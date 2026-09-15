@@ -1,0 +1,651 @@
+{% extends "base.html" %}
+{% block body %}
+{% if enrol_ticket %}
+{# recovery door: reached only with a live host-issued link
+   (`oikonome admin-enrol`). No session, no token — the link IS the
+   authorization, and the server re-checks it when the key lands. #}
+<h1>Enrol a console passkey</h1>
+<div class="card" style="max-width:30rem">
+  <p style="margin-top:0">This one-time link was issued from the host. Enrol a
+     key now, then sign in with it — the link stops working once a key lands.</p>
+  {% if secure_ctx %}
+  <form data-admin-passkey-enrol data-ticket="{{ enrol_ticket }}"
+        style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap">
+    <input name="label" placeholder="name this key (e.g. yubikey-5c)" autocomplete="off" required>
+    <button class="pri">Enrol a passkey</button>
+  </form>
+  <div class="note" data-admin-passkey-error hidden
+       style="margin-top:.5rem;background:rgba(224,105,93,.10);border-color:rgba(224,105,93,.4);color:var(--red)"></div>
+  {% else %}
+  <p class="mut">Passkeys need HTTPS (or localhost). This page is being served
+     over plain http, so nothing can be enrolled here.</p>
+  {% endif %}
+</div>
+{% elif not authed %}
+<h1>Admin console</h1>
+<div class="card" style="max-width:26rem">
+  {% if error %}<div class="note" style="margin-bottom:.8rem;background:rgba(224,105,93,.10);border-color:rgba(224,105,93,.4);color:var(--red)">{{ error }}</div>{% endif %}
+  {# the passkey is the credential. The token block renders only
+     where a token is actually configured — a passkey-only console has no
+     second way in, by design. #}
+  {% if passkeys_enrolled %}
+  <p style="margin-top:0"><button class="pri" type="button" data-admin-passkey-login
+      style="width:100%">Sign in with a passkey</button></p>
+  <div class="note" data-admin-passkey-error hidden
+       style="margin-bottom:.8rem;background:rgba(224,105,93,.10);border-color:rgba(224,105,93,.4);color:var(--red)"></div>
+  {% endif %}
+  {% if token_login %}
+  {% if passkeys_enrolled %}
+  <details>
+    <summary class="sub" style="cursor:pointer">Use the operator token instead</summary>
+  {% endif %}
+  <form method="post" action="/admin/console/login">
+    <p><label>Operator token<br><input type="password" name="token" required autocomplete="off"
+        style="width:100%;padding:.5rem;background:var(--hover);border:1px solid var(--line);border-radius:var(--rs);color:var(--ink)"></label></p>
+    <button class="pri">Sign in</button>
+  </form>
+  {% if passkeys_enrolled %}
+  </details>
+  {% endif %}
+  {% elif not passkeys_enrolled %}
+  {# passkey-only console with nothing enrolled: shut to everyone until the
+     host mints an enrolment link. Say so rather than showing a dead form. #}
+  <p class="mut" style="margin:0">No passkey is enrolled, and this console
+     signs in with a passkey only. Run <code>oikonome admin-enrol</code> on
+     the host for a one-time enrolment link.</p>
+  {% endif %}
+</div>
+{% else %}
+<div style="display:flex;align-items:center;justify-content:space-between">
+  <h1>Admin console</h1>
+  <form method="post" action="/admin/console/logout"><button>Sign out</button></form>
+</div>
+{% if reboot_armed %}
+<div class="card" style="border-color:var(--red);background:rgba(224,105,93,.08);margin-bottom:1rem">
+  <h2 style="margin-top:0;color:var(--red)">Confirm host reboot</h2>
+  <p>Every instance on this host goes down for about 2 minutes. The
+     maintenance broadcast is set automatically.</p>
+  {# same gates as the destructive host commands below: single-use nonce,
+     typed confirm and — once a key is enrolled — a fresh passkey assertion
+     that pages.js drops into the hidden field before the form submits. #}
+  <form method="post" action="/admin/console/host-reboot"
+        {% if admin_creds %}data-admin-stepup="reboot"{% endif %}
+        style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin:0">
+    <input type="hidden" name="stage" value="go">
+    <input type="hidden" name="nonce" value="{{ reboot_nonce }}">
+    <input type="hidden" name="stepup" value="">
+    <input name="confirm" placeholder="type “reboot” to confirm"
+           autocomplete="off" required>
+    <button class="pri" style="background:var(--red);border-color:var(--red);color:#fff;font-size:1rem;padding:.5rem 1.2rem">Yes — reboot the host now</button>
+    <a href="/admin/console" style="margin-left:.4rem">cancel</a>
+  </form>
+  {% if admin_creds %}
+  <p class="sub" style="margin:.5rem 0 0">Confirming asks for your passkey — a
+     fresh touch is required no matter how old this session is.</p>
+  <div class="note" data-admin-passkey-error hidden
+       style="margin-top:.5rem;background:rgba(224,105,93,.10);border-color:rgba(224,105,93,.4);color:var(--red)"></div>
+  {% endif %}
+</div>
+{% elif notice %}<div class="note" style="margin-bottom:.8rem;background:rgba(92,181,107,.10);border-color:rgba(92,181,107,.4);color:var(--green)">{{ notice }}</div>{% endif %}
+{% if mail_health and mail_health.failing %}<div class="note" style="margin-bottom:.8rem;background:rgba(224,105,93,.10);border-color:rgba(224,105,93,.4);color:var(--red)"><b>Outbound mail is failing</b> — {{ mail_health.reason }}. Invites, verification and reset emails are not arriving. A self-host box writes each unsent link to the container log; a hosted instance redacts them, so resend invites and verification from this console once the relay is back. Check the relay / port (cloud hosts often block 25, 465 and 587 — Postmark, SendGrid and Mailgun all accept 2525).</div>{% endif %}
+{% if minted_link %}<div class="card" style="margin-bottom:1rem"><b>Signup link</b> (shown once — also emailed):<br><code>{{ minted_link }}</code></div>{% endif %}
+
+{% if cmd_armed %}
+<div class="card" style="border-color:var(--red);background:rgba(224,105,93,.08);margin-bottom:1rem">
+  <h2 style="margin-top:0;color:var(--red)">Confirm: {{ cmd_armed }}</h2>
+  {% if cmd_armed == 'restore' %}
+  <p>Restore REPLACES this instance's database with a backup — everything
+     added since that dump is lost. A rollback snapshot is taken first.</p>
+  {% elif cmd_armed == 'reset' %}
+  <p>Reset WIPES this instance's data and re-seeds it empty. This cannot be
+     undone — check your backups first.</p>
+  {% elif cmd_armed == 'upgrade' %}
+  <p>Rebuild / restart tears the stack down and brings it back up from the
+     current checkout — every user on this instance is disconnected for the
+     duration.</p>
+  {% else %}
+  <p>Uninstall tears this instance's stack down and removes it. This cannot be
+     undone — check your backups first.</p>
+  {% endif %}
+  {# with a key enrolled this form does NOT submit until the
+     operator touches it — pages.js intercepts, fetches a fresh assertion
+     and drops the single-use ticket into the hidden field below. The
+     server refuses without it, so a JS-less submit fails closed. #}
+  <form method="post" action="/admin/console/run-command"
+        {% if admin_creds %}data-admin-stepup="{{ cmd_armed }}"{% endif %}
+        style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin:0">
+    <input type="hidden" name="command" value="{{ cmd_armed }}">
+    <input type="hidden" name="stage" value="go">
+    <input type="hidden" name="nonce" value="{{ cmd_nonce }}">
+    <input type="hidden" name="stepup" value="">
+    {% if cmd_armed == 'restore' %}
+    <select name="arg" required>
+      <option value="">choose a backup…</option>
+      {% for b in host_state.backups %}<option value="{{ b.name }}">{{ b.name }} ({{ b.size_mb }} MB, {{ '%.0f'|format(b.age_h) }}h ago)</option>{% endfor %}
+    </select>
+    {% endif %}
+    <input name="confirm" placeholder="type “{{ cmd_armed }}” to confirm"
+           autocomplete="off" required>
+    <button class="pri" style="background:var(--red);border-color:var(--red);color:#fff">Yes — {{ cmd_armed }} now</button>
+    <a href="/admin/console" style="margin-left:.4rem">cancel</a>
+  </form>
+  {% if admin_creds %}
+  <p class="sub" style="margin:.5rem 0 0">Confirming asks for your passkey — a
+     fresh touch is required no matter how old this session is.</p>
+  <div class="note" data-admin-passkey-error hidden
+       style="margin-top:.5rem;background:rgba(224,105,93,.10);border-color:rgba(224,105,93,.4);color:var(--red)"></div>
+  {% endif %}
+</div>
+{% endif %}
+
+{# lt(): render a UTC timestamp that pages.js rewrites to the viewer's local
+   timezone. Server text (UTC) is the pre-JS fallback. #}
+{% macro lt(t, fmt='%m/%d/%y %H:%M') %}{% if t %}<time data-localtime="{{ t.isoformat() }}">{{ t.strftime(fmt) }}</time>{% else %}<span class="mut">—</span>{% endif %}{% endmacro %}
+{% macro age(t) %}{% if t %}<time data-localtime="{{ t.isoformat() }}">{{ t.strftime('%m/%d %H:%M') }}</time>{% else %}<span class="mut">never</span>{% endif %}{% endmacro %}
+
+{# ---- console section nav. A tablist that shows one view at a
+   time (pages.js), persists the choice in localStorage, and deep-links via
+   #hash. Auth is unchanged — every view lives behind this one authed render.
+   Infra is NOT a tab — it's the always-present strip rendered directly
+   below this nav.
+   Rendered as a LEFT RAIL on wide screens to match the app's sidebar:
+   same DOM, the layout is entirely CSS (base.html), so the
+   tablist semantics, keyboard nav and the phone's horizontal strip are
+   unchanged. Every tab carries an icon because the unpinned rail collapses
+   to icons only, exactly like the app's. ---- #}
+{# `icon` lets an add-on pane ship its own glyph (the SVG shape markup for
+   the same 24x24 viewBox, from the pane's own `icon` key); without one the
+   frame renders empty, as it does for any key this macro does not know. #}
+{% macro cnicon(key, icon=None) %}<span class="cn-i" aria-hidden="true"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  {%- if icon %}{{ icon | safe }}
+  {%- elif key == 'overview' %}<polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+  {%- elif key == 'tenants' %}<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/>
+  {%- elif key == 'ops' %}<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>
+  {%- elif key == 'deploys' %}<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><path d="M12 3v12"/>
+  {%- elif key == 'audit' %}<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><path d="M16 13H8M16 17H8"/>
+  {%- elif key == 'infra' %}<rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><path d="M6 6h.01M6 18h.01"/>
+  {%- endif %}</svg></span>{% endmacro %}
+<nav class="console-nav" role="tablist" aria-label="Console sections" data-console-nav>
+  {% for key, label in nav_tabs %}
+  <button role="tab" id="tab-{{ key }}" data-nav="{{ key }}"
+          aria-controls="view-{{ key }}"
+          aria-selected="{{ 'true' if loop.first else 'false' }}"
+          tabindex="{{ '0' if loop.first else '-1' }}">{{ cnicon(key, (pane_icons or {}).get(key)) }}<span class="cn-t">{{ label }}</span></button>
+  {% endfor %}
+  <button role="tab" id="tab-infra" data-nav="infra"
+          aria-controls="view-infra" aria-selected="false" tabindex="-1">{{ cnicon('infra') }}<span class="cn-t">Infra</span></button>
+  {# rail chrome, not a destination — hidden on the phone strip. Sits
+     directly after the items, says "Keep open"/"Unpin": the app's pin,
+     in the app's place, with the app's words. #}
+  <button type="button" class="cn-pin" data-rail-pin aria-pressed="false"
+          title="Keep the sidebar open" aria-label="Keep the sidebar open">
+    <span class="cn-i" aria-hidden="true"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg></span>
+    <span class="cn-t">Keep open</span>
+  </button>
+</nav>
+
+{# ================= OVERVIEW ================= #}
+<section class="console-view active" id="view-overview" data-view="overview" role="tabpanel" aria-labelledby="tab-overview">
+<h2>System health</h2>
+<div class="card">
+  <div class="grid cols4" style="gap:.6rem">
+    <div><div class="kpi sm">{{ health.online if health.online is not none else '—' }}</div><div class="sub">users online (15 min)</div></div>
+    <div><div class="kpi sm">{{ health.users if health.users is not none else '—' }}</div><div class="sub">total users · {{ health.tenants if health.tenants is not none else '—' }} tenants</div></div>
+    <div><div class="kpi sm">{{ health.sessions_active if health.sessions_active is not none else '—' }}</div><div class="sub">active sessions</div></div>
+    <div><div class="kpi sm">{% if queue_depth is none %}<span class="pill r">down</span>{% else %}{{ queue_depth }}{% endif %}</div><div class="sub">job queue depth</div></div>
+  </div>
+  <table style="margin-top:.8rem">
+    <tr><th>Database</th><td>PostgreSQL {{ health.db_version or '?' }} · {{ health.db_size or '?' }} · {{ health.db_conns if health.db_conns is not none else '?' }} connections</td></tr>
+    <tr><th>Redis / queue</th><td>{% if health.redis_ok %}<span class="pill g">up</span>{% else %}<span class="pill r">unreachable</span>{% endif %} {% if queue_depth is not none %}· depth {{ queue_depth }}{% endif %}</td></tr>
+    <tr><th>Host</th><td>{% if health.load %}load {{ health.load }} ({{ health.cpus }} vCPU){% else %}<span class="mut">load n/a</span>{% endif %}{% if health.mem_total_gb %} · mem {{ health.mem_used_gb }}/{{ health.mem_total_gb }} GB{% endif %}</td></tr>
+    <tr><th>Workers</th><td>hourly sync {{ age(health.job_sync_all) }} · nightly {{ age(health.job_nightly) }} · email sweep {{ age(health.job_email_all) }}</td></tr>
+    <tr><th>Build</th><td><code>{{ version }}</code>{% if deployments %} · deployed {{ lt(deployments[0].deployed_at) }}{% endif %}</td></tr>
+    <tr><th>Migrations</th><td>{% if health.migrations_pending %}<span class="pill a">{{ health.migrations_pending }} pending</span>{% elif health.migrations_pending == 0 %}<span class="pill g">current</span>{% endif %} · {{ health.migrations if health.migrations is not none else '?' }} applied</td></tr>
+  </table>
+</div>
+
+{# ---- host security/backup state (below System health) ---- #}
+<h2>Host &amp; backups</h2>
+<div class="card">
+  <table>
+    {% set hh = host_state.host %}
+    {% if hh %}
+    <tr><th>OS updates</th><td>{{ hh.updates_pending }} pending{% if hh.security_pending %} · <span class="pill a">{{ hh.security_pending }} security</span>{% endif %}
+      {% if hh.reboot_required %} · <span class="pill r">reboot required</span> <span class="sub">{{ hh.reboot_pkgs }}</span>{% else %} · <span class="pill g">no reboot needed</span>{% endif %}</td></tr>
+    <tr><th>Host</th><td>up {{ (hh.uptime_seconds // 86400) }}d {{ (hh.uptime_seconds % 86400) // 3600 }}h · disk {{ hh.disk_used_pct }}% used
+      <span class="sub">· snapshot {{ hh.generated_at }}</span></td></tr>
+    {% if host_state.container_groups %}
+    <tr><th>Containers</th><td>
+      {% for g in host_state.container_groups %}
+      <span style="white-space:nowrap;display:inline-block;margin:.1rem .8rem .1rem 0">
+        <span class="pill {{ 'g' if not g.bad else 'r' }}">{{ g.ok }} up</span>
+        {{ g.project }}{% if g.done %} <span class="sub">· {{ g.done }} done</span>{% endif %}{% if g.stopped %} <span class="sub">· {{ g.stopped }} stopped</span>{% endif %}{% if g.bad %} <span class="pill r">{{ g.bad|length }} down</span>{% endif %}</span>
+      {% endfor %}
+      {% for g in host_state.container_groups if g.bad %}
+      <div style="margin-top:.3rem">
+        {% for c in g.bad %}
+        <div><span style="display:inline-block;width:9px;height:9px;border-radius:50%;vertical-align:middle;background:{% if 'starting' in (c.status or '') %}var(--amber){% else %}var(--red){% endif %}"></span>
+          <b>{{ c.name }}</b> <span class="sub">{{ c.state }} · {{ c.status }}</span></div>
+        {% endfor %}
+      </div>
+      {% endfor %}</td></tr>
+    {% endif %}
+    {% else %}
+    <tr><th>OS updates</th><td class="mut">not configured — run scripts/host-health.sh from a host timer to surface apt/reboot state here</td></tr>
+    {% endif %}
+    <tr><th>Reboot</th><td>
+      <form method="post" action="/admin/console/host-reboot" style="display:inline;margin:0">
+        <input type="hidden" name="stage" value="arm">
+        <button style="font-size:12px;color:var(--red)">reboot host…</button>
+      </form>
+      <span class="sub">two-step: a typed confirm banner appears at the top of the page</span></td></tr>
+    {% if host_state.backups_available %}
+    {% set bs = host_state.backup_summary %}
+    <tr><th>Backups</th><td>
+      {% if bs %}
+      {% if bs.daily_ok %}<span class="pill g">daily backups healthy</span>{% else %}<span class="pill r">no backup in over 30h — nightly dump may be failing</span>{% endif %}
+      <span class="sub">· last {{ '%.0f'|format(bs.newest_age_h) }}h ago
+      · {{ bs.count }} dump{{ 's' if bs.count != 1 }} over {{ bs.days_covered }} day{{ 's' if bs.days_covered != 1 }}
+      · {{ bs.total_mb }} MB total · oldest {{ bs.oldest_at }}</span>
+      <details style="margin-top:.4rem"><summary style="cursor:pointer" class="sub">latest dumps</summary>
+        {% for b in host_state.backups %}<div class="sub"><code>{{ b.name }}</code> — {{ b.size_mb }} MB, {{ '%.0f'|format(b.age_h) }}h ago</div>{% endfor %}
+      </details>
+      {% else %}<span class="pill r">none found</span> <span class="sub">no backup has been taken yet</span>{% endif %}</td></tr>
+    {% else %}
+    <tr><th>Backups</th><td class="mut">backups dir not mounted (pre-compose-bind install — re-run install.sh)</td></tr>
+    {% endif %}
+  </table>
+</div>
+
+</section>
+
+{# ================= TENANTS (labelled "Users" in the nav) ================= #}
+<section class="console-view" id="view-tenants" data-view="tenants" role="tabpanel" aria-labelledby="tab-tenants">
+<h2>Fleet</h2>
+<div class="card">
+  <p class="sub">Job queue depth: {% if queue_depth is none %}<span class="pill r">redis unreachable</span>{% else %}<span class="pill {{ 'g' if queue_depth < 10 else 'a' }}">{{ queue_depth }}</span>{% endif %}</p>
+  {# one line per household: nothing in this table wraps — actions live on
+     the drill-down (sync, suspend, export, delete), so a row is read, not
+     operated #}
+  <table class="fleet">
+    <tr><th>Owner</th><th title="how long the household has existed">Age</th><th>Status</th>{% include "ext/fleet_head.html" ignore missing %}<th class="num">Users</th><th class="num">Accts</th>{% include "ext/fleet_head_b.html" ignore missing %}<th class="num">Txns</th><th>Last active</th><th class="num" title="sync errors in the last 24 hours">Errs 24h</th></tr>
+    {% for t in tenants %}
+    <tr>
+      <td><a href="/admin/console/tenant/{{ t.id }}">{{ t.owner or '—' }}</a>{% if t.unverified %} <span class="pill a">{{ t.unverified }} unverified</span>{% endif %}</td>
+      <td title="created {{ t.created_at.strftime('%m/%d/%y') }}">{{ age_label(t.created_at) }}</td>
+      <td><span class="pill {{ 'g' if t.status == 'active' else 'r' }}">{{ t.status }}</span></td>
+      {% include "ext/fleet_cell.html" ignore missing %}
+      <td class="num">{{ t.users }}</td>
+      <td class="num">{{ t.accounts }}</td>
+      {% include "ext/fleet_cell_b.html" ignore missing %}
+      <td class="num">{{ t.txns }}</td>
+      <td>{{ lt(t.last_active) if t.last_active else 'never' }}</td>
+      <td class="num">{% if t.sync_errors %}<span class="pill r">{{ t.sync_errors }}</span>{% else %}0{% endif %}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="11" class="mut">No tenants yet.</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+{% if multi_tenant %}
+{% include "ext/console_panel_c.html" ignore missing %}
+
+<h2>Instances</h2>
+<div class="grid cols2">
+  <div class="card">
+    <h2 style="margin-top:0">Create an instance</h2>
+    <p class="sub">Provisions a tenant + owner immediately and returns a
+      one-time set-password link (also emailed). To DELETE an instance,
+      open its row above → Tenant → delete.</p>
+    <form method="post" action="/admin/console/create-instance">
+      <p><label>Owner email<br><input type="email" name="email" required
+          style="width:100%;padding:.5rem;background:var(--hover);border:1px solid var(--line);border-radius:var(--rs);color:var(--ink)"></label></p>
+      {% include "ext/invite_fields.html" ignore missing %}
+      <button class="pri">Create instance</button>
+    </form>
+  </div>
+  <div class="card">
+    <h2 style="margin-top:0">Mint an invite</h2>
+    <p class="sub">Self-signup: the recipient sets their own password and
+      the tenant appears when they complete signup.</p>
+    {% include "ext/console_panel_b.html" ignore missing %}
+    <form method="post" action="/admin/console/invite">
+      <p><label>Email<br><input type="email" name="email" required
+          style="width:100%;padding:.5rem;background:var(--hover);border:1px solid var(--line);border-radius:var(--rs);color:var(--ink)"></label></p>
+      <p><label>Note <span class="mut">(optional)</span><br><input name="note"
+          style="width:100%;padding:.5rem;background:var(--hover);border:1px solid var(--line);border-radius:var(--rs);color:var(--ink)"></label></p>
+      {% include "ext/invite_fields.html" ignore missing %}
+      {% include "ext/invite_fields_b.html" ignore missing %}
+      <button class="pri">Mint invite</button>
+    </form>
+  </div>
+</div>
+
+<h2>Outstanding invites</h2>
+<div class="card">
+  <table>
+    <tr><th>Email</th><th>Note</th><th>Expires</th><th>Options</th></tr>
+    {% for i in invites %}
+    <tr><td>{{ i.email }}</td><td class="mut">{{ i.note or '' }}</td>
+        <td>{{ i.expires_at.strftime('%m/%d/%y') }}</td>
+        {# whatever an installed add-on wrote onto the invite, rendered as
+           its own key/value pairs — the core console reads none of them #}
+        <td class="mut">{% if i.options %}{% for k, v in i.options.items() %}{{ k }}={{ v }}{% if not loop.last %} · {% endif %}{% endfor %}{% else %}standard{% endif %}</td></tr>
+    {% else %}
+    <tr><td colspan="4" class="mut">None outstanding.</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+<h2>Unverified users</h2>
+<div class="card">
+  <table>
+    <tr><th>Email</th><th>Signed up</th><th></th></tr>
+    {% for u in unverified %}
+    <tr>
+      <td>{{ u.email }}</td><td>{{ u.created_at.strftime('%m/%d/%y') }}</td>
+      <td><form method="post" action="/admin/console/resend-verification" style="margin:0">
+        <input type="hidden" name="user_id" value="{{ u.id }}">
+        <button>Re-send verification</button></form></td>
+    </tr>
+    {% else %}
+    <tr><td colspan="3" class="mut">Everyone is verified.</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+{% else %}
+{# Single-household instance: /signup does not exist here, so every door
+   below it (access requests, instance provisioning, signup invites,
+   unverified-user chasing) would hand out links that redirect to /login.
+   Say that once, plainly, instead of offering them. #}
+<h2>Signups</h2>
+<div class="card">
+  <p class="sub">This instance is a single household — it was claimed
+    through its setup link and does not take signups, so access requests,
+    instance provisioning and signup invites do not apply. To share this
+    instance with someone, use <b>Settings → Security &amp; household →
+    Invite</b>, which adds a member to <i>your</i> data.</p>
+</div>
+{% endif %}
+
+<h2>Broadcast <span class="sub">(banner every signed-in user sees)</span></h2>
+<div class="card">
+  {% if broadcast %}
+  <p><span class="pill {{ 'a' if broadcast.severity == 'warn' else 'm' }}">{{ broadcast.severity }}</span>
+     {{ broadcast.message }} <span class="sub">· set {{ lt(broadcast.set_at) }}</span></p>
+  {% else %}<p class="mut">No active broadcast.</p>{% endif %}
+  <form method="post" action="/admin/console/broadcast" style="display:flex;gap:.5rem;flex-wrap:wrap;margin:0">
+    <input name="message" maxlength="300" placeholder="e.g. Maintenance tonight 9pm PT — expect a few minutes of downtime" style="flex:1 1 24rem" value="">
+    <select name="severity"><option value="info">info</option><option value="warn">warn</option></select>
+    <button class="pri">set</button>
+    <button name="message" value="" title="clear the banner">clear</button>
+  </form>
+</div>
+
+<details class="card" style="margin-top:1rem">
+  <summary style="cursor:pointer">
+    <b>Spam defense</b>
+    {% if spam %}<span class="sub">— enforcement <b>{{ 'ON' if spam.enforced else 'OFF' }}</b>
+    · {{ '{:,}'.format(spam.public_count) }} public
+    · {{ spam.blocked_domains }} blocked / {{ spam.blocked_addresses }} addr
+    · {{ spam.drops }} dropped</span>{% else %}<span class="sub">— stats unavailable</span>{% endif %}
+  </summary>
+  {% if spam %}
+  <div style="margin-top:.7rem">
+    <p class="mut" style="margin-top:0">
+      Public blocklist refreshed
+      {{ spam.last_fetched_at.strftime('%m/%d/%y %H:%M') if spam.last_fetched_at else 'never' }}.
+    </p>
+    <div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.6rem">
+      <form method="post" action="/admin/console/refresh-blocklist" style="margin:0">
+        <button class="pri">Refresh blocklist now</button></form>
+      {% include "ext/spam_action.html" ignore missing %}
+      <form method="post" action="/admin/console/block" style="margin:0;display:flex;gap:.3rem">
+        <input name="value" placeholder="domain.com or a@b.com" style="min-width:16rem">
+        <button>Block</button></form>
+    </div>
+    <h3 style="margin:.4rem 0">Auto-blocked / manual domains</h3>
+    <table>
+      <tr><th>Domain</th><th>Source</th><th>Reason</th><th>When</th><th></th></tr>
+      {% for b in spam.recent_blocks %}
+      <tr>
+        <td>{{ b.domain }}</td><td class="mut">{{ b.source }}</td>
+        <td class="mut">{{ b.reason or '' }}</td>
+        <td class="mut">{{ b.added_at.strftime('%m/%d/%y') }}</td>
+        <td><form method="post" action="/admin/console/unblock" style="margin:0">
+          <input type="hidden" name="value" value="{{ b.domain }}">
+          <button>Unblock</button></form></td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" class="mut">No blocked domains yet.</td></tr>
+      {% endfor %}
+    </table>
+    {% include "ext/spam_section_a.html" ignore missing %}
+  </div>
+  {% endif %}
+</details>
+</section>
+
+
+{# ================= ADD-ON PANES ================= #}
+{% for pane in admin_panes %}
+<section class="console-view" id="view-{{ pane.key }}" data-view="{{ pane.key }}" role="tabpanel" aria-labelledby="tab-{{ pane.key }}">
+{% include pane.template %}
+</section>
+{% endfor %}
+
+{# ================= OPS ================= #}
+<section class="console-view" id="view-ops" data-view="ops" role="tabpanel" aria-labelledby="tab-ops">
+<h2>Host operations <span class="sub">(run oikonome.sh on the host)</span></h2>
+<div class="card">
+  {% if cmd_watcher_ready %}
+  <div style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:center">
+    {% for c, label in [('backup','Back up now'), ('status','Status'), ('logs','Recent logs')] %}
+    <form method="post" action="/admin/console/run-command" style="margin:0">
+      <input type="hidden" name="command" value="{{ c }}">
+      <button>{{ label }}</button>
+    </form>
+    {% endfor %}
+    <span class="sub" style="margin:0 .4rem">·</span>
+    {% for c, label in [('upgrade','Rebuild / restart…'), ('restore','Restore a backup…'), ('reset','Reset (wipe data)…'), ('uninstall','Uninstall…')] %}
+    <form method="post" action="/admin/console/run-command" style="margin:0">
+      <input type="hidden" name="command" value="{{ c }}">
+      <button style="color:var(--red)">{{ label }}</button>
+    </form>
+    {% endfor %}
+  </div>
+  <p class="sub" style="margin:.5rem 0 0">Backup / status / logs run on one click; rebuild, restore, reset and uninstall arm a typed confirmation at the top of the page.</p>
+  {% else %}
+  <p class="mut">Not available — the host command watcher isn't installed. Run
+    <code>sudo sh scripts/install-host-command-watcher.sh &lt;install-dir&gt;</code>
+    once on the host.</p>
+  {% endif %}
+  {% if command_results %}
+  <div style="margin-top:.8rem">
+    <b>Recent operations</b>
+    {% for r in command_results %}
+    <details style="margin-top:.3rem">
+      <summary style="cursor:pointer">
+        <span class="pill {{ 'g' if r.state == 'done' else 'r' if r.state == 'failed' else 'a' }}">{{ r.state }}</span>
+        <b>{{ r.cmd }}</b>{% if r.arg %} <span class="sub">{{ r.arg }}</span>{% endif %}{% if r.rc is defined and r.state != 'running' %} <span class="sub">· exit {{ r.rc }}</span>{% endif %}
+      </summary>
+      <pre style="max-height:20rem;overflow:auto;font-size:11px;white-space:pre-wrap">{{ r.log or '(no output captured)' }}</pre>
+    </details>
+    {% endfor %}
+  </div>
+  {% endif %}
+</div>
+
+{# ---- operator access. The console's credential used to be one
+   shared token that reached the root host-agent; a passkey is
+   hardware-bound, revocable one key at a time, and puts a NAME on every
+   audit row. The token survives as break-glass because a plain-http
+   self-host has no secure context and can enrol nothing. ---- #}
+<h2>Operator access</h2>
+<div class="card" data-admin-passkeys>
+  <p style="margin-top:0">Signed in with <b>{{ actor }}</b>{% if passkey_only %} · <b>passkey-only</b> (no operator token){% elif require_passkey %} · passkey required, token is break-glass{% endif %}{% if cf_access %} · behind Cloudflare Access{% endif %} · sessions last 4 hours.</p>
+  {% if admin_creds %}
+  <table style="width:100%">
+    <tr><th style="text-align:left">Passkey</th><th style="text-align:left">Added</th><th style="text-align:left">Last used</th><th></th></tr>
+    {% for c in admin_creds %}
+    <tr>
+      <td>{{ c.label or 'unnamed' }}</td>
+      <td>{{ lt(c.created_at) }}</td>
+      <td>{{ age(c.last_used) }}</td>
+      <td style="text-align:right">
+        <form method="post" action="/admin/console/passkey/delete" data-admin-stepup="remove this passkey" style="margin:0">
+          <input type="hidden" name="cred_id" value="{{ c.id }}">
+          <input type="hidden" name="stepup" value="">
+          <button style="color:var(--red)">remove</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {# One key is a supported posture, so this is the recovery note, not a
+     nag. Only the token console carries one: there, removing the keys
+     recovers TO something the reader already has. There is deliberately no
+     passkey-only equivalent — its recovery is a host command, and the
+     signed-in dashboard is the one place you provably do not need it. The
+     sign-in page still names `admin-enrol`, which is where someone locked
+     out actually reads. #}
+  {% if not passkey_only %}
+  <p class="note" style="margin:.6rem 0 0"><b>Lost your key?</b> On the host:
+     <code>docker compose exec -T app oikonome admin-keys --reset</code> —
+     removes every operator passkey, and the token signs in again
+     immediately. Then enrol a new one here.</p>
+  {% endif %}
+  {% if not require_passkey %}
+  <p class="sub" style="margin:.5rem 0 0">The operator token still signs in.
+     Set <code>OIKONOME_ADMIN_REQUIRE_PASSKEY=1</code> and restart to make it
+     break-glass only — keep a copy of the token somewhere offline first.</p>
+  {% endif %}
+  {% else %}
+  <p class="mut">No operator passkey enrolled — this console is protected by the
+     shared token alone, and that token reaches restore, reset and uninstall on
+     the host.</p>
+  {% endif %}
+  {% if secure_ctx %}
+  {# data-stepup: once a key exists, enrolling ANOTHER one needs a fresh
+     assertion with a key you already hold — a stolen console cookie
+     could otherwise add the thief's own authenticator.
+     The server enforces it; this attribute tells pages.js to collect the
+     ticket first so the button does not just fail with a 403. #}
+  <form data-admin-passkey-enrol{% if passkeys_enrolled %} data-stepup="1"{% endif %}
+        style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin:.6rem 0 0">
+    <input name="label" placeholder="name this key (e.g. yubikey-5c)" autocomplete="off" required>
+    <button class="pri">Enrol a passkey</button>
+  </form>
+  <div class="note" data-admin-passkey-error hidden
+       style="margin-top:.5rem;background:rgba(224,105,93,.10);border-color:rgba(224,105,93,.4);color:var(--red)"></div>
+  {% else %}
+  <p class="mut" style="margin:.6rem 0 0">Passkeys need HTTPS (or localhost) —
+     this console is being served over plain http, so nothing can be enrolled
+     from here. Put a certificate in front of it, or keep using the token.</p>
+  {% endif %}
+</div>
+
+<h2>Jobs</h2>
+<div class="card" style="display:flex;gap:.6rem;flex-wrap:wrap;align-items:center">
+  {% for j, label in [("sync_all", "run sync sweep now"), ("nightly_all", "run nightly detection now"), ("email_all", "run email sweep now")] %}
+  <form method="post" action="/admin/console/run-job" style="display:inline;margin:0">
+    <input type="hidden" name="job" value="{{ j }}">
+    <button>{{ label }}</button>
+  </form>
+  {% endfor %}
+  <span class="sub">enqueued to the worker — watch queue depth in Overview</span>
+</div>
+</section>
+
+{# ================= AUDIT ================= #}
+<section class="console-view" id="view-audit" data-view="audit" role="tabpanel" aria-labelledby="tab-audit">
+<h2>Audit trail <span class="sub">(last 20)</span></h2>
+<div class="card">
+  <table>
+    <tr><th>When</th><th>Action</th><th>Target</th><th>Detail</th><th>IP</th></tr>
+    {% for a in audit %}
+    <tr><td>{{ lt(a.at) }}</td><td>{{ a.action }}</td>
+        <td>{{ a.target or '' }}</td><td class="mut">{{ a.detail or '' }}</td>
+        <td class="mut">{{ a.ip or '' }}</td></tr>
+    {% else %}
+    <tr><td colspan="5" class="mut">No actions yet.</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+<h2>App log <span class="sub">(this container's recent lines)</span></h2>
+<div class="card">
+  <details><summary style="cursor:pointer">show latest log lines</summary>
+  <pre style="max-height:24rem;overflow:auto;font-size:11px;white-space:pre-wrap">{{ applogs or '(empty)' }}</pre>
+  </details>
+</div>
+</section>
+
+{# ================= DEPLOYS ================= #}
+<section class="console-view" id="view-deploys" data-view="deploys" role="tabpanel" aria-labelledby="tab-deploys">
+<h2>Deployments <span class="sub">(last 15 — stamped by the migrate step)</span></h2>
+<div class="card">
+  <table>
+    <tr><th>Version</th><th>What changed</th><th>Deployed</th><th class="num">Migrations</th></tr>
+    {% for d in deployments %}
+    <tr><td><code>{{ d.version }}</code>{% if loop.first %} <span class="pill g">current</span>{% endif %}</td>
+        <td class="mut">{{ d.summary or '—' }}</td>
+        <td>{{ lt(d.deployed_at) }}</td>
+        <td class="num">{{ d.migrations }}</td></tr>
+    {% else %}
+    <tr><td colspan="4" class="mut">No deployments recorded yet (history starts with migration 029).</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+{# Build history, NOT deploy history — see adminconsole._version_history.
+   Collapsed because it is reference material, not an operational signal. #}
+<details class="card" style="margin-top:1rem">
+  <summary style="cursor:pointer"><b>Version history</b>
+    <span class="sub">{% if version_history %}{{ version_history|length }} versions built{% else %}every version ever built{% endif %}, newest first — build history, not deploys</span></summary>
+  {% if version_history %}
+  <table style="margin-top:.75rem">
+    <tr><th>Version</th><th>What it was</th><th>Date</th><th>Commit</th><th class="num">Lines of code</th></tr>
+    {% for v in version_history %}
+    <tr><td><code>{{ v.version }}</code>{% if v.version == version %} <span class="pill g">current</span>{% endif %}</td>
+        <td class="mut">{{ v.subject }}</td>
+        <td>{{ v.date }}</td>
+        <td><code class="mut">{{ v.sha }}</code></td>
+        <td class="num">{% if v.loc is not none %}{{ '{:,}'.format(v.loc) }}{% else %}<span class="mut">—</span>{% endif %}</td></tr>
+    {% endfor %}
+  </table>
+  <p class="sub" style="margin-top:.75rem">
+    Versions before <code>v0.1.1</code> predate this repository's public
+    history — the project's first three days were squashed into the
+    <code>v0.1.0</code> root commit. See <code>HISTORY.md</code> for what
+    that period contained.
+  </p>
+  {% else %}
+  <p class="mut" style="margin-top:.75rem">No manifest in this build —
+    run <code>make version-history</code> and rebuild to populate it.</p>
+  {% endif %}
+</details>
+</section>
+
+{# ================= INFRA (now its own tab, right of Site) =========
+   The live infra-stress panel: collapsed by default (one-line status
+   summary); click / Enter / Space expands into the full timeline charts +
+   gauges. Choice persists in localStorage. pages.js keeps the summary
+   refreshing every 20s (cheap, latest-row only) and re-fetches the heavy
+   chart fragment only while expanded — driven off #infra-panel, unchanged
+   by the relocation. ---- #}
+<section class="console-view" id="view-infra" data-view="infra" role="tabpanel" aria-labelledby="tab-infra">
+{# an add-on's own panel sits ABOVE the stress panel deliberately: infra
+   stress says "is it hurting now", this says what the instance is
+   configured to admit. #}
+<div class="card" id="ext-panel-a">
+{% include "ext/console_panel_a.html" ignore missing %}
+</div>
+<div class="card infra-strip" id="infra-panel" data-infra-refresh data-win="{{ infra.win }}">
+{% include "admin_infra.html" %}
+</div>
+</section>
+{% endif %}
+{% endblock %}

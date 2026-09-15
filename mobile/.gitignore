@@ -1,0 +1,56 @@
+# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
+
+# dependencies
+node_modules/
+
+# Firebase app config — per-checkout, not tracked here (it is not a
+# secret, but it pins a publisher's project id; download your own from
+# the Firebase console)
+google-services.json
+
+# Expo
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# native projects are generated (expo prebuild / run) — app.json is the source
+android/
+ios/
+
+# Native
+.kotlin/
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# Metro
+.metro-health-check*
+
+# debug
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# macOS
+.DS_Store
+*.pem
+
+# local env files
+.env*.local
+
+# typescript
+*.tsbuildinfo
+
+example
+
+# generated native folders
+/ios
+/android
+
+# Play service-account key — a real credential. Symlink your own copy in
+# here so eas.json can name a stable path rather than a home directory.
+/credentials/

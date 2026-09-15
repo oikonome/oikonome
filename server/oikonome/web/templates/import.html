@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block body %}
+<h1>Import transactions</h1>
+{% if msg %}<div class="note" style="margin-bottom:1rem">{{ msg }}</div>{% endif %}
+{% if result %}
+<div class="note" style="margin-bottom:1rem;{% if result.error %}background:rgba(224,105,93,.10);border-color:rgba(224,105,93,.4);color:var(--red){% else %}background:rgba(92,181,107,.10);border-color:rgba(92,181,107,.35);color:var(--green){% endif %}">
+  {% if result.error %}{{ result.error }}
+  {% elif result.source and 'restored' in result.source %}{{ result.source }}.
+  <b><a href="/accounts">Reconnect your bank on the Accounts page →</a></b>
+  {% else %}{% if result.source and 'restored' not in (result.source or '') %}<b>{{ result.source }}</b> — {% endif %}Imported <b>{{ result.imported }}</b> transactions
+  {% if result.skipped_duplicates %} · skipped {{ result.skipped_duplicates }} already covered by a connected bank{% endif %}.
+  <b><a href="/bills">Next: run the recurring-bills finder →</a></b>
+  {% if result.warnings %}
+  <ul style="margin:.4rem 0 0 1.2rem">
+    {% for w in result.warnings %}<li>{{ w }}</li>{% endfor %}
+  </ul>
+  {% endif %}{% endif %}
+</div>
+{% endif %}
+{% if mapping_needed %}
+<div class="card" style="max-width:36rem;margin-bottom:1rem">
+  <h2 style="margin-top:0">Map the columns</h2>
+  <p class="sub">Couldn't auto-detect <b>{{ mapping_needed.filename }}</b> —
+    pick which column is which:</p>
+  <form method="post" action="/import/mapped">
+    <input type="hidden" name="token" value="{{ mapping_needed.token }}">
+    {% macro colsel(name, label, required) %}
+    <p><label>{{ label }}<br>
+      <select name="{{ name }}" {{ 'required' if required }}>
+        {% if not required %}<option value="">— none —</option>{% endif %}
+        {% for h in mapping_needed.header %}<option value="{{ h }}">{{ h }}</option>{% endfor %}
+      </select></label></p>
+    {% endmacro %}
+    {{ colsel('date_col', 'Date column', true) }}
+    {{ colsel('amount_col', 'Amount column', false) }}
+    {# Some exports carry two one-sided columns instead of one signed
+       Amount — the engine takes the pair directly (debit = money out) #}
+    <details style="margin:.4rem 0">
+      <summary class="sub">No single Amount column? Map Debit / Credit
+        instead</summary>
+      {{ colsel('debit_col', 'Debit column (money out)', false) }}
+      {{ colsel('credit_col', 'Credit column (money in)', false) }}
+    </details>
+    {{ colsel('name_col', 'Description / payee column', true) }}
+    {{ colsel('merchant_col', 'Merchant column (optional)', false) }}
+    {{ colsel('category_col', 'Category column (optional)', false) }}
+    <button class="pri">Import with this mapping</button>
+  </form>
+</div>
+{% endif %}
+{% if not accounts %}
+<div class="note" style="margin-bottom:1rem">No accounts yet — 
+  <a href="/accounts">add a manual account first</a>, then come back here.</div>
+{% endif %}
+<div class="card" style="max-width:36rem">
+  <p class="sub">Upload a CSV, OFX/QFX, Quicken QIF, a text-layer <b>PDF
+    statement</b>, a Mint / YNAB / Monarch / Copilot / Simplifi export, or an <b>Oikonome export ZIP</b> (full restore — the migration path between instances) (auto-detected, categories mapped). CSV columns
+    are auto-detected (Date / Amount / Description headers and common
+    variants); OFX/QFX needs no mapping. Rows already covered by a connected
+    bank are skipped automatically.</p>
+  <form method="post" action="/import" enctype="multipart/form-data">
+    <p><label>Into account <span class="sub">(not needed for export-ZIP restores)</span><br>
+      <select name="account_id" style="width:100%">
+        <option value="">— restoring an export ZIP —</option>
+        {% for a in accounts %}
+        <option value="{{ a.id }}">{{ a.institution_name }} — {{ a.name }}{% if a.mask %} {{ a.mask }}{% endif %}</option>
+        {% endfor %}
+      </select></label></p>
+    <p><label>File<br><input type="file" name="file" required accept=".csv,.ofx,.qfx,.qif,.pdf,.zip"></label></p>
+    <p><label>Amount convention <span class="sub">(CSV and PDF only)</span><br>
+      <select name="amount_sign">
+        <option value="bank">bank CSV (negative = money out — most banks)</option>
+        <option value="plaid">CSV positive = money out</option>
+        <option value="statement">bank / checking statement (PDF)</option>
+        <option value="card">credit-card statement (PDF — payments are credits)</option>
+        <option value="investment">investment / brokerage statement (PDF or activity CSV)</option>
+      </select></label></p>
+    <button class="pri">Import</button>
+  </form>
+</div>
+{% if recent %}
+<div class="card" style="margin-top:1rem;max-width:36rem">
+  <h2 style="margin-top:0">Recent imports</h2>
+  <table><thead><tr><th>When</th><th>File</th><th>Source</th>
+    <th class="num">Rows</th><th></th></tr></thead><tbody>
+  {% for b in recent %}
+  <tr>
+    <td class="sub" style="white-space:nowrap">{{ b.created_at|d }}</td>
+    <td class="sub">{{ b.filename or '·' }}</td>
+    <td><span class="pill m">{{ b.source }}</span></td>
+    <td class="num">{{ b.row_count }}</td>
+    <td>
+      <form method="post" action="/import/rollback" style="margin:0"
+            data-confirm="Remove all {{ b.row_count }} rows from this import?">
+        <input type="hidden" name="batch_id" value="{{ b.id }}">
+        <button style="font-size:12px;padding:.2rem .5rem">undo</button>
+      </form>
+    </td>
+  </tr>
+  {% endfor %}
+  </tbody></table>
+</div>
+{% endif %}
+{% endblock %}

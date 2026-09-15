@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="/app/icon.svg">
+<title>{% if title %}Oikonome — {{ title }}{% else %}Oikonome{% endif %}</title>
+<style>
+  /* Transitional Jinja shell — a compact copy of the app's dark theme.
+     The classes here MUST stay in sync with todayview._CLASS_STYLES /
+     _ELEMENT_STYLES (the email inliner bakes the same values). The React
+     SPA replaces these pages; the email keeps this design forever. */
+  :root{--ink:#dbe3ea;--mut:#8b98a3;--line:#2a323d;--bg:#0f141a;--card:#1a212b;
+        --hover:#232c38;--green:#5cb56b;--amber:#f0b429;--red:#e0695d;
+        --blue:#4f9bd6;--r:12px;--rs:8px;
+        /* native controls (select dropdowns, scrollbars) follow dark */
+        color-scheme:dark}
+  *{box-sizing:border-box}
+  /* form controls default to the OS light style otherwise, which paints
+     text inputs and selects white inside the dark theme */
+  input,select,textarea{background:var(--hover);color:var(--ink);
+       border:1px solid var(--line);border-radius:var(--rs);padding:.4rem;
+       font:inherit}
+  /* Chromium drops its color-scheme-dark POPUP rendering when a select
+     carries any author background — style the options explicitly so the
+     popup follows the theme too (same fix as the SPA's index.css) */
+  select option,select optgroup{background:var(--card);color:var(--ink)}
+  body{margin:0;background:var(--bg);color:var(--ink);font-size:15px;line-height:1.5;
+       font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}
+  main{max-width:1150px;margin:0 auto;padding:0 1rem 3rem}
+  /* auth pages center their card in the viewport */
+  body.auth-center{display:flex;align-items:center;justify-content:center;
+                   min-height:100vh;padding:2rem 1rem}
+  body.auth-center main{max-width:26rem;width:100%;padding:0}
+  body.auth-center h1{text-align:center}
+  /* omicron-door mark beside the wordmark, matching the homepage */
+  .brand{display:flex;align-items:center;gap:.5rem}
+  body.auth-center .brand{justify-content:center;margin-bottom:1rem;
+                          font-size:1.6rem;font-weight:700}
+  body.auth-center .brand svg{width:28px;height:28px}
+  a{color:var(--blue);text-decoration:none} a:hover{text-decoration:underline}
+  header{position:sticky;top:0;background:rgba(15,20,26,.85);backdrop-filter:blur(8px);
+         border-bottom:1px solid var(--line);padding:.6rem 1rem;margin-bottom:1rem}
+  header nav{display:flex;gap:1rem;max-width:1150px;margin:0 auto}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);
+        padding:1.05rem 1.15rem;box-shadow:0 1px 3px rgba(0,0,0,.3);overflow-x:auto}
+  .grid{display:grid;gap:1rem}
+  .cols2{grid-template-columns:1fr 1fr}
+  .cols3{grid-template-columns:repeat(3,1fr)}
+  .cols4{grid-template-columns:repeat(4,1fr)}
+  h1{font-size:1.5rem}
+  h2{font-size:17px;margin:14px 0 8px;font-weight:700}
+  .kpi{font-size:32px;font-weight:700;letter-spacing:-.02em}
+  .kpi.sm{font-size:22px}
+  .sub{color:var(--mut);font-size:13px}
+  .mut{color:var(--mut)} .ax{color:var(--mut);font-size:11px}
+  .num{text-align:right}
+  .pos{color:var(--green)} .neg{color:var(--red)}
+  .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:700}
+  .pill.g{background:rgba(92,181,107,.16);color:var(--green)}
+  .pill.a{background:rgba(240,180,41,.16);color:var(--amber)}
+  .pill.r{background:rgba(224,105,93,.16);color:var(--red)}
+  .pill.m{background:rgba(139,152,163,.16);color:var(--mut)}
+  .note{background:rgba(240,180,41,.10);border:1px solid rgba(240,180,41,.28);
+        color:#e6c874;border-radius:var(--rs);padding:8px 11px;font-size:13px}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th{text-align:left;padding:5px 7px;border-bottom:1px solid var(--line);color:var(--mut);
+     font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.03em}
+  td{text-align:left;padding:5px 7px;border-bottom:1px solid var(--line)}
+  /* fleet: one household per line; the card scrolls sideways before a cell wraps */
+  .fleet th,.fleet td{white-space:nowrap}
+  button,.btn{background:var(--hover);color:var(--ink);border:1px solid var(--line);
+     border-radius:var(--rs);padding:.35rem .8rem;cursor:pointer;font-size:14px}
+  button.pri{background:var(--blue);border-color:var(--blue);color:#0b1016;font-weight:600}
+  button.danger{background:rgba(224,105,93,.12);border-color:rgba(224,105,93,.5);color:var(--red)}
+  /* console nav: a sticky tablist; one.console-view shows at a time.
+     On wide screens the SAME DOM lays out as a left rail (below). */
+  .console-nav{position:sticky;top:0;z-index:5;display:flex;gap:.25rem;
+     flex-wrap:wrap;background:rgba(15,20,26,.92);backdrop-filter:blur(8px);
+     border-bottom:1px solid var(--line);padding:.4rem 0;margin:0 0 1rem}
+  .console-nav button{background:transparent;border:1px solid transparent;
+     border-radius:var(--rs);padding:.35rem .85rem;color:var(--mut);
+     font-weight:600;cursor:pointer;font-size:14px;
+     display:inline-flex;align-items:center;gap:.5rem}
+  .console-nav button:hover{color:var(--ink);background:var(--hover)}
+  .console-nav button[aria-selected="true"]{color:var(--ink);
+     background:var(--card);border-color:var(--line)}
+  .console-nav button:focus-visible{outline:2px solid var(--blue);
+     outline-offset:1px}
+  .cn-i{flex:0 0 auto;width:20px;height:20px;display:grid;
+     place-items:center}
+  .cn-t{overflow:hidden;text-overflow:ellipsis}
+  .cn-pin{display:none} /* the horizontal strip has nothing to pin */
+  /* ---- console LEFT RAIL, matching the app's sidebar, BEHAVIOUR
+     INCLUDED. Same DOM, pure CSS relayout, scoped to
+     body:has(...): a browser without :has() keeps the horizontal tablist —
+     degraded, never broken.
+     Default is the app rail's default: a collapsed icon rail that opens
+     OVER the page on hover/focus-within (focus-within is the keyboard's
+     hover — an icon-only rail is unusable by keyboard without it), with
+     the pin sitting directly after the items saying "Keep open"/"Unpin",
+     exactly where and what the app's pin is — position AND language
+     match the app. pages.js toggles body.cn-pinned and
+     persists the choice. */
+  @media(min-width:900px){
+    body:has(.console-nav){--cnw:52px;--cnw-open:200px}
+    body:has(.console-nav) .console-nav{position:fixed;left:0;top:0;
+       bottom:0;width:var(--cnw);flex-direction:column;flex-wrap:nowrap;
+       align-items:stretch;gap:.15rem;padding:.6rem .5rem;margin:0;
+       border-bottom:0;border-right:1px solid var(--line);
+       background:var(--card);backdrop-filter:none;overflow-y:auto;
+       overflow-x:hidden;scrollbar-width:none;transition:width .14s ease}
+    body:has(.console-nav) .console-nav::-webkit-scrollbar{width:0}
+    body:has(.console-nav) .console-nav button{display:flex;
+       width:100%;padding:.5rem .55rem;white-space:nowrap;overflow:hidden;
+       text-align:left}
+    body:has(.console-nav) header,
+    body:has(.console-nav) main{margin-left:var(--cnw)}
+    body:has(.console-nav) .cn-pin{display:flex}
+    /* opacity, never display:none — the label is the accessible name */
+    body:has(.console-nav) .cn-t{opacity:0;transition:opacity .1s ease}
+    body:has(.console-nav)
+       .console-nav:is(:hover,:focus-within){width:var(--cnw-open);
+       box-shadow:8px 0 24px -14px rgba(0,0,0,.6)}
+    body:has(.console-nav)
+       .console-nav:is(:hover,:focus-within) .cn-t{opacity:1}
+    /* pinned: the rail takes real width and stays open */
+    body.cn-pinned:has(.console-nav) header,
+    body.cn-pinned:has(.console-nav) main{margin-left:var(--cnw-open)}
+    body.cn-pinned:has(.console-nav) .console-nav{width:var(--cnw-open);
+       box-shadow:none}
+    body.cn-pinned:has(.console-nav) .cn-t{opacity:1}
+    /* chevron points the way a click moves the rail: right ("Keep open")
+       while collapsed, left ("Unpin") while pinned — the app's icon logic */
+    body:not(.cn-pinned):has(.console-nav) .cn-pin svg{
+       transform:rotate(180deg)}
+  }
+  /* Views all show by default; pages.js adds .nav-ready to switch to
+     single-view mode. So if the script fails to load nothing is hidden and
+     the whole console is still reachable (graceful degradation). */
+  .console-view{display:block}
+  main.nav-ready .console-view{display:none}
+  main.nav-ready .console-view.active{display:block}
+  /* infra-stress strip: a persistent, collapsed-by-default strip
+     that sits directly below the nav (NOT a tab) and stays across views */
+  .infra-strip{padding:.6rem .9rem;margin:0 0 1rem}
+  .infra-title{font-size:14px;font-weight:700;color:var(--ink)}
+  /* infra-stress collapse: one of summary / detail shows at a time */
+  .infra-head{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
+  .infra-sumline{font-size:13px;color:var(--ink);display:inline-flex;
+     align-items:center;gap:.3rem;flex-wrap:wrap}
+  #infra-panel:not(.collapsed) .infra-sumline{display:none}
+  #infra-panel.collapsed .infra-detail{display:none}
+  /* generic collapsed-by-default card (audit trail, …) — data-collapse
+     driven, same contract as the infra panel (pages.js) */
+  [data-collapse] .collapse-head{display:flex;align-items:center;gap:.5rem;
+     cursor:pointer;user-select:none}
+  [data-collapse] .collapse-caret{color:var(--mut);font-size:12px;
+     transition:transform .12s;display:inline-block}
+  [data-collapse]:not(.collapsed) .collapse-caret{transform:rotate(90deg)}
+  [data-collapse].collapsed .collapse-detail{display:none}
+  [data-collapse] .collapse-head:focus-visible{outline:2px solid var(--blue);
+     outline-offset:2px;border-radius:var(--rs)}
+  /* email-confirmed page (unlock.html confirmed branch): a check badge
+     that draws itself, and a bar that counts down the Refresh forward */
+  .ok-card{padding:1.6rem 1.15rem 1.35rem}
+  .ok-wrap{text-align:center}
+  .ok-badge{width:64px;height:64px;border-radius:50%;margin:0 auto 1rem;
+    background:rgba(92,181,107,.14);border:1.5px solid rgba(92,181,107,.45);
+    display:flex;align-items:center;justify-content:center;
+    animation:ok-pop .45s cubic-bezier(.2,1.4,.4,1) both}
+  .ok-badge svg{width:30px;height:30px}
+  .ok-badge path{stroke:var(--green);stroke-width:9;fill:none;stroke-linecap:round;
+    stroke-linejoin:round;stroke-dasharray:60;stroke-dashoffset:60;
+    animation:ok-draw .5s .25s ease-out forwards}
+  @keyframes ok-pop{from{transform:scale(.6);opacity:0}to{transform:scale(1);opacity:1}}
+  @keyframes ok-draw{to{stroke-dashoffset:0}}
+  .ok-h{font-size:1.35rem;font-weight:700;margin:0 0 .35rem;letter-spacing:-.01em}
+  .ok-sub{color:var(--mut);font-size:14px;margin:0 0 1.2rem}
+  .ok-sub b{color:var(--ink);font-weight:600}
+  .ok-btn{display:inline-block;background:var(--blue);color:#0b1016;font-weight:600;
+    border-radius:var(--rs);padding:.55rem 1.1rem;font-size:14px}
+  .ok-btn:hover{text-decoration:none;filter:brightness(1.08)}
+  .ok-timer{height:3px;border-radius:2px;background:var(--hover);margin:1.1rem auto 0;
+    max-width:12rem;overflow:hidden}
+  .ok-timer i{display:block;height:100%;background:var(--green);transform-origin:left;
+    animation:ok-count 4s linear forwards}
+  @keyframes ok-count{to{transform:scaleX(0)}}
+  @media (prefers-reduced-motion:reduce){
+    .ok-badge,.ok-timer i{animation:none}
+    .ok-badge path{animation:none;stroke-dashoffset:0}}
+  @media(max-width:760px){
+    .cols2,.cols3,.cols4{grid-template-columns:1fr}
+    .hide-m{display:none!important}
+  }
+</style>
+{# all page JS is external — the pages CSP has no script-src
+   'unsafe-inline'. Behaviors key off data attributes; see static/pages.js #}
+<script src="/static/pages.js?v={{ asset_ver() }}" defer></script>
+</head>
+{# Centering is the DEFAULT. With centering opt-IN, new server-rendered
+   pages kept shipping the old top-left format because every new route
+   forgot to pass it. Now the auth-centered card is what you get
+   unless a page explicitly opts OUT with centered=false — that set is small
+   and stable: the setup wizard, Plaid link, and the import/dashboard chrome
+   that legitimately want the full-width layout + header. A brand-new auth
+   page needs to do NOTHING to be centered. #}
+{% set _center = (centered is not defined) or centered %}
+<body{% if _center %} class="auth-center"{% endif %}>
+{# no menu here, ever: the app's ONE nav lives in the SPA. These
+   server-rendered pages are standalone flows; a second menu on them was a
+   recurring bug. Full-width pages (centered=false) keep the header. #}
+{% set mark %}<svg width="20" height="20" viewBox="0 0 100 100" aria-hidden="true"><path d="M39.7 78.2 A30 30 0 1 1 60.3 78.2" fill="none" stroke="#4f9bd6" stroke-width="11" stroke-linecap="round"/></svg>{% endset %}
+{% if not _center %}<header><nav><a href="/app/" class="brand">{{ mark }}<b>Oikonome</b></a></nav></header>{% endif %}
+<main>{% if _center %}<div class="brand">{{ mark }}<span>Oikonome</span></div>{% endif %}{% block body %}{% endblock %}</main>
+</body>
+</html>

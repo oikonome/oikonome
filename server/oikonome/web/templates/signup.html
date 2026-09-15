@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block body %}
+<h1>Create your account</h1>
+<div class="card" style="max-width:26rem">
+  {% if error and at_capacity %}
+  {# The wall explains itself: the live cap, that it is temporary, and a
+     way past it a person without an account can actually use. #}
+  <div class="note" style="margin-bottom:.8rem">
+    <p style="margin:0 0 .5rem"><b>Not quite yet</b> — {{ error }}</p>
+    <p style="margin:0">{% if support_email %}<a href="mailto:{{ support_email }}?subject=Oikonome%20account">Email {{ support_email }}</a>{% if intake_open %} or{% endif %}{% endif %}{% if intake_open %}
+      <a href="{{ intake_path() }}">request access</a>{% endif %}.</p>
+  </div>
+  {% elif error %}<div class="note" style="margin-bottom:.8rem;background:rgba(224,105,93,.10);border-color:rgba(224,105,93,.4);color:var(--red)">{{ error }}</div>{% endif %}
+  {% if invite_required %}
+  <p class="sub" style="margin-top:0">Signups are invite-only on this instance.
+    Use the link from your invitation, or paste the code below.</p>
+  {% endif %}
+  <form method="post" action="/signup">
+    <p><label>Email<br><input type="email" name="email" required value="{{ email or '' }}"
+        style="width:100%;padding:.5rem;background:var(--hover);border:1px solid var(--line);border-radius:var(--rs);color:var(--ink)"></label></p>
+    <p><label>Password <span class="sub">(10+ characters)</span><br><input type="password" name="password" required minlength="10" autocomplete="new-password"
+        style="width:100%;padding:.5rem;background:var(--hover);border:1px solid var(--line);border-radius:var(--rs);color:var(--ink)"></label></p>
+    {# Once signup is open the code is no longer asked for — but a link
+       that carries one still works, so the field stays when it is filled. #}
+    {% if invite_required or invite %}
+    <p><label>Invite code{% if not invite_required %} <span class="sub">(optional)</span>{% endif %}<br><input name="invite" value="{{ invite or '' }}"
+        style="width:100%;padding:.5rem;background:var(--hover);border:1px solid var(--line);border-radius:var(--rs);color:var(--ink)"></label></p>
+    {% endif %}
+    {% if ref %}<input type="hidden" name="ref" value="{{ ref }}">{% endif %}
+    {% if turnstile_key %}
+    <div class="cf-turnstile" data-sitekey="{{ turnstile_key }}"
+         data-theme="auto" style="margin:.6rem 0"></div>
+    {% endif %}
+    <button class="pri">Create account</button>
+  </form>
+  {% if turnstile_key %}
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js"
+          async defer></script>
+  {% endif %}
+  <p class="sub" style="margin-top:.8rem"><a href="/login">Already have an account? Sign in</a></p>
+</div>
+{% endblock %}

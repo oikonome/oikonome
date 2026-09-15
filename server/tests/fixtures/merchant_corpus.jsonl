@@ -1,0 +1,38 @@
+{"raw": "U-Haul", "merchant": "U-Haul", "note": "letter-hyphen brand keeps its short half"}
+{"raw": "U-HAUL STORAGE OF SPRINGFIELD SPRINGFIELD IL", "merchant": "U-Haul Storage Springfield Springfield"}
+{"raw": "T-MOBILE", "merchant": "T-Mobile"}
+{"raw": "H-e-b Gas #118", "merchant": "H-E-B Gas"}
+{"raw": "7-ELEVEN #123", "merchant": "7-Eleven", "note": "digit-hyphen brand"}
+{"raw": "1-800-Flowers", "merchant": "1-800-Flowers"}
+{"raw": "A-1 TOWING", "merchant": "A-1 Towing"}
+{"raw": "CHICK-FIL-A #123", "merchant": "Chick-Fil-A"}
+{"raw": "E-ZPass", "merchant": "E-Zpass"}
+{"raw": "Jo-Ann Stores", "merchant": "Jo-Ann Stores"}
+{"raw": "FROZY D-LITE - 14TH ST", "merchant": "Frozy D-Lite"}
+{"raw": "WITHDRAWAL-CASH NORTHWIND CREDIT CD-ONLINE", "merchant": "Withdrawal Cash Northwind Credit", "note": "bank punctuation splits"}
+{"raw": "Giant-eagle #0031", "merchant": "Giant Eagle"}
+{"raw": "CREDIT-INTEREST", "merchant": "Credit Interest"}
+{"raw": "SQ *COFFEE HOUSE", "merchant": "Coffee House", "note": "processor prefix"}
+{"raw": "TST* BURGER BARN", "merchant": "Burger Barn"}
+{"raw": "GglPay TARGET", "merchant": "Target"}
+{"raw": "PP*SPOTIFY", "merchant": "Spotify"}
+{"raw": "ACME STORE XXXXX1234", "merchant": "Acme Store", "note": "masked id tail"}
+{"raw": "PARKING 312-555-01234 LOT", "merchant": "Parking", "note": "phone number is noise"}
+{"raw": "SHELL 12-31 STORE 1010", "merchant": "Shell Store"}
+{"raw": "THE ORCHARD APTS ONLINE payment~ Future Amount: 1875 ~ Tran:", "merchant": "Orchard Apts", "note": "Mint volatile clause"}
+{"raw": "ABSOLUTE SHINE DETAILING 1200 N. HAWTHORN AVE. MARAIS D OLIVE, NV, US", "merchant": "Absolute Shine Detailing", "note": "postal tail then street address"}
+{"raw": "LKS Transportation", "merchant": "Lks Transportation", "note": "Tran: marker is a word boundary"}
+{"raw": "COSTCO WHSE #0007", "merchant": "Costco Whse"}
+{"raw": "AMAZON.COM*1A2B3C AMZN.COM/BILL WA", "merchant": "Amazon Amzn", "note": "a mixed alnum token is not a word — its letters do not survive"}
+{"raw": "Venmo — Casey Example", "merchant": "Venmo — Casey Example", "note": "app-made counterparty name kept verbatim (resolver rule; canonical_merchant not consulted)", "verbatim": true}
+{"raw": "GOOGLE FI", "merchant": "Google Fi", "note": "trailing two letters on a two-word name are the product, not a truncation"}
+{"raw": "PROJECT FI", "merchant": "Project Fi"}
+{"raw": "AT HOME 2020", "merchant": "At Home", "note": "a leading word that is a word keeps its word shape"}
+{"raw": "FROZY D-LITE - 14TH ST", "merchant": "Frozy D-Lite", "note": "'Th' is a fragment of 14TH, not a word; 'St' is a street suffix"}
+{"raw": "US BANK", "merchant": "US Bank", "note": "leading two-letter word is the brand; the old 3-char floor left 'Bank'"}
+{"raw": "us bank", "merchant": "US Bank"}
+{"raw": "JC PENNEY #3030", "merchant": "JC Penney"}
+{"raw": "GE APPLIANCES", "merchant": "GE Appliances"}
+{"raw": "SANDWICH HUT MILLBROOK NV", "merchant": "Sandwich Hut Millbrook", "note": "trailing two letters after a full name are the bank's state code"}
+{"raw": "VALLEY ORGANIC FO", "merchant": "Valley Organic", "note": "trailing two letters are a word the bank truncated"}
+{"raw": "SQ COFFEE HOUSE", "merchant": "Coffee House", "note": "a processor code is not a name in any position"}

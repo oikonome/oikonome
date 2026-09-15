@@ -1,0 +1,1400 @@
+/* The app's base stylesheet — the SPA and the server-rendered pages read
+   as one product. Tokens, chrome, tables, pills, buttons and forms are
+   shared with the Jinja shell (templates/base.html); SPA-only components
+   (calendar, onboarding, matcher) are styled from the same tokens. */
+:root{--ink:#dbe3ea;--mut:#8b98a3;--line:#2a323d;--bg:#0f141a;--card:#1a212b;
+      --hover:#232c38;--green:#5cb56b;--amber:#f0b429;--red:#e0695d;--blue:#4f9bd6;
+      --entity:#b79af0;
+      --r:12px;--rs:8px;--header-bg:rgba(26,33,43,.86);
+      --shadow:0 1px 2px rgba(0,0,0,.28),0 10px 28px -14px rgba(0,0,0,.55);
+      /* without this the browser paints NATIVE controls light — select
+         popups and date pickers came out white-on-white on the dark app */
+      color-scheme:dark}
+
+/* ==== light theme — dark stays the design baseline. Applied by
+   explicit choice (data-theme=light) or by the OS preference when the
+   user hasn't pinned dark. The two blocks are intentionally identical. */
+:root[data-theme=light]{
+      --ink:#1f2933;--mut:#5b6875;--line:#d8dfe6;--bg:#f2f5f7;--card:#ffffff;
+      --hover:#e7edf2;--green:#2f8f46;--amber:#a97b0d;--red:#c44b3e;--blue:#2673b8;
+      --entity:#6f47c4;
+      --header-bg:rgba(255,255,255,.86);
+      --shadow:0 1px 2px rgba(15,23,32,.08),0 10px 28px -14px rgba(15,23,32,.25);
+      color-scheme:light}
+@media (prefers-color-scheme: light){
+  :root:not([data-theme=dark]){
+      --ink:#1f2933;--mut:#5b6875;--line:#d8dfe6;--bg:#f2f5f7;--card:#ffffff;
+      --hover:#e7edf2;--green:#2f8f46;--amber:#a97b0d;--red:#c44b3e;--blue:#2673b8;
+      --entity:#6f47c4;
+      --header-bg:rgba(255,255,255,.86);
+      --shadow:0 1px 2px rgba(15,23,32,.08),0 10px 28px -14px rgba(15,23,32,.25);
+      color-scheme:light}
+}
+*{box-sizing:border-box}
+/* fieldsets default to min-width:min-content — a wide table inside one
+   (DemoLock/ViewerLock wrap whole sections in a fieldset) pushes the page
+   past the viewport instead of scrolling inside the card */
+fieldset{min-width:0}
+html{-webkit-text-size-adjust:100%}
+html,body,#root{margin:0;min-height:100vh}
+body{font:15px/1.55 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+     color:var(--ink);background:var(--bg)}
+::selection{background:rgba(79,155,214,.35)}
+*{scrollbar-width:thin;scrollbar-color:var(--hover) transparent}
+::-webkit-scrollbar{height:8px;width:8px}
+::-webkit-scrollbar-thumb{background:var(--hover);border-radius:4px}
+::-webkit-scrollbar-track{background:transparent}
+:focus-visible{outline:2px solid var(--blue);outline-offset:2px;border-radius:4px}
+
+a{color:var(--ink);text-decoration:underline;text-decoration-color:var(--mut);
+  text-underline-offset:2px;transition:text-decoration-color .15s}
+a:hover{text-decoration-color:var(--ink)}
+
+/* ==== header / nav (.bar) ==== */
+header.top{background:var(--header-bg);backdrop-filter:blur(10px);
+       -webkit-backdrop-filter:blur(10px);
+       border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+/* Installed to an iPhone home screen the app runs behind the status bar
+   (viewport-fit=cover + black-translucent), so the sticky header would sit
+   under the clock and the notch without this. env() is 0 on every device
+   with no cutout — desktop and ordinary Android are untouched. The side
+   insets matter in landscape, where the notch eats one edge. */
+header.top{padding-top:env(safe-area-inset-top)}
+/* one grid column sized to the widest row (the menu), so the top line's
+   right-aligned sync/user cluster lines up with the RIGHTMOST menu item
+   — not the container edge, so the email's last letter sits over the last
+   menu item's text. fit-content(100%) = shrink-wrap, but never wider than
+   the container. */
+/* ONE full-width track, not fit-content. fit-content(100%) sized both
+   rows to their CONTENT: on a 1440
+   viewport the header row and the nav came out 742px wide inside an 1180px
+   shell, leaving 424px of dead space and stranding .rt's margin-left:auto
+   424px short of the right edge. That read as "the nav is oddly
+   left-justified" when the real story was that the whole header block was
+   squeezed into the left 60% of the page. minmax(0,1fr) — not plain 1fr —
+   because the phone nav is an overflow-x scroller and a 1fr track refuses to
+   shrink below its content, which would blow the grid out horizontally. */
+.bar{display:grid;grid-template-columns:minmax(0,1fr);gap:.15rem;
+     max-width:1180px;margin:0 auto;
+     padding:.45rem max(.9rem,env(safe-area-inset-right)) .35rem
+             max(.9rem,env(safe-area-inset-left))}
+.topline{display:flex;align-items:center;gap:.25rem}
+.brand{font-weight:700;margin-right:.6rem;color:var(--blue);text-decoration:none;
+       display:inline-flex;align-items:center;gap:.42rem;padding:.2rem .3rem;
+       border-radius:var(--rs);transition:background .15s}
+.brand:hover{background:var(--hover);text-decoration:none}
+.brand img{display:block}
+nav{display:flex;align-items:center;gap:.1rem;flex-wrap:wrap}
+/* The centred top nav that lived here was replaced by the left icon rail.
+   Removed rather than commented out: two nav layouts fighting over the
+   same element is how a rule survives that nobody can explain. */
+/* the links' wrapper exists only for the phone bar's scroll strip; on
+   desktop it dissolves so the links stay direct flex items of nav */
+.navscroll{display:contents}
+nav a{color:var(--ink);text-decoration:none;padding:.38rem .68rem;border-radius:var(--rs);
+      font-size:14px;white-space:nowrap;transition:background .15s}
+nav a:hover{background:var(--hover);text-decoration:none}
+nav a.on{background:var(--blue);color:#fff}
+.navsep{width:1px;height:1.05rem;background:var(--line);margin:0 .4rem;flex:0 0 auto}
+.rt{margin-left:auto;display:flex;gap:.4rem;align-items:center}
+/* The drawer's chrome exists only below the breakpoint — above it the rail
+   opens on hover and there is nothing to press or to close. Declared here
+   rather than as a `display:none` inside the desktop query so the default
+   is off: a new shell that forgets the media query shows no stray button. */
+.navtoggle,.drawer-head{display:none}
+
+/* ==== the phone drawer ====
+   The bottom tab strip that used to live here was replaced by the drawer
+   (the phone half of the rail). Removed rather than left commented: a stylesheet
+   carrying two nav layouts for the same element is how a rule survives that
+   nobody can explain. The strip's own history is worth keeping though —
+   it docked to the bottom behind `pointer:coarse` rather than behind the
+   width, because a narrowed DESKTOP window has no thumb and a nav that
+   silently relocates to the bottom edge reads as a nav that vanished.
+   The drawer needs no such split:
+   a handle at the top-left is right for a thumb and right for a mouse, so
+   one width query now serves both and that whole class of report is gone. */
+
+/* ==== header right cluster — sync chip + user menu ==== */
+.syncchip{font-size:12px;padding:.24rem .5rem;border-radius:999px;
+          border:1px solid transparent;color:var(--mut);white-space:nowrap}
+/* Status, not a control: no fill, no border, no hover
+   — a flat run of words with a dot, so nothing in the header reads as a
+   button when there is nothing to press. The transparent border keeps
+   the box the same size as the syncing shape below, so the switch never
+   reflows the header. */
+.syncdot{width:7px;height:7px;border-radius:50%;background:var(--green);
+         display:inline-block;flex:none}
+.syncdot.warn{background:var(--amber)}
+.syncdot.busy{background:var(--blue);animation:syncpulse 1.2s ease-in-out infinite}
+@keyframes syncpulse{0%,100%{opacity:1}50%{opacity:.35}}
+/* A sync is the one thing the app does that the user cannot see,
+   and it is also the thing they are waiting on. The chip becomes the
+   progress bar rather than growing one next to it — same box, same width,
+   so the header never reflows mid-sync and nothing jumps under the pointer.
+   Not disabled-looking: it is working, not unavailable. */
+.syncchip.syncing{position:relative;overflow:hidden;opacity:1;
+  color:var(--ink);border-color:var(--blue);background:var(--hover)}
+/* flex, not baseline: centring the row centres the dot against the label
+   by construction. */
+.syncchip-t{position:relative;z-index:1;display:inline-flex;
+  align-items:center;gap:.45em}
+.syncfill{position:absolute;inset:0 auto 0 0;width:0;z-index:0;
+  background:color-mix(in srgb,var(--blue) 26%,transparent);
+  transition:width .5s ease}
+/* Indeterminate ONLY until the worker reports a denominator: a determinate
+   bar parked at 0% is indistinguishable from a hung one. */
+.syncfill.indet{width:45%;animation:syncsweep 1.5s ease-in-out infinite}
+@keyframes syncsweep{
+  0%{transform:translateX(-105%)} 100%{transform:translateX(235%)}}
+/* Reduced motion still needs to say "working" — the pulse and the sweep
+   stop, the FILL stays, because it carries the actual information. */
+@media (prefers-reduced-motion:reduce){
+  .syncdot.busy{animation:none}
+  .syncfill.indet{animation:none;width:100%;opacity:.5}
+}
+.usermenu{position:relative}
+.usermenu>summary{list-style:none;cursor:pointer;font-size:12px;color:var(--mut);
+                  padding:.24rem .6rem;border-radius:var(--rs);max-width:15ch;
+                  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.usermenu>summary::-webkit-details-marker{display:none}
+.usermenu>summary:hover{background:var(--hover);color:var(--ink)}
+.usermenu[open]>summary{background:var(--hover);color:var(--ink)}
+.usermenu-panel{position:absolute;right:0;top:calc(100% + .3rem);z-index:20;
+                background:var(--card);border:1px solid var(--line);
+                border-radius:var(--rs);min-width:11rem;padding:.3rem;
+                display:flex;flex-direction:column;gap:.15rem;
+                box-shadow:var(--shadow)}
+/* The menu's first line is the full address (the chrome shows
+   only the local part) — informational, not clickable */
+.usermenu-email{font-size:12px;color:var(--mut);padding:.4rem .6rem .2rem;
+                border-bottom:1px solid var(--line);margin-bottom:.15rem;
+                word-break:break-all}
+.usermenu-panel a,.usermenu-panel button{text-align:left;font-size:13px;
+                padding:.4rem .6rem;border:none;background:none;color:var(--ink);
+                border-radius:var(--rs);text-decoration:none;cursor:pointer}
+.usermenu-panel a:hover,.usermenu-panel button:hover{background:var(--hover);
+                text-decoration:none}
+
+main{max-width:1180px;margin:1.1rem auto;padding:0 .9rem}
+h1{font-size:1.42rem;margin:.2rem 0 1rem;letter-spacing:-.015em}
+
+/* ==== home lens header: title + stepper + Today|Week|Month|Year ==== */
+.lenshead{display:flex;align-items:center;gap:.8rem;flex-wrap:wrap;margin:.2rem 0 1rem}
+.lenshead h1{margin:0}
+.lensctl{margin-left:auto;display:flex;gap:.4rem;align-items:center;flex-wrap:wrap}
+.lensctl>button{padding:.3rem .6rem;font-weight:700}
+.lensctl select{padding:.28rem .4rem;font-size:13px}
+.lenspick{display:inline-flex;border:1px solid var(--line);border-radius:var(--rs);overflow:hidden}
+.lenspick button{border:none;border-radius:0;padding:.34rem .72rem;font-size:13px;background:var(--card)}
+.lenspick button+button{border-left:1px solid var(--line)}
+.lenspick button.on{background:var(--blue);color:#fff}
+
+/* ==== year lens: 12-cell verdict grid ==== */
+.ygrid{display:grid;grid-template-columns:repeat(4,1fr);gap:.7rem;margin-top:1rem}
+@media(max-width:860px){.ygrid{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:560px){.ygrid{grid-template-columns:repeat(2,1fr)}}
+.ycell{background:var(--card);border:1px solid var(--line);border-radius:var(--r);
+       padding:.65rem .75rem;text-align:left;box-shadow:var(--shadow);display:block}
+.ycell:not(:disabled):hover{background:var(--hover)}
+.ycell:disabled{opacity:.5;cursor:default}
+h2{font-size:1.05rem;margin:1.4rem 0 .6rem;letter-spacing:-.01em}
+.card h2:first-child{margin-top:0}
+.grid{display:grid;gap:1rem}
+.grid2,.cols2{grid-template-columns:1fr 1fr}
+.cols3{grid-template-columns:repeat(3,1fr)}
+.cols4{grid-template-columns:repeat(4,1fr)}
+.grid2{display:grid;gap:1rem;margin-top:1rem}
+.grid2 .card,.grid .card{margin-top:0}
+.grid{margin-top:1rem}
+@media(max-width:1000px){.cols4{grid-template-columns:1fr 1fr}}
+@media(max-width:800px){.grid2,.cols2,.cols3,.cols4{grid-template-columns:1fr}}
+
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);
+      padding:1.05rem 1.15rem;box-shadow:var(--shadow);margin-top:1rem;
+      overflow-x:auto}  /* wide tables scroll inside the card, never the page */
+.kpi{font-size:2rem;font-weight:700;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.kpi.sm{font-size:1.4rem}
+/* the Today/lens hero: the page's ONE big number */
+.hero-remaining{font-size:2.3rem;font-weight:700;letter-spacing:-.02em;
+  font-variant-numeric:tabular-nums;line-height:1.2}
+/* ==== Today hero: verdict sentence, the
+   left-to-spend-today tiles with per-tile daily notes, merchant chips ==== */
+.hero-verdict{display:flex;align-items:baseline;gap:.65rem;flex-wrap:wrap}
+.hv-state{font-size:21px;font-weight:800;letter-spacing:-.01em}
+.hv-delta{font-size:15px;font-variant-numeric:tabular-nums}
+.hv-month{margin-left:auto;font-variant-numeric:tabular-nums}
+.hv-month b{color:var(--ink);font-weight:600}
+.hv-month b.neg{color:var(--red)}
+.hero-todaylbl{letter-spacing:.08em;text-transform:uppercase;
+  font-size:11.5px;margin:1rem 0 .45rem}
+.hero-tiles{display:grid;gap:.6rem;
+  grid-template-columns:repeat(auto-fit,minmax(190px,1fr))}
+.htile{background:var(--hover);border:1px solid var(--line);
+  border-radius:var(--rs);padding:.65rem .8rem .7rem}
+.htile-big{font-size:26px;font-weight:750;letter-spacing:-.015em;
+  line-height:1.1;font-variant-numeric:tabular-nums}
+.htile-sub{font-size:12px;margin-top:.1rem}
+.htile-meter{display:block;margin-top:.5rem;height:6px;min-width:0}
+.hero-hold{margin:.6rem 0 0;font-size:13px;color:var(--mut)}
+.hero-why{margin-top:.9rem;padding-top:.75rem;
+  border-top:1px solid var(--line);display:flex;flex-direction:column;
+  gap:.4rem}
+.hw-line{display:flex;gap:.5rem;flex-wrap:wrap;align-items:baseline}
+.hw-k{color:var(--red);font-weight:700;font-size:13px;white-space:nowrap}
+.hw-chips{display:flex;gap:.35rem;flex-wrap:wrap;min-width:0}
+.hw-chip{background:var(--hover);border:1px solid var(--line);
+  border-radius:999px;padding:.12rem .6rem;font-size:12.5px;
+  white-space:nowrap;max-width:15rem;overflow:hidden;
+  text-overflow:ellipsis;font-variant-numeric:tabular-nums}
+.hw-more{font-size:13px;color:var(--mut)}
+.hw-more summary{cursor:pointer;color:var(--blue);font-size:12.5px;
+  list-style:none;display:inline}
+.hw-more[open] summary{display:block;margin-bottom:.3rem}
+.hero-watch{display:flex;gap:.5rem;align-items:baseline;font-size:13px;
+  color:var(--mut);margin-top:.6rem;border-top:1px solid var(--line);
+  padding-top:.55rem}
+.hero-watch .wdot{width:8px;height:8px;border-radius:50%;flex:0 0 auto;
+  background:var(--amber)}
+.hero-watch.bad{color:var(--red)}
+.hero-watch.bad .wdot{background:var(--red)}
+.mut{color:var(--mut)} .sub{color:var(--mut);font-size:13px}
+.pos{color:var(--green)} .neg{color:var(--red)}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+
+/* ==== tables (dense rows + quiet headers) ==== */
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{text-align:left;padding:.48rem .55rem;border-bottom:1px solid var(--line)}
+th{color:var(--mut);font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.055em}
+tbody tr{transition:background .12s}
+tbody tr:hover{background:rgba(255,255,255,.022)}
+tbody tr:last-child td{border-bottom:none}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+td a{text-decoration:none;border-bottom:1px solid rgba(139,152,163,.35)}
+td a:hover{border-bottom-color:var(--ink)}
+/* per-row chrome stays compact inside tables */
+table button,table .btn{padding:.15rem .5rem;font-size:12.5px}
+table input:not([type="checkbox"]){padding:.15rem .3rem;font-size:12.5px}
+table select{padding:.15rem .3rem;font-size:12.5px}
+table .pill{font-size:11px;padding:.08rem .42rem;white-space:nowrap}
+
+.pill{display:inline-block;padding:.13rem .55rem;border-radius:999px;font-size:11.5px;font-weight:600;line-height:1.5}
+.pill.g{background:rgba(92,181,107,.16);color:var(--green)} .pill.a{background:rgba(240,180,41,.16);color:var(--amber)}
+.pill.r{background:rgba(224,105,93,.16);color:var(--red)} .pill.m{background:rgba(139,152,163,.16);color:var(--mut)}
+.pill.b{background:rgba(79,155,214,.16);color:var(--blue)}
+/* a business ENTITY's own money (its account, or an assigned equity
+   movement) — named after the business, in a hue no other pill uses,
+   so it never reads as the blue Schedule C `biz` tag on a household row */
+.pill.e{background:rgba(160,120,220,.18);color:var(--entity)}
+/* the row detail (under ⋯): the aggregator's facts + the category's why */
+.txn-detail{padding:.2rem .1rem .55rem;font-size:12.5px}
+.txn-facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(15rem,1fr));gap:.3rem 1.2rem}
+.txn-facts .k{display:block;color:var(--mut);font-size:10.5px;text-transform:uppercase;letter-spacing:.05em}
+.txn-facts .v{display:block;color:var(--ink);overflow-wrap:anywhere}
+/* key/value list inside a detail panel (merchant details) */
+.txn-detail dl.kv{display:grid;grid-template-columns:max-content 1fr;gap:.15rem .8rem;margin:0}
+.txn-detail dl.kv dt{color:var(--mut);font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;align-self:baseline}
+.txn-detail dl.kv dd{margin:0;overflow-wrap:anywhere}
+.txn-why{margin-top:.5rem;border-left:3px solid var(--blue);padding:.3rem .6rem;
+  background:rgba(79,155,214,.08);border-radius:4px;color:var(--ink)}
+
+/* business-expense toggle: hover-revealed on desktop, always on when set */
+.biz-toggle{margin-left:6px;font-size:11px;padding:0 6px;min-height:0;border-radius:999px;
+     border:1px solid var(--line);background:transparent;color:var(--mut);cursor:pointer;
+     opacity:0;transition:opacity .1s}
+tr:hover .biz-toggle{opacity:1}
+.biz-toggle.on{opacity:1;border-color:rgba(79,155,214,.5);color:var(--blue);background:rgba(79,155,214,.12)}
+table .biz-toggle{padding:0 6px;font-size:11px}
+
+button,.btn{font:inherit;border:1px solid var(--line);background:var(--card);border-radius:var(--rs);
+     padding:.42rem .8rem;cursor:pointer;color:var(--ink);text-decoration:none;
+     display:inline-block;
+     transition:background .15s,border-color .15s,transform .06s}
+button:hover,.btn:hover{background:var(--hover);border-color:#3a4552;text-decoration:none}
+button:active,.btn:active{transform:translateY(1px)}
+button.pri,.btn.pri{background:var(--blue);color:#fff;border-color:var(--blue)}
+button.pri:hover,.btn.pri:hover{background:#5ea8e0;border-color:#5ea8e0}
+button:disabled{opacity:.55;cursor:default}
+input,select{font:inherit;border:1px solid var(--line);border-radius:var(--rs);padding:.4rem .6rem;
+     background:var(--card);color:var(--ink);transition:border-color .15s,box-shadow .15s}
+input:focus,select:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(79,155,214,.18);outline:none}
+/* Chromium drops its color-scheme-dark popup rendering whenever the select
+   itself carries an author background — even `transparent` (the table
+   category dropdown) — and paints the options on white. Style the options
+   explicitly so every popup follows the theme regardless of select styling. */
+select option,select optgroup{background:var(--card);color:var(--ink)}
+textarea{width:100%;font:13px ui-monospace,Menlo,monospace;border:1px solid var(--line);
+     border-radius:var(--rs);padding:.7rem;background:var(--card);color:var(--ink)}
+textarea:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(79,155,214,.18);outline:none}
+input[type="file"]::file-selector-button{font:inherit;font-size:13px;border:1px solid var(--line);
+     background:var(--hover);color:var(--ink);border-radius:var(--rs);
+     padding:.25rem .7rem;margin-right:.6rem;cursor:pointer}
+
+.note{background:rgba(240,180,41,.10);border:1px solid rgba(240,180,41,.28);color:#e6c874;
+      border-radius:10px;padding:.55rem .75rem;font-size:13px;margin:.5rem 0;
+      display:flex;gap:.5rem;align-items:baseline}
+.note.bad{border-color:rgba(224,105,93,.4);background:rgba(224,105,93,.1);color:var(--red)}
+.note.info{border-color:var(--line);background:var(--card);color:var(--mut)}
+.note.good{border-color:rgba(92,181,107,.35);background:rgba(92,181,107,.1);color:var(--green)}
+.note .dismiss{background:none;border:none;color:inherit;cursor:pointer;
+               font-size:1rem;padding:0 .2rem;opacity:.6}
+.note .dismiss:hover{opacity:1;background:none}
+
+/* App-wide banners (demo countdown, operator broadcast, reboot countdown,
+   bounced email, verify-your-address): siblings of <main> inside .shell,
+   above every route. Each carried its geometry inline as
+   margin:.6rem auto 0 + max-width:72rem — a hand copy of main's content
+   column, correct only for the layout main had before the icon rail. It is a
+   class now because the rail block below has to move these WITH main, and
+   five inline copies of a number is exactly how they got left behind. */
+.topnote{margin:.6rem auto 0;max-width:72rem}
+
+/* ==== charts (donut / ranked bars / axis) ==== */
+.ax{color:var(--mut);font-size:11px}
+.cgrid{stroke:var(--line)}
+.donut{display:flex;gap:1rem;align-items:center;flex-wrap:wrap}
+.dc-t{font-size:15px;font-weight:700;fill:var(--ink)} .dc-s{font-size:10px;fill:var(--mut)}
+.legend{font-size:13px;display:flex;flex-direction:column;gap:.2rem}
+.lg{white-space:nowrap} .lg .mut{margin-left:.2rem}
+.sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:.4rem;vertical-align:middle}
+.barlist{display:flex;flex-direction:column;gap:.3rem}
+.barrow{display:grid;grid-template-columns:170px 1fr 90px;align-items:center;gap:.6rem;font-size:13px}
+.barrow .bartrack{background:var(--bg);border-radius:5px;height:16px;overflow:hidden;position:static}
+.barrow .barfill{height:100%;border-radius:5px}
+.barlbl{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.barval{text-align:right;font-variant-numeric:tabular-nums}
+/* ledger-fit action line (recurring history) */
+.fitline .btn{margin-left:.6rem}
+
+/* ==== bullet bars (shared with the daily email's today_body) ==== */
+.bartrack{background:var(--hover);border-radius:7px;height:14px;overflow:hidden;position:relative}
+.barfill{height:100%;border-radius:0}
+/* the "today" post tick — one marker style on every bar with a pace:
+   a 2px ink line overshooting the track 3px top and bottom. Position
+   with left:<pace>% inside a position:relative wrapper AROUND the track
+   (tracks clip their fill with overflow:hidden, so the tick sits beside
+   the track, not in it). */
+.bartick{position:absolute;top:-3px;bottom:-3px;width:2px;border-radius:1px;background:var(--ink);transform:translateX(-50%);pointer-events:none}
+.barindent{margin-left:1.5rem;border-left:2px solid var(--line);padding-left:.75rem}
+
+.centered{min-height:100vh;display:flex;align-items:center;justify-content:center}
+.centered .card{margin-top:0}
+
+/* page-header row (title + actions) */
+.row-head{display:flex;align-items:center;gap:1rem;margin-bottom:1rem;flex-wrap:wrap}
+.row-head h1{margin:0;flex:1}
+
+/* forms */
+.num-input{width:6.5rem;text-align:right}
+.inline-form{display:flex;gap:.6rem;flex-wrap:wrap;align-items:center}
+.inline-form input{flex:1;min-width:12rem}
+.field-grid{display:grid;gap:.8rem;max-width:34rem}
+.field-grid label{display:block;font-size:14px}
+.field-grid label input:not([type="checkbox"]),.field-grid label select{display:block;width:100%;margin-top:.25rem}
+.field-grid .check{display:flex;gap:.5rem;align-items:baseline}
+
+/* reimburse matcher */
+.matcher{padding:.4rem 0 .6rem}
+.matcher input[type="checkbox"]{width:1.05rem;height:1.05rem;accent-color:var(--blue)}
+
+/* upcoming calendar (SPA-only, same tokens) */
+.cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:2px;overflow-x:auto}
+.cal-head{font-size:11.5px;color:var(--mut);text-align:center;padding:.2rem 0;
+          text-transform:uppercase;letter-spacing:.055em;font-weight:600}
+.cal-cell{min-height:4.2rem;background:var(--bg);border:1px solid var(--line);border-radius:6px;
+          padding:.25rem .35rem;display:flex;flex-direction:column;gap:1px;overflow:hidden}
+.cal-cell.past{opacity:.35}
+.cal-cell.today{outline:1px solid var(--blue)}
+.cal-day{font-size:11px;color:var(--mut)}
+.cal-amt{font-size:13px;font-weight:700;font-variant-numeric:tabular-nums}
+.cal-amt.out{color:var(--red)}
+.cal-amt.in{color:var(--green)}
+.cal-label{font-size:10.5px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* onboarding checklist */
+.onboard-step{display:flex;gap:.8rem;align-items:flex-start;padding:.55rem 0;border-top:1px solid var(--line)}
+.onboard-mark{width:1.6rem;height:1.6rem;border-radius:50%;display:flex;align-items:center;
+              justify-content:center;background:var(--hover);color:var(--mut);
+              font-size:13px;font-weight:700;flex-shrink:0}
+.onboard-mark.done{background:rgba(92,181,107,.18);color:var(--green)}
+.btn-link{align-self:center;white-space:nowrap;color:var(--blue);text-decoration:none}
+.btn-link:hover{text-decoration:underline}
+
+/* ==== responsive ==== */
+@media(max-width:1100px){.hide-t{display:none!important}}
+@media(max-width:760px){
+  /* nav moves to the bottom bar — the top line spans the full width */
+  .bar{grid-template-columns:1fr}
+  .bar{flex-wrap:nowrap;padding:.4rem .5rem;gap:.2rem;justify-content:flex-end}
+  /* the translucent blur chrome reads as CLUTTER on phones — mobile
+     browsers that skip backdrop-filter leave scrolled rows legible straight
+     through both bars. Opaque on mobile; the blur treatment stays
+     desktop-only. */
+  header.top,.settings-nav{background:var(--card);
+      backdrop-filter:none;-webkit-backdrop-filter:none}
+  /* ==== the nav as a drawer ====
+     The rail's reveal is :hover, and a touch screen has no hover, so the
+     same <nav> is parked off the left edge and slides in behind ☰ — the
+     rail's OPEN state, permanently expanded, because once the panel is on
+     screen there is nothing left to gain from hiding the labels. Nine
+     destinations as a horizontal strip needed a scroller and edge fades to
+     hint at the ones off-screen; a vertical panel just shows all nine. */
+  .navtoggle{display:inline-flex;align-items:center;justify-content:center;
+      flex:0 0 auto;width:2.5rem;height:2.5rem;min-width:2.5rem;min-height:0;
+      padding:0;margin-left:-.35rem;background:none;border:0;
+      color:var(--ink);border-radius:var(--rs);cursor:pointer}
+  .navtoggle:hover{background:var(--hover)}
+  nav{position:fixed;left:0;top:0;bottom:0;z-index:40;
+      width:min(80vw,17.5rem);display:flex;flex-direction:column;
+      align-items:stretch;gap:0;background:var(--card);
+      border-right:1px solid var(--line);
+      box-shadow:14px 0 34px -18px rgba(0,0,0,.75);
+      padding:env(safe-area-inset-top) 0
+              calc(.7rem + env(safe-area-inset-bottom)) env(safe-area-inset-left);
+      overflow-y:auto;
+      /* the drawer's own scroll must not chain to the page behind it —
+         without this, flicking past the last item scrolls the content
+         under the scrim and leaves the drawer floating over a page that
+         moved for no reason the user can see */
+      overscroll-behavior:contain;
+      transform:translateX(-100%);
+      /* CLOSED means out of the tab order too. A panel parked off-screen
+         still holds eleven focusable controls, and tabbing from the ☰ into
+         destinations nobody can see is worse than having no drawer at all.
+         visibility is what removes them; it is delayed by the length of the
+         transform so the slide OUT is still watched rather than blinking. */
+      visibility:hidden;transition:transform .18s ease,visibility 0s .18s}
+  .shell.drawer-open nav{transform:none;visibility:visible;
+      transition:transform .18s ease,visibility 0s}
+  .navscrim{position:fixed;inset:0;z-index:39;background:rgba(0,0,0,.5);
+      -webkit-tap-highlight-color:transparent}
+  /* min-width:0 is load-bearing, and it is why the header once overflowed
+     818px wide out of a 670px .bar with the brand at x=-155: a grid item
+     keeps its min-content width unless told it may shrink, which inflates
+     .bar's single track past the viewport and drags the whole header left.
+     Still true with the drawer — .rt's contents are the wide row now. */
+  .topline{min-width:0}
+  .rt{flex:0 0 auto;min-width:0}
+  .drawer-head{display:flex;align-items:center;gap:.5rem;flex:0 0 auto;
+      padding:.55rem .5rem .55rem .85rem;margin-bottom:.2rem;
+      border-bottom:1px solid var(--line)}
+  .drawer-brand{flex:1 1 auto;min-width:0;display:flex;align-items:center;
+      gap:.55rem;font-weight:700;color:var(--blue);text-decoration:none;
+      overflow:hidden;white-space:nowrap}
+  .drawer-brand img{flex:0 0 auto;display:block}
+  .drawer-close{flex:0 0 auto;display:grid;place-items:center;
+      width:2.3rem;height:2.3rem;min-width:2.3rem;min-height:0;padding:0;
+      background:none;border:0;color:var(--mut);border-radius:var(--rs);
+      cursor:pointer}
+  .drawer-close:hover{background:var(--hover);color:var(--ink)}
+  .navscroll{display:flex;flex-direction:column;align-items:stretch;
+      gap:.1rem;width:100%;min-width:0;padding:.2rem .5rem}
+  /* the icons are the point — this is the same nav as the desktop rail, and
+     it is the glyphs that make that legible at a glance rather than the
+     wording, which is identical to the strip the drawer replaced */
+  .nav-i{flex:0 0 auto;display:grid;place-items:center;width:22px;height:22px;
+      color:var(--blue)}
+  nav a{display:flex;align-items:center;gap:.75rem;width:100%;min-width:0;
+      overflow:hidden;padding:.68rem .6rem;font-size:15px;
+      border-radius:var(--rs);white-space:nowrap}
+  nav a.on .nav-i{color:#fff}
+  /* the labels are always up on a phone: nothing here reveals them */
+  .nav-t{opacity:1;flex:1 1 auto;min-width:0;overflow:hidden;
+      text-overflow:ellipsis}
+  .navsep{width:auto;height:1px;margin:.45rem .6rem;background:var(--line)}
+  /* nothing to pin — the drawer is never resident */
+  .rail-pin{display:none}
+  @media (prefers-reduced-motion:reduce){
+    nav{transition:visibility 0s .01s}
+    .shell.drawer-open nav{transition:visibility 0s}
+  }
+  main{margin:.6rem auto;padding:0 .55rem .8rem}
+  h1{font-size:1.2rem;margin:.25rem 0 .65rem}
+  .grid2{gap:.65rem;margin-top:.65rem}
+  .card{padding:.85rem .8rem;border-radius:var(--r);margin-top:.65rem}
+  .kpi{font-size:1.55rem} .kpi.sm{font-size:1.2rem}
+  .hero-remaining{font-size:1.7rem}
+  th,td{padding:.42rem .45rem}
+  /* touch targets + no iOS focus-zoom (16px inputs) */
+  input,select{font-size:16px;padding:.55rem .6rem;min-height:2.6rem}
+  button,.btn{padding:.55rem .8rem;min-height:2.6rem;min-width:2.6rem;font-size:15px}
+  /* icon-only chrome that would otherwise measure under 32px */
+  .note .dismiss{padding:0 .55rem;min-width:2.2rem;min-height:2.2rem}
+  .lensctl>button{min-width:2.6rem}
+  .clip-btn{padding:.3rem .5rem}
+  /* in-table controls stay compact, but not sub-20px: give them a real
+     touch height without desktop-table density loss */
+  table button,table .btn{min-height:1.8rem;min-width:1.8rem;padding:.28rem .6rem;font-size:13px}
+  table input:not([type="checkbox"]),table select{min-height:1.8rem;font-size:13px;padding:.15rem .3rem}
+  /* row links (merchant names, ✎ edit) get an invisible hit-area bump.
+     The underline must hug the TEXT, not the padded hit box — the
+     border-bottom variant painted button-like bars under every link */
+  /* vertical-only bump: horizontal negative margins make adjacent links'
+     hit boxes overlap each other, which is tap ambiguity */
+  td a{display:inline-block;padding:.2rem .1rem;margin:-.2rem 0;
+       border-bottom:none;text-decoration:underline;
+       text-decoration-color:rgba(139,152,163,.45);
+       text-underline-offset:3px}
+  td a:hover{border-bottom:none;text-decoration-color:var(--ink)}
+  .pill{font-size:12px;padding:.16rem .6rem}
+  .biz-toggle{opacity:1;min-height:1.5rem;min-width:1.9rem;padding:0 6px;font-size:12px}
+  /* table-layout:fixed + percentage colgroups OVERLAP text at phone widths
+     (no overflow, so scrollWidth audits never see it). On small screens
+     every table
+     falls back to auto layout: auto may squish but can never overlap;
+     the key pages additionally restack their rows entirely. */
+  table{table-layout:auto !important}
+  .hide-m{display:none!important}
+  /* the transactions filter's from/to line: two fixed-width native date
+     inputs are wider than a phone card — let them shrink instead of
+     poking past the card's right edge */
+  .daterange label{display:flex;align-items:center;gap:.3rem;
+      flex:1 1 0;min-width:0}
+  .daterange input[type=date]{width:100%;min-width:0}
+  /* budget planner category rows: the size=16 name input can't shrink, so
+     the row's min-content width pushed the whole Money-out panel past the
+     phone viewport (amount inputs painted off-screen). Let the name flex. */
+  .bp-name{flex:1 1 auto;min-width:0}
+  .bp-name input{flex:1 1 0;width:100%;min-width:0}
+  /* bar rows stack: label + value on one line, the bar full width below */
+  .barrow{grid-template-columns:1fr auto;grid-template-areas:"lbl val" "bar bar";
+      gap:.15rem .5rem;font-size:13px}
+  .barlbl{grid-area:lbl;white-space:normal}
+  .barval{grid-area:val}
+  .barrow .bartrack{grid-area:bar}
+}
+
+.clip-btn{background:none;border:none;cursor:pointer;font-size:15px;padding:.15rem .3rem;line-height:1}
+.clip-btn:hover{opacity:1 !important}
+
+/* ==== settings: section list beside one section's cards ====
+   Supersedes its sticky chip bar. The list is a sticky column that
+   scrolls with nothing — a section's cards are 1–3 screens now, so the list
+   stays put while the body moves. */
+.setpane{display:grid;grid-template-columns:13.5rem minmax(0,1fr);gap:1.5rem;
+  align-items:start}
+.setnav{position:sticky;display:flex;flex-direction:column;gap:.1rem;
+  /* its own scroll if the window is shorter than the list, so the last
+     section is never stranded below the fold with no way to reach it */
+  max-height:calc(100vh - 5rem);overflow-y:auto;overscroll-behavior:contain}
+.setnav a{display:block;padding:.42rem .6rem;border-radius:var(--rs);
+  color:var(--ink);text-decoration:none;transition:background .15s}
+.setnav a:hover{background:var(--hover)}
+.setnav a.on{background:var(--hover);color:var(--blue)}
+/* dimmed = no card in it matched the search; still reachable, because a
+   search you are about to correct should not move the furniture */
+.setnav a.off{opacity:.4}
+.setnav-l{display:block;font-size:14px;font-weight:500}
+.setnav a.on .setnav-l{font-weight:600}
+.setnav-s{display:block;font-size:11.5px;color:var(--mut);margin-top:1px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.settings-filter{font-size:13px;padding:.3rem .55rem;min-height:0;
+  width:100%;margin-bottom:.5rem}
+.setback{display:inline-block;margin-bottom:.6rem;font-size:14px;
+  color:var(--mut);text-decoration:none}
+.setback:hover{color:var(--ink)}
+h2.ssec{margin:0 0 .2rem;padding-left:.55rem;border-left:3px solid var(--blue);
+  font-size:17px}
+/* a second section only exists in search results, where it needs the air */
+.sgrp + .sgrp h2.ssec{margin-top:1.8rem}
+.sgrp > div > .card{margin-top:1rem}
+
+@media(max-width:760px){
+  /* two panes become two screens — see Settings.tsx, which renders one or
+     the other rather than shrinking both */
+  .setpane{grid-template-columns:minmax(0,1fr);gap:0}
+  .setnav{position:static;max-height:none;overflow:visible;gap:.15rem}
+  .setnav a{padding:.62rem .6rem;border-bottom:1px solid var(--line);
+    border-radius:0}
+  .setnav a:last-child{border-bottom:0}
+  .setnav-l{font-size:15px}
+}
+
+/* ==== connect hub: the linked-bank rows (setup step 1 + Accounts) ==== */
+.linked{margin-top:.9rem}
+.linked-hdr{display:flex;align-items:baseline;gap:.6rem;margin-bottom:.4rem}
+.linked-hdr b{font-size:14px}
+.linked-rows{border:1px solid var(--line);border-radius:var(--rs);overflow:hidden}
+.linked-row{display:flex;align-items:center;gap:.8rem;padding:.55rem .8rem;
+  border-top:1px solid var(--line);background:var(--card)}
+.linked-row:first-child{border-top:0}
+.linked-dot{width:9px;height:9px;border-radius:50%;background:var(--green);flex:none;
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--green) 18%,transparent)}
+.linked-dot.bad{background:var(--red);box-shadow:0 0 0 3px color-mix(in srgb,var(--red) 18%,transparent)}
+.linked-name{font-weight:600;flex:1 1 auto;min-width:0}
+.linked-name small{display:block;font-weight:400;color:var(--mut);font-size:12.5px}
+.linked-x{background:transparent;border:1px solid var(--line);color:var(--mut);
+  border-radius:var(--rs);padding:.25rem .6rem;font-size:12px;cursor:pointer}
+.linked-x:hover{color:var(--ink);border-color:var(--mut)}
+
+/* ==== setup wizard step 2: the history-import bar. Determinate fill (how
+   much of the two-year window has landed) + a sweep while the bank is
+   still sending, so an unmoving fill still reads as working. ==== */
+.bf-bar{position:relative;height:6px;border-radius:3px;overflow:hidden;
+  background:var(--hover);margin-top:.15rem}
+.bf-bar.tall{height:10px;border-radius:5px;margin:.6rem 0 .2rem}
+.bf-fill{position:relative;height:100%;border-radius:inherit;
+  background:var(--blue);transition:width 1.6s cubic-bezier(.2,.7,.2,1)}
+.bf-fill.muted{background:var(--amber,#e6b159);opacity:.6}
+.bf-fill.live::after{content:"";position:absolute;inset:0;
+  background:linear-gradient(90deg,transparent 0%,
+    color-mix(in srgb,#fff 45%,transparent) 50%,transparent 100%);
+  transform:translateX(-100%);animation:bf-sweep 1.6s ease-in-out infinite}
+@keyframes bf-sweep{to{transform:translateX(100%)}}
+.bf-tick{color:var(--blue);transition:color .9s ease}
+@media (prefers-reduced-motion:reduce){.bf-fill.live::after{animation:none}}
+
+/* ==== receipt parse: indeterminate progress bar ==== */
+.rcpt-progress{position:relative;height:6px;border-radius:3px;overflow:hidden;
+  background:var(--hover)}
+.rcpt-progress span{position:absolute;top:0;bottom:0;width:35%;
+  border-radius:3px;background:var(--blue);
+  animation:rcpt-slide 1.2s ease-in-out infinite}
+@keyframes rcpt-slide{0%{left:-35%}100%{left:100%}}
+
+/* ==== ledger row chrome ==================================
+   The category select reads as an editable chip rather than plain muted
+   text: a dotted underline and a caret say "you can change this" without a
+   hover tooltip, which a touch device never shows. Still a native select. */
+.cat-chip{font-size:12px;padding:0 .9rem 0 0;background:transparent;
+  border:none;color:var(--mut);max-width:11rem;cursor:pointer;
+  border-bottom:1px dotted var(--mut);border-radius:0;
+  -webkit-appearance:none;appearance:none;
+  background-image:linear-gradient(45deg,transparent 50%,var(--mut) 50%),
+                   linear-gradient(135deg,var(--mut) 50%,transparent 50%);
+  background-position:calc(100% - 8px) center,calc(100% - 4px) center;
+  background-size:4px 4px,4px 4px;background-repeat:no-repeat}
+.cat-chip:hover,.cat-chip:focus{color:var(--ink);
+  border-bottom-color:var(--ink)}
+/* one control per row, in place of the three that used to sit on every one */
+.row-menu{border:none;background:none;color:var(--mut);cursor:pointer;
+  border-radius:var(--rs);min-width:2.2rem;min-height:2.2rem;font-weight:700;
+  line-height:1;font-size:15px}
+.row-menu:hover{background:var(--hover);color:var(--ink)}
+/* the strip ⋯ opens: every row-level action, named in words. This is the
+   touch equivalent for affordances that can only explain themselves in a
+   hover tooltip, which a phone never shows. */
+.row-actions{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;
+  padding:.5rem .2rem}
+.row-actions button,.row-actions .btn{font-size:12.5px;padding:.32rem .7rem}
+
+/* ==== TxnTable — restack ledger rows into two-line cards on
+   phones. Desktop is untouched (everything lives behind this query).
+   Scoped under .txn-table (TxnTable.tsx) so other tables can't inherit. ==== */
+@media(max-width:620px){
+  /* headers are redundant once rows are cards: date/amount/merchant are
+     self-evident, the category select shows its value, 📎 is iconic */
+  .txn-table thead{display:none}
+  .txn-table tr{
+    display:grid;
+    /* line 1: date · merchant+pills (the ONE flexible track — minmax(0,1fr)
+       lets long merchant names wrap instead of blowing the grid) · amount
+       line 2: category chip (spans left)
+       ⋯ spans both rows on the right: one target for the whole row, which
+       is what it now is — it replaced the per-row trio) */
+    grid-template-columns:max-content minmax(0,1fr) max-content max-content;
+    grid-template-areas:
+      "date merch amt  clip"
+      "cat  cat   cat  clip";
+    align-items:baseline;
+    column-gap:.55rem;row-gap:.2rem;
+    padding:.55rem .1rem;
+    /* the row separator moves from the tds to the card */
+    border-bottom:1px solid var(--line);
+  }
+  .txn-table tbody tr:last-child{border-bottom:none}
+  .txn-table td{border-bottom:none;padding:0}
+  .txn-table .c-date{grid-area:date;font-size:12px}
+  .txn-table .c-merch{grid-area:merch}
+  .txn-table .c-amt{grid-area:amt;font-weight:600}
+  /* !important beats the td's inline whiteSpace:nowrap (harmless for the
+     owner select, needed so the viewer's plain-text category can wrap) */
+  .txn-table .c-cat{grid-area:cat;white-space:normal!important;align-self:center}
+  /* !important beats the cells' inline width:1% — as a grid item that
+     resolves to a ~4px box and the 40px target spills PAST the row's right
+     edge as clipped crescent slivers */
+  .txn-table .c-clip{grid-area:clip;justify-self:end;align-self:center;
+      width:auto!important}
+  .txn-table .row-menu{min-height:2.75rem;min-width:2.75rem}
+  .txn-table .c-date{width:auto!important}
+  /* account column is hide-m (display:none) at this width — grid-area kept
+     only so the showAccount=true shape stays declared, not auto-placed */
+  .txn-table .c-acct{grid-area:cat}
+  /* the recategorize select owns line 2: full width (its inline
+     maxWidth:11rem needs !important) + a real 40px touch target */
+  .txn-table .c-cat select{width:100%;max-width:none!important;min-height:2.5rem}
+  .txn-table .clip-btn{min-height:2.5rem;min-width:2.5rem}
+  /* biz toggle stays visually pill-sized (a 40px pill would double the
+     merchant line) — an invisible ::after halo supplies the touch target */
+  .txn-table .biz-toggle{position:relative}
+  .txn-table .biz-toggle::after{content:"";position:absolute;inset:-9px}
+  /* expander row (ReceiptPanel host): opt out of the card grid entirely
+     so the colSpan cell spans the full width and keeps working */
+  .txn-table tr.tr-expand{display:block;padding:0}
+  .txn-table tr.tr-expand td{display:block;padding:.55rem .1rem}
+}
+
+
+/* ==== day dividers on the ledger (TxnTable dayGroups) — a band before
+   each day carrying the day's spend. Styled as the table's own column
+   headers are (uppercase, muted, on --hover) so it reads as structure
+   rather than as another row of data. ==== */
+.txn-table tr.dayhead td{background:var(--hover);padding:.32rem .55rem}
+/* the row-hover tint means "this is a thing you can act on", which a
+   divider is not */
+.txn-table tbody tr.dayhead:hover{background:transparent}
+.dayhead-in{display:flex;justify-content:space-between;align-items:baseline;gap:1rem}
+.dayhead-l{color:var(--mut);font-size:11px;text-transform:uppercase;
+     letter-spacing:.055em;font-weight:600}
+.dayhead-r{color:var(--mut);font-size:12px;font-variant-numeric:tabular-nums}
+.dayhead-r b{color:var(--ink);font-weight:600}
+@media(max-width:620px){
+  /* opt out of the card grid the way the expander row does, so the
+     colSpan cell spans the full width instead of being placed into
+     "date merch amt clip" */
+  .txn-table tr.dayhead{display:block;padding:0;border-bottom:none}
+  .txn-table tr.dayhead td{display:block}
+  /* the count is the half that survives at phone width — the spend is
+     the point, and two items justified apart on a narrow screen collide */
+  .dayhead-in{gap:.6rem}
+}
+
+/* ==== Today's cash timeline — restack rows into two-line cards on
+   phones (the TxnTable pattern). The desktop table's nowrap/ellipsis
+   cells squeeze the Event column to nothing at phone widths; stacked,
+   the label gets the full line and wraps. Scoped under .cash-tl
+   (Today.tsx) so other tables can't inherit. ==== */
+@media(max-width:620px){
+  /* headers are redundant once rows are cards: date/amount are
+     self-evident and the balance sits mut under the amount */
+  .cash-tl thead{display:none}
+  .cash-tl tr{
+    display:grid;
+    /* line 1: date · label (the ONE flexible track — minmax(0,1fr) lets
+       long event labels wrap instead of blowing the grid) · amount
+       line 2: the running balance, small and mut, under the amount
+       (rows before TODAY carry the same · placeholder as desktop) */
+    grid-template-columns:max-content minmax(0,1fr) max-content;
+    grid-template-areas:
+      "date label amt"
+      "date label bal";
+    align-items:baseline;
+    column-gap:.55rem;row-gap:.05rem;
+    padding:.45rem .1rem;
+    /* the row separator moves from the tds to the card */
+    border-bottom:1px solid var(--line);
+  }
+  .cash-tl tbody tr:last-child{border-bottom:none}
+  .cash-tl td{border-bottom:none;padding:0}
+  /* !important beats the tds' inline width:1% / nowrap-ellipsis */
+  .cash-tl .c-date{grid-area:date;font-size:12px;width:auto!important}
+  .cash-tl .c-label{grid-area:label;white-space:normal!important;
+      overflow:visible!important;text-overflow:clip!important}
+  .cash-tl .c-amt{grid-area:amt;font-weight:600}
+  .cash-tl .c-bal{grid-area:bal;font-size:12px}
+  /* the TODAY divider row (colSpan): opt out of the card grid entirely
+     so the spanning cell keeps working */
+  .cash-tl tr.tr-today{display:block;padding:0;border-bottom:none}
+  .cash-tl tr.tr-today td{display:block;padding:.3rem .1rem}
+}
+
+/* ==== Bills =============================================
+   Thin group separators replace a card-with-its-own-thead per cadence, and
+   the envelope pool renders as progress in the money map's language rather
+   than restating its own cap three times across a row. */
+.bills-table tr.grp td{padding:.9rem .5rem .15rem;font-size:13px;
+  font-weight:700;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--ink);border-bottom:1px solid var(--line)}
+/* rows sit a step inside their cadence heading, so heading vs bill reads
+   from the left edge, not just from type weight; phones restack instead */
+@media(min-width:621px){
+  .bills-table.grouped .billrow .c-name{padding-left:1.35rem}
+}
+.envbar{position:relative;display:block;height:10px;min-width:6rem;
+  background:var(--hover);border-radius:5px;overflow:hidden}
+.envbar>i{position:absolute;inset:0 auto 0 0;background:var(--green);
+  border-radius:5px}
+.envbar>i.over{background:var(--red)}
+.envbar>i.soon{background:var(--amber)}
+.cycle-cell{display:flex;align-items:center;gap:.5rem}.cycle-cell .envbar{flex:1}
+.cycle-words{font-size:12px;white-space:nowrap;font-variant-numeric:tabular-nums;min-width:5.2rem}
+.cycle-words.g{color:var(--green)}.cycle-words.a{color:var(--amber)}.cycle-words.r{color:var(--red)}
+@media(min-width:621px){.bills-table .cycle-dup{display:none}}
+@media(max-width:620px){
+  .bills-table tr.grp{display:block;padding:.7rem 0 0}
+  .bills-table tr.grp td{display:block;border-bottom:none}
+  .bills-table .row-menu{min-height:2.75rem;min-width:2.75rem}
+}
+
+/* ==== Bills page (<=620px): restack rows into two-line cards ============
+   Desktop keeps the shared fixed colgroup x-grid; on phones those fixed
+   percentage columns overlap ("$25.007/21/26awaiting"), so each row becomes
+   a small grid: line 1 = name (+state) · amount, line 2 = meta · edit. */
+@media(max-width:620px){
+  /* the table stops being a table: rows lay themselves out */
+  .bills-table,.bills-table tbody,
+  .bills-props,.bills-props tbody,
+  .bills-arch,.bills-arch tbody{display:block;width:100%}
+  .bills-table thead,.bills-props thead,.bills-arch thead,
+  .bills-table colgroup{display:none}
+  .bills-table td,.bills-props td,.bills-arch td{padding:.05rem 0;border:0}
+  .bills-table tbody tr+tr,.bills-props tbody tr+tr,.bills-arch tbody tr+tr{
+    border-top:1px solid var(--line)}
+
+  /* the stacked layout carries columns the squeezed table had to hide —
+     bring the .hide-m cells/pills back, scoped to these tables only */
+  .bills-table td.hide-m,.bills-props td.hide-m,.bills-arch td.hide-m{
+    display:block!important}
+  .bills-table span.hide-m,.bills-table button.hide-m{
+    display:inline-block!important}
+
+  /* --- cadence-group rows -------------------------------------------- */
+  /* line 1: name … state · amount(right); line 2: due · paid · health · edit */
+  /* State and Health merged into one cell, and the row-level
+     disable button went into the ✎ expander, so the second line is now
+     due · status with ✎ spanning both rows as the row's one target. */
+  .bills-table tr.billrow{display:grid;align-items:center;
+    gap:.15rem .55rem;padding:.5rem .1rem;
+    grid-template-columns:minmax(0,1fr) auto auto;
+    grid-template-areas:"name amt act" "due state act"}
+  /* envelopes swap the due date for the pool bar */
+  .bills-table tr.billrow.env{
+    grid-template-areas:"name amt act" "used state act"}
+  .bills-table .c-name{grid-area:name;min-width:0;padding-right:.3rem}
+  .bills-table .c-name a{max-width:100%;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom}
+  .bills-table .c-amt{grid-area:amt;justify-self:end}
+  .bills-table .c-due{grid-area:due}
+  .bills-table .c-paid{grid-area:paid}
+  .bills-table .c-used{grid-area:used;min-width:0}
+  /* the cycle bar is a desktop glance; stacked rows already say "in N days" */
+  .bills-table td.c-cycle{display:none}
+  .bills-table .c-chgs{grid-area:chgs}
+  .bills-table .c-state{grid-area:state;justify-self:start;
+    /* inline nowrap+hidden clips pills once they're grid items */
+    white-space:normal!important;overflow:visible!important}
+  .bills-table .c-act{grid-area:act;justify-self:end;
+    white-space:normal!important}
+  /* headers are gone — bare numbers/dates get a tiny inline label */
+  .bills-table .c-due::before,.bills-table .c-paid::before,
+  .bills-table .c-chgs::before{
+    color:var(--mut);font-size:11px;font-variant-numeric:normal}
+  .bills-table .c-due::before{content:"due "}
+  .bills-table .c-paid::before{content:"paid "}
+  .bills-table .c-chgs::before{content:"chgs "}
+
+  /* inline edit row (colSpan) spans the card and keeps its flex form */
+  .bills-table tr.editrow{display:block;border-top:0}
+  .bills-table tr.editrow>td{display:block;padding:.5rem .4rem}
+
+  /* --- proposals ------------------------------------------------------ */
+  .bills-props tr{display:grid;align-items:center;
+    gap:.1rem .5rem;padding:.5rem .1rem;
+    grid-template-columns:auto minmax(0,1fr) auto;
+    grid-template-areas:"payee payee amt" "kind cad look" "ev ev ev" "act act act"}
+  .bills-props .c-payee{grid-area:payee;min-width:0}
+  .bills-props .c-amt{grid-area:amt;justify-self:end}
+  .bills-props .c-kind{grid-area:kind}
+  .bills-props .c-cad{grid-area:cad;min-width:0}
+  .bills-props .c-look{grid-area:look;justify-self:end}
+  .bills-props .c-ev{grid-area:ev;min-width:0;font-size:12px}
+  .bills-props .c-act{grid-area:act;justify-self:end}
+
+  /* --- archived ------------------------------------------------------- */
+  .bills-arch tr{display:grid;align-items:center;
+    gap:.1rem .5rem;padding:.5rem .1rem;
+    grid-template-columns:minmax(0,1fr) auto;
+    grid-template-areas:"name amt" "cad arch" "act act"}
+  .bills-arch .c-name{grid-area:name;min-width:0}
+  .bills-arch .c-amt{grid-area:amt;justify-self:end}
+  .bills-arch .c-cad{grid-area:cad}
+  .bills-arch .c-arch{grid-area:arch;justify-self:end}
+  .bills-arch .c-arch::before{content:"archived ";font-size:11px}
+  .bills-arch .c-act{grid-area:act;justify-self:end;white-space:normal!important}
+
+  /* touch targets: in-table controls elsewhere stay 1.8rem-dense; on this
+     stacked layout there is room for the full 40px (2.5rem) */
+  .bills-table button,.bills-table .btn,
+  .bills-props button,.bills-arch button{min-height:2.5rem;min-width:2.5rem}
+  .bills-table .editrow input:not([type="checkbox"]),
+  .bills-table .editrow select{min-height:2.5rem}
+}
+
+/* ==== Accounts page (mobile restack) ==== */
+/* desktop hook only: AcctRow's child-account indent moved from an inline
+   style to this class so the phone layout can shrink it */
+.accts-table td.c-acct.indent{padding-left:4.4rem}
+
+@media(max-width:620px){
+  /* each account row restacks: line 1 = dot/sync + name (+✎) · balance
+     right; line 2 = pills. Headers are redundant once stacked. */
+  .accts-table thead{display:none}
+  .accts-table tr{display:grid;grid-template-columns:minmax(0,1fr) max-content;
+    align-items:start;column-gap:.5rem;border-bottom:1px solid var(--line)}
+  .accts-table tbody tr:last-child{border-bottom:none}
+  /* row border lives on the tr now — per-cell borders would float at
+     different heights once cells stack */
+  .accts-table td{border-bottom:none;min-width:0}
+  .accts-table td.c-acct{grid-column:1}
+  .accts-table td.c-bal{grid-column:2;white-space:nowrap}
+  .accts-table td.c-pad{display:none}
+  .accts-table td.c-acct.indent{padding-left:1.6rem}
+  /* pills/badges (primary, Plaid, fix ↗, run…) become the row's second
+     line instead of wrapping mid-name; empty wrapper adds no height */
+  .accts-table .acct-pills{display:block;margin-top:.3rem}
+  .accts-table .acct-pills:empty{display:none}
+  /* the fixed 3.4em dot+sync box is too tight for a touch-size ↻ */
+  .accts-table .acct-left{width:auto !important;margin-right:.25rem}
+  /* touch targets ≥40px for in-row chrome (sync/run/copy/fix/reconnect) */
+  .accts-table td button{min-height:2.5rem;min-width:2.5rem}
+  /* ✎ rename: invisible hit-area bump, same trick as the 760px td a rule */
+  .accts-table a.acct-edit{display:inline-block;padding:.5rem .55rem;
+    margin:-.4rem -.3rem}
+  /* colSpan rows (✎ edit form) span the whole grid and keep 40px inputs */
+  .accts-table tr.editrow td{grid-column:1 / -1}
+  .accts-table tr.editrow input,
+  .accts-table tr.editrow select{min-height:2.5rem}
+
+  /* Top holdings: acct · value on line 1, symbol tucked below (fund/qty/
+     price are already hide-m — unchanged behavior) */
+  .holds-table thead{display:none}
+  .holds-table tr{display:grid;grid-template-columns:minmax(0,1fr) max-content;
+    grid-template-areas:"acct val" "sym sym";align-items:start;
+    column-gap:.5rem;border-bottom:1px solid var(--line)}
+  .holds-table tbody tr:last-child{border-bottom:none}
+  .holds-table td{border-bottom:none;min-width:0}
+  .holds-table td.c-hacct{grid-area:acct}
+  .holds-table td.c-hval{grid-area:val;white-space:nowrap}
+  .holds-table td.c-hsym{grid-area:sym;padding-top:0}
+}
+
+/* ==== left icon rail ==============================================
+   One <nav> serves two shapes. Desktop: a 74px icon rail pinned to the left
+   that expands to 244px on hover as an OVERLAY — it floats above the page,
+   so nothing reflows and the expansion costs no layout. PINNED, it stops
+   overlaying and takes real width, pushing content right; that state is
+   remembered across sessions. Phone (<=760px): every rule here is scoped
+   inside min-width:761px, so the existing bottom strip is untouched.
+
+   Overlay-by-default is the whole reason this pattern is cheap: the
+   alternative is content jumping sideways every time the pointer crosses
+   the rail. */
+@media(min-width:761px){
+  /* --rail-w is DERIVED, not chosen: .bar's 9.6px padding + the item's
+     8.8px padding + the 22px icon box + the same again = 58.8px, so the
+     icon sits with equal air on both sides. At 74px it left ~34px
+     dead to the RIGHT of every icon against 18.4px on the left, and read
+     as a bar that was too wide rather than an icon that was off-centre. */
+  /* --rail-open here is only the first-paint fallback: App.tsx measures the
+     longest item and overwrites it inline, so the open rail hugs its labels
+     instead of carrying a guessed constant's dead space. */
+  .shell{ --rail-w:58.8px; --rail-open:170px;
+          /* How far the rail pushes the page right — its current LAYOUT
+             width, which is the collapsed one until it is pinned (hovering
+             expands it as an overlay, over the page, so nothing moves).
+             Everything that lines up with the content column reads this:
+             main, .rt, .topnote. It exists because those were three hand
+             copies of the same number, and the banners' copy was written
+             before the rail and never updated. */
+          --col:var(--rail-w);
+          /* .rt is position:fixed, so it occupies no space and everything in
+             the shell starts underneath it. That clearance used to live in
+             main's own margin — which is why the banners rendered ABOVE main
+             were the one thing still sliding under the bar: on the demo, all
+             anyone saw of the reset countdown was a sliver of amber border
+             below the bar. It belongs to the shell, which covers every
+             child, and it is the bar's OWN height rather than a copy of the
+             number, so the two cannot come apart again. */
+          --bar-h:46px; padding-top:var(--bar-h) }
+  .shell.rail-pinned{ --col:var(--rail-open) }
+  header.top{position:fixed;left:0;top:0;bottom:0;width:var(--rail-w);
+      z-index:30;border-right:1px solid var(--line);border-bottom:0;
+      background:var(--card);transition:width .14s ease;overflow:visible;
+      /* …and NO backdrop blur. A filter or backdrop-filter makes an
+         element the containing block for its position:fixed descendants
+         — WebKit implements that, Blink does not — and `.rt` (the top
+         bar) is a descendant of this header. On iPad Safari the bar was
+         therefore laid out inside the 58.8px RAIL instead of the
+         viewport, so the sync chip, the bell, help and the account name
+         piled up on top of the brand in the top-left corner while
+         Chromium at the same width was perfect. The blur bought nothing
+         here anyway: in the rail layout this background is opaque. The
+         phone rule below already drops it, for looks rather than
+         layout. */
+      backdrop-filter:none;-webkit-backdrop-filter:none}
+  /* OPEN. focus-within is NOT optional: an icon-only rail is unusable by
+     keyboard if only the mouse can reveal the labels.
+     A mouse click used to leave focus on the link it activated, so this
+     stayed true long after the pointer had gone and the rail sprang open
+     behind the departing mouse. That is fixed where it starts — App.tsx
+     drops focus on mouse activation — rather than by narrowing this to
+     :focus-visible, which would have made keyboard access depend on both
+     :focus-visible AND :has(), neither of which degrades to anything usable
+     if it is missing. A plain :focus-within is supported everywhere.
+     Written plainly and corrected below, so a browser without :has() still
+     gets a working rail — it just also opens from the top bar, an annoyance
+     rather than a nav that never opens at all. */
+  header.top:is(:hover,:focus-within){width:var(--rail-open);
+      box-shadow:8px 0 24px -14px rgba(0,0,0,.6)}
+  header.top:is(:hover,:focus-within) .nav-t,
+  .shell.rail-pinned .nav-t,
+  header.top:is(:hover,:focus-within) .brand .hide-m,
+  .shell.rail-pinned .brand .hide-m{opacity:1}
+  /* an open rail OVERLAYS the page, this bar included — but .rt is a
+     DESCENDANT of the rail's header, so no z-index can put it under its own
+     ancestor's background. Clip it out from under the open panel instead;
+     the exposed strip reveals the header beneath, which is the rail. Without
+     it the brand read as "O": the label ran under the bar at x=58.8 and the
+     panel's top corner showed the bar's background as a notch.
+     :not(.rail-pinned), like BOTH corrections below already are: pinned,
+     the rail takes real width and .rt starts past it — nothing overlaps, so
+     there is nothing to clip. And because .rt is inside the header, opening
+     the user menu is :focus-within on the header — with this rule live in
+     the pinned state, that clip's 0 BOTTOM inset cut the menu panel off at
+     the bar's own 46px box and the dropdown "went behind the top bar"
+     — pinned plus an open user menu meant an invisible menu. */
+  .shell:not(.rail-pinned) header.top:is(:hover,:focus-within) .rt{
+      clip-path:inset(0 0 0 calc(var(--rail-open) - var(--rail-w)))}
+  .shell.rail-pinned header.top{width:var(--rail-open);box-shadow:none}
+
+  /* CORRECTION 1 — the top bar is not the rail. .rt is a DOM CHILD of this
+     header (it has to be: on phones it sits in the same flex row as the
+     brand), and position:fixed relocates it visually WITHOUT changing where
+     hover and focus bubble to. So pointing anywhere at the bar — sync chip,
+     bell, help, identity, or the gaps between them — read as pointing at the
+     rail and swept it open. Subtract that one descendant rather than listing
+     the ones inside, so the rail's own padding stays live hit area. */
+  .shell:not(.rail-pinned) header.top:has(.rt:is(:hover,:focus-within)){
+      width:var(--rail-w);box-shadow:none}
+  .shell:not(.rail-pinned) header.top:has(.rt:is(:hover,:focus-within)) .nav-t,
+  .shell:not(.rail-pinned) header.top:has(.rt:is(:hover,:focus-within)) .brand .hide-m{opacity:0}
+  .shell:not(.rail-pinned) header.top:has(.rt:is(:hover,:focus-within)) .rt{clip-path:none}
+
+  /* CORRECTION 2 — after a click the pointer is still on the link, so :hover
+     would hold the panel open over the page the click just asked for.
+     .rail-hold suppresses it until the pointer moves away (App.tsx releases
+     by position — NOT on mouseleave, which the collapse itself fires).
+     transition:none is deliberate: this collapse lands on the same frame as
+     the route's render, and a width transition is main-thread, so it would
+     freeze half-open for as long as that render blocks — measured at 242ms
+     and 283ms into Transactions. Snapping shut shows the destination state
+     on the next paint instead of a stalled animation. Scoped to
+     :not(.rail-pinned): pinning is an explicit stay-open. */
+  .shell:not(.rail-pinned) header.top.rail-hold:is(:hover,:focus-within){
+      width:var(--rail-w);box-shadow:none;transition:none}
+  .shell:not(.rail-pinned) header.top.rail-hold:is(:hover,:focus-within) .nav-t,
+  .shell:not(.rail-pinned) header.top.rail-hold:is(:hover,:focus-within) .brand .hide-m{
+      opacity:0;transition:none}
+  .shell:not(.rail-pinned) header.top.rail-hold:is(:hover,:focus-within) .rt{clip-path:none}
+
+  /* The rail still scrolls when the window is too short for eleven items,
+     but its scrollbar is hidden: a classic one is 10px inside a 58.8px
+     column, which eats a quarter of the width and shoves every icon off the
+     centre line the whole rail is built around. Measured at a 223px-tall
+     viewport — offsetWidth 58 against clientWidth 48. */
+  .bar{display:flex;flex-direction:column;gap:.25rem;max-width:none;
+       height:100%;padding:.55rem .6rem;overflow-x:hidden;overflow-y:auto;
+       scrollbar-width:none}
+  .bar::-webkit-scrollbar{width:0;height:0}
+  .topline{flex:0 0 auto;width:100%;min-width:0}
+  nav{flex:1 1 auto;display:flex;flex-direction:column;align-items:stretch;
+      gap:.1rem;justify-content:flex-start;overflow:visible}
+  /* THE icons-vanish bug lives here. .navscroll sized itself to its widest
+     LABEL — measured 130.3px inside a 38.8px nav — so the column overflowed
+     the rail, and overflow-x:hidden still leaves a scroll CONTAINER behind
+     (it only hides the bars). Focusing an item on click therefore made the
+     browser scroll it into view: scrollLeft 45.75, first icon at x=-27.4,
+     every icon off the left edge until something reset it. That is the
+     "vanish for a bit, sometimes" — a frame stall cannot be intermittent on
+     a page that costs the same to render every time.
+     overflow-x:clip is NOT the fix: paired with overflow-y:auto it computes
+     back to hidden, which is why it changed nothing. Constrain the width at
+     the source instead, so nothing ever overflows and there is nothing to
+     scroll. min-width:0 is the load-bearing half — without it the flex
+     item's automatic minimum keeps it at max-content whatever width says. */
+  .navscroll{display:flex;flex-direction:column;align-items:stretch;gap:.1rem;
+             width:100%;min-width:0}
+  nav a,.rail-pin{display:flex;align-items:center;gap:.7rem;overflow:hidden;
+      padding:.5rem .55rem;border-radius:var(--rs);white-space:nowrap;
+      background:none;border:0;color:var(--ink);font:inherit;font-size:14px;
+      text-align:left;cursor:pointer;width:100%}
+  .nav-i{flex:0 0 auto;width:22px;height:22px;display:grid;place-items:center;
+         color:var(--blue)}
+  nav a.on .nav-i{color:#fff}
+  /* the pin is chrome, not a destination — it stays out of the blue */
+  .rail-pin .nav-i{color:var(--mut)}
+  .rail-pin:hover .nav-i{color:var(--ink)}
+  /* opacity, never display:none — the label carries the accessible name the
+     icon does not, and a screen reader must keep hearing it */
+  .nav-t{opacity:0;transition:opacity .1s ease;overflow:hidden}
+  .navsep{width:auto;height:1px;background:var(--line);margin:.4rem .3rem}
+  .rail-pin{margin-top:auto;color:var(--mut)}
+  .rail-pin:hover{background:var(--hover);color:var(--ink)}
+
+  /* The brand is the Home link, so its logo must sit in the SAME optical
+     column as the nine icons below it — measured, not eyeballed: it was
+     3.4px left of them because it carried different horizontal padding
+     (.4rem vs .55rem) and a 20px image against the 22px .nav-i box. Match
+     the padding and the gap, and give the image the same 22px box, so the
+     centres coincide however the icons are later resized. */
+  .brand{margin:0 0 .3rem;padding:.5rem .55rem;gap:.7rem;
+         width:100%;min-width:0;overflow:hidden}
+  .brand img{width:22px;height:22px}
+  .brand .hide-m{opacity:0;transition:opacity .1s ease}
+
+  /* status + identity move OUT of the rail into a slim bar over the content
+     column: a 74px rail cannot hold a chip reading "synced 11m ago", and
+     losing at-a-glance sync state is a real daily cost */
+  /* The bar stays full-bleed (its background and rule must span the whole
+     width) but its CONTENTS stop where main's content column stops, so the
+     identity chip sits over the page rather than out at the window edge.
+     main is a centred max-width column, so past that width it grows a slack
+     on each side that a plain right:0 bar ignores — that slack was 105px at
+     1440 and read as the cluster floating off on its own. Same formula as
+     main's max-width, so the two cannot drift; max() collapses it to the
+     plain gutter below the cap, where there is no slack.
+     Pinned needs no rule of its own: --col is already the rail's current
+     layout width, so left and the inset follow it. */
+  .rt{position:fixed;top:0;right:0;height:var(--bar-h);left:var(--col);
+      margin:0;padding:0 .9rem;z-index:20;display:flex;align-items:center;
+      justify-content:flex-end;gap:.4rem;background:var(--bg);
+      border-bottom:1px solid var(--line);
+      padding-right:calc(.9rem + max(0px,(100% - 1180px - var(--col))/2));
+      transition:left .14s ease,padding-right .14s ease,clip-path .14s ease}
+
+  /* Someone who has asked the system for less motion should not get a panel
+     that slides out from under their pointer. They still get the rail, just
+     switched rather than animated — the layout does not depend on the
+     transition, only the polish does. */
+  @media (prefers-reduced-motion:reduce){
+    header.top,.rt,main{transition:none}
+    .nav-t,.brand .hide-m{transition:none}
+  }
+
+  main{margin:1.1rem auto 0;
+       padding-left:calc(var(--col) + .9rem);padding-right:.9rem;
+       max-width:calc(1180px + var(--col));transition:padding-left .14s ease}
+  /* The banners are their own boxes, so they cannot borrow main's padding —
+     the padding would inset their TEXT and leave the border where it was.
+     Margins instead, resolving to the same two edges: main's box is centred
+     at min(100%, 1180 + col) wide, then inset by the rail and the gutter. */
+  .topnote{max-width:none;
+       margin-left:calc(max(0px,(100% - 1180px - var(--col))/2)
+                        + var(--col) + .9rem);
+       margin-right:calc(max(0px,(100% - 1180px - var(--col))/2) + .9rem);
+       transition:margin-left .14s ease}
+}
+
+/* The phone half of the nav lives in the @media(max-width:760px) block
+   further up, next to the rest of the phone layout, rather than trailing
+   the rail: the two shapes are mutually exclusive media queries, and
+   splitting one of them across the file is how the icons ended up
+   display:none on phones for a whole release. */
+
+/* ==== Bucket rules ======================================
+   Categories and merchants are chips in one row: tap ✕ to drop one, pick or
+   type to add. Replaces a ⌘/Ctrl-click multiselect and comma-separated free
+   text — neither of which a touch device can work, and the second of which
+   hid its own typos. */
+.pill .chip-x{border:none;background:none;color:inherit;cursor:pointer;
+  padding:0 0 0 .1rem;font-size:11px;line-height:1;opacity:.75}
+.pill .chip-x:hover{opacity:1}
+.addchip{font-size:12px;padding:.15rem .5rem;border-radius:999px;
+  border:1px dashed var(--line);background:none;color:var(--mut);cursor:pointer}
+
+/* ==== Retire / Net Worth heroes =========================
+   A hero states the answer; its components are tiles beneath, not equal
+   cards beside it. .assume is the one-line summary that replaced two form
+   cards — the ten fields open from it. */
+.tile{background:var(--hover);border:1px solid var(--line);
+  border-radius:var(--rs);padding:.55rem .7rem}
+.assume{margin-top:.8rem;padding-top:.6rem;border-top:1px dashed var(--line);
+  font-size:13px;color:var(--mut);display:flex;gap:.6rem;flex-wrap:wrap;
+  align-items:baseline}
+
+/* ==== bulk selection bar ===========================================
+   Sticks to the top of the scroll area so the actions stay reachable in a
+   long ledger — selecting row 200 and then hunting for the toolbar is the
+   failure mode this replaces. */
+/* top = the fixed desktop bar's height (0 where there is none): pinned
+   at 0 the bar slid UNDER that bar and was invisible exactly when it was
+   needed — deep in the list */
+.bulkbar{position:sticky;top:var(--bar-h,0px);z-index:6;display:flex;gap:.5rem;
+  flex-wrap:wrap;align-items:center;margin-bottom:.6rem;padding:.5rem .7rem;
+  border-radius:var(--rs);background:var(--hover);
+  border:1px solid var(--blue);box-shadow:var(--shadow)}
+.bulkbar button,.bulkbar select{font-size:12.5px;padding:.3rem .6rem}
+.txn-table tr.picked{background:rgba(79,155,214,.08)}
+.txn-table .c-pick{width:1%}
+.txn-table .c-pick input{min-width:1.15rem;min-height:1.15rem}
+@media(max-width:620px){
+  /* the checkbox joins the first line, ahead of the date */
+  .txn-table tr{grid-template-columns:max-content max-content minmax(0,1fr) max-content max-content;
+    grid-template-areas:"pick date merch amt  clip" "pick cat  cat   cat  clip"}
+  .txn-table .c-pick{grid-area:pick;align-self:center}
+  .txn-table .c-pick input{min-width:1.4rem;min-height:1.4rem}
+}
+
+/* ==== Alerts ============================================
+   An alert states its problem, its age, and the way to fix it. It used to
+   offer exactly one affordance — dismiss — so the only supported response
+   to "your bank stopped syncing" was to hide the message. */
+.alertrow{display:flex;gap:.6rem;align-items:flex-start;padding:.6rem .8rem;
+  border:1px solid var(--line);border-radius:var(--rs);background:var(--hover);
+  margin-top:.5rem}
+.alertrow.bad{border-color:rgba(224,105,93,.45)}
+.alertrow.warn{border-color:rgba(240,180,41,.45)}
+.alertrow .ico{line-height:1.5}
+.alertrow .meta{font-size:11.5px;color:var(--mut);margin-top:.15rem}
+.chip{border-radius:999px;padding:.2rem .7rem;font-size:12.5px;cursor:pointer;
+  background:var(--hover);color:var(--ink);border:1px solid var(--line)}
+.chip.on{background:rgba(79,155,214,.16);border-color:var(--blue);
+  color:var(--blue)}
+
+/* the asker stays reachable while the answers scroll under it */
+.card.asker{position:sticky;top:.5rem;z-index:3}
+
+/* a partial reimbursement's progress, inline in a table cell. Distinct from
+   .bar (a grid container) on purpose — same word, different job. */
+.minibar{display:inline-block;height:6px;border-radius:3px;
+  background:var(--hover);overflow:hidden;vertical-align:middle}
+.minibar>i{display:block;height:100%;background:var(--blue)}
+
+/* a provenance group's header — its own explanation lives here, because the
+   promotion rule is only interesting where it applies */
+.grouphead{display:flex;gap:.6rem;align-items:baseline;padding:.6rem 0 .3rem;
+  border-bottom:1px solid var(--line);cursor:pointer;width:100%;
+  background:none;text-align:left;color:var(--ink);font:inherit}
+.grouphead:hover{color:var(--blue)}
+
+/* a section that has a PROBLEM says so in the list, so it is findable from
+   any other section without a banner floating over all of them */
+.setnav-s.warn{color:var(--amber)}
+
+/* settings rows: label · current value · change. A setting used to
+   be a control cluster you had to read to learn its own value. */
+.setrow{display:flex;gap:.6rem;align-items:baseline;flex-wrap:wrap;
+  padding:.55rem 0;border-bottom:1px solid var(--line)}
+.setrow:last-child{border-bottom:none}
+.setrow .lab{min-width:9rem}
+.setrow .val{color:var(--mut);font-size:13.5px}
+.setrow .act{margin-left:auto}
+@media (max-width:620px){
+  .setrow .lab{min-width:0;flex-basis:100%}
+  .setrow .act{margin-left:0}
+}
+
+/* the setup wizard's one row of chrome: where you are, and the way out */
+.wiz{display:flex;gap:.4rem;align-items:center;font-size:12px;
+  color:var(--mut);margin-bottom:.8rem;flex-wrap:wrap}
+.wiz i{width:8px;height:8px;border-radius:50%;background:var(--line);
+  display:inline-block}
+.wiz i.on{background:var(--blue)}
+.wiz i.done{background:var(--green)}
+
+/* One door instead of three, and the list of what it takes
+   lives inside it — the answer to "what can I drop?" where you look for it */
+.dropzone{border:2px dashed var(--line);border-radius:var(--rs);
+  padding:1.4rem 1rem;text-align:center;background:var(--card);
+  margin-bottom:1rem}
+.dropzone.over{border-color:var(--blue);background:var(--hover)}
+
+/* The wizard's "Finish setup" nav entry: a normal rail row whose colour is
+   the call to action. Green on the ICON as well as the label, because the
+   collapsed rail shows only the icon — a green row with a grey flag said
+   nothing when closed. Last in the file on purpose: it must outrank the
+   rail's own .nav-i colouring, which shares specificity. */
+nav a.nav-finish{color:var(--green,#5cb56b);font-weight:600}
+nav a.nav-finish .nav-i,
+nav a.nav-finish:hover .nav-i{color:var(--green,#5cb56b)}
+/* …but the SELECTED row is a blue fill, and green on blue is unreadable —
+   the label all but disappeared while the user was standing in the wizard
+   it points at. Selection wins: white, like every other active row. */
+nav a.nav-finish.on,
+nav a.nav-finish.on .nav-i,
+nav a.nav-finish.on:hover .nav-i{color:#fff}
+
+/* ==== Settings › Connections › Manage accounts — the accordion.
+   Quiet rows, one editor open at a time. */
+.macct-grp{background:var(--card);border:1px solid var(--line);
+  border-radius:var(--r,12px);margin-top:.9rem;overflow:hidden}
+.macct-head{display:flex;align-items:center;gap:.6rem;
+  padding:.6rem .9rem;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.macct-headact{margin-left:auto;display:flex;gap:.35rem;
+  align-items:center}
+.macct-quiet{background:none;border-color:transparent;color:var(--mut)}
+.macct-quiet:hover{color:var(--ink);border-color:var(--line)}
+.macct-menu>summary{width:28px;text-align:center;padding:.24rem 0}
+.macct-row{display:flex;align-items:center;gap:.55rem;width:100%;
+  padding:.55rem .9rem;background:none;border:0;border-radius:0;
+  border-top:1px solid var(--line);color:var(--ink);font:inherit;
+  text-align:left;cursor:pointer}
+.macct-row:hover,.macct-row[aria-expanded="true"]{background:var(--hover)}
+.macct-row.dim{opacity:.55}
+.macct-caret{color:var(--mut);font-size:11px;flex:0 0 .9em}
+.macct-nm{font-weight:600;font-size:14px;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.macct-sub{font-size:12.5px;white-space:nowrap}
+.macct-bal{margin-left:auto;font-size:13.5px;
+  font-variant-numeric:tabular-nums}
+.macct-ed{border-top:1px solid var(--line);background:var(--hover);
+  padding:.7rem .9rem .8rem}
+.macct-fields{display:flex;gap:.55rem;align-items:end;flex-wrap:wrap}
+.macct-lbl{display:block;font-size:11px;letter-spacing:.04em;
+  text-transform:uppercase;color:var(--mut);margin-bottom:2px}
+.macct-chk{font-size:13px;white-space:nowrap;cursor:pointer;
+  display:inline-flex;gap:.3rem;align-items:center;padding-bottom:.3rem}
+.macct-acts{display:flex;gap:.45rem;align-items:center;margin-top:.6rem}
+@media (max-width:560px){
+  .macct-kind{display:none}
+  .macct-fields input[type=text]{width:100% !important}
+}
+
+/* ==== Help on a phone: the topic index as a fold-out picker ====
+   Desktop keeps the two-column sidebar; under 760px the index is a
+   <details> above the article whose summary names the open topic. */
+.help-picker{padding:0}
+.help-picker>summary{list-style:none;cursor:pointer;display:flex;
+  align-items:center;gap:.6rem;padding:.7rem .9rem;min-height:2.75rem}
+.help-picker>summary::-webkit-details-marker{display:none}
+.help-picker-title{flex:1 1 auto;min-width:0;font-weight:600;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.help-picker-chev{color:var(--mut);transition:transform .15s}
+.help-picker[open] .help-picker-chev{transform:rotate(180deg)}
+.help-picker-body{padding:0 .9rem .9rem;border-top:1px solid var(--line)}
+.help-picker-body>input{margin-top:.8rem}
+.help-picker-body a{min-height:2.4rem;display:flex!important;align-items:center}
+
+/* Merchants: one list, a pinned head, a panel beside it. A row is a logo,
+   a name and one line of facts; the rest opens in the panel so the list
+   never reflows. */
+.merchants-head.pinned{position:sticky;top:.5rem;z-index:3}
+.mrow{display:flex;align-items:center;gap:.7rem;padding:.5rem .35rem;
+  border-top:1px solid var(--line);cursor:pointer;border-radius:6px}
+.mrow:first-of-type{border-top:none}
+.mrow:hover,.mrow.on{background:var(--hover)}
+.mrow .nm{font-weight:600;overflow-wrap:anywhere}
+.mrow .sb,.offer .sb{font-size:12px;color:var(--mut);margin-top:1px}
+.offer{display:flex;gap:.8rem;align-items:flex-start;flex-wrap:wrap;
+  padding:.45rem 0;border-top:1px solid var(--line)}
+/* a category or bill label that opens its rows: plain text at rest, a
+   button on hover — never an underlined link, the number under it is the
+   point of the row */
+a.catlink,.catlink{color:inherit;text-decoration:none;cursor:pointer;border-radius:6px;
+  padding:.05rem .3rem;margin:0 -.3rem;transition:background .12s,color .12s}
+a.catlink:hover,.catlink:hover{background:var(--hover);color:var(--blue);text-decoration:none}
+.linkish{background:none;border:none;padding:0;color:var(--blue);cursor:pointer;
+  font-size:inherit;text-decoration:underline;text-decoration-color:var(--mut)}
+.linkish:hover{background:none}
+.card.fold summary{cursor:pointer;list-style:none;display:flex;align-items:center}
+.card.fold summary::-webkit-details-marker{display:none}
+.card.fold summary::before{content:"▸";color:var(--mut);margin-right:.5rem;font-size:11px}
+.card.fold[open] summary::before{content:"▾"}
+.side-panel{position:fixed;top:0;right:0;bottom:0;width:min(36rem,100%);
+  background:var(--card);border-left:1px solid var(--line);
+  box-shadow:-12px 0 32px rgba(0,0,0,.35);z-index:40;overflow:auto;
+  padding:1rem 1.2rem 2rem}
+.side-panel .close{background:none;border:none;color:var(--mut);font-size:22px;
+  line-height:1;cursor:pointer;padding:.2rem .5rem}
+.side-panel .close:hover{color:var(--ink);background:var(--hover)}
+@media(max-width:700px){.merchants-head.pinned{position:static}}

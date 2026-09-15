@@ -1,0 +1,109 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "oikonome"
+version = "0.1.0"
+description = "Know every morning if you are on budget."
+requires-python = ">=3.12"
+license = "LicenseRef-FSL-1.1-ALv2"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "jinja2>=3.1",
+    "python-multipart>=0.0.9",
+    "psycopg[binary,pool]>=3.2",
+    "argon2-cffi>=23.1",
+    "arq>=0.26",
+    "redis>=5",
+    "httpx>=0.27",
+    # APNs speaks HTTP/2 only; h2 is httpx's protocol backend for it
+    "h2>=4.1",
+    "cryptography>=42",
+    "ofxtools>=0.9",
+    "pypdf>=4",
+    "pypdfium2>=4",
+    "pillow>=10.1",   # ImageFont.load_default(size=) — the email chart's labels
+    # Receipt document-detect -> largest-quad -> perspective warp.
+    # Headless build (no GUI libs); the optimize pass falls back to a
+    # Pillow-only path if cv2 is ever missing at runtime.
+    "opencv-python-headless>=4.9",
+    "numpy>=1.26",
+    "webauthn>=3",
+    # Web-push delivery for the summary notifications
+    "pywebpush>=2",
+    # 2FA enrollment QR code (pure-Python, no binary deps) — renders the
+    # otpauth URI as an SVG the client shows instead of the raw string
+    "segno>=1.6",
+    # User-uploaded XML (SSA earnings records) is parsed with defusedxml,
+    # not stdlib ElementTree: the latter expands internal entities without
+    # limit, so a small upload can exhaust the container's memory.
+    "defusedxml>=0.7",
+]
+
+[project.scripts]
+oikonome = "oikonome.cli:main"
+
+[project.optional-dependencies]
+# `make test` runs ruff before the suite; install with: pip install -e '.[dev]'
+dev = ["ruff>=0.16"]
+# local merchant categorizer (engine/model_categorize.py): loads a
+# deployment-provided joblib artifact. Optional so a bare-metal install
+# without a model file never drags in the sklearn stack; the official
+# image installs it. The pin tracks the sklearn line the shipped
+# artifacts are trained with — a pickle across sklearn majors is luck.
+model = ["scikit-learn>=1.9,<1.10", "joblib>=1.3"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["oikonome"]
+
+[tool.ruff]
+target-version = "py312"
+# Formatting is NOT enforced — no E/W selected, no `ruff format`. This is a
+# security and correctness gate, not a style bot; reformatting 40k lines of
+# working code would bury the signal it exists to carry.
+line-length = 100
+
+[tool.ruff.lint]
+# F  = pyflakes: undefined names, unused imports, shadowed definitions.
+#      Cheap, and it catches the typo'd-variable class before runtime.
+# S  = flake8-bandit: the security ruleset. The point of this gate. It is
+#      selected WHOLESALE so rules the code has never hit (eval, pickle, yaml.load,
+#      shell=True, verify=False, hardcoded passwords, unverified SSL context,
+#      mktemp, telnet/ftp) stay at zero without anyone remembering to add
+#      them one at a time. Everything below is an explicit, reasoned debit.
+select = ["F", "S"]
+
+ignore = [
+    # Dynamic SQL here interpolates only literals and module-level SQL
+    # constants (categories.PLAID_TRUSTED_SQL, budget.PERSONAL_ONLY_SQL, …);
+    # the few fragments built from user input drive off an allowlist rather
+    # than the request (receipts._GROUP_KEYS, entities._EDITABLE,
+    # taxdocs.ANNUAL_FIELDS, an int()-coerced LIMIT, a pg_class-derived table
+    # name unreachable from HTTP). There is no dynamic ORDER BY, and
+    # IN-clauses use `= ANY(%s)` with a bound list rather than joined
+    # placeholders. Left OFF rather than noqa'd at every site; revisit the
+    # rule if that shape changes.
+    "S608",
+    # sha1 is content addressing, never a password. Import rows are keyed by
+    # a hash of their source line for idempotent re-import (sync/*import.py),
+    # and auth/passwords.py uses it because Have I Been Pwned's k-anonymity
+    # range API is DEFINED over SHA-1 prefixes. Password storage is argon2id.
+    "S324",
+    # Best-effort blocks around telemetry, cache warming, and cleanup, where
+    # the failure is genuinely not actionable. Each one is deliberate.
+    "S110", "S112",
+    # Two sites: demo fixture generation and picking an error-page epigraph.
+    # Every security token in the app comes from `secrets` (18 call sites).
+    "S311",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests are not shipped. They hardcode fixture passwords, shell out to the
+# db guard, and assert — all of which the S ruleset flags by design. F still
+# applies: an unused import or shadowed name is a bug in a test too.
+"tests/**" = ["S"]
+# One fixed-argv subprocess call (no shell, no user input) that renders the
+# server-side page bundle.
+"oikonome/web/pages.py" = ["S603", "S607"]

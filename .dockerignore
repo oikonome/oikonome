@@ -1,0 +1,21 @@
+# The compose build context is the repo root, so everything here is sent
+# to the daemon on every image build even though the Dockerfile only COPYs
+# server/, webapp/dist and docs/. Keep secrets, local build outputs and
+# tooling caches out of the context entirely — a leak into an image layer
+# is a leak into every registry it ever reaches.
+.git
+.env
+.env.*
+!docker/.env.example
+docker/.env
+mobile/credentials/
+mobile/android/
+mobile/ios/
+mobile/node_modules/
+webapp/node_modules/
+server/.venv/
+**/__pycache__/
+**/*.pyc
+.wrangler/
+extras/*_tests/
+extras/.git/

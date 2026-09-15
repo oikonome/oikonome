@@ -1,0 +1,85 @@
+name: ci
+on:
+  # PR + manual. The local suite (`make test`) is what gates a release; this
+  # workflow is the required `ci / test` check on pull requests and can be
+  # triggered by hand.
+  pull_request:
+  workflow_dispatch:
+  # NO `release:` trigger — publishing a release must never fire CI.
+  # Releases are published one reviewed commit at a time; see DEVELOPMENT.md.
+
+# the token this workflow gets can only read the checkout — it publishes
+# nothing
+permissions:
+  contents: read
+
+# rapid successive pushes cancel the older in-flight run instead of stacking
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env: { POSTGRES_PASSWORD: devpass, POSTGRES_DB: oikonome }
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 10s
+          --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.14" }
+      - run: pip install ./server
+      # Security + correctness lint (ruff: bandit S rules + pyflakes F).
+      # Runs BEFORE the database steps so it still reports if the postgres
+      # service fails to initialize in the runner.
+      - run: pip install 'ruff>=0.16'
+      - run: ruff check server/oikonome server/tests
+      # The in-app database dump shells out to pg_dump, which refuses a server
+      # newer than itself; the runner's default client trails the postgres
+      # service by two majors, so install the matching one from PGDG. The
+      # runner image does not carry that apt source (Ubuntu 24.04 images from
+      # 2026-08 on), so add it first.
+      - run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client-18
+          # The image also ships a PostgreSQL 16 server, and Debian's pg_wrapper
+          # routes `pg_dump` to that cluster's version regardless of which
+          # clients are installed; put the 18 binaries first for later steps.
+          echo "/usr/lib/postgresql/18/bin" >> "$GITHUB_PATH"
+      - run: pg_dump --version | grep -F '(PostgreSQL) 18.'
+      # The SPA shell is what /app/* routes serve; the tests that assert
+      # those routes answer need a built one, exactly as the image does.
+      - uses: actions/setup-node@v4
+        with: { node-version: "22", cache: npm, cache-dependency-path: webapp/package-lock.json }
+      - run: npm ci --prefix webapp && npm run build --prefix webapp
+      # Both steps run from server/, the same way `make test` does: the
+      # suite reads sibling sources by path and the package by name.
+      - run: python -m oikonome.db.migrate
+        working-directory: server
+        env:
+          OIKONOME_ADMIN_DSN: postgresql://postgres:devpass@127.0.0.1:5433/oikonome
+      - run: python -m unittest discover -t . -s tests
+        working-directory: server
+        env:
+          OIKONOME_TEST_ADMIN_DSN: postgresql://postgres:devpass@127.0.0.1:5433
+      # Dependency CVE scan, folded into this job (not a second runner).
+      # Audits the exact resolved runtime
+      # dependency tree — the set the image installs — against the PyPI
+      # advisory DB. `./server` is already installed above; this project's package
+      # isn't on PyPI, so pip-audit skips it (a warning, not a failure).
+      #
+      # REPORT-ONLY (`|| true`): a newly-disclosed CVE in a dependency should
+      # surface in the log, not red the build and block merges on something
+      # no code change caused. Nothing opens a bump PR automatically here —
+      # dependency bumps are manual, so read the log.
+      - run: pip install pip-audit
+      - run: pip-audit || true

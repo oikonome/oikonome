@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block body %}
+<h1>Choose a new password</h1>
+<div class="card" style="max-width:26rem">
+  {% if error %}<div class="note" style="margin-bottom:.8rem;background:rgba(224,105,93,.10);border-color:rgba(224,105,93,.4);color:var(--red)">{{ error }}</div>{% endif %}
+  {% if token %}
+  <form method="post" action="/reset">
+    <input type="hidden" name="token" value="{{ token }}">
+    <p><label>New password<br><input type="password" name="password" required minlength="10" autocomplete="new-password"
+        style="width:100%;padding:.5rem;background:var(--hover);border:1px solid var(--line);border-radius:var(--rs);color:var(--ink)"></label></p>
+    {% if needs_recovery %}
+    <p class="sub" style="margin-top:-.3rem">This account has a second factor (an authenticator app or a passkey). Resetting the password removes it, so enter one of the recovery codes you saved when you set it up.</p>
+    <p><label>Recovery code<br><input type="text" name="recovery_code" required autocomplete="one-time-code" inputmode="text" spellcheck="false" placeholder="xxxx-xxxx-xxxx-xxxx-xxxx"
+        style="width:100%;padding:.5rem;background:var(--hover);border:1px solid var(--line);border-radius:var(--rs);color:var(--ink)"></label></p>
+    {% endif %}
+    <button class="pri">Set new password</button>
+  </form>
+  {% if needs_recovery %}
+  {# The door for someone with nothing left: a cooling-off reset, or a
+     person to write to. Stated here, where the wall is, not on a help page. #}
+  <form method="post" action="/recover" style="margin:.9rem 0 0">
+    <input type="hidden" name="token" value="{{ token }}">
+    <p class="sub" style="margin:0 0 .4rem"><b>Lost your recovery codes too?</b>
+      You can ask for a reset that removes the second factor after a 7-day
+      cooling-off period. We tell this account on every channel it has, and
+      one click on that message — or any sign-in — cancels it. After the
+      wait, a fresh reset link works without a code.</p>
+    <button type="submit" style="font-size:12px">Start the 7-day recovery</button>
+    {% if support_email %}<span class="sub" style="margin-left:.5rem">or email <a href="mailto:{{ support_email }}?subject=Locked%20out%20of%20my%20account">{{ support_email }}</a></span>{% endif %}
+  </form>
+  {% endif %}
+  {% else %}
+  <p class="sub"><a href="/forgot">Request a new reset link</a></p>
+  {% endif %}
+</div>
+{% endblock %}
