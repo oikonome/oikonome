@@ -1,0 +1,24 @@
+# Sample user unit for the coinbase community script.
+# Copy to ~/.config/systemd/user/, adjust the paths, then enable the timer.
+#
+# The split is the point: ExecStart collects into a local payload file;
+# ExecStartPost pushes it into the app container. A failed pull never
+# publishes, and the leading '-' on ExecStartPost means a failed push
+# doesn't mark the collection run as failed (the payload survives —
+# re-push by hand or let the next run supersede it).
+
+[Unit]
+Description=Oikonome community script: Coinbase pull + push
+# If the app container runs on this machine under systemd, order after it:
+# After=podman-compose@oikonome.service
+
+[Service]
+Type=oneshot
+# Adjust to wherever you keep the script:
+ExecStart=%h/oikonome/community-scripts/coinbase/coinbase_sync.py pull
+ExecStartPost=-%h/oikonome/community-scripts/coinbase/coinbase_sync.py push
+
+# Credentials/config via environment (defaults shown; see README.md):
+#Environment=OIKONOME_COINBASE_KEYS=%h/.config/oikonome-scripts/coinbase
+#Environment=OIKONOME_APP_CONTAINER=oikonome-app-1
+#Environment=OIKONOME_CONTAINER_ENGINE=podman

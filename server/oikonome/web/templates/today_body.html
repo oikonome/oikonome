@@ -1,0 +1,521 @@
+{# ============================================================================
+   SINGLE SOURCE for the Today view — hero card, "Where it's going" map,
+   one cash timeline, top-categories footer.
+   This template IS the daily email's HTML body and mirrors the SPA's
+   Today.tsx. The email renders it via todayview.render_email, which bakes
+   the dark-theme styles into style= attributes. Edit here and Today.tsx
+   together — same change, same commit. `email` is true for the mail
+   render; the interactive SVG chart is web-only (mail clients strip SVG) —
+   the email carries it as an inline PNG instead.
+   Keep markup email-safe: no <script>, no external URLs, and an image only
+   as a data: URI (report.send turns it into an inline part) — never a
+   remote src.
+   ========================================================================== #}
+{# The verdict is the ENGINE's, not a second derivation of it. Recomputing
+   variance-vs-tolerance here holds only until the engine's rule gains a
+   clause the template doesn't know about — the early-month
+   guard lives in budget.py, and a template that recomputed would announce
+   UNDER BUDGET in the 9am email while the Today page said ON BUDGET.
+   One source. #}
+{% set over = st.verdict == 'OVER BUDGET' %}
+{# which hero face. EMAIL renders carry their own `face` — the email
+   summary/detail choice lives in email settings and is
+   deliberately NOT linked to the page's today_view toggle. Page renders
+   pass no face and follow today_view. An un-stamped context defaults to
+   the detail face. #}
+{% set view = (face | default(none)) or st.today_view or 'detail' %}
+{% set under = st.verdict == 'UNDER BUDGET' %}
+{% set var_budget = st.buckets.food.month_budget + st.buckets.other.month_budget %}
+{% set remaining = var_budget - st.variable_actual %}
+
+
+{# ---- unified alert strip (worst first) — the log behind it feeds /alerts;
+      ✕ dismisses (web only — no forms in mail) while the condition persists ---- #}
+{% for a in st.alerts or [] %}
+<div class="note" style="margin:1rem 0 0;display:flex;gap:.5rem;align-items:baseline;{% if a.severity == 'bad' %}background:rgba(224,105,93,.10);border-color:rgba(224,105,93,.4);color:var(--red){% elif a.severity == 'good' %}background:rgba(92,181,107,.10);border-color:rgba(92,181,107,.35);color:var(--green){% elif a.severity == 'info' %}background:var(--card);border-color:var(--line);color:var(--mut){% endif %};">
+  {# an alert naming something you'd want to change links to the page that
+     changes it. In mail that must be an ABSOLUTE url, and only when we have
+     a mailable base — a LAN link in an email is what gets it filtered. #}
+  <span style="flex:1;">{{ '⚠' if a.severity in ('bad','warn') else '✓' if a.severity == 'good' else '•' }}
+    {%- if a.link and (not email or app_base) %} <a href="{{ (app_base ~ '/app' ~ a.link) if email else ('/app' ~ a.link) }}" style="color:inherit;text-decoration:underline;">{{ a.message }}</a>
+    {%- else %} {{ a.message }}{% endif %}</span>
+  {% if not email %}
+  <form method="post" action="/alerts/dismiss" style="display:inline;margin:0;">
+    <input type="hidden" name="kind" value="{{ a.kind }}">
+    <input type="hidden" name="message" value="{{ a.message }}">
+    <input type="hidden" name="back" value="/today">
+    <button title="dismiss" style="background:none;border:none;padding:0 .2rem;color:inherit;opacity:.6;cursor:pointer;">✕</button>
+  </form>
+  {% endif %}
+</div>
+{% endfor %}
+
+{# ---- the "today" post tick, email-safe: mail clients have no absolute
+      positioning, so the web's .bartick overlay becomes three stacked
+      table rows — this 3px stub above the bar, a 2px ink cell IN the bar
+      (c.pace from _insert_pace / the meter6 split), and a stub below ---- #}
+{% macro pacestub(p, mt=none) %}
+    <table cellpadding="0" cellspacing="0" width="100%" role="presentation"
+           style="border-collapse:collapse;table-layout:fixed;{% if mt %}margin-top:{{ mt }};{% endif %}">
+      <tr><td style="width:{{ p }}%;height:3px;font-size:0;line-height:0;padding:0;border:none;">&nbsp;</td>
+          <td style="width:2px;height:3px;font-size:0;line-height:0;padding:0;border:none;background:var(--ink);">&nbsp;</td>
+          <td style="height:3px;font-size:0;line-height:0;padding:0;border:none;">&nbsp;</td></tr>
+    </table>
+{% endmacro %}
+
+{# ---- one row of money-map cells, at whatever height is asked for.
+      `ghost` keeps the columns and drops every colour but the tick's,
+      which is how the stubs above and below the bar are drawn ---- #}
+{% macro mapcells(row, h, ghost=false) %}
+      {%- set used = namespace(w=0.0) %}
+      {% for c in row.cells %}
+      {%- if c.budget or c.pace %}<td style="width:2px;height:{{ h }}px;font-size:0;line-height:0;padding:0;border:none;{% if c.pace or not ghost %}background:var(--ink);{% endif %}">&nbsp;</td>
+      {%- elif c.w > 0.2 %}<td style="width:{{ c.w }}%;height:{{ h }}px;font-size:0;line-height:0;padding:0;border:none{% if c.bg and not ghost %};background:{{ c.bg }}{% endif %};">&nbsp;</td>{% set used.w = used.w + c.w %}{%- endif %}
+      {% endfor %}
+      {% if 100 - used.w > 0.2 %}<td style="width:{{ 100 - used.w }}%;height:{{ h }}px;font-size:0;line-height:0;padding:0;border:none;">&nbsp;</td>{% endif %}
+{% endmacro %}
+
+{# ---- the stub above/below a money-map bar. It renders the BAR'S OWN
+      cells, colourless except the tick, so the tick's column is the same
+      column in all three tables — by construction, not by arithmetic.
+      The plain `pacestub` could not manage that here: with
+      table-layout:fixed the percentage columns divide up whatever is
+      left after the FIXED ones, and a bar carrying a budget divider has
+      two 2px cells where the stub had one. The two tables were therefore
+      measuring their percentages against different widths, and the tick
+      draws as a line with a one-pixel kink in it. ---- #}
+{% macro mapghost(row, mt=none) %}
+    <table cellpadding="0" cellspacing="0" width="100%" role="presentation"
+           style="border-collapse:collapse;table-layout:fixed;{% if mt %}margin-top:{{ mt }};{% endif %}">
+      <tr>{{ mapcells(row, 3, ghost=true) }}</tr>
+    </table>
+{% endmacro %}
+
+{# ---- money-map bar macro (email-safe): segments as table cells; the
+      post tick wraps the bar via the ghost stubs + the in-bar c.pace
+      cell ---- #}
+{% macro mapbar(row, pace_label=false) %}
+    {% if row.pace_pct is not none %}{{ mapghost(row, '3px') }}{% endif %}
+    <table cellpadding="0" cellspacing="0" width="100%" role="presentation"
+           style="border-collapse:collapse;table-layout:fixed;background:var(--hover);border-radius:7px;{% if row.pace_pct is none %}margin-top:3px;{% endif %}">
+      <tr>{{ mapcells(row, 14) }}</tr>
+    </table>
+    {% if row.pace_pct is not none %}{{ mapghost(row) }}
+    {% if pace_label %}
+    <table cellpadding="0" cellspacing="0" width="100%" role="presentation"
+           style="border-collapse:collapse;table-layout:fixed;">
+      <tr><td style="width:{{ row.pace_pct }}%;padding:0;font-size:0;line-height:0;border:none;">&nbsp;</td>
+          <td class="sub" style="padding:0;font-size:10px;line-height:12px;border:none;white-space:nowrap;">today's pace</td></tr>
+    </table>
+    {% endif %}
+    {% endif %}
+{% endmacro %}
+
+{# ---- tile meter (6px) with the post tick: fill split at pace so the
+      2px ink cell sits IN the bar, stubs above and below. An optional
+      scope tag renders beside the bar, like the web tile's tiny "month"
+      — the hero tiles' visible numbers are all daily, so their bar's
+      monthly scope must be legible without a tooltip (mail clients have
+      none anyway); pinned-bill cards pass no tag because their period
+      varies and c.sub already states it. The tag column is fixed-width
+      so the pace stubs still measure the bar alone. ---- #}
+{% macro meter6cells(f, p, over, h, r, ghost=false) %}
+      {%- set bg = ('var(--red)' if over else 'var(--green)') if not ghost else none %}
+      {# p=none — a DAY-scoped bar: no pace tick, the day is the unit #}
+      {% if p is none %}{% if f > 0.2 %}<td style="width:{{ f }}%;height:{{ h }}px;font-size:0;line-height:0;padding:0;border:none;{% if bg %}background:{{ bg }};border-radius:{{ r }}px;{% endif %}">&nbsp;</td>{% endif %}
+          {% elif p < f %}<td style="width:{{ p }}%;height:{{ h }}px;font-size:0;line-height:0;padding:0;border:none;{% if bg %}background:{{ bg }};border-radius:{{ r }}px 0 0 {{ r }}px;{% endif %}">&nbsp;</td>
+          <td style="width:2px;height:{{ h }}px;font-size:0;line-height:0;padding:0;border:none;background:var(--ink);">&nbsp;</td>
+          <td style="width:{{ f - p }}%;height:{{ h }}px;font-size:0;line-height:0;padding:0;border:none;{% if bg %}background:{{ bg }};border-radius:0 {{ r }}px {{ r }}px 0;{% endif %}">&nbsp;</td>
+          {% else %}<td style="width:{{ f }}%;height:{{ h }}px;font-size:0;line-height:0;padding:0;border:none;{% if bg %}background:{{ bg }};border-radius:{{ r }}px;{% endif %}">&nbsp;</td>
+          {% if p - f > 0.2 %}<td style="width:{{ p - f }}%;height:{{ h }}px;font-size:0;line-height:0;padding:0;border:none;">&nbsp;</td>{% endif %}
+          <td style="width:2px;height:{{ h }}px;font-size:0;line-height:0;padding:0;border:none;background:var(--ink);">&nbsp;</td>
+          {% endif %}<td style="height:{{ h }}px;font-size:0;line-height:0;padding:0;border:none;">&nbsp;</td>
+{% endmacro %}
+
+{# ---- the meter's own stub, drawn from the meter's own columns for the
+      reason mapghost states: when the fill stops short of today, the
+      run before the tick is TWO cells (fill, then the gap), and a stub
+      that spends one cell on the same percentage need not round to the
+      same pixel. ---- #}
+{% macro meterghost(f, p, over, h, r, mt=none) %}
+    <table cellpadding="0" cellspacing="0" width="100%" role="presentation"
+           style="border-collapse:collapse;table-layout:fixed;{% if mt %}margin-top:{{ mt }};{% endif %}">
+      <tr>{{ meter6cells(f, p, over, 3, r, ghost=true) }}</tr>
+    </table>
+{% endmacro %}
+
+{% macro meter6(f, p, over, tag=none, h=6, r=3) %}
+  {% if tag %}<table cellpadding="0" cellspacing="0" width="100%" role="presentation" style="border-collapse:collapse;">
+    <tr><td style="padding:0;border:none;vertical-align:bottom;">{% endif %}
+    {% if p is not none %}{{ meterghost(f, p, over, h, r, '.4rem') }}{% endif %}
+    <table cellpadding="0" cellspacing="0" width="100%" role="presentation" style="border-collapse:collapse;table-layout:fixed;background:var(--hover);border-radius:{{ r }}px;">
+      <tr>{{ meter6cells(f, p, over, h, r) }}</tr>
+    </table>
+    {% if p is not none %}{{ meterghost(f, p, over, h, r) }}{% endif %}
+    {% if tag %}</td><td style="width:38px;padding:0 0 3px 6px;border:none;vertical-align:bottom;color:var(--mut);font-size:10px;line-height:1;">{{ tag }}</td></tr>
+  </table>{% endif %}
+{% endmacro %}
+
+{# ---- 1. THE hero card: the verdict pill, ONE big
+      number (the verdict's own — variable remaining), the pace bar, the
+      per-category left-today/rate tiles, projection, cash notice, Why,
+      and the plan as a single flow line ---- #}
+<div class="card" style="margin-top:1rem;">
+  {# the verdict as ONE colored sentence: state word + the engine's pace
+     phrase, month total demoted to context on the right.
+     MIRRORS Today.tsx. #}
+  {# NO flex here: Gmail on Android keeps display:flex
+     but strips flex-wrap, so a flex row that doesn't fit runs OFF the
+     screen instead of wrapping. Float + inline wraps everywhere. #}
+  <div>
+    <span class="sub" style="float:right;margin-left:.65rem;">
+      <b class="{{ 'neg' if remaining < 0 else '' }}" style="{{ '' if remaining < 0 else 'color:var(--ink)' }};font-weight:600;">{{ money(remaining|abs) }}</b>
+      {{ 'over the' if remaining < 0 else 'of' }} {{ money(var_budget) }}{{ '' if remaining < 0 else ' left' }}
+      · {{ day.days_left }} day{{ '' if day.days_left == 1 else 's' }}</span>
+    <span class="{{ 'neg' if over else 'pos' }}" style="font-size:21px;font-weight:800;letter-spacing:-.01em;">
+      {{ 'Over budget' if over else ('Under budget' if under else 'On budget') }}</span>
+    {# pace carries the same good/bad color as the verdict word — it is
+       the same signal, said in dollars. MIRRORS Today.tsx. #}
+    {% if day.pace_line %}<span class="{{ 'neg' if over else 'pos' }}" style="font-size:15px;">{{ day.pace_line }}</span>{% endif %}
+  </div>
+  <div style="clear:both;"></div>
+  {# LEFT TO SPEND TODAY — the star: the only number that changes what
+     you do today. Meter = today's allowance, table cells for mail. #}
+  <div class="sub" style="letter-spacing:.08em;text-transform:uppercase;font-size:11.5px;margin:1rem 0 .45rem;">Left to spend today</div>
+  {# stacked full-width tiles: mail tables don't reflow, and three-across
+     is exactly the phone squeeze test_grid_cards_stack_single_column
+     exists to prevent #}
+  {# tile meter is DAY-scoped, not month-scoped: fill = today's spend of
+     today's allowance, no pace tick.
+     The month gauges live in the Monthly budget card — MIRRORS Today.tsx #}
+  {% set pace_frac = st.today.day / st.days_in_month %}
+  {% if view != 'detail' %}
+  {# SIMPLE face: the one number — still-spendable today across every
+     variable bucket — a day meter, and a chip per bucket. Every string
+     comes composed from build_context (day.simple) so the page and the
+     plain text say the same thing. #}
+  <div style="font-size:38px;font-weight:750;letter-spacing:-.02em;line-height:1.05;">{{ money(day.simple.left_today) }}</div>
+  {% set sfrac = (1 if day.day_spent > 0.005 else 0) if day.day_allow <= 0 else [1, day.day_spent / day.day_allow] | min %}
+  {{ meter6((sfrac * 100) | round, none, day.day_spent > day.day_allow + 0.5, h=14, r=7) }}
+  <div style="margin-top:.55rem;">
+    {% for c in day.simple.chips %}
+    <span class="{{ c.tone }}" style="display:inline-block;background:var(--hover);border:1px solid var(--line);border-radius:999px;padding:.12rem .6rem;font-size:12.5px;white-space:nowrap;margin:0 .25rem .3rem 0;">{{ c.text }}</span>
+    {% endfor %}
+  </div>
+  {% if day.sweep_line %}<div class="sub" style="font-size:12px;margin-top:.15rem;">{{ day.sweep_line }}</div>{% endif %}
+  {% else %}
+  {% for label, a in day.allow_tiles %}
+  {% set overT = a.left_today < -0.5 %}
+  {% set dfrac = (1 if a.spent_today > 0.005 else 0) if a.today_allowance <= 0 else [1, a.spent_today / a.today_allowance] | min %}
+  {# map-style ROW; number stacks UNDER the label, left — the pane keeps
+     one left-aligned anatomy, matching the simple face #}
+  <div style="margin-top:.7rem;">
+    {# the label opens the category's rows — only with a mailable base #}
+    {% if a.to and (not email or app_base) %}<a href="{{ (app_base ~ '/app' ~ a.to) if email else ('/app' ~ a.to) }}" style="color:inherit;text-decoration:none;"><b>{{ label }}</b></a>{% else %}<b>{{ label }}</b>{% endif %}
+    {# the number keeps the tiles' weight — the row layout is the map's,
+       the number's prominence is the tiles' #}
+    <div class="{{ 'neg' if overT else '' }}" style="font-size:22px;font-weight:750;letter-spacing:-.015em;line-height:1.15;">{{ money([0, a.left_today] | max) }}</div>
+    <div class="sub" style="font-size:12px;">
+      {% if overT %}over today by <b class="neg">{{ money(-a.left_today) }}</b> · spent {{ money(a.spent_today) }} of {{ money(a.today_allowance) }}
+      {% elif a.spent_today > 0.005 %}of {{ money(a.today_allowance) }} today · spent {{ money(a.spent_today) }}
+      {% else %}of {{ money(a.today_allowance) }} today · nothing spent yet{% endif %}</div>
+    {{ meter6((dfrac * 100) | round, none, overT, h=14, r=7) }}
+    {% if a.daily_note %}
+    {# tone class last so its color wins over .sub's mute. MIRRORS the
+       colored note on Today.tsx. #}
+    <div class="sub{{ ' ' + a.daily_note_tone if a.daily_note_tone else '' }}" style="font-size:12px;margin-top:.1rem;">{{ a.daily_note }}</div>
+    {% endif %}
+    {% if a.recover_note %}
+    {# how many no-spend days bring the reduced daily back — MIRRORS the
+       line under the note on Today.tsx #}
+    <div class="sub" style="font-size:12px;margin-top:.1rem;">{{ a.recover_note }}</div>
+    {% endif %}
+  </div>
+  {% endfor %}
+  {% endif %}
+  {# PINNED BILLS — bills flagged "pin to Today" in their settings. MIRRORS
+     the Pinned bills tiles on Today.tsx; sentences come composed from
+     build_context (bill_cards), so the two surfaces cannot drift. #}
+  {% if day.bill_cards %}
+  <div class="sub" style="letter-spacing:.08em;text-transform:uppercase;font-size:11.5px;margin:1rem 0 .45rem;">Pinned bills</div>
+  {% for c in day.bill_cards %}
+  {# map-style row; number under the label, left — the pane's one
+     anatomy #}
+  <div style="margin-top:.7rem;">
+    {# the label opens the bill's history — only with a mailable base #}
+    {% if not email or app_base %}<a href="{{ (app_base ~ '/app' if email else '/app') ~ '/bills/history?payee=' ~ (c.label | urlencode) }}" style="color:inherit;text-decoration:none;"><b>{{ c.label }}</b></a>{% else %}<b>{{ c.label }}</b>{% endif %}
+    <div class="{{ 'neg' if c.over else '' }}" style="font-size:22px;font-weight:750;letter-spacing:-.015em;line-height:1.15;">{{ money(c.left) }}</div>
+    <div class="sub" style="font-size:12px;">{{ 'left · ' if c.kind == 'envelope' else 'to go · ' }}{{ c.sub }}</div>
+    {# post tick at today's position in the card's period — MIRRORS the
+       tick on the SPA row's meter (the mapbar pace idiom) #}
+    {{ meter6([3, (c.frac * 100) | round] | max, [99, (c.pace_frac * 100) | round(1)] | min, c.over, h=14, r=7) }}
+    {% if c.status %}
+    <div class="sub{{ ' ' + c.status_tone if c.status_tone else '' }}" style="font-size:12px;margin-top:.1rem;">{{ c.status }}</div>
+    {% endif %}
+  </div>
+  {% endfor %}
+  {% endif %}
+  {% if st.variable_scale %}
+  <div class="sub" style="margin-top:.4rem;color:var(--amber);">Variable budgets auto-scaled from {{ money(st.variable_scale.static_total) }} to fit this month's bills.</div>
+  {% endif %}
+  {% if st.runway and st.runway.balance_unreliable %}
+  <div style="margin-top:.6rem;border-top:1px solid var(--line);padding-top:.5rem;font-size:.85rem;">
+    <b>Cash forecast is waiting on your balance</b> — imported accounts start
+    at $0, so the cash numbers can't be trusted yet.
+    {% if email %}Set today's checking balance on the Accounts page and everything comes alive.
+    {% else %}<a href="/accounts">Set today's checking balance on Accounts</a> and everything comes alive.{% endif %}
+  </div>
+  {% elif cash and cash.state == 'critical' %}
+  <div style="margin-top:.6rem;border-top:1px solid var(--line);padding-top:.5rem;font-size:.85rem;color:var(--red);">
+    {% if cash.kind == 'today' %}Short <b>{{ money(cash.short) }}</b> today — checking doesn't cover cards &amp; bills before the next paycheck. Cover it from savings{% if cash.slow_to is not none %}, or slow spending to <b>{{ money(cash.slow_to) }}/day</b>{% endif %}.
+    {% else %}Short <b>{{ money(cash.short) }}</b> by <b>{{ cash.by|d if cash.by else 'now' }}</b> — cover it from savings{% if cash.slow_to is not none %}, or slow spending to <b>{{ money(cash.slow_to) }}/day</b>{% endif %}.{% endif %}
+  </div>
+  {% elif cash %}
+  <div class="sub" style="margin-top:.6rem;border-top:1px solid var(--line);padding-top:.5rem;font-size:.85rem;">
+    {% if cash.kind == 'forecast' %}Cash gets tight around {{ cash.low_date|d }} (low {{ money(cash.low) }}).
+    {% else %}Cash is tight — {{ money(cash.headroom) }} left after cards &amp; bills before the next paycheck.{% endif %}
+  </div>
+  {% endif %}
+  {# the WHY, over-budget only — a good day is QUIET: merchant chips,
+     then the per-category sentences. MIRRORS Today.tsx; mail has
+     no <details>, so the sentences render expanded here. #}
+  {% if day.why_chips %}
+  <div style="margin-top:.9rem;border-top:1px solid var(--line);padding-top:.75rem;">
+    {# inline-block chips, NOT a flex row: Gmail on Android strips
+       flex-wrap, and five nowrap chips in an unwrappable flex row run
+       off the right edge of the phone. Inline-block wraps in every
+       client. #}
+    <div>
+      <span class="neg" style="font-weight:700;font-size:13px;white-space:nowrap;">Driving it:</span>
+      {% for c in day.why_chips %}
+      <span style="display:inline-block;background:var(--hover);border:1px solid var(--line);border-radius:999px;padding:.12rem .6rem;font-size:12.5px;white-space:nowrap;margin:0 .25rem .3rem 0;">{{ c.payee | truncate(26, True) }} <b class="neg">{{ money(c.amount) }}</b>{% if c.count > 1 %} <span class="sub">{{ c.count }}×</span>{% endif %}</span>
+      {% endfor %}
+    </div>
+    {% for e in (st.why.entries if st.why else []) %}
+    <div style="margin-top:.35rem;"><strong>{{ e.name }}</strong>
+      <span class="{{ 'neg' if e.tone == 'over' else 'pos' if e.tone == 'under' else 'sub' }}">{{ e.text }}</span></div>
+    {% endfor %}
+    {# the over-budget way back, composed server-side with the rest of
+       the Why — the Today page and the app render the same sentence #}
+    {% if st.why and st.why.recovery %}
+    <div class="sub" style="margin-top:.35rem;">{{ st.why.recovery }}</div>
+    {% endif %}
+  </div>
+  {% endif %}
+  {# "This month's plan" demoted to ONE flow line — monthly facts, not
+     daily news; the Budget page owns the detail #}
+  {% if st.plan_surplus is not none and view == 'detail' %}
+  <div style="margin-top:.9rem;padding-top:.7rem;border-top:1px solid var(--line);font-size:13px;{% if not email %}display:flex;gap:.55rem;flex-wrap:wrap;align-items:baseline;{% endif %}">
+    <span class="sub">Plan:</span>
+    <span class="sub"><b style="color:var(--ink);">{{ money(st.income) }}</b> in</span>
+    <span style="color:var(--line);">&#8594;</span>
+    <span class="sub"><b style="color:var(--ink);">{{ money(st.buckets.fixed.month_budget) }}</b> bills</span>
+    <span style="color:var(--line);">&#8594;</span>
+    <span class="sub"><b style="color:var(--ink);">{{ money(var_budget) }}</b> to spend</span>
+    <span style="color:var(--line);">&#8594;</span>
+    {% if st.savings_plan and st.savings_plan > 0.005 %}
+    <span class="sub"><b style="color:var(--ink);">{{ money(st.savings_plan) }}</b> saved</span>
+    <span style="color:var(--line);">&#8594;</span>
+    {% endif %}
+    <span class="sub"><b class="{{ 'pos' if st.plan_surplus >= 0 else 'neg' }}">{{ money(st.plan_surplus) }}</b> excess</span>
+    {# sweep goals sit beside the chain, not inside it — the sentence is
+       composed once in build_context so no surface can drift #}
+    {% if day.sweep_line %}<span class="sub">· {{ day.sweep_line }}</span>{% endif %}
+    {% if not email %}<a href="/app/budget" style="margin-left:auto;font-size:12px;">balance the budget →</a>{% endif %}
+  </div>
+  {% endif %}
+</div>
+
+{# below the verdict pane renders only in DETAIL view — the view scopes
+   the WHOLE page. On the page `view` is the
+   today_view toggle; in email it is the email settings' summary/detail
+   choice (`face`), deliberately independent. `not summary` is belt and
+   braces — a summary email is already view=summary. Page renders never
+   pass `summary`. #}
+{% if not summary and view == 'detail' %}
+{# ---- savings goals — ledger-verified progress + pace:
+      only when a TRACKABLE goal exists (mirrors Today.tsx) ---- #}
+{% set goals = st.savings_goals or [] %}
+{% if goals | rejectattr('plan_only') | list %}
+<div class="card" style="margin-top:1rem;">
+  <div class="sub" style="text-transform:uppercase;letter-spacing:.03em;">Savings goals</div>
+  {% for g in goals %}
+  {% if not (g.plan_only and not g.monthly_plan and not g.target) %}
+  <div style="margin-top:.55rem;">
+    <div style="{% if not email %}display:flex;gap:.6rem;flex-wrap:wrap;align-items:baseline;{% endif %}">
+      <b>{{ g.name }}</b>
+      {% if g.plan_only %}
+      <span class="mut" style="font-size:13px;">plan {{ money(g.monthly_plan) }}/mo</span>
+      <span class="mut" style="font-size:13px;margin-left:auto;">plan only — set a destination account on the Budget page to track progress</span>
+      {% else %}
+      {# open-ended goal (no target): "$X saved" + the measured rate —
+         never "of $0" (mirrors Today.tsx) #}
+      <span class="mut" style="font-size:13px;">{{ money(g.saved or 0) }}{% if g.target %} of {{ money(g.target) }}{% else %} saved{% endif %}{% if g.pct is not none %} ({{ g.pct }}%){% endif %}</span>
+      <span class="mut" style="font-size:13px;margin-left:auto;">
+        {%- if not g.target %}{% if (g.rate_90d or 0) > 0 %}saving {{ money(g.rate_90d) }}/mo{% else %}no contributions in 90 days{% endif %}
+        {%- elif g.pct is not none and g.pct >= 100 %}funded ✓
+        {%- elif g.on_pace is false %}<b class="neg">off pace for {{ g.target_date|d }}</b>
+        {%- elif g.on_pace %}on pace for {{ g.target_date|d }}
+        {%- elif g.eta %}~{{ g.eta|d }} at the current rate
+        {%- else %}no contributions in 90 days{% endif %}</span>
+      {% endif %}
+    </div>
+    {% if not g.plan_only and g.target %}
+    <table cellpadding="0" cellspacing="0" width="100%" role="presentation"
+           style="border-collapse:collapse;table-layout:fixed;background:var(--hover);border-radius:7px;margin-top:4px;">
+      <tr>
+      {% set pct = [[g.pct or 0, 0]|max, 100]|min %}
+      {% if pct > 0.3 %}<td style="width:{{ pct }}%;height:14px;font-size:0;line-height:0;padding:0;border:none;background:var(--green);">&nbsp;</td>{% endif %}
+      <td style="height:14px;font-size:0;line-height:0;padding:0;border:none;">&nbsp;</td>
+      </tr>
+    </table>
+    {% endif %}
+  </div>
+  {% endif %}
+  {% endfor %}
+</div>
+{% endif %}
+
+{# ---- where it's going — the money map, bars only (its headline
+      moved into the hero card; plan-only rows fold into the footer line;
+      the legend prints only when a state it explains is on screen) ---- #}
+<div class="card" style="margin-top:1rem;">
+  <h2 style="margin-top:0;">Monthly budget</h2>
+  {% for row in map.rows %}
+  <div style="margin:.55rem 0;">
+    <div style="font-size:13px{% if row.indent %};padding-left:1.5rem{% endif %};">
+      {% if row.to and (not email or app_base) %}<a href="{{ (app_base ~ '/app' ~ row.to) if email else ('/app' ~ row.to) }}" style="color:inherit;text-decoration:none;">{{ row.label }}</a>{% else %}<span>{{ row.label }}</span>{% endif %}
+      <span class="sub">{{ row.actual_label or money(row.actual) }} / {{ '—' if row.unbudgeted else money(row.budget) }}{% if row.delta %} <span style="color:{{ row.delta.color }};font-weight:600;">{{ row.delta.text }}</span>{% endif %}</span></div>
+    <div{% if row.indent %} style="padding-left:1.5rem;"{% endif %}>
+    {{ mapbar(row) }}
+    </div>
+    {% if row.unbudgeted %}
+    <div class="sub" style="font-size:11px;margin-top:1px;color:var(--amber){% if row.indent %};padding-left:1.5rem{% endif %};">no budget set — set one on the Budget page so this counts toward the verdict</div>
+    {% elif row.caption %}
+    <div class="sub" style="font-size:11px;margin-top:1px{% if row.indent %};padding-left:1.5rem{% endif %};">{{ row.caption }}</div>
+    {% endif %}
+  </div>
+  {% endfor %}
+  {% if map.has_overflow or map.has_pending %}
+  <div class="sub" style="font-size:11px;margin-top:.5rem;">
+    {%- if map.has_overflow %}dark red is past the budget{% endif %}
+    {%- if map.has_overflow and map.has_pending %} · {% endif %}
+    {%- if map.has_pending %}amber is awaiting{% endif %}</div>
+  {% endif %}
+  {% if map.folded or st.irregular_bills or st.overdue_unpaid %}
+  <div class="sub" style="font-size:12px;margin-top:.5rem;">
+    {%- if map.folded %}Also this month: {{ map.folded | join(' · ') }}{% endif %}
+    {%- if map.folded and st.irregular_bills %} · {% endif %}
+    {%- if st.irregular_bills %}non-monthly bills: {% for i in st.irregular_bills[:4] %}{{ i.payee }} <b>{{ money(i.amount) }}</b> ({{ i.label }}){{ ' · ' if not loop.last }}{% endfor %}{% endif %}
+    {%- if (map.folded or st.irregular_bills) and st.overdue_unpaid %}<br>{% endif %}
+    {%- if st.overdue_unpaid %}Scheduled but not yet posted: {% for p, a, due in st.overdue_unpaid[:4] %}{{ p }} {{ money(a) }} (due {{ due|d }}){{ ', ' if not loop.last }}{% endfor %}{% endif %}
+  </div>
+  {% endif %}
+</div>
+
+{# ---- cash timeline: cash's ONE home — the
+      checking/cards/after KPIs, the chart (web only), and recent posted
+      activity flowing into the scheduled events across a TODAY divider.
+      Events show through the forecast low point; the email says how many
+      more there are instead of printing them. ---- #}
+{% set rw = st.runway %}
+{% if fc or day.recent_var or tl_past %}
+<div class="card" style="margin-top:1rem;">
+  <h2 style="margin-top:0;">Cash timeline
+    <span class="sub" style="font-weight:400;">
+      {%- if fc %} recent activity &amp; next {{ fc.days }} days
+      {%- else %} ({{ st.yesterday|d }} – {{ st.today|d }} · variable spending {{ money(day.recent_var|map(attribute='amount')|sum) }}){% endif %}</span></h2>
+  {% if fc %}
+  {# inline-block KPI tiles, not a flex row: Gmail strips flex-wrap and
+     squeezes four tiles into unreadable slivers #}
+  <div>
+    <div style="display:inline-block;vertical-align:top;margin:0 1.4rem .5rem 0;"><span class="sub">checking now</span>
+      <div class="kpi sm {{ 'neg' if fc.checking < 0 else '' }}">{{ money(fc.checking) }}</div></div>
+    <div style="display:inline-block;vertical-align:top;margin:0 1.4rem .5rem 0;"><span class="sub">card debt</span>
+      <div class="kpi sm">{{ money(fc.card_debt) }}</div></div>
+    {% if rw and rw.checking is not none and st.bills_remaining_month is not none %}
+    <div style="display:inline-block;vertical-align:top;margin:0 1.4rem .5rem 0;"><span class="sub" title="checking − card debt − bills still due this month">after cards &amp; bills</span>
+      <div class="kpi sm {{ 'pos' if rw.checking - rw.card_debt - st.bills_remaining_month >= 0 else 'neg' }}">{{ money(rw.checking - rw.card_debt - st.bills_remaining_month) }}</div></div>
+    {% endif %}
+    {% if fc_lows_converged %}
+    {% set l0 = fc_lows[0] %}
+    <div style="display:inline-block;vertical-align:top;margin:0 1.4rem .5rem 0;"><span class="sub">low point</span>
+      <div class="kpi sm {{ 'neg' if l0.min < 0 else '' }}">{{ money(l0.min) }} <span class="sub">{{ l0.min_date|d }}</span></div>
+      {% set negs = fc_lows | selectattr('negative_date') | list %}
+      {% if negs %}
+      {% set negdates = negs | map(attribute='negative_date') | unique | list %}
+      <div class="sub" style="font-size:11px;">
+        {%- if negdates | length == 1 %}negative from {{ negdates[0]|d }}
+        {%- else %}negative from:
+        {% for l in negs %}{{ l.short }} {{ l.negative_date|d }}{{ " · " if not loop.last }}{% endfor %}
+        {%- endif %}</div>
+      {% endif %}
+    </div>
+    {% else %}
+    {% for l in fc_lows %}
+    <div style="display:inline-block;vertical-align:top;margin:0 1.4rem .5rem 0;"><span class="sub">low — {{ l.label }}</span>
+      <div class="kpi sm {{ 'neg' if l.min < 0 else '' }}">{{ money(l.min) }} <span class="sub">{{ l.min_date|d }}</span></div>
+      {% if l.negative_date %}
+      <div class="sub" style="font-size:11px;">negative from {{ l.negative_date|d }}</div>
+      {% endif %}
+    </div>
+    {% endfor %}
+    {% endif %}
+  </div>
+  {# the SVG chart is web-only — mail clients strip SVG. The email carries
+     the same chart as a PNG (emailchart.render), inline in the message. #}
+  {% if not email %}{{ fc_chart | safe }}
+  {% elif fc_email_chart %}<img src="{{ fc_email_chart }}" width="616" alt="Cash forecast chart: autopay statement balance and pay all cards now, next {{ fc.days }} days" style="display:block;width:100%;max-width:616px;height:auto;border:0;margin:10px 0 6px;">
+  {% endif %}
+  {% endif %}
+  {# one chronological table: paid ✓ rows + recent transactions, the TODAY
+     divider, then the scheduled events. transaction-table convention:
+     amounts statement-signed — spending negative, money in
+     positive+green; cents on transaction rows only. #}
+  {% set balcols = 1 if (fc_lows_converged or not fc) else 2 %}
+  <table class="stack-m" style="margin-top:.6rem;"><thead><tr><th>Date</th><th>Event</th><th class="num">Amount</th>
+    {% if balcols == 1 %}<th class="num">Balance</th>
+    {% else %}<th class="num hide-m">Pay cards now</th><th class="num">Autopay stmt</th>{% endif %}</tr></thead><tbody>
+  {% for d0, a, pyee, bn, bs in tl_past %}
+  <tr><td class="mut r2l" style="white-space:nowrap;width:1%;">{{ d0|d }}</td>
+      <td class="mut r1l" style="{% if not email %}overflow:hidden;text-overflow:ellipsis;white-space:nowrap{% else %}word-break:break-word{% endif %};">{{ pyee }}</td>
+      <td class="num r1r mut" style="white-space:nowrap;">{{ money(a) }}</td>
+      <td class="num r2r mut" style="white-space:nowrap;">·</td>
+      {% if balcols == 2 %}<td class="num mut hide-m" style="white-space:nowrap;">·</td>{% endif %}</tr>
+  {% endfor %}
+  {% for r in day.recent_var %}
+  <tr><td class="mut r2l" style="white-space:nowrap;width:1%;">{{ r.date|d }}</td>
+      <td class="r1l" style="{% if not email %}overflow:hidden;text-overflow:ellipsis;white-space:nowrap{% else %}word-break:break-word{% endif %};">{% set s = day.summaries.get(r.txn_id) %}{% if s %}{{ r.payee }} — <i>{{ s }}</i>{% else %}{{ r.payee }}{% endif %}{% if r.pending %} <span class="pill m">pend</span>{% endif %} <span class="sub">· {{ r.category }}</span></td>
+      <td class="num r1r {{ 'pos' if r.amount < 0 else '' }}" style="white-space:nowrap;">{{ moneyc(-r.amount) }}</td>
+      <td class="num r2r mut" style="white-space:nowrap;">·</td>
+      {% if balcols == 2 %}<td class="num mut hide-m" style="white-space:nowrap;">·</td>{% endif %}</tr>
+  {% endfor %}
+  {% if fc %}
+  <tr><td colspan="{{ 3 + balcols }}" style="border-bottom:1px solid var(--blue);padding:.3rem .55rem;">
+      <b style="font-size:12px;color:var(--blue);">TODAY</b>
+      <span class="sub"> · checking {{ money(fc.checking) }} · recent variable spending {{ money(day.recent_var|map(attribute='amount')|sum) }}</span></td></tr>
+  {% for d0, a, pyee, bn, bs in tl_pre %}
+  <tr><td class="mut r2l" style="white-space:nowrap;width:1%;">{{ d0|d }}</td>
+      {# email: let a long payee WRAP. text-overflow:ellipsis needs a width
+         a mail client won't compute, so nowrap pushes the row off the
+         card on a phone. #}
+      <td class="r1l {{ 'mut' if bn is none else '' }}" style="{% if not email %}overflow:hidden;text-overflow:ellipsis;white-space:nowrap{% else %}word-break:break-word{% endif %};">{{ pyee }}</td>
+      <td class="num r1r {{ 'mut' if bn is none else ('pos' if a>0 else '') }}" style="white-space:nowrap;">{{ money(a) }}</td>
+      {% if balcols == 1 %}
+      <td class="num r2r {{ 'neg' if bs is not none and bs < 0 else 'mut' }}" style="white-space:nowrap;">{{ money(bs) if bs is not none else '·' }}</td>
+      {% else %}
+      <td class="num hide-m {{ 'neg' if bn is not none and bn < 0 else 'mut' }}" style="white-space:nowrap;">{{ money(bn) if bn is not none else '·' }}</td>
+      <td class="num r2r {{ 'neg' if bs is not none and bs < 0 else 'mut' }}" style="white-space:nowrap;">{{ money(bs) if bs is not none else '·' }}</td>
+      {% endif %}</tr>
+  {% endfor %}
+  {% endif %}
+  </tbody></table>
+  {% if fc and tl_rest > 0 %}
+  <div class="sub" style="font-size:12px;margin-top:.45rem;">
+    {%- if email %}+ {{ tl_rest }} more scheduled event{{ '' if tl_rest == 1 else 's' }} after the low point — open Oikonome for the full timeline
+    {%- else %}+ {{ tl_rest }} more scheduled event{{ '' if tl_rest == 1 else 's' }} after the low point{% endif %}</div>
+  {% endif %}
+</div>
+{% endif %}
+
+{% endif %}{# /summary gate #}

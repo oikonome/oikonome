@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/app/icon.svg" />
+    <link rel="manifest" href="/app/manifest.webmanifest" />
+    <!-- iOS reads none of the manifest's icons and ignores SVG outright, so
+         without this line a home-screen install shows a screenshot of the
+         page instead of the mark. 180px, opaque, unrounded — iOS applies its
+         own squircle. -->
+    <link rel="apple-touch-icon" href="/app/apple-touch-icon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#0f141a" />
+    <!-- standalone home-screen launch: mobile-web-app-capable is the standard
+         name, the apple- one is what iOS still actually honours. iOS also
+         ignores theme-color, hence its own status-bar style; black-translucent
+         puts the app behind the status bar, which the dark surface wants. -->
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Oikonome" />
+    <title>Oikonome</title>
+    <!-- render-blocking on purpose: sets the pinned theme before first
+         paint; external file because the SPA CSP is script-src 'self' -->
+    <script src="/app/theme-boot.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+{% block body %}
+{# per-tenant drill-down — the support view. Control-plane rows
+   and health only; tenant DATA stays out (console doctrine). #}
+<h1>Tenant — {{ tenant.name or tenant.id }}</h1>
+<p class="sub"><a href="/admin/console">‹ back to console</a> ·
+  created {{ tenant.created_at.strftime('%m/%d/%y') }} ·
+  status <span class="pill {{ 'g' if tenant.status == 'active' else 'r' }}">{{ tenant.status }}</span>{% if tenant.status in (frozen_statuses or []) and tenant.delete_after %} <span class="pill r">purges {{ tenant.delete_after.strftime('%m/%d/%y') }}</span>{% endif %} ·
+  {{ counts.accounts }} accounts · {{ counts.txns }} transactions ·
+  {{ counts.items }} live connections
+  {% include "ext/tenant_pill.html" ignore missing %}
+  support access <span class="pill {{ 'a' if consent else 'm' }}">{% if consent %}granted, expires {{ consent.expires_at.strftime('%m/%d/%y %H:%M') }}{% else %}none{% endif %}</span></p>
+
+{% if msg %}<p class="note">{{ msg }}</p>{% endif %}
+
+{% include "ext/tenant_section_a.html" ignore missing %}
+
+<div style="display:flex;gap:.5rem;flex-wrap:wrap;margin:.6rem 0 1rem">
+  <form method="post" action="/admin/console/sync-now" style="display:inline;margin:0">
+    <input type="hidden" name="tenant_id" value="{{ tenant.id }}">
+    <button>sync now ↻</button>
+  </form>
+  {% if tenant.status == 'suspended' %}
+  <form method="post" action="/admin/console/tenant-status" style="display:inline;margin:0">
+    <input type="hidden" name="tenant_id" value="{{ tenant.id }}">
+    <input type="hidden" name="to" value="active">
+    <button>reactivate</button>
+  </form>
+  {% else %}
+  <form method="post" action="/admin/console/tenant-status" style="display:inline;margin:0"
+        data-confirm="Suspend this tenant? Every request 403s until reactivated.">
+    <input type="hidden" name="tenant_id" value="{{ tenant.id }}">
+    <input type="hidden" name="to" value="suspended">
+    <button style="color:var(--red)">suspend</button>
+  </form>
+  {% endif %}
+  {# export is a data-touching action — audited; the console
+     shows the tenant's support-consent state next to it #}
+  <form method="post" action="/admin/console/tenant-export" style="display:inline;margin:0"
+        data-confirm="Export this tenant's data to a downloadable archive? This is a data-access action and is audited.">
+    <input type="hidden" name="tenant_id" value="{{ tenant.id }}">
+    <button style="font-size:12px">export data ⭳</button>
+  </form>
+  {% if tenant.status in (frozen_statuses or []) %}
+  <form method="post" action="/admin/console/tenant-restore"
+        style="display:inline-flex;gap:.4rem;margin:0 0 0 1.2rem;align-items:center">
+    <input type="hidden" name="tenant_id" value="{{ tenant.id }}">
+    <button style="font-size:12px">{{ 'restore (cancel deletion)' if tenant.status == 'pending_delete' else 'reactivate' }}</button>
+  </form>
+  {% else %}
+  {# grace delete (default) — freezes now, purges after the window #}
+  <form method="post" action="/admin/console/tenant-delete" id="danger"
+        style="display:inline-flex;gap:.4rem;margin:0 0 0 1.2rem;align-items:center"
+        data-confirm="Schedule this tenant for deletion? It freezes now and the worker wipes it after the grace window — restorable until then.">
+    <input type="hidden" name="tenant_id" value="{{ tenant.id }}">
+    <input type="hidden" name="mode" value="grace">
+    <input name="confirm" placeholder="type owner email to confirm"
+           style="font-size:12px;width:14rem">
+    <button style="font-size:12px;color:var(--red)">schedule delete</button>
+  </form>
+  {# data-admin-stepup — pages.js collects a fresh single-use
+     passkey assertion into the hidden field before submitting, the same
+     browser half restore/reset/uninstall already use. The server refuses
+     an immediate purge without it whenever a key is enrolled. #}
+  <form method="post" action="/admin/console/tenant-delete"
+        style="display:inline-flex;gap:.4rem;margin:0;align-items:center"
+        data-admin-stepup
+        data-confirm="Delete this tenant IMMEDIATELY and PERMANENTLY? No grace window — only backups can bring it back.">
+    <input type="hidden" name="tenant_id" value="{{ tenant.id }}">
+    <input type="hidden" name="mode" value="immediate">
+    <input type="hidden" name="stepup" value="">
+    <input name="confirm" placeholder="owner email"
+           style="font-size:12px;width:11rem">
+    <button style="font-size:12px;color:var(--red)">delete now</button>
+  </form>
+  {% endif %}
+</div>
+
+<h2>Users</h2>
+<div class="card">
+  <table>
+    <tr><th>Email</th><th>Role</th><th>Created</th><th>Verified</th><th>2FA</th><th></th></tr>
+    {% for u in users %}
+    <tr><td>{{ u.email }}</td><td>{{ u.role }}</td>
+        <td>{{ u.created_at.strftime('%m/%d/%y') }}</td>
+        <td>{% if u.verified_at %}<span class="pill g">yes</span>{% else %}<span class="pill a">no</span>{% endif %}</td>
+        <td>{% if u.totp %}<span class="pill g">TOTP</span>{% endif %}{% if u.passkeys %} <span class="pill g">{{ u.passkeys }} passkey{{ '' if u.passkeys == 1 else 's' }}</span>{% endif %}{% if not u.totp and not u.passkeys %}<span class="mut">—</span>{% endif %}</td>
+        <td>{% if not u.verified_at %}
+          <form method="post" action="/admin/console/resend-verification" style="display:inline;margin:0">
+            <input type="hidden" name="user_id" value="{{ u.id }}">
+            <button style="font-size:12px;padding:.15rem .5rem">resend verification</button>
+          </form>{% endif %}
+          {% if u.totp or u.passkeys %}
+          {# the lost-everything door: verify who is asking OUT OF BAND
+             first — the typed address is the operator asserting they did #}
+          <form method="post" action="/admin/console/clear-2fa" style="display:inline;margin:0"
+                onsubmit="return confirm('Clear the second factor for {{ u.email }}? TOTP, passkeys and recovery codes go, every session and device is signed out, and they are emailed. Only after verifying who is asking.')">
+            <input type="hidden" name="user_id" value="{{ u.id }}">
+            <input name="confirm" placeholder="type their email" required
+                   style="font-size:12px;padding:.15rem .4rem;width:12rem;background:var(--hover);border:1px solid var(--line);border-radius:var(--rs);color:var(--ink)">
+            <button style="font-size:12px;padding:.15rem .5rem;color:var(--red)">clear second factor</button>
+          </form>{% endif %}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+<h2>Active sessions <span class="sub">(last 10)</span></h2>
+<div class="card">
+  <table>
+    <tr><th>Device</th><th>Signed in</th><th>Last seen</th></tr>
+    {% for s in sessions %}
+    <tr><td class="sub">{{ (s.user_agent or '?')[:70] }}</td>
+        <td>{{ s.created_at.strftime('%m/%d/%y %H:%M') }}</td>
+        <td>{{ s.last_seen.strftime('%m/%d/%y %H:%M') if s.last_seen else '—' }}</td></tr>
+    {% else %}
+    <tr><td colspan="3" class="mut">No active sessions.</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+<h2>Sync log <span class="sub">(last 20 runs)</span></h2>
+<div class="card">
+  <table>
+    <tr><th>When</th><th>Item</th><th class="num">Added</th><th>Error</th></tr>
+    {% for r in synclog %}
+    <tr><td>{{ r.ran_at.strftime('%m/%d/%y %H:%M') }}</td><td>{{ r.item_id or "—" }}</td>
+        <td class="num">{{ r.added }}</td>
+        <td class="sub">{% if r.error %}<span class="pill r">err</span> {{ r.error[:80] }}{% else %}—{% endif %}</td></tr>
+    {% else %}
+    <tr><td colspan="4" class="mut">No sync runs recorded.</td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% endblock %}

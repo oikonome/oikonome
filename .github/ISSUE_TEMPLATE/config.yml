@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & setup help
+    url: https://github.com/oikonome/oikonome/discussions/categories/q-a
+    about: How-do-I questions and setup help — ask in Discussions, where other self-hosters can answer too.
+  - name: Ideas & feature requests
+    url: https://github.com/oikonome/oikonome/discussions/categories/ideas
+    about: Not sure it is a concrete request yet? Float it in Discussions first; a 👍 on an issue is a vote once it is.
+  - name: Hosted service (oikonome.com)
+    url: https://oikonome.com/support
+    about: Questions about an account on the hosted service go to support@oikonome.com, not this tracker — never post account details in a public issue.
+  - name: Security vulnerabilities
+    url: https://github.com/oikonome/oikonome/blob/main/SECURITY.md
+    about: Report privately to security@oikonome.com — please don't open a public issue.

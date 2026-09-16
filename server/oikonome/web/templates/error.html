@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{# branded error page for browser-facing routes (404/500). The
+   base shell already carries the open-arc mark + wordmark above the card,
+   matching the login/signup/forgot pages; API routes never render this —
+   they keep JSON errors (the SPA and integrations parse them). #}
+{% block body %}
+<div class="card" style="max-width:26rem;text-align:center">
+  <h1 style="margin-top:.2rem">{{ heading }}</h1>
+  <p class="mut">{{ message }}</p>
+  {% if quote %}
+  {# a classical garnish, never the functional message — οἰκονόμος is a
+     Greek word, so the house style gets to wink in Greek #}
+  <blockquote class="mut" style="margin:1rem 0 .4rem;font-style:italic">
+    <span lang="grc">{{ quote[0] }}</span><br>
+    <span class="sub">{{ quote[1] }}<br>— {{ quote[2] }}</span>
+  </blockquote>
+  {% endif %}
+  <p style="margin-bottom:.2rem"><a href="/app/">Back to Oikonome</a></p>
+</div>
+{% endblock %}

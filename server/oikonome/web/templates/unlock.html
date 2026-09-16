@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block body %}
+{% if not confirmed %}<h1>Sign-in help</h1>{% endif %}
+<div class="card{{ ' ok-card' if confirmed }}" style="max-width:26rem">
+  {% if confirm_token %}
+  {# The emailed unlock GET only PEEKS. Burning a one-time token on a GET
+     means any mail scanner or prefetcher spends it before the human clicks —
+     so the actual use is this explicit POST. Same split as
+     /admin/approve-request and /reset. (Email verification is the one
+     link that IS spent on the click — see app._verify_email_act.) #}
+  <p>Ready to unlock sign-in for <b>{{ email }}</b>.</p>
+  <p class="sub">This does not sign you in — you will still enter your
+    password on the next screen.</p>
+  <form method="post" action="/unlock/confirm">
+    <input type="hidden" name="token" value="{{ confirm_token }}">
+    <button class="pri">Continue to sign in</button>
+  </form>
+  {% elif confirmed %}
+  {# The response carries a Refresh header (no inline script under the
+     CSP) that forwards to sign-in in four seconds; the bar under the
+     button counts those seconds down so the forward is visible, not just
+     claimed, and the button is for anyone who does not want to wait (or
+     a browser that ignores the header). All animation is CSS. #}
+  <div class="ok-wrap">
+    <div class="ok-badge"><svg viewBox="0 0 100 100" aria-hidden="true"><path d="M26 52 L44 69 L75 34"/></svg></div>
+    <p class="ok-h">Email confirmed</p>
+    <p class="ok-sub"><b>{{ email }}</b> is verified.<br>Taking you to sign in…</p>
+    <a class="ok-btn" href="/login?verified=1">Sign in now</a>
+    <div class="ok-timer" aria-hidden="true"><i></i></div>
+  </div>
+  {% elif sent %}
+  <p>{{ message }}</p>
+  <p class="sub">The link is valid for 30 minutes and works once. It does not
+    sign you in by itself — you will still need your password. Self-hosted
+    instances without email configured print the link to the server log.</p>
+  {% else %}
+  {% if error %}<div class="note" style="margin-bottom:.8rem;background:rgba(224,105,93,.10);border-color:rgba(224,105,93,.4);color:var(--red)">{{ error }}</div>{% endif %}
+  <p class="sub" style="margin-top:0">Stuck on the security check — no
+    checkbox, or one you can't complete? It needs JavaScript from
+    Cloudflare, which some browsers, extensions and company networks block.
+    We can email you a link that lets you sign in without it.</p>
+  {# No human check on this form ON PURPOSE: it is the way out for people who
+     cannot answer one, so gating it would be a third locked door. Mail abuse
+     is capped per ADDRESS in login_unlock, which a botnet cannot spread out
+     of, plus the per-IP limit on this route. #}
+  <form method="post" action="/unlock">
+    <p><label>Email<br><input type="email" name="email" required
+        style="width:100%;padding:.5rem;background:var(--hover);border:1px solid var(--line);border-radius:var(--rs);color:var(--ink)"></label></p>
+    <button class="pri">Email me a sign-in link</button>
+  </form>
+  {% endif %}
+  {% if not confirmed %}
+  <p class="sub" style="margin-top:.8rem"><a href="/login">Back to sign in</a>
+    · <a href="/forgot">Forgot password?</a></p>
+  {% endif %}
+</div>
+{% endblock %}

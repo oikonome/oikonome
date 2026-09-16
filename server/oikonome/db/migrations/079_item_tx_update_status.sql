@@ -1,0 +1,11 @@
+-- Plaid delivers two years of history ASYNCHRONOUSLY after a link: the
+-- first /transactions/sync returns whatever is ready (often ~30 days) and
+-- the rest lands over the following minutes. Income/bill detection run
+-- against that first sliver finds almost nothing, so the setup wizard
+-- needs to know where an item stands.
+-- /transactions/sync reports transactions_update_status on every page;
+-- keep the latest value per item so "is the backfill done" is a column
+-- read, not a Plaid call. NULL for non-Plaid aggregators and for items
+-- last synced before this column existed (treated as complete — their
+-- backfill finished long ago).
+ALTER TABLE items ADD COLUMN IF NOT EXISTS tx_update_status TEXT;

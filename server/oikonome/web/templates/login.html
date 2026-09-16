@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block body %}
+<div class="card" style="max-width:26rem">
+  <div id="demo-note" class="note" style="display:none;margin-bottom:.8rem;background:rgba(230,177,89,.10);border-color:rgba(230,177,89,.4)"></div>
+  {% if notice %}<div class="note" style="margin-bottom:.8rem;background:rgba(92,181,107,.10);border-color:rgba(92,181,107,.4);color:var(--green)">{{ notice }}</div>{% endif %}
+  <div id="login-err" class="note" style="{% if not error %}display:none;{% endif %}margin-bottom:.8rem;background:rgba(224,105,93,.10);border-color:rgba(224,105,93,.4);color:var(--red)">{% if error %}{{ error }}{% endif %}</div>
+  {# Two-step sign-in (pages.js → /api/login): step 1 email+password, step 2
+     code only (password kept in JS memory, never re-typed). Server-rendered
+     need_totp / passkey_only is the no-JS fallback and must re-ask password. #}
+  {% set step2 = need_totp or passkey_only %}
+  <form method="post" action="/login" id="login-form"
+        data-step="{{ '2fa' if step2 else 'cred' }}">
+    {% if not step2 %}
+    <div id="login-step-cred">
+      <p><label>Email<br><input type="email" name="email" required
+          value="{{ email or '' }}" autocomplete="username"
+          style="width:100%;padding:.5rem;background:var(--hover);border:1px solid var(--line);border-radius:var(--rs);color:var(--ink)"></label></p>
+      <p><label>Password<br><input type="password" name="password" required
+          autocomplete="current-password"
+          style="width:100%;padding:.5rem;background:var(--hover);border:1px solid var(--line);border-radius:var(--rs);color:var(--ink)"></label></p>
+    </div>
+    <div id="login-step-2fa" style="display:none">
+      <p class="sub" id="login-as" style="margin:0 0 .5rem"></p>
+      <p class="sub" id="login-2fa-hint" style="margin:0 0 .35rem">
+        6-digit authenticator code — or a one-time <b>recovery code</b> if you
+        lost your app. Prefer a passkey? Use the button below when enrolled.
+      </p>
+      <p><label id="login-2fa-label">Authenticator or recovery code<br>
+        <input name="totp_code" id="login-totp" autocomplete="one-time-code"
+          placeholder="6-digit code or recovery code"
+          style="width:100%;padding:.5rem;background:var(--hover);border:1px solid var(--line);border-radius:var(--rs);color:var(--ink);font-family:ui-monospace,monospace"></label></p>
+    </div>
+    {% else %}
+    {# no-JS / full-page re-render: password must be typed again #}
+    <div id="login-step-2fa">
+      <p class="sub" id="login-as" style="margin:0 0 .5rem">
+        {% if email %}Signing in as <b>{{ email }}</b>{% endif %}
+      </p>
+      <p class="sub" id="login-2fa-hint" style="margin:0 0 .35rem">
+        {% if passkey_only %}
+        This account signs in with a passkey. Use the button below, or paste a
+        one-time <b>recovery code</b> if you lost the device.
+        {% else %}
+        6-digit authenticator code — or a one-time <b>recovery code</b> if you
+        lost your app. Prefer a passkey? Use the button below when enrolled.
+        {% endif %}
+      </p>
+      <p><label id="login-2fa-label">{% if passkey_only %}Recovery code{% else %}Authenticator or recovery code{% endif %}<br>
+        <input name="totp_code" id="login-totp" required
+          autocomplete="{% if passkey_only %}off{% else %}one-time-code{% endif %}"
+          placeholder="{% if passkey_only %}xxxx-xxxx-xxxx-xxxx-xxxx{% else %}6-digit code or recovery code{% endif %}"
+          style="width:100%;padding:.5rem;background:var(--hover);border:1px solid var(--line);border-radius:var(--rs);color:var(--ink);font-family:ui-monospace,monospace"></label></p>
+      <p><label>Password<br><input type="password" name="password" required
+          autocomplete="current-password"
+          style="width:100%;padding:.5rem;background:var(--hover);border:1px solid var(--line);border-radius:var(--rs);color:var(--ink)"></label></p>
+      <input type="hidden" name="email" value="{{ email or '' }}">
+    </div>
+    {% endif %}
+    {# Turnstile lives INSIDE the form so the no-JS submit carries its
+       hidden cf-turnstile-response field. Absent when unconfigured, which
+       is every self-hosted instance.
+
+       data-required says whether the server will ENFORCE the token on this
+       attempt (sign-in is risk-gated — see turnstile.verify_login). When it
+       is 0, pages.js posts without waiting for a token, so a browser that
+       blocks the Cloudflare script signs in at full speed instead of pausing
+       for a challenge nobody is going to ask for.
+
+       data-callback resumes a parked sign-in the moment a token lands, so an
+       escalated widget is answered by the user rather than by a timer. #}
+    {% if turnstile_key %}
+    <div class="cf-turnstile" id="login-turnstile" data-sitekey="{{ turnstile_key }}"
+         data-theme="auto" data-appearance="interaction-only"
+         data-required="{{ '1' if turnstile_wait else '0' }}"
+         data-callback="oikoTurnstileToken"
+         style="margin:.6rem 0"></div>
+    {% endif %}
+    <button class="pri" id="login-submit" style="width:100%;padding:.5rem">
+      {% if step2 %}Sign in with code{% else %}Sign in{% endif %}
+    </button>
+  </form>
+  {% if turnstile_key %}
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js"
+          async defer></script>
+  {% endif %}
+  <button type="button" id="passkey-btn"
+    style="display:none;width:100%;margin-top:.6rem;padding:.5rem;background:transparent;border:1px solid var(--blue);color:var(--blue);border-radius:var(--rs);cursor:pointer">Sign in with a passkey</button>
+  <p id="passkey-err" class="note" style="display:none;margin-top:.6rem;background:rgba(224,105,93,.10);border-color:rgba(224,105,93,.4);color:var(--red)"></p>
+  {# shown only while a human check is actually being demanded —
+     it is the way out for anyone the Cloudflare script cannot reach. #}
+  {% if show_unlock %}
+  <p class="sub" style="margin-top:.8rem">Can't complete the security check?
+    <a href="/unlock">Email me a sign-in link</a>.</p>
+  {% endif %}
+  <p class="sub" style="margin-top:.8rem"><a href="/forgot">Forgot password?</a>{% if hosted() and signup_open() %} · <a href="/signup">No account? Create one</a>{% elif hosted() and intake_open() %} · <a href="{{ intake_path() }}">No account? Request access</a>{% elif hosted() and site_url() %} · <a href="{{ site_url() }}">No account? {{ site_url() | replace("https://", "") | replace("http://", "") | trim("/") }}</a>{% endif %}{% if privacy_url() %} · <a href="{{ privacy_url() }}">Privacy</a>{% endif %}</p>
+</div>
+{% endblock %}

@@ -1,0 +1,5 @@
+name = "coinbase"
+description = "Pull wallets + full transaction history from the Coinbase App API (CDP ES256 keys) and push them into a self-hosted Oikonome via container exec. Reference implementation of the community-script bridge pattern — for Coinbase itself, prefer the app's NATIVE connector."
+source-kind = "api"
+doors = ["endpoint", "container-exec"]
+schedule-suggestion = "daily"

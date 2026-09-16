@@ -1,0 +1,69 @@
+{# infra-stress panel body — included by admin.html AND served
+   alone by /admin/console/infra (pages.js re-fetches it every ~20s into
+   #infra-panel). Dark theme rides the base.html vars; all charts are
+   server-generated inline SVG (CSP: no inline script, no chart libs).
+
+   The panel is ALWAYS EXPANDED — no collapse toggle; the
+   full detail (.infra-detail) always shows and the 20s swap refreshes it. #}
+<div class="infra-head">
+  <b class="infra-title">Infra stress</b>
+  {# sumline kept for the standalone ?summary=1 fragment endpoint; the
+     always-expanded #infra-panel hides it via CSS and shows .infra-detail. #}
+  <span class="infra-sumline">
+    {% if infra.rows == 0 %}<span class="mut">No samples yet</span>{% else %}
+    {% for s in infra.summary %}{{ s.label }} <span class="pill {{ s.cls }}">{{ s.value }}</span>{% if not loop.last %} <span class="mut">·</span> {% endif %}{% endfor %}
+    {% endif %}
+  </span>
+</div>
+{% if infra.stale %}
+<div class="note" style="margin:.5rem 0 0;background:rgba(240,180,41,.10);border-color:rgba(240,180,41,.4);color:var(--amber)">
+  Sampler gap — no infra sample for {{ infra.stale }} minutes (the worker
+  writes one per minute). Current gauges below are that old.
+</div>
+{% endif %}
+<div class="infra-detail" style="margin-top:.7rem">
+{% if infra.rows == 0 %}
+<p class="mut">No samples yet — the worker records one per minute once it's
+  running (fresh install, or the worker has never been up).</p>
+{% else %}
+<div class="grid cols4" style="gap:.6rem">
+  {% for g in infra.gauges %}
+  <div>
+    <div class="kpi sm">{% if g.level %}<span class="pill {{ 'r' if g.level == 'red' else 'a' }}" style="font-size:15px">{{ g.value }}</span>{% else %}{{ g.value }}{% endif %}</div>
+    <div class="sub">{{ g.label }}{% if g.sub %} · {{ g.sub }}{% endif %}</div>
+  </div>
+  {% endfor %}
+</div>
+<div class="sub" style="margin:.6rem 0 .2rem">
+  History:
+  {% for w in infra.windows %}
+  {% if w == infra.win %}<b>{{ w }}</b>{% else %}<a href="/admin/console?win={{ w }}">{{ w }}</a>{% endif %}{% if not loop.last %} · {% endif %}
+  {% endfor %}
+  · {{ infra.rows }} samples
+  {% if infra.gaps %} · <span class="pill a">{{ infra.gaps }} sampler gap{{ 's' if infra.gaps != 1 }}</span>{% endif %}
+  {% if infra.latest %} · latest {{ infra.latest.ts.strftime('%m/%d %H:%M') }} UTC{% endif %}
+</div>
+<div class="grid cols2" style="gap:.8rem">
+  {% for c in infra.charts %}
+  <div class="infra-chart" style="position:relative"
+       data-chart-points="{{ c.points_json }}" data-chart-label="{{ c.label }}"
+       data-chart-vw="{{ c.vw }}" data-chart-vh="{{ c.vh }}">
+    <div class="sub">{{ c.label }}{% if c.unit %} <span class="mut">({{ c.unit }})</span>{% endif %}</div>
+    {{ c.svg | safe }}
+  </div>
+  {% endfor %}
+</div>
+{% if infra.spikes %}
+<details style="margin-top:.6rem" open>
+  <summary style="cursor:pointer" class="sub">Trigger breaches in window ({{ infra.spikes|length }}{{ '+' if infra.spikes|length >= 12 }})</summary>
+  {% for s in infra.spikes %}
+  <div class="sub"><span class="pill {{ 'r' if s.red else 'a' }}">{{ 'red' if s.red else 'amber' }}</span>
+    {{ s.ts.strftime('%m/%d %H:%M') }} UTC — {{ s.what }}</div>
+  {% endfor %}
+</details>
+{% else %}
+<p class="sub" style="margin:.6rem 0 0">No trigger breaches in this window
+  (PG conns &gt;20 · PoolTimeout &gt;0 · p95 &gt;2s · mem/load/disk).</p>
+{% endif %}
+{% endif %}
+</div>

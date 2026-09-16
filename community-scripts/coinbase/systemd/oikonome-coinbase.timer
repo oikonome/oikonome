@@ -1,0 +1,14 @@
+# Sample timer for the coinbase community script (daily; see script.toml
+# schedule-suggestion). Enable with:
+#   systemctl --user enable --now oikonome-coinbase.timer
+
+[Unit]
+Description=Daily Oikonome coinbase community-script run
+
+[Timer]
+OnCalendar=*-*-* 06:30:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

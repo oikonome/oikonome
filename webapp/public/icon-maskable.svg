@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <!-- Oikonome maskable app icon: the same omicron-door mark, but on a
+       FULL-BLEED square. Android and iOS apply their own mask (circle,
+       squircle, rounded square), so baking our own corner radius in — as
+       icon.svg does — would show transparent corners inside theirs.
+
+       The mark is an arc of radius 30 centred at (50,50) with an 11-wide
+       stroke, so it reaches r=35.5. The maskable safe zone is the inner
+       circle of r=40, so it already clears it with room; do not enlarge. -->
+  <rect width="100" height="100" fill="#0f141a"/>
+  <path d="M39.7 78.2 A30 30 0 1 1 60.3 78.2"
+        fill="none" stroke="#4f9bd6" stroke-width="11" stroke-linecap="round"/>
+</svg>

@@ -1,0 +1,429 @@
+# Oikonome self-hosted / dev stack.
+# Copy .env.example → .env, set passwords, `docker compose up -d`.
+# The database passwords and the master key are REQUIRED (${VAR:?…}): an
+# incomplete .env fails loudly at compose time instead of silently running
+# on known passwords — or storing bank tokens in plaintext.
+# Explicit project name: without it the project is named after this directory
+# ("docker"), so volumes/containers get generic docker_* names that collide
+# with anything else and silently outlive a re-clone.
+name: oikonome
+services:
+  app:
+    build: { context: .., dockerfile: docker/Dockerfile }
+    # tag carries the project name so two installs on one host (a real
+    # instance + a demo, say) each own their image — a shared static tag
+    # would let rebuilding one silently change what the other runs from on
+    # its next container recreate
+    image: oikonome:${COMPOSE_PROJECT_NAME:-local}
+    restart: unless-stopped
+    mem_limit: 768m
+    pids_limit: 512
+    # host port: OIKONOME_PORT (default 8042); container stays 8080
+    ports: ["${OIKONOME_PORT:-8042}:8080"]
+    environment:
+      # container-local dates ("today", email windows) follow the household's
+      # timezone; install.sh seeds OIKONOME_TZ from the host (UTC fallback)
+      TZ: ${OIKONOME_TZ:-Etc/UTC}
+      OIKONOME_TZ: ${OIKONOME_TZ:-Etc/UTC}
+      OIKONOME_DSN: postgresql://oikonome_app:${OIKONOME_APP_PASSWORD:?set OIKONOME_APP_PASSWORD in docker/.env (copy .env.example)}@postgres:5432/oikonome
+      # The RUNTIME admin DSN — oikonome_admin (BYPASSRLS + DML,
+      # no DDL, no role powers), NOT the postgres superuser. The superuser
+      # DSN exists only in the one-shot `migrate` service below.
+      OIKONOME_ADMIN_DSN: postgresql://oikonome_admin:${OIKONOME_ADMIN_PASSWORD:?set OIKONOME_ADMIN_PASSWORD in docker/.env (install.sh generates it)}@postgres:5432/oikonome
+      OIKONOME_APP_PASSWORD: ${OIKONOME_APP_PASSWORD:?set OIKONOME_APP_PASSWORD in docker/.env (copy .env.example)}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-}@redis:6379/0
+      # required like the passwords: without it, aggregator tokens and TOTP
+      # seeds would be stored PLAINTEXT (install.sh always generates one;
+      # manual installs must too — see .env.example)
+      OIKONOME_MASTER_KEY: ${OIKONOME_MASTER_KEY:?set OIKONOME_MASTER_KEY in docker/.env — generate one with `openssl rand -base64 32 | tr '+/' '-_'` (see .env.example)}
+      OIKONOME_BASE_URL: ${OIKONOME_BASE_URL:-}
+      # Hosted mode (invite-gated signup, email verify)
+      OIKONOME_HOSTED: ${OIKONOME_HOSTED:-}
+      # A hosted-shape TEST instance may mail a recipient who holds no
+      # account here; never set on a production instance
+      OIKONOME_HOSTED_FREEFORM_RECIPIENTS: ${OIKONOME_HOSTED_FREEFORM_RECIPIENTS:-}
+      # lift invite-only signup (docs/deployment-modes.md)
+      OIKONOME_OPEN_SIGNUP: ${OIKONOME_OPEN_SIGNUP:-}
+      # where a locked-out or turned-away person is told to write (unset:
+      # the app names no address)
+      OIKONOME_SUPPORT_EMAIL: ${OIKONOME_SUPPORT_EMAIL:-}
+      # the operator's site and privacy policy, linked from the sign-in
+      # page when set
+      OIKONOME_SITE_URL: ${OIKONOME_SITE_URL:-}
+      OIKONOME_PRIVACY_URL: ${OIKONOME_PRIVACY_URL:-}
+      # "Support development" link override (default: shown on
+      # self-host → oikonome.com/donate, hidden when OIKONOME_HOSTED is set;
+      # set a URL to force-show, "off" to hide)
+      OIKONOME_DONATE_URL: ${OIKONOME_DONATE_URL:-}
+      # Public demo — pre-auth doors cloaked, hourly reset
+      OIKONOME_DEMO: ${OIKONOME_DEMO:-}
+      OIKONOME_OPERATOR_EMAIL: ${OIKONOME_OPERATOR_EMAIL:-}
+      # Signup addresses that raise NO operator notice (comma-separated
+      # globs), e.g. an automated test harness that signs up on every run.
+      # Read at the signup door, so the web process only.
+      OIKONOME_OPERATOR_NOTICE_SKIP: ${OIKONOME_OPERATOR_NOTICE_SKIP:-}
+      # Bounce webhook shared secret — unset = the endpoint 404s.
+      # Web-only: the worker serves no HTTP and receives no webhooks.
+      OIKONOME_EMAIL_WEBHOOK_TOKEN: ${OIKONOME_EMAIL_WEBHOOK_TOKEN:-}
+      # Operator admin console — unset = console off (404)
+      OIKONOME_ADMIN_TOKEN: ${OIKONOME_ADMIN_TOKEN:-}
+      OIKONOME_ADMIN_IPS: ${OIKONOME_ADMIN_IPS:-}
+      # Console ON with NO token — a passkey is then the only
+      # credential, and `oikonome admin-enrol` is the way back in
+      OIKONOME_ADMIN_ENABLED: ${OIKONOME_ADMIN_ENABLED:-}
+      # Extra origins the console may be a WebAuthn relying party
+      # for (comma-separated). A private-network hostname (a Tailscale
+      # MagicDNS name, say) goes here — it is how a phone reaches the
+      # console with no DNS setup at all. One
+      # passkey per origin; an allowlist, never the bare Host header.
+      OIKONOME_ADMIN_ORIGINS: ${OIKONOME_ADMIN_ORIGINS:-}
+      # Operator passkeys own the console; these harden it further —
+      # require a passkey (token becomes break-glass) and verify Cloudflare
+      # Access at the origin when a policy fronts /admin*
+      OIKONOME_ADMIN_REQUIRE_PASSKEY: ${OIKONOME_ADMIN_REQUIRE_PASSKEY:-}
+      # the native apps this server trusts for passkey sign-in — package /
+      # bundle ids and signing certificates of the build the operator
+      # distributes (unset: none); extra Android packages cover a build
+      # with a renamed application id, which Credential Manager refuses
+      # until the statement names it
+      OIKONOME_ANDROID_PACKAGE: ${OIKONOME_ANDROID_PACKAGE:-}
+      OIKONOME_ANDROID_CERT_SHA256: ${OIKONOME_ANDROID_CERT_SHA256:-}
+      OIKONOME_IOS_APP_IDS: ${OIKONOME_IOS_APP_IDS:-}
+      OIKONOME_ANDROID_EXTRA_PACKAGES: ${OIKONOME_ANDROID_EXTRA_PACKAGES:-}
+      OIKONOME_CF_ACCESS_TEAM: ${OIKONOME_CF_ACCESS_TEAM:-}
+      OIKONOME_CF_ACCESS_AUD: ${OIKONOME_CF_ACCESS_AUD:-}
+      # reverse-proxy IPs/CIDRs whose X-Forwarded-For is trusted (rate
+      # limiting + session IPs); empty = header ignored (see docs)
+      OIKONOME_TRUSTED_PROXIES: ${OIKONOME_TRUSTED_PROXIES:-}
+      # abuse defense: auto-ban repeat offenders (on by default; set 0 to
+      # disable) and optionally reject breached passwords via HIBP (set 1)
+      OIKONOME_AUTOBAN: ${OIKONOME_AUTOBAN:-}
+      OIKONOME_PWNED_CHECK: ${OIKONOME_PWNED_CHECK:-}
+      # web-only: the worker serves no HTTP, so it has no auth doors to guard
+      OIKONOME_TURNSTILE_SITE_KEY: ${OIKONOME_TURNSTILE_SITE_KEY:-}
+      OIKONOME_TURNSTILE_SECRET: ${OIKONOME_TURNSTILE_SECRET:-}
+      # one-time gate for the first-boot setup wizard (install.sh generates
+      # it and prints the /setup?token=… link)
+      OIKONOME_SETUP_TOKEN: ${OIKONOME_SETUP_TOKEN:-}
+      # where /testing feedback packages go: the operator's own inbox
+      OIKONOME_FEEDBACK_TO: ${OIKONOME_FEEDBACK_TO:-}
+      # git describe at install time (GUI footer, doctor bundle)
+      OIKONOME_VERSION: ${OIKONOME_VERSION:-dev}
+      OIKONOME_SMTP_HOST: ${OIKONOME_SMTP_HOST:-}
+      OIKONOME_SMTP_PORT: ${OIKONOME_SMTP_PORT:-587}
+      OIKONOME_SMTP_USER: ${OIKONOME_SMTP_USER:-}
+      OIKONOME_SMTP_PASSWORD: ${OIKONOME_SMTP_PASSWORD:-}
+      OIKONOME_SMTP_FROM: ${OIKONOME_SMTP_FROM:-oikonome@localhost}
+      OIKONOME_SMTP_STARTTLS: ${OIKONOME_SMTP_STARTTLS:-1}
+      # Reactivating a re-verified address on the relay's own
+      # suppression list. BOTH halves need it — the app clears on a
+      # verification click, the worker clears when a scheduled send lands.
+      OIKONOME_POSTMARK_TOKEN: ${OIKONOME_POSTMARK_TOKEN:-}
+      OIKONOME_RECEIPT_MAX_OPTIMIZE_PX: ${OIKONOME_RECEIPT_MAX_OPTIMIZE_PX:-}
+      OIKONOME_RECEIPT_OPTIMIZE_WORK_PX: ${OIKONOME_RECEIPT_OPTIMIZE_WORK_PX:-}
+      OIKONOME_RECEIPT_OPTIMIZE_CONCURRENCY: ${OIKONOME_RECEIPT_OPTIMIZE_CONCURRENCY:-}
+      OIKONOME_RECEIPT_PARSE_CONCURRENCY: ${OIKONOME_RECEIPT_PARSE_CONCURRENCY:-}
+      OIKONOME_RECEIPT_PARSE_WAIT_S: ${OIKONOME_RECEIPT_PARSE_WAIT_S:-}
+      OIKONOME_ASSISTANT_CONCURRENCY: ${OIKONOME_ASSISTANT_CONCURRENCY:-}
+      OIKONOME_PLAID_WEBHOOK_NEG_TTL: ${OIKONOME_PLAID_WEBHOOK_NEG_TTL:-}
+      OIKONOME_PLAID_WEBHOOK_FETCH_CEILING: ${OIKONOME_PLAID_WEBHOOK_FETCH_CEILING:-}
+      OIKONOME_LLM_URL: ${OIKONOME_LLM_URL:-}
+      OIKONOME_CATEGORIZER_MODEL: ${OIKONOME_CATEGORIZER_MODEL:-}
+      OIKONOME_CATEGORIZER_MIN_CONF: ${OIKONOME_CATEGORIZER_MIN_CONF:-}
+      OIKONOME_CATEGORIZER_OVERLAY_MIN_CONF: ${OIKONOME_CATEGORIZER_OVERLAY_MIN_CONF:-}
+      OIKONOME_LLM_MODEL: ${OIKONOME_LLM_MODEL:-}
+      OIKONOME_LLM_API_KEY: ${OIKONOME_LLM_API_KEY:-}
+      OIKONOME_LLM_EXTRA_BODY: ${OIKONOME_LLM_EXTRA_BODY:-}
+      # Platform Plaid — hosted one-door bank link. Empty on
+      # self-host (BYO keys live in tenant config, not env). ENV must be
+      # 'sandbox' while using sandbox keys, else they hit production.
+      OIKONOME_PLAID_CLIENT_ID: ${OIKONOME_PLAID_CLIENT_ID:-}
+      OIKONOME_PLAID_SECRET: ${OIKONOME_PLAID_SECRET:-}
+      OIKONOME_PLAID_ENV: ${OIKONOME_PLAID_ENV:-production}
+      OIKONOME_PLAID_WEBHOOK_URL: ${OIKONOME_PLAID_WEBHOOK_URL:-}
+      # Extra billed products + the zombie-Item reaper threshold (0 = never
+      # reap). Empty is NOT the opt-out: every declared key is materialised,
+      # so empty is what a commented-out variable looks like from in here,
+      # and that has to keep meaning the documented default (self-host:
+      # liabilities + investments). "none" is the opt-out.
+      OIKONOME_PLAID_PRODUCTS_EXTRA: ${OIKONOME_PLAID_PRODUCTS_EXTRA:-}
+      OIKONOME_PLAID_REAP_DAYS: ${OIKONOME_PLAID_REAP_DAYS:-30}
+      # SMS summaries (all three or SMS stays off)
+      OIKONOME_TWILIO_ACCOUNT_SID: ${OIKONOME_TWILIO_ACCOUNT_SID:-}
+      OIKONOME_TWILIO_AUTH_TOKEN: ${OIKONOME_TWILIO_AUTH_TOKEN:-}
+      OIKONOME_TWILIO_FROM: ${OIKONOME_TWILIO_FROM:-}
+      # mobile-app push tickles via the publisher relay (unset = off)
+      OIKONOME_PUSH_RELAY_URL: ${OIKONOME_PUSH_RELAY_URL:-}
+      OIKONOME_PUSH_RELAY_KEY: ${OIKONOME_PUSH_RELAY_KEY:-}
+      # 1 = routing-only pushes: the daily verdict line never leaves the instance
+      OIKONOME_PUSH_CONTENT_FREE: ${OIKONOME_PUSH_CONTENT_FREE:-}
+      OIKONOME_DELETE_GRACE_DAYS: ${OIKONOME_DELETE_GRACE_DAYS:-7}
+      # Connection-pool sizing. Documented in .env.example and read by the
+      # app, so they must be forwarded explicitly — otherwise setting them
+      # does nothing, including the managed-PG step-up procedure that tells
+      # the operator to raise them. Empty == the code's own default.
+      OIKONOME_POOL_MAX: ${OIKONOME_POOL_MAX:-}
+      OIKONOME_CONTROL_POOL_MAX: ${OIKONOME_CONTROL_POOL_MAX:-}
+      OIKONOME_TENANT_POOL_TIMEOUT: ${OIKONOME_TENANT_POOL_TIMEOUT:-}
+      OIKONOME_CONTROL_POOL_TIMEOUT: ${OIKONOME_CONTROL_POOL_TIMEOUT:-}
+      # Spam defense: forwarded for the same reason
+      OIKONOME_SPAM_DEFENSE: ${OIKONOME_SPAM_DEFENSE:-}
+      OIKONOME_SPAM_API: ${OIKONOME_SPAM_API:-}
+      OIKONOME_SPAM_API_BUDGET_MS: ${OIKONOME_SPAM_API_BUDGET_MS:-}
+      OIKONOME_SPAM_CACHE_TTL_DAYS: ${OIKONOME_SPAM_CACHE_TTL_DAYS:-}
+      OIKONOME_SPAM_SAFELIST_EXTRA: ${OIKONOME_SPAM_SAFELIST_EXTRA:-}
+      OIKONOME_SMTP_NO_VERIFY: ${OIKONOME_SMTP_NO_VERIFY:-}
+    # Read-only visibility for the admin console's backup and
+    # host-health cards (install.sh pre-creates both dirs; ops-state is
+    # written by the optional scripts/host-health.sh timer on the host)
+    volumes:
+      - ../backups:/state/backups:ro,z
+      - ../ops-state:/state/ops:ro,z
+      # writable: console→host commands (reboot request); a root path-unit
+      # on the host validates + executes (scripts/host-reboot-watcher)
+      - ../ops-cmd:/state/cmd:z
+      # optional local categorizer artifact (engine/model_categorize.py);
+      # empty dir = feature off, nothing else changes
+      - ../models:/models:ro,z
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/readyz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  worker:
+    image: oikonome:${COMPOSE_PROJECT_NAME:-local}
+    restart: unless-stopped
+    mem_limit: 768m
+    pids_limit: 512
+    command: ["python", "-m", "arq", "oikonome.jobs.worker.WorkerSettings"]
+    environment:
+      TZ: ${OIKONOME_TZ:-Etc/UTC}
+      OIKONOME_TZ: ${OIKONOME_TZ:-Etc/UTC}
+      OIKONOME_DSN: postgresql://oikonome_app:${OIKONOME_APP_PASSWORD:?set OIKONOME_APP_PASSWORD in docker/.env (copy .env.example)}@postgres:5432/oikonome
+      # The RUNTIME admin DSN — oikonome_admin (BYPASSRLS + DML,
+      # no DDL, no role powers), NOT the postgres superuser. The superuser
+      # DSN exists only in the one-shot `migrate` service below.
+      OIKONOME_ADMIN_DSN: postgresql://oikonome_admin:${OIKONOME_ADMIN_PASSWORD:?set OIKONOME_ADMIN_PASSWORD in docker/.env (install.sh generates it)}@postgres:5432/oikonome
+      REDIS_URL: redis://:${REDIS_PASSWORD:-}@redis:6379/0
+      OIKONOME_MASTER_KEY: ${OIKONOME_MASTER_KEY:?set OIKONOME_MASTER_KEY in docker/.env — generate one with `openssl rand -base64 32 | tr '+/' '-_'` (see .env.example)}
+      OIKONOME_BASE_URL: ${OIKONOME_BASE_URL:-}
+      # Hosted mode (invite-gated signup, email verify)
+      OIKONOME_HOSTED: ${OIKONOME_HOSTED:-}
+      # the scheduled mail sweep lives here, so the recipient policy has to
+      # reach the worker or the settings door and the send disagree
+      OIKONOME_HOSTED_FREEFORM_RECIPIENTS: ${OIKONOME_HOSTED_FREEFORM_RECIPIENTS:-}
+      # lift invite-only signup (docs/deployment-modes.md)
+      OIKONOME_OPEN_SIGNUP: ${OIKONOME_OPEN_SIGNUP:-}
+      # The worker's hourly demo_reset_all keys off this
+      OIKONOME_DEMO: ${OIKONOME_DEMO:-}
+      # worker.py mails the operator directly (new-signup notices)
+      OIKONOME_OPERATOR_EMAIL: ${OIKONOME_OPERATOR_EMAIL:-}
+      OIKONOME_SMTP_HOST: ${OIKONOME_SMTP_HOST:-}
+      OIKONOME_SMTP_PORT: ${OIKONOME_SMTP_PORT:-587}
+      OIKONOME_SMTP_USER: ${OIKONOME_SMTP_USER:-}
+      OIKONOME_SMTP_PASSWORD: ${OIKONOME_SMTP_PASSWORD:-}
+      OIKONOME_SMTP_FROM: ${OIKONOME_SMTP_FROM:-oikonome@localhost}
+      OIKONOME_SMTP_STARTTLS: ${OIKONOME_SMTP_STARTTLS:-1}
+      # Reactivating a re-verified address on the relay's own
+      # suppression list. BOTH halves need it — the app clears on a
+      # verification click, the worker clears when a scheduled send lands.
+      OIKONOME_POSTMARK_TOKEN: ${OIKONOME_POSTMARK_TOKEN:-}
+      OIKONOME_RECEIPT_MAX_OPTIMIZE_PX: ${OIKONOME_RECEIPT_MAX_OPTIMIZE_PX:-}
+      OIKONOME_RECEIPT_OPTIMIZE_WORK_PX: ${OIKONOME_RECEIPT_OPTIMIZE_WORK_PX:-}
+      OIKONOME_RECEIPT_OPTIMIZE_CONCURRENCY: ${OIKONOME_RECEIPT_OPTIMIZE_CONCURRENCY:-}
+      OIKONOME_RECEIPT_PARSE_CONCURRENCY: ${OIKONOME_RECEIPT_PARSE_CONCURRENCY:-}
+      OIKONOME_RECEIPT_PARSE_WAIT_S: ${OIKONOME_RECEIPT_PARSE_WAIT_S:-}
+      OIKONOME_ASSISTANT_CONCURRENCY: ${OIKONOME_ASSISTANT_CONCURRENCY:-}
+      OIKONOME_PLAID_WEBHOOK_NEG_TTL: ${OIKONOME_PLAID_WEBHOOK_NEG_TTL:-}
+      OIKONOME_PLAID_WEBHOOK_FETCH_CEILING: ${OIKONOME_PLAID_WEBHOOK_FETCH_CEILING:-}
+      OIKONOME_LLM_URL: ${OIKONOME_LLM_URL:-}
+      OIKONOME_CATEGORIZER_MODEL: ${OIKONOME_CATEGORIZER_MODEL:-}
+      OIKONOME_CATEGORIZER_MIN_CONF: ${OIKONOME_CATEGORIZER_MIN_CONF:-}
+      OIKONOME_CATEGORIZER_OVERLAY_MIN_CONF: ${OIKONOME_CATEGORIZER_OVERLAY_MIN_CONF:-}
+      OIKONOME_LLM_MODEL: ${OIKONOME_LLM_MODEL:-}
+      OIKONOME_LLM_API_KEY: ${OIKONOME_LLM_API_KEY:-}
+      OIKONOME_LLM_EXTRA_BODY: ${OIKONOME_LLM_EXTRA_BODY:-}
+      # Platform Plaid — the hourly sync runs in the worker, so it
+      # needs the same platform creds as the web door (empty on self-host).
+      OIKONOME_PLAID_CLIENT_ID: ${OIKONOME_PLAID_CLIENT_ID:-}
+      OIKONOME_PLAID_SECRET: ${OIKONOME_PLAID_SECRET:-}
+      OIKONOME_PLAID_ENV: ${OIKONOME_PLAID_ENV:-production}
+      OIKONOME_PLAID_WEBHOOK_URL: ${OIKONOME_PLAID_WEBHOOK_URL:-}
+      # Product gating + the nightly zombie-Item reaper both run
+      # in the worker. Empty here means the documented default, not "off"
+      # (a commented-out variable is indistinguishable from empty inside a
+      # container); the opt-out is the word "none".
+      OIKONOME_PLAID_PRODUCTS_EXTRA: ${OIKONOME_PLAID_PRODUCTS_EXTRA:-}
+      OIKONOME_PLAID_REAP_DAYS: ${OIKONOME_PLAID_REAP_DAYS:-30}
+      # The one lever on total aggregator traffic — buckets × 5 minutes IS
+      # the poll interval (12 = hourly), tunable on a busy instance without
+      # a deploy. Empty = the code's 12.
+      OIKONOME_SYNC_BUCKETS: ${OIKONOME_SYNC_BUCKETS:-}
+      # SMS summaries (all three or SMS stays off)
+      OIKONOME_TWILIO_ACCOUNT_SID: ${OIKONOME_TWILIO_ACCOUNT_SID:-}
+      OIKONOME_TWILIO_AUTH_TOKEN: ${OIKONOME_TWILIO_AUTH_TOKEN:-}
+      OIKONOME_TWILIO_FROM: ${OIKONOME_TWILIO_FROM:-}
+      # mobile-app push tickles via the publisher relay (unset = off)
+      OIKONOME_PUSH_RELAY_URL: ${OIKONOME_PUSH_RELAY_URL:-}
+      OIKONOME_PUSH_RELAY_KEY: ${OIKONOME_PUSH_RELAY_KEY:-}
+      # 1 = routing-only pushes: the daily verdict line never leaves the instance
+      OIKONOME_PUSH_CONTENT_FREE: ${OIKONOME_PUSH_CONTENT_FREE:-}
+      OIKONOME_DELETE_GRACE_DAYS: ${OIKONOME_DELETE_GRACE_DAYS:-7}
+      # Connection-pool sizing. Documented in .env.example and read by the
+      # app, so they must be forwarded explicitly — otherwise setting them
+      # does nothing, including the managed-PG step-up procedure that tells
+      # the operator to raise them. Empty == the code's own default.
+      OIKONOME_POOL_MAX: ${OIKONOME_POOL_MAX:-}
+      OIKONOME_CONTROL_POOL_MAX: ${OIKONOME_CONTROL_POOL_MAX:-}
+      OIKONOME_TENANT_POOL_TIMEOUT: ${OIKONOME_TENANT_POOL_TIMEOUT:-}
+      OIKONOME_CONTROL_POOL_TIMEOUT: ${OIKONOME_CONTROL_POOL_TIMEOUT:-}
+      # Spam defense: forwarded for the same reason
+      OIKONOME_SPAM_DEFENSE: ${OIKONOME_SPAM_DEFENSE:-}
+      OIKONOME_SPAM_API: ${OIKONOME_SPAM_API:-}
+      OIKONOME_SPAM_API_BUDGET_MS: ${OIKONOME_SPAM_API_BUDGET_MS:-}
+      OIKONOME_SPAM_CACHE_TTL_DAYS: ${OIKONOME_SPAM_CACHE_TTL_DAYS:-}
+      OIKONOME_SPAM_SAFELIST_EXTRA: ${OIKONOME_SPAM_SAFELIST_EXTRA:-}
+      OIKONOME_SMTP_NO_VERIFY: ${OIKONOME_SMTP_NO_VERIFY:-}
+      # graceful nightly maintenance reboot (worker cron, 09:04 UTC):
+      # set to 1 ONLY on the instance that owns the host's reboot lever
+      OIKONOME_AUTO_REBOOT: ${OIKONOME_AUTO_REBOOT:-}
+    # same state binds as app: the nightly reboot cron reads host-health
+    # (reboot_required) and drops the ops-cmd flag the watcher acts on
+    volumes:
+      - ../ops-state:/state/ops:ro,z
+      - ../ops-cmd:/state/cmd:z
+      - ../models:/models:ro,z
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+      migrate: { condition: service_completed_successfully }
+
+  # The ONLY container that holds the postgres superuser DSN —
+  # runs migrations (DDL + role management, advisory-locked) once per
+  # `up` and exits. app/worker start after it completes and carry only
+  # the least-privilege oikonome_admin runtime DSN.
+  migrate:
+    build: { context: .., dockerfile: docker/Dockerfile }
+    image: oikonome:${COMPOSE_PROJECT_NAME:-local}
+    restart: "no"
+    command: ["oikonome", "migrate"]
+    environment:
+      # deployment history (admin console): migrate stamps each new version
+      OIKONOME_VERSION: ${OIKONOME_VERSION:-dev}
+      # …plus a one-line "what changed" (tip commit subject from install.sh)
+      OIKONOME_VERSION_NOTE: ${OIKONOME_VERSION_NOTE:-}
+      OIKONOME_VERSION_NOTE_FOR: ${OIKONOME_VERSION_NOTE_FOR:-}
+      OIKONOME_ADMIN_DSN: postgresql://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in docker/.env (copy .env.example)}@postgres:5432/oikonome
+      OIKONOME_APP_PASSWORD: ${OIKONOME_APP_PASSWORD:?set OIKONOME_APP_PASSWORD in docker/.env (copy .env.example)}
+      OIKONOME_ADMIN_PASSWORD: ${OIKONOME_ADMIN_PASSWORD:?set OIKONOME_ADMIN_PASSWORD in docker/.env (install.sh generates it)}
+      OIKONOME_MASTER_KEY: ${OIKONOME_MASTER_KEY:?set OIKONOME_MASTER_KEY in docker/.env — generate one with `openssl rand -base64 32 | tr '+/' '-_'` (see .env.example)}
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  postgres:
+    image: docker.io/library/postgres:18-alpine
+    restart: unless-stopped
+    mem_limit: 512m
+    pids_limit: 256
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in docker/.env (copy .env.example)}
+      POSTGRES_DB: oikonome
+      # The postgres:18+ image moved its default PGDATA to
+      # /var/lib/postgresql/<major>/docker and declares /var/lib/postgresql
+      # as its volume — with only the bind mount below, initdb would land in
+      # an anonymous volume and the data would silently NOT be in ./data.
+      # Pin PGDATA to the mounted path.
+      PGDATA: /var/lib/postgresql/data
+    # The database lives in ./data/postgres inside the install folder, so
+    # code + config (.env) + data are ONE directory: stop the stack, delete
+    # the folder, and the install is gone. OIKONOME_DATA_DIR overrides.
+    # Z relabels for SELinux hosts (Fedora et al.); harmless elsewhere.
+    volumes: ["${OIKONOME_DATA_DIR:-../data/postgres}:/var/lib/postgresql/data:Z"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # No volume: redis only holds the transient job queue — losing it on
+  # recreate is harmless, and it keeps all state inside the install folder.
+  # AUTH via REDIS_PASSWORD (install.sh generates + backfills it).
+  # It publishes no host port, but requirepass is cheap defense in depth on
+  # a multi-tenant host — a compromised neighbouring container on the same
+  # network should not get a free job queue. Empty/unset password keeps the
+  # old open behavior (redis treats empty requirepass as auth disabled, and
+  # the clients skip AUTH on an empty password), so a manual `compose up`
+  # before the next install.sh run still comes up.
+  redis:
+    image: docker.io/library/redis:7-alpine
+    restart: unless-stopped
+    mem_limit: 192m
+    pids_limit: 128
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-}"]
+
+  # ── TLS reverse proxy (opt-in via `./oikonome.sh https <domain>`) ──────────
+  # Only started when COMPOSE_PROFILES=tls (the manager sets it in .env).
+  # Terminates HTTPS with an automatic cert and proxies to the app — which
+  # unlocks passkeys (WebAuthn needs a secure context) and Secure cookies.
+  caddy:
+    image: docker.io/library/caddy:2-alpine
+    restart: unless-stopped
+    mem_limit: 96m
+    pids_limit: 128
+    profiles: ["tls"]
+    # host ports are env-tunable so a second instance (or another proxy)
+    # on the same host doesn't collide on 80/443. Note Let's Encrypt's
+    # HTTP-01/TLS-ALPN challenges still have to REACH Caddy on 80/443 —
+    # with moved ports, forward 80→OIKONOME_HTTP_PORT and 443→
+    # OIKONOME_HTTPS_PORT at the router/firewall.
+    ports:
+      - "${OIKONOME_HTTP_PORT:-80}:80"
+      - "${OIKONOME_HTTPS_PORT:-443}:443"
+      - "${OIKONOME_HTTPS_PORT:-443}:443/udp"
+    environment:
+      OIKONOME_DOMAIN: ${OIKONOME_DOMAIN:-localhost}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro,Z
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      app: { condition: service_started }
+
+  # ── Local LLM (opt-in via `./oikonome.sh llm on`) ─────────────────────────
+  # Only started when COMPOSE_PROFILES includes 'llm'. Serves a small,
+  # permissively-licensed model (default Qwen2.5-1.5B, Apache-2.0) over an
+  # OpenAI-compatible API — INTERNAL to the compose network only (no host
+  # port). Powers smart categorization + receipt parsing with zero external
+  # service or API key. The model is pulled into a named volume by the
+  # manager, so it survives restarts and isn't baked into the image.
+  ollama:
+    image: docker.io/ollama/ollama:latest
+    restart: unless-stopped
+    # sized for the default qwen2.5:1.5b text tier — the manager raises it
+    # (via docker/.env) when a bigger chat or vision model is enabled; the
+    # 7b vision tier needs ~8 GB peak for one receipt image, so a limit
+    # this small OOM-kills the runner mid-parse and uploads 500
+    mem_limit: ${OLLAMA_MEM_LIMIT:-3600m}
+    pids_limit: 512
+    profiles: ["llm"]
+    environment:
+      OLLAMA_HOST: "0.0.0.0"          # reachable from the app container
+      # 4096 (ollama's default) can't even hold one receipt photo's image
+      # tokens + the parse prompt; 8192 fits comfortably and the bundled
+      # qwen2.5 tiers all support it
+      OLLAMA_CONTEXT_LENGTH: "${OLLAMA_CONTEXT_LENGTH:-8192}"
+    volumes:
+      - ollama_models:/root/.ollama
+    # For GPU acceleration (optional, much faster): add a `deploy.resources`
+    # reservation for your GPU — CPU inference works out of the box.
+
+volumes:
+  caddy_data:
+  caddy_config:
+  ollama_models:

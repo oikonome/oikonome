@@ -1,0 +1,17 @@
+{
+  "cli": {
+    "version": ">= 22.0.0",
+    "appVersionSource": "local"
+  },
+  "build": {
+    "production": {
+      "autoIncrement": false,
+      "env": {
+        "EXPO_PUBLIC_SERVER_URL": "https://oikonome.example.com"
+      },
+      "ios": {
+        "resourceClass": "m-medium"
+      }
+    }
+  }
+}
