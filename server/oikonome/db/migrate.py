@@ -496,6 +496,13 @@ def run(admin_dsn: str | None = None) -> list[str]:
             " push_updated, push_dead_at, revoked_at, elevated_at,"
             " elevated_passkey_id)"
             " ON device_tokens TO oikonome_app;"
+            # widget_tokens hang off a device row: the app mints, stamps
+            # last_seen and revokes; an injected UPDATE must not re-parent
+            # one onto another device or user (it would then outlive the
+            # revocation of the phone that minted it).
+            "REVOKE UPDATE, DELETE ON widget_tokens FROM oikonome_app;"
+            "GRANT UPDATE (last_seen, revoked_at) ON widget_tokens"
+            " TO oikonome_app;"
             # login_unlocks is the lockout-exemption table: an injected
             # UPDATE that re-parents a row to another user_id, or rewrites
             # token_hash to a known value, hands the attacker a working

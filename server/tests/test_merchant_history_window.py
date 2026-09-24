@@ -48,6 +48,31 @@ class MerchantHistoryWindowTests(unittest.TestCase):
         self.assertEqual(ids, {self.recent})
         self.assertEqual(h["lifetime"]["count"], 2)
 
+    def test_this_month_and_the_last_complete_month_are_calendar_months(self):
+        """The two short windows are calendar months, not days back:
+        "This month" runs from the 1st, and "1m" is the last complete month
+        closed on its last day — so on the 15th neither shows the other's
+        rows, and a charge on the last day of last month is in "1m"."""
+        last_day = TODAY.replace(day=1) - dt.timedelta(days=1)        # May 31
+        on_last_day = add_txn(self.conn, last_day, 12.0, "HARBOR HARDWARE",
+                              merchant=NAME, primary="HOME_IMPROVEMENT")
+        mid_last = add_txn(self.conn, last_day.replace(day=10), 15.0,
+                           "HARBOR HARDWARE", merchant=NAME,
+                           primary="HOME_IMPROVEMENT")
+        first_of_this = add_txn(self.conn, TODAY.replace(day=1), 18.0,
+                                "HARBOR HARDWARE", merchant=NAME,
+                                primary="HOME_IMPROVEMENT")
+        ids, h = self._ids(window="cur")
+        self.assertEqual(ids, {self.recent, first_of_this})
+        self.assertEqual(h["lifetime"]["count"], 5)
+        ids, _ = self._ids(window="1m")
+        self.assertEqual(ids, {on_last_day, mid_last})
+        # the named windows still read as before, and an unknown one as all
+        ids, _ = self._ids(window="1y")
+        self.assertEqual(ids, {self.recent, on_last_day, mid_last, first_of_this})
+        ids, _ = self._ids(window="all")
+        self.assertIn(self.old, ids)
+
 
 if __name__ == "__main__":
     unittest.main()

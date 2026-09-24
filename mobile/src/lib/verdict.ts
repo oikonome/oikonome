@@ -13,7 +13,7 @@ export const VERDICT: Record<string, { color: string; label: string }> = {
 };
 
 // the Today hero renders the verdict as a colored SENTENCE, not a pill —
-// the web hero's exact wording ("On budget" there, "ON PLAN" on pills)
-export const heroLabel = (verdict: string): string =>
-  verdict === "OVER BUDGET" ? "Over budget"
-    : verdict === "UNDER BUDGET" ? "Under budget" : "On budget";
+// the web hero's exact wording ("On budget" there, "ON PLAN" on pills).
+// Lives in pure.ts so the home-screen widget (rendered outside the app,
+// tested under node) reads the very same words.
+export { heroLabel } from "./pure";

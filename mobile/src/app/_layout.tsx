@@ -202,9 +202,11 @@ export default function RootLayout() {
             <Stack.Screen name="networth" options={{ title: "Net worth" }} />
             <Stack.Screen name="cashflow" options={{ title: "Cash flow" }} />
             <Stack.Screen name="alerts" options={{ title: "Alerts" }} />
+            <Stack.Screen name="activity" options={{ title: "Activity" }} />
             <Stack.Screen name="items" options={{ title: "Items" }} />
             <Stack.Screen name="doctor" options={{ title: "Doctor" }} />
             <Stack.Screen name="retire" options={{ title: "Retire" }} />
+            <Stack.Screen name="debt" options={{ title: "Debt" }} />
             <Stack.Screen name="reimburse" options={{ title: "Reimburse" }} />
             <Stack.Screen name="rules" options={{ title: "Rules" }} />
             <Stack.Screen name="business" options={{ title: "Business" }} />

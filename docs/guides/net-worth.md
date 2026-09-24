@@ -39,8 +39,11 @@ Everything before the first recorded month is drawn dashed with a faint
 tint, and the solid line takes over at that boundary; there is no
 graduated shading, and an old stretch is not drawn any softer than a
 recent one. Expect the recorded tail to be exact and the reconstructed
-years to be approximate. **3m / 6m / 1y / 3y / 5y / All** pills pick
-the window, and the window's gain shows in both dollars and percent.
+years to be approximate. **This month / 1m / 3m / 6m / 1y / 3y / 5y /
+All** pills pick the window, and the window's gain shows in both dollars
+and percent. The series is one point per month, so the two short windows
+are two points each: **This month** is the change since the last
+month-end, and **1m** is the last complete month's change on its own.
 
 ## Retirement & investments, and Coinbase
 
@@ -60,6 +63,13 @@ The Retirement page projects whether the portfolio funds your
 retirement and replays the plan against every historical start year
 since 1928 — the full model, its assumptions, and the success-rate
 math are in the retirement guide.
+
+## The debt payoff plan
+
+The **payoff plan** link on the Financial accounts tile opens the Debt
+page: every card and loan on one schedule, avalanche or snowball, with
+an extra-payment what-if and the debt-free month — the debt guide has
+the model.
 
 ## Investment fees
 

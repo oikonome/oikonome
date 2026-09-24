@@ -129,6 +129,47 @@ class TestRetirement(unittest.TestCase):
         self.assertAlmostEqual(r["end_balance"], 1_200_000.0, places=1)
 
 
+class TestCatchUpSaving(unittest.TestCase):
+    """When no retirement age works, the page says what extra monthly
+    saving would make one work. The figure must be one that really works,
+    and the smallest round one that does."""
+    SMALL = {"cash": 20_000.0, "taxable": 80_000.0, "td": 150_000.0,
+             "roth": 50_000.0, "debt": 0.0, "total": 300_000.0}
+
+    def _survives(self, monthly, retire_age=67):
+        return R.simulate(self.SMALL, 45, retire_age, 95, 70_000.0,
+                          extra_annual=monthly * 12.0, **KW)["survived"]
+
+    def test_the_figure_works_and_one_step_less_does_not(self):
+        m = R.catch_up_monthly(self.SMALL, 45, 67, 95, 70_000.0, KW)
+        self.assertGreater(m, 0)
+        self.assertEqual(m % R.CATCH_UP_STEP, 0)
+        self.assertTrue(self._survives(m))
+        self.assertFalse(self._survives(m - R.CATCH_UP_STEP))
+
+    def test_more_working_years_need_less_a_month(self):
+        self.assertLess(R.catch_up_monthly(self.SMALL, 45, 72, 95, 70_000.0, KW),
+                        R.catch_up_monthly(self.SMALL, 45, 67, 95, 70_000.0, KW))
+
+    def test_a_plan_that_already_works_needs_nothing(self):
+        self.assertEqual(R.catch_up_monthly(BK, 45, 67, 95, 40_000.0, KW), 0)
+
+    def test_no_working_years_left_or_an_absurd_target_is_no_answer(self):
+        self.assertIsNone(R.catch_up_monthly(self.SMALL, 67, 67, 95, 70_000.0, KW))
+        self.assertIsNone(R.catch_up_monthly(self.SMALL, 66, 67, 95, 5_000_000.0, KW))
+
+    def test_the_extra_is_saved_from_now_not_from_the_resume_age(self):
+        # KW resumes the plan's own saving at 99 — never — yet extra lands
+        with_extra = R.simulate(self.SMALL, 45, 67, 95, 0.0,
+                                extra_annual=12_000.0, **KW)["at_retire"]
+        without = R.simulate(self.SMALL, 45, 67, 95, 0.0, **KW)["at_retire"]
+        self.assertGreater(with_extra, without + 22 * 12_000.0)
+
+    def test_no_extra_leaves_the_projection_exactly_as_it_was(self):
+        self.assertEqual(R.simulate(BK, 45, 60, 95, 60_000.0, **KW),
+                         R.simulate(BK, 45, 60, 95, 60_000.0, extra_annual=0.0, **KW))
+
+
 class TestBuckets(unittest.TestCase):
     """Tax-treatment classification is subtype/name-driven — no institution
     hardcodes."""

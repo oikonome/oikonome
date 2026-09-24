@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from ..engine import budget, merchant_dedup, reporting
+from ..engine import budget, links, merchant_dedup, merchant_sql, reporting
 from ..engine.compat import as_date
 
 _ACCT_FULL = budget.ACCT_LABEL_SQL   # single definition, shared with _spend_rows
@@ -31,6 +31,23 @@ _NOT_SHADOW = reporting._NOT_SHADOW.format(col="t.account_id")
 # ledger and the bulk-category write still used the old one.
 _MC_JOIN = merchant_dedup.MC_JOIN
 _DISPLAY_MERCHANT = merchant_dedup.DISPLAY_MERCHANT
+# the row's identity key — what the canonical map is keyed BY, so a search
+# on a renamed name finds the rows the rename actually moved
+_RAW_KEY = merchant_sql.RAW_KEY
+
+
+def _merchant_join_for(alias: str, mc: str, mm: str) -> tuple[str, str]:
+    """The display join and display name for a SECOND transactions alias.
+
+    A query naming two transaction rows at once — a reimbursement pair is
+    a charge and its deposit — cannot use the shared fragments twice: they
+    are written for `t`/`mc`/`mm`. The key itself still comes from
+    merchant_sql.raw_key, so only the join's shape is restated here and both
+    sides of such a pair still read one definition of the merchant."""
+    key = merchant_sql.raw_key(alias)
+    join = (f"LEFT JOIN merchant_canonical {mc} ON {mc}.raw_merchant = {key} "
+            f"LEFT JOIN merchants {mm} ON {mm}.id = {alias}.merchant_id")
+    return join, f"COALESCE({mm}.name, {mc}.canonical, {key})"
 
 
 def _as_array(expr: str) -> str:
@@ -82,6 +99,8 @@ def _scope_sql(scope: str) -> str:
 # pills/flags and cannot drift. Every query that formats this MUST also
 # carry _MC_JOIN: payee resolves through the canonical map so a user
 # rename is visible on the ledger, not only on the Merchants page.
+from ..engine.splits import SPLITTABLE_SQL as _SPLITTABLE_SQL  # noqa: E402
+
 _TXN_FIELDS = f"""t.id, t.date, t.amount, {_DISPLAY_MERCHANT} AS payee,
                   {merchant_dedup.MERCHANT_LOGO} AS merchant_logo,
                   {merchant_dedup.MERCHANT_ID} AS merchant_id,
@@ -156,7 +175,20 @@ _TXN_FIELDS = f"""t.id, t.date, t.amount, {_DISPLAY_MERCHANT} AS payee,
                   (t.category_override IS NOT NULL
                    AND (t.override_source = 'user'
                         OR (mcat.transaction_id IS NOT NULL
-                            AND mcat.bill_id IS NULL))) AS override_manual"""
+                            AND mcat.bill_id IS NULL))) AS override_manual,
+                  -- a hand split of this charge across categories: the
+                  -- parts, in order, as a list of category + amount — stored keys,
+                  -- the client labels them; NULL for an unsplit row. The
+                  -- row's `category` above stays the whole row's own (what
+                  -- the split overlays); the rollups read the parts.
+                  (SELECT jsonb_agg(jsonb_build_object('category', sp.category,
+                                                       'amount', sp.amount)
+                                    ORDER BY sp.line)
+                     FROM transaction_splits sp WHERE sp.txn_id = t.id) AS split,
+                  -- would the split door take this row: the spend test
+                  -- the rollups use, so a client offers Split exactly
+                  -- where the server will accept it
+                  (""" + _SPLITTABLE_SQL + """) AS splittable"""
 # the manual_categories join every ledger query needs for provenance
 _TXN_JOINS = "LEFT JOIN manual_categories mcat ON mcat.transaction_id = t.id"
 
@@ -237,8 +269,8 @@ def transactions(conn, year: int, month: int, *, search: str = "",
         # receipt line items match too ("shampoo" finds the run); the
         # canonical is what a RENAMED row displays as its payee, so the new
         # name has to find it
-        q += """ AND (t.search_text LIKE %s
-                 OR COALESCE(t.merchant_outlet, t.merchant_name, t.name) IN (
+        q += f""" AND (t.search_text LIKE %s
+                 OR {_RAW_KEY} IN (
                         SELECT mcs.raw_merchant FROM merchant_canonical mcs
                          WHERE LOWER(mcs.canonical) LIKE %s)
                  OR t.merchant_id IN (SELECT mmm.id FROM merchants mmm
@@ -319,6 +351,9 @@ def search_transactions(conn, search: str, *, account_id: str | None = None,
     # its own predicate (books._BIZ_TXN) and is unaffected.
     where = ["t.removed = 0" + _scope_sql(scope)]
     args: list = []
+    # what each matched row contributes to the sums: the whole charge,
+    # unless a category filter narrows a split row to one of its parts
+    amount_expr, amount_args = "t.amount", []
     # An explicit id list is the caller saying WHICH rows these are — the
     # budget engine handing over the rows behind one of its own numbers.
     # It is the whole predicate: the hidden/shadow filters below would
@@ -346,10 +381,26 @@ def search_transactions(conn, search: str, *, account_id: str | None = None,
         # category (reporting.EFF_CAT coalesces to it), so it is also what
         # comes back as a filter — and no row stores it, so equality would
         # match nothing and the link would look broken.
-        where.append("COALESCE(t.category_override, t.category_primary, '') = ''")
+        # A split row's parts all carry real categories, and the rollups
+        # count it under those alone, so it is never "uncategorised".
+        where.append("COALESCE(t.category_override, t.category_primary, '') = ''"
+                     " AND NOT EXISTS (SELECT 1 FROM transaction_splits sp"
+                     " WHERE sp.txn_id = t.id)")
     elif category:
-        where.append("COALESCE(t.category_override, t.category_primary, '') = %s")
-        args.append(category)
+        # A hand-split row belongs to its parts' categories and ONLY those:
+        # the rollups (categories.PART_CAT) count each part under its own
+        # category and nothing under the row's original one, so the label
+        # that opens the rows behind a number must find exactly those rows,
+        # and the sums below count only the matching part.
+        where.append("((NOT EXISTS (SELECT 1 FROM transaction_splits sp "
+                     "WHERE sp.txn_id = t.id) "
+                     "AND COALESCE(t.category_override, t.category_primary, '') = %s) "
+                     "OR EXISTS (SELECT 1 FROM transaction_splits sp "
+                     "WHERE sp.txn_id = t.id AND sp.category = %s))")
+        args.extend([category, category])
+        amount_expr = ("COALESCE((SELECT SUM(sp.amount) FROM transaction_splits sp"
+                       " WHERE sp.txn_id = t.id AND sp.category = %s), t.amount)")
+        amount_args = [category, category]      # one per SUM below
     if date_from:
         where.append("t.date >= %s"); args.append(as_date(date_from))
     if date_to:
@@ -373,7 +424,7 @@ def search_transactions(conn, search: str, *, account_id: str | None = None,
         # once per ledger row, which on a large ledger costs seconds. '%q%'
         # on search_text rides the trigram index where pg_trgm exists.
         clauses = ["t.search_text LIKE %s",
-                   """COALESCE(t.merchant_outlet, t.merchant_name, t.name) IN (
+                   f"""{_RAW_KEY} IN (
                           SELECT mcs.raw_merchant FROM merchant_canonical mcs
                            WHERE LOWER(mcs.canonical) LIKE %s)""",
                    """t.merchant_id IN (SELECT mmm.id FROM merchants mmm
@@ -452,14 +503,15 @@ def search_transactions(conn, search: str, *, account_id: str | None = None,
         f"ORDER BY t.date DESC, ABS(t.amount) DESC", args).fetchall()]
     row = conn.execute(
         f"SELECT COUNT(*) AS n, "
-        f"       COALESCE(SUM(t.amount) FILTER (WHERE TRUE {money_scope}), 0) AS s, "
+        f"       COALESCE(SUM({amount_expr}) FILTER (WHERE TRUE {money_scope}), 0) AS s, "
         f"       COUNT(*) FILTER (WHERE NOT (TRUE {budget.PERSONAL_ONLY_SQL})) AS biz_n, "
         f"       COUNT(*) FILTER (WHERE TRUE {budget.SPEND_ONLY_SQL}"
         f"                        {budget.PERSONAL_ONLY_SQL}) AS spend_n, "
-        f"       COALESCE(SUM(t.amount) FILTER "
+        f"       COALESCE(SUM({amount_expr}) FILTER "
         f"                (WHERE TRUE {budget.SPEND_ONLY_SQL}"
         f"                       {budget.PERSONAL_ONLY_SQL}), 0) AS spend_sum "
-        f"FROM transactions t WHERE t.id = ANY(%s)", (ids,)).fetchone()
+        f"FROM transactions t WHERE t.id = ANY(%s)",
+        (*amount_args, ids)).fetchone()
     total, amount_sum = row["n"], row["s"]
     spend_n = row["spend_n"]
     spend_sum = round(float(row["spend_sum"]), 2)
@@ -516,6 +568,12 @@ def all_categories(conn) -> list[str]:
     cats |= {r["category_override"] for r in conn.execute(
         "SELECT DISTINCT category_override FROM transactions "
         "WHERE removed = 0 AND category_override IS NOT NULL").fetchall()}
+    # a split part is where the rollups count its share, so a category that
+    # only a part names still has rows behind it and must be filterable
+    cats |= {r["category"] for r in conn.execute(
+        "SELECT DISTINCT sp.category FROM transaction_splits sp "
+        "JOIN transactions t ON t.tenant_id = sp.tenant_id AND t.id = sp.txn_id "
+        "WHERE t.removed = 0").fetchall()}
     return sorted(cats)
 
 
@@ -816,11 +874,21 @@ def set_category(conn, txn_id: str, category: str,
     # per-transaction override, which stay sacred.
     from ..engine import categories as _cats, llm_categorize as _llm
     if scope == "all" and category and category not in _cats.FLOW:
+        # "Whole merchant" is the merchant this row is FILED under — the one
+        # the page shows beside it, read through the display join, never a
+        # string retyped from the row's columns. Retyped, the two part
+        # company for exactly the rows identity work has touched: a fuel
+        # arm's row would hand its parent brand's name to the write (the
+        # brand's own rows recategorized, the pump's left alone), and a
+        # renamed merchant would be taught under the name it no longer
+        # displays as. The display name IS the bucket key _merchant_targets
+        # matches on, so it needs no second resolution.
         row = conn.execute(
-            "SELECT COALESCE(merchant_name, name) AS m FROM transactions "
-            "WHERE id=%s", (txn_id,)).fetchone()
+            f"""SELECT {_DISPLAY_MERCHANT} AS m
+                  FROM transactions t {_MC_JOIN} WHERE t.id=%s""",
+            (txn_id,)).fetchone()
         if row and row["m"]:
-            canon = _canonical_of(conn, row["m"])
+            canon = row["m"]
             with conn.transaction():
                 # Snapshot BEFORE the write, exactly as set_merchant_category
                 # does for the history page: the rows this teach will move
@@ -947,8 +1015,6 @@ def _write_user_rule(conn, canon: str, category: str) -> list[dict]:
 # matchers it has to agree with (budget.merchant_matcher / _tokens): the
 # history page narrows its ledger scans with the same fragments this module
 # writes with, and a second spelling here is a second thing to keep in step.
-_MATCH_TEXT = budget.MATCH_TEXT_SQL
-_MATCH_NORM = budget.MATCH_NORM_SQL
 _tokens_sql = budget.tokens_match_sql
 _merchant_match_sql = budget.merchant_match_sql
 
@@ -981,8 +1047,12 @@ def _page_match_sql(conn, payee: str) -> tuple[str, list] | None:
         # A substring form would read "care" inside longer names
         # ("healthcare", "caretech", "daycare"), so one short merchant
         # name would preview thousands of unrelated rows.
-        return (f"btrim({_MATCH_TEXT}) = ANY(%s)",
-                [sorted({r.lower() for r in raws})])
+        #
+        # The identity key itself, then — the very column raw_strings_for
+        # read these strings from. The match TEXT is the key followed by
+        # the bank line, so it never equals a bare key and compared to one
+        # selects nothing.
+        return f"{_RAW_KEY} = ANY(%s)", [sorted(set(raws))]
     row = conn.execute("SELECT merchant, raw FROM bills WHERE payee=%s LIMIT 1",
                        (payee,)).fetchone()
     key = budget._key_token(payee)
@@ -1003,18 +1073,24 @@ def _page_match_sql(conn, payee: str) -> tuple[str, list] | None:
 
 
 def _token_family(conn, payee: str) -> list[str]:
-    """The distinct raw merchant names the history page counts as this
+    """The distinct merchant identity keys the history page counts as this
     payee — the page's own match (see _page_match_sql). The bulk write must
     cover exactly what the page shows: truncated descriptors register one
     real store under several names/canonicals (the same shop reaching the
     ledger with its words in a different order), and a canonical-only write
-    skips charges sitting right on the page."""
+    skips charges sitting right on the page.
+
+    The IDENTITY KEY (merchant_sql, outlet first), not the aggregator's
+    name: the alias map these strings are looked up in is keyed by it, so a
+    fuel arm's row read by its brand name would resolve the brand's
+    canonical — the write would then teach, count and undo a merchant the
+    page never showed."""
     from ..engine import merchant_dedup
     # a live display bucket resolves in SQL: the raw strings displaying
     # under the name, no ledger scan
     if merchant_dedup.display_in_use(conn, payee):
         fam = [r["m"] for r in conn.execute(
-            f"""SELECT DISTINCT COALESCE(t.merchant_name, t.name) AS m
+            f"""SELECT DISTINCT {_RAW_KEY} AS m
                   FROM transactions t {_MC_JOIN}
                  WHERE t.removed = 0 AND {_DISPLAY_MERCHANT} = %s""",
             (payee,)).fetchall() if r["m"]]
@@ -1029,7 +1105,7 @@ def _token_family(conn, payee: str) -> list[str]:
         return [payee]
     where, params = match
     fam = [r["m"] for r in conn.execute(
-        f"""SELECT DISTINCT COALESCE(t.merchant_name, t.name) AS m
+        f"""SELECT DISTINCT {_RAW_KEY} AS m
               FROM transactions t {_MC_JOIN}
              WHERE t.removed = 0 AND {where}""", params).fetchall() if r["m"]]
     return sorted(set(fam)) or [payee]
@@ -1052,9 +1128,20 @@ def merchant_category_preview(conn, payee: str, category: str,
     write behind it: True (the default) is the history page's bulk set
     (set_merchant_category — token-family scoped); False is the ledger
     row's "apply to whole merchant" (set_category scope="all" — the row's
-    single canonical only)."""
-    canons = (_family_canons(conn, payee) if family
-              else [_canonical_of(conn, payee)])
+    single merchant only).
+
+    `payee` is the name the client is looking at, which for the row door is
+    the row's DISPLAY merchant — already the bucket key, so the narrow
+    scope takes such a name as it stands. Resolved once more through the
+    alias map it could land on another merchant's rows, and the count would
+    then be a promise about rows the write never touches. A payee that is
+    NOT a live display name is a raw descriptor, and that still resolves
+    through the map to the bucket it displays under."""
+    if family:
+        canons = _family_canons(conn, payee)
+    else:
+        canons = ([payee] if merchant_dedup.display_in_use(conn, payee)
+                  else [_canonical_of(conn, payee)])
     seen: set[str] = set()
     n = 0
     for c in canons:
@@ -1067,9 +1154,13 @@ def merchant_category_preview(conn, payee: str, category: str,
     # match never displayed (a wallet-prefixed descriptor pulling in the
     # store's plain one via their shared canonical). The confirm must NAME that full
     # scope, not just the token-matched names — the count already includes it.
+    # The names are the rows' IDENTITY KEYS, the strings the write is keyed
+    # by: the aggregator's name on a fuel-arm row is its PARENT brand's, and
+    # naming that in the confirm would promise a merchant the write does not
+    # touch.
     variants = set(_token_family(conn, payee)) if family else {payee}
     for r in conn.execute(
-            f"""SELECT DISTINCT COALESCE(t.merchant_name, t.name) AS m
+            f"""SELECT DISTINCT {_RAW_KEY} AS m
                FROM transactions t
                {_MC_JOIN}
                WHERE t.removed = 0
@@ -1097,7 +1188,9 @@ def merchant_category_preview(conn, payee: str, category: str,
                     skipped_override += 1
             elif r["id"] in seen and (r["category_primary"] or "") in _BULK_FLOW:
                 flow_rows += 1
-    return {"merchant": _canonical_of(conn, payee), "count": n,
+    # the merchant the confirm names is the one the write will be keyed on
+    return {"merchant": _canonical_of(conn, payee) if family else canons[0],
+            "count": n,
             "variants": sorted(variants),
             "flow_rows": flow_rows,
             "skipped_override": skipped_override}
@@ -1227,13 +1320,17 @@ RULES_PER_PAGE = 50
 def list_rules(conn, source: str | None = None, q: str = "",
                page: int = 1, per_page: int = RULES_PER_PAGE) -> dict:
     """The categorization rules the system is applying, with provenance
-    (user / llm / seed) and each canonical merchant's current transaction
-    count. The page shows three provenance groups loaded lazily, so this
+    (user / llm / seed) and how many of the ledger's transactions each rule
+    reaches. The page shows three provenance groups loaded lazily, so this
     filters by `source`, searches merchant+category (`q`), and paginates
     (~50/page — a mature ledger has thousands of rules and nothing may render
     them all at once). `counts` carries the q-filtered per-source totals for
     every group, so collapsed headers can show counts without loading
     rows."""
+    # merchant_categories is aliased `m` throughout, the alias
+    # llm_categorize._RULE_CANON is written for — the rule side of the match
+    # is that module's, not a second reading of it here.
+    from ..engine import llm_categorize as _llm
     where, params = "TRUE", []
     if (q or "").strip():
         # The search box takes literal text, not a pattern: percent,
@@ -1242,38 +1339,46 @@ def list_rules(conn, source: str | None = None, q: str = "",
         # per-source headers report unfiltered counts, and an underscore would
         # match anything. ESCAPE pins the
         # escape character instead of trusting the server default.
-        where += (" AND (mc.merchant ILIKE %s ESCAPE '\\'"
-                  " OR mc.category_primary ILIKE %s ESCAPE '\\')")
+        where += (" AND (m.merchant ILIKE %s ESCAPE '\\'"
+                  " OR m.category_primary ILIKE %s ESCAPE '\\')")
         params += [_like(q.strip())] * 2
     counts = {s: 0 for s in RULE_SOURCES}
     for r in conn.execute(
-            f"""SELECT mc.source, COUNT(*) AS n FROM merchant_categories mc
-                WHERE {where} GROUP BY mc.source""", params).fetchall():
+            f"""SELECT m.source, COUNT(*) AS n FROM merchant_categories m
+                WHERE {where} GROUP BY m.source""", params).fetchall():
         if r["source"] in counts:
             counts[r["source"]] = r["n"]
     if source:
-        where += " AND mc.source = %s"
+        where += " AND m.source = %s"
         params = params + [source]
     total = conn.execute(
-        f"SELECT COUNT(*) AS n FROM merchant_categories mc WHERE {where}",
+        f"SELECT COUNT(*) AS n FROM merchant_categories m WHERE {where}",
         params).fetchone()["n"]
     page = max(1, int(page or 1))
     per_page = max(1, min(int(per_page or RULES_PER_PAGE), 200))
+    # The count is the rows the rule REACHES, so both sides of the join are
+    # the sides apply() matches on: the rule resolved through the alias map
+    # (_RULE_CANON), the row by the merchant it is filed under (the display
+    # join). Re-deriving the row's merchant from merchant_name instead
+    # reported nothing for every rule on a merchant identity work has
+    # touched — a renamed one, a chain's fuel arm, a spelling folded into a
+    # canonical — so a live rule quietly moving rows read as a dead one.
+    # Case-insensitively because a rule reaches its merchant ROW by
+    # lower(name) there; case-distinct buckets do not survive a rename,
+    # which folds a re-cased name into the existing merchant.
     rows = conn.execute(f"""
-        SELECT mc.merchant, mc.category_primary, mc.source, mc.disabled,
+        SELECT m.merchant, m.category_primary, m.source, m.disabled,
                COALESCE(c.n, 0) AS count
-        FROM merchant_categories mc
+        FROM merchant_categories m
         LEFT JOIN (
-            SELECT COALESCE(m2.canonical, COALESCE(t.merchant_name, t.name))
-                       AS canon, COUNT(*) AS n
+            SELECT lower({_DISPLAY_MERCHANT}) AS disp, COUNT(*) AS n
             FROM transactions t
-            LEFT JOIN merchant_canonical m2
-                   ON m2.raw_merchant = COALESCE(t.merchant_name, t.name)
+            {_MC_JOIN}
             WHERE t.removed = 0
             GROUP BY 1
-        ) c ON c.canon = mc.merchant
+        ) c ON c.disp = lower({_llm._RULE_CANON})
         WHERE {where}
-        ORDER BY mc.source = 'user' DESC, mc.disabled, mc.merchant
+        ORDER BY m.source = 'user' DESC, m.disabled, m.merchant
         LIMIT %s OFFSET %s""",
         params + [per_page, (page - 1) * per_page]).fetchall()
     return {"rules": [dict(r) for r in rows], "total": total,
@@ -1561,21 +1666,184 @@ def clear_category(conn, txn_id: str) -> None:
 # then the reimbursing deposit; no pattern rules
 
 
+# The one lock every write to reimbursement pairs takes. Keyed on the
+# tenant because advisory locks ignore RLS; xact-scoped, so it only guards
+# anything inside an explicit `conn.transaction()` block (these are
+# autocommit connections — see budget.config_txn).
+_REIMB_LOCK = ("SELECT pg_advisory_xact_lock(hashtext(COALESCE("
+               "current_setting('app.tenant_id', true), '')), "
+               "hashtext('reimbursement-link'))")
+
+# A full link repays the charge with the WHOLE deposit, so the whole deposit
+# leaves income. When the deposit is bigger than what it repays by more
+# than rounding and a fee, most of it is money that really did come in — a
+# paycheck that carried one expense back with it — and a full link would
+# erase it. Such a deposit is linked as partial instead.
+#
+# The short side gets only the absolute allowance. A deposit smaller than
+# the charge by a fraction of it is still money nobody paid back — on a
+# large bill 5% is hundreds of dollars — and a full pair would drop it out
+# of spend; only rounding may be waved through there.
+_FULL_LINK_SLACK_ABS = 1.00
+_FULL_LINK_SLACK_FRAC = 0.05
+
+
+def _pair_rows(conn, ids: list[str]) -> dict:
+    """The live rows among `ids`, with what decides whether they may pair:
+    the business they belong to (their own entity, else their account's)
+    and whether their account is one the money math ignores — hidden, or
+    the non-primary copy of an account reached through two connections."""
+    shadows = links.shadow_ids(conn)
+    return {r["id"]: r for r in conn.execute(
+        """SELECT t.id, t.amount,
+                  COALESCE(t.entity_id, a.entity_id)::text AS entity,
+                  (a.user_removed_at IS NOT NULL
+                   OR t.account_id = ANY(%s)) AS ignored
+           FROM transactions t LEFT JOIN accounts a ON a.id = t.account_id
+           WHERE t.id = ANY(%s) AND t.removed = 0""",
+        (shadows, list(ids))).fetchall()}
+
+
+def _pair_refusal(a: dict, b: dict) -> str | None:
+    """Why two rows may not be a reimbursement pair, or None when they may.
+    The same rules reimbursement_candidates lists by, enforced here because
+    the list is only what the client was shown, not what it sends."""
+    if (a["amount"] > 0) == (b["amount"] > 0):
+        return ("pick one charge and one deposit — both rows flow the same "
+                "direction")
+    if a["ignored"] or b["ignored"]:
+        return ("that transaction is in a hidden account or is the duplicate "
+                "copy of a linked account — pair the visible copy instead")
+    if a["entity"] != b["entity"]:
+        return ("a household charge and a business's deposit (or the "
+                "reverse) cannot repay each other — personal and business "
+                "money stay separate")
+    return None
+
+
+def _deposit_fully_applied(conn, dep_id: str) -> bool:
+    """Does the deposit count for nothing but repayments? True when a full
+    pair names it, or when its partial links add up to all of it."""
+    row = conn.execute(
+        """SELECT ABS(t.amount) AS amt,
+                  EXISTS (SELECT 1 FROM reimbursements f
+                          WHERE f.reimburse_id = t.id AND f.partial = 0) AS full,
+                  COALESCE((SELECT SUM(p.amount) FROM reimbursements p
+                            WHERE p.reimburse_id = t.id AND p.partial = 1), 0)
+                      AS applied
+           FROM transactions t WHERE t.id = %s""", (dep_id,)).fetchone()
+    if row is None:
+        return False
+    return bool(row["full"]) or float(row["applied"]) >= float(row["amt"]) - 0.005
+
+
+def _first_link_at(conn, txn_id: str, also=None):
+    """When the earliest reimbursement link naming this row was made —
+    `also` adds the created_at of a link just deleted. None when there is
+    none."""
+    row = conn.execute(
+        "SELECT MIN(created_at) AS at FROM reimbursements "
+        "WHERE expense_id=%s OR reimburse_id=%s", (txn_id, txn_id)).fetchone()
+    stamps = [s for s in ((row["at"] if row else None), also) if s is not None]
+    return min(stamps) if stamps else None
+
+
+def _stamp_link_category(conn, txn_id: str, category: str) -> None:
+    """Give one side of a link its pass-through category.
+
+    A link's category is written as a person's pin (the same door as a hand
+    edit, so every automatic writer leaves it alone), and the only thing
+    that tells it apart from a hand edit made before any link is WHEN the
+    pin was set: at or after the row's first link means the link set it.
+    Unlink relies on that (_release_link_category). So a row that already
+    carries this category keeps its pin untouched — rewriting it would
+    re-date a hand-set transfer as link-made — unless the pin is itself
+    link-made, in which case it is re-dated to now so it stays no older
+    than any link on the row, however many links come and go."""
+    row = conn.execute(
+        """SELECT t.category_override AS cur, m.set_at, m.bill_id,
+                  m.transaction_id IS NOT NULL AS pinned
+             FROM transactions t
+             LEFT JOIN manual_categories m ON m.transaction_id = t.id
+            WHERE t.id = %s""", (txn_id,)).fetchone()
+    if row is None:
+        return
+    if row["cur"] != category:
+        set_category(conn, txn_id, category)
+        return
+    first = _first_link_at(conn, txn_id)
+    if (row["pinned"] and not row["bill_id"] and first is not None
+            and row["set_at"] >= first):
+        conn.execute("UPDATE manual_categories SET set_at = now() "
+                     "WHERE transaction_id = %s", (txn_id,))
+
+
+def _release_link_category(conn, txn_id: str, category: str,
+                           unlinked_at) -> None:
+    """Undo what _stamp_link_category wrote, and nothing else: the row
+    falls back only when it still carries the link's category as a
+    person's pin set at or after its first link. A transfer set by hand
+    before the row was ever linked, or any category chosen since, stays."""
+    row = conn.execute(
+        """SELECT t.category_override AS cur, m.set_at, m.bill_id,
+                  m.transaction_id IS NOT NULL AS pinned
+             FROM transactions t
+             LEFT JOIN manual_categories m ON m.transaction_id = t.id
+            WHERE t.id = %s""", (txn_id,)).fetchone()
+    if row is None or row["cur"] != category:
+        return
+    if not row["pinned"] or row["bill_id"]:
+        return
+    first = _first_link_at(conn, txn_id, also=unlinked_at)
+    if first is not None and row["set_at"] >= first:
+        clear_category(conn, txn_id)
+
+
+# What a full link that was turned into a partial one tells the person.
+_DOWNGRADE_NOTE = ("Linked as partial: the deposit covers more than this "
+                   "charge; the rest stays income")
+_SHORT_DEPOSIT_NOTE = ("Linked as partial: what is left of the deposit "
+                       "does not cover this whole charge; the rest stays "
+                       "spend")
+_ALREADY_REPAID_NOTE = ("Linked as partial: part of this charge was already "
+                        "repaid by another deposit")
+
+
 def link_reimbursement(conn, txn_id: str, other_id: str,
                        partial: bool = False) -> dict:
     """Pair an expense with the deposit that reimburses it. Direction is
     auto-oriented by sign (positive = money out = the expense).
 
+    Only rows reimbursement_candidates could have offered may pair: one
+    charge and one deposit, both in accounts the money math counts (not
+    hidden, not the duplicate copy of a linked account), and both the
+    household's or both the same business's. The client's list is not
+    trusted to have enforced that.
+
     FULL pair: both sides get pass-through semantics — expense →
     TRANSFER_OUT, deposit → TRANSFER_IN — so spend/income math treat the
-    pair as the user's own money moving.
+    pair as the user's own money moving. The whole deposit leaves income,
+    so when the deposit is materially bigger than every charge it repays
+    together, a full link would erase money that really came in; such a
+    link is made PARTIAL instead and says so in `note`. That is the common
+    case from a charge's own page — one insurance check covering several
+    charges, linked one charge at a time — and it is also right: each
+    charge nets to zero, and once the links use the whole check up, the
+    check is a transfer. The other way round, a full pair must not claim
+    more than the deposit has left or repay a charge other deposits
+    already partly repaid: such a link records what really came back, as
+    a partial link, and says so. Linking a pair that is already linked
+    writes nothing and answers with `existing`.
 
-    PARTIAL pair: only a fraction came back (co-pay + insurance check).
-    The deposit still becomes TRANSFER_IN, but the expense KEEPS its
+    PARTIAL pair: only a fraction came back (co-pay + insurance check), or
+    one expense rode back inside a bigger deposit. The expense KEEPS its
     category — spend math nets the received amount off the row
-    (reporting.NET_AMOUNT) and the remainder stays real spend. Several
-    partial deposits can pair to one charge, and one deposit can split
-    across several charges: each link records min(charge's remaining need,
+    (reporting.NET_AMOUNT) and the remainder stays real spend. The deposit
+    keeps its category too, until its links account for all of it: only
+    then is it TRANSFER_IN, because until then the part no charge claimed
+    is still income, and a category is all-or-nothing. Several partial
+    deposits can pair to one charge, and one deposit can split across
+    several charges: each link records min(charge's remaining need,
     deposit's remaining balance), so link amounts never sum past either
     side (both caps are enforced below). The awaiting flag clears only once
     the received total covers the flag's expected value (or the whole
@@ -1602,116 +1870,276 @@ def link_reimbursement(conn, txn_id: str, other_id: str,
 
     The explicit transaction block is load-bearing: these are autocommit
     connections (see budget.config_txn), so outside it an xact-scoped lock
-    would release the instant the statement returned and guard nothing.
-    The lock is keyed on the tenant because advisory locks ignore RLS."""
+    would release the instant the statement returned and guard nothing."""
     with conn.transaction():
-        conn.execute(
-            "SELECT pg_advisory_xact_lock(hashtext(COALESCE("
-            "current_setting('app.tenant_id', true), '')), "
-            "hashtext('reimbursement-link'))")
-        rows = {r["id"]: r for r in conn.execute(
-            "SELECT id, amount FROM transactions "
-            "WHERE id IN (%s,%s) AND removed=0",
-            (txn_id, other_id)).fetchall()}
-        if len(rows) != 2:
-            return {"error": "transaction not found"}
-        a, b = rows[txn_id], rows[other_id]
-        if (a["amount"] > 0) == (b["amount"] > 0):
-            return {"error": "pick one charge and one deposit — both rows "
-                             "flow the same direction"}
-        expense = a if a["amount"] > 0 else b
-        reimb = b if expense is a else a
-        if partial:
-            dep_amt = round(abs(reimb["amount"]), 2)
-            # A partial pair nets the received money off the charge, so
-            # over-linking deposits would drive the row NEGATIVE — spend
-            # understated, a false UNDER BUDGET. Cumulative received may not
-            # exceed the charge. (reporting/budget also floor the net at 0.)
-            got = conn.execute(
-                "SELECT COALESCE(SUM(amount),0) AS got FROM reimbursements "
-                "WHERE expense_id=%s AND partial=1",
-                (expense["id"],)).fetchone()["got"]
-            room = round(float(expense["amount"]) - float(got), 2)
-            if room <= 0.005:
-                return {"error": (
-                    f"that charge is already fully reimbursed — "
-                    f"${float(got):,.2f} of ${float(expense['amount']):,.2f} "
-                    f"already came back")}
-            # Cap the DEPOSIT side too. Without this, one $100 deposit
-            # partial-linked to N different $100 charges would record the FULL
-            # deposit N times, netting them ALL to $0 (true economics: $100
-            # out). Remaining-balance semantics: each link records
-            # min(charge need, deposit remaining) — Σ amounts per
-            # reimburse_id can never exceed abs(deposit.amount).
-            applied = conn.execute(
-                "SELECT COALESCE(SUM(amount),0) AS got FROM reimbursements "
-                "WHERE reimburse_id=%s AND partial=1",
-                (reimb["id"],)).fetchone()["got"]
-            dep_left = round(dep_amt - float(applied), 2)
-            if dep_left <= 0.005:
-                return {"error": (
-                    f"that deposit is already fully applied — all "
-                    f"${dep_amt:,.2f} of it reimburses other charges")}
-            received = round(min(room, dep_left), 2)
-            conn.execute(
-                "INSERT INTO reimbursements (expense_id, reimburse_id, "
-                "partial, amount) VALUES (%s,%s,1,%s) ON CONFLICT DO NOTHING",
-                (expense["id"], reimb["id"], received))
-            set_category(conn, reimb["id"], "TRANSFER_IN")
-            conn.execute("DELETE FROM reimburse_flags WHERE txn_id=%s",
-                         (reimb["id"],))
-            # the charge stays awaiting until enough came back
-            flag = conn.execute(
-                "SELECT expected FROM reimburse_flags WHERE txn_id=%s",
-                (expense["id"],)).fetchone()
-            total = conn.execute(
-                "SELECT COALESCE(SUM(amount),0) AS got FROM reimbursements "
-                "WHERE expense_id=%s AND partial=1",
-                (expense["id"],)).fetchone()["got"]
-            target = (flag["expected"] if flag and flag["expected"]
-                      else expense["amount"])
-            if flag is not None and total >= float(target) - 0.005:
-                conn.execute("DELETE FROM reimburse_flags WHERE txn_id=%s",
-                             (expense["id"],))
-            return {"expense": expense["id"], "reimburse": reimb["id"],
-                    "partial": True, "received": received}
-        conn.execute("INSERT INTO reimbursements (expense_id, reimburse_id) "
-                     "VALUES (%s,%s) ON CONFLICT DO NOTHING",
-                     (expense["id"], reimb["id"]))
-        set_category(conn, expense["id"], "TRANSFER_OUT")
-        set_category(conn, reimb["id"], "TRANSFER_IN")
-        # a matched charge is no longer awaiting — clear any flags
-        conn.execute("DELETE FROM reimburse_flags WHERE txn_id IN (%s,%s)",
-                     (expense["id"], reimb["id"]))
-        return {"expense": expense["id"], "reimburse": reimb["id"]}
+        conn.execute(_REIMB_LOCK)
+        rows = _pair_rows(conn, [txn_id, other_id])
+        return _link_locked(conn, rows, txn_id, other_id, partial)
+
+
+def _link_locked(conn, rows: dict, txn_id: str, other_id: str,
+                 partial: bool) -> dict:
+    """One link, with the lock held and the request's rows already read
+    (`rows` holds the anchor, this counterpart and, for a multi-select,
+    every other counterpart in the same request)."""
+    if txn_id not in rows or other_id not in rows or txn_id == other_id:
+        return {"error": "transaction not found"}
+    a, b = rows[txn_id], rows[other_id]
+    refusal = _pair_refusal(a, b)
+    if refusal:
+        return {"error": refusal}
+    expense = a if a["amount"] > 0 else b
+    reimb = b if expense is a else a
+    # The pair is already linked: a double-tap, a retry, a second device
+    # or the same id twice in one request. Answer with what is there and
+    # write nothing — re-running the full path would stamp both sides as
+    # a full pair over a row that is really partial, and unlink would then
+    # leave the charge's TRANSFER_OUT pin behind for good.
+    have = conn.execute(
+        "SELECT partial, amount FROM reimbursements "
+        "WHERE expense_id = %s AND reimburse_id = %s",
+        (expense["id"], reimb["id"])).fetchone()
+    if have is not None:
+        out = {"expense": expense["id"], "reimburse": reimb["id"],
+               "existing": True}
+        if have["partial"]:
+            out["partial"] = True
+            out["received"] = float(have["amount"] or 0)
+        return out
+    if partial:
+        return _link_partial(conn, expense, reimb)
+    # What the whole deposit would repay: the charges already fully paired
+    # to it, this one, and — when the deposit is the anchor of a
+    # multi-select — the other charges in the same request that may pair
+    # with it. Partial links already drawn from it count too.
+    # The other selected charges count only for what they still need: one
+    # already repaid elsewhere will be refused or drawn down, so weighing
+    # its whole amount would let this link pass as a full pair and erase
+    # income the deposit never spent.
+    covered = {expense["id"]}
+    covered |= {r["expense_id"] for r in conn.execute(
+        "SELECT expense_id FROM reimbursements "
+        "WHERE reimburse_id = %s AND partial = 0",
+        (reimb["id"],)).fetchall()}
+    cover = float(conn.execute(
+        """SELECT COALESCE(SUM(amount), 0) AS s FROM transactions
+           WHERE id = ANY(%s) AND removed = 0""",
+        (sorted(covered),)).fetchone()["s"])
+    if reimb["id"] == txn_id:
+        # A charge already partial-linked to this deposit is counted once,
+        # through the partial sum below — adding its room too would weigh
+        # the deposit against money it has already given.
+        linked_here = {r["expense_id"] for r in conn.execute(
+            "SELECT expense_id FROM reimbursements WHERE reimburse_id = %s",
+            (reimb["id"],)).fetchall()}
+        for i, r in rows.items():
+            if (i not in covered and i not in linked_here and r["amount"] > 0
+                    and _pair_refusal(r, reimb) is None):
+                cover += max(_charge_room(conn, r)[0], 0.0)
+    cover = float(cover) + float(conn.execute(
+        "SELECT COALESCE(SUM(amount),0) AS s FROM reimbursements "
+        "WHERE reimburse_id = %s AND partial = 1 AND expense_id <> %s",
+        (reimb["id"], expense["id"])).fetchone()["s"])
+    dep_amt = abs(float(reimb["amount"]))
+    # A full pair takes the whole charge out of spend, so it is only true
+    # when what is left of the deposit can pay the whole charge, and the
+    # charge has not already been partly repaid by other deposits.
+    # Otherwise the link records what really came back, as a partial link
+    # does, and says so; when either side has nothing left, _link_partial
+    # refuses it the same way it refuses a partial request.
+    room, got = _charge_room(conn, expense)
+    dep_left = _deposit_left(conn, reimb)
+    if got > 0.005 or round(room - dep_left, 2) > _FULL_LINK_SLACK_ABS:
+        out = _link_partial(conn, expense, reimb)
+        if "error" not in out:
+            out["note"] = (_ALREADY_REPAID_NOTE if got > 0.005
+                           else _SHORT_DEPOSIT_NOTE)
+        return out
+    if round(dep_amt - cover, 2) > max(_FULL_LINK_SLACK_ABS,
+                                       _FULL_LINK_SLACK_FRAC * cover):
+        out = _link_partial(conn, expense, reimb)
+        if "error" not in out:
+            out["note"] = _DOWNGRADE_NOTE
+        return out
+    made = conn.execute(
+        "INSERT INTO reimbursements (expense_id, reimburse_id) "
+        "VALUES (%s,%s) ON CONFLICT DO NOTHING RETURNING expense_id",
+        (expense["id"], reimb["id"])).fetchone()
+    if made is None:
+        # nothing was written, so there is nothing to stamp
+        return {"expense": expense["id"], "reimburse": reimb["id"],
+                "existing": True}
+    _stamp_link_category(conn, expense["id"], "TRANSFER_OUT")
+    _stamp_link_category(conn, reimb["id"], "TRANSFER_IN")
+    # a matched charge is no longer awaiting — clear any flags
+    conn.execute("DELETE FROM reimburse_flags WHERE txn_id IN (%s,%s)",
+                 (expense["id"], reimb["id"]))
+    return {"expense": expense["id"], "reimburse": reimb["id"]}
+
+
+def _charge_room(conn, expense: dict) -> tuple[float, float]:
+    """(what of the charge is still unrepaid, what partial links already
+    brought back). A partial pair nets the received money off the charge,
+    so over-linking deposits would drive the row NEGATIVE — spend
+    understated, a false UNDER BUDGET. Cumulative received may not exceed
+    the charge. (reporting/budget also floor the net at 0.)"""
+    # A full pair repays the charge with its whole deposit, so a charge
+    # fully paired to a deposit at least its size has no room for a second
+    # one — otherwise that deposit's whole amount would leave income for a
+    # charge nothing is owed on. A full pair on a smaller deposit (made
+    # before short deposits were linked as partial) repaid only that
+    # deposit, and the rest of the charge is still owed.
+    # A full pair within the dollar allowance repaid the whole charge; only
+    # an older pair on a clearly smaller deposit leaves the rest owed.
+    charge = abs(float(expense["amount"]))
+    got = float(conn.execute(
+        """SELECT COALESCE(SUM(CASE WHEN r.partial = 1 THEN r.amount
+                                    WHEN ABS(dep.amount) >= %s - %s THEN %s
+                                    ELSE LEAST(%s, COALESCE(ABS(dep.amount), %s))
+                               END), 0) AS got
+             FROM reimbursements r
+             LEFT JOIN transactions dep ON dep.id = r.reimburse_id
+            WHERE r.expense_id = %s""",
+        (charge, _FULL_LINK_SLACK_ABS, charge, charge, charge,
+         expense["id"])).fetchone()["got"])
+    return round(float(expense["amount"]) - got, 2), got
+
+
+def _deposit_left(conn, reimb: dict) -> float:
+    """What of the deposit no link has claimed yet.
+
+    Without this cap one $100 deposit partial-linked to N different $100
+    charges would record the FULL deposit N times, netting them ALL to $0
+    (true economics: $100 out). What the deposit already repays can never
+    exceed abs(deposit.amount), and that is its partial links AND the
+    charges fully paired to it: a full pair spends the deposit on the
+    whole charge, so a $1,000 deposit fully paired to a $980 charge has
+    $20 left to give, not $1,000."""
+    applied = conn.execute(
+        """SELECT COALESCE((SELECT SUM(amount) FROM reimbursements
+                            WHERE reimburse_id=%s AND partial=1), 0)
+                + COALESCE((SELECT SUM(e.amount) FROM reimbursements f
+                            JOIN transactions e ON e.id = f.expense_id
+                            WHERE f.reimburse_id=%s AND f.partial=0
+                              AND e.removed=0), 0) AS got""",
+        (reimb["id"], reimb["id"])).fetchone()["got"]
+    return round(round(abs(float(reimb["amount"])), 2) - float(applied), 2)
+
+
+def _link_partial(conn, expense: dict, reimb: dict) -> dict:
+    """The partial half of _link_locked (lock held)."""
+    dep_amt = round(abs(reimb["amount"]), 2)
+    room, got = _charge_room(conn, expense)
+    if room <= 0.005:
+        return {"error": (
+            f"that charge is already fully reimbursed — "
+            f"${float(got):,.2f} of ${float(expense['amount']):,.2f} "
+            f"already came back")}
+    dep_left = _deposit_left(conn, reimb)
+    if dep_left <= 0.005:
+        return {"error": (
+            f"that deposit is already fully applied — all "
+            f"${dep_amt:,.2f} of it reimburses other charges")}
+    received = round(min(room, dep_left), 2)
+    conn.execute(
+        "INSERT INTO reimbursements (expense_id, reimburse_id, "
+        "partial, amount) VALUES (%s,%s,1,%s) ON CONFLICT DO NOTHING",
+        (expense["id"], reimb["id"], received))
+    if _deposit_fully_applied(conn, reimb["id"]):
+        _stamp_link_category(conn, reimb["id"], "TRANSFER_IN")
+    conn.execute("DELETE FROM reimburse_flags WHERE txn_id=%s",
+                 (reimb["id"],))
+    # the charge stays awaiting until enough came back
+    flag = conn.execute(
+        "SELECT expected FROM reimburse_flags WHERE txn_id=%s",
+        (expense["id"],)).fetchone()
+    total = conn.execute(
+        "SELECT COALESCE(SUM(amount),0) AS got FROM reimbursements "
+        "WHERE expense_id=%s AND partial=1",
+        (expense["id"],)).fetchone()["got"]
+    target = (flag["expected"] if flag and flag["expected"]
+              else expense["amount"])
+    if flag is not None and total >= float(target) - 0.005:
+        conn.execute("DELETE FROM reimburse_flags WHERE txn_id=%s",
+                     (expense["id"],))
+    return {"expense": expense["id"], "reimburse": reimb["id"],
+            "partial": True, "received": received}
 
 
 def link_reimbursements(conn, txn_id: str, other_ids: list[str],
                         partial: bool = False) -> dict:
     """Link several counterparts to one anchor in one shot — one check often
-    covers many charges. Failures are reported, not fatal."""
-    linked, errors = [], []
-    for oid in other_ids:
-        r = link_reimbursement(conn, txn_id, oid, partial=partial)
-        (errors if "error" in r else linked).append(r.get("error", oid))
-    return {"linked": len(linked), "errors": errors}
+    covers many charges. Failures are reported in `errors`, not fatal.
+
+    The whole request runs under one lock and reads its rows once, so a
+    deposit anchoring several charges is weighed against all of them
+    rather than against the first alone. A full link made partial because
+    the deposit is bigger than what it repays is not a failure: it is
+    counted in `linked`, and in `partial`, and explained in `notes`.
+    `partial` (how many of the links are partial) and `notes` are present
+    only when non-empty."""
+    linked, errors, notes, n_partial = 0, [], [], 0
+    with conn.transaction():
+        conn.execute(_REIMB_LOCK)
+        # the same id twice is one link, not a second request for it
+        other_ids = list(dict.fromkeys(other_ids))
+        rows = _pair_rows(conn, [txn_id, *other_ids])
+        for oid in other_ids:
+            r = _link_locked(conn, rows, txn_id, oid, partial)
+            if "error" in r:
+                errors.append(r["error"])
+                continue
+            if r.get("existing"):
+                continue
+            linked += 1
+            if r.get("partial"):
+                n_partial += 1
+            if r.get("note") and r["note"] not in notes:
+                notes.append(r["note"])
+    out = {"linked": linked, "errors": errors}
+    if n_partial:
+        out["partial"] = n_partial
+    if notes:
+        out["notes"] = notes
+    return out
 
 
 def unlink_reimbursement(conn, expense_id: str, reimburse_id: str) -> None:
     """Remove a pair; each side falls back to the native category unless
     another pair still references it. A partial pair never touched the
-    expense's category, so only the deposit side falls back."""
-    row = conn.execute(
-        "DELETE FROM reimbursements WHERE expense_id=%s AND reimburse_id=%s "
-        "RETURNING partial", (expense_id, reimburse_id)).fetchone()
-    was_partial = bool(row and row["partial"])
-    sides = (reimburse_id,) if was_partial else (expense_id, reimburse_id)
-    for tid in sides:
-        still = conn.execute(
-            "SELECT 1 FROM reimbursements WHERE expense_id=%s OR reimburse_id=%s LIMIT 1",
-            (tid, tid)).fetchone()
-        if still is None:
-            clear_category(conn, tid)
+    expense's category, so only the deposit side falls back — and a
+    deposit whose remaining links no longer account for all of it lets go
+    of TRANSFER_IN, because the unclaimed part is income again.
+
+    Only what a link wrote is undone (_release_link_category): a transfer
+    the person set by hand before linking stays a transfer.
+
+    The same per-tenant lock as link_reimbursement, inside one
+    transaction: the DELETE, the "is anything still paired" read and the
+    category fallback are one step. Run as separate statements, a link
+    committing between the read and the fallback would have the TRANSFER_IN
+    it just wrote wiped by this unlink."""
+    with conn.transaction():
+        conn.execute(_REIMB_LOCK)
+        row = conn.execute(
+            "DELETE FROM reimbursements WHERE expense_id=%s AND reimburse_id=%s "
+            "RETURNING partial, created_at",
+            (expense_id, reimburse_id)).fetchone()
+        if row is None:
+            return
+        was_partial = bool(row["partial"])
+        # the charge left spend only through a FULL pair; partial receipts
+        # still on it are netted off its own category, which it gets back
+        if not was_partial:
+            still = conn.execute(
+                "SELECT 1 FROM reimbursements WHERE expense_id=%s "
+                "AND partial=0 LIMIT 1", (expense_id,)).fetchone()
+            if still is None:
+                _release_link_category(conn, expense_id, "TRANSFER_OUT",
+                                       row["created_at"])
+        if not _deposit_fully_applied(conn, reimburse_id):
+            _release_link_category(conn, reimburse_id, "TRANSFER_IN",
+                                   row["created_at"])
 
 
 def flag_reimbursement(conn, txn_id: str, partial: bool = False,
@@ -1737,7 +2165,12 @@ def unflag_reimbursement(conn, txn_id: str) -> None:
 
 
 def pending_reimbursements(conn) -> list:
-    """Charges flagged as awaiting reimbursement, oldest first."""
+    """Charges flagged as awaiting reimbursement, oldest first.
+
+    Not those in a hidden account or on the duplicate copy of a linked
+    account: no deposit can be linked to them (link_reimbursement refuses
+    such rows), so listing them would ask for something that cannot be
+    done — the flag stays and reappears if the account is shown again."""
     return conn.execute(
         f"""SELECT t.id, t.date, t.amount, t.pending,
                    {_DISPLAY_MERCHANT} AS payee,
@@ -1752,7 +2185,9 @@ def pending_reimbursements(conn) -> list:
             LEFT JOIN accounts a ON a.id = t.account_id
             LEFT JOIN items i ON i.id = a.item_id
             {_MC_JOIN}
-            ORDER BY t.date ASC""").fetchall()
+            WHERE a.user_removed_at IS NULL
+              AND NOT COALESCE(t.account_id = ANY(%s), false)
+            ORDER BY t.date ASC""", (links.shadow_ids(conn),)).fetchall()
 
 
 def recent_reimbursement_pairs(conn, limit: int = 50) -> list:
@@ -1761,19 +2196,25 @@ def recent_reimbursement_pairs(conn, limit: int = 50) -> list:
     A wrong match stamps both sides TRANSFER_* and the charge leaves the
     pending list, so without this the mistake is invisible everywhere the
     person would look; the matched list puts every pair one click from
-    unlink_reimbursement."""
+    unlink_reimbursement.
+
+    Both sides are named the way the ledger names them — a deposit shown by
+    its bank descriptor while the rest of the app calls that merchant
+    something else is a pair the person cannot recognize, which is the one
+    thing this list exists to make possible."""
+    dep_join, dep_display = _merchant_join_for("d", "dmc", "dmm")
     return conn.execute(
         f"""SELECT r.expense_id, r.reimburse_id, r.partial,
                   r.amount AS received, r.created_at,
                   t.date AS expense_date, t.amount AS expense_amount,
                   {_DISPLAY_MERCHANT} AS expense_payee,
                   d.date AS deposit_date, d.amount AS deposit_amount,
-                  COALESCE(NULLIF(d.merchant_name, ''), d.name)
-                      AS deposit_payee
+                  {dep_display} AS deposit_payee
            FROM reimbursements r
            JOIN transactions t ON t.id = r.expense_id
            JOIN transactions d ON d.id = r.reimburse_id
            {_MC_JOIN}
+           {dep_join}
            ORDER BY r.created_at DESC, t.date DESC
            LIMIT %s""", (int(limit),)).fetchall()
 
@@ -1795,33 +2236,56 @@ def reimbursement_pairs(conn, txn_id: str) -> list:
 
 def reimbursement_candidates(conn, txn_id: str, q: str = "", limit: int = 40):
     """Opposite-direction transactions near the anchor, best matches first
-    (amount closeness, then date proximity, ±180 days).
+    (±180 days): an exact amount leads, then posted rows before pending
+    ones, then the nearest in time, then the nearest in amount, and the
+    row id last so equal rows always list in the same order. Date before
+    amount because one deposit often repays several charges at once — one
+    insurance check covering a clinic visit, a pharmacy fill and a lab
+    bill — and against each of those charges the check is far off in
+    amount but days away in time; ranked by amount alone, such a deposit
+    would sort below every refund and transfer in the ±180-day window.
+    Posted before pending because a pending row is replaced when the bank
+    posts it; a pair made on it follows the charge to the posted row (the
+    settlement carry in sync), but the posted row is the one to pick when
+    both are there.
 
-    Deposit-side candidates (anchor = a charge) come from the tenant's
-    primary checking account — config `checking_account_id`, else any
-    depository checking — AND from the charge's own account, because a
-    merchant refund is credited back to the card that was charged, never
-    to checking; a card payment on that account is not a refund and is
-    kept out by its category. Charge-side candidates
+    Only rows that could pair are listed, whichever side is the anchor:
+    none from a hidden account or from the duplicate copy of a linked
+    account (the same real transactions the primary already lists — each
+    deposit would show twice), and only rows belonging to the same party as
+    the anchor — a household charge is never repaid by a business's
+    deposit, nor the reverse. link_reimbursement enforces the same rules.
+
+    Deposit-side candidates (anchor = a charge) come from EVERY checking
+    and savings account the household has, plus the pinned primary
+    checking (config `checking_account_id`) whatever its type, AND from
+    the charge's own account, because a merchant refund is credited back
+    to the card that was charged, never to checking; a card payment on
+    that account is not a refund and is kept out by its category. The
+    pin only ever widens the list: a pin naming an account that no longer
+    exists (a re-linked institution mints new ids) must not narrow the
+    deposit side to card refunds, and a reimbursement that lands in the
+    household's other checking account is still a reimbursement. Charge-side candidates
     exclude investment/crypto internals and card settlements but KEEP
     already-TRANSFER_OUT charges selectable."""
     anchor = conn.execute(
-        "SELECT id, date, amount, account_id FROM transactions "
-        "WHERE id=%s AND removed=0", (txn_id,)).fetchone()
+        "SELECT t.id, t.date, t.amount, t.account_id, "
+        "COALESCE(t.entity_id, a.entity_id)::text AS entity "
+        "FROM transactions t LEFT JOIN accounts a ON a.id = t.account_id "
+        "WHERE t.id=%s AND t.removed=0", (txn_id,)).fetchone()
     if anchor is None:
         return None, []
     side = "t.amount < 0" if anchor["amount"] > 0 else "t.amount > 0"
     args: list = []
     if anchor["amount"] > 0:   # looking for the reimbursing deposit
         cfg = budget.load_config(conn)
+        checking = ("t.account_id IN (SELECT a2.id FROM accounts a2"
+                    " WHERE a2.type = 'depository'"
+                    " AND a2.subtype IN ('checking', 'savings'))")
         acct = cfg.get("checking_account_id")
         if acct:
-            checking = "t.account_id = %s"
+            checking = f"({checking} OR t.account_id = %s)"
             args.append(acct)
-        else:
-            checking = ("t.account_id IN (SELECT a2.id FROM accounts a2"
-                        " WHERE a2.type = 'depository'"
-                        " AND a2.subtype = 'checking')")
         # the charge's own account carries refunds; its settlements
         # (card payments) are credits too, and are not reimbursements
         side += (f" AND ({checking} OR (t.account_id = %s"
@@ -1833,15 +2297,30 @@ def reimbursement_candidates(conn, txn_id: str, q: str = "", limit: int = 40):
                  " WHERE a2.type IN ('credit','depository'))"
                  " AND COALESCE(t.category_override, t.category_primary, '')"
                  " NOT LIKE 'LOAN_PAYMENTS%%'")
+    # Hidden accounts and linked duplicates, the same two filters as the
+    # ledger listing: the session var covers both, but only tenant_connect
+    # and a link change set it, so the hidden-account subquery stays as the
+    # floor. A pinned or charged account is no exception — hiding it means
+    # it counts toward nothing, pairs included.
+    side += (" AND t.account_id NOT IN (SELECT id FROM accounts"
+             " WHERE user_removed_at IS NOT NULL)" + _NOT_SHADOW)
+    side += " AND COALESCE(t.entity_id, a.entity_id)::text IS NOT DISTINCT FROM %s"
+    args.append(anchor["entity"])
     args += [anchor["date"], anchor["date"]]
     extra = ""
     if q.strip():
-        # the typed filter is literal text — unescaped, a `%` would narrow
-        # nothing and a `_` would widen the candidate list silently
-        extra = (" AND LOWER(COALESCE(t.merchant_name, t.name))"
-                 " LIKE %s ESCAPE '\\'")
-        args.append(_like(q.strip()))
-    args += [abs(anchor["amount"]), anchor["date"]]   # ORDER BY placeholders
+        # Matched against what the list SHOWS (the display merchant), or
+        # against the bank's own descriptor: those are the two things a
+        # person types. Against the aggregator's name alone, typing the
+        # payee on screen finds nothing for a renamed merchant or a fuel
+        # arm, and the deposit looks absent rather than differently named.
+        # The typed filter is literal text — unescaped, a `%` would narrow
+        # nothing and a `_` would widen the candidate list silently.
+        extra = (f" AND (LOWER({_DISPLAY_MERCHANT}) LIKE %s ESCAPE '\\'"
+                 " OR LOWER(t.name) LIKE %s ESCAPE '\\')")
+        args += [_like(q.strip())] * 2
+    # ORDER BY placeholders: exact amount, then date, then amount
+    args += [abs(anchor["amount"]), anchor["date"], abs(anchor["amount"])]
     rows = conn.execute(
         f"""SELECT t.id, t.date, t.amount, t.pending,
                    {_DISPLAY_MERCHANT} AS payee,
@@ -1853,8 +2332,11 @@ def reimbursement_candidates(conn, txn_id: str, q: str = "", limit: int = 40):
             WHERE t.removed = 0 AND {side}
               AND t.date >= %s - INTERVAL '180 days'
               AND t.date <= %s + INTERVAL '180 days'{extra}
-            ORDER BY ABS(ABS(t.amount) - %s) ASC,
-                     ABS(t.date - %s) ASC
+            ORDER BY (ABS(ABS(t.amount) - %s) < 0.005) DESC,
+                     t.pending ASC,
+                     ABS(t.date - %s) ASC,
+                     ABS(ABS(t.amount) - %s) ASC,
+                     t.id ASC
             LIMIT {int(limit)}""", args).fetchall()
     return anchor, rows
 

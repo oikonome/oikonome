@@ -66,7 +66,7 @@ class SearchAverage(unittest.TestCase):
         self.assertEqual(self._spend("sample payee"), {"count": 1, "sum": 40.00})
 
     def test_money_in_is_not_spending(self):
-        add_txn(self.conn, "2026-08-01", 25.00, "Refund Corp")
+        add_txn(self.conn, "2026-08-03", 25.00, "Refund Corp")
         add_txn(self.conn, "2026-08-02", -100.00, "Refund Corp")
         self.assertEqual(self._spend("refund corp"), {"count": 1, "sum": 25.00})
 

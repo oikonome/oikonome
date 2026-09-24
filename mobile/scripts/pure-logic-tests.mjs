@@ -11,15 +11,107 @@ import { readFileSync } from "node:fs";
 import zlib from "node:zlib";
 import test from "node:test";
 
-import { ApiError, countsInTotals, errText, inOperatingProfit }
-  from "../src/lib/api.ts";
+import { ApiError, countsInTotals, errText, inOperatingProfit,
+         whatIfRefusal } from "../src/lib/api.ts";
 import { categoryForServer, CLEAR_CATEGORY, composeBugReport,
          filterCategories, dayLabel, daySpend,
          elevationProof, hostOf,
          hueOf, isPrivateHost, isValidYmd, logoProxyUrl, monogram,
-         serverUrlVerdict, lastSyncPhrase, mergeSavingsGoals, money, numv,
-         pyround, resolveFace, withDayHeads }
+         monthYear, serverUrlVerdict, lastSyncPhrase, mergeSavingsGoals,
+         money, moneyParam, numv, pyround, resolveFace, span, whatIfQuery,
+         withDayHeads }
   from "../src/lib/pure.ts";
+
+import { clockLabel, glanceFace, STALE_AFTER_MS, wideEnoughForChips,
+         widgetOwner, widgetOwnerChanged, credentialStamp, ownedCache,
+         saveStillOwned } from "../src/lib/glance-pure.ts";
+
+// ---- the home-screen widget's face: the hero's simple face, decided
+// from the payload alone; stale beats wrong, and no credential is
+// "Sign in", not a zero ----
+const glance = (over = {}) => ({
+  date: "2026-01-15", budgets_set: true, verdict: "ON BUDGET",
+  left_today: 47, day_spent: 29, day_allow: 76, days_left: 16,
+  pace_line: "$12/day ahead",
+  chips: [{ text: "Groceries $22 today", tone: "" },
+          { text: "Gas over by $8", tone: "neg" }],
+  as_of: "2026-01-15T09:40:00Z", ...over });
+const at = (ms) => ({ glance: glance(), fetched_at: ms });
+
+test("widget: no credential is Sign in, no plan is Set a plan", () => {
+  assert.equal(glanceFace(at(0), false, 0).kind, "signin");
+  assert.equal(glanceFace({ glance: glance({ budgets_set: false }),
+                            fetched_at: 0 }, true, 0).kind, "noplan");
+});
+
+test("widget: the number is the hero's headline in whole dollars", () => {
+  const f = glanceFace(at(1000), true, 1000);
+  assert.equal(f.kind, "verdict");
+  assert.equal(f.number, "$47");
+  assert.equal(f.verdict, "On budget");
+  assert.equal(f.tone, "good");
+  assert.equal(f.sub, "$29 of $76 spent");
+  assert.equal(f.pace, "$12/day ahead");
+  assert.ok(Math.abs(f.fill - 29 / 76) < 1e-9);
+  assert.equal(f.over, false);
+  assert.equal(f.stale, false);
+  assert.deepEqual(f.chips, [{ text: "Groceries $22 today", neg: false },
+                             { text: "Gas over by $8", neg: true }]);
+});
+
+test("widget: over is red, the bar is full and the sub-line says by how much", () => {
+  const f = glanceFace({ glance: glance({ verdict: "OVER BUDGET",
+    left_today: 0, day_spent: 94, day_allow: 76, days_left: 9 }),
+    fetched_at: 5 }, true, 5);
+  assert.equal(f.verdict, "Over budget");
+  assert.equal(f.tone, "bad");
+  assert.equal(f.fill, 1);
+  assert.equal(f.over, true);
+  assert.equal(f.sub, "$18 over · 9 days left");
+  assert.equal(f.number, "$0");
+});
+
+test("widget: an hour-old payload is stale, a minute-old one is not", () => {
+  const now = 10_000_000;
+  assert.equal(glanceFace(at(now - STALE_AFTER_MS - 1), true, now).stale, true);
+  assert.equal(glanceFace(at(now - 60_000), true, now).stale, false);
+  // a credential with nothing cached yet is a placeholder, never Sign in
+  const empty = glanceFace(null, true, now);
+  assert.equal(empty.kind, "verdict");
+  assert.equal(empty.number, "…");
+  assert.equal(empty.stale, true);
+});
+
+test("widget: thousands are grouped, the clock reads 12-hour", () => {
+  const f = glanceFace({ glance: glance({ left_today: 1234, day_allow: 2000,
+    day_spent: 766 }), fetched_at: 0 }, true, 0);
+  assert.equal(f.number, "$1,234");
+  assert.equal(f.sub, "$766 of $2,000 spent");
+  const noon = new Date(2026, 0, 15, 12, 5).getTime();
+  assert.equal(clockLabel(noon), "12:05 PM");
+  assert.equal(clockLabel(new Date(2026, 0, 15, 0, 7).getTime()), "12:07 AM");
+  assert.equal(clockLabel(new Date(2026, 0, 15, 7, 15).getTime()), "7:15 AM");
+  assert.equal(wideEnoughForChips(160), false);
+  assert.equal(wideEnoughForChips(320), true);
+});
+
+// ---- the debt planner's labels: a month first is a month, not a day;
+// a duration reads in years and months ----
+
+test("a payoff month is named without its day", () => {
+  assert.equal(monthYear("2029-03-01"), "Mar 2029");
+  assert.equal(monthYear("2026-12-01"), "Dec 2026");
+  assert.equal(monthYear(null), "");
+  assert.equal(monthYear(""), "");
+});
+
+test("a plan's length reads in years and months", () => {
+  assert.equal(span(29), "2 yr 5 mo");
+  assert.equal(span(24), "2 yr");
+  assert.equal(span(7), "7 mo");
+  assert.equal(span(0), "today");
+  assert.equal(span(null), "not within fifty years");
+});
 
 // ---- banker's rounding: whole-dollar figures must match the server's
 // Python round(), the web and the daily email on every .5 boundary ----
@@ -891,6 +983,25 @@ test("trendWindow reads month-key points, which is what the net-worth report sen
   assert.equal(trendWindow(pts, "3y").full, true);
 });
 
+test("trendWindow: the two short windows on month-key points", () => {
+  // one point per month, the last being the current month's live value
+  const pts = [["2026-05", 100], ["2026-06", 110], ["2026-07", 130],
+               ["2026-08", 160], ["2026-09", 200]];
+  // This month: since the last month-end — two points, the newest last
+  const cur = trendWindow(pts, "cur");
+  assert.deepEqual([pts[cur.start][0], pts[cur.end][0], cur.gain], ["2026-08", "2026-09", 40]);
+  // 1m: the last COMPLETE month — July's end to August's end, the live
+  // point left out, so the gain is August's alone
+  const m1 = trendWindow(pts, "1m");
+  assert.deepEqual([pts[m1.start][0], pts[m1.end][0], m1.gain], ["2026-07", "2026-08", 30]);
+  // every other window still runs to the newest point
+  const m3 = trendWindow(pts, "3m");
+  assert.deepEqual([pts[m3.start][0], pts[m3.end][0]], ["2026-06", "2026-09"]);
+  // too short to close a month: 1m falls back to the open window
+  const short = trendWindow([["2026-08", 10], ["2026-09", 12]], "1m");
+  assert.deepEqual([short.start, short.end, short.gain, short.full], [0, 1, 2, true]);
+});
+
 test("trendWindow: a range longer than the data is the whole series and says so", () => {
   const pts = [["2026-07-01", 100], ["2026-08-30", 110]];
   const w = trendWindow(pts, "5y");
@@ -1407,4 +1518,217 @@ test("delivery reads the email and push flags as one choice and back", () => {
   assert.deepEqual(flagsOf("off"), { on: false, push: false });
   // the legacy default — no schedule saved — is email on, push off
   assert.equal(deliveryOf(true, false), "email");
+});
+
+// ---- the ledger's quick date ranges ----
+import { rangeCaption } from "../src/lib/pure.ts";
+
+test("ledgerRange: This month is from the 1st, 1m is the last complete month closed", () => {
+  const sep15 = new Date(2026, 8, 15);
+  assert.deepEqual(ledgerRange("cur", sep15), { from: "2026-09-01", to: "" });
+  assert.deepEqual(ledgerRange("1m", sep15), { from: "2026-08-01", to: "2026-08-31" });
+  assert.deepEqual(ledgerRange("3m", sep15), { from: "2026-07-01", to: "" });
+  assert.deepEqual(ledgerRange("all", sep15), { from: "", to: "" });
+});
+
+test("ledgerRange: month-end days clamp, and January reaches back a year", () => {
+  // 31 March: the month before has 28 days, and no day-of-month may roll
+  assert.deepEqual(ledgerRange("1m", new Date(2026, 2, 31)), { from: "2026-02-01", to: "2026-02-28" });
+  assert.deepEqual(ledgerRange("1m", new Date(2028, 2, 31)), { from: "2028-02-01", to: "2028-02-29" });
+  assert.deepEqual(ledgerRange("1m", new Date(2026, 0, 31)), { from: "2025-12-01", to: "2025-12-31" });
+  assert.deepEqual(ledgerRange("cur", new Date(2026, 0, 31)), { from: "2026-01-01", to: "" });
+  assert.deepEqual(ledgerRange("6m", new Date(2026, 0, 31)), { from: "2025-08-01", to: "" });
+});
+
+test("rangeCaption names the short windows in words", () => {
+  assert.equal(rangeCaption("cur"), "this month");
+  assert.equal(rangeCaption("1m"), "last month");
+  assert.equal(rangeCaption("3m"), "3m");
+  assert.equal(rangeCaption("all"), "all time");
+});
+
+// ---- "use the automatic category": the one write the client can't echo ----
+import { catLabel, isCategoryReset } from "../src/lib/pure.ts";
+
+test("a category reset has no local echo — the empty category is not a category", () => {
+  // the sentinel the picker and the "Use automatic" button send reaches the
+  // server as the empty string, which means "drop the override" — NOT a
+  // category named "". A screen that echoed what it sent would render this…
+  assert.equal(catLabel(categoryForServer(CLEAR_CATEGORY)), "Uncategorized");
+  // …so the reset is the write whose result is read back instead
+  assert.equal(isCategoryReset(categoryForServer(CLEAR_CATEGORY)), true);
+  // every other write IS the client's own answer and echoes immediately
+  assert.equal(isCategoryReset(categoryForServer("FOOD_AND_DRINK")), false);
+  assert.equal(isCategoryReset(categoryForServer("Groceries")), false);
+});
+
+test("one ledger row is read back from its own day, by id", async () => {
+  const real = globalThis.fetch;
+  const asked = [];
+  globalThis.fetch = async (url) => {
+    asked.push(String(url));
+    return new Response(JSON.stringify({ mode: "search", total: 2, rows: [
+      { id: "other", date: "2026-09-04", category: "TRAVEL" },
+      { id: "row-1", date: "2026-09-04", category: "FOOD_AND_DRINK",
+        override_manual: false, category_why: "the bank's own label" }] }),
+      { status: 200, headers: { "content-type": "application/json" } });
+  };
+  try {
+    const c = makeClient("https://example.invalid", "tok", () => {});
+    const row = await c.txnById("row-1", "2026-09-04T00:00:00");
+    assert.equal(row.category, "FOOD_AND_DRINK");
+    // the server's answer, not the caller's guess: the flag the "Use
+    // automatic" button is gated on comes back false with it
+    assert.equal(row.override_manual, false);
+    assert.equal(row.category_why, "the bank's own label");
+    // scoped to the row's own day — never a whole-ledger scan
+    assert.match(asked[0], /date_from=2026-09-04&date_to=2026-09-04/);
+  } finally { globalThis.fetch = real; }
+});
+
+test("a long day is walked page by page, and an absent row is null", async () => {
+  const real = globalThis.fetch;
+  const page = (n, rows) => new Response(
+    JSON.stringify({ mode: "search", total: 250, rows }),
+    { status: 200, headers: { "content-type": "application/json" } });
+  globalThis.fetch = async (url) => {
+    const n = Number(new URL(String(url)).searchParams.get("page"));
+    // 100 rows a page, the row wanted on the last one
+    const rows = Array.from({ length: 100 }, (_, i) => (
+      { id: `p${n}-${i}`, date: "2026-09-04", category: "TRAVEL" }));
+    if (n === 3) rows[7] = { id: "late", date: "2026-09-04",
+                             category: "GENERAL_MERCHANDISE" };
+    return page(n, n > 3 ? [] : rows);
+  };
+  try {
+    const c = makeClient("https://example.invalid", "tok", () => {});
+    assert.equal((await c.txnById("late", "2026-09-04")).category,
+                 "GENERAL_MERCHANDISE");
+    // a row the day's listing does not hold (a hidden account's) is not an
+    // error — the caller keeps what it has rather than showing a guess
+    assert.equal(await c.txnById("nowhere", "2026-09-04"), null);
+  } finally { globalThis.fetch = real; }
+});
+
+// ---- the emailed sign-in link: a refusal the sign-in screen can print ----
+import { requestUnlock, unlockRefusal } from "../src/lib/api.ts";
+
+/** The unlock door answering with `status` and the HTML page that route
+ *  really serves — it is a page route, so even its refusals are HTML. */
+function unlockDoor(status, statusText = "") {
+  return async () => new Response(
+    "<html><body><h1>Slow down</h1></body></html>",
+    { status, statusText, headers: { "content-type": "text/html" } });
+}
+
+test("the hourly cap on sign-in links reads as a rate limit, not a status line",
+     async () => {
+  const real = globalThis.fetch;
+  globalThis.fetch = unlockDoor(429, "Too Many Requests");
+  try {
+    await assert.rejects(
+      () => requestUnlock("https://example.invalid", "a@b.dev"),
+      (e) => e instanceof ApiError && e.status === 429
+             && /wait a few minutes/i.test(errText(e)));
+  } finally { globalThis.fetch = real; }
+});
+
+test("an unlock refusal with no status line still says something", async () => {
+  // React Native's fetch leaves statusText empty on some platforms, which
+  // is how a refused tap became a silently blank error line
+  const real = globalThis.fetch;
+  globalThis.fetch = unlockDoor(500);
+  try {
+    await assert.rejects(
+      () => requestUnlock("https://example.invalid", "a@b.dev"),
+      (e) => e instanceof ApiError && errText(e).trim().length > 10);
+  } finally { globalThis.fetch = real; }
+});
+
+test("the unlock door's 200 is success, HTML page and all", async () => {
+  const real = globalThis.fetch;
+  globalThis.fetch = unlockDoor(200);
+  try {
+    await requestUnlock("https://example.invalid", "a@b.dev");
+  } finally { globalThis.fetch = real; }
+});
+
+test("a demo instance has no unlock door, and says so", () => {
+  assert.match(unlockRefusal(404), /doesn't offer/i);
+  assert.match(unlockRefusal(503), /error 503/);
+});
+
+// ---- what-if screens (debt planner, retirement): a phone keyboard's
+// "1,000" must reach the GET as the number the save door would store,
+// and a refusal is shown at the fields, never as "couldn't reach" ----
+test("what-if money: formatted amounts become plain numbers", () => {
+  assert.equal(moneyParam("1,000"), "1000");
+  assert.equal(moneyParam("$ 250.50"), "250.5");
+  // the save door strips "," too, so a comma decimal reads the same way
+  // in the what-if as in what Save would store
+  assert.equal(moneyParam("50,5"), "505");
+  assert.equal(moneyParam(""), "0");
+  assert.equal(moneyParam("abc"), "0");
+  // whole dollars round the way every other money figure does — half to
+  // even, as the server and the web do — never half away from zero
+  assert.equal(moneyParam("250.50", true), "250");
+  assert.equal(moneyParam("251.50", true), "252");
+  assert.equal(moneyParam("250.51", true), "251");
+  assert.equal(moneyParam("60,000", true), "60000");
+});
+
+test("what-if query: blanks stay off, money parsed, the rest as typed", () => {
+  assert.deepEqual(
+    whatIfQuery({ spend: "60,000", employer_mo: " 1,250.40 ", ret: "7.0",
+                  cash: "", end: " 95 " },
+                ["spend", "employer_mo", "taxable_mo"], true),
+    { spend: "60000", employer_mo: "1250", ret: "7.0", end: "95" });
+});
+
+test("what-if refusal: a 4xx is the server's sentence, not an outage", () => {
+  assert.equal(whatIfRefusal(new ApiError(429, "Too many requests")),
+               "Too many requests");
+  // a FastAPI validation 422 carries its detail as a list, so the client
+  // is left with no sentence: say it failed, with the status
+  assert.equal(whatIfRefusal(new ApiError(422, "")), "Couldn't load: 422");
+  // the connection's failures keep the offline wording
+  assert.equal(whatIfRefusal(new ApiError(502, "Bad Gateway")), null);
+  assert.equal(whatIfRefusal(new TypeError("Network request failed")), null);
+  // the session handler owns 401 (back to sign-in)
+  assert.equal(whatIfRefusal(new ApiError(401, "Not signed in")), null);
+});
+
+// ---- widget cache ownership: a cached glance is one household's day;
+// a sign-in to another household (or server) must drop it ----
+test("widget owner: same household keeps the cache, another drops it", () => {
+  const a = widgetOwner("https://Home.example/", "t-a");
+  assert.equal(a, widgetOwner("https://home.example", "t-a"));
+  assert.equal(widgetOwnerChanged(a, a), false);
+  assert.equal(widgetOwnerChanged(a, widgetOwner("https://home.example", "t-b")),
+               true);
+  assert.equal(widgetOwnerChanged(a, widgetOwner("https://other.example", "t-a")),
+               true);
+  // no record is a change: a cache nobody can vouch for is not shown
+  assert.equal(widgetOwnerChanged(null, a), true);
+});
+
+// a fetch in flight across a change of household must not re-plant the
+// old household's numbers under the new credential
+test("widget cache: an entry is shown only under the credential it was fetched with", () => {
+  const entry = { glance: glance(), fetched_at: 1, owner: credentialStamp("tok-a") };
+  assert.equal(ownedCache(entry, "tok-a"), entry);
+  assert.equal(ownedCache(entry, "tok-b"), null);        // household B now
+  assert.equal(ownedCache(entry, null), null);           // signed out
+  assert.equal(ownedCache({ glance: glance(), fetched_at: 1 }, "tok-a"), null);
+  assert.equal(ownedCache(null, "tok-a"), null);
+  assert.notEqual(credentialStamp("tok-a"), credentialStamp("tok-b"));
+  assert.equal(credentialStamp("tok-a"), credentialStamp("tok-a"));
+  assert.ok(!credentialStamp("tok-a").includes("tok"));  // never the token
+});
+
+test("widget cache: a save whose credential changed mid-fetch is skipped", () => {
+  assert.equal(saveStillOwned("tok-a", "tok-a"), true);
+  assert.equal(saveStillOwned("tok-a", "tok-b"), false);  // re-minted for B
+  assert.equal(saveStillOwned("tok-a", null), false);     // signed out
+  assert.equal(saveStillOwned(null, null), false);
 });

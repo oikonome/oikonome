@@ -47,6 +47,7 @@ import calendar
 import datetime as dt
 
 from ..engine import budget, reporting
+from ..engine import categories as _categories
 
 # ---- shared helpers ---------------------------------------------------------
 
@@ -187,14 +188,58 @@ def year_category_ledger(conn, key: str, year: int) -> dict:
     same spend predicate and reimbursement netting as `year_summary`'s
     category totals, matched on the display form the label groups by."""
     rows = conn.execute(
-        f"SELECT t.id, {reporting.NET_AMOUNT_JOINED} amt "
-        f"FROM transactions t {reporting.REIMB_PARTIAL_JOIN} "
+        f"SELECT t.id, {reporting.PART_NET_JOINED} amt "
+        f"FROM transactions t {reporting.REIMB_PARTIAL_JOIN} {reporting.SPLIT_JOIN} "
         f"WHERE {reporting.SPEND_WHERE} "
         f"AND t.date >= %s AND t.date < %s "
-        f"AND {reporting.EFF_CAT} = REPLACE(%s, '_', ' ')",
+        f"AND {reporting.PART_CAT} = REPLACE(%s, '_', ' ')",
         (dt.date(year, 1, 1), dt.date(year + 1, 1, 1), key)).fetchall()
-    return {"txn_ids": [r["id"] for r in rows],
+    # a hand-split row is listed once however many of its parts matched
+    # (one per category by construction, so at most once here)
+    return {"txn_ids": list(dict.fromkeys(r["id"] for r in rows)),
             "amount": _R(sum(r["amt"] or 0 for r in rows))}
+
+
+def year_bucket_ledger(conn, bucket: str, year: int,
+                       today: dt.date | None = None) -> dict | None:
+    """The rows a YEAR money map label counted, and its number: that bucket
+    over the year's elapsed BUDGETED months — the months `year_summary`
+    sums into `buckets_annual` (a closed month with no snapshot had no plan
+    and contributes nothing there either) — each month's rows named by
+    `budget.bucket_ledger` against that month's own state. None when the
+    name is a bucket of none of those months, which is the caller's 400.
+
+    `today` decides which months have elapsed, so it is the HOUSEHOLD's day
+    — on the container's UTC clock a west-coast evening on the 31st has
+    already opened the next month, and the year's last bucket would be
+    summed one month wider than the map that links to it."""
+    from .. import localtime
+    today = today or localtime.household_day(conn)
+    snap_months = budget.snapshot_months(conn, year)
+    memo: dict = {}
+    ids: list[str] = []
+    seen: set[str] = set()
+    amount = 0.0
+    label = None
+    for m in range(1, 13):
+        if (year, m) > (today.year, today.month):
+            continue
+        if (year, m) < (today.year, today.month) and m not in snap_months:
+            continue
+        info = budget.bucket_ledger(
+            month_state(conn, year, m, today, memo=memo), bucket)
+        if info is None:
+            continue
+        label = label or info["label"]
+        amount += info["amount"]
+        for t in info["txn_ids"]:
+            if t not in seen:
+                seen.add(t)
+                ids.append(t)
+    if label is None:
+        return None
+    return {"bucket": bucket, "label": label, "amount": _R(amount),
+            "txn_ids": ids}
 
 
 def _first_year(conn) -> int | None:
@@ -306,7 +351,7 @@ def week_summary(conn, start: dt.date, today: dt.date | None = None) -> dict:
         mrows = budget._spend_rows(
             conn, dt.date(yy, mm, 1) - dt.timedelta(days=budget.PREPAY_MATCH_DAYS),
             mst["as_of"] + dt.timedelta(days=1),
-            excluded=cfg.get("excluded_accounts"), memo=memo)
+            excluded=budget.excluded_account_ids(cfg), memo=memo)
         _, occs = budget.match_occurrences(mrows, occs)
         for occ in occs[:n_this]:
             if not (start <= occ["due"] <= end):
@@ -591,11 +636,14 @@ def year_summary(conn, year: int, today: dt.date | None = None) -> dict:
     # would split a display label whose rows store it two ways (an
     # override typed with spaces beside the underscore form), and the
     # totals would change shape just to carry a link.
+    # by category, so a hand-split row's parts are joined and each counts
+    # under its own category (the year total is unchanged: parts sum to
+    # the row)
     two_years = conn.execute(
-        f"SELECT to_char(t.date,'YYYY') yr, {reporting.EFF_CAT} cat, "
-        f"MIN(COALESCE(t.category_override, t.category_primary,'?')) cat_key, "
-        f"SUM({reporting.NET_AMOUNT_JOINED}) amt, GROUPING({reporting.EFF_CAT}) gc "
-        f"FROM transactions t {reporting.REIMB_PARTIAL_JOIN} "
+        f"SELECT to_char(t.date,'YYYY') yr, {reporting.PART_CAT} cat, "
+        f"MIN(COALESCE({_categories.PART_CAT}, '?')) cat_key, "
+        f"SUM({reporting.PART_NET_JOINED}) amt, GROUPING({reporting.PART_CAT}) gc "
+        f"FROM transactions t {reporting.REIMB_PARTIAL_JOIN} {reporting.SPLIT_JOIN} "
         f"WHERE {reporting.SPEND_WHERE} "
         f"AND t.date >= %s AND t.date < %s GROUP BY GROUPING SETS ((yr), (yr, cat))",
         (dt.date(year - 1, 1, 1), dt.date(year + 1, 1, 1))).fetchall()

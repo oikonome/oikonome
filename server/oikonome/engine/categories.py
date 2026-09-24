@@ -86,9 +86,34 @@ def backfill_override_source(conn) -> int:
 
 # Effective category for budget/spend/UI — override wins, else working primary.
 EFFECTIVE_SQL = "COALESCE(t.category_override, t.category_primary)"
-EFFECTIVE_SQL_SPACED = (
-    "REPLACE(COALESCE(t.category_override, t.category_primary, '?'), '_', ' ')"
-)
+
+# One charge, several categories (transaction_splits, migration 138). A
+# rollup BY CATEGORY joins the parts and reads them through PART_CAT /
+# PART_AMOUNT: a split row fans out into one row per part, an unsplit row
+# stays one row whose single part is the row itself — so every reader that
+# joins agrees with every other one, and none of them carries a flag to
+# remember. `t` must be the transactions alias, `sp` is reserved for the
+# parts. Readers that list ledger rows ONE PER TRANSACTION must not join
+# (the join multiplies split rows); they carry the parts as a JSON column.
+SPLIT_JOIN = ("LEFT JOIN transaction_splits sp "
+              "ON sp.tenant_id = t.tenant_id AND sp.txn_id = t.id")
+PART_CAT = "COALESCE(sp.category, t.category_override, t.category_primary)"
+PART_CAT_DISPLAY = (
+    "REPLACE(COALESCE(sp.category, t.category_override, t.category_primary, '?'),"
+    " '_', ' ')")
+PART_AMOUNT = "COALESCE(sp.amount, t.amount)"
+
+
+def part_net(net_expr: str) -> str:
+    """A part's share of the row's reimbursement-netted amount. `net_expr`
+    is the whole row's net (budget.NET_AMOUNT or reporting's joined form);
+    an unsplit row is its net, a part is its own amount when nothing was
+    netted (the common case, kept exact rather than multiplied and divided
+    back through a double) and otherwise its pro-rata share, rounded to the
+    cent so the parts of a netted row still add up."""
+    return (f"CASE WHEN sp.line IS NULL THEN {net_expr} "
+            f"WHEN ({net_expr}) = t.amount OR t.amount = 0 THEN sp.amount "
+            f"ELSE ROUND((sp.amount * ({net_expr}) / t.amount)::numeric, 2)::float8 END")
 
 # Plaid confidences we treat as authoritative for sharp labels.
 PLAID_TRUSTED = frozenset({"HIGH", "VERY_HIGH"})

@@ -233,8 +233,13 @@ def vendor_totals(conn, entity_id: str, year: int | None = None) -> list[dict]:
     # sits in this entity's account, and non-primary linked (shadow) rows are
     # dropped so a dual-sourced account cannot double a vendor past $600.
     from .books import _BIZ_TXN
+    from .reporting import NET_AMOUNT
+    # Net of partial reimbursements, like the P&L: the part a charge had
+    # paid back was never a payment to the vendor that year, and counting it
+    # gross can push a vendor over the $600 line on money that came back.
     rows = conn.execute(
-        f"""SELECT {DISPLAY_MERCHANT} AS payee, COALESCE(SUM(t.amount),0) AS paid
+        f"""SELECT {DISPLAY_MERCHANT} AS payee,
+                   COALESCE(SUM({NET_AMOUNT}),0) AS paid
             FROM transactions t {MC_JOIN}
             WHERE {_BIZ_TXN}
               AND t.removed = 0 AND t.amount > 0
@@ -243,7 +248,7 @@ def vendor_totals(conn, entity_id: str, year: int | None = None) -> list[dict]:
               AND COALESCE(t.category_detailed,'')
                   != 'LOAN_PAYMENTS_CREDIT_CARD_PAYMENT'
               AND EXTRACT(YEAR FROM t.date) = %(yr)s
-            GROUP BY {DISPLAY_MERCHANT} HAVING SUM(t.amount) > 0
+            GROUP BY {DISPLAY_MERCHANT} HAVING SUM({NET_AMOUNT}) > 0
             ORDER BY paid DESC""", params).fetchall()
     marks = {r["merchant"]: r for r in conn.execute(
         "SELECT merchant, reportable, tin_last4 FROM vendor_1099 "

@@ -353,6 +353,24 @@ class ElevationWindowTests(_Base):
             "POST /api/export/token": (
                 c, "post", "/api/export/token", {"json": {"kind": "zip"}},
                 True),
+            # the continuity packet by mail is the whole shape of the
+            # household's money leaving the instance — FRESH, like the
+            # download it mirrors
+            "POST /api/continuity/email": (
+                c, "post", "/api/continuity/email",
+                {"json": {"to": "sam@example.dev"}}, True),
+            # a webhook points the ledger at a URL: creating one, moving
+            # one, and re-keying one step up; toggling and deleting do not
+            "POST /api/webhooks": (
+                c, "post", "/api/webhooks",
+                {"json": {"url": "https://receiver.example/hook",
+                          "events": ["test.ping"]}}, False),
+            "POST /api/webhooks/{hook_id}": (
+                c, "post", f"/api/webhooks/{uuid.uuid4()}",
+                {"json": {"url": "https://receiver.example/hook"}}, False),
+            "POST /api/webhooks/{hook_id}/rotate": (
+                c, "post", f"/api/webhooks/{uuid.uuid4()}/rotate",
+                {"json": {}}, False),
         }
         guarded = sorted(route_key(r) for r in mutating_routes(self.app)
                          if _calls_elevation(r))

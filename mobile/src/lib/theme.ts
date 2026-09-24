@@ -62,6 +62,9 @@ const resolveDark = (mode: ThemeMode) =>
 const IS_DARK = resolveDark(getThemeMode());
 export const isDarkTheme = IS_DARK;
 export const C = IS_DARK ? DARK : LIGHT;
+// both palettes by name, for a surface drawn OUTSIDE the app's theme
+// setting — the home-screen widget follows the launcher's light/dark
+export const PALETTES = { dark: DARK, light: LIGHT } as const;
 
 // money lives in pure.ts (no RN imports) so plain node can unit-test
 // the banker's rounding that keeps mobile's whole-dollar figures in

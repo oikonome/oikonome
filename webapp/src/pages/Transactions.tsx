@@ -7,7 +7,7 @@ import { useDeferredValue, useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import TxnTable from "../components/TxnTable";
 import { api, mmdd, money as money$, catLabel } from "../api/client";
-import { RANGES, ledgerRangeFrom } from "../components/RangePicker";
+import { RANGES, RANGE_LABEL, ledgerRange } from "../components/RangePicker";
 const money = (v: number | null | undefined) => money$(v, true);  // cents on transaction/recurring surfaces
 
 
@@ -41,7 +41,12 @@ export default function Transactions() {
   // the toolbar is not — it searches all history, as it always has — so
   // this can't be derived from `cat` alone.
   const [monthScope, setMonthScope] = useState(
-    !!(sp.get("bucket") || (sp.get("cat") && sp.get("y") && sp.get("m"))));
+    !!((sp.get("bucket") && sp.get("m"))
+       || (sp.get("cat") && sp.get("y") && sp.get("m"))));
+  // a YEAR's bucket — the year lens's money map label: `y` with no `m`,
+  // the bucket over the year's budgeted months as one listing
+  const [yearScope, setYearScope] = useState(
+    !!(sp.get("bucket") && sp.get("y") && !sp.get("m")));
   const [df, setDf] = useState(sp.get("date_from") ?? "");
   const [dt_, setDt] = useState(sp.get("date_to") ?? "");
   // reimbursement quick filter: linked pairs + awaiting
@@ -85,6 +90,7 @@ export default function Transactions() {
   // inside one would otherwise look broken.
   const leaveScope = () => {
     setBucket(""); setAsOf(""); setCounted(false); setMonthScope(false);
+    setYearScope(false);
   };
 
   // A deep link arriving while this page is already open RETARGETS it:
@@ -102,8 +108,9 @@ export default function Transactions() {
     setAcct(sp.get("acct") ?? ""); setCat(sp.get("cat") ?? "");
     setBucket(sp.get("bucket") ?? ""); setAsOf(sp.get("as_of") ?? "");
     setCounted(sp.get("counted") === "1");
-    setMonthScope(!!(sp.get("bucket")
+    setMonthScope(!!((sp.get("bucket") && sp.get("m"))
                      || (sp.get("cat") && sp.get("y") && sp.get("m"))));
+    setYearScope(!!(sp.get("bucket") && sp.get("y") && !sp.get("m")));
     setDf(sp.get("date_from") ?? ""); setDt(sp.get("date_to") ?? "");
     setChannelF(sp.get("channel") ?? "");
     setChecksF(sp.get("checks") === "1");
@@ -146,7 +153,8 @@ export default function Transactions() {
       // the bucket IS the query — it already names its month, and mixing
       // it with the toolbar's filters would list something the verdict
       // never counted
-      ? { bucket, y: String(y), m: String(m), page: String(page),
+      ? { bucket, y: String(y), page: String(page),
+          ...(yearScope ? {} : { m: String(m) }),
           ...(asOf ? { as_of: asOf } : {}) }
       : searching
       ? { q: live, acct, cat, date_from: df, date_to: dt_, page: String(page),
@@ -215,7 +223,7 @@ export default function Transactions() {
   const clear = () => {
     setLive(""); setQ(""); setAcct(""); setCat(""); setDf(""); setDt("");
     setChannelF(""); setChecksF(false); setBucket(""); setAsOf("");
-    setCounted(false); setMonthScope(false); setPage(1);
+    setCounted(false); setMonthScope(false); setYearScope(false); setPage(1);
   };
   // What the list is narrowed to, said in one chip with its month: a deep
   // link's scope is the part that otherwise goes unsaid, and neither a
@@ -229,12 +237,12 @@ export default function Transactions() {
     || (bucket === "food" ? "Food"
         : bucket === "other" ? "Everything else" : bucket);
   const scopeChip = bucket
-    ? `${bucketLabel} · ${monthShort}`
+    ? `${bucketLabel} · ${yearScope ? y : monthShort}`
     : cat && monthScope ? `${catLabel(cat)} · ${monthShort}` : null;
   // ✕ on the chip drops the grouping and keeps the month it named
   const clearScope = () => {
     setBucket(""); setAsOf(""); setCounted(false); setCat("");
-    setMonthScope(false); setPage(1);
+    setMonthScope(false); setYearScope(false); setPage(1);
   };
   // any filter change starts back at page 1
   const set = <T,>(fn: (v: T) => void) => (v: T) => {
@@ -344,6 +352,18 @@ export default function Transactions() {
               <b className={(query.data?.amount_sum ?? 0) < 0 ? "pos" : ""}>
                 {money(-(query.data?.amount_sum ?? 0))}</b>
               <span className="sub" style={{ fontWeight: 400 }}> total</span>
+              {/* the figure the label wore, when the raw sum of its rows
+                  is not it: reimbursements netted, an envelope's overflow
+                  counted only past the envelope */}
+              {bucket && query.data?.bucket === bucket
+                && query.data.bucket_amount != null
+                && Math.abs(query.data.bucket_amount
+                            - (query.data.amount_sum ?? 0)) >= 0.005 && (
+                <span className="sub" style={{ fontWeight: 400 }}
+                      title="what the label counted: reimbursements netted, envelope overflow counted the way the plan counts it">
+                  {" · counted as "}<b>{money(query.data.bucket_amount)}</b>
+                </span>
+              )}
               {/* the total says how much has gone to this merchant; the
                   average says what one visit costs, which is usually the
                   question a merchant search is really asking. Server-side
@@ -501,21 +521,23 @@ export default function Transactions() {
                          alignItems: "center", flexWrap: "wrap",
                          marginTop: ".2rem", paddingTop: ".55rem",
                          borderTop: "1px dashed var(--line)" }}>
-            {/* the site-wide 3m … All vocabulary — one click instead of
-                two typed dates; a typed pair matching none of them lights
-                nothing, and All is the no-date-filter state */}
+            {/* the site-wide This month … All vocabulary — one click
+                instead of two typed dates; a typed pair matching none of
+                them lights nothing, and All is the no-date-filter state */}
             <span style={{ display: "inline-flex", gap: ".35rem", flexWrap: "wrap" }}>
               {RANGES.map((r) => {
-                const from = ledgerRangeFrom(r, now);
-                const on = df === from && !dt_;
+                const v = ledgerRange(r, now);
+                const on = df === v.from && dt_ === v.to;
                 return (
                   <button key={r} type="button"
                           className={`pill m${on ? " pri" : ""}`}
                           title={r === "all" ? "no date filter"
+                                 : r === "cur" ? "from the first of this month"
+                                 : r === "1m" ? "the last complete month"
                                  : `${r} — from the first of the month`}
-                          onClick={() => { setDf(from); setDt(""); setPage(1);
+                          onClick={() => { setDf(v.from); setDt(v.to); setPage(1);
                                            leaveScope(); }}>
-                    {r === "all" ? "All" : r}</button>
+                    {RANGE_LABEL[r]}</button>
                 );
               })}
             </span>

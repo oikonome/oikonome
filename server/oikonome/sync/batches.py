@@ -66,7 +66,8 @@ def tag(conn, txns: list, batch_id: str) -> list:
 def recent(conn, limit: int = 10) -> list:
     """The latest batches, each with `annotations`: what a person has since
     attached to this batch's rows — receipts, notes, reimbursement
-    pairings, business tags, category overrides. A rollback hard-deletes
+    pairings, business tags, category overrides, hand splits (one each,
+    however many parts). A rollback hard-deletes
     the rows and everything cascades with them; the confirm has to be
     able to say so, because the import did not create any of it."""
     rows = [dict(r) for r in conn.execute(
@@ -101,6 +102,8 @@ def recent(conn, limit: int = 10) -> list:
                 + (SELECT count(*) FROM business_txn_class c WHERE c.txn_id = o.id)
                 + (SELECT count(*) FROM manual_categories k
                     WHERE k.transaction_id = o.id)
+                + CASE WHEN EXISTS (SELECT 1 FROM transaction_splits s
+                                     WHERE s.txn_id = o.id) THEN 1 ELSE 0 END
                 + CASE WHEN o.category_override IS NOT NULL THEN 1 ELSE 0 END
                   AS n
              FROM owned o""", (ids, ids)).fetchall()

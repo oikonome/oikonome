@@ -122,6 +122,8 @@ OWNER_ONLY = (
     "/api/billing",
     # who else is in the household, and what else holds its credentials
     "/api/invites", "/api/users", "/api/tokens", "/api/support-access",
+    # where the ledger gets posted to
+    "/api/webhooks",
     # data leaving the instance
     "/api/export", "/export", "/api/connections",
     # bank connections: linking, re-keying, disconnecting

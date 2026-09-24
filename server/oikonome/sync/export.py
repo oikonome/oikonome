@@ -16,7 +16,8 @@ DATA_MAP = {
     "accounts": "your accounts — names, types, balances",
     "transactions": "every transaction (amount positive = money out)",
     "bills": "recurring bills and income the app tracks",
-    "bill_proposals": "detected-but-unconfirmed recurring candidates",
+    "bill_proposals": "recurring bills the app offered to track, and what "
+                      "you said about each",
     "reimbursements": "expense↔repayment pairs you linked",
     "reimburse_flags": "transactions marked awaiting reimbursement",
     "business_flags": "transactions flagged business on personal cards",
@@ -51,6 +52,10 @@ DATA_MAP = {
     "mileage_log": "business mileage entries",
     "vendor_1099": "1099 vendor records",
     "transaction_notes": "your notes on transactions",
+    "transaction_splits": "charges you split by hand across categories "
+                          "(the parts, in order)",
+    "activity_log": "the household's activity log — who changed which "
+                    "category, bill, note or rule, and when",
     "account_links": "same-account links across data sources",
     "receipts": "receipt images (base64 in the CSV)",
     "receipt_items": "receipt line items",
@@ -85,6 +90,8 @@ CONTROL_SKIP = {
                "mailbox that point at the source instance.",
     "api_tokens": "collector credentials — re-issued on the destination.",
     "device_tokens": "phone enrolments, bound to the source instance.",
+    "widget_tokens": "home-screen widget credentials, children of those "
+                     "enrolments.",
     "push_subscriptions": "browser push endpoints, bound to the source "
                           "instance's keys.",
     "support_consents": "consent to let THIS platform's operator read the "

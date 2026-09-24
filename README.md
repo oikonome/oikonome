@@ -76,9 +76,10 @@ around a single daily email, so the tool does the checking, not you.
 
 | Capability |
 |---|
-| Daily budget verdict email (on / over / under + today's number) |
+| Daily budget verdict email (on / over / under + today's number), ending in a *Needs you* section whose buttons confirm a bill or file a charge without signing in |
 | 60-day cash-flow forecast with card-payoff scenarios |
-| Cash Flow report — flow picture, saved-by-month with a 60-day forecast tail, spending & income breakdowns with income by source |
+| Cash Flow report — flow picture, saved-by-month with a 60-day forecast tail, spending & income breakdowns with income by source, and interest & fees paid by year |
+| Debt payoff planner — every card and loan on one schedule, avalanche or snowball, with an extra-payment what-if and the debt-free month |
 | Automatic recurring-bill detection with evidence + approve/reject |
 | Envelope budgets — monthly **and** lumpy annual pools |
 | Retirement projection via historical market replay |
@@ -90,14 +91,17 @@ around a single daily email, so the tool does the checking, not you.
 | Net worth over time |
 | Merchant identity you control — logos, chain outlets under their brand, rename, merge spelling variants, undo |
 | Transaction provenance — check number, payment channel, location, line of business, and *why* a row has its category |
+| Split one charge across several categories by hand |
 | Ledger search with totals, the average per visit and spending per day for any month, category or date range |
 | Ask-your-ledger assistant — read-only summaries, answered by the on-box model |
 | Business / self-employed tracking — entities, P&L, Schedule C, mileage, estimated tax |
-| Household logins — view-only members with their own second factor and email preferences |
+| Household logins — members and view-only readers with their own second factor and email preferences, and an activity log of who changed what |
+| Continuity packet — one printable PDF of the accounts, debts, bills, income and businesses, for whoever has to run the household without you |
 | Passkeys / TOTP 2FA, per-tenant encryption at rest |
 | Email, SMS (your own Twilio credentials) and push delivery of the summaries |
+| Webhooks, a Prometheus `/metrics` exporter, Home Assistant sensors and a local MCP server — on read-only tokens |
 | One-command manager (install / backup / restore / upgrade) |
-| Native iOS and Android app — source in `mobile/`, built pinned to your own server |
+| Native iOS and Android app with a home-screen widget — source in `mobile/`, built pinned to your own server |
 
 <sub>Nothing here is gated: a self-hosted instance has every feature, with
 no tiers and no license checks.</sub>
@@ -116,6 +120,11 @@ reach even if that machine is breached.
   aggregator nothing about when you looked at your ledger — and the daily email
   fetches nothing from the web: its chart and the brand mark travel inside the
   message itself, so opening it cannot be tracked.
+- **Yours to wire up.** Webhooks post signed events to whatever you run beside
+  it, `/metrics` feeds Prometheus, a read-only summary feeds Home Assistant,
+  and a one-file MCP server lets your assistant read the books — every one on
+  a token that can read and nothing else, and every webhook is signed
+  ([docs/integrations.md](docs/integrations.md)).
 - **Envelope-encrypted secrets.** Aggregator tokens and API keys are sealed
   with a **per-tenant envelope** under a master key you control (see
   [docs/master-key.md](docs/master-key.md)); a raw database dump reveals no

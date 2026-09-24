@@ -18,23 +18,22 @@ class AccessDoorTests(unittest.TestCase):
         _ensure_db()
         cls.client = TestClient(app)
 
-    def setUp(self):
-        # DEV_MODE opens the intake door unconditionally, and other suites flip
-        # it on without flipping it back — pin it off so these door-closed
-        # assertions don't depend on test order
-        self._dev = patch("oikonome.web.app.DEV_MODE", False)
-        self._dev.start()
-
-    def tearDown(self):
-        self._dev.stop()
+    def _no_intake_door(self, j):
+        """A phone build shipped before the intake form was retired still
+        reads these two keys and would crash on their absence, so the
+        answer keeps them — permanently shut."""
+        self.assertIn("request_access_open", j)
+        self.assertIn("request_access_path", j)
+        self.assertFalse(j["request_access_open"])
+        self.assertIsNone(j["request_access_path"])
 
     def test_self_host_has_no_door(self):
         with patch.dict(os.environ, {"OIKONOME_HOSTED": "", "OIKONOME_OPEN_SIGNUP": ""}):
             j = self.client.get("/api/access").json()
         self.assertFalse(j["hosted"])
         self.assertIsNone(j["signup_path"])
-        self.assertIsNone(j["request_access_path"])
         self.assertIsNone(j["site_url"])
+        self._no_intake_door(j)
 
     def test_hosted_closed_points_at_the_site(self):
         with patch.dict(os.environ, {"OIKONOME_HOSTED": "1", "OIKONOME_OPEN_SIGNUP": "",
@@ -42,8 +41,8 @@ class AccessDoorTests(unittest.TestCase):
             j = self.client.get("/api/access").json()
         self.assertTrue(j["hosted"])
         self.assertIsNone(j["signup_path"])
-        self.assertIsNone(j["request_access_path"])
         self.assertEqual(j["site_url"], "https://example.org")
+        self._no_intake_door(j)
 
     def test_hosted_closed_without_a_site_offers_no_door(self):
         with patch.dict(os.environ, {"OIKONOME_HOSTED": "1", "OIKONOME_OPEN_SIGNUP": "",
@@ -59,6 +58,7 @@ class AccessDoorTests(unittest.TestCase):
             j = self.client.get("/api/access").json()
             page = self.client.get("/login").text
         self.assertEqual(j["signup_path"], "/signup")
+        self._no_intake_door(j)
         self.assertIn("No account? Create one", page)
         self.assertNotIn("Request access", page)
 
@@ -70,7 +70,7 @@ class AccessDoorTests(unittest.TestCase):
             j = self.client.get("/api/access").json()
         self.assertFalse(j["signup_open"])
         self.assertIsNone(j["signup_path"])
-        self.assertIsNone(j["request_access_path"])
+        self._no_intake_door(j)
 
     def test_hosted_closed_login_page_points_at_the_site(self):
         # both doors shut: the web login page must still offer the same

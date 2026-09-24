@@ -374,6 +374,40 @@ def _h(ticket: str) -> str:
     return hashlib.sha256(ticket.encode()).hexdigest()
 
 
+def _advance_sign_count(conn, passkey_id, verified_against: int,
+                        new_count: int) -> None:
+    """Record an assertion's signature counter — but only while the
+    baseline it was judged against is still the stored one.
+
+    The counter is WebAuthn's cloned-authenticator alarm: a genuine
+    authenticator's counter only ever climbs, so an assertion that does not
+    beat the last count we stored came from a copy of the key. Checking it
+    is a read, a verify and a write, and these connections are in
+    autocommit, so two assertions for one credential arriving together
+    would both be judged against the same stale baseline and both pass —
+    the clone getting in beside the owner, which is the one thing the
+    counter exists to prevent. Making the write conditional closes that
+    without holding a transaction open across the verify: whichever
+    assertion lands second finds the row already moved on, matches no row,
+    and is refused.
+
+    An authenticator that always reports 0 — most platform passkeys, which
+    keep no counter — is untouched: it writes 0 over 0, so its sign-ins
+    still succeed however they overlap. The counter carries no clone
+    signal there and never did.
+
+    Raises ValueError when the row did not move as expected, which also
+    covers a passkey deleted mid-ceremony: in both cases the caller must
+    start over rather than be let in on a stale reading.
+    """
+    row = conn.execute(
+        "UPDATE passkeys SET sign_count = %s, last_used = now() "
+        "WHERE id = %s AND sign_count = %s RETURNING id",
+        (new_count, passkey_id, verified_against)).fetchone()
+    if row is None:
+        raise ValueError("this passkey changed mid sign-in — try again")
+
+
 def stepup_verify(conn, user_id, challenge_id: str, credential: dict,
                   rp_id: str, origin: str) -> str:
     """Verify the assertion (bound to this user) and mint a short-lived
@@ -402,9 +436,7 @@ def stepup_verify(conn, user_id, challenge_id: str, credential: dict,
         credential_public_key=base64url_to_bytes(row["public_key"]),
         credential_current_sign_count=row["sign_count"],
         require_user_verification=True)
-    conn.execute(
-        "UPDATE passkeys SET sign_count = %s, last_used = now() "
-        "WHERE id = %s", (v.new_sign_count, row["id"]))
+    _advance_sign_count(conn, row["id"], row["sign_count"], v.new_sign_count)
     import secrets as _secrets
     ticket = "pkstep-" + _secrets.token_urlsafe(24)
     # store the HASH, return the RAW ticket (it goes to the client).
@@ -491,7 +523,5 @@ def login_verify(conn, challenge_id: str, credential: dict,
         credential_public_key=base64url_to_bytes(row["public_key"]),
         credential_current_sign_count=row["sign_count"],
         require_user_verification=True)
-    conn.execute(
-        "UPDATE passkeys SET sign_count = %s, last_used = now() "
-        "WHERE id = %s", (v.new_sign_count, row["id"]))
+    _advance_sign_count(conn, row["id"], row["sign_count"], v.new_sign_count)
     return {"user_id": row["user_id"], "tenant_id": row["tenant_id"]}

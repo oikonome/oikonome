@@ -19,7 +19,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router";
 import { api, errText, mmdd, money as money$, catLabel } from "../api/client";
-import type { MerchantDetail, MergeProposal } from "../api/client";
+import type { MerchantDetail, MergeProposal, MergeSideFacts } from "../api/client";
 import { removeFromList } from "../api/cache";
 import { canEdit } from "../role";
 import MerchantAvatar from "../components/MerchantAvatar";
@@ -98,6 +98,7 @@ export default function Merchants({ embedded = false }:
     qc.invalidateQueries({ queryKey: ["txns"] });
     qc.invalidateQueries({ queryKey: ["today"] });
     qc.invalidateQueries({ queryKey: ["bills-history"] });
+    qc.invalidateQueries({ queryKey: ["alertsHistory"] });
     toast(msg);
   };
   const rename = useMutation({
@@ -147,6 +148,11 @@ export default function Merchants({ embedded = false }:
         qc.invalidateQueries({ queryKey: ["merchant-detail"] });
         qc.invalidateQueries({ queryKey: ["txns"] });
       }
+      // the "merges" alert retires on the server the moment the queue
+      // empties — by approving OR rejecting the last offer — so the
+      // strip and the Alerts page refetch either way
+      qc.invalidateQueries({ queryKey: ["alertsHistory"] });
+      qc.invalidateQueries({ queryKey: ["today"] });
       toast(v.action === "approve" ? "Merged." : "Kept apart.");
     },
     onError: (e) => toast(`Couldn't decide — ${errText(e)}`),
@@ -227,7 +233,8 @@ export default function Merchants({ embedded = false }:
         <NeedsALook merges={merges} mayEdit={mayEdit} demo={demo}
                     busy={decide.isPending || decideAll.isPending}
                     onDecide={(pid, action) => decide.mutate({ pid, action })}
-                    onMergeAll={() => decideAll.mutate(merges.map((p) => p.id))} />
+                    onMergeAll={() => decideAll.mutate(merges.map((p) => p.id))}
+                    onOpen={setOpen} />
       )}
 
       {recent.length > 0 && (
@@ -321,12 +328,13 @@ export default function Merchants({ embedded = false }:
 }
 
 /** The proposer's queue: pairs the ledger thinks are one business, one
- *  line each. The reasons and the bank strings sit behind "why?" — the
+ *  line each. The reasons and each side's own facts, and what joining them makes, sit behind "details" — the
  *  decision is usually made on the two names alone. */
-function NeedsALook({ merges, mayEdit, demo, busy, onDecide, onMergeAll }: {
+function NeedsALook({ merges, mayEdit, demo, busy, onDecide, onMergeAll, onOpen }: {
   merges: MergeProposal[]; mayEdit: boolean; demo: boolean; busy: boolean;
   onDecide: (pid: string, action: "approve" | "reject") => void;
   onMergeAll: () => void;
+  onOpen: (display: string) => void;
 }) {
   const [why, setWhy] = useState<string | null>(null);
   const n = merges.length;
@@ -352,30 +360,18 @@ function NeedsALook({ merges, mayEdit, demo, busy, onDecide, onMergeAll }: {
             <div>
               <MerchantAvatar name={p.from} logo={p.from_logo} size={18} />{" "}
               <b>{p.from}</b>
-              <span className="mut" style={{ fontSize: 12 }}> · {p.from_rows ?? "?"}</span>
+              <span className="mut" style={{ fontSize: 12 }}> · {p.from_facts?.rows ?? p.from_rows ?? "?"}</span>
               <span className="mut"> → </span>
               <MerchantAvatar name={p.into} logo={p.into_logo} size={18} />{" "}
               <b>{p.into}</b>
-              <span className="mut" style={{ fontSize: 12 }}> · {p.into_rows ?? "?"}</span>
+              <span className="mut" style={{ fontSize: 12 }}> · {p.into_facts?.rows ?? p.into_rows ?? "?"}</span>
             </div>
             <div className="sb">
               {p.signals[0]}
               {" "}<button type="button" className="linkish"
                            onClick={() => setWhy(why === p.id ? null : p.id)}>
-                {why === p.id ? "less" : "why?"}</button>
+                {why === p.id ? "less" : "details"}</button>
             </div>
-            {why === p.id && (
-              <div style={{ fontSize: 12.5, marginTop: ".2rem" }}>
-                <ul style={{ margin: 0, paddingLeft: "1.1rem" }}>
-                  {p.signals.slice(1).map((sg) => <li key={sg}>{sg}</li>)}
-                  {p.supports.map((sp) => <li key={sp} className="mut">{sp}</li>)}
-                </ul>
-                <div className="mut" style={{ marginTop: ".2rem",
-                                              fontFamily: "ui-monospace, monospace" }}>
-                  {[...p.from_samples, ...p.into_samples].slice(0, 4).join("  ·  ")}
-                </div>
-              </div>
-            )}
           </div>
           {mayEdit && (
             <div className="row-actions" style={{ whiteSpace: "nowrap" }}>
@@ -385,9 +381,114 @@ function NeedsALook({ merges, mayEdit, demo, busy, onDecide, onMergeAll }: {
                       onClick={() => onDecide(p.id, "reject")}>Not the same</button>
             </div>
           )}
+          {why === p.id && (
+            <div style={{ fontSize: 12.5, flex: "1 1 100%", minWidth: 0 }}>
+              <ul style={{ margin: 0, paddingLeft: "1.1rem" }}>
+                {p.signals.slice(1).map((sg) => <li key={sg}>{sg}</li>)}
+                {p.supports.map((sp) => <li key={sp} className="mut">{sp}</li>)}
+              </ul>
+              <div className="offer-sum">
+                {/* the side being folded in is usually the newcomer, but a
+                    long-lived spelling with fewer rows can lose too */}
+                <OfferSide tag={(p.from_facts?.first ?? "") > (p.into_facts?.first ?? "")
+                                  ? "New detection" : "Other spelling"}
+                           tone="new" name={p.from}
+                           facts={p.from_facts} samples={p.from_samples}
+                           onOpen={() => onOpen(p.from)} />
+                <div className="offer-op" aria-hidden="true">+</div>
+                <OfferSide tag="History" tone="hist" name={p.into_name ?? p.into}
+                           facts={p.into_facts} samples={p.into_samples}
+                           onOpen={() => onOpen(p.into_name ?? p.into)} />
+                <div className="offer-op" aria-hidden="true">=</div>
+                <OfferMerged p={p} />
+              </div>
+            </div>
+          )}
         </div>
       ))}
     </details>
+  );
+}
+
+/** One side of an offer: what the ledger holds under that name today, so
+ *  the two can be told apart before they are joined. The name opens the
+ *  merchant's panel for everything else. */
+function OfferSide({ tag, tone, name, facts, samples, onOpen }: {
+  tag: string; tone: "new" | "hist"; name: string;
+  facts?: MergeSideFacts | null; samples: string[]; onOpen: () => void;
+}) {
+  return (
+    <div className={"offer-box " + tone}>
+      <div className="offer-tag">{tag}</div>
+      <div className="nm">
+        <button type="button" className="linkish" onClick={onOpen}><b>{name}</b></button>
+      </div>
+      {facts ? (
+        <>
+          <div className="sb">
+            {facts.rows} row{facts.rows === 1 ? "" : "s"} · {money(facts.total)} ·{" "}
+            {facts.first === facts.last
+              ? mmdd(facts.first) : `${mmdd(facts.first)} – ${mmdd(facts.last)}`}
+          </div>
+          <div className="sb">
+            {[facts.rows > 1 && facts.typical != null && `usually ${money(facts.typical)}`,
+              facts.category && catLabel(facts.category), facts.city,
+              facts.accounts.join(", ")].filter(Boolean).join(" · ")}
+          </div>
+          <table style={{ marginTop: ".4rem" }}>
+            <tbody>
+              {facts.recent.map((r, k) => (
+                <tr key={k}>
+                  <td className="mut" style={{ width: "1%", whiteSpace: "nowrap" }}>
+                    {mmdd(r.date)}</td>
+                  <td style={{ fontFamily: "ui-monospace, monospace", fontSize: 11.5 }}>
+                    {r.line}</td>
+                  <td className="num" style={{ width: "1%", whiteSpace: "nowrap" }}>
+                    {money$(r.amount, true)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      ) : (
+        <div className="sb" style={{ fontFamily: "ui-monospace, monospace" }}>
+          {samples.join("  ·  ")}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** What approving makes: one merchant under the surviving name, holding
+ *  both sides' rows. The sums are the two boxes beside it, added. */
+function OfferMerged({ p }: { p: MergeProposal }) {
+  const f = p.from_facts, i = p.into_facts;
+  const dates = [f?.first, f?.last, i?.first, i?.last].filter(Boolean).sort() as string[];
+  return (
+    <div className="offer-box merged">
+      <div className="offer-tag">After merge</div>
+      <div className="nm">
+        <MerchantAvatar name={p.into} logo={p.into_logo} size={18} /> {p.into}
+      </div>
+      {f && i && (
+        <>
+          <div className="sb">
+            {f.rows + i.rows} rows <span className="delta">+{f.rows}</span> ·{" "}
+            {money(f.total + i.total)} <span className="delta">+{money(f.total)}</span>
+          </div>
+          <div className="sb">
+            {mmdd(dates[0])} – {mmdd(dates[dates.length - 1])}
+            {i.category && ` · ${catLabel(i.category)}`}
+          </div>
+        </>
+      )}
+      <div className="sb" style={{ marginTop: ".4rem" }}>
+        “{p.from}” stops being its own merchant: its rows, and any later
+        charge under that name, file here.
+      </div>
+      <div className="sb" style={{ marginTop: ".35rem" }}>
+        Undo any time under Recent changes.</div>
+    </div>
   );
 }
 
@@ -423,11 +524,15 @@ function MerchantPanel({ display, row, mayEdit, demo, busy, onClose, onRename }:
   const options = (cands.data?.merchants ?? [])
     .filter((m) => m.display !== display).slice(0, 8);
   const m: MerchantDetail | undefined = d.data ?? undefined;
+  // Without coordinates the link searches for the PLACE, never the name:
+  // OpenStreetMap's search matches a business only under the exact name
+  // its mappers gave it, so a ledger name in the query finds nothing —
+  // while a street address, or the town alone, always lands somewhere.
   const mapHref = (l: MerchantDetail["locations"][number]) =>
     l.lat != null && l.lon != null
       ? `https://www.openstreetmap.org/?mlat=${l.lat}&mlon=${l.lon}#map=17/${l.lat}/${l.lon}`
       : `https://www.openstreetmap.org/search?query=${encodeURIComponent(
-          [display, l.address, l.city, l.region, l.postal].filter(Boolean).join(", "))}`;
+          [l.address, l.city, l.region, l.postal].filter(Boolean).join(", "))}`;
   const place = (l: MerchantDetail["locations"][number]) =>
     [l.address, [l.city, l.region].filter(Boolean).join(", "), l.postal]
       .filter(Boolean).join(" · ");
@@ -543,7 +648,9 @@ function MerchantPanel({ display, row, mayEdit, demo, busy, onClose, onRename }:
                   <td className="num mut" style={{ whiteSpace: "nowrap" }}>
                     {l.n} visit{l.n === 1 ? "" : "s"} · last {mmdd(l.last)}</td>
                   <td style={{ width: "1%" }}>
-                    <a href={mapHref(l)} target="_blank" rel="noopener noreferrer">map</a></td>
+                    {(l.lat != null || l.address || l.city || l.postal) && (
+                      <a href={mapHref(l)} target="_blank" rel="noopener noreferrer">map</a>
+                    )}</td>
                 </tr>
               ))}
             </tbody></table>

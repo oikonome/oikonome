@@ -5,7 +5,7 @@ finances, with the entity's money kept genuinely separate rather than
 mixed into your personal ledger.
 
 Find it on the **Business** page. The **Business** tab in the main
-navigation appears only once a business exists — most households never
+navigation, just above Accounts, appears only once a business exists — most households never
 run one. The first entity is created through the **Business wizard**
 (Settings → wizards, or the **Set up a business** card that the
 `/business` page shows while it is empty); it walks you through naming

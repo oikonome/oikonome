@@ -41,17 +41,44 @@ from .compat import as_date
 
 HORIZON_DAYS = 60
 
+# Which credit cards count against personal headroom, as one predicate over
+# `accounts a` taking the excluded-account list as its single parameter.
+# The card_debt sum, the payoff events and the Today page's runway tile all
+# splice THIS fragment: the tile and the cash chart render side by side, so
+# a card one of them stops counting has to vanish from the other in the
+# same breath, or the page argues with itself about the same household.
+#   - the Accounts page's "excl" toggle, dropped exactly as every report
+#     drops those accounts' rows (reporting.excluded_accounts_sql)
+#   - business cards, out of PERSONAL runway unless entities are combined
+#   - linked shadow sources, so a card fed by two connections schedules one
+#     payment for its one real balance, not one per account row
+CARD_SCOPE_SQL = """
+      AND NOT (a.id = ANY(%s))
+      AND (NULLIF((SELECT current_setting('app.combine_entities', true)),'')='true'
+           OR a.entity_id IS NULL)
+      AND (NULLIF((SELECT current_setting('app.shadow_ids', true)), '') IS NULL
+           OR NOT (a.id = ANY(string_to_array(
+                   (SELECT current_setting('app.shadow_ids', true)), ','))))
+"""
+
 
 def _checking_balance(conn, cfg: dict) -> float:
     """Per-tenant primary checking: explicit config wins, else the
-    largest-balance depository checking account."""
+    largest-balance depository checking account. An account the household
+    excluded on the Accounts page is not its checking account — pinned or
+    biggest — for the same reason its cards are out of the runway: the
+    runway would then start from money every other figure on the page
+    ignores, and an old high-balance account kept linked would hide the
+    household actually running out of cash."""
+    excluded = budget.excluded_account_ids(cfg)
     acct_id = cfg.get("checking_account_id")
     # a pinned account that has since become a linked group's shadow (its
     # source went stale or errored and the healthy twin took over) would
     # feed a frozen balance into every runway number — honour the live
     # failover the rest of the money math already follows
     from . import links
-    if acct_id and acct_id in set(links.shadow_ids(conn)):
+    if acct_id and (acct_id in set(links.shadow_ids(conn))
+                    or acct_id in set(excluded)):
         acct_id = None
     if acct_id:
         # a pinned account that was since assigned to a business entity
@@ -68,12 +95,14 @@ def _checking_balance(conn, cfg: dict) -> float:
     row = conn.execute(
         """SELECT COALESCE(balance_available, balance_current) AS bal
            FROM accounts WHERE type = 'depository' AND subtype = 'checking'
+             AND NOT (id = ANY(%s))   -- the Accounts page's "excl" toggle
              AND (NULLIF((SELECT current_setting('app.combine_entities', true)),'')='true' OR entity_id IS NULL)  -- don't auto-pick a business account
              -- never auto-pick a shadow (non-primary linked) source
              AND (NULLIF((SELECT current_setting('app.shadow_ids', true)), '') IS NULL
                   OR NOT (id = ANY(string_to_array(
                           (SELECT current_setting('app.shadow_ids', true)), ','))))
-           ORDER BY COALESCE(balance_current, 0) DESC LIMIT 1""").fetchone()
+           ORDER BY COALESCE(balance_current, 0) DESC LIMIT 1""",
+        (excluded,)).fetchone()
     return row["bal"] if row and row["bal"] is not None else 0.0
 
 
@@ -126,14 +155,14 @@ def build(conn, today: dt.date | None = None, days: int = HORIZON_DAYS,
     end = today + dt.timedelta(days=days)
 
     checking_bal = _checking_balance(conn, cfg)
+    # the runway must drop an excluded account's balances and payoff events
+    # exactly as every report drops its rows, or the cash chart's forecast
+    # tail pays off a card the actuals beside it never counted
+    excluded = budget.excluded_account_ids(cfg)
     card_debt = conn.execute(
-        """SELECT COALESCE(SUM(GREATEST(a.balance_current, 0)), 0) AS d
-           FROM accounts a WHERE a.type = 'credit'
-             AND (NULLIF((SELECT current_setting('app.combine_entities', true)),'')='true' OR a.entity_id IS NULL)  -- business cards out of personal runway (unless combined)
-             AND (NULLIF((SELECT current_setting('app.shadow_ids', true)), '') IS NULL
-                  OR NOT (a.id = ANY(string_to_array(
-                          (SELECT current_setting('app.shadow_ids', true)), ','))))
-        """).fetchone()["d"]
+        f"""SELECT COALESCE(SUM(GREATEST(a.balance_current, 0)), 0) AS d
+           FROM accounts a WHERE a.type = 'credit' {CARD_SCOPE_SQL}
+        """, (excluded,)).fetchone()["d"]
     start = checking_bal - card_debt
 
     # per-card payoff events, TWO scenarios:
@@ -147,7 +176,7 @@ def build(conn, today: dt.date | None = None, days: int = HORIZON_DAYS,
     # statement-scenario autopays whose due date the issuer actually gave us
     card_autopay: list[tuple[dt.date, float, str]] = []
     for c in conn.execute(
-            """SELECT COALESCE(a.display_name, a.name) AS name,
+            f"""SELECT COALESCE(a.display_name, a.name) AS name,
                       a.balance_current AS bal,
                       l.raw ->> 'next_payment_due_date' AS due,
                       -- cast only what is a number: a restored ZIP can
@@ -160,14 +189,8 @@ def build(conn, today: dt.date | None = None, days: int = HORIZON_DAYS,
                       END AS stmt
                FROM accounts a LEFT JOIN liabilities l ON l.account_id = a.id
                WHERE a.type = 'credit' AND COALESCE(a.balance_current, 0) > 0.5
-                 AND (NULLIF((SELECT current_setting('app.combine_entities', true)),'')='true' OR a.entity_id IS NULL)
-                 -- Same shadow filter as the card_debt sum above, so a
-                 -- multi-source card (Plaid + SimpleFIN) schedules ONE payment
-                 -- event for its one real balance, not one per linked account
-                 AND (NULLIF((SELECT current_setting('app.shadow_ids', true)), '') IS NULL
-                      OR NOT (a.id = ANY(string_to_array(
-                              (SELECT current_setting('app.shadow_ids', true)), ','))))
-            """).fetchall():
+                 {CARD_SCOPE_SQL}
+            """, (excluded,)).fetchall():
         try:
             due = as_date(c["due"])
         except ValueError:

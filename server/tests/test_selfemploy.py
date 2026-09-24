@@ -181,5 +181,22 @@ class SelfEmployTests(unittest.TestCase):
         self.assertFalse(vt["SMALL VENDOR"]["needs_1099"])   # under $600
 
 
+    def test_1099_vendor_total_is_net_of_partial_reimbursement(self):
+        """A vendor charge partly paid back counts only the part the business
+        kept paying — gross, $700 less $200 repaid would cross the $600
+        line on money that came back."""
+        add_txn(self.conn, TODAY, 700.0, "JANE CONTRACTOR", account="biz",
+                txn_id="c9")
+        add_txn(self.conn, TODAY, -200.0, "CLIENT REPAYS", account="biz",
+                primary="INCOME", txn_id="d9")
+        self.conn.execute(
+            "INSERT INTO reimbursements (expense_id, reimburse_id, partial, "
+            "amount) VALUES ('c9','d9',1,200)")
+        selfemploy.mark_vendor(self.conn, self.ent["id"], "JANE CONTRACTOR")
+        vt = {v["merchant"]: v for v in
+              selfemploy.vendor_totals(self.conn, self.ent["id"], TODAY.year)}
+        self.assertEqual(vt["JANE CONTRACTOR"]["paid"], 500.0)
+        self.assertFalse(vt["JANE CONTRACTOR"]["needs_1099"])
+
 if __name__ == "__main__":
     unittest.main()

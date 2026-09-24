@@ -30,6 +30,8 @@ function TxnRow({ t, onPress, onLongPress, selected }:
       : t.reimb_flag ? "⚑ awaiting reimbursement" : "",
     t.biz_flag ? "🏢 biz" : "",
     t.has_receipt ? "📎" : "",
+    // a hand split: the rollups count its parts, not the category shown
+    t.split?.length ? `✂ split ${t.split.length} ways` : "",
   ].filter(Boolean).join(" · ");
   return (
     <Pressable onPress={onPress ? () => onPress(t) : undefined}

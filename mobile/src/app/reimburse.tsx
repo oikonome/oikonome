@@ -85,36 +85,37 @@ export default function Reimburse() {
     mutationFn: () => client!.reimbLink(pairing!.id, [...chosen],
                                         partialPick),
     onSuccess: (r) => {
-      // a fully paired charge leaves the list now; a partial one shows
-      // what it just received. The refetch behind it settles the rest.
-      // A link that partly failed is not paired: the row stays, and the
+      // A clean full match leaves the list now; the refetch in done()
+      // settles the rest. A partial link (asked for, or downgraded by the
+      // server because the deposit is bigger than the charge) is not
+      // patched: what it netted is min(the charge's remaining need, each
+      // deposit's remaining balance), decided server-side and not in the
+      // response, so the deposits' face value would overstate it. A link
+      // that partly failed is not paired either: the row stays, and the
       // alert below says why.
       const errs: string[] = (r as { errors?: string[] }).errors ?? [];
+      // notes are outcomes, not refusals (the web shows them the same way)
+      const notes: string[] = r.notes ?? [];
       const p = pairing!;
-      if (!partialPick) {
-        if (errs.length === 0)
-          removeFromList<{ pending: PendingReimb[] }, PendingReimb>(
-            qc, ["reimburse"], "pending", (x) => x.id === p.id);
-      } else {
-        const got = -(candidates.data?.candidates ?? [])
-          .filter((c) => chosen.has(c.id))
-          .reduce((t, c) => t + c.amount, 0);
-        patchList<{ pending: PendingReimb[] }, PendingReimb>(
-          qc, ["reimburse"], "pending", (x) => x.id === p.id,
-          { received: (p.received ?? 0) + got });
-      }
+      if (!partialPick && errs.length === 0 && notes.length === 0)
+        removeFromList<{ pending: PendingReimb[] }, PendingReimb>(
+          qc, ["reimburse"], "pending", (x) => x.id === p.id);
       done();
+      // the new pair belongs in the Matched card, the undo surface
+      qc.invalidateQueries({ queryKey: ["reimb-pairs"] });
       // a partly-failed pairing must not read as success — and a clean
       // one says so (the web's sentence), not silence
       const linked = (r as { linked?: number }).linked ?? chosen.size;
+      const noteText = notes.length ? `\n\n${notes.join("\n")}` : "";
       if (errs.length)
         Alert.alert("Some deposits didn't pair",
           errs.slice(0, 3).join("\n")
-          + (errs.length > 3 ? `\n…and ${errs.length - 3} more` : ""));
+          + (errs.length > 3 ? `\n…and ${errs.length - 3} more` : "")
+          + noteText);
       else
         Alert.alert("Linked",
-          `Linked ${pairing?.payee ?? "the charge"} to ${linked} deposit${
-            linked === 1 ? "" : "s"}.`);
+          `Linked ${p.payee} to ${linked} deposit${
+            linked === 1 ? "" : "s"}.` + noteText);
     },
   });
   const unflag = useMutation({
@@ -341,10 +342,12 @@ export default function Reimburse() {
               Payback for {pairing?.payee} ({pairing ? money(pairing.amount) : ""})
             </Text>
             <Text style={s.mut}>
-              Deposits near {pairing ? money(pairing.amount) : ""} since{" "}
-              {pairing ? mmddyy(pairing.date) : ""} — pick the one that
-              paid this back. Tick every deposit that covers this charge
-              — one deposit can reimburse many charges.
+              {/* the candidate search spans 180 days either side of the
+                  charge, so this states the window, not a start date */}
+              Deposits near {pairing ? money(pairing.amount) : ""}, within
+              180 days — pick the one that paid this back. Tick every
+              deposit that covers this charge — one deposit can reimburse
+              many charges.
               {pairing?.partial
                 ? " This expense expects a PARTIAL payback — only the"
                   + " received amount nets out."

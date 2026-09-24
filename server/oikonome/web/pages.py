@@ -313,7 +313,7 @@ def _tenant_count() -> int:
 # step-up ticket, so it lives the same way: sha256 at rest, bound to the
 # user, deleted on read.
 EXPORT_TICKET_TTL = _dt.timedelta(seconds=60)
-_EXPORT_KINDS = ("zip", "dump")
+_EXPORT_KINDS = ("zip", "dump", "continuity")
 
 
 def _mint_export_ticket(user_id, kind: str) -> str:
@@ -370,14 +370,15 @@ def export_token(user: dict = Depends(_user()), body: dict = Body(...)):
     kind = str(body.get("kind") or "zip")
     if kind not in _EXPORT_KINDS:
         raise HTTPException(400, "kind must be zip or dump")
-    if kind == "dump" and user["role"] != "owner":
+    if kind in ("dump", "continuity") and user["role"] != "owner":
         raise HTTPException(403, "owner only")
     _require_elevation(user, fresh_seconds=60,
                        password=str(body.get("password") or ""),
                        totp_code=str(body.get("totp_code") or ""),
                        recovery_code=str(body.get("recovery_code") or ""))
     ticket = _mint_export_ticket(user["user_id"], kind)
-    path = "/export/dump" if kind == "dump" else "/export"
+    path = {"dump": "/export/dump",
+            "continuity": "/export/continuity"}.get(kind, "/export")
     return {"ok": True, "token": ticket,
             "url": f"{path}?t={quote(ticket)}",
             "expires_in": int(EXPORT_TICKET_TTL.total_seconds())}
@@ -493,6 +494,15 @@ EXPORT_SKIP = {
     # ids are this instance's, and carrying it into a fresh one would tell
     # that instance to drop a backfill it has never held.
     "account_adoptions",
+    # Outbound webhooks and their outbox. A receiver URL is a credential in
+    # its own right — a Home Assistant webhook id or a chat incoming-webhook
+    # URL lets whoever holds it trigger the automation or post to the
+    # channel — and a delivery's payload is a copy of the ledger. Neither
+    # travels (and restore would not load them: a destination must not
+    # start posting a household's books to a URL its operator never saw).
+    # tenant_export.ARCHIVE_TABLE_SKIP names the same two.
+    "webhooks",
+    "webhook_deliveries",
 }
 
 # PRESENTATION only — a human-friendly file order for the ZIP and its
@@ -510,7 +520,8 @@ _EXPORT_ORDER = ["items", "accounts", "transactions", "bills",
                  "amazon_orders", "amazon_matches", "amazon_summaries",
                  "business_entity", "entity_membership", "equity_movement",
                  "business_txn_class", "compliance_obligation", "mileage_log",
-                 "vendor_1099", "transaction_notes",
+                 "vendor_1099", "transaction_notes", "transaction_splits",
+                 "activity_log",
                  "account_links",
                  "receipts", "receipt_items",
                  "budget_snapshots",
@@ -574,6 +585,53 @@ def export_data(user: dict = Depends(_user()), t: str = ""):
         _stream(), media_type="application/zip",
         headers={"Content-Disposition":
                  'attachment; filename="oikonome-export.zip"'})
+
+
+@router.get("/export/continuity")
+def export_continuity(user: dict = Depends(_user()), t: str = ""):
+    """The continuity packet: the household's accounts, bills, income and
+    businesses as one PDF a survivor can read cold (engine/continuity).
+    It carries no credential, but it is the whole shape of the money, so
+    it leaves through the same door as the ZIP — owner only, a one-shot
+    ticket minted after a FRESH elevation."""
+    if user["role"] != "owner":
+        raise HTTPException(403, "owner only")
+    _redeem_export_ticket(user["user_id"], "continuity", t)
+    from fastapi.responses import Response
+
+    from ..engine import activity as _activity
+    pdf, name = _continuity_pdf(user)
+    conn = tenancy.tenant_connect(user["tenant_id"])
+    try:
+        _activity.record(conn, user, "settings", "continuity_downloaded")
+    finally:
+        conn.close()
+    return Response(pdf, media_type="application/pdf",
+                    headers={"Content-Disposition":
+                             f'attachment; filename="{name}"',
+                             "Cache-Control": "no-store"})
+
+
+def _continuity_pdf(user: dict) -> tuple[bytes, str]:
+    """Build the packet for this household: (pdf bytes, filename). Shared
+    by the download and the emailed copy so both print the same page."""
+    import os as _os
+
+    from .app import _control_conn
+    from ..engine import continuity
+    with _control_conn() as cc:
+        members = [dict(r) for r in cc.execute(
+            "SELECT email, role FROM users WHERE tenant_id = %s "
+            "ORDER BY created_at", (user["tenant_id"],)).fetchall()]
+    conn = tenancy.tenant_connect(user["tenant_id"])
+    try:
+        packet = continuity.gather(
+            conn, members=members,
+            base_url=_os.environ.get("OIKONOME_BASE_URL", ""))
+    finally:
+        conn.close()
+    return (continuity.render_pdf(packet),
+            continuity.filename(packet["generated_date"]))
 
 
 @router.get("/settings")
@@ -1208,13 +1266,25 @@ def transactions_recategorize(user: dict = Depends(_user()),
                               category: str = Form(""),
                               back: str = Form("/transactions")):
     from . import data
+    from ..engine import activity as _activity
     conn = tenancy.tenant_connect(user["tenant_id"])
     try:
         c = category.strip()
+        was = conn.execute(
+            "SELECT COALESCE(category_override, category_primary) AS cat "
+            "FROM transactions WHERE id=%s", (txn_id,)).fetchone()
         if c == "__clear__":
             data.clear_category(conn, txn_id)
         elif c:
             data.set_category(conn, txn_id, c)
+        if was and c:
+            _activity.record(
+                conn, user, "category",
+                "cleared" if c == "__clear__" else "set", target=txn_id,
+                label=_activity.txn_label(conn, txn_id),
+                detail={"before": was["cat"],
+                        "after": None if c == "__clear__" else c,
+                        "scope": "one"})
     finally:
         conn.close()
     dest = (back if back.startswith("/") and not back.startswith("//")
@@ -1293,6 +1363,9 @@ def bills_proposal(user: dict = Depends(_user()), pid: str = Form(...),
     conn = tenancy.tenant_connect(user["tenant_id"])
     try:
         r = bills.apply_proposal(conn, pid, action)
+        if not r.get("error"):
+            from .api import _log_proposal
+            _log_proposal(conn, user, pid, action, r)
     finally:
         conn.close()
     verb = {"approve": "approved", "reject": "rejected"}.get(action, action)

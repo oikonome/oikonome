@@ -9,7 +9,7 @@ import { Alert, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput,
          View } from "react-native";
 import PullRefresh from "../components/pull-refresh";
 
-import { Card, H, KV } from "../components/ui";
+import { Card, H, HelpLink, KV } from "../components/ui";
 import { ext } from "../ext";
 
 // the add-on's account card, fixed for the life of the bundle
@@ -17,7 +17,8 @@ const AccountCard = ext.account?.Card;
 import * as DocumentPicker from "expo-document-picker";
 import { router, useRouter } from "expo-router";
 
-import { errText, Me, PickedFile, SettingsView } from "../lib/api";
+import { Continuity, errText, Me, PickedFile, SettingsView, TokenScope, Webhook,
+         WebhookEvent } from "../lib/api";
 import { patchQuery, removeFromList, saveSettings } from "../lib/cache";
 import { signOutAction } from "../lib/pure";
 import { useSession } from "../lib/session";
@@ -125,6 +126,139 @@ function ExportDownloads({ dump }: { dump: boolean }) {
   );
 }
 
+// The continuity packet (web: Settings.tsx ContinuityCard): the
+// household's money on paper for whoever is left to run it. Two fields
+// the owner writes, the PDF through the export ticket + share sheet, and
+// an emailed copy that steps up like the download.
+function ContinuityCard() {
+  const { client } = useSession();
+  const qc = useQueryClient();
+  const q = useQuery({ queryKey: ["continuity"],
+                       queryFn: () => client!.continuity(), enabled: !!client });
+  const [note, setNote] = useState<string | null>(null);
+  const [who, setWho] = useState<string | null>(null);
+  const [to, setTo] = useState("");
+  const [msg, setMsg] = useState<{ text: string; bad?: boolean } | null>(null);
+  const d = q.data;
+  const noteNow = note ?? d?.note ?? "";
+  const whoNow = who ?? d?.prepared_for ?? "";
+  const dirty = !!d && (noteNow !== d.note || whoNow !== d.prepared_for);
+  const save = useMutation({
+    mutationFn: () => client!.continuitySave({ note: noteNow,
+                                               prepared_for: whoNow }),
+    onSuccess: (r) => {
+      qc.setQueryData<Continuity>(["continuity"], (o) => o && { ...o, ...r });
+      setNote(null); setWho(null); setMsg({ text: "Saved." });
+    },
+    onError: (e) => setMsg({ text: stepUpMsg(e), bad: true }),
+  });
+  const get = useMutation({
+    mutationFn: async () => {
+      const t = await client!.exportTicket("continuity");
+      await client!.download(t.url, "oikonome-continuity.pdf");
+    },
+    onSuccess: () => setMsg({ text: "Downloaded." }),
+    onError: (e) => setMsg({ text: stepUpMsg(e), bad: true }),
+  });
+  const mail = useMutation({
+    mutationFn: () => client!.continuityEmail(to.trim()),
+    onSuccess: (r) => setMsg({ text: `Sent to ${r.to}.` }),
+    onError: (e) => setMsg({ text: stepUpMsg(e), bad: true }),
+  });
+  const busy = save.isPending || get.isPending || mail.isPending;
+  const askMail = () => Alert.alert(
+    "Email the continuity packet?",
+    `It goes to ${to.trim()} — the whole shape of the household's money. `
+    + "You'll confirm it's you first.",
+    [{ text: "Send", onPress: () => mail.mutate() },
+     { text: "Cancel", style: "cancel" }]);
+  return (
+    <Card>
+      <H>Continuity packet</H>
+      <Text style={s.hintL}>
+        If something happens to you, the person left running the household
+        needs a map: every account and where it is held, the balances that
+        day, the bills and what pays them, the income, the businesses — and,
+        in your words, where the rest is (the password manager, the will,
+        the lawyer, who to call). One PDF from what Oikonome already knows.
+        It holds no passwords.
+      </Text>
+      <Text style={[s.hintL2, { marginTop: 10 }]}>Prepared for (optional)</Text>
+      <TextInput style={s.input} placeholder="a name, e.g. Sam"
+                 placeholderTextColor={C.mut} maxLength={120}
+                 value={whoNow} onChangeText={setWho} />
+      <Text style={[s.hintL2, { marginTop: 10 }]}>
+        Where the rest is — printed as the first section</Text>
+      <TextInput style={[s.input, { minHeight: 110, textAlignVertical: "top" }]}
+                 multiline maxLength={d?.note_max ?? 4000}
+                 placeholder={"Passwords: in the family password manager; "
+                   + "the recovery kit is in the safe.\nWill and life "
+                   + "insurance: top drawer of the desk; the lawyer is…\n"
+                   + "Call…"}
+                 placeholderTextColor={C.mut}
+                 value={noteNow} onChangeText={setNote} />
+      <View style={{ flexDirection: "row", gap: 8, marginTop: 8,
+                     flexWrap: "wrap" }}>
+        <Pressable style={[s.btn, s.btnQuiet, (!dirty || busy) && { opacity: 0.5 }]}
+                   disabled={!dirty || busy} onPress={() => save.mutate()}>
+          <Text style={s.btnText}>{save.isPending ? "saving…" : "Save"}</Text>
+        </Pressable>
+        <Pressable style={[s.btn, (busy || !d) && { opacity: 0.5 }]}
+                   disabled={busy || !d} onPress={() => get.mutate()}>
+          <Text style={s.btnText}>
+            {get.isPending ? "preparing…" : "Download PDF"}</Text>
+        </Pressable>
+      </View>
+      {d && (
+        <View style={{ marginTop: 12 }}>
+          <Text style={s.hintL2}>
+            Email a copy{d.members_only ? " to someone in the household" : ""}
+          </Text>
+          {d.members_only ? (
+            <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6,
+                           marginTop: 6 }}>
+              {d.members.map((m) => (
+                <Pressable key={m} style={[s.chip, to === m && s.chipOn]}
+                           onPress={() => setTo(m)}>
+                  <Text style={{ color: C.text, fontSize: 12 }}>{m}</Text>
+                </Pressable>
+              ))}
+            </View>
+          ) : (
+            <TextInput style={s.input} placeholder="their email address"
+                       placeholderTextColor={C.mut} autoCapitalize="none"
+                       keyboardType="email-address" value={to}
+                       onChangeText={setTo} />
+          )}
+          <Pressable style={[s.btn, s.btnQuiet, { alignSelf: "flex-start",
+                              marginTop: 8 },
+                             (busy || !to.trim() || !d.mail_configured)
+                               && { opacity: 0.5 }]}
+                     disabled={busy || !to.trim() || !d.mail_configured}
+                     onPress={askMail}>
+            <Text style={s.btnText}>
+              {mail.isPending ? "sending…" : "Email the packet"}</Text>
+          </Pressable>
+          {!d.mail_configured && (
+            <Text style={[s.hintL2, { marginTop: 6 }]}>
+              Email isn't configured on this instance — download the PDF and
+              hand it over instead.</Text>
+          )}
+          {d.members_only && (
+            <Text style={[s.hintL2, { marginTop: 6 }]}>
+              Hosted mails the household's finances only to an address with
+              an account here. Invite them under Users first, or download
+              the PDF and hand it over.</Text>
+          )}
+        </View>
+      )}
+      {msg && <Text style={[s.hintL, { marginTop: 8,
+                                       color: msg.bad ? C.warn : C.good }]}>
+        {msg.text}</Text>}
+    </Card>
+  );
+}
+
 export default function Settings() {
   const { client, serverUrl, signOut } = useSession();
   const [testMsg, setTestMsg] = useState<string | null>(null);
@@ -188,8 +322,15 @@ export default function Settings() {
     conn: hit("connections providers plaid mx simplefin bank keys "
       + "scripts manage accounts rename hide remove add link reconnect"),
     tokens: hit("script tokens api bearer collectors community push import"),
+    webhooks: hit("webhooks webhook events post url signature home assistant "
+      + "automation matrix integrations outbound"),
+    readtokens: hit("integration tokens read token api bearer prometheus "
+      + "metrics grafana home assistant sensor mcp assistant scrape "
+      + "endpoints summary"),
     move: hit("move fresh environment bundle passphrase connections "
       + "backup import"),
+    continuity: hit("continuity packet if i die spouse partner survivor "
+      + "estate emergency pdf where things are will print"),
     smtp: hit("email delivery smtp host port password sender test"),
     daily: hit("daily email verdict recipients schedule cadence weekly "
       + "monthly report send email now sms push"),
@@ -313,6 +454,9 @@ export default function Settings() {
           <ExportDownloads dump={!me.data.hosted && me.data.role === "owner"} />
         </Card>
       )}
+      {me.data?.role === "owner" && !me.data.demo && hits.continuity && (
+        <ContinuityCard />
+      )}
       <Card>
         <H>Notifications</H>
         <Text style={s.hint}>
@@ -389,6 +533,14 @@ export default function Settings() {
                     ?? "cadences, recipients, email, SMS + push channels"}
                   href="/notifications" />
         )}
+        {/* the web's Settings → Integrations: what the instance tells
+            other programs — webhooks out, the read doors in */}
+        {owner && (hits.webhooks || hits.readtokens)
+          && <SectionHead>Integrations</SectionHead>}
+        {owner && hits.webhooks && !me.data.demo && <WebhooksCard />}
+        {owner && hits.readtokens && !me.data.demo
+          && <ScriptTokensCard scope="read" />}
+        {owner && hits.readtokens && <EndpointsCard />}
         {hits.family && (<>
           <SectionHead>Users</SectionHead>
           <NavRow label="Family & invites"
@@ -1521,7 +1673,10 @@ function SupportAccessCard({ owner }: { owner: boolean }) {
 }
 
 // ---- script tokens (self-host collectors) ----
-function ScriptTokensCard() {
+// One card, two scopes (the web's shape): Connections renders the push
+// half (a collector's credential), Integrations the read half (a scraper's,
+// a sensor's, an MCP server's).
+function ScriptTokensCard({ scope = "push" }: { scope?: TokenScope }) {
   const { client } = useSession();
   const qc = useQueryClient();
   const q = useQuery({ queryKey: ["tokens"],
@@ -1530,10 +1685,11 @@ function ScriptTokensCard() {
   const [fresh, setFresh] =
     useState<{ name: string; token: string } | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
+  const read = scope === "read";
   // a token is a durable grant, so minting/revoking one is elevation-
   // gated — the same sheet the support-access grant raises
   const mint = useMutation({
-    mutationFn: () => client!.tokenMint(name.trim()),
+    mutationFn: () => client!.tokenMint(name.trim(), scope),
     onSuccess: (r) => {
       // the plaintext appears ONLY here — it won't be shown again
       setFresh({ name: r.name, token: r.token });
@@ -1542,7 +1698,7 @@ function ScriptTokensCard() {
       qc.setQueryData<typeof q.data>(["tokens"], (o) => o && { ...o,
         tokens: [...o.tokens, { id: r.id, name: r.name,
           created_at: new Date().toISOString(), last_used_at: null,
-          revoked_at: null }] });
+          revoked_at: null, scope: r.scope ?? scope }] });
       qc.invalidateQueries({ queryKey: ["tokens"] });
     },
     onError: (e) => setMsg(stepUpMsg(e)),
@@ -1553,14 +1709,22 @@ function ScriptTokensCard() {
       (t: { id: string }) => t.id === id),
     onError: (e) => setMsg(stepUpMsg(e)),
   });
-  const rows = (q.data?.tokens ?? []).filter((t) => !t.revoked_at);
+  // an older row carries no scope and was minted when push was the only kind
+  const rows = (q.data?.tokens ?? [])
+    .filter((t) => !t.revoked_at && (t.scope ?? "push") === scope);
   return (
     <Card>
-      <H>Script tokens</H>
+      <H>{read ? "Integration tokens" : "Script tokens"}</H>
       <Text style={s.hintL}>
-        Credentials for your own collector scripts. A token can push
-        data through the import endpoints — nothing else: it can&apos;t
-        read your ledger or change settings.
+        {read
+          ? "Read-only credentials for the programs that watch your "
+            + "money: a Prometheus scrape, a Home Assistant sensor, the "
+            + "local MCP server. A read token can read the integrations "
+            + "endpoints — nothing else: it can't import a row, change a "
+            + "setting or see a credential."
+          : "Credentials for your own collector scripts. A token can push "
+            + "data through the import endpoints — nothing else: it can't "
+            + "read your ledger or change settings."}
       </Text>
       {fresh && (
         <View style={{ backgroundColor: C.bg, borderColor: C.good,
@@ -1614,7 +1778,8 @@ function ScriptTokensCard() {
         </View>
       ))}
       <TextInput style={s.input}
-                 placeholder="script name (e.g. my-bank)"
+                 placeholder={read ? "what will use it (e.g. grafana)"
+                                   : "script name (e.g. my-bank)"}
                  placeholderTextColor={C.mut}
                  autoCapitalize="none" value={name}
                  onChangeText={setName} />
@@ -1630,6 +1795,258 @@ function ScriptTokensCard() {
           {mint.isPending ? "creating…" : "Create token"}
         </Text>
       </Pressable>
+    </Card>
+  );
+}
+
+
+// ---- Integrations: webhooks out, the read doors in (the web's cards) ----
+const ALL_EVENTS = "*";
+
+function EventChips({ events, value, onChange }: {
+  events: WebhookEvent[]; value: string[]; onChange: (v: string[]) => void;
+}) {
+  const all = value.includes(ALL_EVENTS);
+  const toggle = (name: string) => {
+    if (name === ALL_EVENTS) return onChange(all ? [] : [ALL_EVENTS]);
+    if (all) return;
+    onChange(value.includes(name) ? value.filter((v) => v !== name)
+                                  : [...value, name]);
+  };
+  return (
+    <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6,
+                   marginTop: 6 }}>
+      {[{ name: ALL_EVENTS, description: "every event" }, ...events]
+        .map((ev) => {
+          const on = all ? true : value.includes(ev.name);
+          return (
+            <Pressable key={ev.name} style={[s.chip, on && s.chipOn,
+                         all && ev.name !== ALL_EVENTS && { opacity: 0.5 }]}
+                       onPress={() => toggle(ev.name)}>
+              <Text style={{ color: on ? C.text : C.mut, fontSize: 12 }}>
+                {ev.name === ALL_EVENTS ? "every event" : ev.name}
+              </Text>
+            </Pressable>
+          );
+        })}
+    </View>
+  );
+}
+
+function WebhookRow({ hook }: { hook: Webhook }) {
+  const { client } = useSession();
+  const qc = useQueryClient();
+  const [msg, setMsg] = useState<{ text: string; bad?: boolean } | null>(null);
+  const patch = (row: Webhook) =>
+    qc.setQueryData<{ webhooks: Webhook[]; events: WebhookEvent[] }>(
+      ["webhooks"], (o) => o && { ...o,
+        webhooks: o.webhooks.map((w) => (w.id === row.id ? row : w)) });
+  const toggle = useMutation({
+    mutationFn: (enabled: boolean) =>
+      client!.webhookUpdate(hook.id, { enabled }),
+    onSuccess: (row) => { patch(row); setMsg(null); },
+    onError: (e) => setMsg({ text: errText(e), bad: true }),
+  });
+  const test = useMutation({
+    mutationFn: () => client!.webhookTest(hook.id),
+    onSuccess: (r) => {
+      setMsg(r.ok ? { text: `Delivered — HTTP ${r.status}.` }
+                  : { text: `Not delivered: ${r.error ?? "no answer"}`,
+                      bad: true });
+      qc.invalidateQueries({ queryKey: ["webhooks"] });
+    },
+    onError: (e) => setMsg({ text: errText(e), bad: true }),
+  });
+  const remove = useMutation({
+    mutationFn: () => client!.webhookDelete(hook.id),
+    onSuccess: () => {
+      removeFromList(qc, ["webhooks"], "webhooks",
+                     (w: { id: string }) => w.id === hook.id);
+      qc.invalidateQueries({ queryKey: ["webhooks"] });
+    },
+    onError: (e) => setMsg({ text: errText(e), bad: true }),
+  });
+  const busy = toggle.isPending || test.isPending || remove.isPending;
+  const status = hook.disabled_reason ? "switched off"
+    : hook.last_status == null ? "never sent"
+    : hook.last_error ? `last: ${hook.last_error.slice(0, 40)}`
+    : `last HTTP ${hook.last_status}`;
+  return (
+    <View style={{ borderTopColor: C.border,
+                   borderTopWidth: StyleSheet.hairlineWidth,
+                   paddingVertical: 8, gap: 4 }}>
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+        <View style={{ flex: 1 }}>
+          <Text style={{ color: C.text, fontSize: 13, fontWeight: "600" }}>
+            {hook.name || "webhook"}
+          </Text>
+          <Text style={s.hintL2} numberOfLines={1}>{hook.url}</Text>
+        </View>
+        <Switch value={hook.enabled} disabled={busy}
+                onValueChange={(v) => toggle.mutate(v)}
+                trackColor={{ true: C.accent, false: C.hover }}
+                thumbColor={C.text} />
+      </View>
+      <Text style={s.hintL2}>
+        {hook.events.includes(ALL_EVENTS) ? "every event"
+          : hook.events.join(" · ")}
+        {" · "}{status}
+        {hook.last_attempt_at ? ` · ${mmddyy(hook.last_attempt_at)}` : ""}
+      </Text>
+      {hook.disabled_reason ? (
+        <Text style={{ color: C.bad, fontSize: 12 }}>
+          {hook.disabled_reason} — fix the receiver, then switch it back on.
+        </Text>
+      ) : null}
+      {msg ? (
+        <Text style={{ color: msg.bad ? C.bad : C.good, fontSize: 12 }}
+              onPress={() => setMsg(null)}>{msg.text}</Text>
+      ) : null}
+      <View style={{ flexDirection: "row", gap: 8, marginTop: 2 }}>
+        <Pressable style={[s.btn, s.btnQuiet, busy && { opacity: 0.5 }]}
+                   disabled={busy} onPress={() => test.mutate()}>
+          <Text style={s.btnText}>
+            {test.isPending ? "sending…" : "Send a test"}</Text>
+        </Pressable>
+        <View style={{ flex: 1 }} />
+        <Text style={[{ color: C.bad, fontSize: 12, padding: 6 },
+                      busy && { opacity: 0.5 }]}
+              onPress={() => {
+                if (busy) return;
+                Alert.alert("Delete webhook",
+                  `Delete "${hook.name || hook.url}"? Nothing further `
+                  + "will be sent to it.",
+                  [{ text: "Delete", style: "destructive",
+                     onPress: () => remove.mutate() },
+                   { text: "Cancel", style: "cancel" }]);
+              }}>
+          {remove.isPending ? "deleting…" : "delete"}
+        </Text>
+      </View>
+    </View>
+  );
+}
+
+function WebhooksCard() {
+  const { client } = useSession();
+  const qc = useQueryClient();
+  const q = useQuery({ queryKey: ["webhooks"],
+    queryFn: () => client!.webhooks(), enabled: !!client });
+  const [adding, setAdding] = useState(false);
+  const [url, setUrl] = useState("");
+  const [name, setName] = useState("");
+  const [evs, setEvs] = useState<string[]>([]);
+  const [fresh, setFresh] =
+    useState<{ name: string; secret: string } | null>(null);
+  const [msg, setMsg] = useState<string | null>(null);
+  // the ledger gets posted to this URL — elevation-gated, like a token
+  const create = useMutation({
+    mutationFn: () => client!.webhookCreate({ url: url.trim(), events: evs,
+                                              name: name.trim() }),
+    onSuccess: (r) => {
+      const { secret, ...row } = r;
+      setFresh({ name: row.name || row.url, secret });
+      setUrl(""); setName(""); setEvs([]); setAdding(false); setMsg(null);
+      qc.setQueryData<typeof q.data>(["webhooks"], (o) => o && { ...o,
+        webhooks: [...o.webhooks, row as Webhook] });
+      qc.invalidateQueries({ queryKey: ["webhooks"] });
+    },
+    onError: (e) => setMsg(stepUpMsg(e)),
+  });
+  const hooks = q.data?.webhooks ?? [];
+  return (
+    <Card>
+      <H>Webhooks</H>
+      <Text style={s.hintL}>
+        Tell another program when something happens: new charges from a
+        sync, an alert, the daily verdict, a bill someone edited. Each
+        event is one signed HTTP POST to a URL you choose. Failed
+        deliveries retry for a day; a receiver that stays down gets
+        switched off and says so here.
+      </Text>
+      {fresh ? (
+        <View style={{ backgroundColor: C.bg, borderColor: C.good,
+                       borderWidth: 1, borderRadius: 8, padding: 8,
+                       marginTop: 6, gap: 4 }}>
+          <Text style={s.hintL}>
+            {fresh.name} — copy the signing secret now; it won&apos;t be
+            shown again:
+          </Text>
+          <Text style={{ color: C.text, fontFamily: "monospace",
+                         fontSize: 12 }} selectable>
+            {fresh.secret}
+          </Text>
+          <Pressable style={[s.btn, { alignSelf: "flex-start" }]}
+                     onPress={async () => {
+                       await Clipboard.setStringAsync(fresh.secret);
+                       setFresh(null);
+                     }}>
+            <Text style={s.btnText}>Copy &amp; dismiss</Text>
+          </Pressable>
+        </View>
+      ) : null}
+      {hooks.map((h) => <WebhookRow key={h.id} hook={h} />)}
+      {!hooks.length && !q.isPending ? (
+        <Text style={[s.hintL2, { marginTop: 6 }]}>No webhooks yet.</Text>
+      ) : null}
+      {adding ? (
+        <View style={{ marginTop: 6 }}>
+          <TextInput style={s.input} placeholder="name (e.g. home-assistant)"
+                     placeholderTextColor={C.mut} autoCapitalize="none"
+                     value={name} onChangeText={setName} />
+          <TextInput style={s.input} placeholder="https://receiver.example/hook"
+                     placeholderTextColor={C.mut} autoCapitalize="none"
+                     autoCorrect={false} keyboardType="url"
+                     value={url} onChangeText={setUrl} />
+          <EventChips events={q.data?.events ?? []} value={evs}
+                      onChange={setEvs} />
+          {msg ? (
+            <Text style={{ color: C.bad, fontSize: 12, marginTop: 4 }}
+                  onPress={() => setMsg(null)}>{msg}</Text>
+          ) : null}
+          <View style={{ flexDirection: "row", gap: 8, marginTop: 8 }}>
+            <Pressable style={[s.btn, (create.isPending || !url.trim()
+                                        || !evs.length) && { opacity: 0.5 }]}
+                       disabled={create.isPending || !url.trim() || !evs.length}
+                       onPress={() => create.mutate()}>
+              <Text style={s.btnText}>
+                {create.isPending ? "creating…" : "Create webhook"}</Text>
+            </Pressable>
+            <Pressable style={[s.btn, s.btnQuiet]}
+                       onPress={() => setAdding(false)}>
+              <Text style={s.btnText}>cancel</Text>
+            </Pressable>
+          </View>
+        </View>
+      ) : (
+        <Pressable style={[s.btn, { alignSelf: "flex-start", marginTop: 8 }]}
+                   onPress={() => setAdding(true)}>
+          <Text style={s.btnText}>Add a webhook</Text>
+        </Pressable>
+      )}
+    </Card>
+  );
+}
+
+// where the read doors are, with this instance's address filled in; the
+// paste-ready snippets live on the web card and in the guide
+function EndpointsCard() {
+  const { serverUrl } = useSession();
+  const base = (serverUrl ?? "").replace(/\/$/, "");
+  return (
+    <Card>
+      <H>Read endpoints</H>
+      <Text style={s.hintL}>
+        Every one takes an integration token as a bearer. The summary is
+        one JSON document; /metrics is the same numbers in the Prometheus
+        text format; the query doors behind the MCP server search the
+        ledger, spending, bills and the net-worth series.
+      </Text>
+      <KV k="summary" v={`${base}/api/integrations/summary`} tone="mut" />
+      <KV k="metrics" v={`${base}/metrics`} tone="mut" />
+      <KV k="search" v={`${base}/api/integrations/transactions?q=…`}
+          tone="mut" />
+      <HelpLink topic="integrations" />
     </Card>
   );
 }

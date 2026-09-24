@@ -69,7 +69,7 @@ guide).
 ## Store receipts you never photographed
 
 Two merchants post charges whose names say nothing about what you bought:
-an Amazon charge posts as "AMAZON.COM", and a Costco run as
+an Amazon charge posts as "AMAZON.COM", and a warehouse-club run as
 "WAREHOUSE CLUB #0123". Both can be filled in without a camera, by
 importing the store's own record of the order — see the
 [community scripts guide](../community-scripts.md), which is where that
@@ -106,7 +106,10 @@ everything already collected.
 
 Budget math is unchanged: the **transaction's own total** is the only
 number the verdict, budgets, and reports see. Line items explain a
-charge; they never re-bucket or split it.
+charge; they never re-bucket or split it. To count one charge under
+several categories, **split the row by hand** (the ✂ action in its ⋯
+menu — see the Transactions guide); the receipt then documents what the
+parts were.
 
 ## Gotchas
 

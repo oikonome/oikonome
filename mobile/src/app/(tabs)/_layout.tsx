@@ -11,7 +11,7 @@ import { ext } from "../../ext";
 import { seedSettings } from "../../lib/cache";
 import { useSession } from "../../lib/session";
 import { deviceZone } from "../../lib/zone";
-import { C, getThemeMode, setThemeMode,
+import { C, getThemeMode, mmddyy, setThemeMode,
          type ThemeMode } from "../../lib/theme";
 import { errText } from "../../lib/api";
 
@@ -257,6 +257,31 @@ export default function TabsLayout() {
         onOut={signOut} />
     );
   }
+  // a signup nobody ever confirmed, frozen by the nightly sweep: the way
+  // out is the emailed link, so this screen can ask for it again
+  if (meErr.includes("never confirmed")) {
+    return (
+      <Lockout title="Confirm your email to keep this account"
+        body={"The email address on this account was never confirmed, so "
+              + "the account is frozen and will be deleted when the grace "
+              + "period ends — with everything in it. We emailed a fresh "
+              + "confirmation link to the address you sign in with. Open "
+              + "it and press “Reopen this account” on the page it takes "
+              + "you to — confirming the address alone does not bring the "
+              + "account back. No email? Check spam, or resend it."}
+        action={{ label: "Resend link", onPress: () => {
+          if (resending) return;
+          setResending(true);
+          client!.verifyResend()
+            .then((r) => Alert.alert(r.verified
+              ? "This account is already reopened — pull to refresh."
+              : "Confirmation email sent."))
+            .catch((e) => Alert.alert("Resend failed", errText(e)))
+            .finally(() => setResending(false));
+        } }}
+        onOut={signOut} />
+    );
+  }
   const bounce = me.data?.email_delivery;
   const broadcast = me.data?.broadcast;
   // badge color follows the worst ACTIVE severity, like the web bell
@@ -309,6 +334,10 @@ export default function TabsLayout() {
               }}>
           Verify your email — we sent a link to {me.data!.email}. No
           email? Tap to resend.
+          {me.data!.verify_deadline
+            ? ` Unconfirmed accounts are frozen on ${
+                mmddyy(me.data!.verify_deadline)} and deleted a week later.`
+            : ""}
         </Text>
       )}
       {bounce && (

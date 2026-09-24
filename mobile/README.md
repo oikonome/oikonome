@@ -62,6 +62,38 @@ other people fills with their own client add-on — extra screens, a
 Settings section, lockout screens, wording around an institution allowance,
 legal links. Left as it is, the app is a plain client for one instance.
 
+## Home-screen widget
+
+The widget shows the Today hero's simple face (`GET /api/today/glance`).
+It polls with its own lesser credential (`POST /api/devices/widget`,
+minted once per sign-in in `src/lib/session.tsx`), kept in the plain
+secure-store home so it can be read with nobody holding the phone.
+
+- **Android** — `react-native-android-widget`: the widget is the JSX in
+  `src/widgets/glance-widget.tsx`, drawn by the headless task in
+  `src/widgets/android.tsx` (registered from `index.js`, the app entry).
+  Declared in `app.json` under the plugin's `widgets`; the picker preview
+  is `assets/images/widget-glance-preview.png`. Rebuild the native
+  project (`npx expo prebuild --platform android`) after changing either.
+- **iOS** — a WidgetKit extension, `targets/glance/index.swift`, generated
+  into the Xcode project by `@bacons/apple-targets` at prebuild. It reads
+  the credential from the Keychain in the app group
+  `group.<your bundle id>`, which `plugins/with-widget-sharing.js` grants
+  the app and the target config grants the extension. The tiny local
+  module `modules/widget-reload` lets the app ask WidgetKit to redraw
+  and clear the extension's cached payload.
+  Signing: the extension is its own bundle id (`<app id>.glance`) and
+  needs its own provisioning profile; EAS manages that when
+  `ios.appleTeamId` is set in `app.json`. The Swift is not compiled by
+  `npm run typecheck` — build with Xcode or EAS to verify it.
+- The face — stale after an hour, "Sign in" without a credential, "Set a
+  plan" before a budget — is decided in `src/lib/glance-pure.ts` (node
+  tested) and mirrored line for line in the Swift.
+- The cached payload (both platforms) is one household's numbers, so it
+  goes with the credential: sign-out and a refused (401) poll drop it, and
+  a sign-in to a different household or server drops it before the new
+  credential is written (`widgetOwner` in `src/lib/glance-pure.ts`).
+
 ## Layout
 
 ```

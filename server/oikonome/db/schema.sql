@@ -113,7 +113,12 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     name         TEXT NOT NULL DEFAULT '',       -- which script (display only)
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_used_at TIMESTAMPTZ,
-    revoked_at   TIMESTAMPTZ
+    revoked_at   TIMESTAMPTZ,
+    -- push = the import doors only (a collector); read = the summary,
+    -- metrics and query doors only (a scraper, a sensor, an MCP server).
+    -- Migration 140.
+    scope        TEXT NOT NULL DEFAULT 'push'
+                 CONSTRAINT api_tokens_scope_known CHECK (scope IN ('push', 'read'))
 );
 CREATE INDEX IF NOT EXISTS idx_api_tokens_tenant ON api_tokens(tenant_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_api_tokens_id ON api_tokens(id);
@@ -145,6 +150,22 @@ ALTER TABLE device_tokens ADD COLUMN IF NOT EXISTS elevated_at TIMESTAMPTZ;
 ALTER TABLE device_tokens ADD COLUMN IF NOT EXISTS elevated_passkey_id UUID;
 CREATE INDEX IF NOT EXISTS idx_device_tokens_user ON device_tokens(user_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_device_tokens_id ON device_tokens(id);
+
+-- Home-screen widget tokens (migration 141): the lesser credential a
+-- phone's widget polls with while nobody is holding the phone. A child
+-- of one device row, allowed one read door (the glance payload), and
+-- alive only while its parent device is — the lookup joins through the
+-- live parent, so every revocation of the device ends the widget too.
+CREATE TABLE IF NOT EXISTS widget_tokens (
+    token_hash   TEXT PRIMARY KEY,               -- sha256 of the oikw_ token
+    device_id    UUID NOT NULL,                  -- device_tokens.id (the parent)
+    user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    tenant_id    UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen    TIMESTAMPTZ,
+    revoked_at   TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_widget_tokens_device ON widget_tokens(device_id);
 
 CREATE TABLE IF NOT EXISTS password_resets (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -346,7 +367,9 @@ CREATE TABLE IF NOT EXISTS transactions (
     pending_transaction_id TEXT,
     payment_channel        TEXT,
     removed                INTEGER NOT NULL DEFAULT 0,
-    raw                    JSONB,
+    -- a document, always (see items.raw; migration 132)
+    raw                    JSONB CONSTRAINT transactions_raw_is_an_object
+                           CHECK (raw IS NULL OR jsonb_typeof(raw) = 'object'),
     entity_id UUID, -- per-transaction business override (e.g. business cost on a personal card)
     PRIMARY KEY (tenant_id, id),
     FOREIGN KEY (tenant_id, account_id) REFERENCES accounts(tenant_id, id) ON DELETE CASCADE
@@ -475,6 +498,82 @@ CREATE TABLE IF NOT EXISTS receipt_items (
     -- it, receipts' own txn cascade stranded line items forever
     CONSTRAINT receipt_items_receipt_fk FOREIGN KEY (tenant_id, receipt_id)
         REFERENCES receipts (tenant_id, id) ON DELETE CASCADE
+);
+
+-- a hand split of one charge across categories (migration 138): parts in
+-- line order, summing to the row's amount; category rollups LEFT JOIN it
+-- and read COALESCE(sp.category, effective) / COALESCE(sp.amount, t.amount)
+-- the household's activity log (migration 139): who changed what, and
+-- when — one row per hand-authored act, the actor kept as text so a
+-- removed member's changes still carry their name
+CREATE TABLE IF NOT EXISTS activity_log (
+    tenant_id     UUID NOT NULL DEFAULT NULLIF(current_setting('app.tenant_id', true), '')::uuid,
+    id            UUID NOT NULL DEFAULT gen_random_uuid(),
+    at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    actor_user_id UUID,
+    actor         TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    action        TEXT NOT NULL,
+    target        TEXT,
+    label         TEXT NOT NULL DEFAULT '',
+    summary       TEXT NOT NULL,
+    detail        JSONB CONSTRAINT activity_log_detail_is_an_object
+                  CHECK (detail IS NULL OR jsonb_typeof(detail) = 'object'),
+    PRIMARY KEY (tenant_id, id)
+);
+CREATE INDEX IF NOT EXISTS activity_log_at ON activity_log (tenant_id, at DESC);
+
+-- Outbound webhooks and their deliveries (migration 140): a URL the
+-- household asked to be told at, with the events it wants and a signing
+-- secret encrypted under the tenant key; one delivery row per event per
+-- webhook, attempted with backoff by the worker and kept a week for the
+-- Settings card. Neither table is exported.
+CREATE TABLE IF NOT EXISTS webhooks (
+    tenant_id       UUID NOT NULL DEFAULT NULLIF(current_setting('app.tenant_id', true), '')::uuid,
+    id              UUID NOT NULL DEFAULT gen_random_uuid(),
+    url             TEXT NOT NULL,
+    name            TEXT NOT NULL DEFAULT '',
+    secret          TEXT NOT NULL,
+    events          TEXT[] NOT NULL DEFAULT '{}',
+    enabled         BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_by      TEXT NOT NULL DEFAULT '',
+    last_attempt_at TIMESTAMPTZ,
+    last_status     INTEGER,
+    last_error      TEXT,
+    failures        INTEGER NOT NULL DEFAULT 0,
+    disabled_reason TEXT,
+    PRIMARY KEY (tenant_id, id)
+);
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    tenant_id       UUID NOT NULL DEFAULT NULLIF(current_setting('app.tenant_id', true), '')::uuid,
+    id              UUID NOT NULL DEFAULT gen_random_uuid(),
+    webhook_id      UUID NOT NULL,
+    event           TEXT NOT NULL,
+    payload         JSONB NOT NULL,
+    state           TEXT NOT NULL DEFAULT 'pending',
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    delivered_at    TIMESTAMPTZ,
+    response_status INTEGER,
+    last_error      TEXT,
+    PRIMARY KEY (tenant_id, id)
+);
+CREATE INDEX IF NOT EXISTS webhook_deliveries_due
+    ON webhook_deliveries (tenant_id, next_attempt_at) WHERE state = 'pending';
+CREATE INDEX IF NOT EXISTS webhook_deliveries_hook
+    ON webhook_deliveries (tenant_id, webhook_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS transaction_splits (
+    tenant_id UUID NOT NULL DEFAULT NULLIF(current_setting('app.tenant_id', true), '')::uuid,
+    txn_id    TEXT NOT NULL,
+    line      INTEGER NOT NULL,              -- 1-based, display order
+    category  TEXT NOT NULL,                 -- stored key (FOOD_AND_DRINK / a custom name)
+    amount    DOUBLE PRECISION NOT NULL,     -- same sign as the row; parts sum to it
+    PRIMARY KEY (tenant_id, txn_id, line),
+    CONSTRAINT transaction_splits_txn_fk FOREIGN KEY (tenant_id, txn_id)
+        REFERENCES transactions (tenant_id, id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS bills (
@@ -740,9 +839,25 @@ CREATE TABLE IF NOT EXISTS alerts_log (
     last_seen  DATE NOT NULL,
     active     INTEGER NOT NULL DEFAULT 1,
     dismissed  INTEGER NOT NULL DEFAULT 0,
+    -- when the mute last flipped (migration 142): an emailed mute link
+    -- refuses once the mute changed after the mail went out
+    mute_changed_at TIMESTAMPTZ,
     PRIMARY KEY (tenant_id, id),
     UNIQUE (tenant_id, kind, message)
 );
+
+CREATE OR REPLACE FUNCTION alerts_log_stamp_mute() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.dismissed IS DISTINCT FROM OLD.dismissed THEN
+        NEW.mute_changed_at := now();
+    END IF;
+    RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS alerts_log_stamp_mute ON alerts_log;
+CREATE TRIGGER alerts_log_stamp_mute BEFORE UPDATE ON alerts_log
+    FOR EACH ROW EXECUTE FUNCTION alerts_log_stamp_mute();
 
 CREATE TABLE IF NOT EXISTS job_runs (
     tenant_id UUID NOT NULL DEFAULT NULLIF(current_setting('app.tenant_id', true), '')::uuid,
@@ -888,6 +1003,15 @@ CREATE INDEX IF NOT EXISTS merchants_lower_name
     ON merchants (tenant_id, lower(name));
 ALTER TABLE merchant_canonical ADD COLUMN IF NOT EXISTS merchant_id UUID;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS merchant_id UUID;
+-- The aggregator's merchant name for this row, set aside: the bank line
+-- and the aggregator had agreed on one payee several times over, and this
+-- charge came back named something the line does not say, so the name was
+-- MOVED here and merchant_name left NULL. The row then keys on the bank
+-- line — COALESCE(merchant_name, name) reads it by construction, in every
+-- reader, with no flag to remember — which is what keeps one merchant per
+-- identity key (engine/merchant_sql.raw_key, specs/merchant-identity.md).
+-- A re-sync restating either string puts the name back and clears this.
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS merchant_name_set_aside TEXT;
 -- migration 098: what the aggregator knows about the row, as columns
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS check_number      TEXT;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payment_processor TEXT;
@@ -1064,6 +1188,7 @@ BEGIN
         'income_annual','income_documents','merchant_canonical','merchant_renames','merchants',
         'merchant_categories','merchant_merge_proposals','amazon_orders','amazon_matches','amazon_summaries',
         'costco_receipts','costco_matches',
+        'transaction_splits','activity_log','webhooks','webhook_deliveries',
         'import_staging','business_entity','entity_membership','equity_movement',
         'business_txn_class','compliance_obligation','mileage_log','vendor_1099']
     LOOP

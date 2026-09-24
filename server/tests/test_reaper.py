@@ -368,16 +368,22 @@ class NoticeTests(ReaperBase):
         self.assertIn("no longer exists at Plaid", notes[0]["message"])
 
     def test_daily_email_carries_the_one_liner(self):
-        """The strip renders in the email and Today page alike — the
-        gathered status carries the notice and report.build writes it
-        into both bodies."""
+        """The notice reaches the email the way every alert does: in the
+        "Needs you" section that closes an owner's or member's copy (the
+        Today page shows the same strip). The shared body carries no
+        alerts — a viewer's copy must not — so the section is what is
+        asserted, for an owner address."""
         self._reap_one(error_days_ago=35)
+        from oikonome.notify import mailact
         from oikonome.web import report
         d = report.gather(self.conn, dt.date.today())
         msgs = [a["message"] for a in d.get("alerts") or []]
         self.assertTrue(any("Dead Bank" in m and "reconnect" in m
                             for m in msgs), msgs)
-        _subject, plain, html = report.build(d)
+        acts = mailact.gather(self.conn, d)
+        tid = self.conn.execute(
+            "SELECT current_setting('app.tenant_id') AS t").fetchone()["t"]
+        plain, html = mailact.render(acts, str(tid), "owner@example.dev")
         self.assertIn("Dead Bank", plain)
         self.assertIn("reconnect", plain)
         self.assertIn("Dead Bank", html)

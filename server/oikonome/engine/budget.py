@@ -24,12 +24,19 @@ import re
 from .. import localtime
 from .compat import as_date, as_dict, jsonb
 from . import merchant_sql
+from . import categories as _cats
 
 # effective category (override wins) so a manual recategorization to/away
 # from FOOD_AND_DRINK moves the row between buckets
 FOOD_SQL = ("(COALESCE(t.category_override, t.category_primary) = 'FOOD_AND_DRINK'"
             " OR t.category_override IN ('Amazon - Food & Drink',"
             " 'Costco - Food & Drink'))")
+# the same test per PART of a hand-split row (categories.SPLIT_JOIN must be
+# in the query): the grocery half of a mixed receipt is food, the hardware
+# half is not
+PART_FOOD_SQL = (f"({_cats.PART_CAT} = 'FOOD_AND_DRINK'"
+                 f" OR {_cats.PART_CAT} IN ('Amazon - Food & Drink',"
+                 " 'Costco - Food & Drink'))")
 
 # How much month must elapse before UNDER BUDGET is a claim about spending
 # rather than about the calendar. 0.10 ≈ days 1–4 of a 31-day month
@@ -101,6 +108,28 @@ DEFAULT_CONFIG = {"food_monthly": 0.0, "other_monthly": 0.0,
                   "dynamic_variable_budget": True}
 
 
+def excluded_account_ids(cfg: dict) -> list[str]:
+    """The Accounts page's "excl" toggle (config `excluded_accounts`) as the
+    account-id list the money math filters on. The ONE reader — every
+    surface that drops those accounts' rows, balances and payoff events
+    goes through here.
+
+    Read defensively, because the settings blob is a document a restore can
+    write verbatim: `cfg.get(key) or []` substitutes only on a FALSY value,
+    so a `true` or a number left under the key by a hand-edited or buggy
+    export walks straight into `list()` and raises `TypeError: 'bool'
+    object is not iterable` — one malformed field turning the forecast, the
+    calendar strip and every report into a 500 with no UI to undo it. A
+    value that is not a list reads as "nothing excluded", and elements that
+    cannot be an account id are dropped rather than stringified into a
+    predicate that matches nothing."""
+    v = cfg.get("excluded_accounts")
+    if not isinstance(v, (list, tuple)):
+        return []
+    return [str(a) for a in v
+            if isinstance(a, (str, int)) and not isinstance(a, bool)]
+
+
 def load_config(conn, *, memo: dict | None = None) -> dict:
     """Per-tenant config from tenant_settings (RLS-scoped). Seeds bucket
     budgets from 3-month history on first run.
@@ -117,9 +146,14 @@ def load_config(conn, *, memo: dict | None = None) -> dict:
 def _load_config(conn) -> dict:
     row = conn.execute("SELECT config FROM tenant_settings").fetchone()
     cfg = dict(row["config"]) if row else {}
+    # the live document, coerced once at the door: a reader anywhere in the
+    # app may iterate this list, and not all of them are inside a
+    # failure-tolerant surface (see excluded_account_ids)
+    if "excluded_accounts" in cfg:
+        cfg["excluded_accounts"] = excluded_account_ids(cfg)
     if "food_monthly" in cfg and "other_monthly" in cfg:
         return cfg
-    seed = _seed_config(conn, excluded=cfg.get("excluded_accounts"),
+    seed = _seed_config(conn, excluded=excluded_account_ids(cfg),
                         today=localtime.now_local(cfg).date())
     cfg = {**seed, **cfg}
     # Don't LOCK IN a zero seed computed before any spend has synced (e.g.
@@ -1058,7 +1092,7 @@ def suggest_budgets(conn, today: dt.date) -> dict:
     # Include today (until exclusive → tomorrow) so MTD food isn't invisible
     # on the 20th when the only grocery runs landed this month.
     rows = _spend_rows(conn, start, today + dt.timedelta(days=1),
-                       excluded=cfg.get("excluded_accounts"))
+                       excluded=excluded_account_ids(cfg))
     bills = _recurring_bills(conn, caps=cfg.get("occurrence_caps"),
                              disabled=cfg.get("disabled_bills"))
     # Wizard mid-flight: treat pending expense proposals like bills so
@@ -1246,6 +1280,36 @@ _SHORT_FILLER = {"of", "at", "on", "in", "to", "by", "or", "as", "is", "it",
                  "go", "if", "st", "us"}
 
 
+# An apostrophe JOINS the letters around it; it is never a word break.
+# Which spelling reaches us is an accident of the source — a person types
+# the bill as "Juniper's Market", a feed resolves the payee the same way,
+# and the card line for the very same purchase prints "JUNIPERS MARKET".
+# Broken on, the possessive yields "juniper" and the bank's yields
+# "junipers", so a bill and the charge that pays it share no word and the
+# bill reads as unpaid. Deleted, both are "junipers". It is the reading the
+# string clean takes (merchant_dedup._APOSTROPHE) and the one identity
+# compares descriptors under, so a name means the same words everywhere.
+#
+# Only an apostrophe that FOLLOWS a letter or digit joins: a leading one is
+# a quote mark in front of a word, and the break it sits on is real. All
+# three characters a feed writes it with count. Applied to LOWERED text,
+# here and in SQL (apostrophes_joined_sql), which is what keeps the two
+# spellings of this rule the same rule.
+_APOSTROPHE = re.compile(r"(?<=[a-z0-9])['\u2019\u02bc]")
+
+
+def join_apostrophes(low: str) -> str:
+    """`low` (already lowercased) with its letter-joining apostrophes
+    deleted."""
+    return _APOSTROPHE.sub("", low)
+
+
+def apostrophes_joined_sql(expr: str) -> str:
+    """join_apostrophes, in SQL, over an expression that is already
+    lowercased."""
+    return f"regexp_replace({expr}, '([a-z0-9])[''\u2019\u02bc]', '\\1', 'g')"
+
+
 def _match_words(text: str) -> list[str]:
     """The words a bill and a ledger row are matched on.
 
@@ -1256,7 +1320,7 @@ def _match_words(text: str) -> list[str]:
     never find the rows that pay it and reads as unpaid forever. Both sides
     fall back independently, and only when they have nothing else, so a
     payee with a real word still never matches on 'of' or 'at'."""
-    low = (text or "").lower()
+    low = join_apostrophes((text or "").lower())
     long_ = [t for t in re.findall(r"[a-z]{4,}", low) if t not in STOP_TOKENS]
     if long_:
         return long_
@@ -1294,7 +1358,8 @@ def _match_tokens(bill: dict) -> set:
 def _text_norm(text: str) -> str:
     """Lowercased, alnum-separated, word-boundary-padded form for phrase tests
     (so 'go mobile' matches 'GO MOBILE' but not 'cargo mobile' or 't-mobile')."""
-    return " " + re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip() + " "
+    return " " + re.sub(r"[^a-z0-9]+", " ",
+                        join_apostrophes((text or "").lower())).strip() + " "
 
 
 def _merchant_phrase(merchant: str | None) -> str | None:
@@ -1304,7 +1369,8 @@ def _merchant_phrase(merchant: str | None) -> str | None:
     (order codes, TLDs) must NOT."""
     if not merchant:
         return None
-    words = [w for w in re.split(r"[^a-z0-9]+", merchant.lower()) if w]
+    words = [w for w in re.split(r"[^a-z0-9]+",
+                                 join_apostrophes(merchant.lower())) if w]
     if words and words[0] not in _tokens(merchant):   # leading word was dropped
         return " " + " ".join(words) + " "
     return None
@@ -1620,8 +1686,8 @@ def bill_displays(conn, bills, today: dt.date | None = None,
                  GROUP BY 1, 2, 3, 4),
             k0 AS (
                 SELECT {merchant_sql.DISPLAY_MERCHANT} AS display,
-                       lower(COALESCE(t.merchant_outlet, t.merchant_name,
-                                      t.name)) AS raw_key,
+                       {apostrophes_joined_sql(
+                           f"lower({merchant_sql.RAW_KEY})")} AS raw_key,
                        sum(t.n) AS n,
                        -- filed under the name by a person or by Plaid,
                        -- not merely grouped there by the string clean
@@ -1668,11 +1734,30 @@ def text_matches_merchant(text: str, merchant: str | None,
 # forms deliberately: the two must agree, and the cheapest way to keep them
 # agreeing is to make them impossible to read apart.
 
-# The text a merchant match reads off a ledger row: the row's raw merchant
-# name then its bank descriptor, lowercased — the one string the Python
-# matchers are fed. Callers alias transactions as `t`.
-MATCH_TEXT_SQL = ("lower(COALESCE(t.merchant_name, t.name, '') || ' ' "
-                  "|| COALESCE(t.name, ''))")
+# The text a merchant match reads off a ledger row, and there is ONE of it:
+# the row's identity key (merchant_sql.RAW_KEY — the fuel-arm outlet when
+# one was identified, else the aggregator's merchant name, else the bank
+# line) followed by the bank line, lowercased. Every loader that feeds a
+# bill matcher selects MATCH_PAYEE_SQL as its payee and builds the text
+# with match_text; every SQL pre-filter reads MATCH_TEXT_SQL. They are the
+# same string by construction, which is the whole requirement: a
+# pre-filter is only a pre-filter while it admits every row the Python
+# matcher would, and two pages only agree about a bill while they read
+# its rows the same way. specs/bill-match-text.md has the reasoning, and
+# tests/test_bill_match_text_is_one_definition.py holds the line.
+# Callers alias transactions as `t`.
+MATCH_PAYEE_SQL = merchant_sql.RAW_KEY
+MATCH_TEXT_SQL = apostrophes_joined_sql(
+    f"lower(COALESCE({MATCH_PAYEE_SQL}, '') || ' ' || COALESCE(t.name, ''))")
+
+
+def match_text(payee, name) -> str:
+    """MATCH_TEXT_SQL, in Python: `payee` is the row's MATCH_PAYEE_SQL
+    column, `name` its bank line. Apostrophes joined, as every reader of
+    this text joins them (see _APOSTROPHE)."""
+    return join_apostrophes(f"{payee or ''} {name or ''}".lower())
+
+
 # _text_norm, in SQL: alnum-separated and word-boundary padded, so a phrase
 # test is a plain substring test that still respects word edges.
 MATCH_NORM_SQL = (f"' ' || btrim(regexp_replace({MATCH_TEXT_SQL}, "
@@ -1856,7 +1941,7 @@ ACCT_LABEL_SQL = (
 
 def _spend_rows(conn, since: dt.date, until: dt.date,
                 excluded: list | None = None, *, slim: bool = False,
-                memo: dict | None = None) -> list[dict]:
+                memo: dict | None = None, parts: bool = True) -> list[dict]:
     """excluded: config 'excluded_accounts' account-id list — those accounts'
     transactions are invisible to the budget math (the Accounts page 'excl'
     toggle). Linked shadow accounts (a lower-ranked source of the
@@ -1868,8 +1953,16 @@ def _spend_rows(conn, since: dt.date, until: dt.date,
     render them, so the year-to-date scans skip the merchant, logo and
     account joins. `memo`: request-scoped cache keyed on every input; one
     Today request asks for the same month window from the status, the
-    forecast and the runway, and the ledger cannot move inside one request."""
-    key = _memo_key("spend_rows", since, until, excluded, slim)
+    forecast and the runway, and the ledger cannot move inside one request.
+
+    parts=True (the default) fans a hand-split row out into one row per
+    part — its category, its share of the amount, the same txn_id and a
+    `split_line` — exactly as if the bank had sent that many charges. That
+    is what makes the verdict, the buckets, the bill matcher and the Why
+    see the groceries half of a mixed receipt as food and the rest as other;
+    a reader that wants the charge whole (the anomaly pass asks whether the
+    CHARGE was unusual) passes parts=False."""
+    key = _memo_key("spend_rows", since, until, excluded, slim, parts)
     if memo is not None and key in memo:
         return memo[key]
     from . import links
@@ -1877,21 +1970,31 @@ def _spend_rows(conn, since: dt.date, until: dt.date,
     excl_sql = "AND NOT (t.account_id = ANY(%s))" if excluded else ""
     params: tuple = ((since, until, list(excluded)) if excluded
                      else (since, until))
+    if parts:
+        cat_disp, cat_key = _cats.PART_CAT_DISPLAY, f"COALESCE({_cats.PART_CAT}, '?')"
+        amount, food = _cats.part_net(NET_AMOUNT), PART_FOOD_SQL
+        split_join, split_line = _cats.SPLIT_JOIN, "sp.line"
+    else:
+        cat_disp = "REPLACE(COALESCE(t.category_override, t.category_primary,'?'),'_',' ')"
+        cat_key = "COALESCE(t.category_override, t.category_primary,'?')"
+        amount, food = NET_AMOUNT, FOOD_SQL
+        split_join, split_line = "", "NULL::integer"
     if slim:
-        cols = f"""t.id AS txn_id, t.date, {NET_AMOUNT} AS amount,
-                   COALESCE(t.merchant_outlet, t.merchant_name, t.name) AS payee, t.name,
+        cols = f"""t.id AS txn_id, t.date, {amount} AS amount,
+                   {merchant_sql.RAW_KEY} AS payee, t.name,
                    t.merchant_id::text AS merchant_id,
-                   REPLACE(COALESCE(t.category_override, t.category_primary,'?'),'_',' ') AS category,
+                   {cat_disp} AS category,
                    -- `category` is the DISPLAY form (underscores blown out);
                    -- the stored key rides alongside so a surface that turns a
                    -- category label into a ledger filter has the value the
                    -- ledger actually compares against
-                   COALESCE(t.category_override, t.category_primary,'?') AS stored_category,
-                   {FOOD_SQL} AS is_food, t.pending"""
-        joins = ""
+                   {cat_key} AS stored_category,
+                   {food} AS is_food, t.pending,
+                   {split_line} AS split_line"""
+        joins = split_join
     else:
-        cols = f"""t.id AS txn_id, t.date, {NET_AMOUNT} AS amount,
-                   COALESCE(t.merchant_outlet, t.merchant_name, t.name) AS payee, t.name,
+        cols = f"""t.id AS txn_id, t.date, {amount} AS amount,
+                   {merchant_sql.RAW_KEY} AS payee, t.name,
                    t.merchant_id::text AS merchant_id,
                    -- what the LEDGER shows for this row (the merchant row's
                    -- name, else the alias, else the raw) + its logo: the
@@ -1900,14 +2003,16 @@ def _spend_rows(conn, since: dt.date, until: dt.date,
                    -- on the raw descriptor's tokens
                    COALESCE(mm.name, mc.canonical) AS display_payee,
                    {merchant_sql.MERCHANT_LOGO} AS merchant_logo,
-                   REPLACE(COALESCE(t.category_override, t.category_primary,'?'),'_',' ') AS category,
+                   {cat_disp} AS category,
                    -- the stored key behind the display form above (see slim)
-                   COALESCE(t.category_override, t.category_primary,'?') AS stored_category,
-                   {FOOD_SQL} AS is_food, t.pending,
+                   {cat_key} AS stored_category,
+                   {food} AS is_food, t.pending,
+                   {split_line} AS split_line,
                    {ACCT_LABEL_SQL} AS account"""
         joins = f"""LEFT JOIN accounts a ON a.id = t.account_id
                  LEFT JOIN items i ON i.id = a.item_id
-                 {merchant_sql.MC_JOIN}"""
+                 {merchant_sql.MC_JOIN}
+                 {split_join}"""
     out = conn.execute(
         f"""SELECT {cols}
             FROM transactions t
@@ -1916,7 +2021,7 @@ def _spend_rows(conn, since: dt.date, until: dt.date,
               AND t.date >= %s AND t.date < %s
               {PERSONAL_ONLY_SQL}
               {excl_sql}
-            ORDER BY t.amount DESC""",
+            ORDER BY t.amount DESC, {split_line}""",
         params).fetchall()
     if memo is not None:
         memo[key] = out
@@ -1942,7 +2047,7 @@ def _inflow_rows(conn, since: dt.date, until: dt.date,
                      else (since, until))
     out = conn.execute(
         f"""SELECT t.id AS txn_id, t.date, -t.amount AS amount,
-                   COALESCE(t.merchant_outlet, t.merchant_name, t.name) AS payee, t.name,
+                   {merchant_sql.RAW_KEY} AS payee, t.name,
                    -- the merchant the ledger files the row under, so an
                    -- income series follows its payer like a bill does
                    t.merchant_id::text AS merchant_id
@@ -1983,7 +2088,8 @@ def _card_pay_bill(b: dict) -> bool:
     return flowmap.looks_like_card_payment(b["payee"])
 
 
-def drop_card_pay_bills(conn, bills: list[dict]) -> list[dict]:
+def drop_card_pay_bills(conn, bills: list[dict], *, cfg: dict | None = None,
+                        memo: dict | None = None) -> list[dict]:
     """Bills minus the hand-tracked "card payment" ones, while live card
     debt exists to be paid by the card machinery instead.
 
@@ -1996,22 +2102,26 @@ def drop_card_pay_bills(conn, bills: list[dict]) -> list[dict]:
     shrinks the dynamic variable budgets that the forecast burns at. One
     filter, applied wherever bills become expectations, so the verdict and
     the cash surfaces see the same set. With no live card debt the bill is
-    the only signal an unlinked, hand-tracked card exists and it stays."""
+    the only signal an unlinked, hand-tracked card exists and it stays.
+
+    "Live card debt" means debt the CARD MACHINERY will actually pay on a
+    cash surface, so the question is asked with that machinery's own scope
+    (forecast.CARD_SCOPE_SQL) rather than a second spelling of it: a card
+    the household switched off on the Accounts page, or a business card, or
+    a linked group's shadow source, schedules no payoff event, so counting
+    its balance here would delete the bill and put nothing in its place —
+    the payment would vanish from every cash surface, which is the exact
+    failure this function exists to prevent. (Lazy import: forecast imports
+    this module.)"""
     if not any(_card_pay_bill(b) for b in bills):
         return bills
-    from . import links
+    from . import forecast
+    excluded = excluded_account_ids(
+        cfg if cfg is not None else load_config(conn, memo=memo))
     live_debt = conn.execute(
-        """SELECT COALESCE(SUM(GREATEST(balance_current, 0)), 0) AS d
-           FROM accounts WHERE type = 'credit'
-             AND NOT (id = ANY(%s))
-             -- a BUSINESS card's balance must not
-             -- silently delete a hand-tracked PERSONAL card-payment bill
-             -- — the forecast's own card events exclude entity cards, so
-             -- nothing would replace the dropped bill on any cash
-             -- surface. Same predicate as forecast.build's card_debt.
-             AND (NULLIF((SELECT current_setting('app.combine_entities', true)),
-                         '') = 'true' OR entity_id IS NULL)""",
-        (links.shadow_ids(conn),)).fetchone()["d"]
+        f"""SELECT COALESCE(SUM(GREATEST(a.balance_current, 0)), 0) AS d
+           FROM accounts a WHERE a.type = 'credit'
+             {forecast.CARD_SCOPE_SQL}""", (excluded,)).fetchone()["d"]
     if live_debt > 0.5:
         return [b for b in bills if not _card_pay_bill(b)]
     return bills
@@ -2079,14 +2189,14 @@ def upcoming_bill_occurrences(conn, cfg: dict, today: dt.date,
     """
     key = _memo_key("upcoming_bill_occurrences", today, end, income,
                     cfg.get("occurrence_caps"), cfg.get("disabled_bills"),
-                    cfg.get("excluded_accounts"))
+                    excluded_account_ids(cfg))
     if memo is not None and key in memo:
         return memo[key]
     bills = _recurring_bills(conn, caps=cfg.get("occurrence_caps"),
                              disabled=cfg.get("disabled_bills"),
                              income=income, memo=memo)
     if not income:
-        bills = drop_card_pay_bills(conn, bills)
+        bills = drop_card_pay_bills(conn, bills, cfg=cfg, memo=memo)
     out: list[dict] = []
     # a payment can precede its due date by up to the occurrence match
     # window (≤PREPAY_MATCH_DAYS, month_occurrences) — look back that far
@@ -2094,10 +2204,10 @@ def upcoming_bill_occurrences(conn, cfg: dict, today: dt.date,
     since = today.replace(day=1) - dt.timedelta(days=PREPAY_MATCH_DAYS)
     if income:
         rows = _inflow_rows(conn, since, today + dt.timedelta(days=1),
-                            excluded=cfg.get("excluded_accounts"), memo=memo)
+                            excluded=excluded_account_ids(cfg), memo=memo)
     else:
         rows = _spend_rows(conn, since, today + dt.timedelta(days=1),
-                           excluded=cfg.get("excluded_accounts"), memo=memo)
+                           excluded=excluded_account_ids(cfg), memo=memo)
     py, pm = ((today.year, today.month - 1) if today.month > 1
               else (today.year - 1, 12))
     occs = month_occurrences(bills, py, pm)         # decoys — never emitted
@@ -2278,9 +2388,11 @@ def month_status(conn, today: dt.date, *, historical: bool = False,
     # verdict and its left-to-spend tile would contradict each other.
     frac = (today.day if closed else today.day - 1) / days_in_month
 
-    bills = [] if historical else drop_card_pay_bills(conn, _recurring_bills(
-        conn, caps=cfg.get("occurrence_caps"), disabled=cfg.get("disabled_bills"),
-        memo=memo, rows=bill_rows))
+    bills = [] if historical else drop_card_pay_bills(
+        conn, _recurring_bills(
+            conn, caps=cfg.get("occurrence_caps"),
+            disabled=cfg.get("disabled_bills"), memo=memo, rows=bill_rows),
+        cfg=cfg, memo=memo)
     envelopes = [] if historical else _envelope_bills(
         conn, disabled=cfg.get("disabled_bills"), memo=memo, rows=bill_rows)
     # Occurrence matching reaches back
@@ -2296,7 +2408,7 @@ def month_status(conn, today: dt.date, *, historical: bool = False,
     # in this month's actuals.
     match_rows = _spend_rows(
         conn, month_start - dt.timedelta(days=PREPAY_MATCH_DAYS),
-        today + dt.timedelta(days=1), excluded=cfg.get("excluded_accounts"),
+        today + dt.timedelta(days=1), excluded=excluded_account_ids(cfg),
         memo=memo)
     in_month = [i for i, r in enumerate(match_rows)
                 if as_date(r["date"]) >= month_start]
@@ -2327,7 +2439,7 @@ def month_status(conn, today: dt.date, *, historical: bool = False,
     env_matched, env_states = match_envelopes(
         rows, envelopes, matched_idx,
         prior_used=_envelope_prior_used(conn, envelopes, today,
-                                        excluded=cfg.get("excluded_accounts"),
+                                        excluded=excluded_account_ids(cfg),
                                         memo=memo, bills=bills))
     fixed_rows = ([rows[i] for i in matched_idx]
                   + [r for st in env_states for r in st["rows"]])

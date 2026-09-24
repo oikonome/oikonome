@@ -3,7 +3,7 @@
 // same filters; a row is a logo, a name and one line of facts; tapping
 // a row opens the merchant's own screen (facts, places, source names,
 // Rename / Merge into). The proposer's offers are the "Needs a look"
-// queue above the list, one line each, the evidence behind "why?".
+// queue above the list, one line each, the evidence and both sides behind "details".
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "expo-router";
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
@@ -12,7 +12,7 @@ import PullRefresh from "../components/pull-refresh";
 
 import StaleBanner from "../components/stale-banner";
 import { Card } from "../components/ui";
-import { errText, MerchantCatalog, MergeProposal } from "../lib/api";
+import { errText, MerchantCatalog, MergeProposal, MergeSideFacts } from "../lib/api";
 import { removeFromList } from "../lib/cache";
 import { useSession } from "../lib/session";
 import { useDemo, useViewer } from "../lib/viewer";
@@ -68,6 +68,9 @@ export default function Merchants() {
     qc.invalidateQueries({ queryKey: ["today"] });
     qc.invalidateQueries({ queryKey: ["payee-history"] });
     qc.invalidateQueries({ queryKey: ["bills"] });
+    // the "merges" alert retires on the server the moment the queue
+    // empties; the Alerts screen must not keep showing it lit
+    qc.invalidateQueries({ queryKey: ["alerts"] });
   };
   const undo = useMutation({
     mutationFn: (id: number) => client!.merchantUndo(id),
@@ -85,6 +88,12 @@ export default function Merchants() {
     onSuccess: (_r, v) => {
       removeFromList<MerchantCatalog, MergeProposal>(qc, key, "merges", (x) => x.id === v.pid);
       if (v.action === "approve") invalidate();
+      else {
+        // rejecting the last offer empties the queue too, and with it
+        // the alert that pointed here
+        qc.invalidateQueries({ queryKey: ["alerts"] });
+        qc.invalidateQueries({ queryKey: ["today"] });
+      }
     },
     onError: (e) => Alert.alert("Couldn't decide", errText(e)),
   });
@@ -151,7 +160,8 @@ export default function Merchants() {
         <NeedsALook merges={merges} canEdit={canEdit}
                     busy={decide.isPending || decideAll.isPending}
                     onDecide={(pid, action) => decide.mutate({ pid, action })}
-                    onMergeAll={() => decideAll.mutate(merges.map((p) => p.id))} />
+                    onMergeAll={() => decideAll.mutate(merges.map((p) => p.id))}
+                    onOpen={openRow} />
       )}
 
       {recent.length > 0 && (
@@ -241,11 +251,12 @@ const MerchantRow = memo(function MerchantRow({ m, onOpen }: {
 });
 
 /** The proposer's queue: pairs the ledger thinks are one business, one
- *  line each. The reasons and the bank strings sit behind "why?". */
-function NeedsALook({ merges, canEdit, busy, onDecide, onMergeAll }: {
+ *  line each. The reasons and each side's facts sit behind "details". */
+function NeedsALook({ merges, canEdit, busy, onDecide, onMergeAll, onOpen }: {
   merges: MergeProposal[]; canEdit: boolean; busy: boolean;
   onDecide: (pid: string, action: "approve" | "reject") => void;
   onMergeAll: () => void;
+  onOpen: (display: string) => void;
 }) {
   const [why, setWhy] = useState<string | null>(null);
   const n = merges.length;
@@ -270,23 +281,33 @@ function NeedsALook({ merges, canEdit, busy, onDecide, onMergeAll }: {
                                   borderTopColor: C.border, marginTop: 8 }}>
           <Text style={s.body}>
             <Text style={{ fontWeight: "600" }}>{p.from}</Text>
-            <Text style={s.mut}> · {p.from_rows ?? "?"}</Text>
+            <Text style={s.mut}> · {p.from_facts?.rows ?? p.from_rows ?? "?"}</Text>
             <Text style={s.mut}>  →  </Text>
             <Text style={{ fontWeight: "600" }}>{p.into}</Text>
-            <Text style={s.mut}> · {p.into_rows ?? "?"}</Text>
+            <Text style={s.mut}> · {p.into_facts?.rows ?? p.into_rows ?? "?"}</Text>
           </Text>
           <Text style={s.small}>
             {p.signals[0]}{"  "}
             <Text style={s.link} onPress={() => setWhy(why === p.id ? null : p.id)}>
-              {why === p.id ? "less" : "why?"}</Text>
+              {why === p.id ? "less" : "details"}</Text>
           </Text>
           {why === p.id && (
             <View style={{ marginTop: 4 }}>
               {p.signals.slice(1).map((sg) => <Text key={sg} style={s.small}>• {sg}</Text>)}
               {p.supports.map((sp) => <Text key={sp} style={s.small}>• {sp}</Text>)}
-              <Text style={[s.small, { fontFamily: "monospace" }]} numberOfLines={3}>
-                {[...p.from_samples, ...p.into_samples].slice(0, 4).join("  ·  ")}
-              </Text>
+              {/* the side being folded in is usually the newcomer, but a
+                  long-lived spelling with fewer rows can lose too */}
+              <OfferSide tag={(p.from_facts?.first ?? "") > (p.into_facts?.first ?? "")
+                                ? "New detection" : "Other spelling"}
+                         tone={C.warn} name={p.from}
+                         facts={p.from_facts} samples={p.from_samples}
+                         onOpen={() => onOpen(p.from)} />
+              <Text style={s.op}>+</Text>
+              <OfferSide tag="History" tone={C.accent} name={p.into_name ?? p.into}
+                         facts={p.into_facts} samples={p.into_samples}
+                         onOpen={() => onOpen(p.into_name ?? p.into)} />
+              <Text style={s.op}>=</Text>
+              <OfferMerged p={p} />
             </View>
           )}
           {canEdit && (
@@ -300,6 +321,76 @@ function NeedsALook({ merges, canEdit, busy, onDecide, onMergeAll }: {
         </View>
       ))}
     </Card>
+  );
+}
+
+/** One side of an offer: what the ledger holds under that name today, so
+ *  the two can be told apart before they are joined. The name opens the
+ *  merchant's own screen for everything else. */
+function OfferSide({ tag, tone, name, facts, samples, onOpen }: {
+  tag: string; tone: string; name: string;
+  facts?: MergeSideFacts | null; samples: string[]; onOpen: () => void;
+}) {
+  return (
+    <View style={[s.box, { borderColor: tone }]}>
+      <Text style={[s.tag, { color: tone }]}>{tag}</Text>
+      <Text style={[s.link, { fontWeight: "600" }]} onPress={onOpen}>{name}</Text>
+      {facts ? (
+        <>
+          <Text style={s.small}>
+            {facts.rows} row{facts.rows === 1 ? "" : "s"} · {money(facts.total, false)} ·{" "}
+            {facts.first === facts.last
+              ? mmddyy(facts.first) : `${mmddyy(facts.first)} – ${mmddyy(facts.last)}`}
+          </Text>
+          <Text style={s.small}>
+            {[facts.rows > 1 && facts.typical != null && `usually ${money(facts.typical, false)}`,
+              facts.category && catLabel(facts.category), facts.city,
+              facts.accounts.join(", ")].filter(Boolean).join(" · ")}
+          </Text>
+          {facts.recent.map((r, k) => (
+            <View key={k} style={{ flexDirection: "row", gap: 6, marginTop: 3 }}>
+              <Text style={s.small}>{mmddyy(r.date)}</Text>
+              <Text style={[s.small, { flex: 1, fontFamily: "monospace" }]}>{r.line}</Text>
+              <Text style={s.small}>{money(r.amount, true)}</Text>
+            </View>
+          ))}
+        </>
+      ) : (
+        <Text style={[s.small, { fontFamily: "monospace" }]} numberOfLines={3}>
+          {samples.join("  ·  ")}
+        </Text>
+      )}
+    </View>
+  );
+}
+
+/** What approving makes: one merchant under the surviving name, holding
+ *  both sides' rows. The sums are the two boxes above it, added. */
+function OfferMerged({ p }: { p: MergeProposal }) {
+  const f = p.from_facts, i = p.into_facts;
+  const dates = [f?.first, f?.last, i?.first, i?.last].filter(Boolean).sort() as string[];
+  return (
+    <View style={[s.box, { borderColor: C.good }]}>
+      <Text style={[s.tag, { color: C.good }]}>After merge</Text>
+      <Text style={[s.body, { fontWeight: "600" }]}>{p.into}</Text>
+      {f && i ? (
+        <>
+          <Text style={s.small}>
+            {f.rows + i.rows} rows <Text style={s.delta}>+{f.rows}</Text> ·{" "}
+            {money(f.total + i.total, false)} <Text style={s.delta}>+{money(f.total, false)}</Text>
+          </Text>
+          <Text style={s.small}>
+            {mmddyy(dates[0])} – {mmddyy(dates[dates.length - 1])}
+            {i.category ? ` · ${catLabel(i.category)}` : ""}
+          </Text>
+        </>
+      ) : null}
+      <Text style={[s.small, { marginTop: 4 }]}>
+        “{p.from}” stops being its own merchant: its rows, and any later
+        charge under that name, file here.
+      </Text>
+      <Text style={[s.small, { marginTop: 3 }]}>Undo any time under Recent changes.</Text>
+    </View>
   );
 }
 
@@ -326,4 +417,9 @@ const s = StyleSheet.create({
   chip: { backgroundColor: C.card, borderColor: C.border, borderWidth: 1,
           borderRadius: 999, paddingHorizontal: 10, paddingVertical: 5 },
   chipOn: { borderColor: C.accent },
+  box: { borderWidth: 1, borderRadius: C.rs, backgroundColor: C.bg,
+         paddingHorizontal: 10, paddingVertical: 8, marginTop: 6 },
+  tag: { fontSize: 10.5, fontWeight: "700", letterSpacing: 0.6, textTransform: "uppercase" },
+  op: { color: C.mut, fontSize: 18, fontWeight: "600", textAlign: "center", marginTop: 4 },
+  delta: { color: C.good, fontWeight: "600" },
 });

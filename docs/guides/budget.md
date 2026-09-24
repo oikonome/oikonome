@@ -133,3 +133,6 @@ Each goal has a **contribution mode**:
 - Bills shown here are the evened yearly average; the actual heavy and
   light months show up in Today's irregular-bills list and the
   forecast, not as a broken plan.
+- A charge split by hand on the Transactions page lands in the buckets
+  part by part — the grocery half of a big-box run is Food, the rest is
+  Everything else (or a custom bucket that names its category).

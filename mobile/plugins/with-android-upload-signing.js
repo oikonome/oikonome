@@ -36,9 +36,17 @@ module.exports = function withAndroidUploadSigning(config) {
       (m) => m + RELEASE_SIGNING + "\n");
     // and make the release build type use it when the key is present
     g = g.replace(
-      /(release \{\n\s+\/\/ Caution![^\n]*\n\s+\/\/ see[^\n]*\n)\s+signingConfig signingConfigs\.debug/,
-      "$1            signingConfig project.hasProperty('OIKONOME_UPLOAD_STORE_FILE')"
+      // the template has written both `signingConfig signingConfigs.debug`
+      // and, since Expo 57, `signingConfig = signingConfigs.debug`; a miss
+      // here is silent and ships a debug-signed bundle the store refuses
+      /(release \{\n\s+\/\/ Caution![^\n]*\n\s+\/\/ see[^\n]*\n)\s+signingConfig (?:= )?signingConfigs\.debug/,
+      "$1            signingConfig = project.hasProperty('OIKONOME_UPLOAD_STORE_FILE')"
       + " ? signingConfigs.release : signingConfigs.debug");
+    // a template this regex does not recognise must stop the build here,
+    // not at the store's door
+    if (!/signingConfig = project\.hasProperty\('OIKONOME_UPLOAD_STORE_FILE'\)/.test(g)) {
+      throw new Error("with-android-upload-signing: the release build type's signingConfig line was not found in app/build.gradle; the plugin's pattern needs updating for this template");
+    }
     c.modResults.contents = g;
     return c;
   });

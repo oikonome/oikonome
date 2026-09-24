@@ -646,6 +646,57 @@ def enrichment_from_raw(raw: dict | None) -> dict:
     return out
 
 
+# A bank descriptor and a payee name are a few dozen characters. What
+# arrives here can be anything: a file import maps two of the source's
+# free-text columns onto them, and a tenant-supplied bridge streams what it
+# likes. Two absurd strings cost far more than their own row — the identity
+# resolver compares them word against word, which is quadratic and runs
+# under the household's identity lock, and the alias map keys on whichever
+# of them the row is identified by, where Postgres refuses a btree entry
+# past a couple of thousand bytes and so aborts the resolve for every row in
+# that sync. Clamped in characters (a character may be four bytes), well
+# inside that limit, and clamped rather than refused: the row is the
+# household's record of money moving, and dropping it over a long
+# descriptor is the worse trade. Nothing honest is ever touched. The restore
+# door clamps its own cells the same way, for the same reasons.
+MAX_DESCRIPTOR = 600
+
+
+# What a re-reported row does to its merchant name, as the SET clauses of an
+# ON CONFLICT DO UPDATE on transactions. One spelling, because every ingest
+# door that writes merchant_name has to agree: a row whose aggregator name
+# was set aside keeps it set aside while the feed repeats the same two
+# strings, and goes back for a fresh resolve (name in, set-aside cleared,
+# merchant dropped) the moment the feed says something new. A door that wrote
+# merchant_name alone would leave the name in BOTH columns.
+MERCHANT_NAME_ON_CONFLICT = """merchant_name = CASE
+    WHEN transactions.merchant_name_set_aside IS NOT NULL
+         AND EXCLUDED.name
+             IS NOT DISTINCT FROM transactions.name
+         AND EXCLUDED.merchant_name IS NOT DISTINCT FROM
+             transactions.merchant_name_set_aside
+    THEN NULL ELSE EXCLUDED.merchant_name END,
+merchant_name_set_aside = CASE
+    WHEN transactions.merchant_name_set_aside IS NOT NULL
+         AND EXCLUDED.name
+             IS NOT DISTINCT FROM transactions.name
+         AND EXCLUDED.merchant_name IS NOT DISTINCT FROM
+             transactions.merchant_name_set_aside
+    THEN transactions.merchant_name_set_aside
+    ELSE NULL END,
+merchant_id = CASE
+    WHEN transactions.merchant_name_set_aside IS NOT NULL
+         AND NOT (EXCLUDED.name
+                      IS NOT DISTINCT FROM transactions.name
+                  AND EXCLUDED.merchant_name IS NOT DISTINCT FROM
+                      transactions.merchant_name_set_aside)
+    THEN NULL ELSE transactions.merchant_id END"""
+
+
+def _descriptor(v):
+    return v[:MAX_DESCRIPTOR] if isinstance(v, str) else v
+
+
 def upsert_transactions(conn, txns: list[Transaction]) -> int:
     # every aggregator (plaid per page, mx and simplefin whole-pull) and
     # every importer funnels through here — the one place a generous
@@ -678,14 +729,18 @@ def upsert_transactions(conn, txns: list[Transaction]) -> int:
         # covers every aggregator at once, and category_override (the user's
         # word) is still never touched.
         cat_primary, cat_detailed = t.category_primary, t.category_detailed
+        # the two identity strings, at a length a bank descriptor and a
+        # payee name actually come in (see MAX_DESCRIPTOR) — read from here
+        # on, so every derivation below and the row itself agree
+        line = _descriptor(t.name)
+        named = _descriptor(t.merchant_name)
         # who decided category_primary — the row can say WHY it is what it
         # is (Plaid's own PFC / an importer's map / a flow normalization /
         # the fuel-arm outlet). Machine and user rules re-stamp it later.
         cat_source = (None if cat_primary is None
                       else "plaid" if t.category_plaid else "import")
         if (t.account_id in cards and (t.amount or 0) < 0
-                and flowmap.looks_like_card_payment_on_card(
-                    t.merchant_name or t.name)):
+                and flowmap.looks_like_card_payment_on_card(named or line)):
             cat_primary = "LOAN_PAYMENTS"
             cat_detailed = flowmap.CC_PAYMENT_DETAILED
             cat_source = "flow"
@@ -693,12 +748,12 @@ def upsert_transactions(conn, txns: list[Transaction]) -> int:
         # from the bank's statement line. Deterministic on the same input,
         # so a re-sync (pending → posted) re-derives the same merchant.
         desc = (t.raw or {}).get("original_description")
-        merchant = t.merchant_name or venmo_counterparty(desc)
+        merchant = named or venmo_counterparty(desc)
         # Zelle detail can live in `name` too (file imports put the whole
         # statement line there), and an aggregator-supplied merchant that
         # is itself just the truncated Zelle descriptor is noise, not a
         # merchant — the parsed counterparty beats it.
-        zelle = zelle_counterparty(desc or t.name, (t.amount or 0) < 0)
+        zelle = zelle_counterparty(desc or line, (t.amount or 0) < 0)
         if zelle and (not merchant or _ZELLE_DESCRIPTOR.search(merchant)):
             merchant = zelle
         # The outlet, when a chain's fuel arm is identifiable, is recorded
@@ -709,7 +764,8 @@ def upsert_transactions(conn, txns: list[Transaction]) -> int:
         # above do write merchant_name, and the difference is real — they
         # fire only when the aggregator supplied nothing usable, so they
         # recover a merchant rather than override a correct one.
-        outlet = fuel_arm(merchant, desc, t.name)
+        merchant = _descriptor(merchant)
+        outlet = fuel_arm(merchant, desc, line)
         # A row the bank itself labels as this brand's pump is fuel,
         # whatever the aggregator guessed. An aggregator can file a grocery
         # chain's fuel-station line under groceries, which is how a tank of
@@ -749,7 +805,7 @@ def upsert_transactions(conn, txns: list[Transaction]) -> int:
                        %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                ON CONFLICT (tenant_id, id) DO UPDATE SET
                    date=EXCLUDED.date, amount=EXCLUDED.amount,
-                   name=EXCLUDED.name, merchant_name=EXCLUDED.merchant_name,
+                   name=EXCLUDED.name,
                    merchant_outlet=EXCLUDED.merchant_outlet,
                    category_primary=COALESCE(EXCLUDED.category_primary,
                                              transactions.category_primary),
@@ -786,8 +842,27 @@ def upsert_transactions(conn, txns: list[Transaction]) -> int:
                    -- person retired it (a stuck hold), which the feed
                    -- re-reporting it every hour must not undo
                    removed=CASE WHEN transactions.retired_at IS NOT NULL THEN 1 ELSE 0 END,
+                   -- Setting the aggregator's name aside (engine/
+                   -- merchant_identity) MOVED it to
+                   -- merchant_name_set_aside and left merchant_name NULL,
+                   -- on a judgement about the two strings this row then
+                   -- carried. So a feed re-sending exactly those two
+                   -- strings — which is what every hourly sync does for
+                   -- every row it has — must not hand the name back; the
+                   -- name it was compared against is the set-aside one,
+                   -- not the NULL now standing in merchant_name.
+                   --
+                   -- A feed that restates EITHER string has said something
+                   -- new about the payee: the judgement lapses, the new
+                   -- name lands in merchant_name, and the row goes back for
+                   -- a fresh resolve under what it now reads — which means
+                   -- dropping the merchant too, since keeping it would file
+                   -- the row under a merchant its own key no longer points
+                   -- at. A row that was never set aside takes the feed's
+                   -- name and keeps its merchant, as it always did.
+                   """ + MERCHANT_NAME_ON_CONFLICT + """,
                    raw=EXCLUDED.raw""",
-            (t.id, t.account_id, t.date, t.amount, t.name, merchant, outlet,
+            (t.id, t.account_id, t.date, t.amount, line, merchant, outlet,
              cat_primary, cat_detailed,
              t.category_plaid, t.category_plaid_detailed,
              t.category_plaid_confidence,
@@ -825,11 +900,19 @@ def upsert_transactions(conn, txns: list[Transaction]) -> int:
         # The posted row's own id is the upsert key, so it appears once per
         # page: one target row per pair, and the COALESCE below reads the
         # pending twin exactly as the per-row UPDATE did.
+        # The pin travels WITH the kind that wrote it: a person's category
+        # landing on the posted row without its kind reads as one nobody
+        # set, and the next store or bill pass is entitled to overwrite it.
+        # A person's "use automatic" is an empty pin wearing their kind, so
+        # the posted row having a kind is itself an answer to keep.
+        took = "t.category_override IS NULL AND t.override_source IS NULL"
         conn.execute(
-            """UPDATE transactions t SET
+            f"""UPDATE transactions t SET
                    pending_transaction_id = v.old_id,
-                   category_override = COALESCE(t.category_override,
-                                                p.category_override),
+                   category_override = CASE WHEN {took}
+                        THEN p.category_override ELSE t.category_override END,
+                   override_source = CASE WHEN {took}
+                        THEN p.override_source ELSE t.override_source END,
                    owner_override = COALESCE(t.owner_override,
                                              p.owner_override),
                    entity_id = COALESCE(t.entity_id, p.entity_id)
@@ -907,6 +990,17 @@ def upsert_transactions(conn, txns: list[Transaction]) -> int:
                " WHERE m.transaction_id=v.old_id AND NOT EXISTS"
                "  (SELECT 1 FROM manual_categories x"
                "   WHERE x.transaction_id=v.new_id)")
+        # A hand split is several rows per charge and only means anything
+        # whole, so it moves all together or not at all: never onto a
+        # posted row that has parts of its own. A charge that posts for a
+        # different amount takes the parts with it and the stale-split
+        # sweep then drops them against the POSTED amount — left on the
+        # retired row they would still add up and nothing would notice
+        # they had stopped counting.
+        _carry("UPDATE transaction_splits s SET txn_id=v.new_id"
+               " FROM unnest(%s::text[], %s::text[]) AS v(new_id, old_id)"
+               " WHERE s.txn_id=v.old_id AND NOT EXISTS"
+               "  (SELECT 1 FROM transaction_splits x WHERE x.txn_id=v.new_id)")
         # And retire the predecessors: waiting for the aggregator's own
         # removal delta leaves a phantom pending double-counting spend
         # whenever that delta is missed. OUTSIDE the best-effort carries
@@ -1258,7 +1352,21 @@ def mark_removed(conn, txn_ids: list[str]) -> int:
         log.warning("removal delta named %d id(s) not in the ledger "
                     "(id churn after a reconnect?): %s",
                     len(missed), ", ".join(missed[:10]))
+    # a retired row's notes, receipts, categories and pairings follow the
+    # charge when it lives on under another id (a re-link numbers the same
+    # purchases afresh); best-effort, the nightly sweep is the backstop
+    _reanchor_after_removal(conn, [t for t in txn_ids if t not in missed])
     return len(txn_ids) - len(missed)
+
+
+def _reanchor_after_removal(conn, ids: list[str]) -> None:
+    if not ids:
+        return
+    try:
+        from . import reanchor
+        reanchor.reanchor_stranded(conn, ids)
+    except Exception:                                    # noqa: BLE001
+        log.warning("re-anchor after removal failed", exc_info=True)
 
 
 def reconcile_vanished_pendings(conn, account_ids: list[str],
@@ -1285,6 +1393,9 @@ def reconcile_vanished_pendings(conn, account_ids: list[str],
                      ([r["id"] for r in stale],))
         log.info("retired %d vanished pending row(s) for %s", len(stale),
                  id_prefix)
+        # the charge usually posts under another id: what was written on
+        # the hold follows it
+        _reanchor_after_removal(conn, [r["id"] for r in stale])
     return stale
 
 

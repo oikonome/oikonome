@@ -35,6 +35,11 @@ DOORS = [
     ("post", "/notify/test", "/api/notify/test", {"channel": "email"}),
     ("post", "/support-access", "/api/support-access", {"hours": 1}),
     ("post", "/support-access/revoke", "/api/support-access/revoke", {}),
+    # the continuity packet's fields and its emailed copy are the owner's:
+    # the note says where the will and the passwords are
+    ("put", "/continuity", "/api/continuity", {"note": "x"}),
+    ("post", "/continuity/email", "/api/continuity/email",
+     {"to": "sam@example.dev"}),
 ]
 
 

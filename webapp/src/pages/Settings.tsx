@@ -5,9 +5,10 @@ import { Link, NavLink, useNavigate, useParams } from "react-router";
 import { MxFlow, PlaidFlow, SimplefinFlow } from "../components/ConnectHub";
 import DemoLock from "../components/DemoLock";
 import { api, errText, mmdd, MOBILE_HOMES, WEB_HOMES,
-         type ApiToken, type Invite, type Me, type Member,
+         type ActivityPage, type ApiToken, type Invite, type Me, type Member,
          type MobileDevice, type NotifyStatus, type Session,
-         type Settings as SettingsData } from "../api/client";
+         type Settings as SettingsData, type TokenScope, type Webhook,
+         type WebhookDelivery, type WebhookEvent } from "../api/client";
 import { patchQuery, removeFromList, saveSettings } from "../api/cache";
 import ManageAccounts from "../components/ManageAccounts";
 import Doctor from "./Doctor";
@@ -39,6 +40,11 @@ const SECS = [
   // the id stays "email" for deep links; the section owns every channel
   // the summaries go out on — email, push, SMS
   { id: "email", label: "Email & Push", title: "Email & Push" },
+  // what the instance tells OTHER PROGRAMS: webhooks out, the metrics
+  // and summary doors in, the read tokens that open them. Beside Email &
+  // Push because it is the same subject — what leaves the box about the
+  // money — for a machine instead of a person.
+  { id: "integrations", label: "Integrations", title: "Integrations" },
   // labelled Users; the id stays "household" for deep links
   { id: "household", label: "Users", title: "Users" },
   // how the app presents itself to this household: which page each app
@@ -198,6 +204,10 @@ export default function Settings() {
   // subtitle, so the pane answers "what is my setup?" for the whole page
   // rather than part of it. These are the same keys the cards inside
   // already use, so React Query serves them from cache; no extra request.
+  // the Integrations subtitle: how many webhooks, and whether the app
+  // switched one off — owner only, like the section
+  const hooksQ = useQuery({ queryKey: ["webhooks"], queryFn: api.webhooks,
+                            enabled: isOwner(meQ) });
   const membersQ = useQuery({ queryKey: ["members"], queryFn: api.members });
   const invitesQ = useQuery({ queryKey: ["invites"], queryFn: api.invites,
                               enabled: isOwner(meQ) });
@@ -372,6 +382,13 @@ export default function Settings() {
               + "secret scripts manage accounts rename hide remove shared "
               + "add link reconnect recurring streams enrich"),
     tokens: hit("script tokens api bearer collectors community push import"),
+    webhooks: hit("webhooks webhook events post url signature home assistant "
+                  + "automation matrix integrations outbound"),
+    readtokens: hit("integration tokens read token api bearer prometheus "
+                    + "metrics grafana home assistant sensor mcp assistant "
+                    + "assistant scrape"),
+    endpoints: hit("metrics prometheus home assistant rest sensor mcp "
+                   + "desktop json summary endpoint integrations"),
     llm: hit("ai assistant smart categorization llm ollama openai model endpoint api key extra body vision receipts"),
     setup: hit("setup wizard walkthrough guided onboarding welcome tour "
                + "re-run rerun again restart redo first run getting started "
@@ -380,6 +397,7 @@ export default function Settings() {
                // finding anything just because the read-only inputs moved
                + "retirement retire business birthdate"),
     family: hit("users family household members invite viewer role"),
+    activity: hit("activity log history who changed what audit edits changes"),
     email: hit("change email username login address account"),
     password: hit("change password current new"),
     totp: hit("two-factor authentication totp authenticator code 2fa"),
@@ -389,6 +407,8 @@ export default function Settings() {
     deleteacct: hit("delete account erase data close leave remove everything"),
     maint: hit("maintenance jobs run sync now"),
     data: hit("your data export csv dump database backup restore"),
+    continuity: hit("continuity packet if i die spouse partner survivor "
+                    + "estate emergency pdf where things are will print"),
     move: hit("move fresh environment bundle passphrase connections backup import"),
     feedback: hit("feedback bug report reports"),
     billing: !!ext.account && hit(ext.account.keywords),
@@ -409,13 +429,14 @@ export default function Settings() {
     wizards: h.setup,
     billing: billingOn && h.billing,
     email: h.daily || h.smtp,
+    integrations: h.webhooks || h.readtokens || h.endpoints,
     connections: h.conn || h.tokens,
     categorize: h.rules,
     merchants: h.merchants,
     ai: h.llm,
-    household: h.family || (hosted && h.billing),
+    household: h.family || h.activity || (hosted && h.billing),
     prefs: h.prefs,
-    data: h.maint || h.data || h.move || h.feedback,
+    data: h.maint || h.data || h.continuity || h.move || h.feedback,
     security: h.email || h.password || h.totp || h.passkeys || h.sessions
               || h.support || h.deleteacct,
     // Hosted: no system-health section — the host runs the box
@@ -504,6 +525,17 @@ export default function Settings() {
     ai: q.data.llm_model ? { text: q.data.llm_model }
       : { text: "no endpoint — built-in only" },
     billing: ext.account?.summary?.(meQ.data?.plan),
+    integrations: hooksQ.data
+      ? (() => {
+          const hooks = hooksQ.data.webhooks;
+          const off = hooks.filter((w) => w.disabled_reason).length;
+          const on = hooks.filter((w) => w.enabled).length;
+          if (off) return { text: `${on} webhook${on === 1 ? "" : "s"} · `
+                                  + `${off} switched off`, warn: true };
+          return { text: on ? `${on} webhook${on === 1 ? "" : "s"}`
+                            : "no webhooks" };
+        })()
+      : undefined,
     household: membersQ.data
       ? { text: `${nUsers} ${nUsers === 1 ? "person" : "people"}`
                 + (nInv ? ` · ${nInv} invited` : "") }
@@ -843,12 +875,31 @@ export default function Settings() {
       </>)}
       </Sec>
 
+      <Sec id="integrations" show={secOn("integrations")}>
+      {owner && (<>
+      <Show on={h.webhooks}>
+      <DemoLock on={meQ.data?.demo}>
+      <WebhooksCard />
+      </DemoLock>
+      </Show>
+      <Show on={h.readtokens}>
+      <DemoLock on={meQ.data?.demo}>
+      <ScriptTokensCard scope="read" />
+      </DemoLock>
+      </Show>
+      <Show on={h.endpoints}>
+      <EndpointsCard />
+      </Show>
+      </>)}
+      </Sec>
+
       <Sec id="household" show={secOn("household")}>
       <Show on={h.family}>
       <DemoLock on={meQ.data?.demo}>
       <FamilyCard />
       </DemoLock>
       </Show>
+      <Show on={h.activity}><ActivityCard /></Show>
       {ext.householdCards.map((Card, i) => (
       <Show key={i} on={h.billing || h.family}>
       <DemoLock on={meQ.data?.demo}>
@@ -875,6 +926,14 @@ export default function Settings() {
       {owner && (
       <Show on={h.data}>
       <DataExportCard hosted={hosted} />
+      </Show>
+      )}
+
+      {owner && (
+      <Show on={h.continuity}>
+      <DemoLock on={meQ.data?.demo}>
+      <ContinuityCard />
+      </DemoLock>
       </Show>
       )}
 
@@ -1103,23 +1162,29 @@ function EnrichCard() {
 }
 
 
-function ScriptTokensCard() {
+// One card, two scopes. Connections renders the push half (a collector's
+// credential); Integrations renders the read half (a scraper's, a sensor's,
+// an MCP server's). Same list, same doors; the scope decides which rows
+// show and which words explain them.
+function ScriptTokensCard({ scope = "push" }: { scope?: TokenScope }) {
   const qc = useQueryClient();
   const q = useQuery({ queryKey: ["tokens"], queryFn: api.tokens });
   const [name, setName] = useState("");
   const [fresh, setFresh] = useState<{ name: string; token: string } | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const read = scope === "read";
   // a durable credential — the server wants an elevated session, and the
   // request wrapper's sheet collects the proof when it is not
   const minted = useMutation({
-    mutationFn: () => api.tokenMint(name.trim()),
+    mutationFn: () => api.tokenMint(name.trim(), scope),
     onSuccess: (r) => {
       setErr(null); setFresh({ name: r.name, token: r.token });
       setName("");
       // the mint response IS the new row (minus the plaintext): append it
       // so the table grows at once, then confirm the list
       const row: ApiToken = { id: r.id, name: r.name, created_at: r.created_at,
-        last_used_at: r.last_used_at, revoked_at: r.revoked_at };
+        last_used_at: r.last_used_at, revoked_at: r.revoked_at,
+        scope: r.scope ?? scope };
       qc.setQueryData<{ tokens: ApiToken[] }>(["tokens"],
         (old) => old && { tokens: [...old.tokens, row] });
       qc.invalidateQueries({ queryKey: ["tokens"] });
@@ -1143,15 +1208,26 @@ function ScriptTokensCard() {
     },
     onError: (e) => { if (!String(e).includes("cancelled")) setErr(errText(e)); },
   });
-  const rows = (q.data?.tokens ?? []).filter((t) => !t.revoked_at);
+  // an older row carries no scope and was minted when push was the only kind
+  const rows = (q.data?.tokens ?? [])
+    .filter((t) => !t.revoked_at && (t.scope ?? "push") === scope);
   return (
     <div className="card" style={{ marginTop: "1rem" }}>
-      <h2>Script tokens</h2>
-      <p className="mut">Credentials for your own collector scripts
-        (community scripts). A token can push data through the import
-        endpoints — nothing else: it can't read your ledger or change
-        settings. Put it in the script's config instead of your login
-        password; revoke it here any time.</p>
+      <h2>{read ? "Integration tokens" : "Script tokens"}</h2>
+      {read ? (
+        <p className="mut">Read-only credentials for the programs that
+          watch your money: a Prometheus scrape of <code>/metrics</code>, a
+          Home Assistant sensor on the summary endpoint, the local MCP
+          server your assistant talks to. A read token can read the
+          integrations endpoints — nothing else: it can't import a row,
+          change a setting or see a credential. Revoke it here any time.</p>
+      ) : (
+        <p className="mut">Credentials for your own collector scripts
+          (community scripts). A token can push data through the import
+          endpoints — nothing else: it can't read your ledger or change
+          settings. Put it in the script's config instead of your login
+          password; revoke it here any time.</p>
+      )}
       {err && <div className="note bad" onClick={() => setErr(null)}>{err}</div>}
       {fresh && (
         <div className="note good" style={{ display: "block" }}>
@@ -1183,12 +1259,356 @@ function ScriptTokensCard() {
       )}
       <div style={{ display: "flex", gap: ".5rem", marginTop: ".6rem",
                     flexWrap: "wrap" }}>
-        <input placeholder="script name (e.g. payroll-plan)" value={name}
-               onChange={(e) => setName(e.target.value)} />
+        <input placeholder={read ? "what will use it (e.g. grafana)"
+                                 : "script name (e.g. payroll-plan)"}
+               value={name} onChange={(e) => setName(e.target.value)} />
         <button disabled={minted.isPending || !name.trim()}
                 onClick={() => minted.mutate()}>
           {minted.isPending ? "creating…" : "Create token"}</button>
       </div>
+    </div>
+  );
+}
+
+// ---- Integrations: webhooks out, the read doors in -----------------------
+
+const ALL_EVENTS = "*";
+
+function EventPicker({ events, value, onChange }: {
+  events: WebhookEvent[]; value: string[]; onChange: (v: string[]) => void;
+}) {
+  const all = value.includes(ALL_EVENTS);
+  return (
+    <div style={{ display: "grid", gap: ".15rem", marginTop: ".4rem" }}>
+      <label className="check">
+        <input type="checkbox" checked={all}
+               onChange={(e) => onChange(e.target.checked ? [ALL_EVENTS] : [])} />
+        <b>Every event</b> — including ones added in later versions
+      </label>
+      {events.map((ev) => (
+        <label className="check" key={ev.name}
+               style={all ? { opacity: 0.5 } : undefined}>
+          <input type="checkbox" disabled={all}
+                 checked={all || value.includes(ev.name)}
+                 onChange={(e) => onChange(e.target.checked
+                   ? [...value, ev.name]
+                   : value.filter((v) => v !== ev.name))} />
+          <code>{ev.name}</code>
+          <span className="mut" style={{ marginLeft: ".4rem" }}>
+            {ev.description}</span>
+        </label>
+      ))}
+    </div>
+  );
+}
+
+function SecretOnce({ label, secret, onDone }: {
+  label: string; secret: string; onDone: () => void;
+}) {
+  return (
+    <div className="note good" style={{ display: "block" }}>
+      <div><b>{label}</b> — copy the signing secret now; it won't be shown
+        again. Your receiver checks <code>X-Oikonome-Signature</code> with
+        it.</div>
+      <input readOnly value={secret} style={{ width: "100%",
+          marginTop: ".4rem", fontFamily: "monospace", fontSize: 12 }}
+        onFocus={(e) => e.target.select()} />
+      <button className="dismiss" onClick={onDone}
+              style={{ marginTop: ".3rem" }}>done</button>
+    </div>
+  );
+}
+
+function DeliveryLog({ id }: { id: string }) {
+  const q = useQuery({ queryKey: ["webhook-deliveries", id],
+                       queryFn: () => api.webhookDeliveries(id) });
+  const rows: WebhookDelivery[] = q.data?.deliveries ?? [];
+  if (q.isPending) return <div className="mut">loading…</div>;
+  if (!rows.length) return <div className="mut">nothing sent yet</div>;
+  return (
+    <table style={{ marginTop: ".3rem", fontSize: 12 }}>
+      <thead><tr><th>When</th><th>Event</th><th>State</th><th>Tries</th>
+        <th>Reply</th></tr></thead>
+      <tbody>
+        {rows.map((d) => (
+          <tr key={d.id}>
+            <td>{mmdd(d.created_at)}</td>
+            <td><code>{d.event}</code></td>
+            <td><span className={"pill " + (d.state === "delivered" ? "g"
+                  : d.state === "failed" ? "r" : "a")}>{d.state}</span></td>
+            <td>{d.attempts}</td>
+            <td className="mut">{d.last_error
+              ?? (d.response_status ? `HTTP ${d.response_status}` : "")}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function WebhookRow({ hook, events }: { hook: Webhook; events: WebhookEvent[] }) {
+  const qc = useQueryClient();
+  const [open, setOpen] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [url, setUrl] = useState(hook.url);
+  const [name, setName] = useState(hook.name);
+  const [evs, setEvs] = useState<string[]>(hook.events);
+  const [msg, setMsg] = useState<{ text: string; bad?: boolean } | null>(null);
+  const [secret, setSecret] = useState<string | null>(null);
+  const patch = (row: Webhook) =>
+    qc.setQueryData<{ webhooks: Webhook[]; events: WebhookEvent[] }>(
+      ["webhooks"], (old) => old && { ...old,
+        webhooks: old.webhooks.map((w) => (w.id === row.id ? row : w)) });
+  const update = useMutation({
+    mutationFn: (body: Parameters<typeof api.webhookUpdate>[1]) =>
+      api.webhookUpdate(hook.id, body),
+    onSuccess: (row) => { patch(row); setMsg(null); setEditing(false); },
+    onError: (e) => setMsg({ text: errText(e), bad: true }),
+  });
+  const test = useMutation({
+    mutationFn: () => api.webhookTest(hook.id),
+    onSuccess: (r) => {
+      setMsg(r.ok ? { text: `Delivered — the receiver answered HTTP ${r.status}.` }
+                  : { text: `Not delivered: ${r.error ?? "no answer"}`, bad: true });
+      qc.invalidateQueries({ queryKey: ["webhooks"] });
+      qc.invalidateQueries({ queryKey: ["webhook-deliveries", hook.id] });
+    },
+    onError: (e) => setMsg({ text: errText(e), bad: true }),
+  });
+  const rotate = useMutation({
+    mutationFn: () => {
+      if (!window.confirm("Rotate the signing secret? The receiver must be "
+                          + "given the new one before deliveries verify again."))
+        throw new Error("cancelled");
+      return api.webhookRotate(hook.id);
+    },
+    onSuccess: (r) => { setSecret(r.secret); setMsg(null); },
+    onError: (e) => { if (!String(e).includes("cancelled"))
+      setMsg({ text: errText(e), bad: true }); },
+  });
+  const remove = useMutation({
+    mutationFn: () => {
+      if (!window.confirm("Delete this webhook? Nothing further will be sent "
+                          + "to it.")) throw new Error("cancelled");
+      return api.webhookDelete(hook.id);
+    },
+    onSuccess: () => {
+      removeFromList<{ webhooks: Webhook[] }, Webhook>(
+        qc, ["webhooks"], "webhooks", (w) => w.id === hook.id);
+      qc.invalidateQueries({ queryKey: ["webhooks"] });
+    },
+    onError: (e) => { if (!String(e).includes("cancelled"))
+      setMsg({ text: errText(e), bad: true }); },
+  });
+  const busy = update.isPending || test.isPending || rotate.isPending
+    || remove.isPending;
+  return (
+    <div style={{ borderTop: "1px solid var(--line)", padding: ".6rem 0" }}>
+      <div style={{ display: "flex", gap: ".6rem", alignItems: "center",
+                    flexWrap: "wrap" }}>
+        <label className="check" style={{ margin: 0 }}>
+          <input type="checkbox" checked={hook.enabled} disabled={busy}
+                 onChange={(e) => update.mutate({ enabled: e.target.checked })} />
+          <b>{hook.name || "webhook"}</b>
+        </label>
+        <code style={{ fontSize: 12, wordBreak: "break-all" }}>{hook.url}</code>
+        <span style={{ flex: 1 }} />
+        {hook.disabled_reason
+          ? <span className="pill r">switched off</span>
+          : hook.last_status == null
+            ? <span className="pill m">never sent</span>
+            : hook.last_error
+              ? <span className="pill a">last: {hook.last_error.slice(0, 40)}</span>
+              : <span className="pill g">last HTTP {hook.last_status}</span>}
+      </div>
+      <div className="sub" style={{ marginTop: ".2rem" }}>
+        {hook.events.includes(ALL_EVENTS) ? "every event"
+          : hook.events.map((e) => <code key={e}
+              style={{ marginRight: ".4rem" }}>{e}</code>)}
+        {hook.last_attempt_at && <> · last attempt {mmdd(hook.last_attempt_at)}</>}
+        {hook.failures > 0 && !hook.disabled_reason
+          && <> · {hook.failures} failed in a row</>}
+      </div>
+      {hook.disabled_reason && (
+        <div className="note bad" style={{ marginTop: ".3rem" }}>
+          {hook.disabled_reason} — fix the receiver, then tick the box to
+          turn it back on.</div>
+      )}
+      {msg && <div className={"note " + (msg.bad ? "bad" : "good")}
+                   style={{ marginTop: ".3rem" }}
+                   onClick={() => setMsg(null)}>{msg.text}</div>}
+      {secret && <SecretOnce label="New secret" secret={secret}
+                             onDone={() => setSecret(null)} />}
+      <div style={{ display: "flex", gap: ".4rem", marginTop: ".4rem",
+                    flexWrap: "wrap" }}>
+        <button disabled={busy} onClick={() => test.mutate()}>
+          {test.isPending ? "sending…" : "Send a test"}</button>
+        <button disabled={busy} onClick={() => setEditing((v) => !v)}>
+          {editing ? "cancel" : "edit"}</button>
+        <button disabled={busy} onClick={() => setOpen((v) => !v)}>
+          {open ? "hide deliveries" : "deliveries"}</button>
+        <button disabled={busy} onClick={() => rotate.mutate()}>rotate secret</button>
+        <button disabled={busy} onClick={() => remove.mutate()}
+                style={{ marginLeft: "auto" }}>delete</button>
+      </div>
+      {editing && (
+        <div style={{ marginTop: ".5rem", display: "grid", gap: ".4rem" }}>
+          <input value={name} onChange={(e) => setName(e.target.value)}
+                 placeholder="name" />
+          <input value={url} onChange={(e) => setUrl(e.target.value)}
+                 placeholder="https://…" style={{ fontFamily: "monospace" }} />
+          <EventPicker events={events} value={evs} onChange={setEvs} />
+          <div>
+            <button disabled={busy || !evs.length || !url.trim()}
+                    onClick={() => update.mutate({
+                      name, events: evs,
+                      // a new URL is a step-up; an unchanged one is not sent
+                      ...(url.trim() !== hook.url ? { url: url.trim() } : {}),
+                    })}>
+              {update.isPending ? "saving…" : "Save"}</button>
+          </div>
+        </div>
+      )}
+      {open && <DeliveryLog id={hook.id} />}
+    </div>
+  );
+}
+
+function WebhooksCard() {
+  const qc = useQueryClient();
+  const q = useQuery({ queryKey: ["webhooks"], queryFn: api.webhooks });
+  const [url, setUrl] = useState("");
+  const [name, setName] = useState("");
+  const [evs, setEvs] = useState<string[]>([]);
+  const [adding, setAdding] = useState(false);
+  const [fresh, setFresh] = useState<{ name: string; secret: string } | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const events = q.data?.events ?? [];
+  // the ledger gets posted to this URL — a step-up door, like a token
+  const create = useMutation({
+    mutationFn: () => api.webhookCreate({ url: url.trim(), events: evs,
+                                          name: name.trim() }),
+    onSuccess: (r) => {
+      const { secret, ...row } = r;
+      setFresh({ name: row.name || row.url, secret });
+      setErr(null); setUrl(""); setName(""); setEvs([]); setAdding(false);
+      qc.setQueryData<{ webhooks: Webhook[]; events: WebhookEvent[] }>(
+        ["webhooks"], (old) => old && { ...old,
+          webhooks: [...old.webhooks, row as Webhook] });
+      qc.invalidateQueries({ queryKey: ["webhooks"] });
+    },
+    onError: (e) => setErr(errText(e)),
+  });
+  const hooks = q.data?.webhooks ?? [];
+  return (
+    <div className="card">
+      <h2>Webhooks</h2>
+      <p className="mut">Tell another program when something happens: a
+        sync that brought new charges, an alert, the daily verdict, a bill
+        someone edited. Each event is one signed HTTP POST to a URL you
+        choose — a Home Assistant webhook trigger, a bot, a script of your
+        own. Failed deliveries retry for a day; a receiver that stays down
+        gets switched off and says so here. Payloads and the signature
+        check are in the{" "}
+        <Link to="/help?topic=integrations">integrations guide</Link>.</p>
+      {err && <div className="note bad" onClick={() => setErr(null)}>{err}</div>}
+      {fresh && <SecretOnce label={fresh.name} secret={fresh.secret}
+                            onDone={() => setFresh(null)} />}
+      {hooks.map((h) => <WebhookRow key={h.id} hook={h} events={events} />)}
+      {!hooks.length && !q.isPending && (
+        <div className="mut" style={{ marginTop: ".4rem" }}>No webhooks yet.</div>
+      )}
+      {adding ? (
+        <div style={{ marginTop: ".6rem", display: "grid", gap: ".4rem" }}>
+          <input placeholder="name (e.g. home-assistant)" value={name}
+                 onChange={(e) => setName(e.target.value)} />
+          <input placeholder="https://receiver.example/hook" value={url}
+                 onChange={(e) => setUrl(e.target.value)}
+                 style={{ fontFamily: "monospace" }} />
+          <EventPicker events={events} value={evs} onChange={setEvs} />
+          <div style={{ display: "flex", gap: ".4rem" }}>
+            <button disabled={create.isPending || !url.trim() || !evs.length}
+                    onClick={() => create.mutate()}>
+              {create.isPending ? "creating…" : "Create webhook"}</button>
+            <button onClick={() => setAdding(false)}>cancel</button>
+          </div>
+        </div>
+      ) : (
+        <button style={{ marginTop: ".6rem" }} onClick={() => setAdding(true)}>
+          Add a webhook</button>
+      )}
+    </div>
+  );
+}
+
+// where the read doors are, with this instance's own address filled in —
+// the three snippets a person pastes: a Prometheus scrape job, a Home
+// Assistant REST sensor, an MCP server entry for their assistant
+function EndpointsCard() {
+  const base = window.location.origin;
+  const prom = `scrape_configs:
+  - job_name: oikonome
+    scheme: ${base.startsWith("https") ? "https" : "http"}
+    metrics_path: /metrics
+    authorization:
+      credentials: oik_…   # a read token from the card above
+    static_configs:
+      - targets: ["${base.replace(/^https?:\/\//, "")}"]`;
+  const ha = `rest:
+  - resource: ${base}/api/integrations/summary
+    headers:
+      Authorization: Bearer oik_…   # a read token
+    scan_interval: 900
+    sensor:
+      - name: "Money left today"
+        value_template: "{{ value_json.today.left }}"
+        unit_of_measurement: "$"
+      - name: "Budget verdict"
+        value_template: "{{ value_json.verdict }}"
+      - name: "Net worth"
+        value_template: "{{ value_json.net_worth.total }}"
+        unit_of_measurement: "$"`;
+  const mcp = `{
+  "mcpServers": {
+    "oikonome": {
+      "command": "python3",
+      "args": ["/path/to/integrations/mcp/oikonome_mcp.py"],
+      "env": { "OIKONOME_URL": "${base}", "OIKONOME_TOKEN": "oik_…" }
+    }
+  }
+}`;
+  const Snip = ({ title, text }: { title: string; text: string }) => (
+    <details style={{ marginTop: ".5rem" }}>
+      <summary style={{ cursor: "pointer" }}>{title}</summary>
+      <pre style={{ overflowX: "auto", fontSize: 12, marginTop: ".3rem" }}>
+        <code>{text}</code></pre>
+    </details>
+  );
+  return (
+    <div className="card" style={{ marginTop: "1rem" }}>
+      <h2>Read endpoints</h2>
+      <p className="mut">Every one takes a read token as a bearer.
+        The summary is one JSON document — the verdict, dollars left today,
+        balances, bills due, alerts, connection freshness; <code>/metrics</code>
+        is the same numbers in the Prometheus text format; the query doors
+        behind the MCP server search the ledger, spending, bills and the
+        net-worth series. Full reference:{" "}
+        <Link to="/help?topic=integrations">integrations guide</Link>.</p>
+      <table style={{ fontSize: 12.5 }}>
+        <tbody>
+          <tr><td><code>GET {base}/api/integrations/summary</code></td>
+              <td className="mut">the picture, as JSON</td></tr>
+          <tr><td><code>GET {base}/metrics</code></td>
+              <td className="mut">Prometheus text</td></tr>
+          <tr><td><code>GET {base}/api/integrations/transactions?q=…</code></td>
+              <td className="mut">search the ledger</td></tr>
+          <tr><td><code>GET {base}/api/integrations/{"{"}accounts,spending,bills,alerts,networth{"}"}</code></td>
+              <td className="mut">the rest of the read doors</td></tr>
+        </tbody>
+      </table>
+      <Snip title="Prometheus scrape job" text={prom} />
+      <Snip title="Home Assistant REST sensors" text={ha} />
+      <Snip title="MCP server for your assistant" text={mcp} />
     </div>
   );
 }
@@ -1245,6 +1665,142 @@ function DataExportCard({ hosted }: { hosted: boolean }) {
         )}
       </div>
       {err && <p style={{ color: "var(--red)", marginTop: ".6rem" }}>{err}</p>}
+    </div>
+  );
+}
+
+// The continuity packet: the household's money on paper for whoever is
+// left to run it — every account and where it is held, the balances that
+// day, the bills and what pays them, the income, the businesses, and a
+// note in the owner's words about where the rest is (the password
+// manager, the will, the lawyer). No credential is in it. The PDF rides
+// the same one-shot ticket as the ZIP (fresh elevation); the emailed copy
+// steps up the same way and, on hosted, goes only to a household member.
+function ContinuityCard() {
+  const qc = useQueryClient();
+  const q = useQuery({ queryKey: ["continuity"], queryFn: api.continuity });
+  // null = untouched since the last load; the Save button reads dirtiness
+  const [note, setNote] = useState<string | null>(null);
+  const [who, setWho] = useState<string | null>(null);
+  const [to, setTo] = useState("");
+  const [msg, setMsg] = useState<{ text: string; bad?: boolean } | null>(null);
+  const d = q.data;
+  const noteNow = note ?? d?.note ?? "";
+  const whoNow = who ?? d?.prepared_for ?? "";
+  const dirty = !!d && (noteNow !== d.note || whoNow !== d.prepared_for);
+  const save = useMutation({
+    mutationFn: () => api.continuitySave({ note: noteNow, prepared_for: whoNow }),
+    onSuccess: (r) => {
+      qc.setQueryData<typeof d>(["continuity"], (o) => o && { ...o, ...r });
+      setNote(null); setWho(null); setMsg({ text: "Saved." });
+    },
+    onError: (e) => setMsg({ text: errText(e), bad: true }),
+  });
+  const get = useMutation({
+    mutationFn: () => api.exportTicket("continuity"),
+    onSuccess: (r) => { setMsg(null); window.location.assign(r.url); },
+    onError: (e) => setMsg({ text: errText(e), bad: true }),
+  });
+  const mail = useMutation({
+    mutationFn: () => {
+      if (!window.confirm(`Email the continuity packet to ${to}? It is the `
+                          + "whole shape of the household's money."))
+        throw new Error("cancelled");
+      return api.continuityEmail(to);
+    },
+    onSuccess: (r) => setMsg({ text: `Sent to ${r.to}.` }),
+    onError: (e) => { if (!String(e).includes("cancelled"))
+                        setMsg({ text: errText(e), bad: true }); },
+  });
+  const busy = save.isPending || get.isPending || mail.isPending;
+  const inputStyle = { width: "100%", padding: ".5rem",
+                       background: "var(--hover)", color: "var(--ink)",
+                       border: "1px solid var(--line)", borderRadius: 6,
+                       font: "inherit", boxSizing: "border-box" as const };
+  return (
+    <div className="card" style={{ marginTop: "1rem" }}>
+      <h2>Continuity packet</h2>
+      <p className="mut">If something happens to you, the person left
+        running the household needs a map: every account and where it is
+        held, the balances that day, the bills that come due and what pays
+        them, the income, the businesses — and, in your words, where the
+        rest is (the password manager, the will, the lawyer, who to call).
+        One PDF, printed from what Oikonome already knows. It holds no
+        passwords. Print it whenever the accounts change and keep it where
+        they will look.</p>
+      <label style={{ display: "block", marginTop: ".8rem" }}>
+        <span className="mut">Prepared for (optional)</span>
+        <input value={whoNow} placeholder="a name, e.g. Sam"
+          maxLength={120} style={{ ...inputStyle, marginTop: ".3rem" }}
+          onChange={(e) => setWho(e.target.value)} />
+      </label>
+      <label style={{ display: "block", marginTop: ".6rem" }}>
+        <span className="mut">Where the rest is — printed as the first
+          section</span>
+        <textarea rows={5} value={noteNow}
+          maxLength={d?.note_max ?? 4000}
+          placeholder={"Passwords: in the family password manager; the "
+                       + "recovery kit is in the safe.\nWill and life "
+                       + "insurance: top drawer of the desk; the lawyer is…\n"
+                       + "Call…"}
+          style={{ ...inputStyle, marginTop: ".3rem" }}
+          onChange={(e) => setNote(e.target.value)} />
+      </label>
+      <div style={{ marginTop: ".6rem", display: "flex", gap: ".5rem",
+                    flexWrap: "wrap", alignItems: "center" }}>
+        <button disabled={!dirty || busy} onClick={() => save.mutate()}>
+          {save.isPending ? "saving…" : "Save"}
+        </button>
+        <button className="pri" disabled={busy || !d}
+          onClick={() => get.mutate()}>
+          {get.isPending ? "preparing…" : "Download PDF"}
+        </button>
+      </div>
+      {d && (
+        <div style={{ marginTop: ".9rem" }}>
+          <span className="mut">Email a copy{d.members_only
+            ? " to someone in the household"
+            : ""}</span>
+          <div style={{ marginTop: ".3rem", display: "flex", gap: ".5rem",
+                        flexWrap: "wrap", alignItems: "center" }}>
+            {d.members_only ? (
+              <select value={to} onChange={(e) => setTo(e.target.value)}
+                style={{ ...inputStyle, width: "auto", minWidth: "16rem" }}>
+                <option value="">choose a member…</option>
+                {d.members.map((m) => <option key={m} value={m}>{m}</option>)}
+              </select>
+            ) : (
+              <input type="email" value={to} list="continuity-members"
+                placeholder="their email address"
+                style={{ ...inputStyle, width: "auto", minWidth: "16rem" }}
+                onChange={(e) => setTo(e.target.value)} />
+            )}
+            {!d.members_only && (
+              <datalist id="continuity-members">
+                {d.members.map((m) => <option key={m} value={m} />)}
+              </datalist>
+            )}
+            <button disabled={busy || !to.trim() || !d.mail_configured}
+              onClick={() => mail.mutate()}>
+              {mail.isPending ? "sending…" : "Email the packet"}
+            </button>
+          </div>
+          {!d.mail_configured && (
+            <p className="mut" style={{ marginTop: ".4rem" }}>
+              Email isn't configured on this instance — download the PDF and
+              hand it over instead.</p>
+          )}
+          {d.members_only && (
+            <p className="mut" style={{ marginTop: ".4rem" }}>
+              Hosted mails the household's finances only to an address with
+              an account here. Invite them under{" "}
+              <Link to="/settings/household">Users</Link> first, or download
+              the PDF and hand it over.</p>
+          )}
+        </div>
+      )}
+      {msg && <p style={{ color: msg.bad ? "var(--red)" : "var(--mut)",
+                          marginTop: ".6rem" }}>{msg.text}</p>}
     </div>
   );
 }
@@ -1936,6 +2492,107 @@ function CadenceEditor({ sched, onChange, timezone, onTimezone }: {
 const ROLE_LABEL: Record<string, string> = {
   owner: "owner", member: "member · can edit", viewer: "view-only",
 };
+
+// The household's activity log: who changed which category, bill, note,
+// split, rule… and when. Everyone reads it (everyone sees everything);
+// the server composes each sentence, so this card only puts the person
+// and the time in front of it. Filters by person and by kind; pages by
+// the last row's timestamp.
+const KIND_LABEL: Record<string, string> = {
+  category: "categories", split: "splits", note: "notes", bill: "bills",
+  rule: "rules", receipt: "receipts", reimbursement: "reimbursements",
+  business: "business", merchant: "merchants", account: "accounts",
+  settings: "settings",
+};
+
+function when(iso: string): string {
+  // MM/DD/YY HH:MM in the viewer's own clock — the log is read by the
+  // people in the house, whose clocks agree
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}/${p(d.getDate())}/${String(d.getFullYear()).slice(2)}`
+    + ` ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function ActivityCard() {
+  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
+  const [who, setWho] = useState("");
+  const [kind, setKind] = useState("");
+  // pages already fetched, oldest cursor last; a filter change starts over
+  const [pages, setPages] = useState<ActivityPage[]>([]);
+  const [cursor, setCursor] = useState<string | null>(null);
+  const params: Record<string, string> = {};
+  if (who) params.who = who;
+  if (kind) params.kind = kind;
+  if (cursor) params.before = cursor;
+  const q = useQuery({
+    queryKey: ["activity", params],
+    queryFn: () => api.activity(params),
+    placeholderData: (prev) => prev,
+  });
+  useEffect(() => {
+    if (!q.data) return;
+    setPages((prev) => cursor ? [...prev, q.data] : [q.data]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [q.data]);
+  const reset = () => { setPages([]); setCursor(null); };
+  const first = pages[0] ?? q.data;
+  const rows = pages.flatMap((p) => p.rows);
+  const last = pages[pages.length - 1];
+  const mine = me.data?.email?.toLowerCase();
+  const nameOf = (a: string) => a === mine ? "you"
+    : a.startsWith("script:") ? `the ${a.slice(7)} script` : a;
+  if (q.isPending && !first) return null;
+  return (
+    <div className="card" style={{ marginTop: "1rem" }}>
+      <h2>Activity</h2>
+      <p className="mut">Who changed what, and when — categories, splits,
+        notes, bills, rules, receipts, merchant names, settings. What the
+        app does on its own (syncs, the nightly pass) is not listed; the
+        log keeps two years.</p>
+      <div style={{ display: "flex", gap: ".5rem", flexWrap: "wrap",
+                    marginBottom: ".6rem" }}>
+        <select value={who} title="who"
+          onChange={(e) => { setWho(e.target.value); reset(); }}>
+          <option value="">everyone</option>
+          {(first?.actors ?? []).map((a) => (
+            <option key={a} value={a}>{nameOf(a)}</option>))}
+        </select>
+        <select value={kind} title="what"
+          onChange={(e) => { setKind(e.target.value); reset(); }}>
+          <option value="">everything</option>
+          {(first?.kinds ?? []).map((k) => (
+            <option key={k} value={k}>{KIND_LABEL[k] ?? k}</option>))}
+        </select>
+      </div>
+      {q.isError && <p className="mut">{errText(q.error)}</p>}
+      {rows.length === 0 && !q.isError && (
+        <p className="mut">Nothing yet — the first category you correct,
+          note you leave or bill you edit lands here, with your name on
+          it.</p>)}
+      {rows.length > 0 && (
+        <table>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.id}>
+                <td className="mut" style={{ whiteSpace: "nowrap",
+                                             verticalAlign: "top" }}>
+                  {when(r.at)}</td>
+                <td style={{ verticalAlign: "top" }}>
+                  <b>{nameOf(r.actor)}</b> {r.summary}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>)}
+      {last?.more && last.next && (
+        <button style={{ marginTop: ".5rem" }} disabled={q.isFetching}
+          onClick={() => setCursor(last.next)}>
+          {q.isFetching ? "loading…" : "show older"}</button>)}
+    </div>
+  );
+}
 
 // household members + one-time invite links. Everyone sees the
 // member list (shared truth); only the owner mints/revokes invites,

@@ -1,0 +1,13 @@
+# Oikonome → Prometheus. Replace money.example.lan and oik_… — the token is
+# an INTEGRATION token (read scope) from Settings → Integrations. Any
+# interval from 15 s up is fine; a read token allows 600 requests an hour.
+scrape_configs:
+  - job_name: oikonome
+    scheme: https
+    metrics_path: /metrics
+    scrape_interval: 60s
+    authorization:
+      type: Bearer
+      credentials: oik_…
+    static_configs:
+      - targets: ["money.example.lan"]

@@ -36,6 +36,22 @@ class TestForecast(unittest.TestCase):
         self.assertIsNone(f["plan"]["negative_date"])
         self.assertEqual(f["plan"]["min"], 4450.0)
 
+    def test_an_excluded_card_is_out_of_the_runway(self):
+        """The Accounts page's "excl" toggle drops an account from every
+        report; the runway must drop its balance and its payoff event the
+        same way, or the cash chart's forecast tail pays off a card the
+        actuals beside it never counted."""
+        write_config(self.conn, food_monthly=0, other_monthly=0,
+                     excluded_accounts=["card"])
+        f = forecast.build(self.conn, today=TODAY, days=30)
+        self.assertEqual(f["start"], 5000.0)          # 5000 checking, no card debt
+        self.assertEqual([e for e in f["card_events"] if e[1] < 0], [])
+        # and the toggle off again counts it, as before
+        write_config(self.conn, food_monthly=0, other_monthly=0,
+                     excluded_accounts=[])
+        self.assertEqual(forecast.build(self.conn, today=TODAY, days=30)["start"],
+                         4750.0)
+
     def test_negative_detection(self):
         self.conn.execute("UPDATE accounts SET balance_available=100, "
                           "balance_current=100 WHERE id='chk'")

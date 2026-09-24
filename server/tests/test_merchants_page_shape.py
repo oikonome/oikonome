@@ -28,7 +28,10 @@ class WebMerchantsShape(unittest.TestCase):
 
     def test_the_offers_are_a_queue_with_evidence_behind_a_click(self):
         self.assertIn("Needs a look", self.src)
-        self.assertIn('"why?"', self.src)
+        self.assertIn('"details"', self.src)
+        # details open the sum: what is new, what is history, what merging makes
+        for word in ("New detection", "History", "After merge"):
+            self.assertIn(word, self.src)
         self.assertIn("Merge all", self.src)
 
     def test_merge_picks_an_existing_merchant_and_rename_is_its_own_action(self):
@@ -59,7 +62,8 @@ class MobileMerchantsShape(unittest.TestCase):
             self.skipTest("mobile/ not present")
 
     def test_the_list_mirrors_the_web(self):
-        for word in ("Needs a look", "why?", "Merge all", "Recent changes",
+        for word in ("Needs a look", '"details"', "New detection", "History",
+                     "After merge", "Merge all", "Recent changes",
                      "MERCHANT_ORDERS", "MERCHANT_FILTERS", "sortMerchants"):
             self.assertIn(word, self.list)
         # a row opens the merchant's own screen, which the stack knows

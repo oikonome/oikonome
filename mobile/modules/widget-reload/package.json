@@ -1,0 +1,8 @@
+{
+  "name": "widget-reload",
+  "version": "1.0.0",
+  "description": "Asks WidgetKit to reload the app's home-screen widget timelines",
+  "main": "index.ts",
+  "license": "FSL-1.1-MIT",
+  "private": true
+}

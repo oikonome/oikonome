@@ -7,7 +7,7 @@ import { useEffect, useState } from "react";
 import { Linking, Platform, Pressable, StyleSheet, Text,
          TextInput, View } from "react-native";
 
-import { ApiError, getVerifiedServerUrl, loginAndMintDevice,
+import { ApiError, getVerifiedServerUrl, loginAndMintDevice, requestUnlock,
          PINNED_SERVER_URL } from "../lib/api";
 import { ext } from "../ext";
 import * as WebBrowser from "expo-web-browser";
@@ -52,20 +52,24 @@ export default function Login() {
   // passkey-account fallback untypeable
   const [recoveryMode, setRecoveryMode] = useState(false);
   const [busy, setBusy] = useState(false);
-  // How someone WITHOUT an account gets one here: self-service signup,
-  // the operator's request form, or their site — asked of the server
+  // the server asked for a human check the app cannot show (Turnstile
+  // after a few wrong passwords); the way past it here is the emailed
+  // link, so the screen offers that instead of "use a browser"
+  const [challenged, setChallenged] = useState(false);
+  const [unlockSent, setUnlockSent] = useState(false);
+  // How someone WITHOUT an account gets one here: self-service signup or
+  // the operator's site — asked of the server
   // (GET /api/access, public) so the screen never sends a person to a
   // door that is closed. Null until answered; a failed fetch shows the
   // site link on hosted-looking servers and nothing on self-host.
   const [access, setAccess] = useState<{ hosted: boolean;
-    signup_path: string | null; request_access_path: string | null;
+    signup_path: string | null;
     site_url: string | null; support_email?: string | null } | null>(null);
   useEffect(() => {
     if (!serverUrl) return;
     let live = true;
     const fallback = ext.site?.looksOurs(serverUrl)
-      ? { hosted: true, signup_path: null, request_access_path: null,
-          site_url: ext.site.url }
+      ? { hosted: true, signup_path: null, site_url: ext.site.url }
       : null;
     fetch(serverUrl + "/api/access")
       .then((r) => (r.ok ? r.json() : fallback))
@@ -82,13 +86,10 @@ export default function Login() {
     !serverUrl ? null
     : access?.signup_path?.startsWith("/")
       ? { label: "No account? Create one", href: serverUrl + access.signup_path }
-      : access?.request_access_path?.startsWith("/")
-        ? { label: "No account? Request access",
-            href: serverUrl + access.request_access_path }
-        : siteHref
-          ? { label: `No account? Get one at ${siteHref.replace(/^https:\/\//i, "").replace(/[/:].*$/, "")}`,
-              href: siteHref }
-          : null;
+      : siteHref
+        ? { label: `No account? Get one at ${siteHref.replace(/^https:\/\//i, "").replace(/[/:].*$/, "")}`,
+            href: siteHref }
+        : null;
   const [err, setErr] = useState<string | null>(null);
   // The device-limit refusal, held with the roster it carried. The server's
   // sentence — "revoke an unused device in Settings first" — names a screen
@@ -175,8 +176,13 @@ export default function Login() {
         setNeedsTotp(true);
         setRecoveryMode(true);
       } else if (e instanceof ApiError && e.detail === "human_check_failed") {
-        setErr("The server wants a human check it can't show here. Sign in "
-               + "once in a browser, or wait a few minutes and retry.");
+        setChallenged(true);
+        setErr(unlockSent
+          ? "Still asking for the human check — open the emailed link "
+            + "first, then sign in here."
+          : "The server wants a human check it can't show here. Email "
+            + "yourself a sign-in link below: open it, then sign in here "
+            + "as usual.");
       } else {
         setErr(e instanceof ApiError ? e.detail : String(e));
       }
@@ -250,6 +256,32 @@ export default function Login() {
                    onSubmitEditing={() => submit()} />
       )}
       {err && <Text style={s.err}>{err}</Text>}
+      {/* the web login's "Email me a sign-in link" (its /unlock page), in
+          the app: the link is not a sign-in, it lifts the human check for
+          this account so the password form above works again */}
+      {challenged && (
+        <Pressable disabled={busy || !email.trim()}
+                   onPress={() => {
+                     if (!serverUrl) return;
+                     setBusy(true);
+                     requestUnlock(serverUrl, email.trim())
+                       .then(() => {
+                         setUnlockSent(true);
+                         setErr("If that address exists, a sign-in link was "
+                                + "sent. Open it, then sign in here as "
+                                + "usual — the link itself does not sign "
+                                + "you in.");
+                       })
+                       .catch((e) => setErr(e instanceof ApiError
+                         ? e.detail : String(e)))
+                       .finally(() => setBusy(false));
+                   }}>
+          <Text style={s.link}>
+            {unlockSent ? "Send the sign-in link again"
+                        : "Email me a sign-in link"}
+          </Text>
+        </Pressable>
+      )}
       <Pressable style={[s.btn, (busy || !email.trim() || !password) && s.btnOff]}
                  disabled={busy || !email.trim() || !password}
                  onPress={() => submit()}>
@@ -306,8 +338,7 @@ export default function Login() {
         <Text style={s.link}>Forgot password?</Text>
       </Pressable>
       {/* the web login's door for a first-time visitor, same logic: signup
-          when it is open, the intake form when an add-on provides one, else
-          the operator's site. Accounts are made on the server, never in the app —
+          when it is open, else the operator's site. Accounts are made on the server, never in the app —
           the link hands off to a browser tab like "Forgot password?". */}
       {noAccount && (
         <Pressable disabled={busy}

@@ -84,9 +84,7 @@ or because it's your phone. Off releases both.
 **I installed the mobile app and I don't have an account — now what?**
 Accounts are created on the server, never in the app. The sign-in
 screen offers the door your server has open: *Create one* when
-self-service signup is on, *Request access* where the operator has kept
-an intake form open instead, or a
-link to the product site; a self-hosted instance has no signup door at
+self-service signup is on, or a link to the product site; a self-hosted instance has no signup door at
 all — the operator's setup link or an invite makes accounts there.
 
 **SimpleFIN or CSV import — which should I use?**
@@ -101,23 +99,31 @@ Renamed. It's the **Bills** tab now — same page, same features
 (detection, proposals, envelopes, payee history). The Bills guide
 covers it.
 
-**What do "This month" and "1m" mean on Cash Flow?**
-Every timeframe toggle on the site offers the same six windows (3m, 6m,
-1y, 3y, 5y, All), counted back from the current month to today. Cash
-Flow adds two shorter ones in front: **This month** is the current month
+**What do "This month" and "1m" mean?**
+Every timeframe toggle on the site offers the same eight windows (This
+month, 1m, 3m, 6m, 1y, 3y, 5y, All). **This month** is the current month
 so far, and **1m** is the last complete month, closed before today, so on
 the 13th you can read August whole instead of thirteen days of September.
-Both apply to every section of the page: the flow picture, spending and
-income. The comparison line reads against the month before.
+The longer ones count back from the current month to today. On Cash Flow
+the window applies to every section of the page: the flow picture,
+spending and income, and the comparison line reads against the month
+before.
 
 **Why am I asked whether two merchants are the same?**
 Card terminals and banks spell a business several ways: cut at 13 or 20
 characters, with the city glued on, without the apostrophe. Big chains
 arrive already identified; a local shop does not, so each spelling starts
-as its own merchant. When the app sees spellings that look like one
+as its own merchant. One exception: where your bank's line and your data
+provider have agreed on the same shop several times over, and the
+provider then calls a single charge on that same line something the line
+does not say, the charge stays with the shop the line means — the name
+from that one charge is set aside, and a real business of that name still
+gets a merchant of its own when you actually visit it.
+When the app sees spellings that look like one
 business it queues them under **Needs a look** at the top of the
-**Merchants** page, one line per pair, the reason behind "why?" ("cut at
-13 characters, a terminal's limit"). A quiet line on the Today page, the
+**Merchants** page, one line per pair with the reason ("cut at
+13 characters, a terminal's limit"); **details** shows both merchants'
+rows, totals and latest bank lines beside what the merged one would hold. A quiet line on the Today page, the
 daily email and the bell says how many a night's run found; it comes back
 only when a later run finds more, not as you work through the list. You
 choose:
@@ -249,6 +255,30 @@ Paid occurrences show with a ✓ and stop reserving cash. If it looks
 wrong, check the bill's cadence on the Bills page — a drifted due
 date is the usual cause.
 
+**One charge was several things — can I split it?**
+Yes: the row's **⋯** menu → **split across categories** on the web, or
+**Split…** on the transaction screen in the app. The parts must add up to
+the charge, and every per-category number counts the parts. Only spending
+can be split — a refund, a transfer or a card payment stays one row. See the
+transactions guide.
+
+**Who changed this category (or bill, or note)?**
+Settings → Users → **Activity** on the web, More → **Activity** in the
+app: every hand-made change in the household, with the person and the
+time. What the app does on its own (syncs, the categorizer) is not listed.
+
+**Can I get my numbers into Home Assistant, Grafana or an AI assistant?**
+Yes — Settings → Integrations. Webhooks push events out, `/metrics` and
+`/api/integrations/summary` answer a scraper or a sensor, and a one-file
+MCP server in `integrations/mcp/` lets an assistant read the books. All on
+a read-only token. See [integrations.md](integrations.md).
+
+**What does my family do with this if something happens to me?**
+Print the **continuity packet** (Settings → Data): one PDF of the
+accounts, debts, bills, income and businesses, with a note in your words
+about where the rest is. No passwords go in it. See the continuity packet
+guide.
+
 **How do I back up — and restore?**
 `./oikonome.sh backup` writes a compressed `pg_dump` into `./backups`
 inside the install folder; that one file is the whole state. Restore any
@@ -330,6 +360,20 @@ An operator can cap signups at a set number of accounts while an instance
 grows (the page shows the live number). The refusal names the operator's
 support address when one is configured, and offers an access-request form
 when the operator's add-on has one. A self-hosted instance has no cap.
+
+**I never clicked the confirmation email — what happens?**
+On a hosted instance the account keeps working, but no household email
+goes out until the address is confirmed, and the banner offers a resend.
+After a week you get one reminder with a fresh link. After 30 days the
+account is frozen for a week — a last email names the date and carries a
+fresh link, and the frozen screen has a **Resend** button — and then it is
+deleted with everything in it. Opening any of the links confirms the
+address; while the account is frozen, the page that opens also carries a
+**Reopen this account** button, and pressing it brings the account back
+at once. Households with a subscription, or where anyone has
+ever confirmed, are never touched; a self-hosted instance creates
+accounts already confirmed. Operators set the window with
+`OIKONOME_UNVERIFIED_REAP_DAYS` (0 turns it off).
 
 **What do the other recipient badges mean?**
 *invite expired* — the link timed out after 14 days; **Resend** sends a

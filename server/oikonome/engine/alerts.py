@@ -19,6 +19,8 @@ so a later recurrence shows again — recurrence is news.
 import datetime as dt
 from urllib.parse import quote
 
+from . import links
+
 
 def _mmdd(s) -> str:
     """MM/DD/YY from an ISO-ish string or date (module-wide — one copy)."""
@@ -135,7 +137,11 @@ def reimb_pending(conn) -> dict | None:
     against each charge (the remaining-balance model), floored
     at 0. The link path deletes a flag once enough came back, but a charge
     mid-way through partial receipts stays flagged with money already
-    received — summing the charges would keep alerting on the full amount."""
+    received — summing the charges would keep alerting on the full amount.
+
+    A charge in a hidden account or on the duplicate copy of a linked
+    account is left out, as on the awaiting list: nothing can be linked to
+    it, so it would alert with no way to answer it."""
     rows = conn.execute(
         """SELECT t.date,
                   GREATEST(COALESCE(f.expected, t.amount)
@@ -145,8 +151,11 @@ def reimb_pending(conn) -> dict | None:
                                          AND pr.partial = 1), 0),
                            0) AS outstanding
            FROM reimburse_flags f
-           JOIN transactions t ON t.id = f.txn_id AND t.removed = 0"""
-        ).fetchall()
+           JOIN transactions t ON t.id = f.txn_id AND t.removed = 0
+           LEFT JOIN accounts a ON a.id = t.account_id
+          WHERE a.user_removed_at IS NULL
+            AND NOT COALESCE(t.account_id = ANY(%s), false)""",
+        (links.shadow_ids(conn),)).fetchall()
     open_ = [r for r in rows if (r["outstanding"] or 0) > 0.005]
     if not open_:
         return None
@@ -319,6 +328,7 @@ def log(conn, alerts: list[dict], today: dt.date, *, partial: bool = False):
       they cleared coming back by itself.
     """
     current = {(a["kind"], a["message"]) for a in alerts}
+    raised: list[dict] = []
     with conn.transaction():
         conn.execute(
             # keyed on the tenant, because advisory locks ignore RLS;
@@ -327,7 +337,15 @@ def log(conn, alerts: list[dict], today: dt.date, *, partial: bool = False):
             "SELECT pg_advisory_xact_lock(hashtext(COALESCE("
             "current_setting('app.tenant_id', true), '')), "
             "hashtext('alerts-log'))")
+        # what was active before this snapshot, so the rows the upsert
+        # turns on can be told apart from the ones it merely re-stamps —
+        # the webhook event fires on the edge, once per raise, and a
+        # recurrence after a clearance is a new raise
+        was_active = {(r["kind"], r["message"]) for r in conn.execute(
+            "SELECT kind, message FROM alerts_log WHERE active=1").fetchall()}
         for a in alerts:
+            if (a["kind"], a["message"]) not in was_active:
+                raised.append(a)
             conn.execute(
                 """INSERT INTO alerts_log (kind, severity, message, first_seen,
                                            last_seen, active)
@@ -356,21 +374,28 @@ def log(conn, alerts: list[dict], today: dt.date, *, partial: bool = False):
                            WHEN alerts_log.active=0 THEN 0
                            ELSE alerts_log.dismissed END""",
                 (a["kind"], a["severity"], a["message"], today, today))
-        if partial:
-            return
-        for row in conn.execute(
-                "SELECT id, kind, message FROM alerts_log WHERE active=1"
-                ).fetchall():
-            if (row["kind"], row["message"]) not in current:
-                # clearing keeps the dismissal bit — the "recurrence is
-                # news" reset happens on reactivation, inside the
-                # upsert, where it is atomic. The last_seen guard is the
-                # mirror of the one above: a stale snapshot does not know
-                # about an alert raised after it built its list, so it must
-                # not clear a row a newer writer has stamped.
-                conn.execute("UPDATE alerts_log SET active=0 "
-                             "WHERE id=%s AND last_seen<=%s",
-                             (row["id"], today))
+        if not partial:
+            for row in conn.execute(
+                    "SELECT id, kind, message FROM alerts_log WHERE active=1"
+                    ).fetchall():
+                if (row["kind"], row["message"]) not in current:
+                    # clearing keeps the dismissal bit — the "recurrence is
+                    # news" reset happens on reactivation, inside the
+                    # upsert, where it is atomic. The last_seen guard is the
+                    # mirror of the one above: a stale snapshot does not know
+                    # about an alert raised after it built its list, so it must
+                    # not clear a row a newer writer has stamped.
+                    conn.execute("UPDATE alerts_log SET active=0 "
+                                 "WHERE id=%s AND last_seen<=%s",
+                                 (row["id"], today))
+    # after the commit, so a receiver that reads back sees the row
+    if raised:
+        from ..notify import webhooks
+        for a in raised:
+            webhooks.emit(conn, "alert.raised", {
+                "kind": a["kind"], "severity": a["severity"],
+                "message": a["message"], "link": a.get("link"),
+                "date": today})
 
 
 def history(conn, limit: int = 200) -> list:
@@ -385,6 +410,18 @@ def visible(conn, alerts: list[dict]) -> list[dict]:
     hidden = {(r["kind"], r["message"]) for r in conn.execute(
         "SELECT kind, message FROM alerts_log WHERE dismissed=1").fetchall()}
     return [a for a in alerts if (a["kind"], a["message"]) not in hidden]
+
+
+def retire(conn, kind: str) -> int:
+    """Mark every active alert of one kind resolved, now, because the thing
+    it pointed at is done — the queue it named is empty. The log is
+    otherwise a snapshot the Today build writes, so an alert whose cause
+    the person just cleared on another page would stay lit until the next
+    Today load or the nightly. The dismissal bit is kept: clearing is not
+    dismissing, and a recurrence resets it inside the upsert."""
+    return conn.execute(
+        "UPDATE alerts_log SET active=0 WHERE kind=%s AND active=1",
+        (kind,)).rowcount
 
 
 def dismiss(conn, kind: str, message: str) -> int:

@@ -92,6 +92,6 @@
   <p class="sub" style="margin-top:.8rem">Can't complete the security check?
     <a href="/unlock">Email me a sign-in link</a>.</p>
   {% endif %}
-  <p class="sub" style="margin-top:.8rem"><a href="/forgot">Forgot password?</a>{% if hosted() and signup_open() %} · <a href="/signup">No account? Create one</a>{% elif hosted() and intake_open() %} · <a href="{{ intake_path() }}">No account? Request access</a>{% elif hosted() and site_url() %} · <a href="{{ site_url() }}">No account? {{ site_url() | replace("https://", "") | replace("http://", "") | trim("/") }}</a>{% endif %}{% if privacy_url() %} · <a href="{{ privacy_url() }}">Privacy</a>{% endif %}</p>
+  <p class="sub" style="margin-top:.8rem"><a href="/forgot">Forgot password?</a>{% if hosted() and signup_open() %} · <a href="/signup">No account? Create one</a>{% elif hosted() and site_url() %} · <a href="{{ site_url() }}">No account? {{ site_url() | replace("https://", "") | replace("http://", "") | trim("/") }}</a>{% endif %}{% if privacy_url() %} · <a href="{{ privacy_url() }}">Privacy</a>{% endif %}</p>
 </div>
 {% endblock %}

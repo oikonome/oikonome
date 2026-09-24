@@ -67,12 +67,16 @@ everywhere the product reports spend:
   business entity stays out of every personal report (see the Business
   guide).
 - **Partial reimbursements net off**: a charge with a paired partial
-  reimbursement counts at charge − reimbursed, never below $0. Fully
-  reimbursed pairs drop out entirely (see the Reimbursements guide).
+  reimbursement counts at charge − reimbursed, never below $0, and the
+  deposit counts as income for whatever its partial links leave
+  unclaimed. Fully reimbursed pairs drop out entirely (see the
+  Reimbursements guide).
 
 A transaction's category is always **your override if you set one,
 otherwise the imported category** — recategorizing a row to a transfer
-removes it from spend everywhere on this tab.
+removes it from spend everywhere on this tab. A row you **split** by hand
+counts under each of its parts' categories for that part's amount; the
+totals are unchanged, since the parts add up to the charge.
 
 ### The breakdowns
 
@@ -119,7 +123,17 @@ dividends / other, the flow picture's classifier and colors) with the
 same pace line, and **income by source**: who actually paid — the top
 15 payers, ranked, each with its share, how many deposits, and its
 change vs the previous window (payer names consolidate like the
-Spending tab's merchants, punctuation-only variants folded too). The archival
+Spending tab's merchants, punctuation-only variants folded too). Under it,
+**interest & fees paid**: what holding money and carrying a balance cost,
+by year — interest charged, fees (ATM, overdraft, foreign-transaction,
+wire, membership, late), and the refunds the bank gave back, netted — with
+the year so far beside the interest the same banks paid you, and the
+largest charge of each year named. Bank and card accounts only; an
+investment custodian's fee is fee drag, reported on the Net Worth page.
+The card hides when nothing was ever charged. A new fee or interest
+charge is also a line in the next daily email ("first since March" when
+a card starts charging interest again), so it is heard the day it
+posts, when a call can still reverse it. The archival
 cards live behind **Records**: **career earnings** from an imported
 SSA record, **reported income** from imported tax documents (total,
 wages, investment and tax paid per year — joint returns are marked),

@@ -261,9 +261,18 @@ def _verify_assertion(admin, challenge: bytes, credential: dict, rp_id: str,
         # same stance as enrolment: the assertion stands alone, so it must
         # carry user verification
         require_user_verification=True)
-    admin.execute(
+    # The count is the cloned-key alarm, and this connection is in
+    # autocommit: two assertions arriving together would both be judged
+    # against the same stored count and both pass. So the write only lands
+    # while that baseline still stands — the second one matches no row and
+    # is refused. A counterless authenticator writes 0 over 0 and is
+    # unaffected.
+    moved = admin.execute(
         "UPDATE admin_credentials SET sign_count = %s, last_used = now() "
-        "WHERE id = %s", (v.new_sign_count, row["id"]))
+        "WHERE id = %s AND sign_count = %s RETURNING id",
+        (v.new_sign_count, row["id"], row["sign_count"])).fetchone()
+    if moved is None:
+        raise ValueError("this passkey changed mid sign-in — try again")
     return row
 
 

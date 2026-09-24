@@ -72,6 +72,8 @@ BIZ_MEALS = ["Bistro Verde", "Daily Grind Coffee", "Harvest Table"]
 FUNDS = [("EVG", "Evergreen Growth Fund"), ("SPX5", "Summit 500 Index"),
          ("TBND", "Total Bond Market")]
 COINS = [("BTC", "Bitcoin"), ("ETH", "Ethereum")]
+# the demo cards' purchase APRs (liabilities.raw → the debt planner)
+CARD_APR = {"demo-visa": 24.99, "demo-amex": 21.24}
 
 
 log = logging.getLogger(__name__)
@@ -1026,7 +1028,29 @@ def _write(conn, g: _Gen, rng: random.Random, today: dt.date) -> None:
                DO UPDATE SET raw = EXCLUDED.raw""",
             (aid, jsonb({"next_payment_due_date": due.isoformat(),
                          "last_statement_balance":
-                             round(g.card_stmt[aid], 2)})))
+                             round(g.card_stmt[aid], 2),
+                         # the purchase APR and minimum the debt planner
+                         # reads, in the aggregator's shape
+                         "aprs": [{"apr_type": "purchase_apr",
+                                   "apr_percentage": CARD_APR[aid],
+                                   "balance_subject_to_apr":
+                                       round(g.card_stmt[aid], 2)}],
+                         "minimum_payment_amount":
+                             round(max(25.0, 0.02 * g.card_stmt[aid]), 2)})))
+    # the loans' rates and payments, so the planner's schedule has the
+    # mortgage and the car on it with real terms
+    for aid, raw in (("demo-mort", {"interest_rate": {
+                          "percentage": round(g.mort_rate * 100, 3),
+                          "type": "fixed"},
+                      "next_monthly_payment": round(g.housing * 0.78, 2)}),
+                     ("demo-auto", {"interest_rate_percentage": 6.5,
+                                    "minimum_payment_amount":
+                                        g.car_payment})):
+        conn.execute(
+            """INSERT INTO liabilities (account_id, raw)
+               VALUES (%s,%s) ON CONFLICT (tenant_id, account_id)
+               DO UPDATE SET raw = EXCLUDED.raw""",
+            (aid, jsonb(raw)))
 
     # holdings = the shares the ledger actually accumulated, at today's
     # prices — the same numbers _reconstruct_trend walks backward from
@@ -1056,6 +1080,7 @@ def _write(conn, g: _Gen, rng: random.Random, today: dt.date) -> None:
     _receipts(conn, g, rng, today)
     _business(conn, g, rng, today)
     _notes(conn, g, rng, today)
+    _splits(conn, g, rng, today)
 
 
 # notes a real person actually leaves on a transaction — a mix of receipts
@@ -1149,6 +1174,27 @@ def _business(conn, g: _Gen, rng: random.Random, today: dt.date) -> None:
             conn, eid, kind="reimbursement", amount=t["amount"],
             date=t["date"], txn_id=t["id"],
             note="Business supplies paid on the personal card")
+
+
+def _splits(conn, g: _Gen, rng: random.Random, today: dt.date) -> None:
+    """A handful of general-merchandise charges split by hand — the big-box
+    run that was groceries and a lawn chair — recent enough to show on
+    the default views. Parts sum to the row to the cent."""
+    picks = [t for t in g.txns
+             if t["amount"] >= 60 and t["primary"] == "GENERAL_MERCHANDISE"
+             and t["account_id"] != "demo-biz"
+             and t["date"] >= today - dt.timedelta(days=120)]
+    for t in rng.sample(picks, min(4, len(picks))):
+        cents = int(round(t["amount"] * 100))
+        food = int(cents * rng.uniform(0.45, 0.7))
+        for line, (cat, amt) in enumerate(
+                [("FOOD_AND_DRINK", food), ("GENERAL_MERCHANDISE", cents - food)], 1):
+            conn.execute(
+                """INSERT INTO transaction_splits (txn_id, line, category, amount)
+                   VALUES (%s,%s,%s,%s)
+                   ON CONFLICT (tenant_id, txn_id, line) DO UPDATE
+                       SET category=EXCLUDED.category, amount=EXCLUDED.amount""",
+                (t["id"], line, cat, amt / 100))
 
 
 def _notes(conn, g: _Gen, rng: random.Random, today: dt.date) -> None:
@@ -1273,6 +1319,7 @@ def _configure(conn, g: _Gen, rng: random.Random, today: dt.date,
             (merch, cat, src))
 
     _alert_history(conn, rng, today)
+    _activity(conn, g, rng, today, login[0] if login else "demo@example.com")
 
     # a plausible SSA-style benefit schedule (steady earner at this income)
     ss67 = round(g.gross(today.year) * 0.28 / 12 / 10) * 10
@@ -1352,6 +1399,72 @@ def _configure(conn, g: _Gen, rng: random.Random, today: dt.date,
             "wizard_steps": {k: "done" for k in
                              ("connect", "bills", "budgets", "email", "finish")},
         })
+
+
+def _activity(conn, g: _Gen, rng: random.Random, today: dt.date,
+              email: str) -> None:
+    """Sixty days of the household's activity log, two people at the
+    books: the login you were given and a second adult, so the page shows
+    what it is for — who changed which category, bill, note and when. The
+    rows mirror hand edits the seed made (notes, splits, a bill or two)
+    with plausible timestamps, newest first when read back."""
+    from .engine import activity
+    partner = "sam@example.com"
+    who = [email, email, partner]
+    at0 = dt.datetime.combine(today, dt.time(8, 0))
+    recent = [t for t in g.txns if t["amount"] > 0
+              and t["date"] >= today - dt.timedelta(days=90)
+              and t["account_id"] != "demo-biz"]
+    if not recent:
+        return
+    entries: list[tuple[int, str, str, str, str | None, str, dict | None]] = []
+    # notes the seed wrote
+    for r in conn.execute("SELECT txn_id, note FROM transaction_notes "
+                          "ORDER BY txn_id").fetchall():
+        entries.append((rng.randint(0, 59), rng.choice(who), "note", "added",
+                        r["txn_id"], activity.txn_label(conn, r["txn_id"]),
+                        {"after": r["note"]}))
+    # the hand splits
+    for r in conn.execute("SELECT txn_id, json_agg(json_build_object("
+                          "'category', category, 'amount', amount) "
+                          "ORDER BY line) AS parts FROM transaction_splits "
+                          "GROUP BY txn_id").fetchall():
+        entries.append((rng.randint(0, 40), rng.choice(who), "split", "set",
+                        r["txn_id"], activity.txn_label(conn, r["txn_id"]),
+                        {"parts": r["parts"]}))
+    # category corrections on recent rows
+    cats = ["FOOD_AND_DRINK", "GENERAL_MERCHANDISE", "ENTERTAINMENT",
+            "PERSONAL_CARE", "HOME_IMPROVEMENT", "TRANSPORTATION"]
+    for t in rng.sample(recent, min(18, len(recent))):
+        after = rng.choice([c for c in cats if c != t["primary"]])
+        entries.append((rng.randint(0, 59), rng.choice(who), "category", "set",
+                        t["id"], activity.txn_label(conn, t["id"]),
+                        {"before": t["primary"], "after": after,
+                         "scope": "one"}))
+    # a bill edited, one paused, one confirmed from the finder
+    entries.append((rng.randint(3, 20), email, "bill", "edited",
+                    "FiberLink Internet", "FiberLink Internet",
+                    {"before": {"amount": 65.0, "frequency": "MONTHLY",
+                                "interval": 1},
+                     "after": {"amount": 70.0, "frequency": "MONTHLY",
+                               "interval": 1}}))
+    entries.append((rng.randint(20, 50), partner, "bill", "confirmed",
+                    "StreamBox", "StreamBox", {"proposal": "add"}))
+    entries.append((rng.randint(1, 10), partner, "rule", "set",
+                    "Corner Market", "Corner Market",
+                    {"after": "FOOD_AND_DRINK", "count": 23}))
+    entries.append((rng.randint(30, 59), email, "settings", "changed", None,
+                    "", {"keys": ["budget", "savings_goals"]}))
+    for days, actor, kind, action, target, label, detail in entries:
+        at = at0 - dt.timedelta(days=days, hours=rng.randint(0, 13),
+                                minutes=rng.randint(0, 59))
+        words = activity.sentence(kind, action, label, detail)
+        conn.execute(
+            """INSERT INTO activity_log (at, actor, kind, action, target,
+                                         label, summary, detail)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (at, actor, kind, action, target, label[:120], words[:300],
+             jsonb(detail) if detail else None))
 
 
 def _alert_history(conn, rng: random.Random, today: dt.date) -> None:

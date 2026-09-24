@@ -35,9 +35,10 @@ export function planRows(
           fixedPending?: number; fixedCount?: number;
           savings?: { plan: number; saved: number | null } | null;
           excess?: number | null;
-          // the month the rows cover; the ledger link opens that month
+          // the period the rows cover; the ledger link opens that month —
+          // or, with no month, that YEAR's bucket (the year lens's map)
           // (asOf: the day the figures were read on, when not today)
-          period?: { y: number; m: number; asOf?: string } | null } = {},
+          period?: { y: number; m?: number; asOf?: string } | null } = {},
 ): PlanRow[] {
   const k = opts.scale ?? 1;
   const rows: PlanRow[] = [];
@@ -46,13 +47,16 @@ export function planRows(
   // elsewhere (a warehouse club, a marketplace), a custom bucket is a plan label the ledger
   // has never stored on a transaction, and "Everything else" is whatever
   // the carve-outs left. So the label opens the ledger BY BUCKET, which
-  // lists exactly the rows the verdict counted. A bucket is always a
-  // month's bucket, so a map drawn without one (the yearly map, the budget
-  // page's plan) has no addressable filter and its labels stay plain text.
+  // lists exactly the rows the verdict counted. A bucket is a month's
+  // bucket, or — a year with no month — the union over the year's
+  // budgeted months the yearly map summed; a map drawn with no period at
+  // all (the budget page's plan) has no addressable filter and its labels
+  // stay plain text.
   const ledger = (bucket: string) =>
     opts.period
       ? `/transactions?bucket=${encodeURIComponent(bucket)}`
-        + `&y=${opts.period.y}&m=${opts.period.m}`
+        + `&y=${opts.period.y}`
+        + (opts.period.m ? `&m=${opts.period.m}` : "")
         + (opts.period.asOf ? `&as_of=${opts.period.asOf}` : "")
       : undefined;
   const food = buckets.food;

@@ -17,6 +17,9 @@ expo-env.d.ts
 # native projects are generated (expo prebuild / run) — app.json is the source
 android/
 ios/
+# ...but a local module's native source is source, not generated: without
+# it a build ships no WidgetReload module and the widget calls are no-ops
+!/modules/*/ios/
 
 # Native
 .kotlin/

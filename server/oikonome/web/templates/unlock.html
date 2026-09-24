@@ -5,9 +5,11 @@
   {% if confirm_token %}
   {# The emailed unlock GET only PEEKS. Burning a one-time token on a GET
      means any mail scanner or prefetcher spends it before the human clicks —
-     so the actual use is this explicit POST. Same split as
-     /admin/approve-request and /reset. (Email verification is the one
-     link that IS spent on the click — see app._verify_email_act.) #}
+     so the actual use is this explicit POST. /reset splits the same way:
+     its GET only looks the token up to draw the form, and only the POST
+     spends it. (Email verification is the one emailed link that IS spent
+     on the click, because all it proves is that the mailbox receives this
+     instance's mail — see app._verify_email_act.) #}
   <p>Ready to unlock sign-in for <b>{{ email }}</b>.</p>
   <p class="sub">This does not sign you in — you will still enter your
     password on the next screen.</p>
@@ -15,6 +17,24 @@
     <input type="hidden" name="token" value="{{ confirm_token }}">
     <button class="pri">Continue to sign in</button>
   </form>
+  {% elif confirmed and reopen_token %}
+  {# The address is confirmed, but this household was frozen for never
+     confirming and is on its way to deletion. Bringing it back is a
+     POST behind this button ON PURPOSE: mail scanners fetch every link
+     in a message, and a scanner that could reopen a household would
+     defeat the freeze — on a squatted address, on the victim's behalf.
+     No Refresh header here: there is something to press. #}
+  <p>Your email address <b>{{ email }}</b> is confirmed.</p>
+  <p class="sub">This account was frozen because the address was never
+    confirmed, and it is still scheduled for deletion{% if deletes_on %} on
+    <b>{{ deletes_on }}</b>{% endif %} — with everything in it. One more
+    step brings it back.</p>
+  <form method="post" action="/verify-email">
+    <input type="hidden" name="token" value="{{ reopen_token }}">
+    <button class="pri">Reopen this account</button>
+  </form>
+  <p class="sub" style="margin-top:.8rem">Didn't sign up for this? Close the
+    page — the account is deleted on its own and nobody will write again.</p>
   {% elif confirmed %}
   {# The response carries a Refresh header (no inline script under the
      CSP) that forwards to sign-in in four seconds; the bar under the
@@ -23,8 +43,10 @@
      a browser that ignores the header). All animation is CSS. #}
   <div class="ok-wrap">
     <div class="ok-badge"><svg viewBox="0 0 100 100" aria-hidden="true"><path d="M26 52 L44 69 L75 34"/></svg></div>
-    <p class="ok-h">Email confirmed</p>
-    <p class="ok-sub"><b>{{ email }}</b> is verified.<br>Taking you to sign in…</p>
+    <p class="ok-h">{{ 'Account reopened' if reopened else 'Email confirmed' }}</p>
+    <p class="ok-sub">{% if reopened %}<b>{{ email }}</b> is verified and the
+      account is no longer scheduled for deletion.{% else %}<b>{{ email }}</b>
+      is verified.{% endif %}<br>Taking you to sign in…</p>
     <a class="ok-btn" href="/login?verified=1">Sign in now</a>
     <div class="ok-timer" aria-hidden="true"><i></i></div>
   </div>

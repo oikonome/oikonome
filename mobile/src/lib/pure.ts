@@ -12,6 +12,28 @@ import type { AccountRemoveMode, ElevationProof, ElevationStatus,
 export const numv = (v: string) =>
   Number((v || "0").replace(/[$,\s]/g, "")) || 0;
 
+/** A typed amount as a what-if query value. The GET doors type their
+ *  amounts as numbers, so "1,000" from a phone keyboard is refused
+ *  outright where the save door (which strips "$" and ",") would take
+ *  it; parsing here first makes the what-if read the same amount the
+ *  save would store. `whole` rounds for a door that takes whole dollars. */
+export const moneyParam = (v: string, whole = false) => {
+  const n = numv(v);
+  return String(whole ? pyround(n) : n);
+};
+
+/** A what-if form as query params: a blank box means "the server's
+ *  default" and stays off the query, the money boxes go through
+ *  moneyParam, and anything else rides as typed (trimmed). */
+export function whatIfQuery(fields: Record<string, string>,
+                            moneyKeys: readonly string[], whole = false):
+    Record<string, string> {
+  return Object.fromEntries(Object.entries(fields)
+    .filter(([, v]) => v.trim() !== "")
+    .map(([k, v]) => [k, moneyKeys.includes(k)
+      ? moneyParam(v, whole) : v.trim()]));
+}
+
 // Python-style banker's rounding on the SIGNED value — the server,
 // the web and the daily email all round this way, so half-away-from-zero
 // here would disagree with them by a dollar on a .5 value
@@ -37,6 +59,17 @@ export const money = (n: number, cents = true) => {
 export const CLEAR_CATEGORY = "__clear__";
 export const categoryForServer = (category: string) =>
   category === CLEAR_CATEGORY ? "" : category;
+
+// Does this write hand the row BACK to the automatic layers? The empty
+// category is how the server spells "drop the override", and what the row
+// then reads as — the bank's own label, a bill's stamp, a merchant rule —
+// is decided there and cannot be guessed here. So a reset is the one
+// category write with NO local echo: a caller that shows what it sent
+// shows the empty string, which catLabel renders as "Uncategorized" —
+// the exact opposite of what "use the automatic category" promises. The
+// row is read back from the server instead.
+export const isCategoryReset = (categoryForTheServer: string) =>
+  categoryForTheServer === "";
 
 // /api/connections' last_sync is a server-rendered PHRASE ("synced
 // 12m ago"), never a timestamp — it must reach the screen verbatim.
@@ -473,17 +506,27 @@ export function institutionAllowance(cap?: number | null, used?: number):
 // The window is anchored to the LAST point's date (not today) so a
 // briefly-stale report still selects a full window. `start` indexes the
 // baseline point — the last point at or before the cutoff — so the drawn
-// line begins at the value the gain is measured from.
+// line begins at the value the gain is measured from; `end` is the last
+// point drawn — the newest for every window that runs to now, the
+// previous month's point for "1m", the last complete month. The series is
+// one point per month, so the two short windows are two points each.
+// The site-wide timeframe vocabulary: every over-time toggle offers the
+// same eight windows — This month · 1m · 3m · 6m · 1y · 3y · 5y · All.
+// "This month" is the household's month so far; "1m" is the last COMPLETE
+// month, the one window that closes before today. Web twin: RANGES in
+// webapp/src/components/RangePicker.tsx — keep them identical.
 export const TREND_RANGES =
-  ["3m", "6m", "1y", "3y", "5y", "all"] as const;
-// Cash Flow adds two short windows in front: "This month" (the household's
-// month so far) and "1m" (the last complete month) — cash-flow surfaces
-// only (overview, spending, income). Web twin: CASHFLOW_RANGES.
-export const CASHFLOW_RANGES = ["cur", "1m", ...TREND_RANGES] as const;
-export type TrendRange = (typeof CASHFLOW_RANGES)[number];
+  ["cur", "1m", "3m", "6m", "1y", "3y", "5y", "all"] as const;
+export type TrendRange = (typeof TREND_RANGES)[number];
 export const RANGE_LABEL: Record<TrendRange, string> =
   { cur: "This month", "1m": "1m", "3m": "3m", "6m": "6m", "1y": "1y",
     "3y": "3y", "5y": "5y", all: "All" };
+/** How a caption names the window a figure was measured over ("+$120
+ *  over this month"). Web twin: `rangeCaption` in RangePicker.tsx. */
+export function rangeCaption(range: TrendRange): string {
+  return range === "all" ? "all time" : range === "cur" ? "this month"
+    : range === "1m" ? "last month" : range;
+}
 // the site-wide vocabulary in months (null = all); the web twin is
 // webapp/src/components/RangePicker.tsx — keep them identical. "1m"
 // counts two so a window cut on the current month reaches the last
@@ -491,23 +534,32 @@ export const RANGE_LABEL: Record<TrendRange, string> =
 export const RANGE_MONTHS: Record<TrendRange, number | null> =
   { cur: 1, "1m": 2, "3m": 3, "6m": 6, "1y": 12, "3y": 36, "5y": 60, all: null };
 
-/** The ledger's quick date ranges — the same six windows instead of a
+/** The ledger's quick date ranges — the same eight windows instead of a
  *  vocabulary of its own. A range is a from-date on the first of the
  *  window's opening month with an open end: "3m" in September is Jul 1
  *  onward, the same three calendar months Cash Flow's 3m covers, so the
- *  two pages agree on what a window holds. "all" is no date filter at
- *  all. A calendar date is device-LOCAL (the `ymd` rule in dates.ts: never
- *  through UTC), and `today` is passed in so the boundaries are testable.
- *  The web twin is `ledgerRangeFrom` in
- *  webapp/src/components/RangePicker.tsx — keep them identical. */
+ *  two pages agree on what a window holds; "This month" is from the 1st;
+ *  "1m" is the last complete month CLOSED on its last day (in September:
+ *  Aug 1 – Aug 31). "all" is no date filter at all. A calendar date is
+ *  device-LOCAL (the `ymd` rule in dates.ts: never through UTC), and
+ *  `today` is passed in so the boundaries are testable. The web twin is
+ *  `ledgerRange` in webapp/src/components/RangePicker.tsx — keep them
+ *  identical. */
 export function ledgerRange(range: TrendRange, today: Date):
     { from: string; to: string } {
   const months = RANGE_MONTHS[range];
   if (months === null) return { from: "", to: "" };
+  const ymd = (d: Date) => `${d.getFullYear()}-${
+    String(d.getMonth() + 1).padStart(2, "0")}-${
+    String(d.getDate()).padStart(2, "0")}`;
+  if (range === "1m") {
+    // day 0 of this month = the last day of the month before
+    return { from: ymd(new Date(today.getFullYear(), today.getMonth() - 1, 1)),
+             to: ymd(new Date(today.getFullYear(), today.getMonth(), 0)) };
+  }
   // Date's own month arithmetic on the 1st: no day-of-month to overflow
   const d = new Date(today.getFullYear(), today.getMonth() - (months - 1), 1);
-  return { from: `${d.getFullYear()}-${
-             String(d.getMonth() + 1).padStart(2, "0")}-01`, to: "" };
+  return { from: ymd(d), to: "" };
 }
 
 // ---- counting months backwards, safely ----
@@ -621,25 +673,34 @@ export function shiftMonthsUtc(iso: string, months: number): string {
 
 export function trendWindow(
   points: [string, number][], range: TrendRange,
-): { start: number; gain: number | null; pct: number | null; full: boolean } {
+): { start: number; end: number; gain: number | null; pct: number | null;
+     full: boolean } {
   const n = points.length;
-  if (n < 2) return { start: 0, gain: null, pct: null, full: true };
-  let start = 0;
+  if (n < 2) return { start: 0, end: n - 1, gain: null, pct: null, full: true };
+  // last point at or before an ISO cutoff; -1 when the data starts later
+  const at = (cutoff: string) => {
+    for (let i = n - 1; i >= 0; i--) if (points[i][0] <= cutoff) return i;
+    return -1;
+  };
+  let start = 0, end = n - 1;
   if (range !== "all") {
     const months = RANGE_MONTHS[range]!;
     // clamped, not rolled: a series whose last point is a 31st would
     // otherwise land the cutoff in the month AFTER the one asked for and
     // measure the gain over a window short by a month
-    const cutoff = shiftMonthsUtc(points[n - 1][0], months);
-    // last point at or before the cutoff; none = the data is shorter
-    // than the range and the window IS the whole series
-    for (let i = n - 1; i >= 0; i--) {
-      if (points[i][0] <= cutoff) { start = i; break; }
+    // none = the data is shorter than the range and the window IS the
+    // whole series
+    start = Math.max(0, at(shiftMonthsUtc(points[n - 1][0], months)));
+    if (range === "1m") {
+      // the last COMPLETE month closes at the point before the current
+      // one; a series too short to close it falls back to the open window
+      const close = at(shiftMonthsUtc(points[n - 1][0], 1));
+      if (close > start) end = close;
     }
   }
   const base = points[start][1];
-  const gain = points[n - 1][1] - base;
-  return { start, gain,
+  const gain = points[end][1] - base;
+  return { start, end, gain,
            pct: base > 0 ? (100 * gain) / base : null,
            full: start === 0 };
 }
@@ -759,3 +820,32 @@ export function sortMerchants<T extends { display: string; rows: number; total: 
     r = [...r].sort((a, b) => (b.last ?? "").localeCompare(a.last ?? ""));
   return r;
 }
+
+// ---- the debt planner's two labels (web: pages/Debt.tsx) ------------------
+
+// '2029-03-01' → 'Mar 2029': the schedule walks month firsts, and the
+// day would read as a fact the walk never claimed
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+export const monthYear = (iso: string | null | undefined) => {
+  if (!iso) return "";
+  const m = Number(iso.slice(5, 7)) - 1;
+  return `${MONTHS[m] ?? ""} ${iso.slice(0, 4)}`;
+};
+
+// months → "2 yr 5 mo"; null is the walk's "not within fifty years"
+export const span = (months: number | null) => {
+  if (months === null) return "not within fifty years";
+  if (months === 0) return "today";
+  const y = Math.floor(months / 12), m = months % 12;
+  const parts = [];
+  if (y) parts.push(`${y} yr`);
+  if (m) parts.push(`${m} mo`);
+  return parts.join(" ");
+};
+
+/** The Today hero's verdict sentence — one copy for the hero, the lens
+ *  pages and the home-screen widget. */
+export const heroLabel = (verdict: string): string =>
+  verdict === "OVER BUDGET" ? "Over budget"
+    : verdict === "UNDER BUDGET" ? "Under budget" : "On budget";

@@ -36,3 +36,7 @@
 {"raw": "TACO HUT CENTER NV", "merchant": "Taco Hut Center", "note": "trailing two letters after a full name are the bank's state code"}
 {"raw": "CEDAR RIDGE MA", "merchant": "Cedar Ridge", "note": "trailing two letters are a word the bank truncated"}
 {"raw": "SQ COFFEE HOUSE", "merchant": "Coffee House", "note": "a processor code is not a name in any position"}
+{"raw": "Juniper's Market", "merchant": "Junipers Market", "note": "an apostrophe joins its letters, so the name matches the line 'JUNIPERS MARKET'"}
+{"raw": "JUNIPERS MARKET", "merchant": "Junipers Market"}
+{"raw": "L'Anfora", "merchant": "Lanfora", "note": "an elided prefix joins too, agreeing with the line that prints it closed up"}
+{"raw": "Q'Z BURGER BARN", "merchant": "QZ Burger Barn", "note": "two letters an apostrophe joins are a whole word, not two dropped pieces"}

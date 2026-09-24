@@ -525,7 +525,8 @@ def dedupe_twins(conn, account_id: str, *, apply: bool = True) -> list[dict]:
     from .dedup import _tokens
     rows = conn.execute(
         """SELECT id, date, amount, name, merchant_name, pending,
-                  category_override, owner_override, entity_id, merchant_id
+                  category_override, override_source, owner_override,
+                  entity_id, merchant_id
              FROM transactions
             WHERE account_id = %s AND removed = 0
             ORDER BY date, amount, id""", (account_id,)).fetchall()
@@ -578,15 +579,47 @@ def _retire_twin(conn, keep_id: str, lose_id: str) -> None:
     the database, not from whatever was read when the scan started — an
     edit landing between the scan and the retirement must survive. And
     everything attached to the retired row by its id — notes, receipts,
-    reimbursement and business flags — moves to the survivor, because
+    reimbursement and business flags, a hand split — moves to the survivor, because
     every read path filters removed = 0 and would otherwise hide them."""
+    # The category pin travels WITH the kind of hand that set it: a pin
+    # arriving without its kind reads as one nobody set, so the next store
+    # or bill pass is free to overwrite a person's answer. And a person's
+    # "use automatic" is an EMPTY pin wearing their kind, so a survivor
+    # holding one already has its own answer and must not have it filled in
+    # from the row being retired.
+    took = "k.category_override IS NULL AND k.override_source IS NULL"
     conn.execute(
-        """UPDATE transactions k SET
-               category_override = COALESCE(k.category_override, l.category_override),
+        f"""UPDATE transactions k SET
+               category_override = CASE WHEN {took}
+                    THEN l.category_override ELSE k.category_override END,
+               override_source   = CASE WHEN {took}
+                    THEN l.override_source ELSE k.override_source END,
                owner_override    = COALESCE(k.owner_override,    l.owner_override),
                entity_id         = COALESCE(k.entity_id,         l.entity_id)
            FROM transactions l
           WHERE k.id = %s AND l.id = %s""", (keep_id, lose_id))
+    # The retired row then lets go of exactly what the survivor took, and
+    # keeps an answer the survivor refused — nulling that one would destroy
+    # it, not tidy up. A retired row still wearing an override every read
+    # hides is stranded work: the re-anchor sweep finds it every night and
+    # hunts a twin it can never move it onto, because the survivor already
+    # has its own answer.
+    gone = ("k.category_override IS NOT DISTINCT FROM l.category_override"
+            " AND k.override_source IS NOT DISTINCT FROM l.override_source")
+    conn.execute(
+        f"""UPDATE transactions l SET
+               category_override = CASE WHEN {gone}
+                    THEN NULL ELSE l.category_override END,
+               override_source   = CASE WHEN {gone}
+                    THEN NULL ELSE l.override_source END,
+               owner_override = CASE
+                    WHEN k.owner_override IS NOT DISTINCT FROM l.owner_override
+                    THEN NULL ELSE l.owner_override END,
+               entity_id = CASE
+                    WHEN k.entity_id IS NOT DISTINCT FROM l.entity_id
+                    THEN NULL ELSE l.entity_id END
+           FROM transactions k WHERE l.id = %s AND k.id = %s""",
+        (lose_id, keep_id))
     conn.execute("UPDATE transactions SET removed = 1 WHERE id = %s", (lose_id,))
     # notes: one row per transaction, so they cannot both keep theirs. If
     # the survivor has no note, the retired row's moves over. If BOTH have
@@ -616,12 +649,21 @@ def _retire_twin(conn, keep_id: str, lose_id: str) -> None:
                        (SELECT 1 FROM {table} WHERE txn_id = %s)""",
             (keep_id, lose_id, keep_id))
         conn.execute(f"DELETE FROM {table} WHERE txn_id = %s", (lose_id,))
+    # a hand split moves whole or not at all, and never over the
+    # survivor's own; a copy of the survivor's parts is let go, a differing
+    # split stays on the retired row for the re-anchor sweep to count
+    # rather than being deleted here
+    from ..engine.splits import move_split
+    move_split(conn, lose_id, keep_id)
 
 
 def _pick_survivor(a: dict, ta: set, b: dict, tb: set) -> tuple[dict, dict]:
     def score(r, toks):
         opaque = sum(1 for t in toks if _opaque(t))
-        state = int(bool(r["category_override"] or r["owner_override"] or r["entity_id"]))
+        # an empty pin wearing a kind is "use automatic" — a person's answer
+        # as much as a category is, so it counts as state
+        state = int(bool(r["category_override"] or r["override_source"]
+                         or r["owner_override"] or r["entity_id"]))
         return (0 if r["pending"] else 1,          # posted beats pending
                 -opaque,                           # cleaner name wins
                 state,                             # user state wins

@@ -29,26 +29,13 @@
 {% set remaining = var_budget - st.variable_actual %}
 
 
-{# ---- unified alert strip (worst first) — the log behind it feeds /alerts;
-      ✕ dismisses (web only — no forms in mail) while the condition persists ---- #}
-{% for a in st.alerts or [] %}
-<div class="note" style="margin:1rem 0 0;display:flex;gap:.5rem;align-items:baseline;{% if a.severity == 'bad' %}background:rgba(224,105,93,.10);border-color:rgba(224,105,93,.4);color:var(--red){% elif a.severity == 'good' %}background:rgba(92,181,107,.10);border-color:rgba(92,181,107,.35);color:var(--green){% elif a.severity == 'info' %}background:var(--card);border-color:var(--line);color:var(--mut){% endif %};">
-  {# an alert naming something you'd want to change links to the page that
-     changes it. In mail that must be an ABSOLUTE url, and only when we have
-     a mailable base — a LAN link in an email is what gets it filtered. #}
-  <span style="flex:1;">{{ '⚠' if a.severity in ('bad','warn') else '✓' if a.severity == 'good' else '•' }}
-    {%- if a.link and (not email or app_base) %} <a href="{{ (app_base ~ '/app' ~ a.link) if email else ('/app' ~ a.link) }}" style="color:inherit;text-decoration:underline;">{{ a.message }}</a>
-    {%- else %} {{ a.message }}{% endif %}</span>
-  {% if not email %}
-  <form method="post" action="/alerts/dismiss" style="display:inline;margin:0;">
-    <input type="hidden" name="kind" value="{{ a.kind }}">
-    <input type="hidden" name="message" value="{{ a.message }}">
-    <input type="hidden" name="back" value="/today">
-    <button title="dismiss" style="background:none;border:none;padding:0 .2rem;color:inherit;opacity:.6;cursor:pointer;">✕</button>
-  </form>
-  {% endif %}
-</div>
-{% endfor %}
+{# ---- alerts are NOT here. The mail closes with a per-recipient
+      "Needs you" section (templates/email_needs_you.html, attached by
+      notify/mailact at send time) that carries the alert strip with a
+      mute button, the proposed bills and the uncategorized charges —
+      for owner and member addresses only. A viewer's or guest's copy
+      has no alerts at all. The Today page keeps its strip at the top,
+      where the controls are real. ---- #}
 
 {# ---- the "today" post tick, email-safe: mail clients have no absolute
       positioning, so the web's .bartick overlay becomes three stacked
@@ -292,7 +279,8 @@
       {% endfor %}
     </div>
     {% for e in (st.why.entries if st.why else []) %}
-    <div style="margin-top:.35rem;"><strong>{{ e.name }}</strong>
+    {# the line's bucket opens the same door as its tile above #}
+    <div style="margin-top:.35rem;"><strong>{% if e.to and (not email or app_base) %}<a href="{{ (app_base ~ '/app' ~ e.to) if email else ('/app' ~ e.to) }}" style="color:inherit;text-decoration:none;">{{ e.name }}</a>{% else %}{{ e.name }}{% endif %}</strong>
       <span class="{{ 'neg' if e.tone == 'over' else 'pos' if e.tone == 'under' else 'sub' }}">{{ e.text }}</span></div>
     {% endfor %}
     {# the over-budget way back, composed server-side with the rest of

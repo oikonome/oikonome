@@ -206,6 +206,10 @@ NO_RLS_APP_WRITES = {
                                      "push_platform", "push_token",
                                      "push_updated", "revoked_at")),
     "email_delivery_state":   ("", ()),
+    # a widget token is minted (INSERT) and only ever stamped or revoked;
+    # re-parenting one onto another device or user is what would let it
+    # outlive the revocation of the phone that minted it
+    "widget_tokens":          ("I", ("last_seen", "revoked_at")),
     "email_verifications":    ("I", ("used_at",)),
     "infra_metrics":          ("", ()),
     "invites":                ("ID", ("used_at",)),

@@ -81,7 +81,10 @@ def consume(admin_conn, verification_id, user_id) -> bool:
             "WHERE id=%s AND used_at IS NULL", (verification_id,)).rowcount
         if not burned:
             return False
+        # first_verified_at is the permanent record that this row once
+        # proved a mailbox; an email change clears verified_at, never this
         admin_conn.execute(
-            "UPDATE users SET verified_at=now() "
+            "UPDATE users SET verified_at=now(), "
+            "first_verified_at=coalesce(first_verified_at, now()) "
             "WHERE id=%s AND verified_at IS NULL", (user_id,))
         return True

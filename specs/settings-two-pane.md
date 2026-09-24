@@ -35,12 +35,12 @@ section at a time, with a filter box that searches across all of them.
 
 ## Order
 
-**Connections · Email & Push · Users · Preferences · Data · System ·
-Categorization · Merchants · AI · Wizards · Security**, with the account
-section an installed add-on owns (if any) slotted in just before
+**Connections · Email & Push · Integrations · Users · Preferences · Data ·
+System · Categorization · Merchants · AI · Wizards · Security**, with the
+account section an installed add-on owns (if any) slotted in just before
 Security. This is the order of attention: where the money comes from, what
-the instance sends about it, who else sees it, what is stored and the box
-storing it, the engine that sorts it. Wizards sits near the end because
+the instance sends about it (to people, then to other programs), who else
+sees it, what is stored and the box storing it, the engine that sorts it. Wizards sits near the end because
 re-running a walkthrough is a rare deliberate act; an add-on's account
 section is rarer still. **Security is last on purpose** — it holds the
 password, the second factor and the delete button, and the section you
@@ -54,6 +54,7 @@ land next to should not be the one that can end the account.
 | **Wizards** | guided setup and the other walkthroughs | one card each is too small to be a destination |
 | **Categorization** | LLM settings + rules | both answer "how does a transaction get its category" |
 | **System health** | Doctor's check groups, one card each | a single wrapper card reads as one wall |
+| **Integrations** | webhooks, read-scoped tokens, the read endpoints | what the instance tells other programs — owner only, next to what it tells people |
 
 Old ids redirect rather than 404: `setup`, `planning` and `general` →
 `wizards`, `llm` and `rules` → `categorize`, and a `#sec-<id>` hash is

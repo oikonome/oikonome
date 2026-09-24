@@ -298,7 +298,12 @@ output; only a run with `OIKONOME_ASSUME_YES` set — the bounded snapshot
 the admin console's host agent takes — redacts one-time links) — instead
 of being emailed. The daily email's
 clickable Oikonome header uses the same base URL to link back to your
-instance's Today page.
+instance's Today page, and so do the one-tap buttons in its **Needs you**
+section (confirm a proposed bill, file an uncategorized charge, mute an
+alert). Recurring mail only links to a base URL that is `https` on a real
+domain — a bare IP or a `.lan`/`.local` name is what spam filters drop
+silently — so a LAN-only install gets the same email with the section as
+plain text and no buttons.
 
 ## HTTPS (optional)
 
@@ -356,6 +361,17 @@ browser, or the other way round.)
 
 Set up HTTPS first if you'll use it away from the LAN. A phone that has to
 reach the instance over a VPN or Tailscale works the same way.
+
+The native app also carries a home-screen widget — today's number and
+verdict on the launcher or lock screen (see the Today guide). The
+installed web app has no widget.
+
+## Other programs (optional)
+
+Webhooks, a Prometheus `/metrics` endpoint, Home Assistant sensors and a
+local MCP server for an AI assistant are all in **Settings →
+Integrations**, each on a read-only token you mint there. Nothing to set
+in `.env`. See [integrations.md](integrations.md).
 
 ## Upgrades
 

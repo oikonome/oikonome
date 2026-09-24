@@ -142,6 +142,13 @@ class RetirementApiTests(unittest.TestCase):
                     "spend_now", "growth_path", "grow_to_67", "stress",
                     "stress_ref_age", "hist", "inputs"):
             self.assertIn(key, body)
+        # $4,750 against the default target: no age works, so the page is
+        # told what saving would make one work (a list, possibly empty)
+        self.assertIsNone(body["earliest"])
+        self.assertIsInstance(body["catch_up"], list)
+        for c in body["catch_up"]:
+            self.assertEqual(set(c), {"age", "extra_monthly"})
+            self.assertGreater(c["extra_monthly"], 0)
         inp = body["inputs"]
         self.assertEqual(inp["age"],
                          retirement.age_from_birthdate("1975-03-04"))

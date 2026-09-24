@@ -27,7 +27,7 @@ from __future__ import annotations
 import io
 import logging
 
-from . import model_categorize
+from . import merchant_sql, model_categorize
 
 log = logging.getLogger(__name__)
 
@@ -65,7 +65,7 @@ def training_pairs(conn) -> list[tuple[str, str]]:
     # three forms OR'd together — is quadratic with no index to save it, and
     # on a large ledger it runs for hours inside the nightly sweep.
     rows = conn.execute(
-        """WITH labeled AS (
+        f"""WITH labeled AS (
                SELECT merchant, category_primary, classified_at
                  FROM merchant_categories
                 WHERE source IN ('user', 'llm')
@@ -86,8 +86,7 @@ def training_pairs(conn) -> list[tuple[str, str]]:
                  FROM transactions t
                  LEFT JOIN merchants m ON m.id = t.merchant_id
                  LEFT JOIN merchant_canonical a
-                        ON a.raw_merchant = COALESCE(t.merchant_outlet,
-                                                     t.merchant_name, t.name)
+                        ON a.raw_merchant = {merchant_sql.RAW_KEY}
                 WHERE t.removed = 0),
            latest AS (
                SELECT DISTINCT ON (key) key, name AS sample_name

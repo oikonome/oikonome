@@ -149,6 +149,12 @@ export const MOBILE_HOMES: [string, string][] = [
   ["accounts", "Accounts"], ["more", "More"],
 ];
 
+export interface Continuity {
+  note: string; prepared_for: string;
+  mail_configured: boolean; members_only: boolean; members: string[];
+  note_max: number;
+}
+
 export interface Me {
   // the household's daily-email schedule + whether THIS login is muted
   daily_email?: { on: boolean; hour: number; summary: boolean;
@@ -193,6 +199,9 @@ export interface Me {
   // account creation time (ISO) — the SPA holds the verify
   // banner until this is ≥3 days old
   created_at: string | null;
+  // when the nightly sweep freezes a never-confirmed household (ISO);
+  // null unless hosted, unverified and nobody here ever confirmed
+  verify_deadline: string | null;
   // hosted account must enroll a second factor before use;
   // recovery_codes_left drives the Settings low-codes nudge
   needs_2fa: boolean;
@@ -229,6 +238,17 @@ export interface Invite {
 }
 export interface Member {
   id: string; email: string; role: string; created_at: string; me: boolean;
+}
+// the household activity log: one hand-authored act per row, the sentence
+// composed by the server so every client reads the same words
+export interface ActivityRow {
+  id: string; at: string; actor: string; actor_user_id: string | null;
+  kind: string; action: string; target: string | null; label: string;
+  summary: string; detail: Record<string, unknown> | null;
+}
+export interface ActivityPage {
+  rows: ActivityRow[]; more: boolean; next: string | null;
+  actors: string[]; kinds: string[];
 }
 export interface Alert {
   kind: string; severity: string; message: string;
@@ -541,8 +561,18 @@ export interface BillDetail {
   cadences: [string, string][];
 }
 
+// what the ledger holds under one side of a merge offer, read live
+export interface MergeSideFacts {
+  rows: number; total: number; first?: string | null; last?: string | null;
+  typical?: number | null; category?: string | null; city?: string | null;
+  accounts: string[];
+  recent: { date: string; amount: number; line: string; account?: string | null }[];
+}
 export interface MergeProposal {
   id: string; from: string; into: string; from_id: string; into_id: string;
+  // the surviving merchant's own name — `into` is the brand on a chain offer
+  into_name?: string;
+  from_facts?: MergeSideFacts | null; into_facts?: MergeSideFacts | null;
   from_logo?: string | null; into_logo?: string | null;
   from_rows?: number | null; into_rows?: number | null;
   from_samples: string[]; into_samples: string[];
@@ -675,14 +705,81 @@ export interface FeesReport {
   total: number;
   _built_at?: string;
 }
+/** Interest and fees paid on bank and card accounts, by year — what
+ *  holding money costs, net of what the bank refunded. Empty `by_year`
+ *  means the section has nothing to say. */
+export interface CashCostYear {
+  year: string; interest: number; fees: number; refunds: number; net: number;
+  // [name, amount, date, kind] of the year's largest charge
+  biggest: [string, number, string, "interest" | "fee"] | null;
+}
+export interface CashCostsReport {
+  by_year: CashCostYear[];
+  ytd: CashCostYear | null;
+  interest_ever: number;
+  earned_ytd: number;
+  // [name, amount, date, kind, account] of the newest charge
+  latest: [string, number, string, "interest" | "fee", string] | null;
+  _built_at?: string;
+}
 
 // ---- retirement (/api/retirement) ----
 export interface RetirementInputs {
   age: number; spend: number; ret: number; infl: number; end: number;
   ssage: number; employer_mo: number; taxable_mo: number; resume: number;
   stockpct: number; saving_yr: number; your_ss: number; has_sched: boolean;
+  // the cash bucket's nominal yield in %; null = keeps pace with
+  // inflation (0% real), the default
+  cash: number | null;
 }
+// GET /api/debt-plan — every card and loan with a balance, on one schedule
+export type DebtMethod = "avalanche" | "snowball";
+export interface DebtRow {
+  id: string; name: string; kind: "card" | "mortgage" | "loan";
+  mask: string | null; institution: string | null;
+  balance: number;
+  apr: number; apr_source: "issuer" | "you" | "none";
+  apr_issuer: number | null;
+  min_payment: number; min_source: "issuer" | "you" | "estimate";
+  min_issuer: number | null;
+  // a mortgage servicer's whole monthly payment, escrow included; the
+  // plan walks principal and interest only (min_payment)
+  payment_reported?: number | null;
+  skip: boolean;
+}
+export interface DebtSchedule {
+  method: DebtMethod; extra: number;
+  months: number | null;            // null = not within fifty years
+  debt_free: string | null;         // ISO day of the last payment
+  total_interest: number; total_paid: number;
+  monthly: number;                  // every minimum + the extra
+  starting: number;
+  growing: boolean;                 // the minimums do not cover the interest
+  series: [string, number][];       // today, then each month's first
+  debts: { id: string; order: number; paid_off: string | null;
+           interest: number; paid: number; remaining: number }[];
+}
+export interface DebtPlan {
+  today: string;
+  method: DebtMethod; extra_monthly: number;
+  saved: { method: DebtMethod; extra_monthly: number };
+  debts: DebtRow[];
+  plan: DebtSchedule;               // the chosen method
+  alt: DebtSchedule;                // the other method, same money
+  minimums: DebtSchedule;           // minimums only, nothing rolled
+  estimated: boolean;               // some input is a labelled estimate
+}
+export interface DebtPlanSave {
+  method: DebtMethod; extra_monthly: number | string;
+  debts: Record<string, { apr?: number | string | null;
+                          min_payment?: number | string | null;
+                          skip?: boolean }>;
+}
+
 export interface RetirementData {
+  // null while some age works; otherwise the extra monthly saving, from
+  // now, that would make each listed age work (empty: no saving would)
+  catch_up?: { age: number; extra_monthly: number }[] | null;
   buckets: { cash: number; taxable: number; td: number; roth: number; total: number };
   rows: { age: number; at_retire: number; feasible: boolean;
           fail_age: number | null; max_spend: number; hist_pct: number | null }[];
@@ -769,10 +866,30 @@ export type WizardStep =
   "connect" | "bills" | "budgets" | "email" | "finish"
   // legacy marks still accepted by the API if present in old configs
   | "sync" | "import";
-// script tokens — plaintext appears only in the mint response
+// script tokens — plaintext appears only in the mint response.
+// scope: push = the import doors (a collector); read = the integrations
+// doors (a scraper, a sensor, an MCP server). Never both.
+export type TokenScope = "push" | "read";
 export interface ApiToken {
   id: string; name: string; created_at: string;
   last_used_at: string | null; revoked_at: string | null;
+  scope: TokenScope;
+}
+
+// outbound webhooks (Settings → Integrations) — the secret appears only
+// in the create and rotate responses
+export interface Webhook {
+  id: string; url: string; name: string; events: string[]; enabled: boolean;
+  created_at: string; created_by: string;
+  last_attempt_at: string | null; last_status: number | null;
+  last_error: string | null; failures: number; disabled_reason: string | null;
+}
+export interface WebhookEvent { name: string; description: string }
+export interface WebhookDelivery {
+  id: string; event: string; state: "pending" | "delivered" | "failed";
+  attempts: number; next_attempt_at: string; created_at: string;
+  delivered_at: string | null; response_status: number | null;
+  last_error: string | null;
 }
 
 export interface Onboarding {
@@ -832,6 +949,9 @@ export interface DoctorCheck {
   progress?: number; busy?: boolean;
   detail: string;
 }
+
+/** One part of a hand-split charge (Txn.split) */
+export type SplitPart = { category: string; amount: number };
 
 export interface ReceiptItem {
   line: number; description: string; qty: number | null; amount: number;
@@ -1280,7 +1400,6 @@ export const api = {
   // how a person without an account (or locked out of one) gets help
   // on this instance — public, read before any login
   access: () => req<{ hosted: boolean; signup_path: string | null;
-                      request_access_path: string | null;
                       site_url: string | null;
                       support_email: string | null }>("/api/access"),
   demoLogin: () =>
@@ -1336,7 +1455,11 @@ export const api = {
           // bucket listing: the verdict grouping the rows were counted in
           // ('food', 'other', or a custom bucket's name) and the name to
           // show for it, so the page states the scope in the plan's words
-          bucket?: string; bucket_label?: string }>(
+          bucket?: string; bucket_label?: string;
+          // the figure the label wore (reimbursements netted, envelope
+          // overflow counted as the plan counts it) and whether the door
+          // was a month's or a whole year's
+          bucket_amount?: number; bucket_scope?: "month" | "year" }>(
       "/api/transactions?" + new URLSearchParams(params)),
   // Merchants: the display name, the raw strings under it, and the
   // journal of user-made changes so each is undoable.
@@ -1446,9 +1569,27 @@ export const api = {
   tokens: () => req<{ tokens: ApiToken[] }>("/api/tokens"),
   // both are elevation-gated (a durable credential): no password in the
   // body — the wrapper's sheet is the proof
-  tokenMint: (name: string) =>
-    json<ApiToken & { token: string }>("/api/tokens", { name }),
+  tokenMint: (name: string, scope: TokenScope = "push") =>
+    json<ApiToken & { token: string }>("/api/tokens", { name, scope }),
   tokenRevoke: (id: string) => json("/api/tokens/revoke", { id }),
+  // outbound webhooks — create and a new URL are elevation-gated (the
+  // ledger gets posted there); the rest are plain owner doors
+  webhooks: () =>
+    req<{ webhooks: Webhook[]; events: WebhookEvent[] }>("/api/webhooks"),
+  webhookCreate: (body: { url: string; events: string[]; name: string }) =>
+    json<Webhook & { secret: string }>("/api/webhooks", body),
+  webhookUpdate: (id: string, body: Partial<Pick<Webhook,
+                  "url" | "events" | "name" | "enabled">>) =>
+    json<Webhook>(`/api/webhooks/${id}`, body),
+  webhookDelete: (id: string) => json(`/api/webhooks/${id}/delete`, {}),
+  webhookTest: (id: string) =>
+    json<{ ok: boolean; status: number | null; error: string | null }>(
+      `/api/webhooks/${id}/test`, {}),
+  webhookRotate: (id: string) =>
+    json<Webhook & { secret: string }>(`/api/webhooks/${id}/rotate`, {}),
+  webhookDeliveries: (id: string) =>
+    req<{ deliveries: WebhookDelivery[] }>(
+      `/api/webhooks/${id}/deliveries?limit=20`),
   sessions: () => req<{ sessions: Session[] }>("/api/sessions"),
   // mobile devices (long-lived app credentials, revocable like sessions)
   devices: () => req<{ devices: MobileDevice[] }>("/api/devices"),
@@ -1535,6 +1676,21 @@ export const api = {
   },
   receiptDelete: (id: string) =>
     req<{ ok: boolean }>(`/api/receipts/${id}`, { method: "DELETE" }),
+  // one charge, several categories: the parts a person wrote for a row
+  // (stored category keys + cent-exact amounts summing to the charge). PUT
+  // replaces the whole split; the server answers 400 with the reason in
+  // words when the parts do not add up or one is a flow category.
+  txnSplitSet: (txnId: string, parts: SplitPart[]) =>
+    req<{ ok: boolean; split: SplitPart[] }>(
+      `/api/transactions/${encodeURIComponent(txnId)}/split`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ parts }),
+      }),
+  txnSplitClear: (txnId: string) =>
+    req<{ ok: boolean; split: null }>(
+      `/api/transactions/${encodeURIComponent(txnId)}/split`,
+      { method: "DELETE" }),
   receiptParse: (id: string) =>
     json<{ status: string }>(`/api/receipts/${id}/parse`, {}),
   receiptTag: (id: string, line: number, tag: string) =>
@@ -1621,9 +1777,20 @@ export const api = {
   // one — a cross-site link would ride the Lax cookie. So the browser
   // first steps up here (same proof as the connections bundle) for a
   // one-shot ticket, then navigates to the returned URL within a minute.
-  exportTicket: (kind: "zip" | "dump") =>
+  exportTicket: (kind: "zip" | "dump" | "continuity") =>
     json<{ ok: boolean; token: string; url: string; expires_in: number }>(
       "/api/export/token", { kind }),
+  // the continuity packet: the household's money on paper for whoever is
+  // left to run it. Two fields the owner writes, plus what the email door
+  // will accept; the PDF itself rides the export ticket (kind
+  // "continuity") and the emailed copy steps up like the download.
+  continuity: () => req<Continuity>("/api/continuity"),
+  continuitySave: (body: { note?: string; prepared_for?: string }) =>
+    req<Continuity>("/api/continuity", {
+      method: "PUT", headers: { "content-type": "application/json" },
+      body: JSON.stringify(body) }),
+  continuityEmail: (to: string) =>
+    json<{ ok: boolean; to: string }>("/api/continuity/email", { to }),
   connectionsImport: async (file: File, passphrase: string) => {
     const fd = new FormData();
     fd.set("passphrase", passphrase);
@@ -1723,6 +1890,11 @@ export const api = {
     json("/api/invite/claim", { token, email, password }),
   members: () => req<{ users: Member[]; assignable_roles: string[] }>(
     "/api/users"),
+  // who changed which category, bill, note… and when — newest first;
+  // `before` pages by the last row's timestamp, kind/who/target filter
+  activity: (params: Record<string, string> = {}) =>
+    req<ActivityPage>("/api/activity"
+      + (Object.keys(params).length ? "?" + new URLSearchParams(params) : "")),
   // moving somebody between member and view-only. Elevation-gated like
   // the other durable grants — the same proof removing them asks for.
   memberSetRole: (id: string, role: string) =>
@@ -1981,7 +2153,7 @@ export const api = {
       `/api/reimburse/${encodeURIComponent(id)}/candidates` +
       (q ? `?q=${encodeURIComponent(q)}` : "")),
   reimbLink: (txn_id: string, other_ids: string[], partial = false) =>
-    json<{ linked: number; errors: string[] }>(
+    json<{ linked: number; errors: string[]; notes?: string[] }>(
       "/api/reimburse/link", { txn_id, other_ids, partial }),
   reimbPairs: () => req<{ pairs: ReimbPair[] }>("/api/reimburse/pairs"),
   reimbUnlink: (expense_id: string, reimburse_id: string) =>
@@ -2048,10 +2220,16 @@ export const api = {
   reportIncomeWindow: (range: FlowKey) =>
     req<IncomeWindow>(`/api/reports/income/window?range=${range}`),
   reportFees: () => req<FeesReport>("/api/reports/fees"),
+  reportCashCosts: () => req<CashCostsReport>("/api/reports/cash-costs"),
   // retirement what-if — params are query-string overrides of the inputs
   retirement: (params: Record<string, string> = {}) =>
     req<RetirementData>("/api/retirement" +
       (Object.keys(params).length ? "?" + new URLSearchParams(params) : "")),
+  // debt payoff planner — method/extra are what-if overrides, unsaved
+  debtPlan: (params: Record<string, string> = {}) =>
+    req<DebtPlan>("/api/debt-plan" +
+      (Object.keys(params).length ? "?" + new URLSearchParams(params) : "")),
+  debtPlanSave: (body: DebtPlanSave) => json<DebtPlan>("/api/debt-plan", body),
   // bill CRUD (/api/bills/*)
   billsBill: (payee: string) =>
     req<BillDetail>(`/api/bills/bill?payee=${encodeURIComponent(payee)}`),

@@ -53,10 +53,15 @@ export default function RetireWizard({
       // a birthdate saved here moves the model's starting age; the
       // projection fetched before it is the one the page would keep showing
       qc.invalidateQueries({ queryKey: ["retirement"] });
-      const params: Record<string, string> = {
-        age, spend, employer_mo: employer, taxable_mo: taxable,
-        ret, infl, end,
-      };
+      // A cleared box means "use the default", so it is left out of the
+      // query rather than sent as an empty value — the adjust panel does
+      // the same.
+      const params: Record<string, string> = Object.fromEntries(
+        Object.entries({
+          age, spend, employer_mo: employer, taxable_mo: taxable,
+          ret, infl, end,
+        }).map(([k, v]) => [k, v.trim()] as [string, string])
+          .filter(([, v]) => v !== ""));
       onDone(params);
     },
     onError: (e) => setErr(errText(e)),

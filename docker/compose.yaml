@@ -158,6 +158,9 @@ services:
       # 1 = routing-only pushes: the daily verdict line never leaves the instance
       OIKONOME_PUSH_CONTENT_FREE: ${OIKONOME_PUSH_CONTENT_FREE:-}
       OIKONOME_DELETE_GRACE_DAYS: ${OIKONOME_DELETE_GRACE_DAYS:-7}
+      # hosted: signups nobody ever confirmed are reminded on day 7 and
+      # frozen on this day (0 = off); the nightly sweep reads it
+      OIKONOME_UNVERIFIED_REAP_DAYS: ${OIKONOME_UNVERIFIED_REAP_DAYS:-30}
       # Connection-pool sizing. Documented in .env.example and read by the
       # app, so they must be forwarded explicitly — otherwise setting them
       # does nothing, including the managed-PG step-up procedure that tells
@@ -275,6 +278,9 @@ services:
       # 1 = routing-only pushes: the daily verdict line never leaves the instance
       OIKONOME_PUSH_CONTENT_FREE: ${OIKONOME_PUSH_CONTENT_FREE:-}
       OIKONOME_DELETE_GRACE_DAYS: ${OIKONOME_DELETE_GRACE_DAYS:-7}
+      # hosted: signups nobody ever confirmed are reminded on day 7 and
+      # frozen on this day (0 = off); the nightly sweep reads it
+      OIKONOME_UNVERIFIED_REAP_DAYS: ${OIKONOME_UNVERIFIED_REAP_DAYS:-30}
       # Connection-pool sizing. Documented in .env.example and read by the
       # app, so they must be forwarded explicitly — otherwise setting them
       # does nothing, including the managed-PG step-up procedure that tells

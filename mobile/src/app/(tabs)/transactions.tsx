@@ -17,8 +17,8 @@ import TxnRow from "../../components/txn-row";
 import { errText, setHandedOffTxn, Txn, TxnPage, TxnQuery }
   from "../../lib/api";
 import { patchQueries } from "../../lib/cache";
-import { DayHead, TREND_RANGES, withDayHeads, catLabel, filterCategories,
-         ledgerRange } from "../../lib/pure";
+import { DayHead, RANGE_LABEL, TREND_RANGES, withDayHeads, catLabel,
+         filterCategories, ledgerRange } from "../../lib/pure";
 import { useSession } from "../../lib/session";
 import { useViewer } from "../../lib/viewer";
 import { C, mmddyy, money } from "../../lib/theme";
@@ -63,7 +63,10 @@ export default function Transactions() {
   // the sheet is not — it searches all history, as it always has — so
   // this can't be derived from `cat` alone. (web: monthScope)
   const [monthScope, setMonthScope] = useState(
-    !!(sp.bucket || (sp.cat && sp.y && sp.m)));
+    !!((sp.bucket && sp.m) || (sp.cat && sp.y && sp.m)));
+  // a YEAR's bucket — the year lens's money map label: y with no m, the
+  // bucket over the year's budgeted months as one listing (web: yearScope)
+  const [yearScope, setYearScope] = useState(!!(sp.bucket && sp.y && !sp.m));
   const [reimbF, setReimbF] = useState(false);
   const [dateFrom, setDateFrom] = useState(str(sp.date_from));
   const [dateTo, setDateTo] = useState(str(sp.date_to));
@@ -84,7 +87,8 @@ export default function Transactions() {
     setDateTo(str(sp.date_to));
     setYm({ y: Number(sp.y) || now.getFullYear(),
             m: Number(sp.m) || now.getMonth() + 1 });
-    setMonthScope(!!(sp.bucket || (sp.cat && sp.y && sp.m)));
+    setMonthScope(!!((sp.bucket && sp.m) || (sp.cat && sp.y && sp.m)));
+    setYearScope(!!(sp.bucket && sp.y && !sp.m));
     setPage(1);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [linkKey]);
@@ -126,7 +130,8 @@ export default function Transactions() {
                        || channel || checksF);
   const params: TxnQuery = {
     ...(bucket
-      ? { bucket, y: String(ym.y), m: String(ym.m), page: String(page),
+      ? { bucket, y: String(ym.y), page: String(page),
+          ...(yearScope ? {} : { m: String(ym.m) }),
           ...(asOf ? { as_of: asOf } : {}) }
       : searching
       ? { q: search, acct, cat, page: String(page),
@@ -306,12 +311,12 @@ export default function Transactions() {
     || (bucket === "food" ? "Food"
         : bucket === "other" ? "Everything else" : bucket);
   const scopeChip = bucket
-    ? `${bucketLabel} · ${monthShort}`
+    ? `${bucketLabel} · ${yearScope ? ym.y : monthShort}`
     : cat && monthScope ? `${catLabel(cat)} · ${monthShort}` : null;
   // ✕ on the chip drops the grouping and keeps the month it named
   const clearScope = () => {
     setBucket(""); setAsOf(""); setCounted(false); setCat("");
-    setMonthScope(false); setPage(1);
+    setMonthScope(false); setYearScope(false); setPage(1);
   };
   // every filter in force, as a removable chip under the search box — the
   // sheet can be closed and the list still says what is shaping it
@@ -352,12 +357,13 @@ export default function Transactions() {
   // one would otherwise look broken. (web: leaveScope)
   const leaveScope = () => {
     setBucket(""); setAsOf(""); setCounted(false); setMonthScope(false);
+    setYearScope(false);
   };
   // every filter change starts back at page 1 and leaves that scope
   const refilter = () => { setPage(1); leaveScope(); };
   const clearAll = () => {
     setAcct(""); setCat(""); setBucket(""); setAsOf(""); setCounted(false);
-    setMonthScope(false);
+    setMonthScope(false); setYearScope(false);
     setReimbF(false); setQ(""); setSearch("");
     setDateFrom(""); setDateTo(""); setOwner(""); setScope("");
     setChannel(""); setChecksF(false); setPage(1);
@@ -395,8 +401,12 @@ export default function Transactions() {
         </Pressable>
       </View>
       {active.length > 0 && (
+        // a ScrollView grows by default, so in this flex column the strip
+        // would split the list's height with it and every chip stretched
+        // to fill; the strip is exactly one chip tall
         <ScrollView horizontal showsHorizontalScrollIndicator={false}
-                    keyboardShouldPersistTaps="handled">
+                    keyboardShouldPersistTaps="handled"
+                    style={{ flexGrow: 0, flexShrink: 0 }}>
           <View style={{ flexDirection: "row", gap: 6 }}>
             {active.map((f) => (
               <Pressable key={f.key} style={[s.chip, s.chipOn]}
@@ -481,6 +491,16 @@ export default function Transactions() {
                   {money(-(d0.amount_sum ?? 0))}
                 </Text>
                 <Text style={s.heroMut}> total</Text>
+                {/* the figure the label wore, when the raw sum of its
+                    rows is not it: reimbursements netted, an envelope's
+                    overflow counted only past the envelope */}
+                {bucket && d0.bucket === bucket && d0.bucket_amount != null
+                  && Math.abs(d0.bucket_amount - (d0.amount_sum ?? 0)) >= 0.005 ? (
+                  <Text style={s.heroMut}>
+                    {" · counted as "}
+                    <Text style={{ color: C.text }}>{money(d0.bucket_amount)}</Text>
+                  </Text>
+                ) : null}
                 {(d0.biz_count ?? 0) > 0 && scope !== "business" ? (
                   <Text style={s.heroMut}>
                     {" "}· {d0.biz_count} business (not in the total)</Text>
@@ -739,9 +759,10 @@ export default function Transactions() {
           {summary}{query.isFetching ? " · updating…" : ""}
         </Text>
         <Text style={s.lbl}>Date range</Text>
-        {/* the site-wide 3m … All vocabulary, the same six windows every
-            over-time toggle offers; a picked from/to that matches none of
-            them lights nothing, and All is the no-date-filter state */}
+        {/* the site-wide This month … All vocabulary, the same eight
+            windows every over-time toggle offers; a picked from/to that
+            matches none of them lights nothing, and All is the
+            no-date-filter state */}
         <View style={{ flexDirection: "row", gap: 6, flexWrap: "wrap" }}>
           {TREND_RANGES.map((r) => {
             const v = ledgerRange(r, now);
@@ -753,7 +774,7 @@ export default function Transactions() {
                            // question from "this bucket, this month"
                            setDateFrom(v.from); setDateTo(v.to); refilter();
                          }}>
-                <Text style={s.chipText(on)}>{r === "all" ? "All" : r}</Text>
+                <Text style={s.chipText(on)}>{RANGE_LABEL[r]}</Text>
               </Pressable>
             );
           })}

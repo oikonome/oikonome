@@ -44,7 +44,8 @@ won't fight you.
   charges are that merchant's rows within an amount tolerance. Renaming
   or merging the merchant keeps the bill paid. Only a bill with no
   merchants on it falls back to matching words in the transaction's
-  text. The app offers additions to a bill's merchants (a renamed payee,
+  text (an apostrophe doesn't matter there: a bill named "Juniper's
+  Market" finds the charge a bank prints as "JUNIPERS MARKET"). The app offers additions to a bill's merchants (a renamed payee,
   a sibling spelling) as proposals you approve; it never widens a bill on
   its own. Such a proposal reads "add merchant · Northwind — add to bill
   “Northwind Headquarters”", followed by how many charges that merchant
@@ -162,7 +163,8 @@ vanish — so a new bill is never proposed off one.
 
 Click a payee for its full history: every charge (with the same
 recategorize / reimbursement / business-flag / receipt controls as the
-Transactions page) over the usual 3m · 6m · 1y · 3y · 5y · All picker —
+Transactions page) over the usual This month · 1m · 3m · 6m · 1y · 3y ·
+5y · All picker —
 All by default, so the list agrees with the lifetime total — monthly
 totals, the lifetime total, and
 **Avg / mo (active)** — the average over months that actually had

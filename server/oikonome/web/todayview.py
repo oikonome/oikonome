@@ -52,22 +52,9 @@ _env = Environment(loader=ChoiceLoader(
                    autoescape=select_autoescape(["html"]))
 _env.globals.update(charts=charts, money=charts._money)
 # hosted() — templates show hosted-only chrome (the login page's
-# request-access link); a callable so env flips need no restart
+# "create an account" link); a callable so env flips need no restart
 import os as _os  # noqa: E402
 _env.globals.update(hosted=lambda: env_flag("OIKONOME_HOSTED"))
-# intake_open() — the request-access link only shows when an installed
-# add-on registers an intake path; absent by default.
-# Same predicate /api/access and an add-on's intake route use (including
-# its DEV_MODE override) so the web login page and the native sign-in
-# screen can't disagree about the door; imported lazily — app imports us.
-
-
-def _intake_path():
-    return _ext.gate.intake_path()
-
-
-_env.globals.update(intake_open=lambda: bool(_intake_path()),
-                    intake_path=_intake_path)
 # signup_open() — hosted self-service signup (OIKONOME_OPEN_SIGNUP); the
 # login page offers "Create an account" only then.
 _env.globals.update(signup_open=lambda: env_flag("OIKONOME_OPEN_SIGNUP"))
@@ -492,6 +479,12 @@ def allowances(st: dict) -> tuple[dict, list, list]:
         entry["to"] = _ledger(st, "food" if label == "Food"
                               else "other" if label == "Everything else"
                               else label)
+    # the Why's per-bucket lines name the same buckets, so they open the
+    # same doors (the web and the app link them from their own tile map)
+    for e in (st.get("why") or {}).get("entries") or []:
+        e["to"] = _ledger(st, "food" if e["name"] == "Food"
+                          else "other" if e["name"] == "Everything else"
+                          else e["name"])
     return allow, allow_kids, tiles
 
 

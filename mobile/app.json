@@ -2,7 +2,7 @@
   "expo": {
     "name": "Oikonome",
     "slug": "oikonome",
-    "version": "1.2.6",
+    "version": "1.2.9",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "oikonome",
@@ -72,7 +72,30 @@
           "faceIDPermission": "Unlock Oikonome with Face ID so your financial data stays behind the same lock as your phone."
         }
       ],
-      "./plugins/with-android-upload-signing.js"
+      "./plugins/with-android-upload-signing.js",
+      [
+        "react-native-android-widget",
+        {
+          "widgets": [
+            {
+              "name": "Glance",
+              "label": "Left today",
+              "description": "What's still spendable today, and the day's verdict.",
+              "minWidth": "110dp",
+              "minHeight": "110dp",
+              "targetCellWidth": 2,
+              "targetCellHeight": 2,
+              "maxResizeWidth": "400dp",
+              "maxResizeHeight": "180dp",
+              "resizeMode": "horizontal",
+              "previewImage": "./assets/images/widget-glance-preview.png",
+              "updatePeriodMillis": 1800000
+            }
+          ]
+        }
+      ],
+      "./plugins/with-widget-sharing.js",
+      "@bacons/apple-targets"
     ],
     "experiments": {
       "typedRoutes": true,

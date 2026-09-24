@@ -231,6 +231,26 @@ class OffersAreDecidedByThePerson(unittest.TestCase):
         self.assertTrue(all(o["signals"] for o in offers))
         self.assertEqual(mm.run(self.conn)["inserted"], 0)
 
+    def test_an_offer_carries_each_sides_facts_so_they_can_be_told_apart(self):
+        """Each side of an offer says what the ledger holds under it today —
+        rows, total, dates, the usual charge, and its latest bank lines with
+        the account — and a side's facts never borrow the other side's rows."""
+        mm.run(self.conn)
+        o = next(o for o in mm.pending(self.conn) if o["from"] == "Ashbury Harve")
+        f, i = o["from_facts"], o["into_facts"]
+        self.assertEqual((f["rows"], i["rows"]), (3, 5))
+        self.assertEqual((f["total"], i["total"]), (73.5, 122.5))
+        self.assertEqual(f["typical"], 24.5)
+        self.assertEqual(f["category"], "FOOD AND DRINK")
+        self.assertEqual(f["last"], str(TODAY - dt.timedelta(days=1)))
+        self.assertEqual(f["first"], str(TODAY - dt.timedelta(days=19)))
+        self.assertEqual([r["line"] for r in f["recent"]], ["ASHBURY HARVE"] * 3)
+        self.assertEqual(len(i["recent"]), mm.RECENT_SHOWN)
+        self.assertEqual(f["recent"][0]["date"], f["last"])
+        self.assertTrue(f["recent"][0]["account"])
+        self.assertEqual(f["accounts"], ["Test Card"])
+        self.assertEqual(o["into_name"], "Ashbury Harvest Market")
+
     def test_approving_merges_through_the_journal_and_is_undoable(self):
         from oikonome.engine import merchant_dedup
         mm.run(self.conn)
@@ -289,6 +309,23 @@ class OffersAreDecidedByThePerson(unittest.TestCase):
                          line["message"])
         mm.decide(self.conn, mm.pending(self.conn)[0]["id"], "approve")
         self.assertIsNone(mm.notice(self.conn))
+
+    def test_working_the_queue_retires_the_logged_alert_at_once(self):
+        """The alert row in the log is a snapshot the Today build writes.
+        Emptying the queue from the alert's own link — approving or
+        rejecting the last offer — must resolve that row then and there,
+        or the person comes back to an alert that still says the pairs
+        are waiting."""
+        from oikonome.engine import alerts
+        mm.run(self.conn)
+        alerts.log(self.conn, alerts.build({"merge_offers": mm.notice(self.conn)}), TODAY)
+        row = lambda: [r for r in alerts.history(self.conn) if r["kind"] == "merges"][0]
+        self.assertEqual(row()["active"], 1)
+        offers = mm.pending(self.conn)
+        mm.decide(self.conn, offers[0]["id"], "reject")
+        self.assertEqual(row()["active"], 1)          # one offer still waits
+        mm.decide(self.conn, offers[1]["id"], "approve")
+        self.assertEqual(row()["active"], 0)          # queue empty: resolved
 
     def test_approving_a_chain_offer_puts_every_outlet_under_the_brand(self):
         from oikonome.engine.compat import jsonb
@@ -450,6 +487,50 @@ class OffersAreDecidedByThePerson(unittest.TestCase):
         self.assertGreaterEqual(r["true"], 2)
         self.assertEqual(r["false"], 0)
         self.assertEqual(r["precision"], 1.0)
+
+
+class _CannedRows:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def fetchall(self):
+        return self._rows
+
+
+class _SplitReadConn:
+    """A connection whose two reads disagree: the second answer names a
+    merchant the first did not. That is what READ COMMITTED gives when a
+    charge is ingested between the two statements behind an offer's side
+    facts — each statement takes its own snapshot."""
+
+    def __init__(self, *answers):
+        self._answers = list(answers)
+
+    def execute(self, sql, params=None):
+        return _CannedRows(self._answers.pop(0))
+
+
+class SideFactsSurviveALedgerThatMovesBetweenTheReads(unittest.TestCase):
+    """The Merchants page must load even when a charge lands mid-read: a
+    merchant only the second statement saw is left factless, never fatal."""
+
+    KNOWN = "11111111-1111-1111-1111-111111111111"
+    FRESH = "22222222-2222-2222-2222-222222222222"
+
+    def test_a_merchant_only_the_second_read_saw_does_not_break_the_page(self):
+        conn = _SplitReadConn(
+            [{"id": self.KNOWN, "n": 2, "total": 40.0,
+              "first": TODAY - dt.timedelta(days=9), "last": TODAY,
+              "typical": 20.0, "category": "FOOD AND DRINK",
+              "city": "Ashbury", "accounts": ["Test Card"]}],
+            [{"id": self.KNOWN, "date": TODAY, "amount": 20.0,
+              "line": "ASHBURY HARVE", "account": "Test Card"},
+             {"id": self.FRESH, "date": TODAY, "amount": 5.0,
+              "line": "ASHBURY HARVE", "account": "Test Card"}])
+        facts = mm.side_facts(conn, [self.KNOWN, self.FRESH])
+        self.assertEqual([r["amount"] for r in facts[self.KNOWN]["recent"]], [20.0])
+        # no half-stated side: without totals there is nothing honest to show
+        self.assertNotIn(self.FRESH, facts)
 
 
 if __name__ == "__main__":

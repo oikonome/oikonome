@@ -64,20 +64,29 @@ the totals)" note explains why the three figures look the way they do.
 
 ## The date range
 
-Beside the from/to boxes sit the same six range buttons every other
-over-time surface uses — **3m · 6m · 1y · 3y · 5y · All**. They are a
-shortcut into the same from/to filter, cut on calendar months: **3m** in
-September means "from July 1", the same three months Cash Flow's 3m
-covers. **All** clears both dates. Type a from/to by hand and none of the
-six lights up — the boxes are still the precise control, the buttons are
-the quick one.
+Beside the from/to boxes sit the same eight range buttons every other
+over-time surface uses — **This month · 1m · 3m · 6m · 1y · 3y · 5y ·
+All**. They are a shortcut into the same from/to filter, cut on calendar
+months: **3m** in September means "from July 1", the same three months
+Cash Flow's 3m covers; **This month** is from the 1st; **1m** is the last
+complete month, closed on its last day (in September, August 1–31).
+**All** clears both dates. Type a from/to by hand and none of the eight
+lights up — the boxes are still the precise control, the buttons are the
+quick one.
 
-On the phone the filters live in one sheet, and the same six buttons head
+On the phone the filters live in one sheet, and the same eight buttons head
 its **Date range** section, with **from** and **to** opening a calendar
 rather than asking you to type a date. **Account** and **Category** there
 are searchable drop-downs (closed accounts grouped under *Archived /
 closed*) instead of long strips of chips, and the sheet's top line keeps
 score as you go — "September 2026 · 128 transactions · $412.00 listed".
+A listing opened from a plan label (a Today tile, a money-map row, a Why
+line) says what it is in a chip — "Food · Sep 2026", or "Food · 2026"
+from the year lens — and, when the raw sum of the listed rows is not the
+number the label wore, the headline adds **counted as $X**: the plan
+nets reimbursements and counts an envelope's overflow only past the
+envelope, while the list shows whole rows.
+
 Back on the list, every filter in force shows as a chip under the search
 box: tap one to drop that filter, or **clear all** to drop them together,
 and a subhead reports what is left — "24 listed · $612.40 total for this
@@ -184,7 +193,11 @@ The same select also offers:
   string.
 - **↺ reset to source category** — deletes the override; the row falls
   back to its underlying category. If a merchant rule exists for that
-  merchant, the rule re-applies on the next categorization sweep.
+  merchant, the rule re-applies on the next categorization sweep. A
+  category you set yourself also has a one-tap way back: the **↺** beside
+  the category on the web row, and **Use automatic** on the transaction
+  screen in the app. Overrides a bill or a store match wrote keep only the
+  picker's reset.
 - **↔ mark reimbursed…** — opens the Reimbursements page to pair the
   charge with the deposit that paid it back.
 - When you have a business set up, each expense also lists that
@@ -204,6 +217,44 @@ transfers and income included — and teaches no merchant rule. It then
 reports how many it changed and, honestly, how many of those were
 transfers or income that now count as spending.
 
+## Splitting one charge across categories
+
+A single charge is often several things — the big-box run that was
+groceries and a lawn chair, the payment to a roommate that was rent and
+the power bill. Open the row's **⋯** menu and choose **✂ split across
+categories**: a panel opens under the row with one line per part
+(category + amount). Add parts, put the remainder on a line with the
+**←** button, and **Save split** once the parts add up to the charge — the
+panel refuses to save until they do, and so does the server. In the app
+the same editor is the **Split…** button on the transaction screen; its
+category sheet picks for one part at a time.
+
+Only spending can be split: a refund, a transfer, a card payment or a
+row on a loan account counts as one whole row, and the action is not
+offered there.
+
+A split row shows its parts where the category select was, with a
+**✂ split** pill; tap the parts to edit. **Remove split** hands the row
+back whole. Both the web and the app mark a split row in the ledger.
+
+What a split changes: **every per-category figure counts the parts**
+instead of the row — the Today verdict's food / everything-else buckets
+and any custom bucket, the daily email, the Cash Flow and Spending
+category totals, the Month and Year lenses, and a category filter on this
+page (the row answers to each of its parts' categories). What it leaves
+alone: totals by month, by merchant and by account, the reimbursement
+netting (a partial reimbursement is shared across the parts pro rata),
+the anomaly checks (a charge that is unusually large is judged whole),
+and the row's own category, which stays as the bank, a rule or you set
+it and comes back the moment the split is removed. A bill's matcher sees
+the parts as separate charges, so a split bill payment matches its bill
+only if one part carries the bill's amount.
+
+Parts must be spending categories — transfers, income and loan payments
+are decided for the whole row, never for a part. A pending charge that
+posts for a different amount drops its split (the parts no longer add
+up); split it again once it settles.
+
 ## Receipts
 
 Open a row's **⋯** menu and choose **attach a receipt** to add an image or
@@ -220,6 +271,13 @@ and the clip appears only when a receipt is already attached (view
 only). The server enforces it too — the writes are rejected, not just
 hidden. A **member** login edits this page exactly as the owner does;
 see the security guide for what each role can change.
+
+## Who changed it
+
+Every hand edit on a row — a category correction, a split, a note, a
+receipt, a flag — is recorded with the person and the time in the
+household's activity log: **Settings → Users → Activity** on the web,
+**More → Activity** in the app. See [Account security → Activity](security.md).
 
 ## Gotchas
 

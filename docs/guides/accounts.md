@@ -280,7 +280,10 @@ always per institution.
   credit / investment / …) — classification drives net worth grouping
   and the retirement tax buckets.
 - **Excl. from budget** (in the edit row) removes an account's
-  spending from budget math entirely — the **excl** pill marks it.
+  spending from budget math entirely — the **excl** pill marks it. The
+  cash runway leaves it out too: an excluded checking account is never
+  the runway's starting balance, and an excluded card's balance is not
+  counted as debt to cover.
 - An account with no current balance is treated as closed and moves to
   the collapsed **Archived (N)** section — hidden from daily surfaces,
   history kept. It carries a **closed** pill when its connection still

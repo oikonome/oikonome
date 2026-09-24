@@ -12,7 +12,7 @@ import { api, catLabel, money, type SpendingReport, type SpendingWindow }
   from "../api/client";
 import AreaChart from "../components/AreaChart";
 import MerchantAvatar from "../components/MerchantAvatar";
-import { CASHFLOW_RANGES, RangePicker, type Range } from "../components/RangePicker";
+import { RangePicker, type Range } from "../components/RangePicker";
 
 // how the story names the window being compared against
 export const PREV_NAME: Record<Range, string> = {
@@ -87,7 +87,7 @@ export default function SpendingSection({ range, setRange }: {
                       flexWrap: "wrap" }}>
           <h2 style={{ margin: 0 }}>Spending</h2>
           <span style={{ marginLeft: "auto" }}>
-            <RangePicker value={range} onChange={setRange} options={CASHFLOW_RANGES} />
+            <RangePicker value={range} onChange={setRange} />
           </span>
         </div>
         <div style={{ display: "flex", gap: ".5rem", alignItems: "baseline",

@@ -31,7 +31,7 @@ def _html_escape(s) -> str:
     return _htmlmod.escape(str(s or ""))
 
 from ..auth import api_tokens, device_tokens, email_verify, login_unlock, \
-    passwords, reset as reset_mod, sessions, signup_invites
+    passwords, reset as reset_mod, sessions, signup_invites, widget_tokens
 from ..db import crypto, tenancy
 from ..engine import budget
 # `FLAG=0` has to mean off: compose materializes every declared key, and a
@@ -39,6 +39,7 @@ from ..engine import budget
 # is the difference between a closed instance and an open one
 from ..envnum import env_flag
 from .. import ext
+from ..jobs import unverified as _unverified
 from . import demoguard
 from . import permissions
 from . import security
@@ -246,6 +247,15 @@ LOCKOUT_STATUSES: dict[str, tuple[int, str, tuple[str, ...]]] = {
     "pending_delete": (
         403, "this account is scheduled for deletion — contact support "
              "to cancel before the grace period ends", ()),
+    # a signup nobody ever confirmed, frozen by the nightly sweep
+    # (jobs/unverified.py) with a fresh link in the owner's inbox. The
+    # resend door stays open: the way out is the click, and a frozen
+    # session must still be able to ask for the link again.
+    _unverified.STATUS: (
+        403, "this account was never confirmed — click the confirmation "
+             "link we emailed you, or resend it; unconfirmed accounts are "
+             "deleted when the grace period ends",
+        ("/api/verify-email/resend",)),
     # An installed add-on may freeze a household under statuses of its own
     # and name the doors that stay open so the state can be escaped from
     # inside the app.
@@ -360,6 +370,42 @@ def _billing_write_blocked(sess: dict) -> bool:
     return ext.gate.write_blocked(sess["tenant_id"])
 
 
+def _lacks_second_factor(sess: dict) -> bool:
+    """True for a hosted account that has enrolled no strong factor and
+    holds no waiver — the account the forced-2FA gate refuses writes to.
+    `sess` carries `has_totp`, `second_factor_waived` and `user_id`; only
+    a TOTP-less account pays the passkey lookup."""
+    if (not env_flag("OIKONOME_HOSTED") or sess.get("has_totp")
+            or sess.get("second_factor_waived")):
+        return False
+    with _control_conn() as conn:
+        return conn.execute(
+            "SELECT 1 FROM passkeys WHERE user_id=%s LIMIT 1",
+            (sess["user_id"],)).fetchone() is None
+
+
+def write_refusal(sess: dict) -> tuple[int, str] | None:
+    """`(HTTP status, message)` when this account may not change the
+    household right now, else None — the account-standing gates
+    `current_user` applies to a write (total lockout, the billing
+    read-only state, forced 2FA), for a door that authenticates some
+    other way. The emailed action links are that door: a token minted
+    while the household was in good standing must not outlive the
+    standing, and a mail cannot be recalled once sent. No exemption
+    applies there — none of the doors a lockout leaves open is a write to
+    the household's money. `sess` is shaped like a session row
+    (tenant_id, user_id, tenant_status, has_totp, second_factor_waived)."""
+    frozen = LOCKOUT_STATUSES.get(sess.get("tenant_status"))
+    if frozen is not None:
+        return frozen[0], frozen[1]
+    if _billing_write_blocked(sess):
+        return 402, "this account is read-only right now"
+    if _lacks_second_factor(sess):
+        return 403, ("enroll a second factor (authenticator or passkey) "
+                     "before making changes")
+    return None
+
+
 # The exact doors a script token may open — push-only, as
 # docs/community-scripts.md promises ("push through the import endpoints
 # and update a manual account balance — nothing else"). A
@@ -391,10 +437,37 @@ SCRIPT_TOKEN_ALLOW = frozenset({
 # so every allowlisted door is covered without decorating each route.
 SCRIPT_TOKEN_RATE = (60, 3600.0)     # (requests, window seconds)
 
+# A READ-scoped token is the other half: the summary, metrics and query
+# doors and nothing else — it cannot import a row or touch a setting. The
+# doors are the integrations router's, matched by prefix at a segment
+# boundary, plus the Prometheus text endpoint. GET only: a read token
+# that could POST anywhere would be a write credential by another name.
+READ_TOKEN_PREFIXES = ("/api/integrations",)
+READ_TOKEN_EXACT = frozenset({("GET", "/metrics")})
+# A scraper polls every 15-60 s and a sensor refreshes on its own clock,
+# so the read budget is ten times the push one — still a bound, so a
+# leaked read token cannot be used to hammer the summary computation.
+READ_TOKEN_RATE = (600, 3600.0)
 
-def _script_token_ratelimit(request: Request) -> None:
-    n, window = SCRIPT_TOKEN_RATE
-    key = ("script-token", security.client_ip(request))
+# The one door a home-screen widget token opens: the glance payload
+# (today's verdict, the allowance left, the day bar, the bucket chips).
+# Everything else — the full Today page, the ledger, the device roster —
+# needs the device token behind the biometric gate.
+WIDGET_TOKEN_DOOR = ("GET", "/api/today/glance")
+
+
+def _read_token_allowed(method: str, path: str) -> bool:
+    if (method, path) in READ_TOKEN_EXACT:
+        return True
+    if method != "GET":
+        return False
+    return any(path == p or path.startswith(p + "/")
+               for p in READ_TOKEN_PREFIXES)
+
+
+def _script_token_ratelimit(request: Request, scope: str = "push") -> None:
+    n, window = READ_TOKEN_RATE if scope == "read" else SCRIPT_TOKEN_RATE
+    key = (f"script-token-{scope}", security.client_ip(request))
     store = security._shared_store()
     ok = store.check(key, n, window) if store else None
     if ok is None:                       # no Redis, or Redis down
@@ -406,12 +479,30 @@ def _script_token_ratelimit(request: Request) -> None:
 def current_user(request: Request) -> dict:
     auth = request.headers.get("authorization", "")
     if auth.startswith("Bearer " + api_tokens.PREFIX):
-        if (request.method, request.url.path) not in SCRIPT_TOKEN_ALLOW:
+        # The door check needs the token's scope, and the scope is on the
+        # row — but an unauthenticated caller must not be able to make the
+        # lookup do work on a path no scope could ever reach, so the union
+        # of both allowlists is checked BEFORE the lookup and the exact
+        # scope after it.
+        method, path = request.method, request.url.path
+        pushable = (method, path) in SCRIPT_TOKEN_ALLOW
+        readable = _read_token_allowed(method, path)
+        if not (pushable or readable):
             raise HTTPException(
-                403, "script tokens are limited to the import push endpoints")
-        _script_token_ratelimit(request)
+                403, "script tokens are limited to the import push endpoints "
+                     "(push scope) and the integrations read endpoints "
+                     "(read scope)")
         with _control_conn() as conn:
             row = api_tokens.lookup(conn, auth[len("Bearer "):])
+            scope = (row or {}).get("scope") or "push"
+            _script_token_ratelimit(request, scope)
+            if row is not None and not (pushable if scope == "push"
+                                        else readable):
+                raise HTTPException(
+                    403, "this token is push-scoped: it can only import"
+                    if scope == "push" else
+                    "this token is read-scoped: it can only read the "
+                    "integrations endpoints")
             # The script-token branch enforces every lockout the cookie
             # path enforces below. Returning before them would leave a
             # suspended, pending-delete or read-only
@@ -430,13 +521,36 @@ def current_user(request: Request) -> dict:
         frozen = LOCKOUT_STATUSES.get(status)
         if frozen is not None:
             raise HTTPException(frozen[0], frozen[1])
-        if _billing_write_blocked({"tenant_id": row["tenant_id"]}):
+        # the billing read-only state stops WRITES; a read token reads,
+        # exactly as a signed-in session still can in that state
+        if scope == "push" and _billing_write_blocked(
+                {"tenant_id": row["tenant_id"]}):
             raise HTTPException(402, "this account is read-only until "
                                      "billing is resolved")
+        # a push token acts as the owner on its doors (an import is an
+        # owner act); a read token is a viewer — it may look and nothing
+        # more, and every write gate already refuses that role
         return {"user_id": row["created_by"], "tenant_id": row["tenant_id"],
-                "email": f"script:{row['name']}", "role": "owner",
-                "script_token": True}
-    if auth.startswith("Bearer " + device_tokens.PREFIX):
+                "email": f"script:{row['name']}",
+                "role": "owner" if scope == "push" else "viewer",
+                "script_token": True, "token_scope": scope}
+    if auth.startswith("Bearer " + widget_tokens.PREFIX):
+        # a home-screen widget token is a CHILD of a device token that
+        # can reach one door — the glance payload — and nothing else. The
+        # path check comes before the lookup so an unauthenticated caller
+        # cannot make the lookup do work on a path no widget could reach,
+        # and the per-IP budget is the read-token one: a widget polls on
+        # the OS's clock, and a leaked token must not become a way to
+        # hammer the Today computation.
+        if (request.method, request.url.path) != WIDGET_TOKEN_DOOR:
+            raise HTTPException(
+                403, "widget tokens can only read the glance payload")
+        _script_token_ratelimit(request, "read")
+        with _control_conn() as conn:
+            sess = widget_tokens.lookup(conn, auth[len("Bearer "):])
+        if sess is None:
+            raise HTTPException(401, "invalid or revoked widget token")
+    elif auth.startswith("Bearer " + device_tokens.PREFIX):
         # a mobile device token is a full session equivalent (it was
         # minted BY an authenticated session, so every login defense
         # already ran) — resolve it to the same row shape and fall
@@ -499,19 +613,12 @@ def current_user(request: Request) -> dict:
     # endpoints stay open (NEEDS_2FA_OK) so they can actually enroll.
     # has_totp rides the session row; only TOTP-less users pay the passkey
     # lookup.
-    if (env_flag("OIKONOME_HOSTED")
-            and mutating
+    if (mutating
             and not path_within(request.url.path, NEEDS_2FA_OK)
-            and not sess.get("has_totp")
-            and not sess.get("second_factor_waived")):
-        with _control_conn() as conn:
-            has_passkey = conn.execute(
-                "SELECT 1 FROM passkeys WHERE user_id=%s LIMIT 1",
-                (sess["user_id"],)).fetchone() is not None
-        if not has_passkey:
-            raise HTTPException(
-                403, "enroll a second factor (authenticator or passkey) "
-                     "before making changes")
+            and _lacks_second_factor(sess)):
+        raise HTTPException(
+            403, "enroll a second factor (authenticator or passkey) "
+                 "before making changes")
     return sess
 
 
@@ -1848,6 +1955,75 @@ async def unsubscribe_act(request: Request):
     return _unsubscribe_page("done", email=email)
 
 
+def _act_page(state: str, *, sentence: str = "", button: str = "",
+              email: str = "", token: str = "", status: int = 200):
+    from fastapi.responses import HTMLResponse
+    from . import todayview
+    from ..notify import mailact
+    from .report import mailable_base
+    return HTMLResponse(
+        todayview._env.get_template("mailact.html").render(
+            title="From your email", state=state, sentence=sentence,
+            button=button, email=email, token=token,
+            app_base=mailable_base(), ttl_days=mailact.TTL_DAYS),
+        status_code=status)
+
+
+def _act_token(token: str):
+    """`(statement, state)` — the parsed token, or the page state that
+    explains why there is none."""
+    from ..notify import mailact
+    tok = mailact.parse(token)
+    if tok is not None:
+        return tok, None
+    return None, ("expired" if mailact.expired(token) else "unknown")
+
+
+@app.get("/act", dependencies=[Depends(limit("mailact", 60, 3600))])
+def act_page(token: str = ""):
+    """A button in the daily email. PEEKS ONLY: says what the button will
+    do and shows it; a mail scanner that prefetches links must not confirm
+    a bill for someone who did nothing. The change is the POST below."""
+    from ..notify import mailact
+    tok, bad = _act_token(token)
+    if bad:
+        return _act_page(bad, status=400)
+    got = mailact.describe(tok)
+    st = got["state"]
+    return _act_page(st, sentence=got.get("sentence", ""),
+                     button=got.get("button", ""), email=tok["email"],
+                     token=token,
+                     status=200 if st in ("confirm", "already") else
+                     got.get("code", 403) if st == "blocked" else
+                     403 if st == "forbidden" else
+                     503 if st == "failed" else 400)
+
+
+@app.post("/act", dependencies=[Depends(limit("mailact", 60, 3600))])
+async def act_do(request: Request):
+    """Do what the emailed button says — approve or reject a proposed
+    bill, file an uncategorized charge, mute an alert — for the address
+    the token names, if it still holds an owner or member account and
+    that account may write right now (`write_refusal`)."""
+    from ..notify import mailact
+    form_token = ""
+    try:
+        form = await request.form()
+        form_token = str(form.get("token") or "")
+    except Exception:                                      # noqa: BLE001
+        pass
+    tok, bad = _act_token(form_token or request.query_params.get("token", ""))
+    if bad:
+        return _act_page(bad, status=400)
+    got = mailact.apply(tok)
+    st = got["state"]
+    return _act_page(st, sentence=got.get("sentence", ""), email=tok["email"],
+                     status=200 if st in ("done", "already") else
+                     got.get("code", 403) if st == "blocked" else
+                     403 if st == "forbidden" else
+                     503 if st == "failed" else 400)
+
+
 @app.get("/recipient-invite",
          dependencies=[Depends(limit("recipient_invite", 30, 3600))])
 def recipient_invite_page(token: str = ""):
@@ -1960,16 +2136,14 @@ def signup_submit(request: Request, email: str = Form(...),
                       ref=ref, cf_token=cf_token)
     except HTTPException as e:
         # 503 is the capacity wall and nothing else on this door: the
-        # template then renders the sentence with its mail link live and
-        # points at the intake link when an add-on registers one, instead
-        # of a bare red line that reads as an outage.
+        # template then renders the sentence with its mail link live,
+        # instead of a bare red line that reads as an outage.
         return HTMLResponse(
             todayview._env.get_template("signup.html").render(
                 centered=True, title="Create your account", invite=invite,
                 email=email, ref=ref, error=e.detail,
                 at_capacity=(e.status_code == 503),
                 support_email=support_email(),
-                intake_open=bool(ext.gate.intake_path()),
                 turnstile_key=turnstile.render_key(),
                 invite_required=_signup_needs_invite()),
             status_code=e.status_code)
@@ -2484,9 +2658,9 @@ def _deliver_invite(email: str, signup_path: str) -> None:
     _log_link("signup invite", email, signup_path)
 
 
-def _verify_email_act(token: str):
+def _verify_email_act(token: str, reopen: bool = False):
     """Spend the verification link and say so. Shared by the emailed GET
-    and the POST (older mails and no-JS forms).
+    and the POST (the reopen button, older mails and no-JS forms).
 
     Verification is the one emailed action that is SAFE to spend on a
     GET, unlike /reset and /unlock: all it proves is that the mailbox
@@ -2495,30 +2669,46 @@ def _verify_email_act(token: str):
     link was "already used" — so a spent-but-unexpired link for a
     verified user renders the same confirmed page as a fresh one. The
     page then forwards itself to sign-in (Refresh header: the strict CSP
-    allows no inline script) so a click in the mail is the whole task."""
+    allows no inline script) so a click in the mail is the whole task.
+
+    Reopening a household the nightly sweep froze is the one thing this
+    link does NOT do on a GET — that act is `reopen`, reached only by the
+    button on the confirmed page (jobs/unverified.py explains why). The
+    page therefore has two endings: the ordinary "confirmed, off to sign
+    in", and, for a frozen household, "confirmed — now reopen it", which
+    does not forward anywhere because the person has something to press."""
     from fastapi.responses import HTMLResponse
     from . import todayview
     with _control_conn() as conn:
         row = email_verify.lookup(conn, token)
         spent = None if row else email_verify.lookup_spent(conn, token)
-    ok = False
-    if row is not None:
-        admin = tenancy.admin_connect()
-        try:
-            ok = email_verify.consume(admin, row["id"], row["user_id"])
-        finally:
-            admin.close()
-        if not ok:                                # lost a race to a twin GET
-            with _control_conn() as conn:
-                spent = email_verify.lookup_spent(conn, token)
-    if not ok and not (spent and spent["verified"]):
-        return HTMLResponse(
-            todayview._env.get_template("login.html").render(
-                centered=True, title="Verify email",
-                error="That verification link is invalid, expired, or "
-                      "already used — sign in and use “Resend” to get a "
-                      "fresh one."),
-            status_code=400)
+    ok, reopened = False, None
+    admin = tenancy.admin_connect()
+    try:
+        if row is not None:
+            ok = _unverified.confirm(admin, row["id"], row["user_id"])
+            if not ok:                            # lost a race to a twin GET
+                with _control_conn() as conn:
+                    spent = email_verify.lookup_spent(conn, token)
+        if not ok and not (spent and spent["verified"]):
+            return HTMLResponse(
+                todayview._env.get_template("login.html").render(
+                    centered=True, title="Verify email",
+                    error="That verification link is invalid, expired, or "
+                          "already used — sign in and use “Resend” to get a "
+                          "fresh one."),
+                status_code=400)
+        user_id = (row or spent)["user_id"]
+        if reopen:
+            reopened = _unverified.reopen(admin, user_id)
+        frozen = None if reopened else _unverified.frozen_household(
+            admin, user_id)
+    finally:
+        admin.close()
+    if reopened:
+        # the installed gate paused what would keep charging a frozen
+        # household; outside the transaction, like the console's restore
+        ext.gate.on_tenant_restored(reopened)
     email = (row or spent)["email"]
     if ok:
         # someone just proved this mailbox receives mail, so any bounce
@@ -2527,36 +2717,66 @@ def _verify_email_act(token: str):
         # corrected address stays dead upstream however clean the local table is.
         from ..notify import delivery as _delivery
         _delivery.clear(email)
+    headers = {} if frozen else {"Refresh": "4; url=/login?verified=1"}
     return HTMLResponse(
         todayview._env.get_template("unlock.html").render(
-            centered=True, title="Email confirmed", confirmed=True,
-            email=email),
-        headers={"Refresh": "4; url=/login?verified=1"})
+            centered=True,
+            title="Reopen this account" if frozen else "Email confirmed",
+            confirmed=True, email=email, reopened=bool(reopened),
+            # the same token the form posts back: the page is reached by
+            # holding it, and it stays valid until it expires, so the
+            # button needs nothing else to identify the household
+            reopen_token=token if frozen else "",
+            deletes_on=_unverified.notice_date(frozen["delete_after"])
+            if frozen and frozen["delete_after"] else ""),
+        headers=headers)
 
 
 @app.get("/verify-email", dependencies=[Depends(limit("verify_email", 30, 3600))])
 def verify_email(token: str = ""):
-    """The emailed link: verifies on the click — no confirm button.
-    Burns the token and stamps users.verified_at on the ADMIN
+    """The emailed link: confirms the address on the click — no confirm
+    button. Burns the token and stamps users.verified_at on the ADMIN
     connection — the app role deliberately cannot write verified_at
     (column scope). See _verify_email_act for why a GET may spend this
-    particular token."""
+    particular token, and why it may not reopen a frozen household."""
     return _verify_email_act(token)
 
 
 @app.post("/verify-email",
           dependencies=[Depends(limit("verify_email", 30, 3600))])
 def verify_email_confirm(token: str = Form("")):
-    return _verify_email_act(token)
+    """The POST behind the confirmed page's "Reopen this account" button,
+    and the no-JS twin of the GET.
+
+    It takes an emailed token — typically the one the GET that drew the
+    button just spent, but any unexpired link that mailbox was sent
+    counts, a superseded one included (jobs/unverified.reopen says why).
+    What it may reopen is only that token's own household, only while
+    that household is frozen, and only once its user is verified. Its defence against a
+    forged cross-site submit is the app's Origin check on every write,
+    which is also the whole of the reclaim door's."""
+    return _verify_email_act(token, reopen=True)
 
 
 @app.post("/api/verify-email/resend",
           dependencies=[Depends(limit("verify_resend", 3, 3600))])
 def verify_email_resend(user: dict = Depends(current_user)):
+    """Mail a fresh confirmation link.
+
+    `verified` answers "is there anything left for this account to do
+    here?", not "is the column set" — and for a household frozen for
+    never confirming there always is, even when the address itself is
+    already verified. That pairing is not exotic: a mail scanner that
+    fetched the last link, or a person who opened it and closed the page
+    without pressing the button, leaves exactly it. Answering "already
+    verified, nothing sent" there would dead-end the ONE door a frozen
+    session may open, on a household that is days from being erased —
+    so a frozen household is always mailed a fresh link."""
     with _control_conn() as conn:
         u = conn.execute("SELECT verified_at FROM users WHERE id=%s",
                          (user["user_id"],)).fetchone()
-        if u and u["verified_at"]:
+        frozen = _unverified.frozen_household(conn, user["user_id"])
+        if u and u["verified_at"] and frozen is None:
             return {"ok": True, "verified": True}
         token = email_verify.create(conn, user["user_id"])
     import threading
@@ -2653,13 +2873,21 @@ def _error_page(status: int, heading: str, message: str,
 # 404 for an unknown path raises the starlette class directly, which a
 # fastapi-subclass registration does not match — so a bad browser URL
 # would reach FastAPI's raw {"detail": "Not Found"} JSON.
+def _machine_path(path: str) -> bool:
+    """A route a program reads, never a browser: the JSON API, and the
+    Prometheus text door — a scraper handed a 303 to /login reads a
+    login page as its metrics and reports the target down without ever
+    saying why."""
+    return path.startswith("/api") or path == "/metrics"
+
+
 @app.exception_handler(StarletteHTTPException)
 async def _auth_redirect(request: Request, exc: StarletteHTTPException):
     """Page routes bounce anonymous users to /login instead of raw JSON
     and render branded 404s; API routes keep JSON errors — the SPA and
     integrations parse them."""
     from fastapi.responses import JSONResponse, RedirectResponse
-    page = not request.url.path.startswith("/api")
+    page = not _machine_path(request.url.path)
     if (exc.status_code == 401 and page
             and not request.url.path.startswith("/login")):
         return RedirectResponse("/login", status_code=303)
@@ -2699,7 +2927,7 @@ from psycopg.errors import InvalidTextRepresentation  # noqa: E402
 @app.exception_handler(PoolTimeout)
 async def _pool_starved(request: Request, exc: PoolTimeout):
     from fastapi.responses import JSONResponse
-    if request.url.path.startswith("/api"):
+    if _machine_path(request.url.path):
         return JSONResponse(
             {"detail": "server busy — try again shortly"},
             status_code=503, headers={"Retry-After": "15"})
@@ -2718,7 +2946,7 @@ async def _bad_literal(request: Request, exc: InvalidTextRepresentation):
     route surfaces a bare 500 on '/api/thing/not-a-uuid'. One handler covers
     the class; a uuid miss reads as 404 (the id names no record), any
     other bad literal as 400."""
-    if request.url.path.startswith("/api"):
+    if _machine_path(request.url.path):
         from fastapi.responses import JSONResponse
         if "uuid" in str(exc):
             return JSONResponse({"detail": "no such record"}, status_code=404)
@@ -2734,7 +2962,7 @@ async def _unhandled_error(request: Request, exc: Exception):
     the traceback still reaches the logs — the page's "it's been logged"
     stays true. API routes keep the plain-text body clients already treat
     as opaque."""
-    if request.url.path.startswith("/api"):
+    if _machine_path(request.url.path):
         from fastapi.responses import PlainTextResponse
         return PlainTextResponse("Internal Server Error", status_code=500)
     return _error_page(500, "Something went wrong",
@@ -2775,9 +3003,8 @@ def access_info():
     """How a person WITHOUT an account gets one on this instance — read by
     the native app's sign-in screen (and anyone) before any login, so it
     carries no secrets and no per-instance detail beyond the public doors:
-    self-service signup (OIKONOME_OPEN_SIGNUP, the open-signup switch), an
-    intake form an installed add-on registers, or neither — in which case
-    the operator's site is the door. Self-host has no signup door at all
+    self-service signup (OIKONOME_OPEN_SIGNUP, the open-signup switch), or
+    none — in which case the operator's site is the door. Self-host has no signup door at all
     (accounts are made by the operator's setup link / invites)."""
     hosted = env_flag("OIKONOME_HOSTED")
     # the demo box closes every account-creating door with a 404
@@ -2785,12 +3012,13 @@ def access_info():
     # sign-in screen's "Create one" at a door that does not exist
     demo = env_flag("OIKONOME_DEMO")
     signup = hosted and not demo and env_flag("OIKONOME_OPEN_SIGNUP")
-    intake = ext.gate.intake_path() if hosted and not demo else None
     return {"hosted": hosted,
             "signup_open": signup,
-            "request_access_open": bool(intake),
             "signup_path": "/signup" if signup else None,
-            "request_access_path": intake,
+            # older builds of the phone app read these two keys, so they
+            # stay in the answer, always empty
+            "request_access_open": False,
+            "request_access_path": None,
             # the operator's own site, when they publish one
             "site_url": site_url() if hosted else None,
             # where a locked-out person can write; the sign-in screens'
@@ -2840,7 +3068,7 @@ def support_email() -> str:
 
 def site_url() -> str | None:
     """The operator's public site, if they publish one — the sign-in page's
-    "No account?" door when neither signup nor an intake form is open."""
+    "No account?" door when signup is closed."""
     return (os.environ.get("OIKONOME_SITE_URL") or "").strip() or None
 
 
@@ -4440,6 +4668,10 @@ def me(user: dict = Depends(current_user)):
             "SELECT totp_secret, verified_at, created_at, "
             "second_factor_waived FROM users "
             "WHERE id=%s", (user["user_id"],)).fetchone()
+        # the date the nightly sweep freezes a never-confirmed household —
+        # read here while the control connection is open
+        verify_deadline = (_unverified.deadline(conn, user["tenant_id"])
+                           if u and not u["verified_at"] else None)
         n_passkeys = conn.execute(
             "SELECT count(*) n FROM passkeys WHERE user_id=%s",
             (user["user_id"],)).fetchone()["n"]
@@ -4585,6 +4817,11 @@ def me(user: dict = Depends(current_user)):
             # its first login; only surface it once ≥3 days still unverified
             "created_at": (u["created_at"].isoformat()
                            if u and u["created_at"] else None),
+            # when the nightly sweep freezes this household unless someone
+            # confirms (ISO) — the banner names the date. null when the
+            # sweep is off, not hosted, or anyone here ever confirmed.
+            "verify_deadline": (verify_deadline.isoformat()
+                                if verify_deadline else None),
             # null while there is no reason to think this address
             # is broken. Non-null means the mail provider has reported it
             # could not deliver, the scheduled sends are HELD, and the SPA
@@ -4861,12 +5098,22 @@ def user_remove(user_id: str, user: dict = Depends(current_user),
         user, password=str((body or {}).get("password") or ""),
         totp_code=str((body or {}).get("totp_code") or ""),
         recovery_code=str((body or {}).get("recovery_code") or ""))
-    with _control_conn() as conn:
+    with _control_conn() as conn, conn.transaction():
+        # A script token outlives its maker's row (created_by is SET NULL
+        # on delete) and a push token acts as the owner, so a removed
+        # person — a second owner included — would keep a working door
+        # into the household. Their tokens end with their membership; the
+        # tenant scope keeps a wrong id from touching another household.
+        conn.execute(
+            "UPDATE api_tokens SET revoked_at = now() WHERE created_by = %s "
+            "AND tenant_id = %s AND revoked_at IS NULL",
+            (target_uuid, user["tenant_id"]))
         n = conn.execute(
             "DELETE FROM users WHERE id = %s AND tenant_id = %s",
             (target_uuid, user["tenant_id"])).rowcount
-    if not n:
-        raise HTTPException(404, "no such member")
+        if not n:
+            # nothing removed, so nothing revoked either
+            raise HTTPException(404, "no such member")
     return {"ok": True}
 
 
@@ -5540,13 +5787,28 @@ def _assert_standing_allows_device(conn, row) -> None:
     full-access persistence, so minting one is exactly the act those
     gates exist to stop; skipping them would let an account that may not
     write at all walk away holding a standing credential.
+
+    Which statuses those are is read from LOCKOUT_STATUSES, not spelled
+    out again here: a second hand-written list of frozen states drifts
+    from the first, and naming only suspension and pending deletion left
+    every later lockout — the product's own freeze of a signup nobody
+    confirmed, and whatever an installed add-on freezes a household
+    under — minting durable credentials while every cookie of that
+    household was being refused.
+
+    A lockout that leaves DOORS OPEN is the exception, and for the same
+    reason /login lets such a session through to the app: it is meant to
+    be escaped from inside, and the phone keeps no cookie, so the device
+    token is the only credential it can knock on those doors with. That
+    token is not a way around the lockout — `current_user` confines it to
+    exactly those paths for as long as the status holds, and it dies with
+    the household if the freeze runs its course. Refusing it would leave
+    a phone that signed in during a lapsed trial or a never-confirmed
+    freeze unable to reach the one screen that ends it.
     """
-    status = row["tenant_status"]
-    if status == "suspended":
-        raise HTTPException(403, "this account is suspended — contact "
-                                 "support")
-    if status == "pending_delete":
-        raise HTTPException(403, "this account is scheduled for deletion")
+    frozen = LOCKOUT_STATUSES.get(row["tenant_status"])
+    if frozen is not None and not frozen[2]:
+        raise HTTPException(frozen[0], frozen[1])
     # A read-only standing does NOT refuse the mint. The phone keeps no
     # cookie, so a fresh sign-in on the phone is the ONLY way its holder
     # reaches /api/billing — and current_user already confines a token
@@ -5644,6 +5906,28 @@ def devices_list(request: Request, user: dict = Depends(current_user)):
         "current": bool(r["current"]),
         "push": r["push_state"],       # "on" | "dead" | None (never asked)
     } for r in rows]}
+
+
+@app.post("/api/devices/widget",
+          dependencies=[Depends(limit("device_widget", 30, 3600))])
+def device_widget_mint(request: Request, user: dict = Depends(current_user)):
+    """Mint this device's home-screen widget token — the lesser
+    credential the widget polls the glance door with while the device
+    token stays behind the biometric gate. Device-token callers only:
+    the widget belongs to the phone that shows it, and hanging the token
+    off the caller's own device row means revoking the device (sessions
+    panel, password change, idling out) blanks the widget too. A widget
+    token cannot mint one (it never reaches this door), and neither can
+    a browser session — a browser has no home screen. One per device:
+    minting again replaces the previous token."""
+    demoguard.deny(user)
+    if not user.get("device_id") or user.get("widget"):
+        raise HTTPException(403, "sign in from the mobile app to set up "
+                                 "the home-screen widget")
+    with _control_conn() as conn:
+        token = widget_tokens.mint(conn, user["user_id"], user["tenant_id"],
+                                   user["device_id"])
+    return {"token": token}
 
 
 @app.post("/api/devices/push",
@@ -5908,8 +6192,20 @@ def account_leave(request: Request, user: dict = Depends(current_user),
         tc.close()
     admin = tenancy.admin_connect()
     try:
-        admin.execute("DELETE FROM users WHERE id=%s AND role != 'owner'",
-                      (user["user_id"],))
+        with admin.transaction():
+            # the script tokens this person made end with them. First: the
+            # row's delete NULLs created_by, after which they cannot be
+            # found (see user_remove). One transaction, so a refused
+            # delete (an owner) revokes nothing.
+            admin.execute(
+                "UPDATE api_tokens SET revoked_at = now() "
+                "WHERE created_by = %s AND tenant_id = %s "
+                "AND revoked_at IS NULL AND EXISTS (SELECT 1 FROM users "
+                "WHERE id = %s AND role != 'owner')",
+                (user["user_id"], user["tenant_id"], user["user_id"]))
+            admin.execute(
+                "DELETE FROM users WHERE id=%s AND role != 'owner'",
+                (user["user_id"],))
     finally:
         admin.close()
     resp = Response('{"ok": true}', media_type="application/json")
@@ -6251,6 +6547,10 @@ from . import testing as _testing  # noqa: E402
 app.include_router(_api.router)
 from . import reporting_api as _rapi  # noqa: E402
 app.include_router(_rapi.router)
+# the read doors a read-scoped token may reach, /metrics, and the
+# owner's webhook management
+from . import integrations as _integrations  # noqa: E402
+app.include_router(_integrations.router)
 from . import help as _help  # noqa: E402
 app.include_router(_help.router)
 from . import logos as _logos  # noqa: E402

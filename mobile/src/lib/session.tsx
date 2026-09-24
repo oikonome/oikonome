@@ -68,6 +68,9 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     // the next login is a new device row server-side; let it register push
     import("./push").then(({ resetPushRegistration }) =>
       resetPushRegistration()).catch(() => {});
+    // and the home-screen widget goes blank now, not at its next redraw
+    import("./glance").then(({ clearWidget }) => clearWidget())
+      .catch(() => {});
     tokenMode.current = null;
     setToken(null);
     setPhase("setup");
@@ -278,8 +281,14 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     if (phase === "ready" && client) {
       import("./push").then(({ registerNativePush }) =>
         registerNativePush(client)).catch(() => {});
+      // and give the home-screen widget its own credential — the device
+      // token stays behind the gate, the widget polls with a lesser one
+      if (serverUrl) {
+        import("./glance").then(({ ensureWidgetToken }) =>
+          ensureWidgetToken(client, serverUrl)).catch(() => {});
+      }
     }
-  }, [phase, client]);
+  }, [phase, client, serverUrl]);
 
   const setCaptureAllowed = useCallback(async (ok: boolean) => {
     await saveCaptureAllowed(ok);

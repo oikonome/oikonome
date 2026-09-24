@@ -255,6 +255,26 @@ def classify(conn, txn_id: str, bucket: str, *, sched_c_line=None,
         (txn_id, bucket, sched_c_line, note))
 
 
+# The row's amount net of partial reimbursement links, keeping the ledger
+# sign: a charge counts only what was not paid back (reporting.NET_AMOUNT)
+# and a deposit only the part no charge claimed (reporting.INCOME_NET). The
+# books must net both sides the way the personal readers do — gross on
+# both overstates Schedule C receipts and expenses by the repaid amount,
+# and once links use up the whole deposit (it turns TRANSFER_IN and leaves
+# revenue) a gross expense would understate net profit. `amount` stays
+# gross beside it, because the ledger shows what the bank recorded.
+_NET_SIGNED = (f"CASE WHEN t.amount > 0 THEN {reporting.NET_AMOUNT} "
+               f"WHEN t.amount < 0 THEN -({reporting.INCOME_NET}) "
+               "ELSE t.amount END")
+
+
+def _net(t: dict) -> float:
+    """A worksheet row's netted amount; falls back to the gross for a row
+    built without it (a caller-supplied list)."""
+    n = t.get("net_amount")
+    return t["amount"] if n is None else n
+
+
 def entity_transactions(conn, entity_id: str, year: int | None = None) -> list[dict]:
     """Every business transaction (expense or revenue) with its bucket — the
     classification worksheet + P&L input."""
@@ -264,11 +284,12 @@ def entity_transactions(conn, entity_id: str, year: int | None = None) -> list[d
         yr = " AND EXTRACT(YEAR FROM t.date) = %(yr)s"
         params["yr"] = year
     rows = conn.execute(
-        f"""SELECT t.id, t.date, t.amount,
+        f"""SELECT t.id, t.date, t.amount, {_NET_SIGNED} AS net_amount,
                    {_md.DISPLAY_MERCHANT} AS payee, {_md.MERCHANT_LOGO} AS merchant_logo,
                    COALESCE(t.category_override, t.category_primary) AS category,
                    t.category_detailed AS cat_detailed,
                    {reporting.ORIGINAL_CAT} AS cat_original,
+                   {reporting.PARTLY_CLAIMED_DEPOSIT} AS partly_claimed,
                    tn.note AS note,
                    c.bucket, c.sched_c_line
             FROM transactions t {_md.MC_JOIN}
@@ -277,10 +298,12 @@ def entity_transactions(conn, entity_id: str, year: int | None = None) -> list[d
             WHERE {_BIZ_TXN} AND t.removed = 0{yr}
             ORDER BY t.date DESC, t.amount DESC""", params).fetchall()
     return [{"id": r["id"], "date": r["date"].isoformat() if r["date"] else None,
-             "amount": float(r["amount"] or 0), "payee": r["payee"],
+             "amount": float(r["amount"] or 0),
+             "net_amount": float(r["net_amount"] or 0), "payee": r["payee"],
              "merchant_logo": r["merchant_logo"],
              "category": r["category"], "cat_detailed": r["cat_detailed"],
              "cat_original": r["cat_original"], "note": r["note"],
+             "partly_claimed": bool(r["partly_claimed"]),
              "bucket": r["bucket"], "sched_c_line": r["sched_c_line"]}
             for r in rows]
 
@@ -333,7 +356,7 @@ def _lifetime_startup(conn, entity_id: str, kind: str,
         # SAME bucket rule the year-scoped loop uses — explicit class first,
         # else the default from the business start date
         if (t["bucket"] or default_bucket(start, d)) == kind:
-            total += amt
+            total += _net(t)
     return round(total, 2)
 
 
@@ -380,23 +403,32 @@ def _pnl_core(conn, entity_id: str, year: int | None = None,
             # (a rule written for a payment app's outflows also reaches its
             # inflows) — it is revenue only when the user made it INCOME
             # outright.
+            #
+            # A deposit a link stamped TRANSFER_IN before a partial link
+            # stopped doing that, whose links claim only part of it, is
+            # still revenue for the part no charge claimed — the same rule
+            # personal income applies (reporting.PARTLY_CLAIMED_DEPOSIT);
+            # its net figure is already that part.
             was_transfer = "TRANSFER" in (t.get("cat_original") or "").upper()
-            if ("TRANSFER" not in cat and not is_cc_payment
+            if t.get("partly_claimed") or (
+                    "TRANSFER" not in cat and not is_cc_payment
                     and (not was_transfer or cat == "INCOME")):
-                revenue += -amt
+                revenue += -_net(t)
             continue
         # expense: bucket = explicit class, else default from start date
         bucket = t["bucket"] or default_bucket(start, d)
         if cat in ("TRANSFER_OUT", "TRANSFER_IN") or is_cc_payment:
             continue
+        net = _net(t)
         if bucket == "organizational":
-            org_total += amt
+            org_total += net
         elif bucket == "startup_195":
-            startup_total += amt
-        else:
-            operating += amt
+            startup_total += net
+        elif net > 0:
+            # a charge paid back in full nets to nothing — no empty line
+            operating += net
             line = t["sched_c_line"] or (t["category"] or "Uncategorized")
-            by_line[line] = round(by_line.get(line, 0.0) + amt, 2)
+            by_line[line] = round(by_line.get(line, 0.0) + net, 2)
 
     revenue = round(revenue, 2)
     operating = round(operating, 2)

@@ -97,7 +97,9 @@ the month is left out of the year's money map, since nothing was
 budgeted. Clicking a cell opens that month's report card.
 
 Below the grid: a money map summing the **elapsed months only** (a July
-view shows seven months of plan, not a phantom full year), annual totals
+view shows seven months of plan, not a phantom full year) — each of its
+labels opens that bucket's rows for the year, the same months summed —
+annual totals
 — income, spend, saved, savings rate — and the top twelve spending
 categories next to the prior year's figures, with a Total spend row. Annual income and spend use the Cash Flow
 report's definitions (see the cash-flow guide). A year with no bank

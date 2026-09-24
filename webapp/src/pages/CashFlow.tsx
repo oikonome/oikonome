@@ -16,13 +16,14 @@
 import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { useSearchParams } from "react-router";
-import { api, money, type CashflowReport, type FlowKey, type FlowPeriod }
+import { api, money, type CashCostsReport, type CashflowReport, type FlowKey,
+         type FlowPeriod }
   from "../api/client";
 import AreaChart from "../components/AreaChart";
 import Bars from "../components/Bars";
 import { FlowChart, NetBars } from "../components/CashFlowCharts";
 import MerchantAvatar from "../components/MerchantAvatar";
-import { CASHFLOW_RANGES, cashflowCutoffMonth, RANGE_MONTHS, RangePicker,
+import { RANGES, cashflowCutoffMonth, RANGE_MONTHS, RangePicker,
          type Range }
   from "../components/RangePicker";
 import SpendingSection, { Delta, PREV_NAME } from "./Spending";
@@ -49,7 +50,7 @@ export default function CashFlow() {
     if (v === "overview") sp.delete("tab"); else sp.set("tab", v);
     setSp(sp, { replace: true });
   };
-  const range = (CASHFLOW_RANGES.includes(sp.get("range") as Range)
+  const range = (RANGES.includes(sp.get("range") as Range)
                  ? sp.get("range") : "1y") as Range;
   const setRange = (v: Range) => {
     if (v === "1y") sp.delete("range"); else sp.set("range", v);
@@ -171,7 +172,7 @@ function OverviewSection({ tab, onTab, range, setRange }: {
                       onClick={() => onTab(x.key)}>{x.label}</button>
             ))}
           </div>
-          <RangePicker value={range} onChange={setRange} options={CASHFLOW_RANGES} />
+          <RangePicker value={range} onChange={setRange} />
         </div>
         {fq.isPending && <Loading />}
         {/* the flow endpoint is rate-limited (60/60s) and can 5xx on its
@@ -304,7 +305,7 @@ function IncomeSection({ range, setRange }: {
                       flexWrap: "wrap" }}>
           <h2 style={{ margin: 0 }}>Income</h2>
           <span style={{ marginLeft: "auto" }}>
-            <RangePicker value={range} onChange={setRange} options={CASHFLOW_RANGES} />
+            <RangePicker value={range} onChange={setRange} />
           </span>
         </div>
         <div style={{ display: "flex", gap: ".5rem", alignItems: "baseline",
@@ -383,8 +384,82 @@ function IncomeSection({ range, setRange }: {
         </div>
       )}
 
+      <CashCosts />
       <IncomeRecords />
     </>
+  );
+}
+
+const MON3 = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug",
+              "Sep", "Oct", "Nov", "Dec"];
+const mmdd = (iso: string) => `${iso.slice(5, 7)}/${iso.slice(8, 10)}`;
+const monYear = (iso: string) => `${MON3[Number(iso.slice(5, 7))]} ${iso.slice(0, 4)}`;
+
+/** Interest and fees paid — what holding money and carrying a balance cost,
+ *  by year, net of refunds, beside what the same banks paid in interest.
+ *  Sits under income by source because interest EARNED is a row up there;
+ *  this is the other side of it. Hidden when nothing was ever charged. */
+function CashCosts() {
+  const q = useQuery({ queryKey: ["report", "cash-costs"],
+                       queryFn: api.reportCashCosts });
+  const r: CashCostsReport | undefined = q.data;
+  if (!r || r.by_year.length === 0) return null;
+  const ytd = r.ytd;
+  const year = r.by_year[0].year;
+  const net = ytd ? ytd.net : 0;
+  const vsEarned = r.earned_ytd - net;
+  return (
+    <div className="card">
+      <h2>Interest &amp; fees paid <span className="sub" style={{ fontWeight: 400 }}>
+        — what holding money costs you, by year</span></h2>
+      <div style={{ display: "flex", gap: "1.4rem", flexWrap: "wrap",
+                    alignItems: "baseline" }}>
+        <div><span className="sub">{ytd ? `${ytd.year} so far` : `${year}`}</span>
+          <div className={`kpi sm ${net > 0 ? "neg" : net < 0 ? "pos" : ""}`}>
+            {money(net)}</div>
+          <div className="sub" style={{ fontSize: 11 }}>
+            {ytd ? <>{money(ytd.interest)} interest · {money(ytd.fees)} fees
+                     {ytd.refunds > 0 && <> − {money(ytd.refunds)} refunded</>}</>
+                 : "nothing charged this year"}</div></div>
+        <div><span className="sub">vs interest earned</span>
+          <div className={`kpi sm ${vsEarned > 0 ? "pos" : vsEarned < 0 ? "neg" : ""}`}>
+            {vsEarned > 0 ? "+" : ""}{money(vsEarned)}</div>
+          <div className="sub" style={{ fontSize: 11 }}>
+            earned {money(r.earned_ytd)} · paid {money(net)} this year</div></div>
+        <div><span className="sub">card interest</span>
+          <div className={`kpi sm ${r.interest_ever > 0 ? "" : "pos"}`}>
+            {money(r.interest_ever)}</div>
+          <div className="sub" style={{ fontSize: 11 }}>
+            {r.interest_ever > 0 ? "ever, across every account" : "never charged on any account"}</div></div>
+      </div>
+      <table style={{ marginTop: ".6rem" }}>
+        <thead><tr><th>Year</th><th className="num">Interest</th>
+          <th className="num">Fees</th><th className="num">Refunds</th>
+          <th className="num">Net</th><th>Biggest</th></tr></thead>
+        <tbody>
+          {r.by_year.map((y) => (
+            <tr key={y.year}>
+              <td>{y.year}</td>
+              <td className="num">{y.interest ? money(y.interest) : "·"}</td>
+              <td className="num">{y.fees ? money(y.fees) : "·"}</td>
+              <td className="num pos">{y.refunds ? `−${money(y.refunds)}` : "·"}</td>
+              <td className="num"><b>{money(y.net)}</b></td>
+              <td className="mut" style={{ fontSize: 12 }}>
+                {y.biggest ? `${y.biggest[0]} ${money(y.biggest[1])} · ${mmdd(y.biggest[2])}` : "—"}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {r.latest && (
+        <div className="sub" style={{ fontSize: 12, marginTop: ".5rem" }}>
+          Latest: <b>{r.latest[4]}</b> {r.latest[3] === "interest" ? "charged" : "—"}{" "}
+          {r.latest[3] === "interest" ? <>interest of <b>{money(r.latest[1], true)}</b></>
+            : <>{r.latest[0]} <b>{money(r.latest[1], true)}</b></>}{" "}
+          on {mmdd(r.latest[2])} ({monYear(r.latest[2])}). A new charge is also
+          in the daily email the day it posts.
+        </div>
+      )}
+    </div>
   );
 }
 

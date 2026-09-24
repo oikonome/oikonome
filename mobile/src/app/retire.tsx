@@ -13,20 +13,31 @@ import PullRefresh from "../components/pull-refresh";
 import Sparkline from "../components/sparkline";
 import StaleBanner from "../components/stale-banner";
 import { Card, H, HelpLink, KV, Pill } from "../components/ui";
+import { whatIfRefusal } from "../lib/api";
 import { saveSettings } from "../lib/cache";
+import { numv, whatIfQuery } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { useViewer } from "../lib/viewer";
 import { C, money } from "../lib/theme";
 
 const m$ = (n: number) => money(n, false);
+// the dollar boxes: /api/retirement takes them as whole numbers, so
+// "60,000" or "250.50" from a phone keyboard is parsed before it rides
+const MONEY_KEYS = ["spend", "employer_mo", "taxable_mo"] as const;
+const whatIfParams = (f: Record<string, string>) =>
+  whatIfQuery(f, MONEY_KEYS, true);
 
-function Fld({ label, value, onChange }: {
-  label: string; value: string; onChange: (v: string) => void;
+function Fld({ label, value, placeholder, onChange }: {
+  label: string; value: string;
+  // what an empty field means (the server's default), shown in its place
+  placeholder?: string;
+  onChange: (v: string) => void;
 }) {
   return (
     <View style={{ width: "30%" }}>
       <Text style={{ color: C.mut, fontSize: 10 }}>{label}</Text>
       <TextInput style={s.input} keyboardType="numbers-and-punctuation"
+                 placeholder={placeholder} placeholderTextColor={C.mut}
                  value={value} onChangeText={onChange} />
     </View>
   );
@@ -46,6 +57,12 @@ export default function Retire() {
     enabled: !!client,
     placeholderData: (prev) => prev,
   });
+  // A failed what-if leaves query.data empty (placeholderData only covers
+  // the pending fetch), and the whole page renders from it. Keep the last
+  // projection the server did send, so a refused answer can be corrected
+  // in the form instead of taking the screen with it.
+  const [lastGood, setLastGood] = useState<typeof query.data>();
+  if (query.data && query.data !== lastGood) setLastGood(query.data);
   // first visit with no birthdate and no wizard mark → offer the
   // walkthrough; "done" OR "skipped" both mean finished
   const settings = useQuery({ queryKey: ["settings"],
@@ -80,7 +97,11 @@ export default function Retire() {
         }} />
     );
   }
-  const r = query.data;
+  const r = query.data ?? lastGood;
+  const whatIfErr = query.isError && !query.data
+    ? whatIfRefusal(query.error)
+      ?? "Couldn't reach the server — pull down to retry."
+    : null;
   const inp = r?.inputs;
   const f = form ?? (inp ? {
     // age MUST ride the recalc — dropping it re-projects from the
@@ -91,6 +112,8 @@ export default function Retire() {
     ssage: String(inp.ssage), stockpct: String(inp.stockpct),
     employer_mo: String(inp.employer_mo),
     taxable_mo: String(inp.taxable_mo), resume: String(inp.resume),
+    // blank = the server's default (cash keeps pace with inflation)
+    cash: inp.cash == null ? "" : inp.cash.toFixed(1),
   } : null);
   const set = (k: string) => (v: string) =>
     setForm({ ...(f ?? {}), [k]: v });
@@ -136,6 +159,21 @@ export default function Retire() {
                 </Text>
               </Text>
             )}
+            {can === null && (r.catch_up ?? []).length > 0 ? (
+              <Text style={[s.mut, { marginTop: 4 }]}>
+                <Text style={{ color: C.text }}>
+                  To get back on track, save{" "}
+                  {(r.catch_up ?? []).map((c, k) => (
+                    <Text key={c.age}>
+                      {k > 0 ? ", or " : ""}
+                      <Text style={{ fontWeight: "700" }}>{m$(c.extra_monthly)}/mo more</Text>
+                      {" "}to retire at {c.age}
+                    </Text>
+                  ))}
+                </Text>
+                {" "}— starting now, on top of what the plan already saves.
+              </Text>
+            ) : null}
             <KV k={`Retire today (${inp.age}) supports`}
                 v={`${m$(r.spend_now)}/yr — after-tax, today's dollars`} />
             <KV k="You have today"
@@ -155,7 +193,8 @@ export default function Retire() {
               <Text style={{ color: C.text, fontWeight: "700" }}>
                 Assumptions:{" "}
               </Text>
-              {inp.ret}% return · {inp.infl}% inflation · to {inp.end} ·
+              {inp.ret}% return · {inp.infl}% inflation
+              {inp.cash != null ? ` · cash ${inp.cash}%` : ""} · to {inp.end} ·
               SS at {inp.ssage}
               {inp.has_sched ? ` (${m$(inp.your_ss)}/mo)`
                              : " (no SSA statement)"}
@@ -186,6 +225,8 @@ export default function Retire() {
                        onChange={set("ret")} />
                   <Fld label="inflation %" value={f.infl}
                        onChange={set("infl")} />
+                  <Fld label="cash yield %" value={f.cash}
+                       placeholder="= inflation" onChange={set("cash")} />
                   <Fld label="to age" value={f.end}
                        onChange={set("end")} />
                   <Fld label="SS claim" value={f.ssage}
@@ -202,13 +243,20 @@ export default function Retire() {
                 <Pressable style={[s.btn, { alignSelf: "flex-start" },
                                    query.isFetching && { opacity: 0.5 }]}
                            disabled={query.isFetching}
-                           onPress={() => setParams({ ...f })}>
+                           // a blank field is "use the default" and must
+                           // not ride the query as an empty value
+                           onPress={() => setParams(whatIfParams(f))}>
                   <Text style={s.btnText}>
                     {query.isFetching ? "Recalculating…" : "Recalculate"}
                   </Text>
                 </Pressable>
               </View>
             )}
+            {whatIfErr
+              ? <Text style={[s.mut, { color: C.bad, marginTop: 6 }]}>
+                  {whatIfErr}
+                </Text>
+              : null}
           </Card>
 
           {r.growth_path.length > 1 && (
@@ -384,10 +432,10 @@ function RetireWizard({ defaults, onDone, onSkip }: {
                  "What do you want to spend in retirement?",
                  "How much are you saving each month?",
                  "A few market assumptions", "You're set"];
-  const params = () => ({
-    age: age.trim(), spend: spend.trim(), employer_mo: employer.trim(),
-    taxable_mo: taxable.trim(), ret: ret.trim(), infl: infl.trim(),
-    end: end.trim() });
+  // A cleared box means "use the default", so it is left out of the query
+  // rather than sent as an empty value — the adjust panel does the same.
+  const params = () => whatIfParams({
+    age, spend, employer_mo: employer, taxable_mo: taxable, ret, infl, end });
   const next = () => {
     setErr(null);
     if (i === 0) {
@@ -396,8 +444,9 @@ function RetireWizard({ defaults, onDone, onSkip }: {
         setErr("Enter an age between 18 and 100."); return;
       }
     }
-    if (i === 1 && (!Number.isFinite(Number(spend))
-                    || Number(spend) < 0)) {
+    // "60,000" is a spend, not a typo: judge it as the query will send it
+    const spendN = Number(spend.replace(/[$,\s]/g, ""));
+    if (i === 1 && (!Number.isFinite(spendN) || spendN < 0)) {
       setErr("Enter a non-negative annual spend."); return;
     }
     if (i === 3 && birth.trim())
@@ -480,11 +529,11 @@ function RetireWizard({ defaults, onDone, onSkip }: {
           <Text style={{ color: C.text, fontSize: 14, lineHeight: 21 }}>
             Age <Text style={{ fontWeight: "700" }}>{age}</Text> · spend{" "}
             <Text style={{ fontWeight: "700" }}>
-              ${Number(spend).toLocaleString()}/yr
+              ${numv(spend).toLocaleString()}/yr
             </Text> · saving{" "}
             <Text style={{ fontWeight: "700" }}>
-              ${(Number(employer)
-                 + Number(taxable)).toLocaleString()}/mo
+              ${(numv(employer)
+                 + numv(taxable)).toLocaleString()}/mo
             </Text>
             {" · return "}{ret}% / inflation {infl}% · to age {end}.
           </Text>

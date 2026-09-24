@@ -159,8 +159,12 @@ def _t_spend_lookup(conn, args) -> dict:
         where.append(f"{DISPLAY_MERCHANT} ILIKE %s ESCAPE '\\'")
         params.append(_like(merchant))
     if category:
-        where.append(f"{reporting.EFF_CAT} ILIKE %s ESCAPE '\\'")
-        params.append(_like(category.replace("_", " ")))
+        # the row's own category, or any part of a hand split
+        where.append(
+            f"({reporting.EFF_CAT} ILIKE %s ESCAPE '\\' OR EXISTS ("
+            "SELECT 1 FROM transaction_splits sp WHERE sp.txn_id = t.id "
+            "AND REPLACE(sp.category, '_', ' ') ILIKE %s ESCAPE '\\'))")
+        params.extend([_like(category.replace("_", " "))] * 2)
     try:
         year = int(year) if year not in (None, "") else None
     except (TypeError, ValueError):

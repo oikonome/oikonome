@@ -192,6 +192,38 @@ class CanonicalMerchantTests(unittest.TestCase):
             merchant_dedup.canonical_merchant("Elmhaven Brewing Co", cities),
             "Elmhaven Brewing")
 
+    def test_a_configured_city_spelled_with_an_apostrophe_still_strips(self):
+        """City variants are matched against the already-cleaned label, so
+        they take the same apostrophe rule the label took."""
+        cities = tuple(sorted(merchant_dedup._city_variants("Anse d'Or"),
+                              key=len, reverse=True))
+        self.assertEqual(
+            merchant_dedup.canonical_merchant("Tacoria Anse d'Or", cities),
+            "Tacoria")
+
+    def test_an_apostrophe_joins_its_letters_instead_of_breaking_them(self):
+        """A feed resolves a payee as "Juniper's Market" while the card line
+        for the same purchase prints "JUNIPERS MARKET". Both have to clean
+        to one string, or one business is two merchants."""
+        canon = merchant_dedup.canonical_merchant
+        self.assertEqual(canon("Juniper's Market"), "Junipers Market")
+        self.assertEqual(canon("JUNIPERS MARKET"), "Junipers Market")
+        # every character a feed writes it with
+        for glyph in ("'", "\u2019", "\u02bc"):
+            self.assertEqual(canon(f"Juniper{glyph}s Market"),
+                             "Junipers Market", repr(glyph))
+        # a trailing possessive
+        self.assertEqual(canon("Junipers' Market"), "Junipers Market")
+        # an elided prefix agrees with the line that prints it closed up
+        self.assertEqual(canon("L'Anfora"), canon("LANFORA"))
+        # two letters an apostrophe joins are a whole word, not two dropped
+        # pieces
+        self.assertEqual(canon("Q'Z BURGER BARN"), "QZ Burger Barn")
+        # two different payees still differ
+        self.assertNotEqual(canon("Juniper's Pizza"), canon("Marion Pizza"))
+        # a LEADING one is a quote mark, and its word break is real
+        self.assertEqual(canon("Casa 'Verde Grill"), "Casa Verde Grill")
+
     def test_never_reduces_to_empty(self):
         # all-noise names fall back to the raw string, never ''
         self.assertEqual(merchant_dedup.canonical_merchant("PP*"), "PP*")
@@ -210,7 +242,7 @@ class LabelLengthTests(unittest.TestCase):
     def test_a_pathological_label_is_cut_before_the_scrub(self):
         import time
         from oikonome.engine.merchant_dedup import canonical_merchant
-        for filler in (" ", "0", "~", "-"):
+        for filler in (" ", "0", "~", "-", "'"):
             label = "Acme" + filler * 200_000 + "Store"
             t0 = time.monotonic()
             canonical_merchant(label)
@@ -383,20 +415,41 @@ class ApplyTests(unittest.TestCase):
         import re
         root = pathlib.Path(__file__).resolve().parents[1] / "oikonome"
         # the DISPLAY chain — the thing that must read the same everywhere.
-        # llm_categorize keys category RULES on the canonical string and
-        # merchant_dedup's docstring
-        # quotes the chain; both are named exceptions, not a pattern gap.
         pat = re.compile(r"COALESCE\(\s*mc\.canonical\s*,\s*t\.merchant_outlet", re.I)
         offenders = []
         for f in root.rglob("*.py"):
-            if f.name in ("merchant_sql.py", "llm_categorize.py",
-                          "merchant_dedup.py"):
+            if f.name == "merchant_sql.py":
                 continue
             if pat.search(f.read_text(encoding="utf-8")):
                 offenders.append(str(f.relative_to(root)))
         self.assertEqual(offenders, [],
                          f"{offenders} spell the merchant join themselves — "
                          "import merchant_sql.MC_JOIN / DISPLAY_MERCHANT")
+
+    def test_no_module_spells_the_identity_key_itself(self):
+        """The IDENTITY KEY — what a row is grouped, aliased and re-resolved
+        by — has one spelling, merchant_sql.raw_key.
+
+        A module that types the outlet-first chain out by hand keeps the
+        OLD key: it would go on filing a row under the aggregator name the
+        resolver set aside, while every other surface files it under the
+        bank line. Raw key → merchant would stop being a function, and a
+        rename would move rows a household never asked about."""
+        import pathlib
+        import re
+        root = pathlib.Path(__file__).resolve().parents[1] / "oikonome"
+        pat = re.compile(
+            r"COALESCE\(\s*(?:\w+\.)?merchant_outlet\s*,\s*(?:\w+\.)?merchant_name",
+            re.I)
+        offenders = []
+        for f in root.rglob("*.py"):
+            if f.name == "merchant_sql.py":
+                continue
+            if pat.search(f.read_text(encoding="utf-8")):
+                offenders.append(str(f.relative_to(root)))
+        self.assertEqual(offenders, [],
+                         f"{offenders} spell the identity key themselves — "
+                         "use merchant_sql.raw_key / RAW_KEY")
 
 
 if __name__ == "__main__":

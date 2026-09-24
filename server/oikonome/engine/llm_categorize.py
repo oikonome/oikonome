@@ -394,7 +394,12 @@ def chat_tools(messages: list[dict], tools: list[dict], max_tokens: int,
 
 # ---- selection -----------------------------------------------------------
 
-from .merchant_sql import DISPLAY_MERCHANT as _DISPLAY, MC_JOIN as _MC_JOIN  # noqa: E402
+from .merchant_sql import DISPLAY_MERCHANT as _DISPLAY  # noqa: E402
+from .merchant_sql import MC_JOIN as _MC_JOIN  # noqa: E402
+from .merchant_sql import raw_key as _raw_key  # noqa: E402
+
+# this module writes its SQL against the unaliased table name
+_TXN_RAW_KEY = _raw_key("transactions")
 
 
 def pending_merchants(conn, limit: int | None = None) -> list[dict]:
@@ -624,9 +629,8 @@ def apply(conn, canon: str | None = None,
         # live there), while flow_classify hands us the base descriptor. A
         # scope matching only one of them silently updates nothing for the
         # other's rows, so match either.
-        scope_sql = ("\n              AND (COALESCE(transactions.merchant_outlet, "
-                     "transactions.merchant_name, transactions.name) "
-                     "= ANY(%(scope_raws)s)"
+        scope_sql = ("\n              AND (" + _TXN_RAW_KEY
+                     + " = ANY(%(scope_raws)s)"
                      "\n                   OR COALESCE(transactions.merchant_name, "
                      "transactions.name) = ANY(%(scope_raws)s))")
     # apply() uses bare column names (no t. alias) — expand refineable
@@ -709,12 +713,10 @@ def apply(conn, canon: str | None = None,
     # snapshot listed it under the outlet, recategorized without an undo
     # entry and without being counted. The write must never match
     # differently than the page.
-    cand_join = """
+    cand_join = f"""
         FROM transactions
         LEFT JOIN merchant_canonical mc
-               ON mc.raw_merchant = COALESCE(transactions.merchant_outlet,
-                                             transactions.merchant_name,
-                                             transactions.name)"""
+               ON mc.raw_merchant = {_TXN_RAW_KEY}"""
 
     def _update(rows_where: str, user_only: bool) -> int:
         # TRUST GUARD (machine pass only). A machine rule —
@@ -736,9 +738,7 @@ def apply(conn, canon: str | None = None,
             WITH {_rules_cte(user_only)},
             cand AS (
                 SELECT transactions.id AS id,
-                       COALESCE(mc.canonical, transactions.merchant_outlet,
-                                transactions.merchant_name,
-                                transactions.name) AS canon,
+                       COALESCE(mc.canonical, {_TXN_RAW_KEY}) AS canon,
                        transactions.merchant_id::text AS mid,
                        transactions.category_primary AS cur,
                        COALESCE(transactions.raw

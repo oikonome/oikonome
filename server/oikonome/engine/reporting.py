@@ -31,6 +31,7 @@ import logging
 import re
 
 from . import budget
+from . import categories as _categories
 
 log = logging.getLogger(__name__)
 from .compat import as_date, as_dict, jsonb
@@ -60,6 +61,14 @@ SPEND_WHERE = ("""t.removed = 0 AND t.amount > 0
 # ('RENT_AND_UTILITIES') display-merge with native primaries ('RENT AND
 # UTILITIES'); Amazon overrides carry no underscores so are unaffected.
 EFF_CAT = "REPLACE(COALESCE(t.category_override, t.category_primary,'?'),'_',' ')"
+# The same, per PART of a hand-split row (categories.SPLIT_JOIN in the
+# query, and the amount read through PART_NET_JOINED): a rollup BY
+# CATEGORY takes these two together, so a split row lands in each of its
+# categories for its share. A rollup by anything else (month, merchant)
+# keeps EFF_CAT / NET_AMOUNT_JOINED and no join — the parts sum to the row,
+# and joining would only multiply it.
+PART_CAT = _categories.PART_CAT_DISPLAY
+SPLIT_JOIN = _categories.SPLIT_JOIN
 
 # What the AGGREGATOR called the row, before any rule touched it: Plaid's own
 # personal_finance_category primary (the raw payload outlives every later
@@ -90,6 +99,17 @@ NOT_RECLASSIFIED_TRANSFER_IN = f"""
 # here under the name callers already use so the two cannot drift apart.
 NET_AMOUNT = budget.NET_AMOUNT
 
+# The deposit side of the same netting: a deposit partial-linked to charges
+# counts as income only in the part no charge claimed. The claimed part is
+# already netted off those charges' spend, so counting it as income too
+# would count the repayment twice; dropping the whole deposit (a
+# TRANSFER_IN category) would lose the part that really was income — a
+# paycheck that carried one expense back with it. Floored at 0 for the
+# same reason NET_AMOUNT is. `t` must be the transactions alias.
+INCOME_NET = """GREATEST(-t.amount - COALESCE((SELECT SUM(pr.amount)
+    FROM reimbursements pr
+    WHERE pr.reimburse_id = t.id AND pr.partial = 1), 0), 0)"""
+
 # The same net, as a join. NET_AMOUNT's correlated subquery is re-run for
 # every output row (a SubPlan), which on an all-history aggregate means tens
 # of thousands of probes of a table that is usually empty. Pre-aggregating
@@ -103,6 +123,8 @@ REIMB_PARTIAL_JOIN = ("LEFT JOIN (SELECT expense_id, SUM(amount) AS s "
                       "FROM reimbursements WHERE partial = 1 "
                       "GROUP BY expense_id) pr ON pr.expense_id = t.id")
 NET_AMOUNT_JOINED = "GREATEST(t.amount - COALESCE(pr.s, 0), 0)"
+# a part's share of the joined net (see PART_CAT)
+PART_NET_JOINED = _categories.part_net(NET_AMOUNT_JOINED)
 
 # merchant_dedup fragments — imported, ONE definition. Callers alias
 # transactions as `t`, LEFT JOIN via MC_JOIN, group/label by DISPLAY_MERCHANT.
@@ -134,8 +156,8 @@ def excluded_accounts_sql(conn, memo: dict | None = None) -> tuple[str, tuple]:
     `memo` is the request-scoped budget cache, when the caller already has
     one — the config must be read once per call, or the spend total and the
     fixed split can be judged under two different configs."""
-    excluded = list(budget.load_config(conn, memo=memo).get(
-        "excluded_accounts") or [])
+    excluded = budget.excluded_account_ids(
+        budget.load_config(conn, memo=memo))
     return (("AND NOT (t.account_id = ANY(%s))", (excluded,)) if excluded
             else ("", ()))
 
@@ -870,10 +892,14 @@ def compute_spending(conn, today: dt.date | None = None) -> dict:
     # grouping from the same scan, and each group's SUM is still rounded in
     # SQL exactly as the three separate queries rounded theirs. GROUPING()
     # tells the rows apart — 0 = (yr, cat), 1 = year only, 2 = category only.
+    # by category, so the parts of a hand-split row are joined and each
+    # lands under its own category for its share (the year totals still
+    # add up: the parts sum to the row)
+    pamt2 = _R2.format(f"SUM({PART_NET_JOINED})")
     all_time = conn.execute(
-        f"SELECT to_char(t.date,'YYYY') yr, {EFF_CAT} cat, {amt2} amt, COUNT(*) n, "
-        f"GROUPING(to_char(t.date,'YYYY'), {EFF_CAT}) g "
-        f"FROM transactions t {REIMB_PARTIAL_JOIN} WHERE {SPEND_WHERE} {excl} "
+        f"SELECT to_char(t.date,'YYYY') yr, {PART_CAT} cat, {pamt2} amt, COUNT(*) n, "
+        f"GROUPING(to_char(t.date,'YYYY'), {PART_CAT}) g "
+        f"FROM transactions t {REIMB_PARTIAL_JOIN} {SPLIT_JOIN} WHERE {SPEND_WHERE} {excl} "
         f"GROUP BY GROUPING SETS ((yr, cat), (yr), (cat))",
         ex_p or None).fetchall()
     by_year = sorted((r for r in all_time if r["g"] == 1), key=lambda r: r["yr"])
@@ -906,8 +932,8 @@ def compute_spending(conn, today: dt.date | None = None) -> dict:
     # from the year-over-year table — which is the one place you would go to
     # see exactly that.
     cat_tot = conn.execute(
-        f"SELECT {EFF_CAT} cat, {amt2} amt FROM transactions t {REIMB_PARTIAL_JOIN} "
-        f"WHERE {SPEND_WHERE} "
+        f"SELECT {PART_CAT} cat, {pamt2} amt FROM transactions t {REIMB_PARTIAL_JOIN} "
+        f"{SPLIT_JOIN} WHERE {SPEND_WHERE} "
         f"AND t.date >= %s::date - INTERVAL '12 months' {excl} "
         f"GROUP BY cat ORDER BY amt DESC LIMIT 15", (today, *ex_p)).fetchall()
     cat_all = sorted(by_cat, key=lambda r: -r["amt"])[:15]
@@ -957,13 +983,32 @@ def _bank_account_ids(conn) -> list[str]:
              AND LOWER(i.institution_name) NOT LIKE ALL(%s)""", (_INV_PATTERNS,))]
 
 
+# A deposit stamped TRANSFER_IN whose partial links do not use it up. A
+# partial link repays one charge out of the deposit and leaves the rest as
+# income, so such a deposit is income net of its links (INCOME_NET)
+# whatever its override says: the stamp may predate the rule that a
+# partial link leaves the deposit's category alone, or come back that way
+# from an archive, and reading it as a whole transfer would drop the
+# unclaimed part from income. A partial-linked deposit is a repayment by
+# construction, so a transfer set by hand on one reads the same way. Not a
+# deposit with a full pair (a full link spends all of it), and not one the
+# aggregator itself called a transfer — that was never income.
+PARTLY_CLAIMED_DEPOSIT = """(t.category_override = 'TRANSFER_IN'
+    AND COALESCE(t.category_primary, '') NOT IN ('TRANSFER_IN','TRANSFER_OUT')
+    AND NOT EXISTS (SELECT 1 FROM reimbursements fr
+                    WHERE fr.reimburse_id = t.id AND fr.partial = 0)
+    AND (SELECT SUM(pr.amount) FROM reimbursements pr
+         WHERE pr.reimburse_id = t.id AND pr.partial = 1)
+        < -t.amount - 0.005)"""
+
 # The income definition, as SQL over bank rows. Own-money inflows a bank
 # stamps INCOME are excluded (_NOT_OWN_MONEY_SQL). Callers supply the bank
 # account ids as the one parameter.
 _INCOME_WHERE = f"""t.removed=0 AND t.amount < 0 AND t.account_id = ANY(%s)
               {_NOT_OWN_MONEY_SQL}
-              AND COALESCE(t.category_override, t.category_primary, '')
-                  NOT IN ('TRANSFER_IN','TRANSFER_OUT')
+              AND (COALESCE(t.category_override, t.category_primary, '')
+                   NOT IN ('TRANSFER_IN','TRANSFER_OUT')
+                   OR {PARTLY_CLAIMED_DEPOSIT})
               {NOT_RECLASSIFIED_TRANSFER_IN}
               {_NOT_SHADOW.format(col="t.account_id")}
               {budget.PERSONAL_ONLY_SQL}"""
@@ -975,7 +1020,7 @@ def _income_by(conn, grain: str):
     col = "to_char(t.date,'%s')" % ("YYYY-MM" if grain == "month" else "YYYY")
     excl, ex_p = excluded_accounts_sql(conn)
     return conn.execute(
-        f"""SELECT {col} p, {_R2.format("SUM(-t.amount)")} amt FROM transactions t
+        f"""SELECT {col} p, {_R2.format(f"SUM({INCOME_NET})")} amt FROM transactions t
             WHERE {_INCOME_WHERE} {excl}
             GROUP BY p ORDER BY p""",
         (_bank_account_ids(conn), *ex_p)).fetchall()
@@ -991,7 +1036,7 @@ def _income_year_month(conn) -> tuple[dict, dict]:
     excl, ex_p = excluded_accounts_sql(conn)
     for r in conn.execute(
             f"""SELECT to_char(t.date,'YYYY') yr, to_char(t.date,'YYYY-MM') p,
-                       {_R2.format("SUM(-t.amount)")} amt
+                       {_R2.format(f"SUM({INCOME_NET})")} amt
                 FROM transactions t
                 WHERE {_INCOME_WHERE} {excl}
                 GROUP BY GROUPING SETS ((yr), (p))""",
@@ -1020,7 +1065,7 @@ def month_flows(conn, year: int, month: int) -> dict:
             WHERE {SPEND_WHERE} AND t.date >= %s AND t.date < %s {excl}""",
         (start, end, *ex_p)).fetchone()["amt"]
     inc = conn.execute(
-        f"""SELECT {_R2.format("COALESCE(SUM(-t.amount), 0)")} amt
+        f"""SELECT {_R2.format(f"COALESCE(SUM({INCOME_NET}), 0)")} amt
             FROM transactions t
             WHERE {_INCOME_WHERE} AND t.date >= %s AND t.date < %s {excl}""",
         (_bank_account_ids(conn), start, end, *ex_p)).fetchone()["amt"]
@@ -1222,9 +1267,11 @@ def spending_window(conn, today: dt.date, range_key: str) -> dict:
     excl, ex_p = excluded_accounts_sql(conn)
 
     def _cats(a: dt.date, b: dt.date) -> dict[str, float]:
+        # by category: a hand-split row counts under each of its parts
+        pamt2 = _R2.format(f"SUM({PART_NET_JOINED})")
         return {r["cat"]: float(r["amt"] or 0) for r in conn.execute(
-            f"SELECT {EFF_CAT} cat, {amt2} amt FROM transactions t "
-            f"{REIMB_PARTIAL_JOIN} WHERE {SPEND_WHERE} "
+            f"SELECT {PART_CAT} cat, {pamt2} amt FROM transactions t "
+            f"{REIMB_PARTIAL_JOIN} {SPLIT_JOIN} WHERE {SPEND_WHERE} "
             f"AND t.date >= %s AND t.date < %s {excl} GROUP BY cat",
             (a, b, *ex_p))}
 
@@ -1285,7 +1332,7 @@ def income_window(conn, today: dt.date, range_key: str) -> dict:
         out = {"paychecks": 0.0, "interest": 0.0, "other": 0.0}
         for r in conn.execute(
                 f"""SELECT t.name, COALESCE(t.category_detailed,'') AS d,
-                          -t.amount AS amt
+                          {INCOME_NET} AS amt
                      FROM transactions t
                     WHERE {_INCOME_WHERE} AND t.date >= %s AND t.date < %s
                     {excl}""",
@@ -1297,7 +1344,7 @@ def income_window(conn, today: dt.date, range_key: str) -> dict:
     prev_kinds = _kinds(prev, start) if prev else None
     by_month = [[r["ym"], round(float(r["amt"] or 0), 2)] for r in conn.execute(
         f"""SELECT to_char(t.date,'YYYY-MM') ym,
-                   SUM(-t.amount) amt FROM transactions t
+                   SUM({INCOME_NET}) amt FROM transactions t
             WHERE {_INCOME_WHERE} AND t.date >= %s AND t.date < %s {excl}
             GROUP BY ym ORDER BY ym""", (bank, start, end, *ex_p))]
 
@@ -1309,7 +1356,7 @@ def income_window(conn, today: dt.date, range_key: str) -> dict:
     def _sources(a: dt.date, b: dt.date, limit: int | None):
         rows = conn.execute(
             f"""SELECT {DISPLAY_MERCHANT} payee,
-                       {_R2.format('SUM(-t.amount)')} amt, COUNT(*) n,
+                       {_R2.format(f'SUM({INCOME_NET})')} amt, COUNT(*) n,
                        max({MERCHANT_LOGO}) logo
                  FROM transactions t {MC_JOIN}
                 WHERE {_INCOME_WHERE} AND t.date >= %s AND t.date < %s {excl}
@@ -1416,7 +1463,7 @@ def flow_breakdown(conn, today: dt.date, range_key: str) -> dict:
         inc = {"paychecks": 0.0, "interest": 0.0, "other": 0.0}
         for r in conn.execute(
                 f"""SELECT t.name, COALESCE(t.category_detailed,'') AS d,
-                          -t.amount AS amt
+                          {INCOME_NET} AS amt
                      FROM transactions t
                     WHERE {_INCOME_WHERE} AND t.date >= %s AND t.date < %s
                     {excl_sql}""",
@@ -2003,9 +2050,147 @@ def compute_fees(conn, today: dt.date | None = None) -> dict:
     }
 
 
+# ---- interest & fees paid: what holding cash and carrying a card costs ----
+
+# A row that is a bank or card charging for the account itself — a fee, or
+# interest on a carried balance — rather than a purchase. The aggregator's
+# BANK_FEES family (interest charge, ATM, overdraft, foreign transaction,
+# late/other) by tag, older imports by their legacy primary, and the words a
+# statement prints when no tag arrived. Interest EARNED is income and never
+# lands here: an INCOME primary is excluded outright, so "Interest Paid" on
+# a savings account stays on the income side of the page.
+#
+# Read per PART of a hand-split row (categories.SPLIT_JOIN in the query):
+# a part is a fee exactly when the person put it under BANK_FEES, and the
+# bank's tag and statement words speak only for an unsplit row — a fee row
+# split into fee and goods is only its fee part, and a fee folded into a
+# purchase counts once split out.
+_CASH_COST_WHERE = (r"""t.removed=0 AND t.pending=0 AND t.account_id = ANY(%s)
+  AND UPPER(COALESCE(t.category_override, t.category_primary, ''))
+      NOT IN ('INCOME','TRANSFER_IN','TRANSFER_OUT','LOAN_PAYMENTS')
+  AND (UPPER(COALESCE(""" + _categories.PART_CAT + r""", ''))
+           IN ('BANK_FEES','BANK FEES')
+       OR (sp.line IS NULL AND (
+           UPPER(COALESCE(t.category_detailed,'')) LIKE 'BANK\_FEES%%' ESCAPE '\'
+        OR UPPER(COALESCE(t.category_detailed,'')) = 'BANK FEES'
+        OR (' ' || LOWER(t.name) || ' ') LIKE '%% interest charge%%'
+        OR (' ' || LOWER(t.name) || ' ') LIKE '%% purchase interest %%'
+        OR (' ' || LOWER(t.name) || ' ') LIKE '%% finance charge %%')))""")
+_INTEREST_WORDS = ("interest charge", "purchase interest", "finance charge",
+                   "interest charged")
+
+
+def _cash_account_ids(conn) -> list[str]:
+    """Depository and credit accounts at a real bank — the accounts whose
+    fees and interest are the cost of holding cash and carrying a balance.
+    An investment provider's accounts are out: their fee drag is
+    compute_fees' subject, and counting a custodian fee here would report
+    it twice on one page."""
+    from . import links
+    shadows = links.shadow_ids(conn)
+    return [r["id"] for r in conn.execute(
+        f"""SELECT a.id FROM accounts a JOIN items i ON i.id=a.item_id
+            WHERE a.type IN ('depository','credit')
+              AND LOWER(COALESCE(i.institution_name,'')) NOT LIKE ALL(%s)
+              AND NOT (a.id = ANY(%s))
+              AND ({budget.COMBINE_OR} a.entity_id IS NULL)""",
+        (_INV_PATTERNS, shadows))]
+
+
+def cash_cost_kind(name: str, detailed: str) -> str:
+    """'interest' for a carried-balance charge, 'fee' for everything else the
+    bank charged for the account."""
+    if (detailed or "").upper() == "BANK_FEES_INTEREST_CHARGE":
+        return "interest"
+    low = " " + (name or "").lower() + " "
+    return "interest" if any(w in low for w in _INTEREST_WORDS) else "fee"
+
+
+def cash_cost_rows(conn, since: dt.date | None = None) -> list[dict]:
+    """Every fee and interest charge (and their refunds — negative rows) on
+    the household's bank and card accounts, newest first, each classified.
+    `since` bounds the scan for the daily edge check."""
+    ids = _cash_account_ids(conn)
+    if not ids:
+        return []
+    excl, ex_p = excluded_accounts_sql(conn)
+    bound = "AND t.date >= %s" if since else ""
+    params: tuple = (ids, *((since,) if since else ()), *ex_p)
+    rows = conn.execute(
+        f"""SELECT t.id, t.date, {_categories.PART_AMOUNT} AS amount,
+                   t.name, t.account_id,
+                   COALESCE(t.category_detailed,'') AS detailed,
+                   {DISPLAY_MERCHANT} payee, a.name AS account
+              FROM transactions t {MC_JOIN} {SPLIT_JOIN}
+              JOIN accounts a ON a.id = t.account_id
+             WHERE {_CASH_COST_WHERE} {bound} {excl}
+             ORDER BY t.date DESC, t.amount DESC""", params).fetchall()
+    out = []
+    for r in rows:
+        out.append({"id": r["id"], "date": as_date(r["date"]),
+                    "amount": float(r["amount"] or 0),
+                    "name": (r["payee"] or r["name"] or "").strip(),
+                    "account": r["account"] or "", "account_id": r["account_id"],
+                    "kind": cash_cost_kind(r["name"], r["detailed"])})
+    return out
+
+
+def compute_cash_costs(conn, today: dt.date | None = None) -> dict:
+    """Interest and fees paid, by year: what holding money and carrying a
+    balance cost, netted against the refunds the bank gave back (an ATM
+    fee reimbursed is not a fee paid). The interest-earned figure for the
+    current year is beside it so the page can say whether the household's
+    cash costs more than it pays. Empty `by_year` means nothing to show."""
+    today = today or dt.date.today()
+    rows = cash_cost_rows(conn)
+    years: dict[str, dict] = {}
+    interest_ever = 0.0
+    latest = None
+    for r in rows:
+        y = str(r["date"].year)
+        b = years.setdefault(y, {"year": y, "interest": 0.0, "fees": 0.0,
+                                 "refunds": 0.0, "net": 0.0, "biggest": None})
+        amt = r["amount"]
+        if amt < 0:
+            b["refunds"] += -amt
+        elif r["kind"] == "interest":
+            b["interest"] += amt
+            interest_ever += amt
+        else:
+            b["fees"] += amt
+        b["net"] += amt
+        if amt > 0 and (b["biggest"] is None or amt > b["biggest"][1]):
+            b["biggest"] = [r["name"], round(amt, 2), r["date"].isoformat(),
+                            r["kind"]]
+        if amt > 0 and latest is None:
+            latest = [r["name"], round(amt, 2), r["date"].isoformat(),
+                      r["kind"], r["account"]]
+    by_year = [{k: (round(v, 2) if isinstance(v, float) else v)
+                for k, v in b.items()}
+               for b in sorted(years.values(), key=lambda b: b["year"],
+                               reverse=True)]
+    # interest earned this year, on the same accounts, so "net vs earned"
+    # compares like with like (dividends are a brokerage's, not a bank's)
+    bank = _bank_account_ids(conn)
+    excl, ex_p = excluded_accounts_sql(conn)
+    earned = conn.execute(
+        f"""SELECT COALESCE(SUM({INCOME_NET}),0) AS amt FROM transactions t
+             WHERE {_INCOME_WHERE} AND t.date >= %s
+               AND (COALESCE(t.category_detailed,'') = 'INCOME_INTEREST_EARNED'
+                    OR (' ' || LOWER(t.name) || ' ') LIKE '%% interest %%')
+               {excl}""",
+        (bank, dt.date(today.year, 1, 1), *ex_p)).fetchone()["amt"]
+    ytd = next((b for b in by_year if b["year"] == str(today.year)), None)
+    return {"by_year": by_year, "ytd": ytd,
+            "interest_ever": round(interest_ever, 2),
+            "earned_ytd": round(float(earned or 0), 2),
+            "latest": latest}
+
+
 REPORTS = {
     "networth": compute_networth,
     "spending": compute_spending,
     "cashflow": compute_cashflow,
     "fees": compute_fees,
+    "cash_costs": compute_cash_costs,
 }

@@ -543,7 +543,7 @@ class FeesTests(unittest.TestCase):
             write_config(conn, advisory_fees={"evergreen": 0.0025},
                          advisory_fee_exempt_masks=["1111"])
             add_item(conn, "rb", "Evergreen Robo")
-            add_account(conn, "rba", "Automated Investing", "investment",
+            add_account(conn, "rba", "Managed Portfolio", "investment",
                         "brokerage", 110000, item="rb")
             # self-directed account at the same robo: exempt by mask
             add_account(conn, "rbs", "Stock Picking", "investment",
@@ -574,7 +574,7 @@ class FeesTests(unittest.TestCase):
         try:
             write_config(conn)
             add_item(conn, "rb", "Evergreen Robo")
-            add_account(conn, "rba", "Automated Investing", "investment",
+            add_account(conn, "rba", "Managed Portfolio", "investment",
                         "brokerage", 110000, item="rb")
             add_holding(conn, "rba", "VTI", 1000, 110, 110000)
             names = [p[0] for p in reporting.compute_fees(conn)["by_platform"]]
@@ -626,7 +626,7 @@ class BrokeragePLTests(unittest.TestCase):
             add_item(conn, "nb", "Northwind Brokerage")
             add_account(conn, "roth", "Roth IRA", "investment", "roth",
                         1000, item="nb", mask="1234")
-            add_account(conn, "auto", "Automated Investing", "investment",
+            add_account(conn, "auto", "Managed Portfolio", "investment",
                         "brokerage", 2000, item="nb", mask="5678")
             # a source basis known to be wrong ($6) — override must win
             add_holding(conn, "roth", "VEA", 100, 10, 1000,
@@ -635,7 +635,7 @@ class BrokeragePLTests(unittest.TestCase):
                         raw={"cost_basis": 1500})
             pl = reporting._brokerage_pl(conn)
             self.assertEqual(pl, [
-                {"name": "Automated Investing", "institution": "Northwind Brokerage",
+                {"name": "Managed Portfolio", "institution": "Northwind Brokerage",
                  "basis": 1500.0, "value": 2000.0, "pl": 500.0, "pct": 33.3},
                 {"name": "Roth IRA", "institution": "Northwind Brokerage",
                  "basis": 400.0, "value": 1000.0, "pl": 600.0, "pct": 150.0},

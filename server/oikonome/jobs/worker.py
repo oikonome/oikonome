@@ -32,6 +32,7 @@ import asyncio
 import datetime as dt
 import logging
 import os
+import threading
 
 from arq import cron
 
@@ -678,6 +679,11 @@ def _sync_pass(conn, tenant_id: str, since_days: int, progress,
         alerts.heartbeat(conn, "sync", f"{len(items)} items")
     # proactive email the moment a connection breaks or recovers —
     # a mail failure must never break the sync
+    if transitions:
+        from ..notify import webhooks as _wh
+        _wh.emit(conn, "connection.changed", {
+            "connections": [{"name": t["name"], "from": t["old"],
+                             "to": t["new"]} for t in transitions]})
     try:
         built = link_alert.build_alert(transitions)
         if built:
@@ -746,7 +752,74 @@ def _sync_pass(conn, tenant_id: str, since_days: int, progress,
         except Exception as e:                       # noqa: BLE001
             log.warning("bill txn-category apply failed tenant=%s: %s",
                         tenant_id, e)
+        # a hand split whose row just posted for a different amount no
+        # longer adds up; the parts are dropped rather than counted as a
+        # total the bank never charged
+        try:
+            from ..engine import splits as _splits
+            n = _splits.drop_stale(conn)
+            if n:
+                log.info("dropped %d stale split parts tenant=%s", n, tenant_id)
+        except Exception as e:                       # noqa: BLE001
+            log.warning("stale split sweep failed tenant=%s: %s", tenant_id, e)
     return failures
+
+
+def _recent_txn_ids(conn) -> set[str] | None:
+    """The ids of the recent rows before a sync, so the rows the sync adds
+    can be named afterwards. None when no webhook wants them — the set is
+    a few hundred ids at most (the sync window is 30 days; 45 covers a
+    backdated post), but there is no reason to read it for nobody."""
+    from ..notify import webhooks as _wh
+    if not (_wh.wanted(conn, "transactions.new")
+            or _wh.wanted(conn, "sync.completed")):
+        return None
+    return {r["id"] for r in conn.execute(
+        "SELECT id FROM transactions "
+        "WHERE date >= CURRENT_DATE - 45").fetchall()}
+
+
+def _webhooks_after_sync(conn, results: dict, before_ids: set | None,
+                         tenant_id: str = "") -> None:
+    """sync.completed and transactions.new for the household's webhooks.
+    Best-effort — a failure here never fails the sync."""
+    if before_ids is None or not results:
+        return
+    try:
+        from ..notify import webhooks as _wh
+        names = {r["id"]: r["institution_name"] for r in conn.execute(
+            "SELECT id, institution_name FROM items").fetchall()}
+        items = []
+        for iid, st in results.items():
+            ok = str(st).startswith("ok:")
+            items.append({"id": iid, "name": names.get(iid, iid),
+                          "ok": ok,
+                          "error": None if ok else str(st).partition(":")[2] or str(st)})
+        # the payee as the ledger displays it (rename, merchant row), the
+        # one definition every surface reads
+        from ..engine import merchant_sql as _msql
+        new_rows = conn.execute(
+            f"""SELECT t.id, t.date, t.amount,
+                       {_msql.DISPLAY_MERCHANT} AS payee,
+                       t.name AS bank_text, t.account_id,
+                       COALESCE(a.display_name, a.name) AS account, t.pending,
+                       COALESCE(t.category_override, t.category_primary) AS category
+                  FROM transactions t LEFT JOIN accounts a ON a.id = t.account_id
+                  {_msql.MC_JOIN}
+                 WHERE t.date >= CURRENT_DATE - 45 AND t.removed = 0
+                   AND NOT (t.id = ANY(%s))
+                 ORDER BY t.date DESC, ABS(t.amount) DESC""",
+            (list(before_ids),)).fetchall()
+        _wh.emit(conn, "sync.completed", {
+            "connections": items, "new_transactions": len(new_rows),
+            "ok": all(i["ok"] for i in items)})
+        if new_rows:
+            _wh.emit(conn, "transactions.new", {
+                "count": len(new_rows),
+                "transactions": [dict(r) for r in new_rows[:_wh.LIST_MAX]]})
+    except Exception as e:                                   # noqa: BLE001
+        log.warning("webhooks after sync failed tenant=%s: %s",
+                    tenant_id, e)
 
 
 def sync_tenant(tenant_id: str, since_days: int = 30, progress=None) -> dict:
@@ -794,6 +867,7 @@ def sync_tenant(tenant_id: str, since_days: int = 30, progress=None) -> dict:
         # pass about to run — clear it, or a leftover request would buy
         # every later sweep a second pass for ever.
         _clear_sync_nudge(conn)
+        before_ids = _recent_txn_ids(conn)
         try:
             failures += _sync_pass(conn, tenant_id, since_days, progress,
                                    results)
@@ -816,6 +890,7 @@ def sync_tenant(tenant_id: str, since_days: int = 30, progress=None) -> dict:
             # as "done" over it
             failures += 1
             raise
+        _webhooks_after_sync(conn, results, before_ids, tenant_id)
         return results
     finally:
         # settle the progress row for whoever is watching. State only —
@@ -873,6 +948,18 @@ def nightly_tenant(tenant_id: str) -> dict:
                 conn, localtime.now_local(_bsnap.load_config(conn)).date())
         except Exception as e:                   # noqa: BLE001
             log.warning("budget snapshot failed tenant=%s: %s", tenant_id, e)
+        # the activity log keeps two years; older rows go quietly
+        try:
+            from ..engine import activity as _activity
+            _activity.prune(conn)
+        except Exception as e:                   # noqa: BLE001
+            log.warning("activity prune failed tenant=%s: %s", tenant_id, e)
+        # settled webhook deliveries keep a week
+        try:
+            from ..notify import webhooks as _wh
+            _wh.prune(conn)
+        except Exception as e:                   # noqa: BLE001
+            log.warning("webhook prune failed tenant=%s: %s", tenant_id, e)
         try:
             stats = bills.run(conn)
         except Exception as e:                   # noqa: BLE001
@@ -925,6 +1012,16 @@ def nightly_tenant(tenant_id: str) -> dict:
         except Exception as e:                   # noqa: BLE001
             log.warning("plaid recurring cross-check failed tenant=%s: %s",
                         tenant_id, e)
+        # what a person wrote on a retired row follows the live charge —
+        # the backstop for every retirement path the sync hooks missed
+        try:
+            from ..sync import reanchor as _ra
+            ra = _ra.reanchor_stranded(conn)
+            if ra["moved"] or ra["ambiguous"]:
+                stats["reanchored"] = ra["moved"]
+                stats["reanchor_ambiguous"] = ra["ambiguous"]
+        except Exception as e:                       # noqa: BLE001
+            log.warning("re-anchor sweep failed tenant=%s: %s", tenant_id, e)
         from ..engine import amazon_match as _am
         from ..engine import costco_match as _cm
         from ..engine import llm_categorize as _llm
@@ -1135,7 +1232,28 @@ def snapshot_tenant(tenant_id: str) -> dict:
     'networth-snapshot'). This is what makes the REAL net-worth trend
     accrue — it must run from day one or the recorded series gets a hole."""
     from ..web import reporting_api
-    return reporting_api.snapshot_tenant(tenant_id)
+    out = reporting_api.snapshot_tenant(tenant_id)
+    if out.get("snapshot"):
+        conn = tenancy.tenant_connect(tenant_id)
+        try:
+            from ..notify import webhooks as _wh
+            if _wh.wanted(conn, "networth.snapshot"):
+                from ..engine import reporting as _rep
+                row = conn.execute(
+                    "SELECT date, total FROM networth_snapshot "
+                    "ORDER BY date DESC LIMIT 1").fetchone()
+                nw = _rep.compute_networth(conn)
+                _wh.emit(conn, "networth.snapshot", {
+                    "date": row["date"] if row else None,
+                    "total": round(float(row["total"]), 2) if row else None,
+                    "with_property": round(float(nw.get("full_total") or 0), 2),
+                    "by_institution": [{"institution": k, "total": v}
+                                       for k, v in nw.get("by_institution") or []]})
+        except Exception as e:                   # noqa: BLE001
+            log.warning("networth webhook failed tenant=%s: %s", tenant_id, e)
+        finally:
+            conn.close()
+    return out
 
 
 def _tz():
@@ -1175,6 +1293,37 @@ def _sched_int(entry: dict, key: str, default: int, hi: int) -> int | None:
     return v if 0 <= v <= hi else None
 
 
+def _stamp_fresh(conn, cfg: dict, now_utc: dt.datetime, job: str,
+                 since: dt.datetime) -> bool:
+    """Has the household's local day turned since `job` last stamped
+    job_runs? `since` is today's local midnight in the zone in effect now.
+    Shared by every once-a-local-day send (the cadence emails and the
+    daily webhook event) so all of them read "today" the same way."""
+    from .. import localtime
+    hb = conn.execute("SELECT ran_at, zone FROM job_runs WHERE job=%s",
+                      (job,)).fetchone()
+    if hb is None:
+        return True
+    if hb["ran_at"] >= since:
+        return False
+    # The heartbeat is older than today's local midnight in the zone
+    # in effect NOW. It must also be older than that midnight in the
+    # zone it was STAMPED in: moving the household to a zone far
+    # enough ahead that "now" is already tomorrow's date pushes
+    # today's midnight past this morning's send, and the next sweep
+    # sends the same day's verdict again. A day has only turned when
+    # both zones say so.
+    if hb["zone"] and hb["zone"] != localtime.tenant_tz_name(cfg) \
+            and localtime.valid_zone(hb["zone"]):
+        import zoneinfo
+        then = now_utc.astimezone(zoneinfo.ZoneInfo(hb["zone"]))
+        then_start = dt.datetime.combine(
+            then.date(), dt.time.min, then.tzinfo
+        ).astimezone(dt.timezone.utc)
+        return hb["ran_at"] < then_start
+    return True
+
+
 def emails_due(conn, now_utc: dt.datetime) -> list[str]:
     """Which cadences should send THIS hour. email_schedule =
     {daily:{on,hour}, weekly:{on,hour,weekday 0=Mon}, monthly:{on,hour}},
@@ -1202,28 +1351,7 @@ def emails_due(conn, now_utc: dt.datetime) -> list[str]:
         return []
 
     def fresh(job, since):
-        hb = conn.execute("SELECT ran_at, zone FROM job_runs WHERE job=%s",
-                          (job,)).fetchone()
-        if hb is None:
-            return True
-        if hb["ran_at"] >= since:
-            return False
-        # The heartbeat is older than today's local midnight in the zone
-        # in effect NOW. It must also be older than that midnight in the
-        # zone it was STAMPED in: moving the household to a zone far
-        # enough ahead that "now" is already tomorrow's date pushes
-        # today's midnight past this morning's send, and the next sweep
-        # sends the same day's verdict again. A day has only turned when
-        # both zones say so.
-        if hb["zone"] and hb["zone"] != localtime.tenant_tz_name(cfg) \
-                and localtime.valid_zone(hb["zone"]):
-            import zoneinfo
-            then = now_utc.astimezone(zoneinfo.ZoneInfo(hb["zone"]))
-            then_start = dt.datetime.combine(
-                then.date(), dt.time.min, then.tzinfo
-            ).astimezone(dt.timezone.utc)
-            return hb["ran_at"] < then_start
-        return True
+        return _stamp_fresh(conn, cfg, now_utc, job, since)
 
     # fire on the first sweep AT OR AFTER the configured hour (>=,
     # not ==) that hasn't run today. The `fresh(job, day_start)` guard keeps
@@ -1248,11 +1376,18 @@ def emails_due(conn, now_utc: dt.datetime) -> list[str]:
     sched = effective_email_schedule(cfg)
     due = []
 
+    # a webhook subscribed to the daily verdict is a channel too: the
+    # event rides the daily cadence's hour even when no email/SMS/push
+    # wants it
+    from ..notify import webhooks as _wh
+    hook_daily = _wh.wanted(conn, "report.daily")
+
     def slot(entry, cadence):
         # the cadence's local send hour, or None when the entry is off or
         # malformed — a malformed one is skipped and logged rather than
         # allowed to take the other cadences down with it
-        if not _channels_on(entry):
+        if not _channels_on(entry) and not (cadence == "daily"
+                                            and hook_daily):
             return None
         hour = _sched_int(entry, "hour", 7, 23)
         if hour is None:
@@ -1290,6 +1425,24 @@ def email_due(conn, now_utc: dt.datetime) -> bool:
     return "daily" in emails_due(conn, now_utc)
 
 
+# the job_runs stamp of the day's report.daily webhook event, separate
+# from the daily email's: the two succeed and fail independently
+DAILY_HOOK_JOB = "daily-webhook"
+
+
+def _daily_hook_queued_today(conn, cfg: dict) -> bool:
+    """Was today's report.daily already queued — today being the
+    household's local day, read exactly as the daily email reads it
+    (including the zone the stamp was written in, so moving the household
+    east does not make the same day look new and post the report twice)."""
+    from .. import localtime
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    local = now_utc.astimezone(localtime.tenant_tz(cfg))
+    day_start = dt.datetime.combine(local.date(), dt.time.min,
+                                    local.tzinfo).astimezone(dt.timezone.utc)
+    return not _stamp_fresh(conn, cfg, now_utc, DAILY_HOOK_JOB, day_start)
+
+
 class NoRecipients(RuntimeError):
     """The manual "email me now" button found nobody to mail.
 
@@ -1298,6 +1451,28 @@ class NoRecipients(RuntimeError):
     pending), but a person who just pressed the button must not be told
     "sent" when nothing left the box — that is how an unverified owner
     sat waiting for a mail that was never going to come."""
+
+
+def _needs_you(conn, tenant_id: str, d: dict):
+    """The daily mail's closing "Needs you" section as a per-address
+    function for report.send_each — the household's part (proposals,
+    uncategorized charges, alerts) gathered once here while the tenant
+    connection is open, the actor list read once, and each copy cut at send
+    time with buttons signed for its own address. An address without an
+    owner or member account gets nothing: no buttons, no alerts."""
+    from ..notify import mailact
+    try:
+        acts = mailact.gather(conn, d)
+        who = mailact.actors(tenant_id)
+    except Exception:                                      # noqa: BLE001
+        log.exception("tenant %s: needs-you section unavailable", tenant_id)
+        return None
+
+    def personal(address: str) -> tuple[str, str]:
+        if address.strip().lower() not in who:
+            return "", ""
+        return mailact.render(acts, tenant_id, address)
+    return personal
 
 
 def email_tenant(tenant_id: str, send_it: bool = True,
@@ -1331,6 +1506,8 @@ def email_tenant(tenant_id: str, send_it: bool = True,
         from ..notify import render as _short
         entry = _sched_entry(cfg.get("email_schedule"), cadence)
         short = ""
+        personal = None
+        hooked = False
         if cadence == "weekly":
             subject, plain, html = lens_email.build_weekly(conn, today_local)
             start = lenses_mod.monday_of(today_local - dt.timedelta(days=7))
@@ -1368,6 +1545,31 @@ def email_tenant(tenant_id: str, send_it: bool = True,
             subject, plain, html = report.build(
                 d, summary=bool(entry.get("summary")))
             short = _short.short_daily(d)
+            personal = _needs_you(conn, tenant_id, d)
+            # the daily webhook event: the same gather the mail renders,
+            # in the integrations summary shape; queued here, sent by the
+            # drain. Not on the manual "email me now" button — that is a
+            # mail, not the day's report. It has its own once-a-day stamp:
+            # the mail below may fail and come due again every hourly
+            # sweep until the relay is back, and each retry must not post
+            # the receiver another copy of the day's report
+            if send_it and not force_email:
+                try:
+                    from ..notify import webhooks as _wh
+                    if _wh.wanted(conn, "report.daily"):
+                        hooked = _daily_hook_queued_today(conn, cfg)
+                        if not hooked:
+                            from ..web import integrations as _integ
+                            hooked = _wh.emit(
+                                conn, "report.daily",
+                                _integ.summary(conn, today_local, st=d)) > 0
+                            if hooked:
+                                alerts.heartbeat(
+                                    conn, DAILY_HOOK_JOB, subject[:80],
+                                    zone=localtime.tenant_tz_name(cfg))
+                except Exception as e:           # noqa: BLE001
+                    log.warning("daily webhook failed tenant=%s: %s",
+                                tenant_id, e)
         # force_email (the manual "email me now" button): send the email,
         # skip the other channels + the cadence heartbeat entirely
         want_email = True if force_email else entry.get("on", True)
@@ -1422,7 +1624,7 @@ def email_tenant(tenant_id: str, send_it: bool = True,
         # missing recipient goes unnoticed for days with nothing logging a
         # problem.
         outcome = report.send_each(subject, plain, html, recipients, smtp=smtp,
-                                   unsubscribe=tenant_id)
+                                   unsubscribe=tenant_id, personal=personal)
         failed = [r["email"] for r in outcome if not r["ok"]]
         if failed:
             log.warning("tenant %s: daily email failed for %d/%d recipients: %s",
@@ -1460,7 +1662,7 @@ def email_tenant(tenant_id: str, send_it: bool = True,
             except Exception as e:               # noqa: BLE001
                 log.warning("push fan-out failed for %s: %s", tenant_id, e)
     if send_it and not force_email and (had_recipients or want_sms
-                                        or want_push):
+                                        or want_push or hooked):
         conn2 = tenancy.tenant_connect(tenant_id)
         try:
             from .. import localtime
@@ -1550,10 +1752,16 @@ async def nightly_all(ctx):
     # account the gate froze tonight gets its full grace window rather than
     # racing this same run
     frozen = (await asyncio.to_thread(ext.gate.nightly)).get("frozen", [])
+    # signups nobody ever confirmed: the day-7 reminder and the day-30
+    # freeze (jobs/unverified.py; hosted only, OIKONOME_UNVERIFIED_REAP_DAYS=0
+    # disables). Before the purge for the same reason as the gate's sweeps.
+    from . import unverified as _unverified
+    stale_signups = await asyncio.to_thread(_unverified.sweep)
     # finish deletions whose grace window has lapsed
     purged = await asyncio.to_thread(purge_scheduled_deletions)
     return {"detect": detect, "snapshot": snapshot, "script_alerts": stale,
-            "plaid_reap": reap, "frozen": frozen, "purged": purged}
+            "plaid_reap": reap, "frozen": frozen, "purged": purged,
+            "unverified": stale_signups}
 
 
 def purge_scheduled_deletions() -> list[str]:
@@ -1572,14 +1780,16 @@ def purge_scheduled_deletions() -> list[str]:
     purge that fails leaves the tenant in its current status (retried
     next night) and writes an admin_audit row so a permanently-stuck
     tenant is visible in the console, not silently frozen forever."""
-    from ..web.adminconsole import _audit, _purge_tenant
+    from ..web.adminconsole import _audit, _frozen_statuses, _purge_tenant
     admin = tenancy.admin_connect()
     try:
         # every status a purge may finish: the product's own grace
-        # deletion, plus whatever an installed add-on freezes a household
-        # under (asked rather than hardcoded, so a new lockout status never
-        # leaves tenants frozen forever with nothing to sweep them)
-        statuses = ["pending_delete", *ext.gate.lockout_statuses()]
+        # deletion and its never-confirmed freeze, plus whatever an
+        # installed add-on freezes a household under (asked rather than
+        # hardcoded, so a new lockout status never leaves tenants frozen
+        # forever with nothing to sweep them) — the console's restore
+        # lifts exactly this set
+        statuses = _frozen_statuses()
         candidates = [str(r["id"]) for r in admin.execute(
             "SELECT id FROM tenants WHERE status = ANY(%s) "
             "AND delete_after IS NOT NULL AND delete_after <= now()",
@@ -1692,6 +1902,66 @@ def _email_if_due(tenant_id: str) -> None:
             tenancy.release_lock(conn, f"oikonome:email:{tenant_id}")
     finally:
         conn.close()
+
+
+def _webhook_tenants() -> list[str]:
+    """Tenants with a delivery due — one admin query instead of a
+    tenant-scoped connection per household per minute. Longest-waiting
+    first, so a pass that runs out of minute does not always leave the
+    same households for last."""
+    admin = tenancy.admin_connect()
+    try:
+        return [str(r["tenant_id"]) for r in admin.execute(
+            "SELECT tenant_id FROM webhook_deliveries "
+            "WHERE state = 'pending' AND next_attempt_at <= now() "
+            "GROUP BY tenant_id ORDER BY min(next_attempt_at)").fetchall()]
+    finally:
+        admin.close()
+
+
+def webhooks_drain_tenant(tenant_id: str) -> dict:
+    from ..notify import webhooks as _wh
+    conn = tenancy.tenant_connect(tenant_id)
+    try:
+        return _wh.deliver_pending(conn)
+    finally:
+        conn.close()
+
+
+# held for the length of one drain pass. arq's job timeout cancels the
+# coroutine but not the thread it awaits, so a pass that overran its
+# minute would otherwise have the next one start beside it, and every
+# minute another thread would join the default executor that the sync,
+# email and nightly sweeps also run on
+_WEBHOOK_PASS = threading.Lock()
+
+
+def webhooks_drain() -> dict:
+    """Send every due webhook delivery, per tenant, isolating failures.
+    Does nothing while the previous pass is still running."""
+    if not _WEBHOOK_PASS.acquire(blocking=False):
+        log.info("webhook drain skipped — the previous pass is still "
+                 "running")
+        return {}
+    try:
+        out: dict[str, str] = {}
+        for tid in _webhook_tenants():
+            try:
+                r = webhooks_drain_tenant(tid)
+                out[tid] = f"sent:{r['sent']} failed:{r['failed']}"
+            except Exception as e:               # noqa: BLE001
+                out[tid] = f"error:{type(e).__name__}"
+                log.error("webhook drain failed for tenant %s: %s", tid, e)
+        return out
+    finally:
+        _WEBHOOK_PASS.release()
+
+
+async def webhooks_all(ctx):
+    """Every minute: the webhook outbox. A delivery is queued by whatever
+    observed the event and sent here, so a slow receiver never holds a
+    request or a sync."""
+    return await asyncio.to_thread(webhooks_drain)
 
 
 async def email_all(ctx):
@@ -1995,7 +2265,7 @@ class WorkerSettings:
     on_startup = _startup
     functions = [sync_all, nightly_all, email_all, demo_reset_all, sync_one,
                  sync_item, broadcast_sweep, nightly_reboot,
-                 blocklist_refresh] + ext.job_functions()
+                 blocklist_refresh, webhooks_all] + ext.job_functions()
     cron_jobs = [
         # every 5 minutes, each firing serving one tenant hash-slot — every
         # tenant still syncs exactly hourly, just not all at :00 (see
@@ -2015,5 +2285,6 @@ class WorkerSettings:
         cron(broadcast_sweep,                           # stale reboot banners
              minute={2, 12, 22, 32, 42, 52}),
         cron(nightly_reboot, hour=9, minute=4),         # graceful maint window
+        cron(webhooks_all, minute=set(range(60))),      # the webhook outbox
     ] + ext.cron_jobs()
     redis_settings = _redis_settings()

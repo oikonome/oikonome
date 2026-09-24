@@ -177,13 +177,13 @@ class ScopedApplyTests(unittest.TestCase):
 
     def test_set_category_still_propagates_merchant_wide(self):
         # the interactive door now passes canon= — behavior must be unchanged
-        canon(self.conn, "CAROUSEL LLC", "Carousel")
-        canon(self.conn, "SQ *CAROUSEL", "Carousel")
-        add_raw_txn(self.conn, "c1", "2025-07-01", 3, "CAROUSEL LLC",
+        canon(self.conn, "RIVER FERRY LLC", "River Ferry")
+        canon(self.conn, "SQ *RIVER FERRY", "River Ferry")
+        add_raw_txn(self.conn, "c1", "2025-07-01", 3, "RIVER FERRY LLC",
                     primary="PERSONAL_CARE",
                     raw={"personal_finance_category":
                          {"primary": "PERSONAL_CARE"}})
-        add_raw_txn(self.conn, "c2", "2025-07-02", 3, "SQ *CAROUSEL",
+        add_raw_txn(self.conn, "c2", "2025-07-02", 3, "SQ *RIVER FERRY",
                     primary="PERSONAL_CARE",
                     raw={"personal_finance_category":
                          {"primary": "PERSONAL_CARE"}})
@@ -222,13 +222,13 @@ class RekeyMigrationTests(unittest.TestCase):
         self.conn.execute(REKEY_SQL)
 
     def test_agreeing_raw_rules_merge_to_one_canonical_row(self):
-        canon(self.conn, "SQ *POINTE D'AMOUR CARO", "Pointe Amour Caro")
-        canon(self.conn, "NYX POINTE AMOUR CARO", "Pointe Amour Caro")
-        rule(self.conn, "SQ *POINTE D'AMOUR CARO", "ENTERTAINMENT")
-        rule(self.conn, "NYX POINTE AMOUR CARO", "ENTERTAINMENT")
+        canon(self.conn, "SQ *LAKE O'BRIEN CAFE", "Lake Obrien Cafe")
+        canon(self.conn, "NYX LAKE OBRIEN CAFE", "Lake Obrien Cafe")
+        rule(self.conn, "SQ *LAKE O'BRIEN CAFE", "ENTERTAINMENT")
+        rule(self.conn, "NYX LAKE OBRIEN CAFE", "ENTERTAINMENT")
         self._migrate()
         self.assertEqual(rules(self.conn), {
-            "Pointe Amour Caro": ("ENTERTAINMENT", "llm", False)})
+            "Lake Obrien Cafe": ("ENTERTAINMENT", "llm", False)})
 
     def test_single_raw_variant_is_rekeyed(self):
         canon(self.conn, "SQ *NRTHWND SPR", "Northwind Coffee")
@@ -301,12 +301,12 @@ class RekeyMigrationTests(unittest.TestCase):
     def test_merge_then_apply_covers_a_third_variant(self):
         # the point of the re-key: post-merge, a generic-bucket row under a
         # variant that never had its own rule is filled by apply()
-        for raw in ("SQ *CAROUSEL", "CAROUSEL LLC", "NYX CAROUSEL"):
-            canon(self.conn, raw, "Carousel")
-        rule(self.conn, "SQ *CAROUSEL", "ENTERTAINMENT")
-        rule(self.conn, "CAROUSEL LLC", "ENTERTAINMENT")
+        for raw in ("SQ *RIVER FERRY", "RIVER FERRY LLC", "NYX RIVER FERRY"):
+            canon(self.conn, raw, "River Ferry")
+        rule(self.conn, "SQ *RIVER FERRY", "ENTERTAINMENT")
+        rule(self.conn, "RIVER FERRY LLC", "ENTERTAINMENT")
         self._migrate()
-        add_raw_txn(self.conn, "v3", "2025-07-01", 9, "NYX CAROUSEL",
+        add_raw_txn(self.conn, "v3", "2025-07-01", 9, "NYX RIVER FERRY",
                     primary="OTHER",
                     raw={"personal_finance_category": {"primary": "OTHER"}})
         llm_categorize.apply(self.conn)

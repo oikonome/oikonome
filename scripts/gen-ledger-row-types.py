@@ -34,6 +34,16 @@ def ts_type(prop: dict) -> str:
             out.append("null")
         elif x in _TS:
             out.append(_TS[x])
+        elif x == "array":
+            # a list of one shape, rendered inline (`{ a: string }[]`)
+            out.append(ts_type(prop["items"]) + "[]")
+        elif x == "object":
+            props = prop.get("properties") or {}
+            req = set(prop.get("required") or [])
+            fields = "; ".join(
+                f"{k}{'' if k in req else '?'}: {ts_type(v)}"
+                for k, v in props.items())
+            out.append("{ " + fields + " }")
         else:
             raise ValueError(
                 f"ledger-row schema type {x!r} has no TypeScript mapping — "

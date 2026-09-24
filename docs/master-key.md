@@ -1,9 +1,9 @@
 # The master key: backup and rotation
 
 `OIKONOME_MASTER_KEY` (in `docker/.env`) is the root of Oikonome's
-at-rest encryption. Aggregator tokens and API keys encrypt under a
-per-household data key, which is itself stored wrapped by the master
-key; TOTP seeds and the instance's web-push signing key encrypt directly
+at-rest encryption. Aggregator tokens, API keys and webhook signing
+secrets encrypt under a per-household data key, which is itself stored
+wrapped by the master key; TOTP seeds and the instance's web-push signing key encrypt directly
 under it. The database alone is not enough to read those secrets — and
 that is the point.
 
@@ -33,7 +33,10 @@ Rotate on a schedule if your policy asks for one, and immediately if the
 key may have leaked (a copied `.env`, a compromised backup host). Rotation
 re-wraps the stored ciphertexts under the new key — bank connections,
 TOTP and browser push notifications keep working; nothing needs
-re-linking or re-subscribing.
+re-linking or re-subscribing. Webhooks keep their signing secrets. What
+does not survive is the links in emails already sent — the one-tap
+*Needs you* buttons and the unsubscribe link are signed from the key, so
+they stop working; the next email carries fresh ones.
 
 1. Generate a new key:
 

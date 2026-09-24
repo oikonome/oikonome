@@ -71,7 +71,8 @@ class _RingHandler(logging.Handler):
 import re as _re
 
 # Every one-time link the app mints, by URL shape. Query params: reset /
-# setup / verify-email / recipient-invite / unsubscribe (?token=), export
+# setup / verify-email / recipient-invite / unsubscribe / act (?token=),
+# export
 # and dump downloads (?t=), admin-enrol (?ticket=), verification (?code=),
 # and the admin-console / approval signup link (?invite=). Path segments
 # whose NEXT segment is the token: legacy /invite/<token> and the Plaid

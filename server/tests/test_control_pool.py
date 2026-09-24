@@ -124,10 +124,15 @@ class ControlPoolTests(unittest.TestCase):
 
         from psycopg_pool import PoolTimeout
         pool = tenancy._pool(tenancy.APP_DSN)
-        held = [pool.getconn(timeout=10) for _ in range(pool.max_size)]
+        # taken one at a time inside the try: a connection some earlier test
+        # never gave back makes this loop time out, and what it did take
+        # must still go back or every later test starves with it
+        held = []
         old = tenancy.TENANT_POOL_TIMEOUT
-        tenancy.TENANT_POOL_TIMEOUT = 0.2
         try:
+            for _ in range(pool.max_size):
+                held.append(pool.getconn(timeout=10))
+            tenancy.TENANT_POOL_TIMEOUT = 0.2
             t0 = time.perf_counter()
             with self.assertRaises(PoolTimeout):
                 tenancy.tenant_connect(uuid.uuid4())
@@ -144,10 +149,12 @@ class ControlPoolTests(unittest.TestCase):
         an immediate-ish 503 with Retry-After (API JSON, page HTML), not a
         30 s hang into a 500."""
         pool = tenancy._control_pool(tenancy.APP_DSN)
-        held = [pool.getconn(timeout=10) for _ in range(pool.max_size)]
+        held = []
         old_timeout = tenancy.CONTROL_POOL_TIMEOUT
-        tenancy.CONTROL_POOL_TIMEOUT = 0.2
         try:
+            for _ in range(pool.max_size):
+                held.append(pool.getconn(timeout=10))
+            tenancy.CONTROL_POOL_TIMEOUT = 0.2
             r = self.client.get("/api/me")
             self.assertEqual(r.status_code, 503)
             self.assertEqual(r.headers.get("Retry-After"), "15")

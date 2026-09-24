@@ -1,4 +1,4 @@
-"""Spam defense for public email intake (signup, and any intake form an add-on adds).
+"""Spam defense for the public email doors (signup).
 
 Design:
 

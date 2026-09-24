@@ -2,10 +2,15 @@
 
 Alerts answer one question: **what needs your attention today?** The same
 list renders in several places — the strip at the top of the Today page,
-the top of the daily email, the **bell** in the web header (its badge
-carries the count, coloured by the worst severity, and opens the Alerts
-page), the phone app's Alerts screen, and the Alerts page itself, which
-adds the full history and the dismiss controls.
+the **Needs you** section at the foot of the daily email, the **bell** in
+the web header (its badge carries the count, coloured by the worst
+severity, and opens the Alerts page), the phone app's Alerts screen, and
+the Alerts page itself, which adds the full history and the dismiss
+controls.
+
+In the email the alerts go only to **owners and members** — the people
+who can act on them. A viewer's copy, and a copy sent to an address that
+has no login on the household, carries no alerts at all.
 
 ## What can fire
 
@@ -94,6 +99,25 @@ last push (a password change or reset revokes every token) gets its own
 alert on the strip, in the daily email and on the Doctor page, naming the
 source and pointing at Settings → Scripts to mint a replacement — a
 collector in that state is not stale, it is locked out until you do.
+
+## Acting from the email
+
+Each alert in the daily email carries a **mute ✕** link, and the section
+above it lists the things the alerts point at that can be settled in one
+tap: a **proposed bill** (Confirm bill / Not a bill — Confirm income /
+Not income for a paycheck the finder spotted) and an **uncategorized
+charge** from the last day or two, with a few likely categories to pick
+from and an *other…* link into the app. Tapping a button opens a small
+page that says exactly what it is about to do, with one button to do it.
+No sign-in: the link is signed for the address the mail was sent to, does
+that one thing only, and works for seven days. Filing a charge from the
+email sets that one charge; it never writes a merchant rule (open the
+charge in the app for that). A button whose work is already done — the
+proposal decided from the app, the alert already cleared — says so and
+changes nothing.
+
+Buttons appear only when the instance has a public https address
+(`OIKONOME_BASE_URL`); a LAN-only install gets the alerts as text.
 
 ## Dismissing
 

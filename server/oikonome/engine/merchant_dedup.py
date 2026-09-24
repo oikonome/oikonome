@@ -7,11 +7,11 @@ Tran:' vs 'THE ORCHARD APTS ONLINE PMT~', or 'Acme Lending' vs 'Acme Lending
 Student'.
 
 Three layers, all writing to the `merchant_canonical` map (raw -> canonical),
-never touching `name`/`merchant_name`/`raw`. Display surfaces read
-COALESCE(mc.canonical, t.merchant_outlet, t.merchant_name, t.name) — the
-DISPLAY_MERCHANT fragment below, joined per MC_JOIN, which keys the map on
-the outlet when one was identified — so the fix is reversible (drop the
-rows) and clobber-proof (sync only writes name/merchant_name):
+never touching `name`/`merchant_name`/`raw`. Display surfaces read the
+merchant row's name, else this map, else the row's own identity key — the
+DISPLAY_MERCHANT fragment below, joined per MC_JOIN, both spelled once in
+merchant_sql — so the fix is reversible (drop the rows) and clobber-proof
+(sync only writes name/merchant_name):
 
   Layer 1 — `canonical_merchant()`: deterministic. Strips Mint '~…~ Tran'
      volatile clauses (they embed the dollar amount, exploding one payee
@@ -76,6 +76,38 @@ _GEO = re.compile(r",\s*[A-Za-z]{2}\s*,?\s*(?:us|usa)\s*$", re.I)
 _ADDR = re.compile(r"(?<=\S)\s+\d{2,6}[A-Za-z]?\s+(?:[NSEW]\.?|"
                    r"north|south|east|west|[A-Za-z]{3,})\b.*$", re.I)
 
+# An apostrophe is a LETTER-JOINER here, never a word break: it is DELETED
+# before the scrub rather than turned into a space. Which spelling reaches
+# us is an accident of the source — one feed resolves a payee as "Juniper's
+# Market" while the card line for the same purchase prints "JUNIPERS
+# MARKET" — and the canonical form has to come out the same string either
+# way, or one business becomes two merchants with the money split between
+# them until somebody merges them by hand. Broken on, "Juniper's" yields
+# the pieces "Juniper" and "s", the one-letter piece goes as noise, and
+# this payee is "Juniper Market" while its own bank line is "Junipers
+# Market".
+#
+# Deleting the punctuation is also exactly what a bank does to a name it
+# prints, so the joined form is the one spelling BOTH sources can produce,
+# and it is the reading engine/merchant_identity compares a descriptor
+# under (its `_joined_words`). The two modules have to agree: a name this
+# function cleaned is matched against the lines it came from.
+#
+# The same one rule runs over an elided prefix — "L'Anfora" -> "Lanfora" —
+# which agrees with a line printing it closed up ("LANFORA") and not with
+# one that spaces it out ("L ANFORA", whose lone letter is dropped as a
+# bank's letter prefix, the way "N BROADWAY MARKET" loses its "N"). One
+# rule in one direction is the point: a possessive that joins beside a
+# prefix that splits is two rules for a reader to hold, and the comparison
+# that genuinely needs both spellings takes the union of the two readings
+# rather than asking this function to pick differently per name.
+#
+# Only an apostrophe that FOLLOWS a letter or digit joins. A leading one is
+# a quote mark standing in front of a word, and the word break it sits on
+# is real. All three characters a feed may write it with count: ASCII, the
+# typographic right single quote, and the modifier letter a few sources use.
+_APOSTROPHE = re.compile(r"(?<=[A-Za-z0-9])['’ʼ]")
+
 
 def cities_for(conn) -> tuple[str, ...]:
     """The tenant's configured city names (`merchant_strip_cities`).
@@ -122,8 +154,13 @@ def _city_variants(city: str) -> set[str]:
     if len(city) < 4:
         return set()
     out = {city}
-    scrubbed = " ".join(t for t in re.sub(r"[^A-Za-z ]+", " ", city).split()
-                        if len(t) >= 3)
+    # the same scrub the label got, apostrophe rule included, or a town
+    # spelled with one ("Anse d'Or") would be generated as two words the
+    # cleaned label no longer contains
+    scrubbed = " ".join(
+        t for t in re.sub(r"[^A-Za-z ]+", " ",
+                          _APOSTROPHE.sub("", city)).split()
+        if len(t) >= 3)
     if scrubbed:
         out.add(scrubbed)
         floor = max(6, -(-len(scrubbed) * 7 // 10))       # ceil(70%)
@@ -349,6 +386,9 @@ def canonical_merchant(name: str, cities=()) -> str:
     # still splits. Digits survive ONLY inside such a hyphenated word that
     # also carries letters — a bare phone number or date is still noise.
     s = _HYPHEN_RUN.sub(_bind_hyphens, s)
+    # an apostrophe joins the letters it sits between instead of breaking
+    # them apart — see _APOSTROPHE
+    s = _APOSTROPHE.sub("", s)
     s = re.sub(r"[^A-Za-z0-9 \x00]+", " ", s)
     toks = []
     for t in s.split():
@@ -442,12 +482,14 @@ def apply(conn) -> int:
     """Idempotent, no-LLM. Gives every distinct raw merchant its layer1
     canonical WITHOUT overwriting any method='llm'/'manual' row. Cheap
     enough to run every sync. Returns rows touched."""
-    # the OUTLET-first key — the same key the join uses, so an outlet
-    # string gets its layer1 row minted and refreshed like any other
+    # the identity key — the same key the join uses, so an outlet string
+    # gets its layer1 row minted and refreshed like any other, and a row
+    # whose aggregator name was set aside mints one for its bank line
+    # rather than for the name it no longer answers to
     rows = conn.execute(
-        "SELECT DISTINCT COALESCE(merchant_outlet, merchant_name, name) m "
+        f"SELECT DISTINCT {merchant_sql.RAW_KEY_UNALIASED} m "
         "FROM transactions WHERE removed=0 "
-        "AND COALESCE(merchant_outlet, merchant_name, name) IS NOT NULL").fetchall()
+        f"AND {merchant_sql.RAW_KEY_UNALIASED} IS NOT NULL").fetchall()
     # refresh the harvested list first, so a newly-synced city takes effect
     # in this same pass rather than the next one
     try:
@@ -466,6 +508,11 @@ def apply(conn) -> int:
     own = harvest_city_map(conn)
     touched = 0
     recomputed: list[str] = []
+    # the merchant each machine-written alias names NOW, so a key whose
+    # canonical changes below can say which merchant its rows are leaving
+    held = {r["raw_merchant"]: r["merchant_id"] for r in conn.execute(
+        "SELECT raw_merchant, merchant_id FROM merchant_canonical "
+        " WHERE method = 'layer1'").fetchall()}
     with conn.transaction():
         for r in rows:
             m = r["m"]
@@ -496,17 +543,67 @@ def apply(conn) -> int:
     # forever: the merchant row is what every surface displays, and the
     # resolve below only visits rows that have none. This is how a fix to
     # canonical_merchant reaches data that is already in the ledger.
+    #
+    # The merchant those rows LEAVE is retired into the one they went to
+    # rather than dropped, and what was stored under its name follows: see
+    # merchant_identity.re_resolve_recleaned and _rekey_rules.
     if recomputed:
-        ids = [r["id"] for r in conn.execute(
-            f"SELECT t.id FROM transactions t "
-            f" WHERE {merchant_identity.RAW_KEY_SQL} = ANY(%s) "
-            f"   AND t.removed = 0", (recomputed,)).fetchall()]
-        if ids:
-            merchant_identity.resolve(conn, txn_ids=ids, only_unresolved=False)
+        for pair in merchant_identity.re_resolve_recleaned(
+                conn, {m: held.get(m) for m in recomputed}):
+            _rekey_rules(conn, pair["from"], pair["into"])
     # every row gets its merchant row (new strings, un-resolved backlog);
     # the full pass also prunes any merchant the re-resolve above emptied
     merchant_identity.resolve(conn)
     return touched
+
+
+def _rekey_rules(conn, old: str, new: str) -> int:
+    """Move the category rules stored under a retired merchant's name to the
+    name of the merchant its rows went to.
+
+    A rule is kept under a STRING. It reaches its rows through that
+    string's alias row, or else through a live merchant of that exact name
+    — so a rule written under a display name stops matching anything the
+    night the string clean renames the merchant, silently: the household's
+    correction is still on the Rules page and no longer does anything. A
+    rule keyed on a raw spelling is left alone (its alias row moved with
+    the rows), and so is one whose name another live merchant still
+    carries.
+
+    Where the new name already has a rule, a person's outranks a machine's
+    and otherwise the one already there stays: it is the rule the surviving
+    merchant's rows have been living under."""
+    if not old or not new or old.lower() == new.lower():
+        return 0
+    moved = 0
+    with conn.transaction():
+        rules = conn.execute(
+            """SELECT m.merchant, m.source FROM merchant_categories m
+                WHERE lower(m.merchant) = lower(%s)
+                  AND NOT EXISTS (SELECT 1 FROM merchant_canonical a
+                                   WHERE a.raw_merchant = m.merchant)
+                  AND NOT EXISTS (SELECT 1 FROM merchants l
+                                   WHERE l.merged_into IS NULL
+                                     AND lower(l.name) = lower(m.merchant))
+                ORDER BY (m.source <> 'user'), m.classified_at DESC
+                  FOR UPDATE OF m""", (old,)).fetchall()
+        for i, r in enumerate(rules):
+            there = conn.execute(
+                "SELECT source FROM merchant_categories WHERE merchant = %s "
+                "FOR UPDATE", (new,)).fetchone()
+            wins = i == 0 and (there is None or (
+                r["source"] == "user" and there["source"] != "user"))
+            if wins and there is not None:
+                conn.execute("DELETE FROM merchant_categories "
+                             "WHERE merchant = %s", (new,))
+            if wins:
+                moved += conn.execute(
+                    "UPDATE merchant_categories SET merchant = %s "
+                    "WHERE merchant = %s", (new, r["merchant"])).rowcount
+            else:
+                conn.execute("DELETE FROM merchant_categories "
+                             "WHERE merchant = %s", (r["merchant"],))
+    return moved
 
 
 # ---- user-made naming, the layer that outranks every automatic one -------
@@ -532,8 +629,7 @@ def raw_strings_for(conn, display: str) -> list[str]:
     and split one payee in two. What must not cross the personal/business
     line is MONEY, and that is scoped where money is computed (`listing`)."""
     rows = conn.execute(
-        f"SELECT DISTINCT COALESCE(t.merchant_outlet, t.merchant_name, "
-        f"                         t.name) AS raw "
+        f"SELECT DISTINCT {merchant_sql.RAW_KEY} AS raw "
         f"  FROM transactions t {MC_JOIN} "
         f" WHERE t.removed = 0 AND {DISPLAY_MERCHANT} = %s", (display,)
     ).fetchall()
@@ -648,7 +744,7 @@ def rename(conn, display: str, to: str) -> dict:
     # rows alongside so the difference is visible rather than mysterious.
     rows = conn.execute(
         "SELECT count(*) AS n FROM transactions t WHERE t.removed=0 AND "
-        "COALESCE(t.merchant_outlet, t.merchant_name, t.name) = ANY(%s)",
+        f"{merchant_sql.RAW_KEY} = ANY(%s)",
         (raws,)).fetchone()["n"]
     # the merchant ROW follows: whole-merchant rename keeps the merchant
     # (and its logo); a rename onto an existing name is a merge
@@ -725,12 +821,11 @@ def detail(conn, display: str) -> dict | None:
                    round(COALESCE(sum(t.amount)
                          FILTER (WHERE {personal}), 0)::numeric, 2) AS total,
                    min(t.date) AS first, max(t.date) AS last,
-                   array_agg(DISTINCT COALESCE(t.merchant_outlet,
-                             t.merchant_name, t.name)) AS variants,
+                   array_agg(DISTINCT {merchant_sql.RAW_KEY}) AS variants,
                    -- the keys a rule reaches these rows by (see the rule
                    -- lookup below): canonical strings and merchant rows
-                   array_agg(DISTINCT COALESCE(mc.canonical, t.merchant_outlet,
-                             t.merchant_name, t.name)) AS canons,
+                   array_agg(DISTINCT COALESCE(mc.canonical,
+                             {merchant_sql.RAW_KEY})) AS canons,
                    array_agg(DISTINCT mm.id::text)
                        FILTER (WHERE mm.id IS NOT NULL) AS mids,
                    max(mm.logo_url) AS logo, max(mm.website) AS website,
@@ -884,13 +979,16 @@ def listing(conn, q: str = "", limit: int = 200,
     # expressions, same figures (a sum of per-tuple sums; the DISTINCT
     # variant aggregates sort thousands of values, not tens of thousands per
     # merchant). The CTE is aliased `t` so merchant_sql's MC_JOIN and
-    # DISPLAY_MERCHANT apply verbatim — the one definition, not a copy.
+    # DISPLAY_MERCHANT apply verbatim — the one definition, not a copy —
+    # which means it has to carry every column the identity key is built
+    # from.
     # The personal/business test is decided once per row in the innermost
     # subquery; `OFFSET 0` keeps the planner from inlining that subquery and
     # re-evaluating the predicate for each of the three FILTERs that read it.
     return conn.execute(
         f"""WITH t AS (
-                SELECT r.merchant_id, r.merchant_outlet, r.merchant_name, r.name,
+                SELECT r.merchant_id, r.merchant_outlet, r.merchant_name,
+                       r.name,
                        count(*) FILTER (WHERE r.personal) AS n_personal,
                        sum(r.amount) FILTER (WHERE r.personal) AS amt_personal,
                        count(*) FILTER (WHERE NOT r.personal) AS n_business,
@@ -905,10 +1003,8 @@ def listing(conn, q: str = "", limit: int = 200,
                    round(COALESCE(sum(t.amt_personal), 0)::numeric, 2) AS total,
                    sum(t.n_business)::bigint AS business_rows,
                    min(t.first_seen) AS first, max(t.last_seen) AS last,
-                   (array_agg(DISTINCT COALESCE(t.merchant_outlet,
-                              t.merchant_name, t.name)))[1:50] AS variants,
-                   count(DISTINCT COALESCE(t.merchant_outlet,
-                         t.merchant_name, t.name)) AS variant_count,
+                   (array_agg(DISTINCT {merchant_sql.RAW_KEY}))[1:50] AS variants,
+                   count(DISTINCT {merchant_sql.RAW_KEY}) AS variant_count,
                    -- the merchant ROW's facts (after the ordinals the ORDER BY
                    -- uses: 1 = display, 2 = the personal row count)
                    max(mm.logo_url) AS logo, max(mm.website) AS website,

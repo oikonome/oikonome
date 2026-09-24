@@ -68,6 +68,14 @@ export default function Today() {
     enabled: !!client,
     placeholderData: (prev) => prev,
   });
+  // the home-screen widget shows this hero's simple face; whenever the
+  // live Today payload settles, refresh the widget from the same door so
+  // opening the app never leaves the launcher showing an older verdict
+  useEffect(() => {
+    if (!client || viewDate || !q.data || q.isFetching) return;
+    import("../../lib/glance").then(({ refreshWidget }) =>
+      refreshWidget(client)).catch(() => {});
+  }, [client, viewDate, q.data, q.isFetching]);
   const ob = useQuery({
     queryKey: ["onboarding"],
     queryFn: () => client!.onboarding(),
@@ -725,7 +733,10 @@ export default function Today() {
                     {whyOpen && d.why.entries.map((e) => (
                       <Text key={e.name} style={{ fontSize: 13,
                                                   lineHeight: 19 }}>
-                        <Text style={{ color: C.text, fontWeight: "700" }}>
+                        {/* the line's bucket is a tile's bucket: same door */}
+                        <Text style={{ color: C.text, fontWeight: "700" }}
+                              onPress={() => router.push(
+                                ledgerRoute(tileTo(e.name)) as never)}>
                           {e.name}{" "}
                         </Text>
                         <Text style={{ color: e.tone === "over" ? C.bad

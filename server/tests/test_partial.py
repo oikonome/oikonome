@@ -48,10 +48,21 @@ class PartialReimbTests(unittest.TestCase):
         self.assertEqual(_cat(self.conn, self.check), "TRANSFER_IN")
 
     def test_full_pair_unchanged(self):
-        data.link_reimbursement(self.conn, self.bill, self.check)
+        check = add_txn(self.conn, TODAY + dt.timedelta(days=1), -500.0,
+                        "NORTHWIND INSURANCE", primary="INCOME", account="chk")
+        data.link_reimbursement(self.conn, self.bill, check)
         self.assertEqual(_cat(self.conn, self.bill), "TRANSFER_OUT")
-        self.assertEqual(_cat(self.conn, self.check), "TRANSFER_IN")
+        self.assertEqual(_cat(self.conn, check), "TRANSFER_IN")
         self.assertIsNone(_row(self.conn, self.bill))   # excluded entirely
+
+    def test_full_link_of_a_smaller_check_records_what_came_back(self):
+        """A $150 check cannot repay a $500 bill in full: the link is
+        recorded as $150 back and the other $350 stays spend."""
+        r = data.link_reimbursement(self.conn, self.bill, self.check)
+        self.assertEqual((r.get("partial"), r.get("received")), (True, 150.0))
+        self.assertTrue(r.get("note"))
+        self.assertIsNone(_cat(self.conn, self.bill))
+        self.assertEqual(_row(self.conn, self.bill)["amount"], 350.0)
 
     def test_multiple_partials_accumulate(self):
         check2 = add_txn(self.conn, TODAY + dt.timedelta(days=9), -350.0,

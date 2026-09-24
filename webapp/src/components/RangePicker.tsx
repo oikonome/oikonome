@@ -1,20 +1,25 @@
 // The site-wide timeframe vocabulary. Every over-time toggle offers the
-// same six windows — 3m 6m 1y 3y 5y All — so a reader never relearns a
-// picker per page (Net Worth set the convention; Cash Flow and the rest
-// follow it). The mobile twin of the constants is mobile/src/lib/pure.ts
-// (TREND_RANGES) — keep them identical.
-export const RANGES = ["3m", "6m", "1y", "3y", "5y", "all"] as const;
-// Cash Flow adds two short windows in front of the six: "This month" (the
-// household's month so far) and "1m" (the last complete month). They are
-// months on the same clock, cut server-side like the rest
-// (reporting.FLOW_RANGES), and only the cash-flow surfaces — overview,
-// spending, income — offer them; a net-worth series has no use for a
-// window one point long.
-export const CASHFLOW_RANGES = ["cur", "1m", ...RANGES] as const;
-export type Range = (typeof CASHFLOW_RANGES)[number];
+// same eight windows — This month · 1m · 3m · 6m · 1y · 3y · 5y · All — so a
+// reader never relearns a picker per page (Net Worth set the convention;
+// Cash Flow added the two short windows and the rest follow). "This month"
+// is the household's month so far; "1m" is the last COMPLETE month, the one
+// window that closes before today. Both are months on the same clock as
+// the rest, cut server-side where the server windows
+// (reporting.FLOW_RANGES) and on the calendar month here. The mobile twin
+// of the constants is mobile/src/lib/pure.ts (TREND_RANGES) — keep them
+// identical.
+export const RANGES =
+  ["cur", "1m", "3m", "6m", "1y", "3y", "5y", "all"] as const;
+export type Range = (typeof RANGES)[number];
 export const RANGE_LABEL: Record<Range, string> =
   { cur: "This month", "1m": "1m", "3m": "3m", "6m": "6m", "1y": "1y",
     "3y": "3y", "5y": "5y", all: "All" };
+/** How a caption names the window a figure was measured over ("+$120
+ *  over this month"). Mobile twin: `rangeCaption` in lib/pure.ts. */
+export function rangeCaption(range: Range): string {
+  return range === "all" ? "all time" : range === "cur" ? "this month"
+    : range === "1m" ? "last month" : range;
+}
 // months back from the household's current month, inclusive. "1m" counts
 // two so a window cut on the current month reaches the last complete one
 // — the cash graph's history stops before the current month, so the two
@@ -108,18 +113,30 @@ export function shiftMonthsUtc(iso: string, months: number): string {
     .toISOString().slice(0, 10);
 }
 
-/** The ledger's quick date filter for a range: the first day of the
- *  window's opening month as a LOCAL "YYYY-MM-DD" ("3m" in September is
- *  Jul 1 — the same three calendar months Cash Flow's 3m covers), "" for
- *  "all". A calendar date the reader types into a date box is local, so
- *  this one is cut on the browser's calendar, not UTC. The mobile twin is
- *  `ledgerRange` in mobile/src/lib/pure.ts — keep them identical. */
-export function ledgerRangeFrom(range: Range, today: Date = new Date()): string {
+/** The ledger's quick date filter for a range, as LOCAL "YYYY-MM-DD"
+ *  dates: the first day of the window's opening month with an open end
+ *  ("3m" in September is Jul 1 onward — the same three calendar months
+ *  Cash Flow's 3m covers), "This month" from the 1st, and "1m" the last
+ *  complete month CLOSED on its last day (in September: Aug 1 – Aug 31).
+ *  "all" is no date filter at all. A calendar date the reader types into a
+ *  date box is local, so this one is cut on the browser's calendar, not
+ *  UTC. The mobile twin is `ledgerRange` in mobile/src/lib/pure.ts — keep
+ *  them identical. */
+export function ledgerRange(range: Range, today: Date = new Date()):
+    { from: string; to: string } {
   const months = RANGE_MONTHS[range];
-  if (months === null) return "";
+  if (months === null) return { from: "", to: "" };
+  const ymd = (d: Date) => `${d.getFullYear()}-${
+    String(d.getMonth() + 1).padStart(2, "0")}-${
+    String(d.getDate()).padStart(2, "0")}`;
+  if (range === "1m") {
+    // day 0 of this month = the last day of the month before
+    return { from: ymd(new Date(today.getFullYear(), today.getMonth() - 1, 1)),
+             to: ymd(new Date(today.getFullYear(), today.getMonth(), 0)) };
+  }
   // Date's own month arithmetic on the 1st: no day-of-month to overflow
   const d = new Date(today.getFullYear(), today.getMonth() - (months - 1), 1);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-01`;
+  return { from: ymd(d), to: "" };
 }
 
 export function RangePicker({ value, onChange, dead, options }: {
@@ -127,7 +144,7 @@ export function RangePicker({ value, onChange, dead, options }: {
   // a range longer than the data equals All — the caller can mark it so
   // the picker doesn't draw two buttons for one view
   dead?: (r: Range) => boolean;
-  // the six site-wide windows by default; Cash Flow passes CASHFLOW_RANGES
+  // the eight site-wide windows by default; a caller may offer fewer
   options?: readonly Range[];
 }) {
   return (

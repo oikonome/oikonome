@@ -11,8 +11,10 @@ import { saveSettings } from "../api/cache";
 import AreaChart from "../components/AreaChart";
 import RetireWizard from "../components/RetireWizard";
 
-function Fld({ name, label, value, step = "1", w = "6rem", onChange }: {
+function Fld({ name, label, value, step = "1", w = "6rem", ph, onChange }: {
   name: string; label: string; value: number | string; step?: string; w?: string;
+  // what an empty field means (the server's default), shown in its place
+  ph?: string;
   onChange: (name: string, v: string) => void;
 }) {
   return (
@@ -20,6 +22,7 @@ function Fld({ name, label, value, step = "1", w = "6rem", onChange }: {
                     color: "var(--mut)", gap: ".15rem" }}>
       {label}
       <input type="number" name={name} value={value} step={step}
+             placeholder={ph}
              style={{ width: w }} onChange={(e) => onChange(name, e.target.value)} />
     </label>
   );
@@ -139,11 +142,17 @@ export default function Retirement() {
     ret: inp.ret.toFixed(1), infl: inp.infl.toFixed(1), end: inp.end,
     ssage: inp.ssage, stockpct: inp.stockpct, employer_mo: inp.employer_mo,
     taxable_mo: inp.taxable_mo, resume: inp.resume,
+    // blank = the server's default (cash keeps pace with inflation)
+    cash: inp.cash == null ? "" : inp.cash.toFixed(1),
   };
   const set = (name: string, v: string) => setForm({ ...f, [name]: v });
   const recalc = (e: React.FormEvent) => {
     e.preventDefault();
-    setParams(Object.fromEntries(Object.entries(f).map(([k, v]) => [k, String(v)])));
+    // a blank field is "use the default", so it must not ride the query
+    // string as an empty value the server would refuse to parse
+    setParams(Object.fromEntries(Object.entries(f)
+      .filter(([, v]) => String(v) !== "")
+      .map(([k, v]) => [k, String(v)])));
   };
 
   const can = r.earliest;
@@ -174,6 +183,19 @@ export default function Retirement() {
                            letterSpacing: "-.02em" }}>not by {lastAge}</span>
             <span className="neg">not sustainable on this portfolio without
               more saving</span>
+            {(r.catch_up ?? []).length > 0 && (
+              <div style={{ flex: "1 1 100%" }}>
+                To get back on track, save{" "}
+                {(r.catch_up ?? []).map((c, k) => (
+                  <span key={c.age}>
+                    {k > 0 && ", or "}
+                    <b>{money(c.extra_monthly)}/mo more</b> to retire at {c.age}
+                  </span>
+                ))}
+                <span className="mut"> — starting now, on top of what the
+                  plan already saves.</span>
+              </div>
+            )}
           </div>
         )}
         <div className="grid cols3" style={{ gap: ".6rem", marginTop: ".8rem" }}>
@@ -204,6 +226,7 @@ export default function Retirement() {
         <div className="assume">
           <span><b style={{ color: "var(--ink)" }}>Assumptions:</b>{" "}
             {inp.ret}% return · {inp.infl}% inflation
+            {inp.cash != null ? ` · cash ${inp.cash}%` : ""}
             · to {inp.end} · SS at {inp.ssage}
             {inp.has_sched ? ` (${money(inp.your_ss)}/mo)` : " (no SSA statement)"}
             {" "}· {inp.stockpct}% stocks ·{" "}
@@ -234,6 +257,8 @@ export default function Retirement() {
                  onChange={set} />
             <Fld name="infl" label="inflation %" value={f.infl} step="0.1"
                  w="4.5rem" onChange={set} />
+            <Fld name="cash" label="cash yield %" value={f.cash} step="0.1"
+                 w="5.5rem" ph="= inflation" onChange={set} />
             <Fld name="end" label="to age" value={f.end} w="4.5rem" onChange={set} />
             <Fld name="ssage" label="SS claim" value={f.ssage} w="4.5rem"
                  onChange={set} />

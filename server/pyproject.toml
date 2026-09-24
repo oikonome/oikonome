@@ -24,6 +24,9 @@ dependencies = [
     "ofxtools>=0.9",
     "pypdf>=4",
     "pypdfium2>=4",
+    # the continuity packet (Settings → Data) is a PDF a survivor reads
+    # cold; reportlab is pure Python, so the image grows by no system libs
+    "reportlab>=4",
     "pillow>=10.1",   # ImageFont.load_default(size=) — the email chart's labels
     # Receipt document-detect -> largest-quad -> perspective warp.
     # Headless build (no GUI libs); the optimize pass falls back to a

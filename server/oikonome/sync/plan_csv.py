@@ -44,6 +44,7 @@ from collections import defaultdict
 
 from ..engine.compat import as_date, jsonb
 from . import heartbeat
+from .base import MERCHANT_NAME_ON_CONFLICT
 
 # items.aggregator for every plan-CSV item, whatever the provider slug
 AGGREGATOR = "plan_csv"
@@ -310,7 +311,8 @@ def import_csv(conn, plan: str, text: str, balance: float | None = None,
                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,0,0,%s,'flow')
                    ON CONFLICT (tenant_id, id) DO UPDATE SET
                        date=EXCLUDED.date, amount=EXCLUDED.amount,
-                       name=EXCLUDED.name, merchant_name=EXCLUDED.merchant_name,
+                       name=EXCLUDED.name,
+                       """ + MERCHANT_NAME_ON_CONFLICT + """,
                        category_primary=EXCLUDED.category_primary,
                category_source=EXCLUDED.category_source,
                        category_detailed=EXCLUDED.category_detailed,

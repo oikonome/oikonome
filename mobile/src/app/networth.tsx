@@ -13,7 +13,8 @@ import StaleBanner from "../components/stale-banner";
 import { Card, H, HelpLink, KV } from "../components/ui";
 import { errText, ManualAsset, PLRow } from "../lib/api";
 import { saveSettings } from "../lib/cache";
-import { TREND_RANGES, trendWindow, type TrendRange } from "../lib/pure";
+import { RANGE_LABEL, rangeCaption, TREND_RANGES, trendWindow,
+         type TrendRange } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { useViewer } from "../lib/viewer";
 import { C, money } from "../lib/theme";
@@ -64,7 +65,7 @@ export default function NetWorth() {
   // NetWorth trend card (trendWindow lives in pure.ts, runner-tested)
   const [range, setRange] = useState<TrendRange>("all");
   const w = trendWindow(fullTrend, range);
-  const sliced = fullTrend.slice(w.start);
+  const sliced = fullTrend.slice(w.start, w.end + 1);
   const eu = d?.trend_estimated_until !== undefined
     && d.trend_estimated_until - w.start > 0
     ? d.trend_estimated_until - w.start : undefined;
@@ -133,7 +134,7 @@ export default function NetWorth() {
                                ? C.accent + "22" : "transparent" }}>
                   <Text style={{ fontSize: 12,
                                  color: range === r ? C.accent : C.mut }}>
-                    {r === "all" ? "All" : r}</Text>
+                    {RANGE_LABEL[r]}</Text>
                 </Pressable>
               );
             })}
@@ -145,7 +146,7 @@ export default function NetWorth() {
               {w.pct !== null
                 ? ` · ${w.pct >= 0 ? "+" : ""}${w.pct.toFixed(1)}%` : ""}
               <Text style={{ color: C.mut }}>
-                {"  over "}{range === "all" ? "all time" : range}</Text>
+                {"  over "}{rangeCaption(range)}</Text>
             </Text>
           )}
           {/* the reconstructed prefix draws dashed — an estimate must

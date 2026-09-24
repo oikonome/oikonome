@@ -347,13 +347,13 @@ class ResolveOnWriteTests(unittest.TestCase):
     def setUp(self):
         self.conn = make_db()
         # one real merchant under two descriptors, both -> one canonical
-        for raw in ("SQ *POINTE DAMOUR CARO", "NYX POINTE AMOUR CARO"):
-            canon(self.conn, raw, "Pointe Amour Caro")
-        add_raw_txn(self.conn, "a", "2025-07-01", 10, "SQ *POINTE DAMOUR CARO",
+        for raw in ("SQ *LAKE OBRIEN CAFE", "NYX LAKE OBRIEN CAFE"):
+            canon(self.conn, raw, "Lake Obrien Cafe")
+        add_raw_txn(self.conn, "a", "2025-07-01", 10, "SQ *LAKE OBRIEN CAFE",
                     primary="GENERAL_MERCHANDISE",
                     raw={"personal_finance_category":
                          {"primary": "GENERAL_MERCHANDISE"}})
-        add_raw_txn(self.conn, "b", "2025-07-02", 12, "NYX POINTE AMOUR CARO",
+        add_raw_txn(self.conn, "b", "2025-07-02", 12, "NYX LAKE OBRIEN CAFE",
                     primary="GENERAL_MERCHANDISE",
                     raw={"personal_finance_category":
                          {"primary": "GENERAL_MERCHANDISE"}})
@@ -363,13 +363,13 @@ class ResolveOnWriteTests(unittest.TestCase):
             "INSERT INTO merchant_categories "
             "(merchant, category_primary, source, disabled) "
             "VALUES (%s,%s,'user',false)",
-            ("SQ *POINTE DAMOUR CARO", "PERSONAL_CARE"))
+            ("SQ *LAKE OBRIEN CAFE", "PERSONAL_CARE"))
 
     def tearDown(self):
         self.conn.close()
 
     def test_users_choice_wins_over_conflicting_variant_rule(self):
-        res = data.set_merchant_category(self.conn, "NYX POINTE AMOUR CARO",
+        res = data.set_merchant_category(self.conn, "NYX LAKE OBRIEN CAFE",
                                          "ENTERTAINMENT")
         # every variant's rows moved despite the pre-existing conflict…
         self.assertEqual(cat(self.conn, "a"), "ENTERTAINMENT")
@@ -382,25 +382,25 @@ class ResolveOnWriteTests(unittest.TestCase):
         # it (next test).
         self.assertIsNone(self.conn.execute(
             "SELECT 1 FROM merchant_categories "
-            "WHERE merchant='SQ *POINTE DAMOUR CARO'").fetchone())
+            "WHERE merchant='SQ *LAKE OBRIEN CAFE'").fetchone())
         self.assertEqual(self.conn.execute(
             "SELECT category_primary FROM merchant_categories "
-            "WHERE merchant='Pointe Amour Caro'").fetchone()[
+            "WHERE merchant='Lake Obrien Cafe'").fetchone()[
                 "category_primary"], "ENTERTAINMENT")
 
     def test_undo_restores_the_conflicting_rule(self):
-        res = data.set_merchant_category(self.conn, "NYX POINTE AMOUR CARO",
+        res = data.set_merchant_category(self.conn, "NYX LAKE OBRIEN CAFE",
                                          "ENTERTAINMENT")
         data.undo_merchant_category(self.conn, res["undo"])
         # the raw-keyed rule is back to its prior (conflicting) category…
         self.assertEqual(self.conn.execute(
             "SELECT category_primary FROM merchant_categories "
-            "WHERE merchant='SQ *POINTE DAMOUR CARO'").fetchone()[
+            "WHERE merchant='SQ *LAKE OBRIEN CAFE'").fetchone()[
                 "category_primary"], "PERSONAL_CARE")
         # …the canonical rule the write created is gone…
         self.assertIsNone(self.conn.execute(
             "SELECT 1 FROM merchant_categories "
-            "WHERE merchant='Pointe Amour Caro'").fetchone())
+            "WHERE merchant='Lake Obrien Cafe'").fetchone())
         # …and the rows returned to their prior category
         self.assertEqual(cat(self.conn, "a"), "GENERAL_MERCHANDISE")
         self.assertEqual(cat(self.conn, "b"), "GENERAL_MERCHANDISE")
@@ -414,7 +414,7 @@ class ResolveOnWriteTests(unittest.TestCase):
         rules = {r["merchant"]: r["category_primary"] for r in self.conn.execute(
             "SELECT merchant, category_primary FROM merchant_categories "
             "WHERE source='user'").fetchall()}
-        self.assertEqual(rules, {"Pointe Amour Caro": "ENTERTAINMENT"})
+        self.assertEqual(rules, {"Lake Obrien Cafe": "ENTERTAINMENT"})
         # the sibling variant's row moved (the unanimity gate was not
         # vetoed); the corrected row itself carries the per-row override
         self.assertEqual(cat(self.conn, "a"), "ENTERTAINMENT")
@@ -428,20 +428,20 @@ class ResolveOnWriteTests(unittest.TestCase):
         # silent and unrecoverable from this door — the history page's
         # bulk write already snapshotted it, so this door does the same
         res = data.set_category(self.conn, "b", "ENTERTAINMENT", scope="all")
-        self.assertEqual(res["merchant"], "Pointe Amour Caro")
+        self.assertEqual(res["merchant"], "Lake Obrien Cafe")
         self.assertIsNone(self.conn.execute(
             "SELECT 1 FROM merchant_categories "
-            "WHERE merchant='SQ *POINTE DAMOUR CARO'").fetchone())
+            "WHERE merchant='SQ *LAKE OBRIEN CAFE'").fetchone())
         # the snapshot round-trips through the same undo door
         data.undo_merchant_category(self.conn, res["undo"])
         row = self.conn.execute(
             "SELECT category_primary FROM merchant_categories "
-            "WHERE merchant='SQ *POINTE DAMOUR CARO'").fetchone()
+            "WHERE merchant='SQ *LAKE OBRIEN CAFE'").fetchone()
         self.assertEqual(row["category_primary"], "PERSONAL_CARE")
         # the canonical rule the teach created is gone (none existed before)
         self.assertIsNone(self.conn.execute(
             "SELECT 1 FROM merchant_categories "
-            "WHERE merchant='Pointe Amour Caro'").fetchone())
+            "WHERE merchant='Lake Obrien Cafe'").fetchone())
         # the sibling row moved back; the corrected row keeps its per-row
         # override — undo reverses the merchant-wide teach, not the
         # user's direct answer on the row itself
@@ -460,13 +460,13 @@ class ResolveOnWriteTests(unittest.TestCase):
         # re-enabled by resolve-on-write (that would reverse the user's disable)
         self.conn.execute(
             "UPDATE merchant_categories SET disabled=true "
-            "WHERE merchant='SQ *POINTE DAMOUR CARO'")
-        data.set_merchant_category(self.conn, "NYX POINTE AMOUR CARO",
+            "WHERE merchant='SQ *LAKE OBRIEN CAFE'")
+        data.set_merchant_category(self.conn, "NYX LAKE OBRIEN CAFE",
                                    "ENTERTAINMENT")
         self.assertEqual(cat(self.conn, "b"), "ENTERTAINMENT")
         self.assertTrue(self.conn.execute(
             "SELECT disabled FROM merchant_categories "
-            "WHERE merchant='SQ *POINTE DAMOUR CARO'").fetchone()["disabled"])
+            "WHERE merchant='SQ *LAKE OBRIEN CAFE'").fetchone()["disabled"])
 
 
 class PickerCategoryListTests(unittest.TestCase):

@@ -16,9 +16,11 @@ import * as DocumentPicker from "expo-document-picker";
 import * as ImagePicker from "expo-image-picker";
 
 import { Card, H, KV } from "../components/ui";
-import { errText, getHandedOffTxn, TodayFull, Txn, TxnPage } from "../lib/api";
+import { errText, getHandedOffTxn, SplitPart, TodayFull, Txn,
+         TxnPage } from "../lib/api";
 import { patchQueries, removeFromList } from "../lib/cache";
-import { categoryForServer, CLEAR_CATEGORY, catLabel, filterCategories } from "../lib/pure";
+import { categoryForServer, CLEAR_CATEGORY, catLabel, filterCategories,
+         isCategoryReset } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { useDemo, useViewer } from "../lib/viewer";
 import { C, mmddyy, money } from "../lib/theme";
@@ -49,11 +51,16 @@ export default function TxnDetail() {
   const [picking, setPicking] = useState(false);
   const [filter, setFilter] = useState("");
   const [err, setErr] = useState<string | null>(null);
+  // one charge, several categories — the split editor's draft (null =
+  // closed) and, while its category sheet is open, which part it serves
+  const [splitDraft, setSplitDraft] =
+    useState<{ category: string; amount: string }[] | null>(null);
+  const [pickFor, setPickFor] = useState<number | null>(null);
 
   const cats = useQuery({
     queryKey: ["categories"],
     queryFn: () => client!.categories(),
-    enabled: !!client && picking,
+    enabled: !!client && (picking || pickFor !== null),
   });
   // the payee's whole story — same payload the web history page renders
   const hist = useQuery({
@@ -221,6 +228,24 @@ export default function TxnDetail() {
     },
     onError: (e) => Alert.alert("Couldn't remove it", errText(e)),
   });
+  // A reset ("Use automatic") is the one category write whose RESULT the
+  // client cannot compute: dropping the override hands the row back to the
+  // automatic layers, and what they say — the bank's own label, a bill's
+  // stamp, a merchant rule — is known only to the server. The web table
+  // skips its optimistic patch there and lets the ledger refetch it is
+  // bound to bring the answer back. This screen has no query behind it (its
+  // row is handed over in memory), so nothing would ever correct a guess:
+  // it reads the row back itself and adopts the server's whole answer —
+  // the category, the provenance line under it, and the override flag the
+  // "Use automatic" button is gated on.
+  const adoptServerRow = async () => {
+    const fresh = await client!.txnById(txn!.id, txn!.date);
+    // not in its own day's listing: leave what is on screen rather than
+    // replace it with a guess — the write itself landed either way
+    if (!fresh) return;
+    setTxn(fresh);
+    patchRow(fresh);
+  };
   const setCat = useMutation({
     // the sentinel→empty-string mapping lives in pure.ts so the wire
     // call and the local echo can never disagree
@@ -228,16 +253,35 @@ export default function TxnDetail() {
         { category: string; scope: "one" | "all" }) =>
       client!.setCategory(txn!.id, categoryForServer(category), scope),
     // the picker closes and the row flips on the tap, not on the round
-    // trip; a refused write puts the old category back
+    // trip; a refused write puts the old category back. A reset has no
+    // echo to make (see adoptServerRow) — the row keeps the category it
+    // is showing until the server's own answer arrives, exactly as the
+    // web row does while its refetch is in flight.
     onMutate: (v) => {
       const before = txn;
       setPicking(false);
-      setTxn((x) => (x ? { ...x,
-        category: categoryForServer(v.category) } : x));
+      if (!isCategoryReset(categoryForServer(v.category)))
+        setTxn((x) => (x ? { ...x,
+          category: categoryForServer(v.category) } : x));
       return { before };
     },
     onSuccess: (_d, v) => {
+      if (isCategoryReset(categoryForServer(v.category))) {
+        invalidateLedgers();
+        // the write landed — say so, since a failed read-back leaves the
+        // old category on screen and would otherwise read as a dead tap
+        void adoptServerRow().catch((e) =>
+          setErr(`Reset saved — couldn't refresh this screen: ${errText(e)}`));
+        return;
+      }
       patchRow({ category: categoryForServer(v.category) });
+      // the category decides whether the row can be split (and so does
+      // the account type and the bank's detail, which only the server
+      // weighs), so read the row back rather than keep the `splittable`
+      // this screen opened with. If the read-back fails, the category on
+      // screen is already right and the split door still refuses a
+      // non-spending row itself.
+      void adoptServerRow().catch(() => {});
       if (v.scope === "all") {
         // a merchant rule rewrites rows in every month, and the Merchants
         // detail sheet shows the merchant's category and rule (the web
@@ -255,6 +299,29 @@ export default function TxnDetail() {
       if (ctx?.before) setTxn(ctx.before);
       setErr(errText(e));
     },
+  });
+
+  // the split's parts count in every per-category figure — the verdict,
+  // the Spending categories, both lenses — so those refetch behind the
+  // patched row (the web SplitPanel invalidates the same)
+  const splitLanded = (split: SplitPart[] | null) => {
+    setTxn((x) => (x ? { ...x, split } : x));
+    patchRow({ split });
+    setSplitDraft(null);
+    invalidateLedgers();
+    qc.invalidateQueries({ queryKey: ["report"] });
+    qc.invalidateQueries({ queryKey: ["lens-month"] });
+    qc.invalidateQueries({ queryKey: ["lens-year"] });
+  };
+  const splitSave = useMutation({
+    mutationFn: (parts: SplitPart[]) => client!.txnSplitSet(txn!.id, parts),
+    onSuccess: (r) => splitLanded(r.split),
+    onError: (e) => Alert.alert("Couldn't save the split", errText(e)),
+  });
+  const splitClear = useMutation({
+    mutationFn: () => client!.txnSplitClear(txn!.id),
+    onSuccess: () => splitLanded(null),
+    onError: (e) => Alert.alert("Couldn't remove the split", errText(e)),
   });
 
   const reimb = useMutation({
@@ -307,6 +374,9 @@ export default function TxnDetail() {
   }
   const inflow = txn.amount < 0;
   const flagged = !!(txn.reimb || txn.reimb_flag);
+  // the server says whether the split door takes this row (the spend
+  // test the rollups use); the web gates its ✂ action on the same field
+  const canSplit = !viewer && !!txn.splittable;
 
   // "All" is the same merchant-wide write as Bills → "Apply to whole
   // merchant": a user rule outranks the bank's transfer label, so
@@ -348,6 +418,14 @@ export default function TxnDetail() {
     ]);
   };
   const chooseCategory = (category: string) => {
+    // the split editor asked: set that part and close, no scope question
+    if (pickFor !== null) {
+      const i = pickFor;
+      setSplitDraft((d) => d ? d.map((p, j) => j === i ? { ...p, category } : p) : d);
+      setPickFor(null);
+      setFilter("");
+      return;
+    }
     // the demo refuses the merchant-wide write, so the scope question
     // has one honest answer there — offering "All" would only 403
     if (demo) {
@@ -449,9 +527,22 @@ export default function TxnDetail() {
             ) : null}
           </View>
           {!viewer && (
-            <Pressable style={s.btn} onPress={() => setPicking(true)}>
-              <Text style={s.btnText}>Change</Text>
-            </Pressable>
+            <View style={{ gap: 6, alignItems: "flex-end" }}>
+              <Pressable style={s.btn} onPress={() => setPicking(true)}>
+                <Text style={s.btnText}>Change</Text>
+              </Pressable>
+              {/* a category you set yourself goes back to the automatic
+                  layer in one tap, without opening the picker for its
+                  reset entry (web: the ↺ beside the category) */}
+              {txn.override_manual ? (
+                <Pressable style={s.btn}
+                           onPress={() => setCat.mutate({
+                             category: CLEAR_CATEGORY, scope: "one" })}
+                           accessibilityLabel="use the automatic category">
+                  <Text style={s.btnText}>Use automatic</Text>
+                </Pressable>
+              ) : null}
+            </View>
           )}
         </View>
         <View style={[s.actRow, { marginTop: 10 }]}>
@@ -482,6 +573,129 @@ export default function TxnDetail() {
         {err ? <Text style={{ color: C.bad, fontSize: 12, marginTop: 8 }}
                      onPress={() => setErr(null)}>{err}</Text> : null}
       </Card>
+
+      {/* one charge, several categories — the parts count where the
+          category above would (the web's ✂ split panel). Offered on a
+          row the server marks splittable — spending the rollups count, never
+          a refund, transfer or card payment; viewers read the parts, plain. */}
+      {(txn.split?.length || canSplit) ? (
+      <Card>
+        <View style={s.actRow}>
+          <View style={{ flex: 1 }}>
+            <Text style={s.mut}>Split across categories</Text>
+            {txn.split?.length ? txn.split.map((p, i) => (
+              <Text key={i} style={s.actVal}>
+                <Text style={s.mut}>{money(Math.abs(p.amount))}</Text>
+                {"  "}{catLabel(p.category)}
+              </Text>
+            )) : (
+              <Text style={s.mut}>
+                not split — the whole charge counts as {catLabel(txn.category)}
+              </Text>
+            )}
+          </View>
+          {!viewer && splitDraft === null && (
+            <View style={{ gap: 6, alignItems: "flex-end" }}>
+              {canSplit && (
+              <Pressable style={s.btn} onPress={() => setSplitDraft(
+                txn.split?.length
+                  ? txn.split.map((p) => ({ category: p.category,
+                                            amount: Math.abs(p.amount).toFixed(2) }))
+                  // start from the row's own category and one empty line
+                  : [{ category: txn.category_override || txn.category_key || "",
+                       amount: Math.abs(txn.amount).toFixed(2) },
+                     { category: "", amount: "" }])}>
+                <Text style={s.btnText}>{txn.split?.length ? "Edit" : "Split…"}</Text>
+              </Pressable>
+              )}
+              {txn.split?.length ? (
+                <Pressable style={[s.btn, s.btnQuiet]} disabled={splitClear.isPending}
+                           onPress={() => splitClear.mutate()}>
+                  <Text style={[s.btnText, { color: C.mut }]}>Remove</Text>
+                </Pressable>
+              ) : null}
+            </View>
+          )}
+        </View>
+        {splitDraft !== null && (() => {
+          const total = Math.round(Math.abs(txn.amount) * 100);
+          const sum = splitDraft.reduce((a, p) => {
+            const v = Number(p.amount);
+            return a + (Number.isFinite(v) ? Math.round(v * 100) : 0);
+          }, 0);
+          const left = total - sum;
+          const ready = splitDraft.length >= 2 && left === 0
+            && splitDraft.every((p) => p.category && Math.round(Number(p.amount) * 100) > 0)
+            && new Set(splitDraft.map((p) => p.category)).size === splitDraft.length;
+          const sign = txn.amount < 0 ? -1 : 1;
+          const set = (i: number, patch: Partial<{ category: string; amount: string }>) =>
+            setSplitDraft((d) => d ? d.map((p, j) => j === i ? { ...p, ...patch } : p) : d);
+          return (
+            <View style={{ marginTop: 10, gap: 8 }}>
+              <Text style={s.mut}>
+                The parts must add up to {money(Math.abs(txn.amount))}.
+              </Text>
+              {splitDraft.map((p, i) => (
+                <View key={i} style={s.actRow}>
+                  <Pressable style={[s.entChip, { flex: 1 }]}
+                             onPress={() => { setFilter(""); setPickFor(i); }}
+                             accessibilityLabel={`category of part ${i + 1}`}>
+                    <Text style={{ color: p.category ? C.text : C.mut, fontSize: 14 }}
+                          numberOfLines={1}>
+                      {p.category ? catLabel(p.category) : "category…"}
+                    </Text>
+                  </Pressable>
+                  <TextInput style={[s.noteInput, { flex: 0, width: 96, minHeight: 36,
+                                                    textAlign: "right" }]}
+                             keyboardType="decimal-pad" placeholder="0.00"
+                             placeholderTextColor={C.mut} value={p.amount}
+                             accessibilityLabel={`amount of part ${i + 1}`}
+                             onChangeText={(v) => set(i, { amount: v })} />
+                  {left !== 0 ? (
+                    <Text style={{ color: C.accent, fontSize: 12 }}
+                          onPress={() => set(i, { amount: (Math.max(0,
+                            Math.round((Number(p.amount) || 0) * 100) + left) / 100).toFixed(2) })}>
+                      ← {(left / 100).toFixed(2)}
+                    </Text>
+                  ) : null}
+                  {splitDraft.length > 2 ? (
+                    <Text style={{ color: C.mut, fontSize: 16, padding: 4 }}
+                          accessibilityLabel={`remove part ${i + 1}`}
+                          onPress={() => setSplitDraft((d) =>
+                            d ? d.filter((_, j) => j !== i) : d)}>✕</Text>
+                  ) : null}
+                </View>
+              ))}
+              <View style={[s.actRow, { flexWrap: "wrap" }]}>
+                <Text style={{ color: C.accent, fontSize: 13 }}
+                      onPress={() => setSplitDraft((d) =>
+                        d ? [...d, { category: "", amount: "" }] : d)}>
+                  + part
+                </Text>
+                <Text style={{ color: left === 0 ? C.mut : C.warn, fontSize: 12, flex: 1 }}>
+                  {left === 0 ? "adds up" : left > 0
+                    ? `${(left / 100).toFixed(2)} left to place`
+                    : `${(-left / 100).toFixed(2)} over the charge`}
+                </Text>
+                <Pressable style={[s.btn, s.btnQuiet]}
+                           onPress={() => setSplitDraft(null)}>
+                  <Text style={[s.btnText, { color: C.mut }]}>Cancel</Text>
+                </Pressable>
+                <Pressable style={[s.btn, !ready && { opacity: 0.4 }]}
+                           disabled={!ready || splitSave.isPending}
+                           onPress={() => splitSave.mutate(splitDraft.map((p) => ({
+                             category: p.category,
+                             amount: sign * Math.round(Number(p.amount) * 100) / 100 })))}>
+                  <Text style={s.btnText}>
+                    {splitSave.isPending ? "Saving…" : "Save split"}
+                  </Text>
+                </Pressable>
+              </View>
+            </View>
+          );
+        })()}
+      </Card>
+      ) : null}
 
       <Card>
         <View style={s.actRow}>
@@ -757,8 +971,8 @@ export default function TxnDetail() {
         </Card>
       )}
 
-      <Modal visible={picking} animationType="slide" transparent
-             onRequestClose={() => setPicking(false)}>
+      <Modal visible={picking || pickFor !== null} animationType="slide" transparent
+             onRequestClose={() => { setPicking(false); setPickFor(null); }}>
         <View style={s.sheetWrap}>
           <View style={s.sheet}>
             <Text style={s.sheetTitle}>Category</Text>
@@ -773,7 +987,9 @@ export default function TxnDetail() {
                   Couldn't load categories — tap to retry.
                 </Text>
               )}
-              {/* clearing an override is inherently this-row-only */}
+              {/* clearing an override is inherently this-row-only; a
+                  split's part has nothing to reset to */}
+              {pickFor === null && (
               <Pressable style={s.catRow}
                          onPress={() => setCat.mutate({
                            category: CLEAR_CATEGORY, scope: "one" })}>
@@ -781,6 +997,7 @@ export default function TxnDetail() {
                   ↺ Reset to source category
                 </Text>
               </Pressable>
+              )}
               {filter.trim().length > 1
                 && !catList.some((c) =>
                      c.toLowerCase() === filter.trim().toLowerCase()) && (
@@ -807,7 +1024,7 @@ export default function TxnDetail() {
               ))}
             </ScrollView>
             <Pressable style={[s.btn, s.btnQuiet, { alignSelf: "center" }]}
-                       onPress={() => setPicking(false)}>
+                       onPress={() => { setPicking(false); setPickFor(null); }}>
               <Text style={[s.btnText, { color: C.mut }]}>Close</Text>
             </Pressable>
           </View>

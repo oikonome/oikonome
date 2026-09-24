@@ -1,3 +1,4 @@
+import type { Glance } from "./glance-pure";
 import type { Txn } from "./ledger-row.generated";
 // Thin API client. Every number the app shows comes from the server's
 // /api — the app holds no business logic. Types mirror webapp/src/api's
@@ -95,8 +96,18 @@ export interface TodayFull {
               card_autopay: [string, number, string][] } | null;
 }
 
+// what the ledger holds under one side of a merge offer, read live
+export interface MergeSideFacts {
+  rows: number; total: number; first?: string | null; last?: string | null;
+  typical?: number | null; category?: string | null; city?: string | null;
+  accounts: string[];
+  recent: { date: string; amount: number; line: string; account?: string | null }[];
+}
 export interface MergeProposal {
   id: string; from: string; into: string; from_id: string; into_id: string;
+  // the surviving merchant's own name — `into` is the brand on a chain offer
+  into_name?: string;
+  from_facts?: MergeSideFacts | null; into_facts?: MergeSideFacts | null;
   from_logo?: string | null; into_logo?: string | null;
   from_rows?: number | null; into_rows?: number | null;
   from_samples: string[]; into_samples: string[];
@@ -158,6 +169,10 @@ export interface TxnPage {
   // answers in the search shape and says which bucket it answered and
   // what to call it ("Food", "Everything else", the carve-out's name)
   bucket?: string; bucket_label?: string;
+  // the figure the label wore (reimbursements netted, envelope overflow
+  // counted as the plan counts it) and whether the door was a month's or
+  // a whole year's (y with no m)
+  bucket_amount?: number; bucket_scope?: "month" | "year";
   // month mode: the month's cash flow by the Cash Flow page's definitions
   // (spend / income / income − spend) — transfers and card payments are
   // excluded, so these are not row sums
@@ -183,6 +198,36 @@ export interface TxnPage {
                    via_bank: boolean }[];
 }
 
+// script token scope: push = the import doors (a collector); read = the
+// integrations doors (a scraper, a sensor, an MCP server). Never both.
+export type TokenScope = "push" | "read";
+
+// outbound webhooks — the secret appears only in the create response
+export interface Webhook {
+  id: string; url: string; name: string; events: string[]; enabled: boolean;
+  created_at: string; last_attempt_at: string | null;
+  last_status: number | null; last_error: string | null; failures: number;
+  disabled_reason: string | null;
+}
+export interface WebhookEvent { name: string; description: string }
+
+// the household activity log: one hand-authored act per row, the sentence
+// composed by the server so every client reads the same words
+export interface ActivityRow {
+  id: string; at: string; actor: string; actor_user_id: string | null;
+  kind: string; action: string; target: string | null; label: string;
+  summary: string; detail: Record<string, unknown> | null;
+}
+export interface ActivityPage {
+  rows: ActivityRow[]; more: boolean; next: string | null;
+  actors: string[]; kinds: string[];
+}
+export interface Continuity {
+  note: string; prepared_for: string;
+  mail_configured: boolean; members_only: boolean; members: string[];
+  note_max: number;
+}
+
 export interface Me {
   email: string; tenant_id: string; role: "owner" | "viewer";
   version: string; hosted: boolean; demo: boolean;
@@ -197,6 +242,9 @@ export interface Me {
   donate_url?: string | null;
   totp_enabled?: boolean; verified?: boolean;
   created_at?: string | null;
+  // when the nightly sweep freezes a never-confirmed household (ISO);
+  // null unless hosted, unverified and nobody here ever confirmed
+  verify_deadline?: string | null;
   recovery_codes_left?: number;
   has_business?: boolean;
   // the household's allowance. institution_cap is how many banks the
@@ -422,6 +470,23 @@ export interface IncomeWindow {
   // [payer, amount, deposits, prev-window amount|null, logo]
   sources: [string, number, number, number | null, string | null][];
 }
+/** Interest and fees paid on bank and card accounts, by year — what
+ *  holding money costs, net of what the bank refunded. Empty `by_year`
+ *  means the section has nothing to say. */
+export interface CashCostYear {
+  year: string; interest: number; fees: number; refunds: number; net: number;
+  // [name, amount, date, kind] of the year's largest charge
+  biggest: [string, number, string, "interest" | "fee"] | null;
+}
+export interface CashCostsReport {
+  by_year: CashCostYear[];
+  ytd: CashCostYear | null;
+  interest_ever: number;
+  earned_ytd: number;
+  // [name, amount, date, kind, account] of the newest charge
+  latest: [string, number, string, "interest" | "fee", string] | null;
+  _built_at?: string;
+}
 export interface CashflowReport {
   savings_by_year: [string, number | null, number,
                     number | null, number | null][];
@@ -458,6 +523,9 @@ export interface ReceiptItem {
   line: number; description: string; qty: number | null;
   amount: number; tag: string;
 }
+/** One part of a hand-split charge (Txn.split) */
+export type SplitPart = { category: string; amount: number };
+
 export interface Receipt {
   id: string; mime: string; has_optimized?: boolean;
   kind: "receipt" | "check";
@@ -544,8 +612,59 @@ export interface RetirementInputs {
   ssage: number; employer_mo: number; taxable_mo: number; resume: number;
   stockpct: number; saving_yr: number; your_ss: number;
   has_sched: boolean;
+  // the cash bucket's nominal yield in %; null = keeps pace with
+  // inflation (0% real), the default (web: client.ts RetirementInputs)
+  cash: number | null;
 }
+// GET /api/debt-plan — every card and loan with a balance, on one
+// schedule (web: client.ts DebtPlan)
+export type DebtMethod = "avalanche" | "snowball";
+export interface DebtRow {
+  id: string; name: string; kind: "card" | "mortgage" | "loan";
+  mask: string | null; institution: string | null;
+  balance: number;
+  apr: number; apr_source: "issuer" | "you" | "none";
+  apr_issuer: number | null;
+  min_payment: number; min_source: "issuer" | "you" | "estimate";
+  min_issuer: number | null;
+  // a mortgage's servicer payment including escrow (min_issuer is then the
+  // principal-and-interest part); null for every other kind
+  payment_reported?: number | null;
+  skip: boolean;
+}
+export interface DebtSchedule {
+  method: DebtMethod; extra: number;
+  months: number | null;            // null = not within fifty years
+  debt_free: string | null;         // ISO day of the last payment
+  total_interest: number; total_paid: number;
+  monthly: number;                  // every minimum + the extra
+  starting: number;
+  growing: boolean;                 // the minimums do not cover the interest
+  series: [string, number][];       // today, then each month's first
+  debts: { id: string; order: number; paid_off: string | null;
+           interest: number; paid: number; remaining: number }[];
+}
+export interface DebtPlan {
+  today: string;
+  method: DebtMethod; extra_monthly: number;
+  saved: { method: DebtMethod; extra_monthly: number };
+  debts: DebtRow[];
+  plan: DebtSchedule;               // the chosen method
+  alt: DebtSchedule;                // the other method, same money
+  minimums: DebtSchedule;           // minimums only, nothing rolled
+  estimated: boolean;               // some input is a labelled estimate
+}
+export interface DebtPlanSave {
+  method: DebtMethod; extra_monthly: number | string;
+  debts: Record<string, { apr?: number | string | null;
+                          min_payment?: number | string | null;
+                          skip?: boolean }>;
+}
+
 export interface RetirementData {
+  // null while some age works; otherwise the extra monthly saving, from
+  // now, that would make each listed age work (empty: no saving would)
+  catch_up?: { age: number; extra_monthly: number }[] | null;
   buckets: { cash: number; taxable: number; td: number; roth: number;
              total: number };
   earliest: number | null;
@@ -1002,6 +1121,19 @@ export function errText(e: unknown): string {
   return body || raw;
 }
 
+/** What a what-if screen shows at its fields when a recalculation fails,
+ *  or null when the failure is the connection's. A 4xx is the server
+ *  answering about what was sent, so the screen keeps its last good
+ *  numbers and says so beside the inputs — replacing it with "couldn't
+ *  reach the server" is untrue, and pulling to refresh re-sends the same
+ *  refused request forever. A 401 is not the input's fault: the session
+ *  handler already takes that one back to sign-in. */
+export function whatIfRefusal(e: unknown): string | null {
+  if (!(e instanceof ApiError) || e.status < 400 || e.status >= 500
+      || e.status === 401) return null;
+  return e.detail ? e.detail : `Couldn't load: ${e.status}`;
+}
+
 /** normalize what a person types into an origin the client can call */
 export function normalizeServerUrl(input: string): string {
   let u = input.trim().replace(/\/+$/, "");
@@ -1290,6 +1422,12 @@ export function makeClient(baseUrl: string, token: string,
       await Sharing.shareAsync(r.uri);
     },
     me: () => req<Me>("/api/me"),
+    // who changed which category, bill, note… and when — newest first;
+    // `before` pages by the last row's timestamp, kind/who filter
+    activity: (params: Record<string, string> = {}) =>
+      req<ActivityPage>("/api/activity"
+        + (Object.keys(params).length
+          ? "?" + new URLSearchParams(params) : "")),
     todayFull: (date?: string) =>
       req<TodayFull>("/api/today/full"
         + (date ? `?date=${encodeURIComponent(date)}` : "")),
@@ -1324,7 +1462,17 @@ export function makeClient(baseUrl: string, token: string,
     // a one-shot ticket the export download redeems within a minute. The
     // door wants FRESH elevation (the whole household's data leaves in one
     // file), so the sheet shows even inside an elevated window.
-    exportTicket: (kind: "zip" | "dump") =>
+    // the continuity packet (web: client.ts continuity*)
+    continuity: () => req<Continuity>("/api/continuity"),
+    continuitySave: (body: { note?: string; prepared_for?: string }) =>
+      req<Continuity>("/api/continuity", {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body) }),
+    continuityEmail: (to: string) =>
+      req<{ ok: boolean; to: string }>("/api/continuity/email", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ to }) }),
+    exportTicket: (kind: "zip" | "dump" | "continuity") =>
       req<{ ok: boolean; token: string; url: string; expires_in: number }>(
         "/api/export/token", { method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1333,6 +1481,28 @@ export function makeClient(baseUrl: string, token: string,
       req<TxnPage>("/api/transactions?" + new URLSearchParams(
         Object.entries(params)
           .filter(([, v]) => v !== undefined) as [string, string][])),
+    /** ONE ledger row, read back from the server. There is no single-row
+     *  door, and the ledger search scoped to the row's own DAY is the
+     *  narrowest one there is — it answers in exactly the shape every
+     *  ledger surface already renders, provenance and all. For a screen
+     *  holding its row in local state that needs the server's answer to a
+     *  write it cannot compute itself. Null when the row is not in that
+     *  day's listing (a hidden account's row, or a day longer than the
+     *  pages walked here), which callers read as "keep what you have". */
+    txnById: async (id: string, date: string): Promise<Txn | null> => {
+      const day = date.slice(0, 10);
+      let seen = 0;
+      for (let page = 1; page <= 10; page++) {
+        const p = await req<TxnPage>("/api/transactions?"
+          + new URLSearchParams({ date_from: day, date_to: day,
+                                  page: String(page) }));
+        const hit = (p.rows ?? []).find((r) => r.id === id);
+        if (hit) return hit;
+        seen += (p.rows ?? []).length;
+        if (!p.rows?.length || p.total == null || seen >= p.total) break;
+      }
+      return null;
+    },
     accounts: () => req<{ accounts: Account[] }>("/api/accounts"),
     bills: () => req<BillsData>("/api/bills"),
     reportNetworth: () => req<NetWorthReport>("/api/reports/networth"),
@@ -1345,6 +1515,7 @@ export function makeClient(baseUrl: string, token: string,
       req<SpendingWindow>(`/api/reports/spending/window?range=${range}`),
     reportIncomeWindow: (range: FlowKey) =>
       req<IncomeWindow>(`/api/reports/income/window?range=${range}`),
+    reportCashCosts: () => req<CashCostsReport>("/api/reports/cash-costs"),
     alertsHistory: () => req<{ alerts: AlertRow[] }>("/api/alerts/history"),
     alertDismiss: (kind: string, message: string) =>
       req<{ ok: boolean }>("/api/alerts/dismiss", {
@@ -1471,17 +1642,48 @@ export function makeClient(baseUrl: string, token: string,
         headers: { "Content-Type": "application/json" },
         body: "{}",
       }),
-    // ---- script tokens (self-host collectors) ----
+    // ---- script tokens (self-host collectors, and the read half the
+    // integrations use) ----
     tokens: () =>
       req<{ tokens: { id: string; name: string; created_at: string;
             last_used_at: string | null;
-            revoked_at: string | null }[] }>("/api/tokens"),
-    tokenMint: (name: string) =>
-      req<{ id: string; name: string; token: string }>("/api/tokens", {
+            revoked_at: string | null; scope?: TokenScope }[] }>("/api/tokens"),
+    tokenMint: (name: string, scope: TokenScope = "push") =>
+      req<{ id: string; name: string; token: string; scope: TokenScope }>(
+        "/api/tokens", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name, scope }),
+        }),
+    // ---- outbound webhooks (Settings → Integrations on the web) ----
+    webhooks: () =>
+      req<{ webhooks: Webhook[]; events: WebhookEvent[] }>("/api/webhooks"),
+    webhookCreate: (body: { url: string; events: string[]; name: string }) =>
+      req<Webhook & { secret: string }>("/api/webhooks", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name }),
+        body: JSON.stringify(body),
       }),
+    webhookUpdate: (id: string, body: Partial<Pick<Webhook,
+                    "url" | "events" | "name" | "enabled">>) =>
+      req<Webhook>(`/api/webhooks/${id}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+    webhookDelete: (id: string) =>
+      req<{ ok: boolean }>(`/api/webhooks/${id}/delete`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      }),
+    webhookTest: (id: string) =>
+      req<{ ok: boolean; status: number | null; error: string | null }>(
+        `/api/webhooks/${id}/test`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+        }),
     tokenRevoke: (id: string) =>
       req<{ ok: boolean }>("/api/tokens/revoke", {
         method: "POST",
@@ -1605,6 +1807,12 @@ export function makeClient(baseUrl: string, token: string,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id }),
       }),
+    // the home-screen widget's own credential (one door, dies with this
+    // device) and the payload that door serves — the app reads it too,
+    // to refresh the widget from the numbers it just showed
+    widgetToken: () =>
+      req<{ token: string }>("/api/devices/widget", { method: "POST" }),
+    glance: () => req<Glance>("/api/today/glance"),
     registerPush: (token: string, platform: "fcm" | "apns") =>
       req<{ ok: boolean }>("/api/devices/push", {
         method: "POST",
@@ -1707,7 +1915,7 @@ export function makeClient(baseUrl: string, token: string,
         `/api/reimburse/${encodeURIComponent(id)}/candidates` +
         (q ? `?q=${encodeURIComponent(q)}` : "")),
     reimbLink: (txn_id: string, other_ids: string[], partial = false) =>
-      req<{ linked: number; errors: string[] }>("/api/reimburse/link", {
+      req<{ linked: number; errors: string[]; notes?: string[] }>("/api/reimburse/link", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ txn_id, other_ids, partial }),
@@ -1786,6 +1994,17 @@ export function makeClient(baseUrl: string, token: string,
       req<RetirementData>("/api/retirement"
         + (Object.keys(params).length
           ? "?" + new URLSearchParams(params) : "")),
+    // debt payoff planner — method/extra are what-if overrides, unsaved
+    debtPlan: (params: Record<string, string> = {}) =>
+      req<DebtPlan>("/api/debt-plan"
+        + (Object.keys(params).length
+          ? "?" + new URLSearchParams(params) : "")),
+    debtPlanSave: (body: DebtPlanSave) =>
+      req<DebtPlan>("/api/debt-plan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }),
     business: (year?: number, limit?: number) => {
       const p = new URLSearchParams();
       if (year) p.set("year", String(year));
@@ -2336,6 +2555,20 @@ export function makeClient(baseUrl: string, token: string,
         }),
     receiptDelete: (id: string) =>
       req<{ ok: boolean }>(`/api/receipts/${id}`, { method: "DELETE" }),
+    // one charge, several categories: the parts a person wrote for a row
+    // (stored category keys + cent-exact amounts summing to the charge).
+    // PUT replaces the whole split; a 400 carries the reason in words.
+    txnSplitSet: (txnId: string, parts: SplitPart[]) =>
+      req<{ ok: boolean; split: SplitPart[] }>(
+        `/api/transactions/${encodeURIComponent(txnId)}/split`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ parts }),
+        }),
+    txnSplitClear: (txnId: string) =>
+      req<{ ok: boolean; split: null }>(
+        `/api/transactions/${encodeURIComponent(txnId)}/split`,
+        { method: "DELETE" }),
     receiptParse: (id: string) =>
       req<{ status: string }>(`/api/receipts/${id}/parse`, {
         method: "POST",
@@ -2571,6 +2804,48 @@ export async function loginAndMintDevice(
   if (!login.ok) throw await parseError(login);
   return mintDeviceFromSession(baseUrl, login, deviceName, platform,
                                replaceDeviceId);
+}
+
+/** The emailed answer to the human check. When the server demands a
+ *  Turnstile the app cannot render (human_check_failed after a few wrong
+ *  passwords), proving control of the account's mailbox passes the same
+ *  check: the server's /unlock door mails a one-time link that opens a
+ *  short exemption for THAT account, after which the ordinary password
+ *  sign-in above works again. It is not a sign-in — the link carries no
+ *  session — so the app only asks for the mail and says what to do next.
+ *  The server answers 200 whether or not the address exists (the web page
+ *  does the same), so there is nothing to read back but the status.
+ *
+ *  A REFUSAL is not JSON either: /unlock is a page route, so its 429 (the
+ *  door's hourly cap) and its 404 (a demo instance, which has no such
+ *  door) arrive as the server's HTML error page. parseError would find no
+ *  `detail` there and fall back to the status line, which the sign-in
+ *  screen would then print raw — so the status is turned into words by
+ *  unlockRefusal below, the way every /api door's JSON `detail` already
+ *  reaches the screen in words. */
+export async function requestUnlock(baseUrl: string, email: string):
+    Promise<void> {
+  const r = await fetch(baseUrl + "/unlock", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ email }).toString(),
+  });
+  if (!r.ok) throw new ApiError(r.status, unlockRefusal(r.status));
+}
+
+/** The words for an unlock refusal. The one a person actually meets is the
+ *  door's own hourly cap — it sends mail, so it is capped — and it gets
+ *  what the server's own 429 page says. A demo instance has no such door
+ *  at all (404). Anything else names the status, which is at least
+ *  something to report, where an empty status line is nothing. */
+export function unlockRefusal(status: number): string {
+  if (status === 429)
+    return "Too many attempts from your connection in a short time — "
+      + "wait a few minutes and try again.";
+  if (status === 404)
+    return "This server doesn't offer emailed sign-in links.";
+  return `Couldn't send the sign-in link (error ${status}) — `
+    + "try again in a moment.";
 }
 
 /** The session→device-token exchange every sign-in flow shares: use the

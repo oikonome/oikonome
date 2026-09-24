@@ -1,7 +1,8 @@
 """Converge merchants that one payee was split across.
 
-The resolver decides identity from COALESCE(merchant_outlet, merchant_name,
-name), so a payee whose rows an aggregator enriched UNEVENLY keys two ways:
+The resolver decides identity from the row's identity key
+(engine/merchant_sql.raw_key), so a payee whose rows an aggregator
+enriched UNEVENLY keys two ways:
 the tidy enrichment string on the rows that got one, the raw bank
 descriptor on the rows that did not. Two keys are two independent
 decisions, so the household ends up with two merchants and two alias rows
@@ -34,7 +35,7 @@ from __future__ import annotations
 
 import logging
 
-from . import merchant_dedup, merchant_identity
+from . import merchant_dedup, merchant_identity, merchant_sql
 
 log = logging.getLogger(__name__)
 
@@ -74,14 +75,15 @@ def _abbrev_distance(descriptor: str, name: str) -> int:
 
     Zero means the descriptor spells the whole name out. Used to break a
     tie between two names of equal authority: the one the descriptor
-    matches word for word is the one it names most tightly."""
-    dwords = merchant_identity._words(descriptor)
-    loose = 0
-    for m in merchant_identity._words(name):
-        if m in dwords:
-            continue
-        loose += 1
-    return loose
+    matches word for word is the one it names most tightly.
+
+    Both readings of an apostrophe count, on both sides, exactly as
+    `_descriptor_names` reads them — a line printing "JUNIPERS" spells
+    "Juniper's" out in full, and scoring it as two loose words would hand
+    the tie to a name the line abbreviates."""
+    dwords = merchant_identity._descriptor_words(descriptor)
+    return min(sum(1 for m in reading if m not in dwords)
+               for reading in merchant_identity._name_readings(name))
 
 
 def _survivor_key(descriptor: str, cand: dict) -> tuple:
@@ -176,7 +178,7 @@ def _candidates(conn, scan_limit: int) -> list[dict]:
     that differs. Removed rows are ignored: they are not displayed, and a
     retired lineage would otherwise keep proposing a merge forever."""
     rows = conn.execute(
-        """WITH split AS (
+        f"""WITH split AS (
                SELECT t.name AS descriptor
                  FROM transactions t
                 WHERE t.removed = 0 AND t.merchant_id IS NOT NULL
@@ -187,8 +189,7 @@ def _candidates(conn, scan_limit: int) -> list[dict]:
                 LIMIT %s)
            SELECT t.name AS descriptor, t.merchant_id AS mid,
                   count(*) AS rows,
-                  bool_or(COALESCE(t.merchant_outlet, t.merchant_name,
-                                   t.name) LIKE %s) AS counterparty_key
+                  bool_or({merchant_sql.RAW_KEY} LIKE %s) AS counterparty_key
              FROM transactions t
              JOIN split s ON s.descriptor = t.name
             WHERE t.removed = 0 AND t.merchant_id IS NOT NULL

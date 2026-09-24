@@ -18,12 +18,13 @@ morning as the window slides.
 
 import datetime as dt
 
-from . import budget
+from . import budget, merchant_sql
 from .compat import as_date
 
 DUP_WINDOW_DAYS = 2
 DUP_MIN = 10.0
 NEW_MERCHANT_MIN = 200.0
+COST_MIN = 1.00            # a fee or interest charge below this is not worth a line
 
 
 def _money(v: float) -> str:
@@ -38,8 +39,11 @@ def detect(conn, today: dt.date) -> list[str]:
     # today paths), else an excluded high-churn card fires phantom
     # double-charge / big-purchase alerts.
     cfg = budget.load_config(conn)
+    # parts=False: the questions here (charged twice? unusually large?)
+    # are about the CHARGE the bank sent, so a hand-split row stays whole
     rows = budget._spend_rows(conn, since, today + dt.timedelta(days=1),
-                              excluded=cfg.get("excluded_accounts"))
+                              excluded=budget.excluded_account_ids(cfg),
+                              parts=False)
     msgs: list[str] = []
 
     # possible double charges. Keyed on the raw statement descriptor as well
@@ -77,20 +81,68 @@ def detect(conn, today: dt.date) -> list[str]:
     for r in rows:
         merchant = (r["payee"] or "").strip()
         m = merchant.lower()
-        if (r["amount"] < NEW_MERCHANT_MIN or not m or m in seen
+        # one alert per merchant per scan, counted by identity: a payee whose
+        # rows key on an outlet and on a bare descriptor is still one payee
+        ident = r.get("merchant_id") or m
+        if (r["amount"] < NEW_MERCHANT_MIN or not m or ident in seen
                 or as_date(r["date"]) < fresh):
             continue
-        seen.add(m)
+        seen.add(ident)
         # prior = ANY charge strictly before this one (including 1-3 days ago
         # inside the scan window) — bounding it at `since` would leave a blind
         # window where a merchant's second charge fires a false "first-ever"
-        # alert
+        # alert.
+        #
+        # "The same merchant" is the row's OWN identity, and it has to be
+        # asked for in the same spelling the payee above is: the merchant the
+        # row is filed under, else the identity key. Probing a different
+        # expression — the aggregator's merchant name, where the payee is the
+        # outlet or the bank's line — answers "no prior" for every row whose
+        # two spellings differ, so a fuel pump, a renamed payee and a line
+        # the aggregator named one-off all read as first-ever on a payee with
+        # a hundred charges behind it. That is the one shape this alert must
+        # never wear: it asks the person to go and check a charge that is
+        # ordinary.
         prior = conn.execute(
-            """SELECT 1 FROM transactions
+            f"""SELECT 1 FROM transactions
                WHERE removed = 0 AND date < %s
-                 AND LOWER(COALESCE(merchant_name, name)) = %s LIMIT 1""",
-            (r["date"], m)).fetchone()
+                 AND (LOWER(BTRIM({merchant_sql.RAW_KEY_UNALIASED})) = %s
+                      OR merchant_id = %s::uuid) LIMIT 1""",
+            (r["date"], m, r.get("merchant_id"))).fetchone()
         if prior is None:
-            msgs.append(f"First-ever charge from {merchant}: {_money(r['amount'])} "
+            # named as the ledger names it: an identity key is sometimes a
+            # descriptor nobody has ever read, and an alert asking the person
+            # to recognize a charge has to say what the charge looks like
+            shown = (r.get("display_payee") or "").strip() or merchant
+            msgs.append(f"First-ever charge from {shown}: {_money(r['amount'])} "
                         f"— verify you recognize it")
+
+    # a fee or interest charge that just posted. Money lost to holding money
+    # is the one spend a person can nearly always do something about — a
+    # fee is often waived for the asking, interest stops when the statement
+    # is paid — but only if they hear about it the day it lands, not in a
+    # yearly total. Refunds are silent. A card's first interest in a while
+    # names the gap, because "first since March" is the whole story.
+    from . import reporting
+    for r in reporting.cash_cost_rows(conn, since=fresh):
+        if r["amount"] < COST_MIN or r["date"] < fresh:
+            continue
+        when = f"{r['date']:%m/%d}"
+        if r["kind"] == "interest":
+            prior = conn.execute(
+                """SELECT MAX(date) AS d FROM transactions
+                    WHERE removed = 0 AND account_id = %s AND amount > 0
+                      AND date < %s
+                      AND (COALESCE(category_detailed,'') = 'BANK_FEES_INTEREST_CHARGE'
+                           OR LOWER(name) LIKE '%% interest charge%%'
+                           OR LOWER(name) LIKE '%%purchase interest%%'
+                           OR LOWER(name) LIKE '%%finance charge%%')""",
+                (r["account_id"], r["date"])).fetchone()["d"]
+            gap = (f"first since {as_date(prior):%b %Y}" if prior
+                   else "first ever on this account")
+            msgs.append(f"Interest charged: {r['account']} "
+                        f"{_money(r['amount'])} on {when} — {gap}")
+        else:
+            msgs.append(f"Fee charged: {r['name']} {_money(r['amount'])} "
+                        f"on {when} ({r['account']})")
     return msgs

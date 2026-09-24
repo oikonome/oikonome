@@ -287,8 +287,6 @@
 </div>
 
 {% if multi_tenant %}
-{% include "ext/console_panel_c.html" ignore missing %}
-
 <h2>Instances</h2>
 <div class="grid cols2">
   <div class="card">
@@ -355,13 +353,13 @@
 
 {% else %}
 {# Single-household instance: /signup does not exist here, so every door
-   below it (access requests, instance provisioning, signup invites,
+   below it (instance provisioning, signup invites,
    unverified-user chasing) would hand out links that redirect to /login.
    Say that once, plainly, instead of offering them. #}
 <h2>Signups</h2>
 <div class="card">
   <p class="sub">This instance is a single household — it was claimed
-    through its setup link and does not take signups, so access requests,
+    through its setup link and does not take signups, so
     instance provisioning and signup invites do not apply. To share this
     instance with someone, use <b>Settings → Security &amp; household →
     Invite</b>, which adds a member to <i>your</i> data.</p>
@@ -399,7 +397,6 @@
     <div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.6rem">
       <form method="post" action="/admin/console/refresh-blocklist" style="margin:0">
         <button class="pri">Refresh blocklist now</button></form>
-      {% include "ext/spam_action.html" ignore missing %}
       <form method="post" action="/admin/console/block" style="margin:0;display:flex;gap:.3rem">
         <input name="value" placeholder="domain.com or a@b.com" style="min-width:16rem">
         <button>Block</button></form>
@@ -420,7 +417,6 @@
       <tr><td colspan="5" class="mut">No blocked domains yet.</td></tr>
       {% endfor %}
     </table>
-    {% include "ext/spam_section_a.html" ignore missing %}
   </div>
   {% endif %}
 </details>

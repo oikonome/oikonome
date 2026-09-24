@@ -81,8 +81,12 @@ export default function Merchant() {
     } else {
       url = Platform.OS === "ios" ? `https://maps.apple.com/?q=${q}` : `geo:0,0?q=${q}`;
     }
+    // the maps app knows businesses by name; OpenStreetMap's search does
+    // not, so the fallback asks it for the place alone
+    const where = encodeURIComponent(
+      [l.address, l.city, l.region, l.postal].filter(Boolean).join(", "));
     Linking.openURL(url).catch(() =>
-      Linking.openURL(`https://www.openstreetmap.org/search?query=${q}`).catch(() => {}));
+      Linking.openURL(`https://www.openstreetmap.org/search?query=${where}`).catch(() => {}));
   };
   const site = m?.website
     ? (/^https?:/.test(m.website) ? m.website : "https://" + m.website) : null;

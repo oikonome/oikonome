@@ -7,8 +7,7 @@
      way past it a person without an account can actually use. #}
   <div class="note" style="margin-bottom:.8rem">
     <p style="margin:0 0 .5rem"><b>Not quite yet</b> — {{ error }}</p>
-    <p style="margin:0">{% if support_email %}<a href="mailto:{{ support_email }}?subject=Oikonome%20account">Email {{ support_email }}</a>{% if intake_open %} or{% endif %}{% endif %}{% if intake_open %}
-      <a href="{{ intake_path() }}">request access</a>{% endif %}.</p>
+    {% if support_email %}<p style="margin:0"><a href="mailto:{{ support_email }}?subject=Oikonome%20account">Email {{ support_email }}</a>.</p>{% endif %}
   </div>
   {% elif error %}<div class="note" style="margin-bottom:.8rem;background:rgba(224,105,93,.10);border-color:rgba(224,105,93,.4);color:var(--red)">{{ error }}</div>{% endif %}
   {% if invite_required %}

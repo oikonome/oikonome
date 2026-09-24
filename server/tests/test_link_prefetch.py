@@ -14,17 +14,34 @@ GET, because all it proves is that the mailbox receives our mail and a
 scanner's prefetch proves the same thing; what must never recur is the human
 then being told "already used" — a spent, unexpired link for a verified user
 shows the same confirmed page.
+
+The exception stops exactly there. Reopening a household frozen for never
+confirming is an ACT, not a proof, so it waits behind the button on that
+page — a POST, which no scanner sends.
 """
 import os
 import unittest
+import unittest.mock
 import uuid
 
 from fastapi.testclient import TestClient
 
 from oikonome.auth import email_verify, login_unlock
 from oikonome.db import tenancy
+from oikonome.jobs import unverified, worker
 
 from .util import _ensure_db
+
+
+def _tenant_of(email):
+    admin = tenancy.admin_connect()
+    try:
+        return admin.execute(
+            "SELECT t.id, t.status, t.delete_after FROM tenants t "
+            "JOIN users u ON u.tenant_id = t.id WHERE u.email=%s",
+            (email,)).fetchone()
+    finally:
+        admin.close()
 
 
 def _user_row(email):
@@ -100,6 +117,52 @@ class LinkPrefetchTests(unittest.TestCase):
             admin.close()
         r = TestClient(self.appmod.app).get(f"/verify-email?token={old}")
         self.assertEqual(r.status_code, 400)
+
+    def test_a_prefetch_confirms_the_address_but_reopens_nothing(self):
+        """The one thing the verification link does NOT do on a GET.
+
+        A scanner that could reopen a frozen household would hand mail
+        security a veto over the erasure of signups nobody ever answered
+        for — and on a squatted address the veto would be exercised by
+        the victim's own provider, keeping the squatter's household
+        alive. So the freeze survives the fetch and the scheduled purge
+        still erases the household on its date.
+        """
+        email, _ = self._account()
+        admin = tenancy.admin_connect()
+        try:
+            uid = _user_row(email)["id"]
+            admin.execute("UPDATE users SET verified_at=NULL, "
+                          "first_verified_at=NULL WHERE id=%s", (uid,))
+            admin.execute(
+                "UPDATE tenants SET status=%s, status_before_delete='active', "
+                "delete_after = now() - interval '1 minute' WHERE id = "
+                "(SELECT tenant_id FROM users WHERE id=%s)",
+                (unverified.STATUS, uid))
+            token = email_verify.create(admin, uid)
+        finally:
+            admin.close()
+        scanner = TestClient(self.appmod.app)
+        r = scanner.get(f"/verify-email?token={token}",
+                        follow_redirects=False)
+        self.assertEqual(r.status_code, 200, r.text)
+        # the address IS confirmed — that is all a fetch can prove, and
+        # all it is allowed to decide
+        self.assertIsNotNone(_user_row(email)["verified_at"])
+        row = _tenant_of(email)
+        self.assertEqual(row["status"], unverified.STATUS)
+        self.assertIsNotNone(row["delete_after"])
+        # and the household is erased on schedule, by the ordinary purge
+        with unittest.mock.patch("oikonome.erasure.release_external",
+                                 return_value={"plaid_items": 0,
+                                               "released": "none",
+                                               "mx_user": "none"}), \
+             unittest.mock.patch(
+                 "oikonome.notify.account_mail.account_deleted",
+                 return_value=True):
+            purged = worker.purge_scheduled_deletions()
+        self.assertIn(str(row["id"]), purged)
+        self.assertIsNone(_user_row(email))
 
     def test_scanner_get_does_not_burn_the_unlock_link(self):
         email, client = self._account()

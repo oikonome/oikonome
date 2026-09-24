@@ -167,6 +167,81 @@ class PnlTests(unittest.TestCase):
         self.assertEqual(p["operating_expenses"], 0.0)   # CC pmt excluded
         self.assertEqual(p["net_operating"], 300.0)
 
+    def _partial_link(self, expense_id, deposit_id, amount):
+        self.conn.execute(
+            "INSERT INTO reimbursements (expense_id, reimburse_id, partial, "
+            "amount) VALUES (%s,%s,1,%s)", (expense_id, deposit_id, amount))
+
+    def test_partial_reimbursement_nets_both_sides_of_the_books(self):
+        """A deposit that carried one business charge back with it is
+        revenue only in the part no charge claimed, and the charge is an
+        expense only in the part not repaid. Gross on both sides leaves net
+        right but overstates Schedule C receipts AND expenses by the repaid
+        amount."""
+        add_txn(self.conn, TODAY, -3000.0, "CLIENT PAYMENT", account="biz",
+                primary="INCOME", txn_id="dep1")
+        add_txn(self.conn, TODAY, 200.0, "OFFICE DEPOT", account="biz",
+                txn_id="exp1")
+        books.classify(self.conn, "exp1", "operating", sched_c_line="Supplies")
+        self._partial_link("exp1", "dep1", 200.0)
+        p = books.pnl(self.conn, self.ent["id"])
+        self.assertEqual(p["revenue"], 2800.0)
+        self.assertEqual(p["operating_expenses"], 0.0)
+        self.assertEqual(p["net_operating"], 2800.0)
+        self.assertNotIn("Supplies", p["operating_by_line"])
+
+    def test_old_style_transfer_stamp_keeps_the_unclaimed_revenue(self):
+        """A client payment an older partial link stamped TRANSFER_IN, whose
+        links claim only $200 of its $3,000, is still $2,800 of revenue —
+        the same figure personal income reads for it."""
+        add_txn(self.conn, TODAY, -3000.0, "CLIENT PAYMENT", account="biz",
+                primary="INCOME", txn_id="dep2")
+        add_txn(self.conn, TODAY, 200.0, "OFFICE DEPOT", account="biz",
+                txn_id="exp2")
+        books.classify(self.conn, "exp2", "operating", sched_c_line="Supplies")
+        self._partial_link("exp2", "dep2", 200.0)
+        self.conn.execute("UPDATE transactions SET category_override="
+                          "'TRANSFER_IN' WHERE id='dep2'")
+        p = books.pnl(self.conn, self.ent["id"])
+        self.assertEqual(p["revenue"], 2800.0)
+        self.assertEqual(p["operating_expenses"], 0.0)
+        self.assertEqual(p["net_operating"], 2800.0)
+
+    def test_deposit_used_up_by_partial_links_does_not_understate_net(self):
+        """Once partial links claim the whole deposit it becomes a transfer
+        and leaves revenue; the charge it repaid must leave expenses too,
+        or net profit drops by money that came back."""
+        add_txn(self.conn, TODAY, -500.0, "CLIENT", account="biz",
+                primary="INCOME", txn_id="rev9")
+        add_txn(self.conn, TODAY, 300.0, "HARDWARE", account="biz",
+                txn_id="exp9")
+        add_txn(self.conn, TODAY, -120.0, "VENDOR REFUND", account="biz",
+                primary="TRANSFER_IN", txn_id="dep9")
+        books.classify(self.conn, "exp9", "operating", sched_c_line="Supplies")
+        self._partial_link("exp9", "dep9", 120.0)
+        p = books.pnl(self.conn, self.ent["id"])
+        self.assertEqual(p["revenue"], 500.0)
+        self.assertEqual(p["operating_expenses"], 180.0)
+        self.assertEqual(p["operating_by_line"].get("Supplies"), 180.0)
+        self.assertEqual(p["net_operating"], 320.0)
+
+    def test_partially_reimbursed_startup_cost_counts_net(self):
+        """The §195 total (this year's and the lifetime one the deduction is
+        judged on) counts only the part of a pre-opening cost not repaid."""
+        add_txn(self.conn, dt.date(2026, 6, 10), 1000.0, "LAWYER",
+                account="biz", txn_id="su9")
+        add_txn(self.conn, dt.date(2026, 6, 20), -400.0, "PARTNER SHARE",
+                account="biz", primary="TRANSFER_IN", txn_id="dep8")
+        self._partial_link("su9", "dep8", 400.0)
+        p = books.pnl(self.conn, self.ent["id"], 2026)
+        self.assertEqual(p["startup_195"], 600.0)
+        self.assertEqual(p["startup_deduction"]["total"], 600.0)
+        row = next(r for r in books.entity_transactions(self.conn,
+                                                        self.ent["id"])
+                   if r["id"] == "su9")
+        self.assertEqual(row["amount"], 1000.0)    # the ledger stays gross
+        self.assertEqual(row["net_amount"], 600.0)
+
     def test_unclassified_pre_start_defaults_to_startup(self):
         # a pre-open cost with NO explicit class defaults to §195 start-up
         add_txn(self.conn, dt.date(2026, 6, 10), 12.00, "DOMAIN REGISTRAR",

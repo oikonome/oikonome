@@ -9,6 +9,7 @@ import type { ReactNode } from "react";
 import { flushSync } from "react-dom";
 import { Link, useNavigate } from "react-router";
 import ReceiptPanel from "./ReceiptPanel";
+import SplitPanel from "./SplitPanel";
 import { api, errText, mmdd, money as money$, type Entity, type Txn, catLabel } from "../api/client";
 import { patchQueries } from "../api/cache";
 import MerchantAvatar from "./MerchantAvatar";
@@ -127,14 +128,18 @@ type RowProps = {
   menuOpen: boolean;
   noteOpen: boolean;
   receiptOpen: boolean;
+  splitOpen: boolean;
   activeEntities: Entity[];
   catGroups: ReactNode;
+  // every category the pickers offer, so a split's custom name is known
+  knownCats: Set<string>;
   onArm: (id: string) => void;
   onPick: (id: string) => void;
   onRecat: (id: string, category: string) => void;
   onMenu: (id: string) => void;
   onNote: (id: string) => void;
   onReceipt: (id: string) => void;
+  onSplit: (id: string) => void;
   onBiz: (id: string, on: boolean) => void;
   onRetire: (id: string) => void;
   onNoteDone: (id: string, note?: string) => void;
@@ -193,8 +198,8 @@ function TxnDetail({ t }: { t: Txn }) {
 
 const Row = memo(function Row({ t, viewer, showAccount, picked, armed,
   saving, bizPending, canRetire, retiring, menuOpen, noteOpen, receiptOpen,
-  activeEntities, catGroups, onArm, onPick, onRecat, onMenu, onNote,
-  onReceipt, onBiz, onRetire, onNoteDone }: RowProps) {
+  splitOpen, activeEntities, catGroups, knownCats, onArm, onPick, onRecat,
+  onMenu, onNote, onReceipt, onSplit, onBiz, onRetire, onNoteDone }: RowProps) {
   const tcat = catLabel(t.category || "");
   const xfer = tcat.includes("TRANSFER") ||
     (tcat.includes("LOAN PAYMENTS") && t.amount < 0);
@@ -283,10 +288,34 @@ const Row = memo(function Row({ t, viewer, showAccount, picked, armed,
             come free with it. The reimbursement flag lives in the ⋯
             strip instead; two doors to one action is how they drift
             apart. */}
-        {viewer ? (
+        {/* a hand-split row shows its parts where the category goes —
+            the rollups count those, not the row's own category — and
+            the picker steps aside: recategorizing a split is editing the
+            split. Viewers read the same parts, plain. */}
+        {t.split?.length ? (
+          <span className="txn-split" role={viewer ? undefined : "button"}
+                tabIndex={viewer ? undefined : 0}
+                title={viewer ? "split across categories" : "edit the split"}
+                aria-label={`split across ${t.split.length} categories${viewer ? "" : " — edit"}`}
+                style={{ cursor: viewer ? undefined : "pointer",
+                         display: "inline-flex", flexDirection: "column",
+                         gap: 1, fontSize: 12, lineHeight: 1.3 }}
+                onClick={viewer ? undefined : () => onSplit(t.id)}
+                onKeyDown={viewer ? undefined : (e) => {
+                  if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSplit(t.id); }
+                }}>
+            {t.split.map((p, i) => (
+              <span key={i}>
+                <span className="mut">{money(Math.abs(p.amount))}</span>
+                {" "}{catLabel(p.category)}
+              </span>
+            ))}
+            <span className="pill b" style={{ alignSelf: "flex-start" }}>✂ split</span>
+          </span>
+        ) : viewer ? (
           <span style={{ fontSize: 12, color: "var(--mut)" }}>
             {catLabel(t.category)}</span>
-        ) : (
+        ) : (<>
         <select value="" title="recategorize (permanent override)"
                 className="cat-chip"
                 aria-label={`category: ${catLabel(t.category)} — change`}
@@ -319,7 +348,18 @@ const Row = memo(function Row({ t, viewer, showAccount, picked, armed,
           {catGroups}
           </>)}
         </select>
-        )}
+        {/* a category you set yourself can be handed back to the automatic
+            layer in one tap, without opening the picker to find the reset
+            entry; a bill's or a store match's override is not yours to
+            drop here and keeps only the picker's reset */}
+        {t.override_manual && !saving ? (
+          <button type="button" className="chip-x"
+                  style={{ marginLeft: ".3rem" }}
+                  title="use automatic — drop your category and let the row take its source category again"
+                  aria-label={`use the automatic category for ${t.payee}`}
+                  onClick={() => onRecat(t.id, "__clear__")}>↺</button>
+        ) : null}
+        </>)}
       </td>
       {showAccount && (
         <td className="mut hide-m hide-t c-acct" title={t.account ?? ""}
@@ -368,6 +408,13 @@ const Row = memo(function Row({ t, viewer, showAccount, picked, armed,
           <button onClick={() => onReceipt(t.id)}>
             📎 {t.has_receipt ? "receipt" : "attach a receipt"}</button>
           )}
+          {/* the server's own answer: Split is offered exactly where
+              the split door will take the row */}
+          {!viewer && t.splittable && (
+          <button onClick={() => onSplit(t.id)}
+            title="one charge, several categories — the parts count where the row's category would">
+            ✂ {t.split?.length ? "edit split" : "split across categories"}</button>
+          )}
           {!viewer && !xfer && t.amount > 0 && !t.recurring_bill && (
           <Link className="btn" style={{ textDecoration: "none" }}
             to={`/bills/history?payee=${encodeURIComponent(t.payee)}`}
@@ -413,6 +460,11 @@ const Row = memo(function Row({ t, viewer, showAccount, picked, armed,
       // receipt panel spans the full width on phones
       <tr className="tr-expand"><td className="c-expand" colSpan={expandCols}>
         <ReceiptPanel txnId={t.id} /></td></tr>
+    )}
+    {splitOpen && (
+      <tr className="tr-expand"><td className="c-expand" colSpan={expandCols}>
+        <SplitPanel t={t} catGroups={catGroups} known={knownCats}
+                    onDone={() => onSplit(t.id)} /></td></tr>
     )}
     </>
   );
@@ -462,6 +514,9 @@ export default memo(function TxnTable({ rows, showAccount = true,
                          ...(cats.data?.plaid_flow ?? [])]);
     return (cats.data?.categories ?? []).filter((c) => !std.has(c));
   }, [cats.data]);
+  const knownCats = useMemo(() => new Set([
+    ...(cats.data?.plaid_spend ?? []), ...(cats.data?.plaid_flow ?? []),
+    ...customCats]), [cats.data, customCats]);
   // one shared element for the full taxonomy — the bulk bar and every
   // armed row picker offer the identical list, built once per cats fetch
   const catGroups = useMemo(() => (<>
@@ -512,6 +567,7 @@ export default memo(function TxnTable({ rows, showAccount = true,
     return heads;
   }, [dayGroups, rows]);
   const [receiptFor, setReceiptFor] = useState<string | null>(null);
+  const [splitFor, setSplitFor] = useState<string | null>(null);
   const [noteFor, setNoteFor] = useState<string | null>(null);
   // Three always-rendered controls per row — a biz toggle plus a 📝 and a
   // 📎 at 30% opacity — is 300 buttons on a 100-row page, most of them
@@ -784,11 +840,13 @@ export default memo(function TxnTable({ rows, showAccount = true,
   const bizMutate = biz.mutate;
   const onBiz = useCallback((id: string, on: boolean) =>
     bizMutate({ id, on }), [bizMutate]);
-  // ⋯ opens one strip at a time; note and receipt panels close with it
+  // ⋯ opens one strip at a time; note, receipt and split panels close with it
   const onMenu = useCallback((id: string) => {
     setMenuFor((cur) => (cur === id ? null : id));
-    setNoteFor(null); setReceiptFor(null);
+    setNoteFor(null); setReceiptFor(null); setSplitFor(null);
   }, []);
+  const onSplit = useCallback((id: string) =>
+    setSplitFor((cur) => (cur === id ? null : id)), []);
   const onNote = useCallback((id: string) =>
     setNoteFor((cur) => (cur === id ? null : id)), []);
   const onReceipt = useCallback((id: string) =>
@@ -963,10 +1021,12 @@ export default memo(function TxnTable({ rows, showAccount = true,
                canRetire={!viewer && !demo && stuckPending(t)}
                retiring={retiring.has(t.id)}
                menuOpen={menuFor === t.id} noteOpen={noteFor === t.id}
-               receiptOpen={receiptFor === t.id}
+               receiptOpen={receiptFor === t.id} splitOpen={splitFor === t.id}
                activeEntities={activeEntities} catGroups={catGroups}
+               knownCats={knownCats}
                onArm={arm} onPick={toggleOne} onRecat={recat}
                onMenu={onMenu} onNote={onNote} onReceipt={onReceipt}
+               onSplit={onSplit}
                onBiz={onBiz} onRetire={onRetire} onNoteDone={onNoteDone} />
           {scopeAsk?.id === t.id && (
             <tr className="tr-expand" data-scope-ask>

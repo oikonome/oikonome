@@ -135,6 +135,12 @@ def fees(user: dict = Depends(_user())):
     return _report("fees", user)
 
 
+@router.get("/cash-costs", dependencies=_REPORT_LIMIT)
+def cash_costs(user: dict = Depends(_user())):
+    """Interest and fees paid on bank and card accounts, by year."""
+    return _report("cash_costs", user)
+
+
 # ---- nightly snapshot job (jobs-callable; sync body, worker-thread safe) ----
 
 

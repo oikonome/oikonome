@@ -274,20 +274,16 @@ def gather(conn, today: dt.date, *, live: bool = True) -> dict:
         status["runway"] = None
     else:
         checking_bal = forecast._checking_balance(conn, cfg)
+        # forecast.build's own card-scope predicate, spliced rather than
+        # restated: its card_debt and this tile's render side by side on
+        # Today and in the nightly email, and a second copy of the rule is
+        # a second thing to forget to update
         cards = conn.execute(
-            """SELECT i.institution_name AS bank, a.mask, a.balance_current AS bal
+            f"""SELECT i.institution_name AS bank, a.mask, a.balance_current AS bal
                FROM accounts a JOIN items i ON i.id = a.item_id
-               WHERE a.type = 'credit'
-                 AND (NULLIF((SELECT current_setting('app.shadow_ids', true)), '') IS NULL
-                      OR NOT (a.id = ANY(string_to_array(
-                              (SELECT current_setting('app.shadow_ids', true)), ','))))
-                 -- business cards stay out of PERSONAL
-                 -- runway/headroom unless combined — same predicate as
-                 -- forecast.build, whose card_debt this must agree with (the
-                 -- two render side by side)
-                 AND (NULLIF((SELECT current_setting('app.combine_entities', true)),
-                             '') = 'true' OR a.entity_id IS NULL)
-               ORDER BY a.balance_current DESC""").fetchall()
+               WHERE a.type = 'credit' {forecast.CARD_SCOPE_SQL}
+               ORDER BY a.balance_current DESC""",
+            (budget.excluded_account_ids(cfg),)).fetchall()
         card_debt = sum(max(0.0, c["bal"] or 0.0) for c in cards)
         horizon = paycheck or (today + dt.timedelta(days=14))
         # The same rule the forecast uses — occurrence-matched against MTD
@@ -530,11 +526,8 @@ def build(d: dict, *, summary: bool = False) -> tuple:
     base = mailable_base()
     plain = ([f"Oikonome — {base}/app/", ""] if base else []) + \
         [f"Daily budget — {_d(d['today'])}", ""]
-    for a in d.get("alerts") or []:
-        pre = {"bad": "!! ", "warn": "!! ", "good": "++ "}.get(a["severity"], "-- ")
-        plain += [pre + a["message"]]
-    if d.get("alerts"):
-        plain += [""]
+    # alerts are not here: they close the mail, per recipient, inside the
+    # "Needs you" section (notify/mailact) — and only for an owner or member
     # hero mirror: verdict sentence, then the
     # left-to-spend-today tiles as one line, each tile carrying its own
     # plan-vs-now daily note — same strings as the Today page and the
@@ -792,9 +785,16 @@ def send_each(subject: str, plain: str, html: str, recipients: list[str],
               sender: str | None = None,
               attachments: list[tuple[str, bytes, str]] | None = None,
               smtp: dict | None = None,
-              unsubscribe: str | None = None) -> list[dict]:
+              unsubscribe: str | None = None,
+              personal=None) -> list[dict]:
     """Send household mail as ONE MESSAGE PER RECIPIENT, each addressed to
     that person. Returns [{email, ok, error}] — one row per recipient.
+
+    `personal(address) -> (plain, html)` adds a section that belongs to ONE
+    copy — the daily verdict's "Needs you" block, whose buttons are signed
+    for the address they were mailed to and which a viewer's copy must not
+    carry at all. It goes in before the unsubscribe footer, so the footer
+    stays last.
 
     `unsubscribe=<tenant_id>` closes each copy with a per-address
     unsubscribe footer (and the List-Unsubscribe headers mail clients turn
@@ -833,9 +833,12 @@ def send_each(subject: str, plain: str, html: str, recipients: list[str],
     for r in recipients:
         try:
             p, h, unsub_url = plain, html, None
+            if personal is not None:
+                from ..notify import mailact
+                p, h = mailact.attach(p, h, *personal(r))
             if unsubscribe:
                 from ..notify import unsubscribe as _unsub
-                p, h, unsub_url = _unsub.decorate(plain, html, unsubscribe, r)
+                p, h, unsub_url = _unsub.decorate(p, h, unsubscribe, r)
             send(subject, p, h, [r], sender=sender,
                  attachments=attachments, smtp=smtp, bcc=False,
                  list_unsubscribe=unsub_url or None)

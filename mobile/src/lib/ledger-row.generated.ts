@@ -81,4 +81,8 @@ export interface Txn {
   override_manual?: boolean | null;
   /** true when the row is a companion charge — the fee that rides with override_bill's payment */
   override_is_fee?: boolean | null;
+  /** a hand split of this charge across categories, in order — stored category keys and cent-exact amounts summing to `amount`; null when the row is not split. `category` stays the whole row's own; the rollups count the parts */
+  split?: { category: string; amount: number }[] | null;
+  /** true when the split door will take this row — the spend test the rollups use (money out, not a transfer, not a card payment, not on a loan account); clients offer Split and Edit split only when true */
+  splittable?: boolean | null;
 }

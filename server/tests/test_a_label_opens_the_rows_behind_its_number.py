@@ -57,7 +57,7 @@ def seed_month(conn) -> dict:
                            primary="FOOD_AND_DRINK"),
         # Food by OVERRIDE, not by category: the tile counts it, and
         # cat=FOOD_AND_DRINK never would
-        "costco": add_txn(conn, dt.date(2026, 7, 11), 120.0, "COSTCO WHSE",
+        "costco": add_txn(conn, dt.date(2026, 7, 11), 120.0, "ACME MARKET",
                           primary="GENERAL_MERCHANDISE",
                           override="Costco - Food & Drink"),
         # bill-shaped: matched to its occurrence, so it is FIXED spend and
@@ -189,6 +189,57 @@ class LedgerLinkApiTests(unittest.TestCase):
         kids = self.get(bucket="Kids", y=2026, m=7)
         self.assertEqual(kids["bucket_label"], "Kids")
         self.assertEqual({r["id"] for r in kids["rows"]}, {self.ids["tots"]})
+
+    def test_a_bucket_listing_echoes_the_tiles_figure(self):
+        """Beside the listed rows' raw sum the answer carries the number
+        the label wore — the plan's own figure for that bucket — so the
+        page can say both when they differ (reimbursements netted,
+        envelope overflow counted only past the envelope)."""
+        body = self.get(bucket="food", y=2026, m=7)
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            st = lenses.month_state(conn, 2026, 7, TODAY)
+        finally:
+            conn.close()
+        self.assertEqual(body["bucket_amount"],
+                         budget.bucket_ledger(st, "food")["amount"])
+        self.assertEqual(body["bucket_scope"], "month")
+
+    def test_a_years_bucket_is_the_sum_of_its_months_buckets(self):
+        """The year lens's money map label opens the bucket over the year:
+        `y` with no `m`. Its rows are the union of the month doors over
+        the months the map summed, and its figure is the map's own."""
+        year = self.get(bucket="food", y=2026)
+        self.assertEqual(year["bucket_scope"], "year")
+        self.assertEqual(year["bucket_label"], "Food")
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            summary = lenses.year_summary(conn, 2026, TODAY)
+        finally:
+            conn.close()
+        months = [c["m"] for c in summary["cells"]
+                  if c["status"] in ("final", "projected")]
+        self.assertIn(7, months)
+        want_rows: set[str] = set()
+        want_amount = 0.0
+        for m in months:
+            door = self.get(bucket="food", y=2026, m=m)
+            want_rows |= {r["id"] for r in door["rows"]}
+            want_amount += door["bucket_amount"]
+        self.assertEqual({r["id"] for r in year["rows"]}, want_rows)
+        self.assertAlmostEqual(year["bucket_amount"], want_amount, places=2)
+        self.assertAlmostEqual(year["bucket_amount"],
+                               summary["buckets_annual"]["food"]["actual"],
+                               places=2)
+        # a year has no as-of day, and a name that is no bucket is refused
+        with mock.patch("oikonome.localtime.now_local", return_value=LOCAL_NOW):
+            r = self.client.get("/api/transactions",
+                                params={"bucket": "food", "y": 2026,
+                                        "as_of": "2026-07-10"})
+            self.assertEqual(r.status_code, 400)
+            r = self.client.get("/api/transactions",
+                                params={"bucket": "Yachts", "y": 2026})
+            self.assertEqual(r.status_code, 400)
 
     def test_a_past_months_bucket_lists_that_month(self):
         body = self.get(bucket="food", y=2026, m=6)
@@ -397,6 +448,20 @@ class EmailLabelLinkTests(unittest.TestCase):
             self.assertIn("https://budget.example.test" + want, html, want)
         # no stale category door survives beside them
         self.assertNotIn("transactions?cat=", html)
+
+    def test_a_why_line_opens_its_bucket(self):
+        """The Why's per-bucket sentences name the tiles' buckets, so each
+        one is the same door as its tile — in the mail as on the page."""
+        # the doors are set while the mail is composed, on the same
+        # entries the page renders
+        html = self._html("https://budget.example.test")
+        entries = (self.d.get("why") or {}).get("entries") or []
+        self.assertTrue(entries, "the fixture month has no Why lines")
+        for e in entries:
+            self.assertTrue(e["to"].startswith("/transactions?bucket="), e)
+            href = "https://budget.example.test/app" + e["to"].replace("&", "&amp;")
+            self.assertIn(f'href="{href}" style="color:inherit;text-decoration:none;">{e["name"]}</a>',
+                          html, e["name"])
 
     def test_the_ampersand_is_escaped_once(self):
         """Jinja autoescape owns the href; a hand-escaped link would arrive

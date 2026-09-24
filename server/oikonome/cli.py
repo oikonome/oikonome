@@ -4,7 +4,6 @@ import argparse
 import os
 import sys
 
-from . import ext
 
 
 def main() -> None:
@@ -114,6 +113,14 @@ def main() -> None:
     ms.add_argument("--apply", action="store_true")
     ms.add_argument("--limit", type=int, default=None,
                     help="merges per tenant (default: the nightly's cap)")
+    rs = sub.add_parser("reanchor-stranded",
+                        help="move notes, receipts, categories and pairings "
+                             "left on retired transactions onto the live "
+                             "row that is the same charge; prints the "
+                             "counts per tenant (the nightly does this too)")
+    rs.add_argument("--tenant", default=None, help="one tenant id only")
+    rs.add_argument("--dry-run", action="store_true",
+                    help="count what would move, write nothing")
     dt_ = sub.add_parser("dedupe-twins",
                          help="retire the second lineage of transactions that "
                               "reached an account twice under two ids (a "
@@ -132,6 +139,8 @@ def main() -> None:
     if args.cmd == "dedupe-twins":
         raise SystemExit(dedupe_twins(args.tenant, args.account, args.apply))
 
+    if args.cmd == "reanchor-stranded":
+        raise SystemExit(reanchor_stranded_cmd(args.tenant, dry_run=args.dry_run))
     if args.cmd == "merchants-resolve":
         raise SystemExit(merchants_resolve(args.tenant, reclean=args.reclean))
     if args.cmd == "merchants-repair-splits":
@@ -186,6 +195,37 @@ def main() -> None:
         from . import demo
         r = demo.reset(seed_value=args.seed, years=args.years)
         print(json.dumps({k: v for k, v in r.items() if k != "password"}))
+
+
+def reanchor_stranded_cmd(tenant: str | None = None, *, dry_run: bool = False) -> int:
+    """Re-anchor stranded children for every tenant (or one) and print the
+    counts as JSON, one line per tenant. --dry-run counts the stranded rows
+    and their twins without writing."""
+    import json
+
+    from .db import tenancy
+    from .sync import reanchor
+    admin = tenancy.admin_connect()
+    try:
+        rows = admin.execute("SELECT id FROM tenants" +
+                             (" WHERE id=%s" if tenant else ""),
+                             ((tenant,) if tenant else ())).fetchall()
+    finally:
+        admin.close()
+    for r in rows:
+        conn = tenancy.tenant_connect(str(r["id"]))
+        try:
+            if dry_run:
+                st = {"stranded": 0, "matched": 0, "ambiguous": 0, "no_twin": 0}
+                for row in reanchor.stranded(conn):
+                    st["stranded"] += 1
+                    st[reanchor.find_twin(conn, row)[1]] += 1
+            else:
+                st = reanchor.reanchor_stranded(conn)
+            print(json.dumps({"tenant": str(r["id"]), **st}))
+        finally:
+            conn.close()
+    return 0
 
 
 def merchants_resolve(tenant: str | None = None, *, reclean: bool = False) -> int:
@@ -555,9 +595,6 @@ def mint_invite(email: str, days: int, note: str | None) -> None:
     admin = tenancy.admin_connect()
     try:
         token = signup_invites.mint(admin, email, days=days, note=note)
-        # a pending access request for this address, if an add-on keeps
-        # them, is now answered
-        ext.gate.on_invite_minted(admin, email.strip().lower())
     finally:
         admin.close()
     path = f"/signup?invite={token}&email={quote(email.strip().lower())}"

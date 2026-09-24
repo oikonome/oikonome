@@ -37,21 +37,24 @@ DOCS_DIR = _docs_dir()
 # not listed sorts after, alphabetically
 _ORDER = ["faq", "quickstart", "importing", "troubleshooting",
           "reverse-proxy", "community-scripts", "collectors",
-          "tax-documents"]
+          "integrations", "tax-documents"]
 
 # docs/guides/*.md are per-feature product guides, listed as their own
 # group after the root docs (the SPA renders the groups; the
 # flat order here just keeps faq/quickstart first for older clients).
 # Ordered as a reading path: the verdict first, then the money model,
 # then the pages, then the trust/admin topics.
+# Same order as the app's navigation: Debt sits under Cash Flow, Business
+# just above Accounts.
 _GUIDE_ORDER = ["today", "lenses", "concepts", "budget", "bills",
-                "money-map", "cash-flow", "transactions", "merchants", "rules",
-                "net-worth", "retirement", "accounts",
-                "owners", "reimbursements", "receipts", "business", "alerts",
-                "assistant", "security", "import-history"]
+                "money-map", "cash-flow", "debt", "transactions", "merchants",
+                "rules", "net-worth", "retirement", "business", "accounts",
+                "owners", "reimbursements", "receipts", "alerts",
+                "assistant", "security", "continuity-packet", "import-history"]
 
 # root docs split into sidebar groups; guides are group "guides"
 _SETUP = {"quickstart", "importing", "collectors", "community-scripts",
+          "integrations",
           "reverse-proxy", "deployment-modes"}
 
 

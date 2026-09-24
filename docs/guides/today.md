@@ -72,6 +72,12 @@ there each browser and each phone remembers its own. The daily
 email does not — its summary/detail shape is its own **email face**
 setting on the daily row of your notification settings.
 
+The email also ends differently from the page: the alert strip sits at
+the **bottom**, in a *Needs you* section that adds one-tap buttons for
+proposed bills and uncategorized charges (see [Alerts](alerts.md)). Only
+owners and members get that section; a viewer's or guest's copy stops at
+the timeline.
+
 In the detail view each category gets a full-width row — the same
 bar style as the money map — whose number is **left today**: today's
 allowance (fixed at the start of the day) minus what you've spent
@@ -112,13 +118,15 @@ each category gets its own line, plus — while days remain — a way back:
 the most you can spend per remaining day in each bucket and still end
 the month inside its budget ("spend at most $18/day on Food"); a bucket
 already through its budget is named as a $0-a-day one. On or under
-budget there is no Why — the verdict speaks for itself.
+budget there is no Why — the verdict speaks for itself. Each "by
+category" line is headed by its bucket's name, and that name opens the
+same rows its tile does.
 
 Every category and bill name on Today — the Food / Everything else
-tiles, the money map's rows, the pinned bills — opens the rows behind
-its number: the category's transactions for this month, or
-the bill's history. Plain text at rest, a button on hover or a press on
-the phone.
+tiles, the money map's rows, the Why's category lines, the pinned bills
+— opens the rows behind its number: the category's transactions for
+this month, or the bill's history. Plain text at rest, a button on hover
+or a press on the phone.
 
 ## The plan, in one line
 
@@ -170,6 +178,10 @@ realistic default) and **pay all cards now** (the comparison). When
 both bottom out at the same low they collapse into a single balance
 column.
 
+These scenarios test the next few weeks' cash, so they pay each card off
+at its due date. The longer question — when every card and loan is gone,
+and in what order — is the Debt page's (see the debt guide).
+
 Each card's **autopay date** is drawn on the chart as a dashed line
 labelled with the card, so a step down in the curve says which payment
 caused it. Only dates your card issuer actually reports are marked;
@@ -181,6 +193,30 @@ If any account still sits at an unset $0 balance, the forecast hides
 rather than present $0 as truth; the verdict card says so instead
 ("Cash forecast is waiting on your balance", with a link to Accounts).
 Set real balances on the Accounts page and it appears.
+
+## On your phone's home screen
+
+The mobile app ships a home-screen widget that shows the simple face of
+this page: the one number left to spend today, the verdict, and the day
+bar. The wider size adds the per-bucket chips. Tap it to open Today.
+
+- **Same number as the app.** The widget is fed by the same door that
+  composes the hero, in whole dollars, so it can never disagree with the
+  page or the daily email.
+- **Refreshes on the phone's clock** — about every half hour, and again
+  whenever you open the app. When the last refresh is more than an hour
+  old the widget turns grey and shows the time it was fetched, rather
+  than a verdict that may no longer hold.
+- **Its own credential.** The widget never touches the token behind
+  your biometric lock. It gets a lesser one that can read only this
+  glance (no balances, no transactions, no account names) and that dies
+  with the phone's sign-in: revoke the device in Settings, change your
+  password, or sign out, and the widget goes back to "Sign in".
+- **Before you have a budget** it says "Set a plan" — like the page,
+  it does not render a verdict on a plan you have not made.
+
+Add it the way you add any widget: long-press the home screen, find
+Oikonome, pick "Left today" (Android) or the small or medium size (iOS).
 
 ## Gotchas
 

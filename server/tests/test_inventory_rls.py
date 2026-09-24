@@ -38,6 +38,7 @@ from .util import TEST_DB, _admin_dsn, _ensure_db
 RLS_EXEMPT = {
     "api_tokens":         "script tokens; authenticated pre-tenant-context",
     "device_tokens":      "looked up by bearer token, before a tenant is known",
+    "widget_tokens":      "the widget's child credential, same lookup",
     "invites":            "claimed by a recipient who has no tenant yet",
     "push_subscriptions": "notify/push.py sweeps every tenant nightly",
     # Answered by an invited person who, on self-host, has no

@@ -143,13 +143,13 @@ class DepositSideCapTests(unittest.TestCase):
 
     def test_full_pairing_path_untouched(self):
         """FULL (non-partial) pairing keeps its by-design semantics: both
-        sides become TRANSFER_*, no amount math, one deposit may still pair
-        with several charges (refcounted on unlink)."""
+        sides become TRANSFER_*, and one deposit may still pair with
+        several charges it pays for (refcounted on unlink)."""
         a = add_txn(self.conn, TODAY, 100.0, "MEDICAL A", account="chk",
                     primary="MEDICAL")
         b = add_txn(self.conn, TODAY, 100.0, "MEDICAL B", account="chk",
                     primary="MEDICAL")
-        dep = add_txn(self.conn, TODAY, -100.0, "EMPLOYER REIMB",
+        dep = add_txn(self.conn, TODAY, -200.0, "EMPLOYER REIMB",
                       account="chk", primary="INCOME")
         r = data.link_reimbursements(self.conn, dep, [a, b])
         self.assertEqual(r, {"linked": 2, "errors": []})

@@ -5,7 +5,10 @@ Banks spell the same shop several ways. One month it arrives as
 lowercase — and each spelling becomes its own merchant, splitting one
 provider's totals across three rows that never add up on any page.
 
-The app consolidates the obvious cases automatically, but it is
+The app consolidates the obvious cases automatically — including a name
+the bank prints without its apostrophe ("Juniper's Market" and "JUNIPERS
+MARKET" are one merchant), and when that cleanup improves, bills and
+category rules attached to the old spelling move with it — but it is
 deliberately cautious: a wrong merge is worse than a missed one. The **Merchants** page is
 where you settle the rest by hand — and your answer outranks every
 automatic rule, because you were there and the app was only reading
@@ -49,7 +52,10 @@ seen, the category rule behind it, and the actions.
 
 When the app thinks two spellings are one business it queues them under
 **Needs a look** at the top of the page, one line per pair with the
-reason behind "why?"; **Merge** joins them, **Not the same** keeps them
+reason. **details** opens three boxes that read as a sum — the new
+detection, the history it would join, and the merchant you would have
+after merging, each with its rows, total, dates and latest bank lines
+(a name opens that merchant). **Merge** joins them, **Not the same** keeps them
 apart for good, and nothing is merged unless you say so.
 
 The counts and totals are your personal ledger's. A merchant you only
@@ -84,7 +90,16 @@ the bank printed. Such a row could land under a second merchant named
 after the descriptor itself, so one payee shows up twice: once tidily
 named, once as something like `ACME TELECOM NEW YORK USA`.
 
-New charges are filed under the identified merchant. Pairs already split
+New charges are filed under the identified merchant. The same applies the
+other way round: where your bank's line and your data provider have agreed
+on a shop several times over, a single charge the provider suddenly names
+something else — something the line does not say — stays with the shop the
+line means. That one charge's name is set aside rather than remembered, so
+a real business of that name still gets its own merchant the first time you
+visit it — and the charge itself is searchable by the line your statement
+shows, not by the name it was moved off.
+
+Pairs already split
 are merged by the nightly job, which converges up to 25 such pairs a night, keeping the
 better-sourced name — the one your bank connection identified, with its
 logo — and folding the other into it. Every merge is journalled like any

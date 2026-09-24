@@ -50,6 +50,10 @@ SHAPES = [
      "FAKERECIP00000000001", "/recipient-invite?token="),
     ("GET /verify-email?token=FAKEVERIFY0000000001 HTTP/1.1",
      "FAKEVERIFY0000000001", "/verify-email?token="),
+    # a button in the daily email (act from the mail) — a signed statement
+    # that can confirm a bill or file a charge for a week
+    ("GET /act?token=FAKEACT0000000000001 HTTP/1.1",
+     "FAKEACT0000000000001", "/act?token="),
     # Plaid link token in the URL PATH (pages.py), with and without the
     # /status poll suffix
     ("GET /accounts/plaid/link/link-sandbox-FAKE0001-abcd-ef HTTP/1.1",

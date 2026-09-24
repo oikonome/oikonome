@@ -34,6 +34,7 @@ mobile/              Expo/React Native app (specs/mobile.md)
 docker/              Dockerfile + compose + Caddy (tls profile)
 docs/                end-user docs
 community-scripts/   example host-side data collectors
+integrations/        outbound: the local MCP server, Home Assistant and Prometheus examples
 specs/               design notes for shipped features
 ```
 

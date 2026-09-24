@@ -67,6 +67,7 @@ import time
 
 from fastapi import Body, FastAPI, HTTPException, Request
 
+from .. import logsafe
 # The trusted-proxy walk is shared with the instance on purpose: the relay
 # runs from the same image, and the rule (believe X-Forwarded-For only when
 # the socket peer is a trusted proxy, then take the rightmost untrusted hop)
@@ -76,6 +77,17 @@ from ..web.security import client_ip
 from . import apns, fcm
 
 log = logging.getLogger("oikonome.relay")
+
+# The relay is a process of its own (`uvicorn oikonome.relay.app:app`), so
+# it has to flatten its own log records: the instance installs the factory
+# at web startup and the worker at its entrypoint, and neither of those
+# runs here. It matters more here than there — the gate below logs the
+# request path on refusals that carry no credential at all, and the ASGI
+# server percent-decodes the target, so a request for `/v1/%0A...` would
+# otherwise write a second, invented line into the operator's log. At
+# import rather than in the lifespan because import is the one moment that
+# precedes every record this process can emit.
+logsafe.install()
 
 # Instance keys the relay accepts, comma-separated so one can be rotated
 # in while the other is still in use. The instance sends its key in the

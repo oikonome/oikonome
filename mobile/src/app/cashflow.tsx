@@ -16,8 +16,9 @@ import NetBars from "../components/net-bars";
 import Sparkline from "../components/sparkline";
 import StaleBanner from "../components/stale-banner";
 import { Card, H, HelpLink, KV } from "../components/ui";
-import type { CashflowReport, FlowKey, IncomeWindow } from "../lib/api";
-import { CASHFLOW_RANGES, cashflowCutoffMonth, RANGE_LABEL, RANGE_MONTHS,
+import type { CashCostsReport, CashflowReport, FlowKey, IncomeWindow }
+  from "../lib/api";
+import { TREND_RANGES, cashflowCutoffMonth, RANGE_LABEL, RANGE_MONTHS,
          type TrendRange }
   from "../lib/pure";
 import { useSession } from "../lib/session";
@@ -89,6 +90,12 @@ export default function CashFlow() {
     enabled: !!client && tab === "income",
     placeholderData: (prev) => prev,
   });
+  // interest & fees paid — the Income tab's last living card; same gate
+  const ccq = useQuery({
+    queryKey: ["report", "cash-costs"],
+    queryFn: () => client!.reportCashCosts(),
+    enabled: !!client && tab === "income",
+  });
   const d = query.data;
   const flow = flowQ.data;
   const series = d ? savedSeries(d, range) : null;
@@ -108,7 +115,8 @@ export default function CashFlow() {
                                       onRefresh={() => Promise.all([
                                         query.refetch(), flowQ.refetch(),
                                         ...(tab === "income"
-                                          ? [iq.refetch()] : [])])} />}>
+                                          ? [iq.refetch(), ccq.refetch()]
+                                          : [])])} />}>
       <StaleBanner query={query} />
       {query.isPending && <Text style={s.center}>Loading…</Text>}
       {query.isError && !d && (
@@ -133,7 +141,7 @@ export default function CashFlow() {
             <>
               <View style={{ flexDirection: "row", gap: 4, marginTop: 8,
                              flexWrap: "wrap" }}>
-                {CASHFLOW_RANGES.map((r) => (
+                {TREND_RANGES.map((r) => (
                   <Pressable key={r}
                              style={[s.chip, range === r && s.chipOn]}
                              onPress={() => setRange(r)}>
@@ -256,6 +264,7 @@ export default function CashFlow() {
         <IncomeTab chartW={chartW} range={range} setRange={setRange}
                    iq={iq} />
       )}
+      {tab === "income" && ccq.data && <CashCosts r={ccq.data} />}
       {d && tab === "income" && (
         <IncomeRecords d={d} chartW={chartW} />
       )}
@@ -320,7 +329,7 @@ function IncomeTab({ chartW, range, setRange, iq }: {
           <H>Income</H>
           <View style={{ flexDirection: "row", gap: 4, marginLeft: "auto",
                          flexWrap: "wrap" }}>
-            {CASHFLOW_RANGES.map((r) => (
+            {TREND_RANGES.map((r) => (
               <Pressable key={r} style={[s.chip, range === r && s.chipOn]}
                          onPress={() => setRange(r)}>
                 <Text style={{ color: range === r ? C.text : C.mut,
@@ -411,6 +420,87 @@ function IncomeTab({ chartW, range, setRange, iq }: {
         </Card>
       )}
     </>
+  );
+}
+
+const mmdd = (iso: string) => `${iso.slice(5, 7)}/${iso.slice(8, 10)}`;
+
+/** Interest and fees paid — what holding money and carrying a balance cost,
+ *  by year, net of refunds, beside what the same banks paid in interest.
+ *  Under income by source because interest EARNED is a row up there; this
+ *  is the other side of it. Hidden when nothing was ever charged. Mirrors
+ *  the web's CashCosts. */
+function CashCosts({ r }: { r: CashCostsReport }) {
+  if (r.by_year.length === 0) return null;
+  const ytd = r.ytd;
+  const net = ytd ? ytd.net : 0;
+  const vsEarned = r.earned_ytd - net;
+  const tone = (v: number, upIsBad: boolean) =>
+    v === 0 ? C.text : (v > 0) === upIsBad ? C.bad : C.good;
+  const Kpi = ({ k, v, color, sub }: { k: string; v: string; color: string;
+                                        sub: string }) => (
+    <View style={{ minWidth: 96 }}>
+      <Text style={s.mut}>{k}</Text>
+      <Text style={{ color, fontSize: 20, fontWeight: "700",
+                     fontVariant: ["tabular-nums"] }}>{v}</Text>
+      <Text style={[s.mut, { fontSize: 11 }]}>{sub}</Text>
+    </View>
+  );
+  return (
+    <Card>
+      <H>Interest &amp; fees paid{" "}
+        <Text style={{ color: C.mut, fontSize: 12, fontWeight: "400" }}>
+          — what holding money costs you, by year</Text></H>
+      <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 14,
+                     marginTop: 6 }}>
+        <Kpi k={ytd ? `${ytd.year} so far` : r.by_year[0].year}
+             v={m$(net)} color={tone(net, true)}
+             sub={ytd
+               ? `${m$(ytd.interest)} interest · ${m$(ytd.fees)} fees`
+                 + (ytd.refunds > 0 ? ` − ${m$(ytd.refunds)} refunded` : "")
+               : "nothing charged this year"} />
+        <Kpi k="vs interest earned"
+             v={`${vsEarned > 0 ? "+" : ""}${m$(vsEarned)}`}
+             color={tone(vsEarned, false)}
+             sub={`earned ${m$(r.earned_ytd)} · paid ${m$(net)} this year`} />
+        <Kpi k="card interest" v={m$(r.interest_ever)}
+             color={r.interest_ever > 0 ? C.text : C.good}
+             sub={r.interest_ever > 0 ? "ever, across every account"
+                                      : "never charged on any account"} />
+      </View>
+      <View style={[s.tRow, { marginTop: 8, borderTopWidth: 0 }]}>
+        <Text style={[s.tHead, { flex: 1, textAlign: "left" }]}>Year</Text>
+        <Text style={s.tHead}>Interest</Text>
+        <Text style={s.tHead}>Fees</Text>
+        <Text style={s.tHead}>Refunds</Text>
+        <Text style={s.tHead}>Net</Text>
+      </View>
+      {r.by_year.map((y) => (
+        <View key={y.year}>
+          <View style={s.tRow}>
+            <Text style={[s.tNum, { flex: 1, textAlign: "left" }]}>{y.year}</Text>
+            <Text style={s.tNum}>{y.interest ? m$(y.interest) : "·"}</Text>
+            <Text style={s.tNum}>{y.fees ? m$(y.fees) : "·"}</Text>
+            <Text style={[s.tNum, { color: C.good }]}>
+              {y.refunds ? `−${m$(y.refunds)}` : "·"}</Text>
+            <Text style={[s.tNum, { fontWeight: "700" }]}>{m$(y.net)}</Text>
+          </View>
+          {y.biggest && (
+            <Text style={[s.mut, { fontSize: 11, marginTop: -2, marginBottom: 2 }]}>
+              biggest: {y.biggest[0]} {m$(y.biggest[1])} · {mmdd(y.biggest[2])}</Text>
+          )}
+        </View>
+      ))}
+      {r.latest && (
+        <Text style={[s.mut, { marginTop: 6 }]}>
+          Latest: <Text style={{ color: C.text }}>{r.latest[4]}</Text>{" "}
+          {r.latest[3] === "interest" ? "charged interest of" : `— ${r.latest[0]}`}{" "}
+          <Text style={{ color: C.text }}>{money(r.latest[1], true)}</Text>{" "}
+          on {mmdd(r.latest[2])}. A new charge is also in the daily email the
+          day it posts.
+        </Text>
+      )}
+    </Card>
   );
 }
 

@@ -54,11 +54,13 @@ Each row is `label · actual / budget · delta`:
 - Excess cash is never a bar: it folds into the footer line "Also this
   month: $X excess stays in checking", beside any plan-only savings
   row.
-- **Every label opens its rows** on the monthly map (Today, the Budget
-  page, the month lens): a category name opens the transactions the
-  number counts for that month; a bill's name opens its history. The
-  year lens's map keeps its labels as plain text — a year's bucket has
-  no single month to open. The label reads as plain text and becomes a button on hover
+- **Every label opens its rows** (Today, the month lens, the year
+  lens): a category name opens the transactions the number counts for
+  that month — or, on the year lens's map, for the year: one listing of
+  that bucket over the same elapsed, budgeted months the map summed,
+  with a "Food · 2026" chip over it. A bill's name opens its history.
+  The Budget page's plan, which is no period's tally, keeps plain text.
+  The label reads as plain text and becomes a button on hover
   (a press on the phone) — the number beside it is the point of the row,
   so nothing is underlined. The same labels link in the daily email.
 

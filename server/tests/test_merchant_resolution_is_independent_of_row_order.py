@@ -60,8 +60,8 @@ class ResolutionOrderTests(unittest.TestCase):
         aggregator enriches the charge and leaves the refund bare, and the
         refund is the newer row. Deciding it first finds nothing under the
         descriptor and mints a second merchant."""
-        self._unenriched("2026-09-10", -24.63, DESCRIPTOR, "ref5")
-        add_txn(self.conn, "2026-09-09", 24.63, DESCRIPTOR,
+        self._unenriched("2026-06-04", -21.70, DESCRIPTOR, "ref5")
+        add_txn(self.conn, "2026-06-03", 21.70, DESCRIPTOR,
                 merchant="example telecom", txn_id="chg5")
         order = self._scan_order()
         self.assertLess(order.index("ref5"), order.index("chg5"),
@@ -80,8 +80,8 @@ class ResolutionOrderTests(unittest.TestCase):
     def test_one_merchant_however_the_rows_are_ordered(self):
         """The same fixture in either order yields one merchant, and the
         SAME one — the outcome is a function of the ledger, not the scan."""
-        self._unenriched("2026-09-10", -24.63, DESCRIPTOR, "ref6")
-        add_txn(self.conn, "2026-09-09", 24.63, DESCRIPTOR,
+        self._unenriched("2026-06-04", -21.70, DESCRIPTOR, "ref6")
+        add_txn(self.conn, "2026-06-03", 21.70, DESCRIPTOR,
                 merchant="example telecom", txn_id="chg6")
         merchant_identity.resolve(self.conn)
         unenriched_first = self._merchant_of("ref6")["name"]
@@ -90,14 +90,14 @@ class ResolutionOrderTests(unittest.TestCase):
         self.addCleanup(other.close)
         write_config(other, plaid_client_id="cid", plaid_secret="sec",
                      plaid_env="sandbox")
-        add_txn(other, "2026-09-09", 24.63, DESCRIPTOR,
+        add_txn(other, "2026-06-03", 21.70, DESCRIPTOR,
                 merchant="example telecom", txn_id="chg7")
         other.execute(
             """INSERT INTO transactions (id,account_id,date,amount,name,
                    merchant_name,category_primary,pending,removed,raw)
-               VALUES ('ref7','card',%s,-24.63,%s,NULL,
+               VALUES ('ref7','card',%s,-21.70,%s,NULL,
                        'GENERAL_MERCHANDISE',0,0,%s)""",
-            (as_date("2026-09-10"), DESCRIPTOR, jsonb({})))
+            (as_date("2026-06-04"), DESCRIPTOR, jsonb({})))
         merchant_identity.resolve(other)
 
         self.assertEqual(self._merchant_of("ref7", other)["id"],
@@ -116,9 +116,9 @@ class ResolutionOrderTests(unittest.TestCase):
         run."""
         tid = self.conn.execute(
             "SELECT current_setting('app.tenant_id') AS t").fetchone()["t"]
-        add_txn(self.conn, "2026-09-09", 24.63, DESCRIPTOR,
+        add_txn(self.conn, "2026-06-03", 21.70, DESCRIPTOR,
                 merchant="example telecom", txn_id="chg9")
-        self._unenriched("2026-09-10", -24.63, DESCRIPTOR, "ref9")
+        self._unenriched("2026-06-04", -21.70, DESCRIPTOR, "ref9")
 
         app_dsn = os.environ.get(
             "OIKONOME_TEST_DSN",

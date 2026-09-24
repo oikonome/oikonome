@@ -40,6 +40,10 @@ class DemoDoorTests(unittest.TestCase):
         finally:
             os.environ.pop("OIKONOME_DEMO", None)
 
+    def test_doors_open_without_env(self):
+        os.environ.pop("OIKONOME_DEMO", None)
+        self.assertNotEqual(self.client.get("/forgot").status_code, 404)
+
 
 class SuspensionTests(unittest.TestCase):
     """tenants.status='suspended' blocks EVERYTHING but logout."""

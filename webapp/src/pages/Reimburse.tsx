@@ -317,30 +317,32 @@ function Matcher({ anchor, onDone }: {
   const [partial, setPartial] = useState(!!anchor.partial);
 
   const link = useMutation({
-    mutationFn: (v: { ids: string[]; partial: boolean; amount: number }) =>
+    mutationFn: (v: { ids: string[]; partial: boolean }) =>
       api.reimbLink(anchor.id, v.ids, v.partial),
     onSuccess: (r, v) => {
-      // settle the anchor row in the cache now rather than leaving it
-      // behind the closed matcher until the refetch lands: a full match
-      // takes it off the list, a partial one advances its progress. The
-      // refetch still runs to pick up what the server decided (a partial
-      // that reached its expected amount, a link that failed).
-      if (r.linked > 0) {
-        type Pending = { pending: PendingReimb[] };
-        if (v.partial)
-          patchList<Pending, PendingReimb>(qc, ["reimb"], "pending",
-            (x) => x.id === anchor.id,
-            (x) => ({ ...x, received: (x.received ?? 0) + v.amount }));
-        else
-          removeFromList<Pending, PendingReimb>(qc, ["reimb"], "pending",
-                                                (x) => x.id === anchor.id);
-      }
+      // Notes are outcomes, not refusals: the server links a full match
+      // as partial when the deposit is bigger than the charge it repays,
+      // because the rest of that deposit is still income.
+      const notes = r.notes ?? [];
+      // A clean full match takes the charge off the list now rather than
+      // leaving it behind the closed matcher until the refetch lands. A
+      // partial link (asked for, or downgraded by the server) is not
+      // patched: what it netted is min(the charge's remaining need, each
+      // deposit's remaining balance), decided server-side and not in the
+      // response, so the deposits' face value would overstate it — the
+      // refetch brings the real progress.
+      if (r.linked > 0 && !v.partial && notes.length === 0)
+        removeFromList<{ pending: PendingReimb[] }, PendingReimb>(
+          qc, ["reimb"], "pending", (x) => x.id === anchor.id);
       qc.invalidateQueries({ queryKey: ["reimb"] });
+      // the new pair belongs in the Matched card, the undo surface
+      qc.invalidateQueries({ queryKey: ["reimb-pairs"] });
       qc.invalidateQueries({ queryKey: ["today"] });
       qc.invalidateQueries({ queryKey: ["txns"] });
-      onDone(r.errors?.length
+      const head = r.errors?.length
         ? `Linked ${r.linked}, ${r.errors.length} failed: ${r.errors.join("; ")}`
-        : `Linked ${anchor.payee} to ${r.linked} deposit${r.linked === 1 ? "" : "s"}.`);
+        : `Linked ${anchor.payee} to ${r.linked} deposit${r.linked === 1 ? "" : "s"}.`;
+      onDone(notes.length ? `${head} ${notes.join(" ")}` : head);
     },
     onError: (e) => onDone(errText(e)),
   });
@@ -359,8 +361,10 @@ function Matcher({ anchor, onDone }: {
   return (
     <div className="matcher">
       <div style={{ display: "flex", gap: ".5rem", flexWrap: "wrap", alignItems: "center" }}>
-        <b>Deposits near {money(target)} since {mmdd(anchor.date)} — pick the
-          one that paid this back</b>
+        {/* the candidate search spans 180 days either side of the charge,
+            so the heading states the window rather than a start date */}
+        <b>Deposits near {money(target)}, within 180 days — pick the one
+          that paid this back</b>
         <input placeholder="filter by merchant…" size={18} value={search}
                style={{ marginLeft: "auto" }}
                onChange={(e) => setSearch(e.target.value)} />
@@ -372,7 +376,7 @@ function Matcher({ anchor, onDone }: {
       <div style={{ marginTop: ".7rem", display: "flex", gap: ".8rem",
                     alignItems: "center", flexWrap: "wrap" }}>
         <button className="pri" disabled={picked.size === 0 || link.isPending}
-                onClick={() => link.mutate({ ids: [...picked], partial, amount: sum })}>
+                onClick={() => link.mutate({ ids: [...picked], partial })}>
           {picked.size > 1 ? `match ${picked.size} selected` : "match selected"}
         </button>
         <label className="sub" style={{ cursor: "pointer" }}

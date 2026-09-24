@@ -3,7 +3,7 @@ import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useRef,
   useState, type ReactElement } from "react";
 import { Link, Navigate, NavLink, Route, Routes, useLocation,
   useNavigate, useNavigationType } from "react-router";
-import { WEB_HOMES, abortRequestEpoch, api, assistant as assistantApi, AuthError, errText, type Me } from "./api/client";
+import { WEB_HOMES, abortRequestEpoch, api, assistant as assistantApi, AuthError, errText, mmdd, type Me } from "./api/client";
 import { saveSettings } from "./api/cache";
 
 // "auto" follows the OS (no data-theme attribute); light/dark pin
@@ -47,6 +47,7 @@ const PAGE = {
   "/assistant": () => import("./pages/Assistant"),
   "/cashflow": () => import("./pages/CashFlow"),
   "/retirement": () => import("./pages/Retirement"),
+  "/debt": () => import("./pages/Debt"),
   "/networth": () => import("./pages/NetWorth"),
   "/alerts": () => import("./pages/Alerts"),
   "/bills": () => import("./pages/Bills"),
@@ -74,6 +75,7 @@ const CashFlow = lazy(PAGE["/cashflow"]);
 const Retirement = lazy(PAGE["/retirement"]);
 const NetWorth = lazy(PAGE["/networth"]);
 const Alerts = lazy(PAGE["/alerts"]);
+const Debt = lazy(PAGE["/debt"]);
 const Bills = lazy(PAGE["/bills"]);
 const BillsHistory = lazy(PAGE["/bills/history"]);
 const Accounts = lazy(PAGE["/accounts"]);
@@ -116,7 +118,7 @@ const PAGE_TITLES: Record<string, string> = {
   "/welcome": "Welcome", "/transactions": "Transactions",
   "/items": "Items", "/budget": "Budget",
   "/rules": "Rules", "/merchants": "Merchants", "/assistant": "Assistant", "/cashflow": "Cash Flow",
-  "/retirement": "Retirement", "/networth": "Net Worth",
+  "/retirement": "Retirement", "/networth": "Net Worth", "/debt": "Debt",
   "/alerts": "Alerts", "/bills": "Bills & Income",
   "/bills/history": "Bill history", "/accounts": "Accounts",
   "/reimburse": "Reimbursements", "/business": "Business",
@@ -239,7 +241,7 @@ const HELP_TOPIC_BY_ROUTE: [string, string][] = [
   ["/transactions", "transactions"], ["/bills", "bills"],
   ["/budget", "budget"], ["/rules", "rules"], ["/merchants", "merchants"],
   ["/assistant", "assistant"], ["/cashflow", "cash-flow"],
-  ["/retirement", "retirement"],
+  ["/retirement", "retirement"], ["/debt", "debt"],
   ["/networth", "net-worth"], ["/alerts", "alerts"],
   ["/accounts", "accounts"], ["/items", "accounts"],
   ["/reimburse", "reimbursements"], ["/import", "import-history"],
@@ -291,6 +293,9 @@ const ICON: Record<string, React.ReactNode> = {
   "/retirement": I(<><path d="M7 3h10M7 21h10" />
                      <path d="M8 3v3.5c0 2 4 3.8 4 5.5s-4 3.5-4 5.5V21" />
                      <path d="M16 3v3.5c0 2-4 3.8-4 5.5s4 3.5 4 5.5V21" /></>),
+  // a stair descending to the baseline: balances stepping down to zero
+  "/debt": I(<><path d="M3 5h5v5h5v5h5v4H3z" />
+               <path d="M3 19h18" /></>),
   // stacked bars climbing: net worth over time
   "/networth": I(<><path d="M4 20V13M10 20V8M16 20v-9M22 20V4" />
                    <path d="M2 20h20" /></>),
@@ -543,6 +548,10 @@ export default function App() {
     // app bug rather than a countdown the person can still stop.
     if (String(me.error).includes("scheduled for deletion"))
       return <PendingDeletePage />;
+    // a signup nobody ever confirmed, frozen by the nightly sweep: the
+    // way out is the emailed link, so this screen can ask for it again
+    if (String(me.error).includes("never confirmed"))
+      return <UnconfirmedPage />;
     // A TRANSIENT failure must not blank a working app. On mobile, leaving
     // the browser and coming back fires a focus-refetch while the radio is
     // still asleep; that one failed request must not replace the whole UI
@@ -758,20 +767,11 @@ export default function App() {
           <span className="navsep" />
           <AssistantTab />
           <NavLink to="/cashflow" className={tab}><span className="nav-i">{ICON["/cashflow"]}</span><span className="nav-t">Cash Flow</span></NavLink>
+          <NavLink to="/debt" className={tab}><span className="nav-i">{ICON["/debt"]}</span><span className="nav-t">Debt</span></NavLink>
           {/* Merchants is deliberately NOT in the main nav: it is a
               correction tool you visit occasionally, not a daily surface,
               and lives under Settings → Merchants (its
               own page at /merchants, same as Rules). */}
-          {/* the Business tab appears only once a business EXISTS.
-              Most households never run one, and a
-              permanently empty top-level tab makes the app look like it is
-              built for someone else. Set one up in Settings → Guided setup →
-              Business wizard and the tab appears. The /business route stays
-              reachable either way, so a bookmark or a stale link still lands
-              on the page (which has its own empty state pointing at the
-              wizard) instead of a blank screen. */}
-          {me.data.has_business &&
-            <NavLink to="/business" className={tab}><span className="nav-i">{ICON["/business"]}</span><span className="nav-t">Business</span></NavLink>}
           <span className="navsep" />
           <NavLink to="/retirement" className={tab}><span className="nav-i">{ICON["/retirement"]}</span><span className="nav-t">Retire</span></NavLink>
           <NavLink to="/networth" className={tab}><span className="nav-i">{ICON["/networth"]}</span><span className="nav-t">Net Worth</span></NavLink>
@@ -782,6 +782,16 @@ export default function App() {
               stays: it is the only route to fixing a broken bank
               connection, and "Accounts" inside a menu opened from your own
               email address reads as user accounts, not bank accounts. */}
+          {/* the Business tab appears only once a business EXISTS.
+              Most households never run one, and a
+              permanently empty top-level tab makes the app look like it is
+              built for someone else. Set one up in Settings → Guided setup →
+              Business wizard and the tab appears. The /business route stays
+              reachable either way, so a bookmark or a stale link still lands
+              on the page (which has its own empty state pointing at the
+              wizard) instead of a blank screen. */}
+          {me.data.has_business &&
+            <NavLink to="/business" className={tab}><span className="nav-i">{ICON["/business"]}</span><span className="nav-t">Business</span></NavLink>}
           <NavLink to="/accounts" className={tab}><span className="nav-i">{ICON["/accounts"]}</span><span className="nav-t">Accounts</span></NavLink>
           <SetupTab owner={owner} />
           {/* pin lives at the END of the rail, after the destinations: it
@@ -895,7 +905,11 @@ export default function App() {
         <div className="note topnote">
           <span style={{ flex: 1 }}>
             Verify your email — we sent a link to <b>{me.data.email}</b>.
-            No email? Check spam, or resend.</span>
+            No email? Check spam, or resend.
+            {me.data.verify_deadline && <>
+              {" "}Unconfirmed accounts are frozen on{" "}
+              {mmdd(me.data.verify_deadline)} and deleted a week later.</>}
+          </span>
           <button style={{ whiteSpace: "nowrap" }}
             onClick={() => api.verifyResend()
               .then((r) => window.dispatchEvent(new CustomEvent("oiko-toast",
@@ -1233,6 +1247,7 @@ const AppRoutes = memo(function AppRoutes({ me, homeWeb, homeKnown }: {
       <Route path="/fees" element={<Navigate to="/networth" replace />} />
       <Route path="/retirement" element={lazyRoute(<Retirement />)} />
       <Route path="/networth" element={lazyRoute(<NetWorth />)} />
+      <Route path="/debt" element={lazyRoute(<Debt />)} />
       <Route path="/alerts" element={lazyRoute(<Alerts />)} />
       <Route path="/bills" element={lazyRoute(<Bills />)} />
       <Route path="/bills/history" element={lazyRoute(<BillsHistory />)} />
@@ -1318,18 +1333,48 @@ function NotFoundPage() {
 // One lockout shell for every frozen-account state: title, paragraphs,
 // the sign-out that stays open server-side on purpose. Every API call 403s in these states, so
 // the app can't render anything else.
-function LockoutPage({ title, paras }: { title: string; paras: string[] }) {
+function LockoutPage({ title, paras, action }: {
+  title: string; paras: string[];
+  // the one way out that isn't signing out — a lockout the person can
+  // escape from inside offers it here, beside Sign out
+  action?: { label: string; onClick: () => void };
+}) {
   return (
     <div className="centered">
       <div className="card" style={{ maxWidth: "28rem" }}>
         <h2 style={{ marginTop: 0 }}>{title}</h2>
         {paras.map((p, i) => <p key={i} className="mut">{p}</p>)}
-        <button onClick={() =>
-          api.logout().finally(() => { window.location.href = "/login"; })}>
-          Sign out
-        </button>
+        <div style={{ display: "flex", gap: ".5rem", flexWrap: "wrap" }}>
+          {action && <button onClick={action.onClick}>{action.label}</button>}
+          <button onClick={() =>
+            api.logout().finally(() => { window.location.href = "/login"; })}>
+            Sign out
+          </button>
+        </div>
       </div>
     </div>
+  );
+}
+
+function UnconfirmedPage() {
+  const toast = (detail: string) =>
+    window.dispatchEvent(new CustomEvent("oiko-toast", { detail }));
+  return (
+    <LockoutPage title="Confirm your email to keep this account"
+      paras={[
+        "The email address on this account was never confirmed, so the "
+        + "account is frozen and will be deleted when the grace period "
+        + "ends — with everything in it.",
+        "We emailed a fresh confirmation link to the address you sign in "
+        + "with. Open it and press “Reopen this account” on the page it "
+        + "takes you to — confirming the address alone does not bring the "
+        + "account back. No email? Check spam, or resend it.",
+      ]}
+      action={{ label: "Resend link", onClick: () => api.verifyResend()
+        .then((r) => toast(r.verified
+          ? "This account is already reopened — reload."
+          : "Confirmation email sent."))
+        .catch((e) => toast(`Resend failed: ${errText(e)}`)) }} />
   );
 }
 

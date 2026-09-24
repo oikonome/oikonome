@@ -103,7 +103,10 @@ export default function YearLens({ y, onMonth }: {
             <MoneyMap
               rows={planRows(
                 { food: d.buckets_annual.food, other: d.buckets_annual.other },
-                { fixedActual: d.buckets_annual.fixed.actual,
+                { // a label opens the year's bucket: the same months this
+                  // map summed, as one listing
+                  period: { y: d.y },
+                  fixedActual: d.buckets_annual.fixed.actual,
                   fixedBudget: d.buckets_annual.fixed.month_budget,
                   // Savings — standing monthly plan × the same
                   // elapsed months every other row here covers.

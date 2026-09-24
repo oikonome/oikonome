@@ -20,7 +20,13 @@
     <input type="hidden" name="tenant_id" value="{{ tenant.id }}">
     <button>sync now ↻</button>
   </form>
-  {% if tenant.status == 'suspended' %}
+  {# A tenant frozen with a deletion date on it gets NEITHER lever: this
+     one writes `status` alone, and the restore below is the only door
+     that also clears delete_after / status_before_delete. The server
+     refuses it either way; not drawing the button is so the operator
+     never reaches for it. #}
+  {% if tenant.status in (frozen_statuses or []) %}
+  {% elif tenant.status == 'suspended' %}
   <form method="post" action="/admin/console/tenant-status" style="display:inline;margin:0">
     <input type="hidden" name="tenant_id" value="{{ tenant.id }}">
     <input type="hidden" name="to" value="active">

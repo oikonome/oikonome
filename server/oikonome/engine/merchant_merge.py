@@ -25,9 +25,10 @@ from __future__ import annotations
 import hashlib
 import re
 import statistics
+import weakref
 from collections import Counter, defaultdict
 
-from . import merchant_dedup
+from . import merchant_dedup, merchant_sql
 from .compat import as_date, as_dict, jsonb
 
 # Where card terminals and bank feeds cut a merchant name. A prefix that
@@ -611,16 +612,16 @@ def propose(cands: list[dict], cities: list[str],
 
 # ---- loaders ---------------------------------------------------------------
 
-_ROWS_SQL = """
-    SELECT {key} AS key, t.merchant_id::text AS merchant_id,
-           COALESCE(t.merchant_outlet, t.merchant_name, t.name) AS raw_key,
+_ROWS_SQL = f"""
+    SELECT {{key}} AS key, t.merchant_id::text AS merchant_id,
+           {merchant_sql.RAW_KEY} AS raw_key,
            COALESCE(t.raw->>'original_description', t.name) AS descriptor,
            t.raw->>'merchant_entity_id' AS entity,
            REPLACE(COALESCE(t.category_override, t.category_primary, ''), '_', ' ') AS category,
            t.amount, t.mcc, t.location_city AS city, t.date
       FROM transactions t
      WHERE t.removed = 0 AND t.amount > 0
-       AND COALESCE(t.merchant_outlet, t.merchant_name, t.name) IS NOT NULL
+       AND {merchant_sql.RAW_KEY} IS NOT NULL
 """
 
 
@@ -707,8 +708,8 @@ def _live_names(conn) -> list[dict]:
               AND EXISTS (SELECT 1 FROM transactions t
                            WHERE t.merchant_id = m.id AND t.removed = 0
                              AND t.amount > 0
-                             AND COALESCE(t.merchant_outlet, t.merchant_name,
-                                          t.name) IS NOT NULL)""").fetchall()
+                             AND """ + merchant_sql.RAW_KEY + """
+                                 IS NOT NULL)""").fetchall()
 
 
 def _neighbourhood(names: list[dict], ids: set[str]) -> list[str]:
@@ -742,16 +743,32 @@ def _neighbourhood(names: list[dict], ids: set[str]) -> list[str]:
     return sorted({r["id"] for r in names if find(r["id"]) in roots} | set(ids))
 
 
+# one city list per connection: the ingest pass asks for it on every
+# sync, and the GROUP BY behind it walks the whole ledger each time for an
+# answer that changes only when a new city lands on two rows — the next
+# connection (the next sync, the next request) reads it afresh
+_CITIES_MEMO: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
 def cities_known(conn) -> list[str]:
     """Places a location tail may name: the configured strip list plus every
     city the aggregator has put on a row (a fact, not a guess)."""
+    try:
+        return list(_CITIES_MEMO[conn])
+    except (KeyError, TypeError):
+        pass
     out = set(merchant_dedup.cities_for(conn))
     for r in conn.execute(
             "SELECT location_city AS c, count(*) AS n FROM transactions "
             "WHERE removed = 0 AND location_city IS NOT NULL "
             "GROUP BY 1 HAVING count(*) >= 2").fetchall():
         out.add(r["c"])
-    return sorted(out)
+    cities = sorted(out)
+    try:
+        _CITIES_MEMO[conn] = cities
+    except TypeError:              # a connection that cannot be weakly referenced
+        pass
+    return list(cities)
 
 
 def load_rehearsal(conn) -> list[dict]:
@@ -759,8 +776,7 @@ def load_rehearsal(conn) -> list[dict]:
     the string clean of their raw key. Each candidate keeps `labels` — the
     live merchant ids its rows carry today — as the truth to score against."""
     cities = list(merchant_dedup.cities_for(conn))
-    rows = conn.execute(_ROWS_SQL.format(
-        key="COALESCE(t.merchant_outlet, t.merchant_name, t.name)")).fetchall()
+    rows = conn.execute(_ROWS_SQL.format(key=merchant_sql.RAW_KEY)).fetchall()
     groups: dict[str, list] = defaultdict(list)
     names: dict[str, str] = {}
     for r in rows:
@@ -878,8 +894,69 @@ def run(conn, *, limit: int = 25, only_ids: list[str] | None = None) -> dict:
     return stats
 
 
+RECENT_SHOWN = 3
+
+
+def side_facts(conn, ids: list[str]) -> dict[str, dict]:
+    """What the ledger holds under each merchant today, so a person can
+    tell the two sides of an offer apart before joining them: how much,
+    over which dates, the usual charge, where, through which accounts, and
+    the latest bank lines. Read live — the evidence stored
+    with the offer is the ledger as it was the night the offer was made."""
+    if not ids:
+        return {}
+    facts: dict[str, dict] = {}
+    for r in conn.execute(
+            """SELECT t.merchant_id::text AS id, count(*) AS n,
+                      SUM(t.amount) AS total, MIN(t.date) AS first, MAX(t.date) AS last,
+                      PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY t.amount) AS typical,
+                      MODE() WITHIN GROUP (ORDER BY REPLACE(COALESCE(
+                          t.category_override, t.category_primary, ''), '_', ' ')) AS category,
+                      MODE() WITHIN GROUP (ORDER BY t.location_city) AS city,
+                      ARRAY_AGG(DISTINCT COALESCE(a.display_name, a.name))
+                          FILTER (WHERE COALESCE(a.display_name, a.name) IS NOT NULL)
+                          AS accounts
+                 FROM transactions t
+                 LEFT JOIN accounts a ON a.id = t.account_id
+                WHERE t.removed = 0 AND t.amount > 0
+                  AND t.merchant_id = ANY(%s::uuid[])
+                GROUP BY 1""", (list(ids),)).fetchall():
+        facts[r["id"]] = {
+            "rows": r["n"], "total": round(float(r["total"] or 0), 2),
+            "first": str(as_date(r["first"])) if r["first"] else None,
+            "last": str(as_date(r["last"])) if r["last"] else None,
+            "typical": round(float(r["typical"]), 2) if r["typical"] is not None else None,
+            "category": r["category"] or None, "city": r["city"] or None,
+            "accounts": list(r["accounts"] or []), "recent": []}
+    for r in conn.execute(
+            """SELECT * FROM (
+                 SELECT t.merchant_id::text AS id, t.date, t.amount,
+                        COALESCE(t.raw->>'original_description', t.name) AS line,
+                        COALESCE(a.display_name, a.name) AS account,
+                        ROW_NUMBER() OVER (PARTITION BY t.merchant_id
+                                           ORDER BY t.date DESC, t.id) AS k
+                   FROM transactions t
+                   LEFT JOIN accounts a ON a.id = t.account_id
+                  WHERE t.removed = 0 AND t.amount > 0
+                    AND t.merchant_id = ANY(%s::uuid[])) x
+               WHERE k <= %s ORDER BY id, k""", (list(ids), RECENT_SHOWN)).fetchall():
+        # The totals and the lines are two statements, so a charge ingested
+        # between them puts a merchant in this answer that the first read
+        # never saw. Its totals would be a year out of date anyway, so the
+        # side is left factless for this load rather than half-stated —
+        # and the page loads instead of raising.
+        side = facts.get(r["id"])
+        if side is None:
+            continue
+        side["recent"].append({
+            "date": str(as_date(r["date"])), "amount": round(float(r["amount"]), 2),
+            "line": (r["line"] or "")[:60], "account": r["account"]})
+    return facts
+
+
 def pending(conn) -> list[dict]:
-    """Pending proposals whose merchants are both still live, with names."""
+    """Pending proposals whose merchants are both still live, with names
+    and each side's facts."""
     out = []
     for r in conn.execute(
             """SELECT p.id, p.evidence, p.created_at,
@@ -894,6 +971,7 @@ def pending(conn) -> list[dict]:
         # a chain offer names the brand, which no member wears yet
         out.append({"id": r["id"], "from": r["from_name"],
                     "into": ev.get("rename_to") or r["into_name"],
+                    "into_name": r["into_name"],
                     "from_id": r["from_id"], "into_id": r["into_id"],
                     "from_logo": r["from_logo"], "into_logo": r["into_logo"],
                     "from_rows": (ev.get("from") or {}).get("rows"),
@@ -902,6 +980,10 @@ def pending(conn) -> list[dict]:
                     "into_samples": (ev.get("into") or {}).get("samples") or [],
                     "signals": ev.get("signals") or [],
                     "supports": ev.get("supports") or []})
+    facts = side_facts(conn, [i for o in out for i in (o["from_id"], o["into_id"])])
+    for o in out:
+        o["from_facts"] = facts.get(o["from_id"])
+        o["into_facts"] = facts.get(o["into_id"])
     return out
 
 
@@ -934,6 +1016,21 @@ def notice(conn) -> dict | None:
     return {"pending": r["pending"], "batch": n, "found": r["found"].isoformat()}
 
 
+def settle_alert(conn) -> bool:
+    """Retire the "merges" alert the moment the queue it names is empty —
+    after the decision that empties it. Without this the row stays active
+    until the next Today build rewrites the snapshot, and the person who
+    just worked the queue from the alert's own link comes back to find it
+    still lit. A merge made by hand on the Merchants page does not empty
+    the queue: its offer stays listed until the nightly prunes the emptied
+    merchant, and that same nightly rewrites the snapshot. Returns whether
+    anything was retired."""
+    if notice(conn) is not None:
+        return False
+    from . import alerts
+    return alerts.retire(conn, "merges") > 0
+
+
 def _others_named(conn, name: str | None, pair: tuple[str, str]) -> list[str]:
     """Live merchants wearing `name` that are not the pair being decided.
     Matched case-insensitively, because merchant_dedup.rename resolves an
@@ -963,6 +1060,8 @@ def decide(conn, pid: str, action: str) -> dict:
         if action == "reject":
             conn.execute("UPDATE merchant_merge_proposals SET status='rejected', "
                          "decided_at=now() WHERE id=%s", (pid,))
+            # rejecting the last offer empties the queue as surely as a merge
+            settle_alert(conn)
             return {"rejected": pid}
         if action != "approve":
             return {"error": f"unknown action {action!r}"}
@@ -1011,4 +1110,6 @@ def decide(conn, pid: str, action: str) -> dict:
                 "UPDATE merchant_merge_proposals SET into_merchant_id=%s "
                 "WHERE status='pending' AND into_merchant_id=%s",
                 (live["id"], p["into_merchant_id"]))
+        # now that the offer is decided the queue may be empty
+        settle_alert(conn)
         return {"approved": pid, "from": frm, "into": into, **moved}

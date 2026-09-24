@@ -154,6 +154,10 @@ DEMO_OPEN = {
         "Plaid calls this, not a browser; no user to guard, verified by sig",
     "POST /api/notify/push/unsubscribe":
         "de-escalation: drops a push endpoint, cannot add or read one",
+    "POST /act":
+        "a button from the daily email, no session; demo tenants send no "
+        "mail so no button exists for one, and notify.mailact.apply refuses "
+        "a demo tenant outright",
     "POST /api/doctor/scripts/{source}":
         "sets stale-warning hours/alerts only; opens no door and moves no "
         "data (the token doors themselves are POST /api/tokens, pinned)",

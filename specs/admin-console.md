@@ -62,6 +62,25 @@ points give it, and the product's own surface is the list above.
   (cancel → active) any time before purge. An explicit **delete now**
   (`mode=immediate`) purges at once, unrecoverably, for the abuse case;
   `OIKONOME_DELETE_GRACE_DAYS=0` makes every delete immediate.
+- **Signups nobody ever confirmed (hosted).** The nightly sweep
+  (`jobs/unverified.py`) reminds each unconfirmed person once on day 7
+  with a fresh link, and on day `OIKONOME_UNVERIFIED_REAP_DAYS` (30)
+  freezes the household under `status='unverified_expired'` with a
+  7-day `delete_after`, mailing the owner the date and a fresh link. The
+  freeze is the same shape as `pending_delete` — the same purge finishes
+  it, the same **restore** lifts it — with one door left open
+  (`/api/verify-email/resend`), because the way out is in the mailbox:
+  opening a link confirms the address, and the page it lands on carries
+  the button whose POST lifts the freeze, in a transaction that takes
+  the same tenants row lock the purge takes. A GET never lifts it —
+  mail scanners fetch every link they are sent, and a fetch that could
+  reopen a household would defeat the freeze — so the resend door mails
+  a fresh link to a frozen household even when its address is already
+  verified. "Never confirmed" reads `users.first_verified_at` as well as
+  `verified_at` (an email change clears only the latter), and a household
+  with money attached is never a candidate. Each step is an
+  `admin_audit` row (`tenant_delete_scheduled` with `reason=unverified`,
+  `tenant_delete_restored` with `reason=email_confirmed`).
 - **Portable data export.** `POST /tenant-export` streams a ZIP of the
   tenant's data as JSON (one file per tenant-scoped table + a manifest),
   read through the tenant's RLS connection so it can't cross tenants.

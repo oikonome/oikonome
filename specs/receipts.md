@@ -13,8 +13,9 @@ Decisions:
    filter → CSV/printable summary with receipt images linked — the
    Schedule-C flow. Budget math is UNCHANGED: the transaction's total
    still rules the verdict; line items explain, never re-bucket.
-   (Item-level bucket splitting rejected for now — rewires verdict
-   math.)
+   (Item-level bucket splitting rejected — rewires verdict math. What
+   shipped instead is a HAND split of the row, `specs/transaction-splits.md`:
+   the person writes the parts, and they must add up.)
 3. **Images live in Postgres** (bytea, 5 MB cap per receipt) — one
    backup story: pg_dump / oikonome.sh backup / the dump download all
    carry receipts automatically.

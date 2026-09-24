@@ -196,6 +196,10 @@ ARCHIVE_CONTROL_SKIP = {
     "sessions": "live login state — a token hash plus the IP and browser of "
                 "an in-flight session. Credential material with a lifetime "
                 "measured in days, not a record of the household.",
+    "widget_tokens": "a home-screen widget's polling credential — a token "
+                     "hash bound to one phone enrolment and to this instance. "
+                     "Credential material, not a record of the household; the "
+                     "device it belongs to is what the archive lists.",
 } | ext.gate.export_exclusions()
 
 _CREDENTIAL_COL = ("token", "hash", "secret", "endpoint", "p256dh",
@@ -219,6 +223,19 @@ def _control_rows(admin, table: str, tenant_id: str) -> list[dict]:
         sql.SQL("SELECT {} FROM {} WHERE tenant_id = %s").format(
             sql.SQL(", ").join(sql.Identifier(c) for c in cols),
             sql.Identifier(table)), (tenant_id,)).fetchall()
+
+
+# RLS tenant tables the portability archive leaves out, each with its
+# reason. Discovery would otherwise carry them like any other table.
+ARCHIVE_TABLE_SKIP = {
+    "webhooks": "outbound webhook destinations — a receiver URL is a "
+                "credential in its own right (whoever holds a Home "
+                "Assistant webhook id or a chat incoming-webhook URL can "
+                "trigger or post through it)",
+    "webhook_deliveries": "the webhook outbox — each payload is a copy of "
+                          "ledger rows already in the archive, addressed "
+                          "to a receiver the archive does not name",
+}
 
 
 def build_archive(tenant_id: str, *, operator: str,
@@ -258,7 +275,8 @@ def build_archive(tenant_id: str, *, operator: str,
         # hand-maintained list is exactly the thing that drifts.
         control = {t: _control_rows(admin, t, tenant_id)
                    for t in ARCHIVE_CONTROL_TABLES}
-        tables = rls_tenant_tables(admin)
+        tables = [t for t in rls_tenant_tables(admin)
+                  if t not in ARCHIVE_TABLE_SKIP]
     finally:
         admin.close()
     if tenant is None:

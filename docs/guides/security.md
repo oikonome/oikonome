@@ -194,11 +194,22 @@ list any time from **Settings** on a device that is already signed in.
 
 ## Script tokens
 
-Owner-only bearer credentials (prefix `oik_`) for host-side collector
-scripts — see the import history guide. Minted once and **shown once**;
-they can only push data through the import doors, never read or manage
-the account. Mint and revoke are step-up actions (above), and a password
-or email change revokes every token you minted.
+Owner-only bearer credentials (prefix `oik_`) for programs, not people.
+Minted once and **shown once**, and each one has exactly one of two
+scopes:
+
+- **push** (Settings → Connections → Script tokens): a host-side collector
+  script — see the import history guide. It can push data through the
+  import doors, never read or manage the account.
+- **read** (Settings → Integrations → Integration tokens): a Prometheus
+  scrape, a Home Assistant sensor, the local MCP server. It can read the
+  integrations endpoints — a bounded picture of the books — and nothing
+  else: no import, no settings, no credentials. See the integrations
+  guide.
+
+Mint and revoke are step-up actions (above), and a password or email
+change revokes every token you minted. Creating a webhook — a URL the
+instance posts your ledger's events to — steps up the same way.
 
 ## When sign-in asks for a security check
 
@@ -291,6 +302,42 @@ undo or that reach outside the instance.
 
 There is no way to make somebody else the owner. A household has exactly
 one, and transferring it is not something an invite or a dropdown does.
+
+## Activity — who changed what
+
+When two people keep one set of books, "who changed this?" needs an
+answer. **Settings → Users → Activity** on the web, and **More →
+Activity** in the mobile app, list the household's hand-made changes,
+newest first, each with the person and the time:
+
+> **you** changed the category of Corner Market $42.50 on 09/12/26 from
+> General Merchandise to Food and Drink
+>
+> **sam@example.com** edited the bill FiberLink Internet: amount $65.00 →
+> $70.00
+>
+> **you** added a note on Hillside Hardware $123.45 on 09/10/26: "warranty in
+> the folder"
+
+What lands there: category corrections (including a "teach the merchant"
+and a bulk file), splits, notes, bills — added, edited, paused, archived,
+restored, and the finder's offers you confirm or dismiss (from the app or
+from the buttons in the daily email) — rules, receipts attached or
+removed, reimbursement flags and matches, business flags, merchant
+renames and merges, account nicknames and budget exclusions, and a
+settings save (which names the settings that changed and never their
+values).
+
+What does not: anything the app does on its own — a sync, the nightly
+bill pass stamping its rows, the categorizer, the store matchers. The log
+answers "who did this", and for the app's own work the answer is always
+the app.
+
+Filter by person or by kind; **show older** pages back. A change made
+through a script token is listed as that script. Someone removed from the
+household keeps their name on the changes they made — that is the point
+of a log. The log travels in your data export and restores with it, and
+keeps two years.
 
 ## Delete account
 

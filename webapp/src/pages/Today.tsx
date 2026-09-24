@@ -586,7 +586,8 @@ export default function Today({ date = null }: { date?: string | null }) {
                 <summary>by category ▸</summary>
                 {d.why.entries.map((e) => (
                   <div key={e.name} style={{ margin: ".15rem 0" }}>
-                    <b>{e.name}</b>{" "}
+                    {/* the line's bucket is a tile's bucket: same door */}
+                    <Link className="catlink" to={tileTo(e.name)}><b>{e.name}</b></Link>{" "}
                     <span className={e.tone === "over" ? "neg"
                       : e.tone === "under" ? "pos" : "sub"}>{e.text}</span>
                   </div>

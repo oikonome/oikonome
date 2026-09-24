@@ -52,6 +52,9 @@ SESSION_DEPS = ("Depends(current_user)", "Depends(_user())")
 MEMBER_OK = {
     # --- the household's money: the whole point of the role -------------
     "POST /api/transactions/{txn_id}/category",
+    # a hand split of one charge is bookkeeping like a category pick
+    "PUT /api/transactions/{txn_id}/split",
+    "DELETE /api/transactions/{txn_id}/split",
     "POST /api/transactions/{txn_id}/note",
     "POST /api/transactions/{txn_id}/owner",
     "POST /api/transactions/{txn_id}/entity",
@@ -89,6 +92,9 @@ MEMBER_OK = {
     "POST /api/receipts/{rid}/items/{line}/tag",
     "DELETE /api/receipts/{rid}",
     "POST /api/budget/snapshots/backfill",
+    # the debt payoff plan (method, extra payment, rate overrides) is a
+    # budget the household keeps, not the account
+    "POST /api/debt-plan",
     "POST /api/settings",
     "POST /settings",
     "POST /api/assistant",
@@ -180,6 +186,7 @@ MEMBER_OK = {
     "POST /api/stepup/passkey/options",
     "POST /api/auth/elevate",
     "POST /api/devices/push",
+    "POST /api/devices/widget",
     "POST /api/devices/revoke",
     "POST /api/notify/push/subscribe",
     "POST /api/notify/push/unsubscribe",

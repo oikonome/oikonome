@@ -201,6 +201,60 @@ class RestoreV2Tests(unittest.TestCase):
             "SELECT partial, expected FROM reimburse_flags").fetchone()
         self.assertEqual((flag["partial"], flag["expected"]), (1, 50.0))
 
+    def _override(self, conn, tid):
+        return conn.execute(
+            "SELECT category_override FROM transactions WHERE id=%s",
+            (tid,)).fetchone()["category_override"]
+
+    def test_hand_set_transfer_survives_unlink_after_a_restore(self):
+        """A transfer the person set by hand before linking stays after the
+        link is undone — on the restored copy too. Unlink tells a hand pin
+        from a link-made one by comparing when each was made, so restore
+        must carry both times rather than stamp them alike."""
+        from oikonome.sync import export
+        from oikonome.web import data
+
+        from .util import TODAY, add_txn
+        exp = add_txn(self.conn, TODAY, 200.0, "OFFICE SUPPLY CO")
+        dep = add_txn(self.conn, TODAY, -200.0, "EMPLOYER REIMB",
+                      account="chk", primary="INCOME")
+        data.set_category(self.conn, dep, "TRANSFER_IN")
+        data.link_reimbursement(self.conn, exp, dep)
+        dest = make_db()
+        try:
+            restore.restore_zip(dest, export.build_zip(self.conn))
+            self.assertEqual(self._override(dest, dep), "TRANSFER_IN")
+            data.unlink_reimbursement(dest, exp, dep)
+            self.assertEqual(self._override(dest, dep), "TRANSFER_IN")
+            self.assertIsNone(self._override(dest, exp))
+        finally:
+            dest.close()
+
+    def test_undated_archive_never_makes_a_hand_pin_look_link_made(self):
+        """An archive whose pins and links carry no times: the links are
+        dated after the pins, so an unlink keeps the pin."""
+        from oikonome.web import data
+        z = _zip({
+            "transactions": (["id", "account_id", "date", "amount", "name",
+                              "category_primary", "category_override"], [
+                {"id": "e1", "account_id": "card", "date": "2026-07-01",
+                 "amount": 200, "name": "HOTEL",
+                 "category_primary": "TRAVEL",
+                 "category_override": "TRANSFER_OUT"},
+                {"id": "r1", "account_id": "chk", "date": "2026-07-05",
+                 "amount": -200, "name": "EMPLOYER",
+                 "category_primary": "INCOME",
+                 "category_override": "TRANSFER_IN"}]),
+            "manual_categories": (["transaction_id", "category"], [
+                {"transaction_id": "r1", "category": "TRANSFER_IN"}]),
+            "reimbursements": (["expense_id", "reimburse_id", "partial",
+                                "amount"], [
+                {"expense_id": "e1", "reimburse_id": "r1", "partial": 0}]),
+        })
+        restore.restore_zip(self.conn, z)
+        data.unlink_reimbursement(self.conn, "e1", "r1")
+        self.assertEqual(self._override(self.conn, "r1"), "TRANSFER_IN")
+
     def test_disabled_merchant_rule_stays_disabled(self):
         z = _zip({
             "merchant_categories": (

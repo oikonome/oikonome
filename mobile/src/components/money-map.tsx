@@ -60,9 +60,10 @@ export function planRows(
           fixedPending?: number;
           savings?: { plan: number; saved: number | null } | null;
           excess?: number | null;
-          // the month the rows cover; the ledger link opens that month
+          // the period the rows cover; the ledger link opens that month —
+          // or, with no month, that YEAR's bucket (the year lens's map)
           // (asOf: the day the figures were read on, when not today)
-          period?: { y: number; m: number; asOf?: string } | null } = {},
+          period?: { y: number; m?: number; asOf?: string } | null } = {},
 ): PlanRow[] {
   const rows: PlanRow[] = [];
   // A plan row's rows are the rows the MONTH VERDICT counts in that
@@ -71,12 +72,14 @@ export function planRows(
   // rather than a stored category, and "Everything else" is everything
   // the other rows did not claim. So the link names the bucket and the
   // server answers with exactly the rows behind the number. A bucket is
-  // only defined for a month, so a map with no period (the yearly and
-  // budget maps) has no link at all rather than a link to the wrong set.
+  // a month's, or — a year with no month — the union over the budgeted
+  // months the yearly map summed; a map with no period at all (the budget
+  // screen's plan) has no link rather than a link to the wrong set.
   const ledger = (bucket: string) =>
     opts.period
-      ? `bucket=${encodeURIComponent(bucket)}&y=${opts.period.y}&m=${
-          opts.period.m}${opts.period.asOf ? `&as_of=${opts.period.asOf}` : ""}`
+      ? `bucket=${encodeURIComponent(bucket)}&y=${opts.period.y}${
+          opts.period.m ? `&m=${opts.period.m}` : ""}${
+          opts.period.asOf ? `&as_of=${opts.period.asOf}` : ""}`
       : undefined;
   const food = buckets.food;
   const other = buckets.other;

@@ -16,8 +16,8 @@ superuser — the postgres superuser credential exists only in the one-shot
 migration container.
 
 Hardening notes for deployers: `OIKONOME_MASTER_KEY` is required by the
-compose stack (aggregator tokens, TOTP seeds and the instance's web-push
-signing key encrypt at rest under it — the installer generates it; keep a
+compose stack (aggregator tokens, webhook signing secrets, TOTP seeds and
+the instance's web-push signing key encrypt at rest under it — the installer generates it; keep a
 copy, restores need the same key; backup + rotation procedure:
 [docs/master-key.md](docs/master-key.md)), run behind TLS, keep the compose
 Postgres unexposed, enable TOTP on your account.
@@ -26,10 +26,37 @@ Two doors are worth knowing about because they read the whole household at
 once. The **full export** and the **database dump** are not plain links: each
 download needs a one-shot ticket minted by a fresh step-up (password, or a
 live code where a second factor is enrolled) and expires within a minute, so
-a stolen signed-in tab cannot quietly stream them. The **operator console**
+a stolen signed-in tab cannot quietly stream them. The **continuity
+packet** (a PDF of every account, debt, bill and business) takes the same
+fresh step-up, to download or to email. The **operator console**
 (`/admin/console`) is off unless you enable it, and the way back in after
 losing its passkey is a command inside the container — see
 [docs/troubleshooting.md](docs/troubleshooting.md).
+
+Some credentials are made for programs rather than people, and each opens
+as little as its job needs. A **push** script token (`oik_`) can only
+import rows. A **read** script token — the integration token behind
+`/metrics`, the Home Assistant sensors and the local MCP server — can only
+`GET` `/api/integrations/*` and `/metrics`, rate-limited per address; it
+cannot import, change a setting or see a credential. A phone's
+**widget token** (`oikw_`) opens exactly one door, today's verdict and
+allowance, and dies with the device sign-in it hangs off. The three tokens
+are stored only as a hash (the script tokens are shown once, when minted).
+A password change ends every one that person made, and removing a member
+or owner from the household — or their leaving it — ends the script tokens
+they made. A **webhook signing secret** (`oikwh_`) is the other direction: it is
+shown once, stored encrypted under the household's key, left out of the
+data export, and signs every delivery (HMAC-SHA256 over timestamp and
+body) so the receiver can refuse a forgery or a replay. Minting a script
+token and adding a webhook are step-up actions. The one-tap buttons in the daily
+email are signed links for one action on one object, addressed to the
+recipient, and expire after seven days. Pressing one is a write like any
+other: the address must still hold an owner or member account in good
+standing — a suspended, deleting or read-only household, or a hosted
+account with no second factor, gets a refusal — and a button whose object
+has changed since the mail went out does nothing. They (and the
+unsubscribe link) are keyed from `OIKONOME_MASTER_KEY`, so rotating the
+key voids the ones already sent.
 
 A mailed password reset strips every second factor, so on an account with
 one enrolled it demands a recovery code as well — inbox control alone must

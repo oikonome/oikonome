@@ -38,7 +38,7 @@ class _PauseInsideTheLink:
 
     def execute(self, sql, *a, **kw):
         cur = self._conn.execute(sql, *a, **kw)
-        if "SELECT id, amount FROM transactions" in sql:
+        if "COALESCE(t.entity_id, a.entity_id)::text AS entity" in sql:   # the link's first read of both rows
             with contextlib.suppress(threading.BrokenBarrierError):
                 self._barrier.wait(timeout=_WAIT)
         return cur

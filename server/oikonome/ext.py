@@ -226,23 +226,12 @@ class Gate:
         runs. Returns an audit word."""
         return "n/a"
 
-    def on_tenant_restored(self, tenant_id) -> None:
-        return None
-
-    def claim_intake_request(self, admin, request_id) -> str | None:
-        """Approving an access request: return its address and mark it
-        claimed, inside the caller's transaction; None if there is no such
-        pending request (or no intake form)."""
-        return None
-
-    def on_invite_minted(self, admin, email: str) -> None:
+    def on_tenant_restored(self, tenant_id) -> str | None:
+        """The deletion was called off: lift whatever the schedule paused.
+        Returns an audit word, or None when there is nothing to report."""
         return None
 
     # ---- intake capacity ---------------------------------------------------
-    def intake_path(self) -> str | None:
-        """Where a person without an account asks for one (an intake form), or None when there is no such door."""
-        return None
-
     def intake_cap(self) -> int | None:
         return None
 

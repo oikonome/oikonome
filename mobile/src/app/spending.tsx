@@ -14,7 +14,7 @@ import Sparkline from "../components/sparkline";
 import StaleBanner from "../components/stale-banner";
 import { Card, H, KV } from "../components/ui";
 import type { FlowKey } from "../lib/api";
-import { CASHFLOW_RANGES, catLabel, RANGE_LABEL } from "../lib/pure";
+import { TREND_RANGES, catLabel, RANGE_LABEL } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { C, money } from "../lib/theme";
 
@@ -51,7 +51,7 @@ function RangeChips({ value, onChange }: {
 }) {
   return (
     <View style={{ flexDirection: "row", gap: 4, flexWrap: "wrap" }}>
-      {CASHFLOW_RANGES.map((r) => (
+      {TREND_RANGES.map((r) => (
         <Pressable key={r} style={[s.chip, value === r && s.chipOn]}
                    onPress={() => onChange(r)}>
           <Text style={{ color: value === r ? C.text : C.mut, fontSize: 11 }}>

@@ -9,8 +9,12 @@ flags, business flags, tenant settings, and — converter v2 (migration
 008) — liabilities, holdings, crypto_holdings, networth_recorded,
 networth_snapshot, income_annual, income_documents, merchant_canonical,
 merchant_renames, merchant_categories, amazon_orders/matches/summaries,
-costco_receipts/matches.
-Skipped: alerts history, proposals, batches (operational residue).
+costco_receipts/matches. Also the offers the household has already
+answered — bill_proposals and merchant_merge_proposals — and the
+import batches its file imports are tagged with, which is what keeps
+those imports reversible on the destination.
+Skipped: alerts history, sync logs, job heartbeats, staged uploads
+(operational residue).
 Every insert is ON CONFLICT DO NOTHING on the original ids — re-restoring
 the same ZIP is a no-op. Counts report actual INSERTS: rows
 the tenant already had are tallied under `already_present`, so a restore
@@ -26,6 +30,7 @@ import io
 import json
 import logging
 import math
+import uuid
 import zipfile
 
 from ..engine.compat import as_date, jsonb
@@ -161,9 +166,15 @@ _SECRET_SUBSTR = ("secret", "token", "password", "client_id",
 # instance (a code sent to the number and typed back) or not at all; a ZIP
 # that carried them would plant any number as verified. Both the record
 # and its pending half stay behind; the owner re-verifies after a move.
+# plaid_enrich_used is this instance's own running count of the Enrich rows
+# Plaid billed this month — the one thing holding a household to its cap.
+# It describes what the instance spent, not what the household owns, so the
+# destination's count always wins: an old export would otherwise hand back a
+# spent month, and a hand-edited negative count would lift the cap entirely,
+# billed to whoever owns the Plaid keys (the operator, on hosted).
 _POLICY_KEYS = ("demo_mode", "demo_login", "smtp_starttls",
                 "taxdocs_allow_remote_llm", "notify_phone",
-                "notify_phone_pending")
+                "notify_phone_pending", "plaid_enrich_used")
 
 
 def _secret_key(k) -> bool:
@@ -245,14 +256,24 @@ def carry_forward_secrets(dest, incoming):
 
 # Every ZIP member the restore reads back. The export writes MORE than
 # this — every RLS-scoped table minus a skip set — and the difference is
-# deliberate: alerts, sync logs, job heartbeats, staged uploads, proposals
-# and the like are this instance's operating state, not the household's
-# data, and restoring them would replay stale alerts and half-finished
-# jobs into the destination. The export's README names which files come
+# deliberate: alerts, sync logs, job heartbeats and staged uploads are
+# this instance's operating state, not the household's data, and restoring
+# them would replay stale alerts and half-finished jobs into the
+# destination. The export's README names which files come
 # back and which are kept for the person's records only, from this set.
 # `bills` is read under a variable (older archives call it recurring.csv),
 # so a source test that only scans literal `_rows(z, "…")` calls misses it.
-RESTORED_MEMBERS: frozenset[str] = frozenset(['account_links', 'accounts', 'amazon_matches', 'amazon_orders', 'amazon_summaries', 'bills', 'budget_snapshots', 'business_entity', 'business_flags', 'business_txn_class', 'compliance_obligation', 'costco_matches', 'costco_receipts', 'crypto_holdings', 'entity_membership', 'equity_movement', 'holdings', 'income_annual', 'income_documents', 'items', 'liabilities', 'manual_categories', 'merchant_canonical', 'merchant_categories', 'merchant_merge_proposals', 'merchant_renames', 'merchants', 'mileage_log', 'networth_recorded', 'networth_snapshot', 'receipt_items', 'receipts', 'recipient_invites', 'recurring', 'reimburse_flags', 'reimbursements', 'tenant_settings', 'transaction_notes', 'transactions', 'vendor_1099'])
+RESTORED_MEMBERS: frozenset[str] = frozenset(['account_links', 'accounts', 'amazon_matches', 'amazon_orders', 'amazon_summaries', 'bill_proposals', 'bills', 'budget_snapshots', 'business_entity', 'business_flags', 'business_txn_class', 'compliance_obligation', 'costco_matches', 'costco_receipts', 'crypto_holdings', 'entity_membership', 'equity_movement', 'holdings', 'import_batches', 'income_annual', 'income_documents', 'items', 'liabilities', 'manual_categories', 'merchant_canonical', 'merchant_categories', 'merchant_merge_proposals', 'merchant_renames', 'merchants', 'mileage_log', 'networth_recorded', 'networth_snapshot', 'receipt_items', 'receipts', 'recipient_invites', 'recurring', 'reimburse_flags', 'reimbursements', 'tenant_settings', 'transaction_notes', 'transaction_splits', 'transactions', 'vendor_1099', 'activity_log'])
+
+
+# A restored activity-log row is held to the size of one the app writes. The
+# feed returns every row's target and detail on each read, and a CSV cell may
+# be megabytes (_MAX_CELL is sized for a receipt photo), so one crafted row
+# would be paid for on every read of the feed from then on. A real target is
+# an id; a real detail is a before/after pair of short values. The row is
+# the household's record and still lands — clipped, never refused.
+ACTIVITY_TARGET_MAX = 200
+ACTIVITY_DETAIL_MAX = 16 * 1024          # bytes of JSON
 
 
 # A crafted archive must not be able to fill a control-plane table. A live
@@ -365,6 +386,27 @@ def _json_list(v) -> list:
     as none. `x or []` is NOT this check: it substitutes on a falsy value
     and waves an object or a number straight through."""
     return v if isinstance(v, list) else []
+
+
+def clean_excluded_accounts(cfg: dict) -> None:
+    """Coerce the Accounts page's "excl" list in a restored config into the
+    shape the toggle itself would have written, dropping what cannot be an
+    account id and removing the key when nothing is left.
+
+    Same class as `clean_bill_raw` on the field beside it: the settings blob
+    goes in verbatim, and every money surface iterates this list. A `true`
+    or a number under the key is TRUTHY, so the `value or []` idiom hands it
+    straight to `list()` and the forecast, the calendar strip and every
+    report raise instead of rendering — with no UI for the household to
+    take the value back out."""
+    if "excluded_accounts" not in cfg:
+        return
+    from ..engine.budget import excluded_account_ids
+    ids = excluded_account_ids(cfg)
+    if ids:
+        cfg["excluded_accounts"] = ids
+    else:
+        cfg.pop("excluded_accounts", None)
 
 
 def clean_bill_raw(v) -> dict:
@@ -702,6 +744,55 @@ def _unescape(v):
     return v
 
 
+# The longest a feed's own words about a payee can honestly be. A bank
+# descriptor is a fixed-width statement field, an aggregator's merchant name
+# is shorter still, and an outlet brand shorter again — the biggest real ones
+# run to a couple of hundred characters. A CSV CELL, though, may be megabytes
+# (_MAX_CELL is sized for a receipt photo), and these are the strings the
+# identity pass at the end of a restore reads word by word, the ones the
+# generated search column concatenates, and the ones every payee list shows,
+# so one crafted cell is paid for on every read of that ledger from then on.
+#
+# It is also the difference between a restore and no restore. Several of
+# these strings are btree keys — the alias map's own key, a merchant's
+# lower(name), a check number — and Postgres refuses an index entry past
+# about 2,700 bytes, so ONE absurd cell aborts the whole all-or-nothing
+# restore rather than landing oddly. The cap is in characters and a character
+# may be four bytes, so it is set well inside that limit.
+#
+# Clamped rather than refused: a transaction is the household's record of
+# money moving, and dropping the row (or the archive) over a long descriptor
+# is the worse trade. Nothing honest is ever touched.
+MAX_DESCRIPTOR = 600
+
+
+def _descriptor(v):
+    """A restored free-text descriptor: un-escaped, and never longer than a
+    real one."""
+    v = _unescape(v)
+    return v[:MAX_DESCRIPTOR] if isinstance(v, str) else v
+
+
+def _merchant_name_cells(r) -> tuple:
+    """`(merchant_name, merchant_name_set_aside)` for a restored row.
+
+    When the resolver files a charge under the merchant its bank line means,
+    the aggregator's name for that one charge MOVES to
+    `merchant_name_set_aside` and the row keys on the line from then on, like
+    a row the aggregator never named. An archive written by the build that
+    instead left the name in place and marked it with a boolean carries the
+    stray name in `merchant_name` and `merchant_name_overruled` = true; the
+    name is moved here on the way in, so the row means on the destination
+    exactly what it meant on the source. An archive older than either
+    spelling says nothing about any of this and restores unchanged.
+    """
+    name = _descriptor(r.get("merchant_name")) or None
+    aside = _descriptor(r.get("merchant_name_set_aside")) or None
+    if aside is None and _b(r.get("merchant_name_overruled")):
+        name, aside = None, name
+    return name, aside
+
+
 def restore_zip(conn, data: bytes, *, progress=None) -> dict:
     """Merge an export ZIP into this tenant. `progress`, when given, is
     called as (table, rows, done) while the members stream past — the
@@ -954,7 +1045,9 @@ def _restore_zip(conn, data) -> dict:
                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, COALESCE(%s, now()))
                    ON CONFLICT DO NOTHING""",
                 (r["id"], r.get("plaid_entity_id") or None,
-                 _unescape(r.get("name")), r.get("name_source") or "layer1",
+                 # the same clamp the ledger's descriptors get: this name is
+                 # matched word by word against them
+                 _descriptor(r.get("name")), r.get("name_source") or "layer1",
                  r.get("kind") or "merchant", r.get("logo_url") or None,
                  r.get("website") or None, r.get("phone") or None,
                  r.get("mcc") or None, r.get("parent_id") or None,
@@ -1045,11 +1138,12 @@ def _restore_zip(conn, data) -> dict:
         # DO NOTHING travels in chunks instead. Memory is unchanged: _rows
         # still streams, and only CHUNK rows are held at a time.
         def _txn_params(r):
+            m_name, m_aside = _merchant_name_cells(r)
             return (r["id"], r.get("account_id") or None, as_date(r["date"]),
                     as_date(r.get("authorized_date") or None),
                     _f(r.get("amount")),      # 0 is a real amount
-                    _unescape(r.get("name")),
-                    _unescape(r.get("merchant_name")) or None,
+                    _descriptor(r.get("name")),
+                    m_name,
                     r.get("category_primary") or None,
                     r.get("category_detailed") or None,
                     # The aggregator's OWN verdict and its confidence. These
@@ -1063,7 +1157,7 @@ def _restore_zip(conn, data) -> dict:
                     # row and, the restore being one transaction, abort all
                     # of it
                     r.get("category_plaid_confidence") or None,
-                    _unescape(r.get("category_override")) or None,
+                    _descriptor(r.get("category_override")) or None,
                     int(r.get("pending") or 0),
                     r.get("pending_transaction_id") or None,
                     r.get("payment_channel") or None,
@@ -1075,7 +1169,13 @@ def _restore_zip(conn, data) -> dict:
                     # the merchant rename screen). Both ride the SELECT *
                     # export.
                     r.get("owner_override") or None,
-                    _unescape(r.get("merchant_outlet")) or None,
+                    _descriptor(r.get("merchant_outlet")) or None,
+                    # the aggregator's name for this one charge, which the
+                    # resolver set aside in favour of the merchant the bank
+                    # line means. NULL when the archive never had one —
+                    # dropping it would re-key the row on a name the ledger
+                    # had already judged a misreading.
+                    m_aside,
                     # the merchant ROW (097) — but only when the archive
                     # actually carried it. A pointer at a merchant that is
                     # not here is worse than no pointer: identity reads
@@ -1084,11 +1184,11 @@ def _restore_zip(conn, data) -> dict:
                     jsonb(_raw_dict(_j(r.get("raw")))),
                     # migration 098: the aggregator's facts as columns
                     r.get("category_source") or None,
-                    r.get("check_number") or None,
+                    _descriptor(r.get("check_number")) or None,
                     r.get("payment_processor") or None,
-                    _unescape(r.get("location_city")) or None,
+                    _descriptor(r.get("location_city")) or None,
                     r.get("location_region") or None,
-                    _unescape(r.get("location_address")) or None,
+                    _descriptor(r.get("location_address")) or None,
                     r.get("location_postal") or None,
                     _f(r.get("location_lat")) if r.get("location_lat") not in (None, "") else None,
                     _f(r.get("location_lon")) if r.get("location_lon") not in (None, "") else None,
@@ -1108,13 +1208,14 @@ def _restore_zip(conn, data) -> dict:
                           category_plaid_detailed, category_plaid_confidence,
                           category_override, pending, pending_transaction_id,
                           payment_channel, removed, entity_id, owner_override,
-                          merchant_outlet, merchant_id, raw,
+                          merchant_outlet, merchant_name_set_aside,
+                          merchant_id, raw,
                           category_source, check_number, payment_processor,
                           location_city, location_region, location_address,
                           location_postal, location_lat, location_lon,
                           location_store, mcc, override_source, retired_at)
                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                              %s,%s,%s,%s,%s,%s,%s,
+                              %s,%s,%s,%s,%s,%s,%s,%s,
                               %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                       ON CONFLICT (tenant_id, id) DO NOTHING"""
         CHUNK = 1000
@@ -1152,7 +1253,7 @@ def _restore_zip(conn, data) -> dict:
                        active, synced_at, raw)
                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s)
                    ON CONFLICT (tenant_id, id) DO NOTHING""",
-                (r["id"], r.get("type"), _unescape(r.get("payee")),
+                (r["id"], r.get("type"), _descriptor(r.get("payee")),
                  _f(r.get("amount")),          # same as above
                  r.get("frequency") or None,
                  _f(r.get("monthly_amount")),
@@ -1163,17 +1264,101 @@ def _restore_zip(conn, data) -> dict:
             counts["bills"] = counts.get("bills", 0) + cur.rowcount
             skipped += 1 - cur.rowcount
 
+        # The detected-bill offers and, above all, the ANSWERS to them —
+        # the same reasoning as the merchant merge offers below. A rejection
+        # is the household saying "that run of charges is not a bill I want
+        # tracked", and the detector's id is derived from the evidence
+        # (payee group, cycle, rounded amount), so the rejected row is the
+        # only thing keeping the offer from coming back: the nightly pass
+        # inserts ON CONFLICT DO NOTHING, so it re-derives the same id and
+        # writes nothing. Left out of a restore, every candidate the person
+        # has already turned down is offered again the first night on the
+        # destination, and an approved one is offered again beside the bill
+        # it already became.
+        #
+        # Undecided rows travel too, and cost nothing: the nightly recomputes
+        # them under the same ids. (The exception is an offer derived from an
+        # aggregator's own recurring stream, whose id IS the stream id —
+        # a re-linked connection numbers its streams afresh, so that one can
+        # be re-offered whatever this does.) A proposal names its bill by
+        # PAYEE STRING rather than by id, and the bills above carry their
+        # payees, so nothing has to be re-pointed; where the bill is missing
+        # entirely, approving already answers "that bill no longer exists"
+        # and leaves the offer standing.
+        for r in _rows(z, "bill_proposals.csv"):
+            if not r.get("id") or not r.get("payee"):
+                continue
+            cur = conn.execute(
+                """INSERT INTO bill_proposals (id, kind, bill_type, payee,
+                       amount, frequency, interval, next_due, evidence,
+                       llm_tag, status, created_at, decided_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                           COALESCE(%s, now()),%s)
+                   ON CONFLICT (tenant_id, id) DO NOTHING""",
+                (r["id"], r.get("kind") or None,
+                 r.get("bill_type") or "occurrence",
+                 _descriptor(r.get("payee")), _f(r.get("amount")),
+                 r.get("frequency") or None, _i(r.get("interval"), 1),
+                 as_date(r["next_due"]) if r.get("next_due") else None,
+                 # read with `.get` wherever it is used, so a cell carrying
+                 # a list or a number becomes no evidence rather than a
+                 # crash on the Bills screen
+                 jsonb(_raw_dict(_j(r.get("evidence")))),
+                 r.get("llm_tag") or None,
+                 # a hand-edited status the app never writes would sit in the
+                 # table invisible to every query that reads it; anything
+                 # unrecognised is simply an offer nobody has answered yet
+                 (r.get("status") if r.get("status") in
+                  ("pending", "approved", "rejected", "auto", "superseded")
+                  else "pending"),
+                 _ts(r.get("created_at")), _ts(r.get("decided_at"))))
+            counts["bill_proposals"] = (counts.get("bill_proposals", 0)
+                                        + cur.rowcount)
+            skipped += 1 - cur.rowcount
+
+        # The import batches the restored ledger rows are tagged with. Batch
+        # ownership rides in each transaction's `raw._batches`, which the
+        # rows above carry, so without this table the tags point at batches
+        # that are not here: Recent imports lists nothing, and the one-click
+        # undo for a file the person imported — the only way back out of a
+        # bad import, since those rows come from no feed — is gone for good,
+        # while the rows themselves keep counting in every total. Restoring
+        # the record makes the door work on the destination exactly as it did
+        # on the source; `account_id` is the account the file was imported
+        # into, for display, and is not a pointer anything follows.
+        for r in _rows(z, "import_batches.csv"):
+            if not r.get("id") or not r.get("source"):
+                continue
+            cur = conn.execute(
+                """INSERT INTO import_batches (id, source, account_id,
+                       filename, row_count, created_at)
+                   VALUES (%s,%s,%s,%s,%s, COALESCE(%s, now()))
+                   ON CONFLICT (tenant_id, id) DO NOTHING""",
+                (r["id"], r["source"], r.get("account_id") or None,
+                 _descriptor(r.get("filename")) or None,
+                 _i(r.get("row_count"), 0) or 0, _ts(r.get("created_at"))))
+            counts["import_batches"] = (counts.get("import_batches", 0)
+                                        + cur.rowcount)
+            skipped += 1 - cur.rowcount
+
         for r in _rows(z, "manual_categories.csv"):
             if _txn_exists(conn, r.get("transaction_id")):
                 # bill_id (a bill's transaction category, not a person's
                 # correction) travels too, else a restore turns every
-                # bill-stamped row into a hand edit the bill can't revert
+                # bill-stamped row into a hand edit the bill can't revert.
+                # So does set_at: unlinking a reimbursement tells a pin the
+                # link wrote from one a person set before it by comparing
+                # set_at with the link's created_at, and a restore that
+                # stamped both now() would make every hand-set transfer
+                # look link-made and let an unlink clear it.
                 cur = conn.execute(
                     """INSERT INTO manual_categories (transaction_id, category,
-                                                      bill_id)
-                       VALUES (%s,%s,%s) ON CONFLICT (tenant_id, transaction_id)
+                                                      bill_id, set_at)
+                       VALUES (%s,%s,%s, COALESCE(%s, now()))
+                       ON CONFLICT (tenant_id, transaction_id)
                        DO NOTHING""", (r["transaction_id"], r["category"],
-                                       r.get("bill_id") or None))
+                                       r.get("bill_id") or None,
+                                       _ts(r.get("set_at"))))
                 counts["overrides"] = counts.get("overrides", 0) + cur.rowcount
                 skipped += 1 - cur.rowcount
         # an archive written before overrides carried their kind: classify
@@ -1185,14 +1370,21 @@ def _restore_zip(conn, data) -> dict:
         for r in _rows(z, "reimbursements.csv"):
             if (_txn_exists(conn, r.get("expense_id"))
                     and _txn_exists(conn, r.get("reimburse_id"))):
+                # created_at is the other half of the pin comparison above.
+                # An archive without it gets clock_timestamp(), which is
+                # later than the now() any undated pin was given: the tie
+                # breaks toward a pin looking hand-set, so an unlink may
+                # leave a link-made transfer behind but never clears one a
+                # person chose.
                 cur = conn.execute(
                     """INSERT INTO reimbursements (expense_id, reimburse_id,
-                           partial, amount)
-                       VALUES (%s,%s,%s,%s)
+                           partial, amount, created_at)
+                       VALUES (%s,%s,%s,%s, COALESCE(%s, clock_timestamp()))
                        ON CONFLICT (tenant_id, expense_id, reimburse_id)
                        DO NOTHING""",
                     (r["expense_id"], r["reimburse_id"],
-                     _i(r.get("partial"), 0) or 0, _f(r.get("amount"))))
+                     _i(r.get("partial"), 0) or 0, _f(r.get("amount")),
+                     _ts(r.get("created_at"))))
                 counts["reimbursements"] = counts.get("reimbursements", 0) + cur.rowcount
                 skipped += 1 - cur.rowcount
 
@@ -1429,6 +1621,97 @@ def _restore_zip(conn, data) -> dict:
             counts["transaction_notes"] = counts.get("transaction_notes", 0) + cur.rowcount
             skipped += 1 - cur.rowcount
 
+        # A hand split is one statement about one charge — these parts,
+        # adding up to it — so it restores per transaction, whole or not at
+        # all. Merging an archive's lines into a split the row already has
+        # produced parts from both versions summing past the charge, and the
+        # sync's stale-split pass then deleted every part, the person's
+        # current split included. So: a row that already has a split keeps
+        # it; otherwise the archive's parts must pass the same validation a
+        # person's edit does against the restored amount, or none are
+        # written. A part whose row is absent (a pre-FK archive) is skipped
+        # like any other annotation.
+        from ..engine import splits as _splits
+        groups: dict[str, list] = {}
+        for r in _rows(z, "transaction_splits.csv"):
+            if (not _txn_exists(conn, r.get("txn_id"))
+                    or not r.get("category") or _f(r.get("amount")) is None):
+                skipped += 1
+                continue
+            groups.setdefault(r["txn_id"], []).append(
+                (_i(r.get("line"), 0) or 0, r["category"], _f(r["amount"])))
+        for txn_id, parts in groups.items():
+            parts.sort(key=lambda p: p[0])
+            have = conn.execute(
+                "SELECT 1 FROM transaction_splits WHERE txn_id = %s LIMIT 1",
+                (txn_id,)).fetchone()
+            row = conn.execute(
+                "SELECT amount FROM transactions WHERE id = %s",
+                (txn_id,)).fetchone()
+            # the door's own rule: a split on a row the spend rollups do not
+            # read is counted by nothing and dropped by the next sync's
+            # stale sweep, so it is skipped rather than reported restored
+            if have or not row or not _splits.splittable(conn, txn_id):
+                skipped += len(parts)
+                continue
+            try:
+                clean = _splits.validate(
+                    row["amount"], [{"category": c, "amount": a}
+                                    for _, c, a in parts])
+            except _splits.SplitError:
+                skipped += len(parts)
+                continue
+            for line, p in enumerate(clean, 1):
+                conn.execute(
+                    """INSERT INTO transaction_splits (txn_id, line, category,
+                                                      amount)
+                       VALUES (%s,%s,%s,%s)""",
+                    (txn_id, line, p["category"], p["amount"]))
+            counts["transaction_splits"] = (counts.get("transaction_splits", 0)
+                                            + len(clean))
+
+        # the activity log travels whole: it is the household's own record
+        # of who changed what, and nothing can regenerate it. The actor's
+        # user id is dropped (people are numbered per instance) and the
+        # actor TEXT kept, which is what the page shows anyway; a row
+        # already here (same UUID) is left alone, so restoring the same
+        # archive twice does not double the log.
+        for r in _rows(z, "activity_log.csv"):
+            if not (r.get("id") and r.get("actor") and r.get("kind")
+                    and r.get("action") and r.get("summary")):
+                skipped += 1
+                continue
+            at = _ts(r.get("at"))
+            if at is None:
+                skipped += 1
+                continue
+            # the whole restore is one transaction, so a malformed id must
+            # be caught here rather than left to the driver
+            try:
+                rid = str(uuid.UUID(str(r["id"])))
+            except ValueError:
+                skipped += 1
+                continue
+            detail = _j(r.get("detail"))
+            if not isinstance(detail, dict) or len(json.dumps(
+                    detail, default=str).encode()) > ACTIVITY_DETAIL_MAX:
+                detail = None
+            cur = conn.execute(
+                """INSERT INTO activity_log (id, at, actor_user_id, actor,
+                                             kind, action, target, label,
+                                             summary, detail)
+                   VALUES (%s::uuid,%s,NULL,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (tenant_id, id) DO NOTHING""",
+                (rid, at, str(r["actor"])[:120], str(r["kind"])[:40],
+                 str(r["action"])[:40],
+                 (str(r["target"])[:ACTIVITY_TARGET_MAX]
+                  if r.get("target") else None),
+                 str(r.get("label") or "")[:120],
+                 str(r["summary"])[:300],
+                 jsonb(detail) if detail is not None else None))
+            counts["activity_log"] = counts.get("activity_log", 0) + cur.rowcount
+            skipped += 1 - cur.rowcount
+
         # ---- converter v2 (migration 008): history / reference tables ----
 
         for r in _rows(z, "liabilities.csv"):
@@ -1515,6 +1798,9 @@ def _restore_zip(conn, data) -> dict:
             if not _snapshot_budgets_numeric(snap_cfg):
                 skipped += 1
                 continue
+            # a frozen month is read back as a config like any other — the
+            # week lens hands its excluded list straight to the spend query
+            clean_excluded_accounts(snap_cfg)
             # the frozen bill schedule travels too; shape-checked here and
             # row-by-row on read (snapshot_bill_rows), so a crafted blob
             # degrades to "no frozen schedule", never a crash
@@ -1596,7 +1882,11 @@ def _restore_zip(conn, data) -> dict:
                 # method is invisible to both forever. A hand-edited or
                 # pre-method CSV defaults to 'manual' — the preservation-
                 # safe choice, since manual rows are never recomputed over.
-                (r["raw_merchant"], r["canonical"], r.get("method") or "manual",
+                # The key is a bank descriptor, so it takes the descriptor
+                # clamp: the alias and the ledger string it has to equal are
+                # cut the same way and go on matching.
+                (_descriptor(r["raw_merchant"]), _descriptor(r["canonical"]),
+                 r.get("method") or "manual",
                  _ts(r.get("as_of")),
                  # same screen as the transactions above: an alias whose
                  # merchant is not in the archive resolves by its canonical
@@ -1649,7 +1939,8 @@ def _restore_zip(conn, data) -> dict:
                        source, classified_at, disabled)
                    VALUES (%s,%s,%s, COALESCE(%s, now()), %s)
                    ON CONFLICT (tenant_id, merchant) DO NOTHING""",
-                (r["merchant"], r["category_primary"], r.get("source") or "llm",
+                (_descriptor(r["merchant"]), r["category_primary"],
+                 r.get("source") or "llm",
                  _ts(r.get("classified_at")), _b(r.get("disabled"))))
             counts["merchant_categories"] = counts.get("merchant_categories", 0) + cur.rowcount
             skipped += 1 - cur.rowcount
@@ -1782,6 +2073,20 @@ def _restore_zip(conn, data) -> dict:
             # shapes can't smuggle them either.
             cfg = scrub_config(cfg_in)
             notes.extend(normalize_notify_shapes(cfg))
+            clean_excluded_accounts(cfg)
+            # The Enrich cap is the household's preference and restores, but
+            # only inside the range the settings door accepts: above the
+            # ceiling it would authorise spend the operator never allowed,
+            # and a value that is not a number would break every Enrich call
+            # until someone happened to save settings again. A malformed one
+            # is dropped, which leaves this instance's own value in place.
+            if "plaid_enrich_cap" in cfg:
+                from ..web.api import _enrich_cap_ceiling
+                try:
+                    cfg["plaid_enrich_cap"] = max(0, min(
+                        int(cfg["plaid_enrich_cap"]), _enrich_cap_ceiling()))
+                except (TypeError, ValueError, OverflowError):
+                    cfg.pop("plaid_enrich_cap")
             # scrub_config drops
             # secret/demo keys but NOT email_recipients — a crafted ZIP
             # could plant an outsider address that then receives the

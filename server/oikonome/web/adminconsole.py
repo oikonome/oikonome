@@ -242,7 +242,7 @@ def _multi_tenant() -> bool:
     """Does this instance take signups at all?
 
     Everything the console offers around ONBOARDING A STRANGER —
-    access requests, minting a signup invite, provisioning an instance,
+    minting a signup invite, provisioning an instance,
     chasing unverified users, an add-on's own columns — presumes
     `/signup` exists. It does not on a self-hosted box: that instance
     bootstraps through its setup link and stays one household, so
@@ -291,7 +291,7 @@ def _render(request: Request, **ctx) -> HTMLResponse:
 
 _SINGLE_HOUSEHOLD_NOTICE = (
     "This instance is a single household — it does not take signups, so "
-    "invites, access requests and instance provisioning do not apply here. "
+    "invites and instance provisioning do not apply here. "
     "To share it, use Settings → Security & household → Invite.")
 
 _NOTICE_CODES = {
@@ -1472,13 +1472,9 @@ async def invite(request: Request, email: str = Form(...),
 
 
 def _mint_invite(request: Request, *, email: str = "", days: int = 14,
-                 note: str = "", extra: dict | None = None,
-                 request_id: str | None = None):
-    """The one mint path, shared by the invite form and by approving an
-    access request. When `request_id` is given the address comes from the
-    installed gate's request row, and the row is read, checked and claimed
-    INSIDE the same advisory-locked transaction as the mint — see the
-    comment on the lock below."""
+                 note: str = "", extra: dict | None = None):
+    """The one mint path: count the seats and mint inside one
+    advisory-locked transaction — see the comment on the lock below."""
     if (bounce := _require(request)) is not None:
         return bounce
     if not _multi_tenant():
@@ -1518,26 +1514,9 @@ def _mint_invite(request: Request, *, email: str = "", days: int = 14,
         with admin.transaction():
             admin.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
                           ("oikonome:intake-mint",))
-            if request_id is not None:
-                # Approving an access request reads-checks-claims here, under
-                # the SAME lock as the mint, because minting BURNS every
-                # older unused invite for the address. A pre-check on its
-                # own connection would let two overlapping approvals (a
-                # double-click, two tabs) both see invited_at IS NULL and
-                # both mint, the second invalidating the first one already
-                # emailed. Serialized here, the loser reads the claim the
-                # winner wrote and is a no-op.
-                claimed = ext.gate.claim_intake_request(admin, request_id)
-                if claimed is None:
-                    # the finally below closes the connection; _dashboard
-                    # opens its own
-                    return _dashboard(request, notice="That request is gone "
-                                                      "or already approved.")
-                email = claimed
             # accounts_used_guarded, not `usage`: this door reads only
-            # the account count, and `usage` also scans `sessions` and
-            # counts open access requests — two queries held under the
-            # instance-wide intake-mint lock for nothing. The guard is a
+            # the account count, and `usage` also scans `sessions` — a
+            # query held under the instance-wide intake-mint lock for nothing. The guard is a
             # SAVEPOINT because this transaction goes on to mint: a bare
             # except around a failed statement would leave the transaction
             # aborted, turning the fail-open degrade into a 500.
@@ -1561,7 +1540,6 @@ def _mint_invite(request: Request, *, email: str = "", days: int = 14,
                     f"more accounts."))
             token = signup_invites.mint(admin, email, days=days,
                                         note=note or None, options=options)
-            ext.gate.on_invite_minted(admin, email)
             _audit(admin, "invite", target=email,
                    detail=(f"days={days}"
                            + (f" note={note}" if note else "")
@@ -1572,7 +1550,7 @@ def _mint_invite(request: Request, *, email: str = "", days: int = 14,
     path = f"/signup?invite={token}&email={quote(email)}"
     base = os.environ.get("OIKONOME_BASE_URL", "").rstrip("/")
     link = f"{base}{path}" if base else path
-    # deliver by email too (same path as the approve-by-email flow);
+    # deliver by email too;
     # the link renders once so the operator can also hand it over directly
     from .app import _deliver_invite
     threading.Thread(target=_deliver_invite, args=(email, path),
@@ -1729,23 +1707,50 @@ def tenant_status(request: Request, tenant_id: str = Form(...),
                   to: str = Form(...)):
     """Suspend / reactivate a tenant. Suspension is TOTAL (the current_user
     gate 403s every request except logout) — the abuse and support lever,
-    distinct from billing's read-only state."""
+    distinct from billing's read-only state.
+
+    This lever does NOT touch a household that is frozen with a deletion
+    date on it (its own scheduled delete, the never-confirmed freeze, an
+    add-on's lockout): those carry `delete_after` and
+    `status_before_delete`, which only the restore door knows how to
+    unwind. Writing `status` over them by hand strands the pair — the
+    purge stops selecting the row, so a household that was on its way to
+    being erased simply sits frozen forever with a date nothing reads,
+    and a later reactivate leaves a stale "restore me to" behind. So the
+    frozen case is refused with the door that handles it named, rather
+    than half-performed. The row is locked for the read-then-write, the
+    same FOR UPDATE the restore and the purge take, so this decision is
+    made against the status the write lands on rather than one the
+    nightly sweep has since replaced."""
     if (bounce := _require(request)) is not None:
         return bounce
     if to not in ("active", "suspended"):
         raise HTTPException(400, "to must be active|suspended")
+    verb = "suspend" if to == "suspended" else "reactivate"
     admin = tenancy.admin_connect()
     try:
-        row = admin.execute(
-            "UPDATE tenants SET status=%s WHERE id=%s RETURNING id",
-            (to, tenant_id)).fetchone()
-        if row is None:
-            return _dashboard(request, notice="No such tenant.")
-        _audit(admin, f"tenant_{'suspend' if to == 'suspended' else 'activate'}",
-               target=tenant_id, ip=client_ip(request))
+        with admin.transaction():
+            row = admin.execute(
+                "SELECT coalesce(status,'active') AS status FROM tenants "
+                "WHERE id=%s FOR UPDATE", (tenant_id,)).fetchone()
+            if row is None:
+                notice = "No such tenant."
+            elif row["status"] in _frozen_statuses():
+                notice = (f"NOT {to} — this tenant is frozen "
+                          f"({row['status']}) with a deletion date on it. "
+                          f"Restore it first (that is the door that clears "
+                          f"the date), then {verb} it.")
+            else:
+                admin.execute(
+                    "UPDATE tenants SET status=%s WHERE id=%s",
+                    (to, tenant_id))
+                _audit(admin,
+                       f"tenant_{'suspend' if to == 'suspended' else 'activate'}",
+                       target=tenant_id, ip=client_ip(request))
+                notice = f"Tenant {to}."
     finally:
         admin.close()
-    return _dashboard(request, notice=f"Tenant {to}.")
+    return _dashboard(request, notice=notice)
 
 
 @router.post("/sync-now",
@@ -2013,11 +2018,14 @@ def tenant_detail(request: Request, tenant_id: str, msg: str = ""):
 
 
 def _frozen_statuses() -> list[str]:
-    """Tenant statuses a restore can lift: the product's own scheduled
-    deletion plus whatever an installed add-on freezes a household under.
-    Read from the gate rather than written out here, so the console and
-    `current_user` can never disagree about the set."""
-    return ["pending_delete", *ext.gate.lockout_statuses()]
+    """Tenant statuses a restore can lift, and the nightly purge finishes:
+    the product's own scheduled deletion, its freeze of a signup nobody
+    ever confirmed, plus whatever an installed add-on freezes a household
+    under. Read from the gate rather than written out here, so the
+    console, the purge and `current_user` can never disagree about the
+    set."""
+    from ..jobs.unverified import STATUS as _unverified
+    return ["pending_delete", _unverified, *ext.gate.lockout_statuses()]
 
 
 def _grace_days() -> int:
@@ -2187,8 +2195,29 @@ def tenant_restore(request: Request, tenant_id: str = Form(...)):
     # transaction: a round trip to an outside service must not be held
     # across the row lock this door takes against the worker's purge. A
     # no-op for a tenant that was never paused, which is most of them.
-    ext.gate.on_tenant_restored(tenant_id)
-    return _dashboard(request, notice=f"Tenant restored to {row['prev']}.")
+    billing_word = ext.gate.on_tenant_restored(tenant_id)
+    notice = f"Tenant restored to {row['prev']}."
+    # what happened to the money is audited like the schedule's pause was,
+    # in its own row because it happens after the restore's transaction —
+    # and a pause this door refused to lift (an operator's own) is said to
+    # the operator's face, not only to the log
+    if billing_word and billing_word not in ("n/a", "none", "disabled",
+                                             "not_paused"):
+        admin = tenancy.admin_connect()
+        try:
+            _audit(admin, "tenant_delete_restored_billing", target=tenant_id,
+                   detail=f"release={billing_word}", ip=client_ip(request))
+        finally:
+            admin.close()
+        if billing_word == "left_operator_pause":
+            notice += (" Its subscription is paused by hand in Stripe, not "
+                       "by the deletion — left paused; lift it there if "
+                       "that is what you mean.")
+        elif billing_word == "resume_failed":
+            notice += (" Stripe did not answer the resume — the subscription "
+                       "is still paused; retry the restore or resume it in "
+                       "Stripe.")
+    return _dashboard(request, notice=notice)
 
 
 @router.post("/tenant-export",

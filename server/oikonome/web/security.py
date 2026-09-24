@@ -114,7 +114,7 @@ def _sec_event(event: str, ip: str, **fields) -> None:
 # A request BODY must be bounded. Starlette buffers the whole body to build
 # `Body(...)`/`Form(...)` before a handler — or its auth dependency — runs,
 # so a single POST of a multi-GB JSON string to an UNAUTHENTICATED route
-# (/api/invite/claim, /login, /signup, /forgot, an add-on's intake form,
+# (/api/invite/claim, /login, /signup, /forgot,
 # passkey options) would OOM the shared container, taking every tenant down
 # with it. Webhooks and file uploads refuse to read unbounded; the ordinary
 # JSON/form routes need the same treatment.

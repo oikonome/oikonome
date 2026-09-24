@@ -156,7 +156,7 @@ RMD_DIVISOR = {72: 27.4, 73: 26.5, 74: 25.5,
 def simulate(buckets, age, retire_age, end_age, spend, rr, ss_annual, ss_age,
              rental_annual, td_annual, taxable_annual, resume_age,
              eff_ord, eff_cg, gain_frac, shock=(), rr_path=None,
-             cash_rr=0.0, rmd_start=RMD_START):
+             cash_rr=0.0, rmd_start=RMD_START, extra_annual=0.0):
     """Run age→end_age. Returns dict(survived, fail_age, end_balance,
     at_retire).
 
@@ -169,7 +169,10 @@ def simulate(buckets, age, retire_age, end_age, spend, rr, ss_annual, ss_age,
     shock: real-return overrides for the first len(shock) RETIREMENT years —
     the sequence-of-returns stress. rr_path: full per-year real-return
     sequence (index 0 = current age) — overrides rr and shock. cash_rr: the
-    cash bucket's real return. rmd_start: first RMD age."""
+    cash bucket's real return. rmd_start: first RMD age. extra_annual:
+    saving on top of the plan, into taxable, every working year from now —
+    not held back to resume_age, because it is the answer to "what would
+    I have to start doing"."""
     # The four buckets live in locals for the whole walk. A projection runs
     # this loop thousands of times (every bisection step of every retire
     # age, every historical path), so a dict rebuilt per simulated year is
@@ -213,6 +216,8 @@ def simulate(buckets, age, retire_age, end_age, spend, rr, ss_annual, ss_age,
                 td += td_annual                             # employer plan
                 taxable += taxable_annual                   # brokerage sweep
             taxable += rmd_net
+            if extra_annual:
+                taxable += extra_annual
         else:
             income = (ss_net if a >= ss_age else 0.0) + rent_net + rmd_net
             need = spend - income
@@ -274,6 +279,34 @@ def _max_spend(buckets, age, retire_age, end_age, rr, ss_annual, ss_age,
 # Replay the plan against EVERY contiguous window of real 1928-2025 returns
 # (wrapping), blended stock/bond. Deterministic — no RNG — and explainable:
 # "survived N of 98 historical sequences".
+
+
+CATCH_UP_CAP = 50_000.0 * 12     # past this a month the honest answer is "no"
+CATCH_UP_STEP = 10               # the page shows a round monthly figure
+
+
+def catch_up_monthly(buckets, age, retire_age, end_age, spend, kw):
+    """Smallest extra monthly saving, from now until `retire_age`, that
+    makes retiring then last to end_age — rounded UP to the step, so the
+    figure shown is one that works. 0 when the plan already works; None
+    when there are no working years left to save in, or no saving under
+    the cap is enough."""
+    def ok(extra):
+        return simulate(buckets, age, retire_age, end_age, spend,
+                        extra_annual=extra, **kw)["survived"]
+    if ok(0.0):
+        return 0
+    if retire_age <= age or not ok(CATCH_UP_CAP):
+        return None
+    lo, hi = 0.0, CATCH_UP_CAP
+    for _ in range(30):
+        mid = (lo + hi) / 2
+        if ok(mid):
+            hi = mid
+        else:
+            lo = mid
+    monthly = int(-(-hi / 12 // CATCH_UP_STEP) * CATCH_UP_STEP)
+    return monthly
 
 
 @functools.lru_cache(maxsize=32)
@@ -448,6 +481,16 @@ def _project_cached(key: tuple) -> dict:
         stress.append({"label": label, "earliest": s_earliest,
                        "max_spend_at_ref": s_max})
 
+    # no age works: say what saving would make one work — the customary
+    # age and the last one the table tries
+    catch_up = None
+    if earliest is None:
+        catch_up = []
+        for ra in sorted({ref_age, retire_max}):
+            m = catch_up_monthly(b, age, ra, end_age, spend, kw)
+            if m:
+                catch_up.append({"age": ra, "extra_monthly": m})
+
     hist = hist_success(b, age, ref_age, end_age, spend, stock_frac, kw)
     hist["spend90"] = hist_spend_at(b, age, ref_age, end_age, stock_frac, kw, 0.90)
     hist["spend100"] = hist_spend_at(b, age, ref_age, end_age, stock_frac, kw, 1.0)
@@ -473,4 +516,5 @@ def _project_cached(key: tuple) -> dict:
         "grow_to_67": at67,
         "stress": stress, "stress_ref_age": ref_age,
         "hist": hist,
+        "catch_up": catch_up,
     }

@@ -4,45 +4,61 @@
 // own manual_assets).
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
+import { Link } from "react-router";
 import { saveSettings } from "../api/cache";
 import { api, errText,  money, type FeesReport, type ManualAsset, type NetWorthReport,
          type PLRow, catLabel } from "../api/client";
 import AreaChart from "../components/AreaChart";
 import Bars from "../components/Bars";
 import Donut from "../components/Donut";
-import { RANGE_MONTHS, RangePicker, shiftMonthsUtc, type Range }
+import { RANGE_MONTHS, RangePicker, rangeCaption, shiftMonthsUtc, type Range }
   from "../components/RangePicker";
 import { canEdit, isViewer } from "../role";
 
 // The over-time chart's window math (the toggle vocabulary itself lives in
-// components/RangePicker — the site-wide 3m/6m/1y/3y/5y/all). The window is
+// components/RangePicker — the site-wide This month … All). The window is
 // anchored to the LAST point's date (not today) so a briefly-stale report
 // still selects a full window. `start` is the index of the baseline point —
 // the last point at or before the cutoff — so the drawn line begins at
-// the value the gain is measured from.
+// the value the gain is measured from; `end` is the last point drawn: the
+// newest one for every window that runs to now, and for "1m" — the last
+// COMPLETE month, the one window that closes before today — the last
+// point at or before the previous month, so the gain is that month's
+// alone. The series is one point per month, so the two short windows are
+// two points: the change since the last month-end, and the change across
+// the month before. Mobile twin: `trendWindow` in lib/pure.ts.
 export type TrendRange = Range;
 
 export function trendWindow(points: [string, number][], range: TrendRange): {
-  start: number; gain: number | null; pct: number | null; full: boolean;
+  start: number; end: number; gain: number | null; pct: number | null;
+  full: boolean;
 } {
   const n = points.length;
-  if (n < 2) return { start: 0, gain: null, pct: null, full: true };
-  let start = 0;
+  if (n < 2) return { start: 0, end: n - 1, gain: null, pct: null, full: true };
+  // last point at or before an ISO cutoff; -1 when the data starts later
+  const at = (cutoff: string) => {
+    for (let i = n - 1; i >= 0; i--) if (points[i][0] <= cutoff) return i;
+    return -1;
+  };
+  let start = 0, end = n - 1;
   if (range !== "all") {
     const months = RANGE_MONTHS[range]!;
     // clamped, not rolled: a series whose last point is a 31st would
     // otherwise land the cutoff in the month AFTER the one asked for and
     // measure the gain over a window short by a month
-    const cutoff = shiftMonthsUtc(points[n - 1][0], months);
-    // last point at or before the cutoff; none = the data is shorter
-    // than the range and the window IS the whole series
-    for (let i = n - 1; i >= 0; i--) {
-      if (points[i][0] <= cutoff) { start = i; break; }
+    // none = the data is shorter than the range and the window IS the
+    // whole series
+    start = Math.max(0, at(shiftMonthsUtc(points[n - 1][0], months)));
+    if (range === "1m") {
+      const close = at(shiftMonthsUtc(points[n - 1][0], 1));
+      // a series too short to close the month falls back to the open
+      // window rather than measuring nothing
+      if (close > start) end = close;
     }
   }
   const base = points[start][1];
-  const gain = points[n - 1][1] - base;
-  return { start, gain,
+  const gain = points[end][1] - base;
+  return { start, end, gain,
            pct: base > 0 ? (100 * gain) / base : null,
            full: start === 0 };
 }
@@ -95,7 +111,8 @@ export default function NetWorth() {
           <div className="tile">
             <div className="sub">Financial accounts</div>
             <div className="kpi sm">{money(nw.current_total)}</div>
-            <div className="sub">cash + investments − card debt · live</div>
+            <div className="sub">cash + investments − card debt · live
+              {" · "}<Link to="/debt">payoff plan</Link></div>
           </div>
           <div className="tile">
             <div className="sub">Property &amp; vehicles, net</div>
@@ -226,7 +243,7 @@ function TrendCard({ trend, estimatedUntil, range, setRange }: {
   setRange: (r: TrendRange) => void;
 }) {
   const w = trendWindow(trend, range);
-  const sliced = trend.slice(w.start);
+  const sliced = trend.slice(w.start, w.end + 1);
   // the estimate boundary is an index into the FULL series — rebase it,
   // dropping it when the whole window is measured data
   const eu = estimatedUntil !== undefined && estimatedUntil - w.start > 0
@@ -243,7 +260,7 @@ function TrendCard({ trend, estimatedUntil, range, setRange }: {
             {w.gain >= 0 ? "+" : "−"}{money(Math.abs(w.gain))}
             {w.pct !== null && <> · {w.pct >= 0 ? "+" : ""}
               {w.pct.toFixed(1)}%</>}
-            <span className="mut"> over {range === "all" ? "all time" : range}
+            <span className="mut"> over {rangeCaption(range)}
             </span>
           </span>
         )}

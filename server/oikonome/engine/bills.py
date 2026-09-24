@@ -602,7 +602,7 @@ def apply_txn_categories(conn, *, bill_id: str | None = None,
                           - dt.timedelta(days=days)]
         rows = conn.execute(
             f"""SELECT t.id, t.amount, t.category_override, t.override_source,
-                      COALESCE(t.merchant_name, t.name) AS raw_payee, t.name,
+                      {budget.MATCH_PAYEE_SQL} AS raw_payee, t.name,
                       t.merchant_id::text AS merchant_id,
                       m.bill_id AS mark_bill, m.category AS mark_cat,
                       (m.transaction_id IS NOT NULL AND m.bill_id IS NULL) AS user_set
@@ -620,7 +620,7 @@ def apply_txn_categories(conn, *, bill_id: str | None = None,
             if not _cats.override_outranks(r["override_source"], "bill",
                                            r["category_override"]):
                 continue
-            text = f"{r['raw_payee'] or ''} {r['name'] or ''}".lower()
+            text = budget.match_text(r["raw_payee"], r["name"])
             amt = r["amount"] or 0
             hits = [(abs(abs(amt) - ref), bid, cat)
                     for bid, cat, ref, ok in matchers
@@ -714,7 +714,8 @@ def _identity(conn, items, *, backed_only: bool = False) -> dict:
 def _words(text: str | None) -> set[str]:
     """Every alphanumeric run of a name, lowercased — the words a person
     reads, short ones included."""
-    return set(re.findall(r"[a-z0-9]+", (text or "").lower()))
+    return set(re.findall(r"[a-z0-9]+",
+                          budget.join_apostrophes((text or "").lower())))
 
 
 def attachable(conn, payee: str, merchant: str | None, names,
@@ -780,9 +781,11 @@ def attachable(conn, payee: str, merchant: str | None, names,
     # the lone name is longer than the bill's words: a rename, unless the
     # ledger knows a merchant the bill's words name exactly (any age)
     named = conn.execute(
-        """SELECT 1 AS one FROM merchants
+        f"""SELECT 1 AS one FROM merchants
             WHERE merged_into IS NULL AND name <> ALL(%s)
-              AND regexp_split_to_array(lower(name), '[^a-z0-9]+') <@ %s::text[]
+              AND regexp_split_to_array(
+                      {budget.apostrophes_joined_sql("lower(name)")},
+                      '[^a-z0-9]+') <@ %s::text[]
               AND lower(name) ~ '[a-z0-9]'
             LIMIT 1""", (keep, sorted(bill_toks))).fetchone()
     if named is None:
@@ -1211,7 +1214,7 @@ def _ledger_rows(conn, today: dt.date, *, include_pending: bool = False) -> list
             # the bank sends, and the payee it lands on becomes the bill's
             # match key (budget._key_token(payee)) — a display rename here
             # would create bills whose key matches no transaction text.
-            f"""SELECT t.date, t.amount, COALESCE(t.merchant_name, t.name) AS payee,
+            f"""SELECT t.date, t.amount, {budget.MATCH_PAYEE_SQL} AS payee,
                        t.name, t.account_id,
                        COALESCE(t.category_override, t.category_primary, '') AS category,
                        {budget.FOOD_SQL} AS is_food,
@@ -1234,12 +1237,12 @@ def _ledger_rows(conn, today: dt.date, *, include_pending: bool = False) -> list
                   {budget.PERSONAL_ONLY_SQL}
                   AND t.date >= %s AND t.date <= %s""",
             (bool(include_pending), shadows, since, today)).fetchall():
-        text = f"{r['payee'] or ''} {r['name'] or ''}"
+        text = budget.match_text(r["payee"], r["name"])
         out.append({"date": as_date(r["date"]), "amount": r["amount"],
                     "payee": r["payee"] or "?", "category": r["category"],
                     "account_id": r["account_id"],
                     "merchant_id": r["merchant_id"],
-                    "is_food": bool(r["is_food"]), "text": text.lower(),
+                    "is_food": bool(r["is_food"]), "text": text,
                     "tokens": budget._tokens(text),
                     "key": budget._key_token(r["payee"] or "")})
     return out
@@ -1508,7 +1511,7 @@ def advance_received_income(conn, today: dt.date | None = None) -> int:
                 continue    # that deposit belongs to the previous occurrence
             if abs(float(r["amount"]) - float(b["amount"])) > tol:
                 continue
-            if match(f"{r['payee'] or ''} {r['name'] or ''}".lower(), None,
+            if match(budget.match_text(r["payee"], r["name"]), None,
                      budget.row_merchant_id(r)):
                 received = True
                 break
@@ -1794,7 +1797,7 @@ def _propose_income(conn, today, stats):
                 # Raw descriptor: paycheck grouping keys off the ACH text
                 # (_income_key strips its noise words), and the merchant map
                 # is a retail-display tool that never sees payroll strings.
-                f"""SELECT t.date, t.amount, COALESCE(t.merchant_name, t.name) AS payee
+                f"""SELECT t.date, t.amount, {budget.MATCH_PAYEE_SQL} AS payee
                    FROM transactions t
                    JOIN accounts a ON a.id = t.account_id
                    WHERE t.removed = 0 AND t.pending = 0 AND t.amount <= -200
@@ -2088,7 +2091,7 @@ def _income_rows(conn, today: dt.date) -> list[dict]:
             # Raw descriptor: this is the universe an income bill's key is
             # matched against (same rule as _ledger_rows) — matching text,
             # not a display name.
-            """SELECT t.date, t.amount, COALESCE(t.merchant_name, t.name) AS payee,
+            f"""SELECT t.date, t.amount, {budget.MATCH_PAYEE_SQL} AS payee,
                       t.name, COALESCE(t.category_primary,'') AS category,
                       t.merchant_id::text AS merchant_id
                FROM transactions t
@@ -2101,11 +2104,11 @@ def _income_rows(conn, today: dt.date) -> list[dict]:
             # owner's paycheck series
             + budget.PERSONAL_ONLY_SQL,
             (shadows, since)).fetchall():
-        text = f"{r['payee'] or ''} {r['name'] or ''}"
+        text = budget.match_text(r["payee"], r["name"])
         out.append({"date": as_date(r["date"]), "amount": -r["amount"],
                     "payee": r["payee"] or "?", "category": r["category"],
                     "merchant_id": r["merchant_id"],
-                    "is_food": False, "text": text.lower(),
+                    "is_food": False, "text": text,
                     "tokens": budget._tokens(text),
                     "key": budget._key_token(r["payee"] or "")})
     return out
@@ -2474,11 +2477,38 @@ def _history_match_sql(is_bill: bool, bill_merchant: str | None,
     return frag, list(params)
 
 
+# the site-wide timeframe vocabulary, as the history page's transaction
+# list bounds it: months back from today for the open windows, None for
+# all. "cur" (this month so far) and "1m" (the last complete month) are
+# calendar months, cut in merchant_history itself.
+HISTORY_WINDOWS = {"cur": 1, "1m": 1, "3m": 3, "6m": 6, "1y": 12, "3y": 36,
+                   "5y": 60, "all": None}
+
+
 def merchant_history(conn, payee: str, today: dt.date | None = None,
-                     months: int = 24) -> dict:
+                     months: int | None = 24, *,
+                     window: str | None = None) -> dict:
     """Everything a merchant-history page needs: matched transactions,
-    monthly totals, lifetime aggregate, and the ledger fit."""
+    monthly totals, lifetime aggregate, and the ledger fit.
+
+    The transaction list is bounded by `months` back from today (None =
+    the whole ledger), or, when `window` names one of HISTORY_WINDOWS, by
+    that window: "cur" is this month from the 1st, "1m" the last complete
+    month closed on its last day, the rest months back as before. The
+    lifetime aggregate is lifetime whatever the window."""
     today = today or localtime.household_day(conn)
+    until: dt.date | None = None
+    if window is not None:
+        months = HISTORY_WINDOWS.get(window)      # unknown reads as all
+    if window == "cur":
+        since = today.replace(day=1)
+    elif window == "1m":
+        until = today.replace(day=1)
+        since = (until - dt.timedelta(days=1)).replace(day=1)
+    else:
+        # months=None is the whole ledger: the page's "All" window
+        since = (dt.date(1900, 1, 1) if months is None
+                 else today - dt.timedelta(days=months * 31))
     row = conn.execute(
         "SELECT merchant, amount, category, raw FROM bills "
         "WHERE payee=%s LIMIT 1", (payee,)).fetchone()
@@ -2563,9 +2593,6 @@ def merchant_history(conn, payee: str, today: dt.date | None = None,
     match_frag, match_params = _history_match_sql(
         is_bill, bill_merchant, key, want_cat, want_display, display_bucket,
         want_canon, arb_toks, bill_ids)
-    # months=None is the whole ledger: the page's "All" window
-    since = (dt.date(1900, 1, 1) if months is None
-             else today - dt.timedelta(days=months * 31))
     txns = []
     for r in conn.execute(
             f"""SELECT t.id AS txn_id, t.date, t.amount, t.pending,
@@ -2574,7 +2601,7 @@ def merchant_history(conn, payee: str, today: dt.date | None = None,
                       -- what the bank literally sent, kept beside the display
                       -- name: bill matching is defined on the raw descriptor's
                       -- tokens, so it must not start reading a renamed label
-                      COALESCE(t.merchant_name, t.name) AS raw_payee, t.name,
+                      {budget.MATCH_PAYEE_SQL} AS raw_payee, t.name,
                       mc.canonical AS canon, mm.logo_url AS merchant_logo,
                       REPLACE(COALESCE(t.category_override, t.category_primary,'?'),'_',' ') AS category,
                       tn.note AS note,
@@ -2592,13 +2619,14 @@ def merchant_history(conn, payee: str, today: dt.date | None = None,
                     -- O(rows x notes) once a ledger is annotated.
                     -- A LEFT JOIN scans it once.
                     LEFT JOIN transaction_notes tn ON tn.txn_id = t.id
-               WHERE t.removed = 0 AND t.date >= %s AND {match_frag}
+               WHERE t.removed = 0 AND t.date >= %s AND t.date < %s
+                 AND {match_frag}
                -- id breaks the date tie: without it two charges on one day
                -- come back in whatever order the plan happened to produce,
                -- so the same page reorders itself between requests
                ORDER BY t.date DESC, t.id DESC""",
-            (since, *match_params)).fetchall():
-        text = f"{r['raw_payee'] or ''} {r['name'] or ''}".lower()
+            (since, until or dt.date(9999, 1, 1), *match_params)).fetchall():
+        text = budget.match_text(r["raw_payee"], r["name"])
         ok = (bill_match(text, None, r["merchant_id"]) if is_bill
               else _merchant_row_matches(r, text, want_display, display_bucket,
                                          want_canon, arb_toks))
@@ -2657,7 +2685,7 @@ def merchant_history(conn, payee: str, today: dt.date | None = None,
     for r in conn.execute(
             f"""SELECT t.date, t.amount, t.pending, {life_cols},
                       t.merchant_id::text AS merchant_id,
-                      COALESCE(t.merchant_name, t.name) AS raw_payee, t.name,
+                      {budget.MATCH_PAYEE_SQL} AS raw_payee, t.name,
                       REPLACE(COALESCE(t.category_override, t.category_primary,'?'),'_',' ') AS category
                FROM transactions t
                     {life_join}
@@ -2669,7 +2697,7 @@ def merchant_history(conn, payee: str, today: dt.date | None = None,
                  -- cannot take a date bound; the merchant predicate is what
                  -- keeps it off the rest of the ledger
                  AND {match_frag}""", match_params or None).fetchall():
-        text = f"{r['raw_payee'] or ''} {r['name'] or ''}".lower()
+        text = budget.match_text(r["raw_payee"], r["name"])
         # same display-first rule as the txn list above: the lifetime
         # aggregate sits beside it, so a different matcher here would print
         # a total that disagrees with the rows it is totalling

@@ -49,7 +49,15 @@
     "override_bill_id": {"type": ["string", "null"], "description": "the bill that stamped the override, when a bill did"},
     "override_bill": {"type": ["string", "null"], "description": "that bill's payee"},
     "override_manual": {"type": ["boolean", "null"], "description": "true when a person set the override"},
-    "override_is_fee": {"type": ["boolean", "null"], "description": "true when the row is a companion charge — the fee that rides with override_bill's payment"}
+    "override_is_fee": {"type": ["boolean", "null"], "description": "true when the row is a companion charge — the fee that rides with override_bill's payment"},
+    "split":         {"type": ["array", "null"],
+                      "description": "a hand split of this charge across categories, in order — stored category keys and cent-exact amounts summing to `amount`; null when the row is not split. `category` stays the whole row's own; the rollups count the parts",
+                      "items": {"type": "object",
+                                "properties": {"category": {"type": "string"},
+                                               "amount":   {"type": "number"}},
+                                "required": ["category", "amount"],
+                                "additionalProperties": false}},
+    "splittable":    {"type": ["boolean", "null"], "description": "true when the split door will take this row — the spend test the rollups use (money out, not a transfer, not a card payment, not on a loan account); clients offer Split and Edit split only when true"}
   },
   "additionalProperties": false
 }

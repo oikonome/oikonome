@@ -99,11 +99,13 @@ class TestMatchWords(unittest.TestCase):
     that pay it, and its bill reads as unpaid forever."""
 
     def test_a_long_word_never_matches_on_a_short_one(self):
-        self.assertEqual(budget._tokens("City of Pointe d'Amour"),
-                         {"city", "pointe", "amour"})
-        self.assertEqual(budget._key_token("City of Pointe d'Amour"), "city")
+        # an elided prefix joins its word, as a bank prints it closed up
+        # ("LAKE OBRIEN")
+        self.assertEqual(budget._tokens("Village of Lake O'Brien"),
+                         {"village", "lake", "obrien"})
+        self.assertEqual(budget._key_token("Village of Lake O'Brien"), "village")
         # 'of' is not a match token just because it is there
-        self.assertNotIn("of", budget._tokens("City of Pointe d'Amour"))
+        self.assertNotIn("of", budget._tokens("Village of Lake O'Brien"))
 
     def test_a_name_of_initials_still_gets_a_key(self):
         for payee, key in (("CVS", "cvs"), ("IRS", "irs"), ("DMV", "dmv")):
@@ -123,9 +125,9 @@ class TestMatchWords(unittest.TestCase):
 
 class TestMatching(BudgetBase):
     def test_key_token_required(self):
-        add_bill(self.conn, "City of Pointe d'Amour", 86.0,
+        add_bill(self.conn, "Village of Lake O'Brien", 90.0,
                  next_due=TODAY.replace(day=5), last_seen=TODAY.replace(day=5))
-        add_txn(self.conn, TODAY.replace(day=5), 86.0, "BANGKOK RESTAURANT",
+        add_txn(self.conn, TODAY.replace(day=5), 90.0, "BANGKOK RESTAURANT",
                 primary="FOOD_AND_DRINK")
         st = self.status()
         self.assertEqual(st["buckets"]["fixed"]["actual"], 0.0)

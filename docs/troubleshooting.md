@@ -141,6 +141,48 @@ Everything that is *not* a file upload — signing in, saving settings,
 ordinary API calls — is capped at a **1 MB** request body, which is far
 more than any of them legitimately send.
 
+### the daily email's "Needs you" section has no buttons
+The buttons link back to your instance, and recurring mail only carries
+links to `OIKONOME_BASE_URL` when it is `https` on a real domain — a bare
+IP or a `.lan`/`.local` name is exactly what mail providers filter. Set it
+(`./oikonome.sh https <domain>` does) and the next email has buttons.
+Only owners and members get the section at all; a viewer's copy stops at
+the timeline. A button that says its work is already done is right —
+someone settled it in the app first; a category button names the category
+the charge is under now and changes nothing. A button that says email
+buttons are off means the household can't be changed right now (read-only
+billing, a suspension, or — on a hosted instance — no second factor
+enrolled yet); sign in to see what it needs. Links older than seven days,
+or sent before a master-key rotation, are dead; use the next morning's.
+
+### Prometheus marks the target down, or a sensor reads nothing
+Try the door by hand:
+`curl -H "Authorization: Bearer oik_…" https://<your instance>/metrics`.
+A refusal is always a JSON reason, never the sign-in page. `401`: the
+token is missing, mistyped or revoked — a password or email change
+revokes every script token, so mint a new one. `403 … push-scoped`: the
+token came from Settings → Connections (a collector's); integrations need
+one from Settings → Integrations. `429`: a read token gets 600 requests
+an hour per address; scrape less often. If `curl` works but the scraper
+does not, look at the reverse proxy — an auth layer in front of the whole
+site swallows the bearer header (see [reverse-proxy.md](reverse-proxy.md)).
+
+### a webhook stopped firing
+Settings → Integrations → the webhook's **deliveries** shows the last
+twenty and what the receiver said. Failed deliveries retry for about
+fifteen hours; thirty failed attempts in a row switch the webhook off,
+and Settings says so. Fix the receiver, press **Send a test**, then tick
+the webhook back on. A LAN address is fine on a self-hosted instance; the
+cloud metadata address never is.
+
+### the home-screen widget is grey or says "Sign in"
+Grey with a time means the phone has not refreshed it for over an hour —
+the OS schedules widget refreshes, and opening the app forces one; check
+that the phone can reach the instance. **Sign in** means its credential
+is gone: it dies with the device's sign-in, so a device revoked in
+Settings, a password change or a sign-out all end it. Open the app and
+sign in again. **Set a plan** means there is no budget yet.
+
 ### locked out (forgot password, no SMTP)
 The **Forgot password** link on the sign-in page emails a reset link —
 which needs SMTP configured. Without it, reset from the machine that

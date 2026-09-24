@@ -55,12 +55,12 @@ of the buckets up front, in the same order withdrawals draw.
 Each simulated year:
 
 - Investment buckets grow at the real return. **Cash keeps pace with
-  inflation** (0% real). There is no control for a different cash yield
-  on the page yet; the projection API accepts one (a nominal percentage)
-  for scripts and integrations, and pricing cash at 0% nominal shows why
-  the default is the kinder assumption — at 0% nominal,
-  $100k is worth about $74k of today's dollars after ten years of 3%
-  inflation.
+  inflation** (0% real) unless you set a **cash yield** under
+  *adjust ▾* — a nominal percentage, the same number a savings account
+  advertises; leave it blank for the default. Pricing cash at 0% nominal
+  shows why the default is the kinder assumption — at 0% nominal, $100k
+  is worth about $74k of today's dollars after ten years of 3% inflation.
+  (Scripts pass it as `cash` on the projection API.)
 - **RMDs** start at the age SECURE 2.0 sets for your birth year (72 if
   born 1950 or earlier, 73 if born 1951–1959, 75 from 1960; without a
   birthdate, 75) — working or retired, since an IRA's distribution cannot be deferred by employment.
@@ -83,6 +83,14 @@ age. **Max sustainable spend** is found by binary search: the largest
 constant real spend that just barely survives. The per-age table runs
 from your current age to 72, and the earliest feasible row is the
 headline answer.
+
+When no age in the table works, the headline says **not by 72** and, under
+it, what would get you back on track: the extra amount to save each month
+— starting now, on top of the contributions already in the plan, into
+taxable savings — that makes retiring at 67 work, and the smaller amount
+that makes 72 work. Each figure is rounded up to the next $10, so it is
+one that really lasts. If you are already past an age, or no monthly
+amount is enough, that age is left out.
 
 ## Replayed against history
 
@@ -120,8 +128,8 @@ shows the earliest feasible age and max spend under each, and the
 - Historical sequences wrap: a start year late in the record splices
   the oldest years on after the newest. Pre-1928 conditions and
   futures unlike the past are, by construction, not represented.
-- Cash only keeps pace with inflation (0% real) — it never earns the
-  portfolio's return, so a large cash bucket drags the projection exactly
-  as it drags real portfolios. A cash-yield control is not on the page
-  yet; the projection API takes one (a nominal yield, converted to real
-  against your inflation figure) for scripts.
+- Cash never earns the portfolio's return, so a large cash bucket drags
+  the projection exactly as it drags real portfolios. Left alone it only
+  keeps pace with inflation (0% real); the cash-yield box under
+  **adjust** sets a nominal yield, converted to real against your
+  inflation figure.

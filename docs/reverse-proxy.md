@@ -43,6 +43,18 @@ compares them.
 If your proxy forwards only selected paths, include
 `/.well-known/assetlinks.json` and `/.well-known/apple-app-site-association` — the Android and iOS apps' passkey sign-in
 depends on those files being reachable on your domain.
+The links in the daily email land on top-level paths, not under `/app` or
+`/api`: `/act` (the *Needs you* buttons), `/unsubscribe` and
+`/recipient-invite`. Forward those too, and `/metrics` if something
+outside the LAN scrapes it.
+
+An authentication layer in front of the whole site (basic auth, an SSO
+gateway) breaks everything that signs in with a bearer token instead of a
+browser: the mobile app and its home-screen widget, collector scripts, and
+the integrations doors (`/api/integrations/*`, `/metrics`) that
+Prometheus, Home Assistant and the MCP server use. Exempt those paths, or
+keep such a layer to the admin console (below). A scraper refused by the
+app gets a `401` with a JSON reason, never a redirect to the sign-in page.
 
 ## Real client IPs behind the proxy
 
