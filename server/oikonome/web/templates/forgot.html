@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block body %}
+<h1>Reset password</h1>
+<div class="card" style="max-width:26rem">
+  {% if sent %}
+  <p>{{ message }}</p>
+  <p class="sub">The link is valid for 1 hour and works once. Self-hosted
+    instances without email configured print the link to the server log.</p>
+  {% else %}
+  {% if error %}<div class="note" style="margin-bottom:.8rem;background:rgba(224,105,93,.10);border-color:rgba(224,105,93,.4);color:var(--red)">{{ error }}</div>{% endif %}
+  {# This belongs here, where the reset is about to happen, rather than
+     beside the link on the one screen where a person is trying to get IN. #}
+  <p class="sub" style="margin-top:0">We email you a link that sets a new
+    password. If you have two-factor sign-in turned on, using the link also
+    clears it, so you can enrol your authenticator again afterwards.</p>
+  <form method="post" action="/forgot">
+    <p><label>Email<br><input type="email" name="email" required
+        style="width:100%;padding:.5rem;background:var(--hover);border:1px solid var(--line);border-radius:var(--rs);color:var(--ink)"></label></p>
+    {# The widget must live INSIDE the form, or a challenged reset has no way
+       to carry a token — the same rule /login follows. #}
+    {% if turnstile_key %}
+    <div class="cf-turnstile" data-sitekey="{{ turnstile_key }}"
+         data-theme="auto" data-appearance="interaction-only"
+         data-required="{{ '1' if turnstile_wait else '0' }}"
+         style="margin:.6rem 0"></div>
+    {% endif %}
+    <button class="pri">Send reset link</button>
+  </form>
+  {% if turnstile_key %}
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js"
+          async defer></script>
+  {% endif %}
+  {# The emailed way past a check the browser cannot run — offered on
+     login.html too, and this door is where a locked-out user needs it
+     most. #}
+  {% if show_unlock %}
+  <p class="sub" style="margin-top:.8rem">Can't complete the security check?
+    <a href="/unlock">Email me a sign-in link</a>.</p>
+  {% endif %}
+  {% endif %}
+  <p class="sub" style="margin-top:.8rem"><a href="/login">Back to sign in</a></p>
+</div>
+{% endblock %}

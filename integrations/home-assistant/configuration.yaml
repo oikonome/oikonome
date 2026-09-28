@@ -1,0 +1,85 @@
+# Oikonome → Home Assistant. Replace money.example.lan and oik_… — the
+# token is an INTEGRATION token (read scope) from Settings → Integrations.
+
+rest:
+  - resource: https://money.example.lan/api/integrations/summary
+    headers:
+      Authorization: Bearer oik_…
+    scan_interval: 900
+    sensor:
+      - name: "Money left today"
+        unique_id: oikonome_left_today
+        value_template: "{{ value_json.today.left }}"
+        unit_of_measurement: "$"
+        icon: mdi:cash
+      - name: "Budget verdict"
+        unique_id: oikonome_verdict
+        value_template: "{{ value_json.verdict }}"
+        icon: mdi:scale-balance
+      - name: "Month spent"
+        unique_id: oikonome_month_spent
+        value_template: "{{ value_json.month.spent }}"
+        json_attributes_path: "$.month"
+        json_attributes: [budget, expected, variance, days_left]
+        unit_of_measurement: "$"
+      - name: "Bills due this week"
+        unique_id: oikonome_bills_due_7d
+        value_template: "{{ value_json.bills_due | sum(attribute='amount') }}"
+        json_attributes: [bills_due]
+        unit_of_measurement: "$"
+        icon: mdi:calendar-clock
+      - name: "Net worth"
+        unique_id: oikonome_net_worth
+        value_template: "{{ value_json.net_worth.total }}"
+        unit_of_measurement: "$"
+        icon: mdi:chart-line
+      - name: "Bank sync age"
+        unique_id: oikonome_sync_age
+        value_template: >-
+          {{ (value_json.connections | map(attribute='last_sync_age_seconds')
+              | select('number') | list | max(default=0) / 3600) | round(1) }}
+        unit_of_measurement: "h"
+        icon: mdi:bank-transfer
+      # one balance sensor per account: repeat this block with the account
+      # id from /api/integrations/accounts (or the summary's accounts[].id)
+      - name: "Checking balance"
+        unique_id: oikonome_balance_checking
+        value_template: >-
+          {{ (value_json.accounts | selectattr('id', 'eq', 'YOUR-ACCOUNT-ID')
+              | map(attribute='balance') | first) }}
+        unit_of_measurement: "$"
+
+automation:
+  - alias: "Oikonome: big charge just posted"
+    trigger:
+      - platform: webhook
+        webhook_id: oikonome
+        allowed_methods: [POST]
+        local_only: true
+    condition:
+      - "{{ trigger.json.event == 'transactions.new' }}"
+      - "{{ trigger.json.data.transactions | selectattr('amount', '>', 200) | list | count > 0 }}"
+    action:
+      - service: notify.mobile_app_phone
+        data:
+          title: "Big charge"
+          message: >-
+            {% for t in trigger.json.data.transactions if t.amount > 200 -%}
+            {{ t.payee }} ${{ '%.2f' | format(t.amount) }}{{ ", " if not loop.last }}
+            {%- endfor %}
+
+  - alias: "Oikonome: the morning verdict"
+    trigger:
+      - platform: webhook
+        webhook_id: oikonome
+        allowed_methods: [POST]
+        local_only: true
+    condition:
+      - "{{ trigger.json.event == 'report.daily' }}"
+    action:
+      - service: notify.mobile_app_phone
+        data:
+          title: "{{ trigger.json.data.verdict | title }}"
+          message: >-
+            ${{ '%.0f' | format(trigger.json.data.today.left) }} left today ·
+            {{ trigger.json.data.pace }}

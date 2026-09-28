@@ -1,0 +1,63 @@
+{
+  "wallets": [
+    {
+      "id": "11111111-aaaa-4bbb-8ccc-000000000001",
+      "name": "BTC Wallet",
+      "currency": {"code": "BTC", "type": "crypto"},
+      "balance": {"amount": "0.5", "currency": "BTC"}
+    },
+    {
+      "id": "11111111-aaaa-4bbb-8ccc-000000000002",
+      "name": "Cash (USD)",
+      "currency": {"code": "USD", "type": "fiat"},
+      "balance": {"amount": "250.00", "currency": "USD"}
+    },
+    {
+      "id": "11111111-aaaa-4bbb-8ccc-000000000003",
+      "name": "ETH Wallet",
+      "currency": {"code": "ETH", "type": "crypto"},
+      "balance": {"amount": "0", "currency": "ETH"}
+    }
+  ],
+  "transactions": {
+    "11111111-aaaa-4bbb-8ccc-000000000001": [
+      {
+        "id": "22222222-aaaa-4bbb-8ccc-000000000001",
+        "type": "buy",
+        "status": "completed",
+        "created_at": "2026-01-15T12:00:00Z",
+        "amount": {"amount": "0.5", "currency": "BTC"},
+        "native_amount": {"amount": "-20000.00", "currency": "USD"}
+      }
+    ],
+    "11111111-aaaa-4bbb-8ccc-000000000002": [
+      {
+        "id": "22222222-aaaa-4bbb-8ccc-000000000002",
+        "type": "fiat_deposit",
+        "status": "completed",
+        "created_at": "2026-01-10T09:30:00Z",
+        "amount": {"amount": "20250.00", "currency": "USD"},
+        "native_amount": {"amount": "20250.00", "currency": "USD"}
+      }
+    ],
+    "11111111-aaaa-4bbb-8ccc-000000000003": [
+      {
+        "id": "22222222-aaaa-4bbb-8ccc-000000000003",
+        "type": "sell",
+        "status": "completed",
+        "created_at": "2025-11-02T18:45:00Z",
+        "amount": {"amount": "-1.0", "currency": "ETH"},
+        "native_amount": {"amount": "-3100.00", "currency": "USD"}
+      },
+      {
+        "id": "22222222-aaaa-4bbb-8ccc-000000000004",
+        "type": "send",
+        "status": "pending",
+        "created_at": "2026-02-01T08:00:00Z",
+        "amount": {"amount": "-0.1", "currency": "ETH"},
+        "native_amount": {"amount": "-310.00", "currency": "USD"}
+      }
+    ]
+  },
+  "spot": {"BTC": 60000.0}
+}

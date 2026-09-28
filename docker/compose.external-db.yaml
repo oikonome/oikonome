@@ -1,0 +1,50 @@
+# Run against an EXTERNAL / managed Postgres (a cloud provider's managed
+# database, your own server) instead of the bundled postgres container.
+#
+# Activate by listing this file after the base one in docker/.env:
+#   COMPOSE_FILE=compose.yaml:compose.external-db.yaml
+# and setting (also in docker/.env):
+#   OIKONOME_DB_HOST=…            # e.g. db.example.internal
+#   OIKONOME_DB_PORT=5432         # provider port (default 5432)
+#   OIKONOME_DB_NAME=oikonome     # the app database (create it first)
+#   OIKONOME_DB_SSLMODE=require   # managed providers require TLS
+#   OIKONOME_DB_ADMIN_USER=dbadmin      # provider admin (CREATEROLE; no
+#                                       # superuser needed — see migrate.py)
+#   POSTGRES_PASSWORD=…                 # that admin user's password
+#   OIKONOME_DB_MAINT_DB=postgres       # db to connect to for DROP/CREATE
+#                                       # DATABASE (restore); some managed
+#                                       # providers name it differently
+#
+# The bundled postgres service is disabled via an impossible profile, and
+# every dependency on it is reset. Backups/restores route through the
+# migrate service's client tools automatically (oikonome.sh detects
+# COMPOSE_FILE). Note: BYPASSRLS falls back to table ownership on managed
+# providers without superuser — migrate.py handles it.
+services:
+  app:
+    environment:
+      OIKONOME_DSN: postgresql://oikonome_app:${OIKONOME_APP_PASSWORD:?}@${OIKONOME_DB_HOST:?set OIKONOME_DB_HOST for external-db mode}:${OIKONOME_DB_PORT:-5432}/${OIKONOME_DB_NAME:-oikonome}?sslmode=${OIKONOME_DB_SSLMODE:-require}
+      OIKONOME_ADMIN_DSN: postgresql://oikonome_admin:${OIKONOME_ADMIN_PASSWORD:?}@${OIKONOME_DB_HOST:?}:${OIKONOME_DB_PORT:-5432}/${OIKONOME_DB_NAME:-oikonome}?sslmode=${OIKONOME_DB_SSLMODE:-require}
+    depends_on: !reset
+      redis: { condition: service_started }
+      migrate: { condition: service_completed_successfully }
+
+  worker:
+    environment:
+      OIKONOME_DSN: postgresql://oikonome_app:${OIKONOME_APP_PASSWORD:?}@${OIKONOME_DB_HOST:?}:${OIKONOME_DB_PORT:-5432}/${OIKONOME_DB_NAME:-oikonome}?sslmode=${OIKONOME_DB_SSLMODE:-require}
+      OIKONOME_ADMIN_DSN: postgresql://oikonome_admin:${OIKONOME_ADMIN_PASSWORD:?}@${OIKONOME_DB_HOST:?}:${OIKONOME_DB_PORT:-5432}/${OIKONOME_DB_NAME:-oikonome}?sslmode=${OIKONOME_DB_SSLMODE:-require}
+    depends_on: !reset
+      redis: { condition: service_started }
+      migrate: { condition: service_completed_successfully }
+
+  migrate:
+    environment:
+      # the provider ADMIN credential lives ONLY here (and in the
+      # maintenance DSN oikonome.sh backup/restore use)
+      OIKONOME_ADMIN_DSN: postgresql://${OIKONOME_DB_ADMIN_USER:-postgres}:${POSTGRES_PASSWORD:?}@${OIKONOME_DB_HOST:?}:${OIKONOME_DB_PORT:-5432}/${OIKONOME_DB_NAME:-oikonome}?sslmode=${OIKONOME_DB_SSLMODE:-require}
+      OIKONOME_MAINT_DSN: postgresql://${OIKONOME_DB_ADMIN_USER:-postgres}:${POSTGRES_PASSWORD:?}@${OIKONOME_DB_HOST:?}:${OIKONOME_DB_PORT:-5432}/${OIKONOME_DB_MAINT_DB:-postgres}?sslmode=${OIKONOME_DB_SSLMODE:-require}
+    depends_on: !reset {}
+
+  postgres:
+    # never started in external-db mode (and nothing depends on it)
+    profiles: ["external-db-disabled"]

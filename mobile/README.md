@@ -1,0 +1,137 @@
+# Oikonome mobile
+
+Native companion app (iOS + Android, Expo / React Native) for an
+Oikonome instance. Design and auth model: [`../specs/mobile.md`](../specs/mobile.md).
+
+The app is a client: first run asks for your server URL, login mints a
+device token kept in the secure enclave behind a biometric unlock, and
+every screen renders what the server's `/api` returns.
+
+## Develop
+
+```bash
+npm install
+npm start          # Expo dev server; scan the QR with Expo Go / a dev build
+npm run typecheck  # tsc --noEmit — a REAL check here, run it before pushing
+npm run lint
+
+# unit tests for src/lib/pure.ts and the pure helpers in src/lib/api.ts
+node --experimental-strip-types scripts/pure-logic-tests.mjs
+```
+
+There is no JS test framework: the money and merge logic that fails
+silently lives in dependency-free modules, and the script above runs
+those cases under plain node (v22.6+). The server suite invokes it too,
+so `make test` at the repo root goes red on a regression here.
+
+Point the connect screen at any running instance — a local dev server
+works (`http://<lan-ip>:8042`; use the LAN address, not localhost, so
+the phone can reach it).
+
+## Pinning a build to your server
+
+A build made with `EXPO_PUBLIC_SERVER_URL` set never shows the connect
+screen — it signs in to that one origin and nothing else:
+
+```bash
+EXPO_PUBLIC_SERVER_URL=https://oikonome.example.com npx expo run:android --variant release
+# or, for a cloud build, put it under build.<profile>.env in eas.json
+```
+
+Metro reads the variable when it bundles the JS, so it has to be set for
+the build command itself. Left unset, the app is the bring-your-own-server
+build and asks for the URL on first run.
+
+## Building your own
+
+The tree builds as-is for your own instance, but the identity in it is a
+placeholder: `app.json` carries `org.example.oikonome` as the iOS bundle
+identifier and Android package, build number 1, no `owner`, no EAS
+project id, no associated domains and no `googleServicesFile`. Before a
+build you distribute, set those to yours — an EAS project of your own
+(`eas init` fills `extra.eas.projectId`), your Firebase project's
+`google-services.json` if you want Android push, and, for iOS passkeys,
+`ios.associatedDomains` naming your server (which must serve
+`/.well-known/apple-app-site-association` for it; `src/ext/index.tsx`
+→ `webcredentialHosts` lists the same hosts). `eas.json` has one
+`production` profile pinning `EXPO_PUBLIC_SERVER_URL`; change the URL, and
+add `submit` profiles for your own store accounts if you publish.
+
+A local Android release build (`npx expo run:android --variant release`)
+signs with your upload key when `~/.gradle/gradle.properties` names it —
+never put these in the repo:
+
+```properties
+OIKONOME_UPLOAD_STORE_FILE=/path/to/upload-keystore.jks
+OIKONOME_UPLOAD_STORE_PASSWORD=…
+OIKONOME_UPLOAD_KEY_ALIAS=upload
+# optional; defaults to the store password
+OIKONOME_UPLOAD_KEY_PASSWORD=…
+```
+
+`plugins/with-android-upload-signing.js` writes that signing config into
+`android/app/build.gradle` at every prebuild. Without the properties the
+release build is signed with the debug keystore, which is fine for trying
+it out but a store refuses it, and it will not install over a build signed
+with your upload key.
+
+`src/ext/index.tsx` is the one slot an operator running the product for
+other people fills with their own client add-on — extra screens, a
+Settings section, lockout screens, wording around an institution allowance,
+legal links. Left as it is, the app is a plain client for one instance.
+
+## Home-screen widget
+
+The widget shows the Today hero's simple face (`GET /api/today/glance`).
+It polls with its own lesser credential (`POST /api/devices/widget`,
+minted once per sign-in in `src/lib/session.tsx`), kept in the plain
+secure-store home so it can be read with nobody holding the phone.
+
+- **Android** — `react-native-android-widget`: the widget is the JSX in
+  `src/widgets/glance-widget.tsx`, drawn by the headless task in
+  `src/widgets/android.tsx` (registered from `index.js`, the app entry).
+  Declared in `app.json` under the plugin's `widgets`; the picker preview
+  is `assets/images/widget-glance-preview.png`. Rebuild the native
+  project (`npx expo prebuild --platform android`) after changing either.
+- **iOS** — a WidgetKit extension, `targets/glance/index.swift`, generated
+  into the Xcode project by `@bacons/apple-targets` at prebuild. It reads
+  the credential from the Keychain in the app group
+  `group.<your bundle id>`, which `plugins/with-widget-sharing.js` grants
+  the app and the target config grants the extension. The tiny local
+  module `modules/widget-reload` lets the app ask WidgetKit to redraw
+  and clear the extension's cached payload.
+  Signing: the extension is its own bundle id (`<app id>.glance`) and
+  needs its own provisioning profile; EAS manages that when
+  `ios.appleTeamId` is set in `app.json`. The Swift is not compiled by
+  `npm run typecheck` — build with Xcode or EAS to verify it.
+- The face — stale after an hour, "Sign in" without a credential, "Set a
+  plan" before a budget — is decided in `src/lib/glance-pure.ts` (node
+  tested) and mirrored line for line in the Swift.
+- The cached payload (both platforms) is one household's numbers, so it
+  goes with the credential: sign-out and a refused (401) poll drop it, and
+  a sign-in to a different household or server drops it before the new
+  credential is written (`widgetOwner` in `src/lib/glance-pure.ts`).
+
+## Layout
+
+```
+src/app/          expo-router routes — one file per screen
+  connect.tsx     first-run server URL
+  login.tsx       password or native passkey → device token mint
+  unlock.tsx      biometric gate
+  (tabs)/         Today, Transactions, Accounts, Bills, More
+  …               the rest of the product hangs off More: budget, month,
+                  year, spending, cash flow, net worth, retire, reimburse,
+                  rules, merchants, business, imports, assistant, items,
+                  alerts, doctor, notifications, settings, security, help,
+                  feedback (plus the detail screens txn, bill,
+                  bill-history, and the welcome / business / connect-hub
+                  walkthroughs) — `ls src/app` is the current list
+src/lib/          api client + types, secure storage, session state,
+                  push, passkeys, theme, and pure.ts (money/merge logic
+                  with no React Native imports, so node can test it)
+src/components/   shared UI (ledger row, money map, staleness banner)
+```
+
+Every screen mirrors a page of the web app (`../webapp`) — same naming,
+wording and semantics. When you change one, change the other.

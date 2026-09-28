@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block body %}
+{# Written for whoever the mail reached — an owner, a partner, a guest with
+   no account. One question, one button, no sign-in, no pitch.
+
+   The GET only shows this; the mute is the POST. A mail scanner that
+   prefetches every link must not silence someone who did nothing (the same
+   peek-then-act split as /recipient-invite and /verify-email). #}
+<h1>{% if state == 'done' %}Unsubscribed{% else %}Unsubscribe{% endif %}</h1>
+<div class="card" style="max-width:30rem">
+  {% if state == 'confirm' %}
+  <p>Stop every Oikonome email to <b>{{ email }}</b>?</p>
+  <p class="sub" style="margin-top:0">That is the daily verdict, the weekly
+    report, the monthly report card, the year in review, and the household
+    alerts. Sign-in and security emails are not affected.</p>
+  <form method="post" action="/unsubscribe" style="margin-top:1rem">
+    <input type="hidden" name="token" value="{{ token }}">
+    <button class="pri" name="answer" value="unsubscribe">Unsubscribe
+      {{ email }}</button>
+  </form>
+  <p class="sub">Changed your mind later? The household owner can turn it
+    back on under Settings → Email.</p>
+  {% elif state == 'done' %}
+  <p>Done — <b>{{ email }}</b> will not receive any more Oikonome household
+    emails.</p>
+  <p class="sub">Stops immediately. The household owner can turn it back on
+    under Settings → Email, and you can close this page.</p>
+  {% elif state == 'failed' %}
+  <div class="note" style="margin-bottom:.8rem">That did not save — the
+    instance could not update its settings just now.</div>
+  <p class="sub" style="margin-top:0">Try the link again in a minute, or ask
+    the household owner to mute <b>{{ email }}</b> under Settings → Email.</p>
+  {% else %}
+  <div class="note" style="margin-bottom:.8rem">That unsubscribe link is
+    not valid for this instance.</div>
+  <p class="sub" style="margin-top:0">Use the link at the bottom of the most
+    recent email, or ask the household owner to mute your address under
+    Settings → Email.</p>
+  {% endif %}
+</div>
+{% endblock %}

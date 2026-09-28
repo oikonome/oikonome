@@ -1,0 +1,26 @@
+# Dependabot here raises ALERTS, not pull requests: version updates are
+# checked but never opened (limit 0), and a dependency bump lands through a
+# normal release. Security advisories still arrive through the repository's
+# Dependabot alerts.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /server
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+  - package-ecosystem: npm
+    directory: /webapp
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+  - package-ecosystem: npm
+    directory: /mobile
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+  - package-ecosystem: docker
+    directory: /docker
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0

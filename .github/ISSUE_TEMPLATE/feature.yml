@@ -1,0 +1,12 @@
+name: Feature request
+description: An idea or a missing capability
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve for you?
+    validations: { required: true }
+  - type: textarea
+    id: shape
+    attributes:
+      label: What might it look like?

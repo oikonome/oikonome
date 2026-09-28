@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block body %}
+<h1>Finish creating your account</h1>
+<div class="card" style="max-width:26rem">
+  {% if error %}<div class="note" style="margin-bottom:.8rem;background:rgba(224,105,93,.10);border-color:rgba(224,105,93,.4);color:var(--red)">{{ error }}</div>
+  <p class="sub"><a href="/login">Sign in</a> · <a href="/signup">Start again</a></p>
+  {% elif road == 'blocked' %}
+  <p class="sub" style="margin-top:0">There is already an account for <b>{{ email }}</b>.
+    It was never confirmed, but it is in use — it holds records, or
+    something an operator's add-on holds for it, or other people are signed up inside it. <b>Nothing here
+    will be deleted, and nothing here will be handed over.</b> This page
+    will not act at all.</p>
+  <p class="sub">This one needs a person. Write to
+    {% if support_email %}<b>{{ support_email }}</b>{% else %}whoever runs this instance{% endif %}
+    from this address and it will be sorted out by hand.</p>
+  <p class="sub" style="margin-top:.8rem">Already have an account you can use?
+    <a href="/login">Sign in</a></p>
+  {% elif road == 'move_out' %}
+  <p class="sub" style="margin-top:0">This address was added to
+    <b>someone else's household</b> as a member, and it was never confirmed.
+    Because you can read this address, continuing moves it out into a new,
+    empty household of your own. <b>That household's records stay where they
+    are</b> — and you will not have access to them. What stops working is
+    only what was set up on this address itself: its password, any
+    authenticator or passkeys, and any invitations it sent that nobody has
+    used. Choose the password you'll sign in with — whatever was typed on the
+    signup form is not kept.</p>
+  <form method="post" action="/signup/reclaim">
+    <input type="hidden" name="token" value="{{ token }}">
+    <p><label>Password <span class="sub">(10+ characters)</span><br><input type="password" name="password" required minlength="10" autocomplete="new-password"
+        style="width:100%;padding:.5rem;background:var(--hover);border:1px solid var(--line);border-radius:var(--rs);color:var(--ink)"></label></p>
+    <button class="pri">Finish and sign in</button>
+  </form>
+  <p class="sub" style="margin-top:.8rem">Already have an account you can use?
+    <a href="/login">Sign in</a> · <a href="/forgot">Reset your password</a></p>
+  {% else %}
+  <p class="sub" style="margin-top:0">You're finishing the account for <b>{{ email }}</b>.
+    An earlier account was started under this address and never confirmed;
+    it holds nothing at all — no records, no settings, nothing an add-on holds and
+    nobody else — and finishing here replaces it. Choose the password you'll
+    sign in with — whatever was typed on the signup form is not kept.</p>
+  <form method="post" action="/signup/reclaim">
+    <input type="hidden" name="token" value="{{ token }}">
+    <p><label>Password <span class="sub">(10+ characters)</span><br><input type="password" name="password" required minlength="10" autocomplete="new-password"
+        style="width:100%;padding:.5rem;background:var(--hover);border:1px solid var(--line);border-radius:var(--rs);color:var(--ink)"></label></p>
+    <button class="pri">Finish and sign in</button>
+  </form>
+  <p class="sub" style="margin-top:.8rem">Already have an account you can use?
+    <a href="/login">Sign in</a> · <a href="/forgot">Reset your password</a></p>
+  {% endif %}
+</div>
+{% endblock %}

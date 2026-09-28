@@ -1,0 +1,42 @@
+{"raw": "X-Press", "merchant": "X-Press", "note": "letter-hyphen brand keeps its short half"}
+{"raw": "Q-PACK STORAGE OF SPRINGFIELD SPRINGFIELD IL", "merchant": "Q-Pack Storage Springfield Springfield"}
+{"raw": "K-WIRELESS", "merchant": "K-Wireless"}
+{"raw": "K-o-a Gas #0555", "merchant": "K-O-A Gas"}
+{"raw": "9-LANTERN #123", "merchant": "9-Lantern", "note": "digit-hyphen brand"}
+{"raw": "1-800-Blooms", "merchant": "1-800-Blooms"}
+{"raw": "A-1 TOWING", "merchant": "A-1 Towing"}
+{"raw": "QUICK-PIE-A #123", "merchant": "Quick-Pie-A"}
+{"raw": "Q-ZTrip", "merchant": "Q-Ztrip"}
+{"raw": "Ki-Sol Stores", "merchant": "Ki-Sol Stores"}
+{"raw": "MAPLE Q-SUMMIT - 2ND ST", "merchant": "Maple Q-Summit"}
+{"raw": "XFER-OUT HARBORLINE SAVINGS ATM-WEB", "merchant": "Xfer Out Harborline Savings Atm", "note": "bank punctuation splits"}
+{"raw": "Harbor-coffee #5150", "merchant": "Harbor Coffee"}
+{"raw": "CHARGE-SERVICE", "merchant": "Charge Service"}
+{"raw": "SQ *COFFEE HOUSE", "merchant": "Coffee House", "note": "processor prefix"}
+{"raw": "TST* BURGER BARN", "merchant": "Burger Barn"}
+{"raw": "GglPay BRIGHTMART", "merchant": "Brightmart"}
+{"raw": "PP*SUITEHUB", "merchant": "Suitehub"}
+{"raw": "ACME STORE XXXXX1234", "merchant": "Acme Store", "note": "masked id tail"}
+{"raw": "PARKING 312-555-01234 LOT", "merchant": "Parking", "note": "phone number is noise"}
+{"raw": "PETROX 12-31 STORE 1010", "merchant": "Petrox Store"}
+{"raw": "BRIARWOOD LOFTS RENT ~ SCHED 1620.00 ~ REF 44", "merchant": "Briarwood Lofts Rent", "note": "a tilde clause carries a volatile amount"}
+{"raw": "CEDAR DINER 200 N. OAK AVE. SPRINGFIELD, NV, US", "merchant": "Cedar Diner", "note": "postal tail then street address"}
+{"raw": "QUILLON Transportation", "merchant": "Quillon Transportation", "note": "a word that starts with Tran is not the Tran: marker"}
+{"raw": "TEST WHSE #0123", "merchant": "Test Whse"}
+{"raw": "AMAZON.COM*1A2B3C AMZN.COM/BILL WA", "merchant": "Amazon Amzn", "note": "a mixed alnum token is not a word — its letters do not survive"}
+{"raw": "Venmo — Casey Example", "merchant": "Venmo — Casey Example", "note": "app-made counterparty name kept verbatim (resolver rule; canonical_merchant not consulted)", "verbatim": true}
+{"raw": "NOVA FI", "merchant": "Nova Fi", "note": "trailing two letters on a two-word name are the product, not a truncation"}
+{"raw": "VOLARI FI", "merchant": "Volari Fi"}
+{"raw": "AT NOOK 2033", "merchant": "At Nook", "note": "a leading word that is a word keeps its word shape"}
+{"raw": "MAPLE Q-SUMMIT - 2ND ST", "merchant": "Maple Q-Summit", "note": "'Nd' is a fragment of 2ND, not a word; 'St' is a street suffix"}
+{"raw": "NW BANK", "merchant": "NW Bank", "note": "leading two-letter word is the brand, not noise"}
+{"raw": "nw bank", "merchant": "NW Bank"}
+{"raw": "JT OUTFITTERS #3030", "merchant": "JT Outfitters"}
+{"raw": "QX APPLIANCES", "merchant": "QX Appliances"}
+{"raw": "TACO HUT CENTER NV", "merchant": "Taco Hut Center", "note": "trailing two letters after a full name are the bank's state code"}
+{"raw": "CEDAR RIDGE MA", "merchant": "Cedar Ridge", "note": "trailing two letters are a word the bank truncated"}
+{"raw": "SQ COFFEE HOUSE", "merchant": "Coffee House", "note": "a processor code is not a name in any position"}
+{"raw": "Juniper's Market", "merchant": "Junipers Market", "note": "an apostrophe joins its letters, so the name matches the line 'JUNIPERS MARKET'"}
+{"raw": "JUNIPERS MARKET", "merchant": "Junipers Market"}
+{"raw": "L'Amandiere", "merchant": "Lamandiere", "note": "an elided prefix joins too, agreeing with the line that prints it closed up"}
+{"raw": "Q'Z BURGER BARN", "merchant": "QZ Burger Barn", "note": "two letters an apostrophe joins are a whole word, not two dropped pieces"}

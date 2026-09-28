@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block body %}
+<h1>Account recovery</h1>
+<div class="card" style="max-width:28rem">
+  {% if error %}<div class="note" style="margin-bottom:.8rem;background:rgba(224,105,93,.10);border-color:rgba(224,105,93,.4);color:var(--red)">{{ error }}</div>{% endif %}
+  {% if state == "requested" %}
+  <div class="note" style="background:rgba(92,181,107,.10);border-color:rgba(92,181,107,.4);color:var(--green)">Recovery requested.</div>
+  <p style="margin:.8rem 0 .4rem">Nothing has changed yet. A reset that removes this
+    account's second factor becomes possible on
+    <b>{{ lands_at.strftime('%b %d, %Y at %H:%M UTC') }}</b>.</p>
+  <p class="sub">We have told the account by email (and by push and text where those are
+    set up). If that message was not expected, one click on it cancels this — and so
+    does any sign-in.</p>
+  <p class="sub">After that date, come back to <a href="/forgot">Reset password</a>,
+    request a fresh link, and it will work without a recovery code.{% if support_email %} Questions:
+    <a href="mailto:{{ support_email }}">{{ support_email }}</a>.{% endif %}</p>
+  {% elif state == "landed" %}
+  <p style="margin-top:0">The waiting period is over — your reset link works
+    without a recovery code now.</p>
+  <p class="sub"><a href="/reset?token={{ token }}">Back to the reset page</a></p>
+  {% elif state == "not_needed" %}
+  <p style="margin-top:0">This account has no second factor to clear — your reset link
+    works as it is.</p>
+  <p class="sub"><a href="/reset?token={{ token }}">Back to the reset page</a></p>
+  {% elif state == "cancel_confirm" %}
+  <p style="margin-top:0">Cancel the recovery requested for <b>{{ email }}</b>?</p>
+  <p class="sub">It would have allowed a reset that removes the account's second factor
+    on {{ lands_at.strftime('%b %d, %Y at %H:%M UTC') }}. Cancelling keeps every factor in
+    place; nothing else changes.</p>
+  <form method="post" action="/recover/cancel">
+    <input type="hidden" name="token" value="{{ token }}">
+    <button class="pri">Cancel the recovery</button>
+  </form>
+  <p class="sub" style="margin-top:.8rem">If you did not ask for this, also change your
+    password once signed in{% if support_email %}, and write to
+    <a href="mailto:{{ support_email }}">{{ support_email }}</a>{% endif %}.</p>
+  {% elif state == "cancelled" %}
+  <div class="note" style="background:rgba(92,181,107,.10);border-color:rgba(92,181,107,.4);color:var(--green)">Cancelled — the account's second factor stays.</div>
+  <p class="sub" style="margin-top:.8rem"><a href="/login">Back to sign in</a></p>
+  {% else %}
+  <p class="sub"><a href="/forgot">Request a new reset link</a></p>
+  {% endif %}
+</div>
+{% endblock %}

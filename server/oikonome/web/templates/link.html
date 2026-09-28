@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block body %}
+<div class="card" style="max-width:40rem;margin-top:1rem">
+  <h2 style="margin-top:0">
+    {% if kind == 'update' %}Re-authenticate {{ institution or 'connection' }}
+    {% else %}Add a bank connection{% endif %}
+  </h2>
+  <p class="sub">A secure Plaid login page opens in a new tab. Log into your
+     bank there — this page waits and finishes automatically. You can open
+     the tab on this device or scan the link on your phone.</p>
+
+  <p>
+    <a class="btn pri" href="{{ url }}" target="_blank" rel="noopener"
+       id="linkopen" style="text-decoration:none">Open bank login ↗</a>
+    <a class="btn" href="/accounts" style="text-decoration:none">cancel</a>
+  </p>
+
+  {# the waiting/polling logic lives in /static/pages.js (#linkwait hook)
+     — no inline script, so the pages CSP stays script-src 'self'
+      #}
+  <div id="strip" style="display:flex;align-items:center;gap:.6rem;margin-top:.4rem;
+       padding:.55rem .8rem;border:1px solid var(--line);border-radius:8px;background:var(--hover)">
+    <span id="spin" style="display:inline-block;width:14px;height:14px;border:2px solid var(--mut);
+          border-top-color:var(--blue);border-radius:50%;animation:spin 0.9s linear infinite"></span>
+    <span id="txt">Waiting for you to finish in the bank tab…</span>
+    <span id="elapsed" class="mut" style="font-size:12px"></span>
+  </div>
+  <div id="linkwait" data-url="{{ url }}" data-token="{{ link_token }}"></div>
+  <style>@keyframes spin{to{transform:rotate(360deg)}}</style>
+</div>
+{% endblock %}

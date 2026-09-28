@@ -1,0 +1,40 @@
+__pycache__/
+*.pyc
+.venv/
+# symlinked venvs/node_modules too — a `dir/` pattern skips symlinks, so a
+# worktree's .venv symlink would otherwise be committable
+.venv
+*.egg-info/
+# a bare `.env` does NOT cover `.env.local` / `.env.staging` / `.env.prod` — a
+# real secrets file under any of those names would be committable. Ignore the
+# whole family and re-admit the one template that must stay tracked.
+.env
+.env.*
+!.env.example
+node_modules/
+node_modules
+dist/
+/data/
+docker/compose.override.yaml
+# community scripts default to a credentials.json beside the script in an
+# INSTALLED copy — belt against one landing in a checkout
+community-scripts/*/credentials.json
+.envrc
+
+# Build manifest for the admin console's version-history panel. GENERATED at
+# build time, never committed: install.sh writes it from the checkout's own
+# history, so a tracked copy would only go stale.
+server/oikonome/version_history.tsv
+
+# maintenance lock taken by oikonome.sh / scripts/backup.sh
+.maintenance.lock
+
+# generated from the running server; never tracked
+webapp/openapi.json
+# a publisher's own Firebase config; every checkout supplies its own
+mobile/google-services.json
+
+# an operator's add-on is installed from here at image build time; only
+# the README is the product's
+extras/*
+!extras/README.md

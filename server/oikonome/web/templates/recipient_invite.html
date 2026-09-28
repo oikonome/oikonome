@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block body %}
+{# the recipient's page, and the only page in the app written for
+   someone who does not have an account and may never want one. So: no
+   sign-in link, no product pitch, no "create your own" — two buttons and
+   enough information to choose between them.
+
+   The GET only PEEKS (same as /verify-email): a mail
+   scanner prefetching this link must not be able to consent on a person's
+   behalf. Both real answers are POSTs. #}
+<h1>{% if state == 'invited' %}Join this daily email?{% else %}Daily email{% endif %}</h1>
+<div class="card" style="max-width:30rem">
+  {% if state == 'invited' %}
+  <p>
+    {% if invited_by %}<b>{{ invited_by }}</b> would like{% else %}Someone
+    would like{% endif %} to send <b>{{ email }}</b> their household's daily
+    Oikonome summary.
+  </p>
+  <p class="sub" style="margin-top:0">It contains their real balances and
+    spending, so it only starts if you say yes.</p>
+
+  <h2 style="margin-top:1.1rem">What you'd get</h2>
+  <table role="presentation">
+    <tr><td style="border:0;padding:.3rem 0">
+      <b>One email each morning</b><br>
+      <span class="sub">Are they on budget today, and the one number to hit
+        if they're not.</span></td></tr>
+    <tr><td style="border:0;padding:.3rem 0">
+      <b>Nothing else</b><br>
+      <span class="sub">No marketing, no account, no tracking — we don't
+        even record whether you open it.</span></td></tr>
+    <tr><td style="border:0;padding:.3rem 0">
+      <b>A way out, always</b><br>
+      <span class="sub">Say no here, or ask them to remove you, at any
+        time.</span></td></tr>
+  </table>
+
+  <form method="post" action="/recipient-invite" style="margin-top:1rem">
+    <input type="hidden" name="token" value="{{ token }}">
+    <button class="pri" name="answer" value="accept">Yes, send it to me</button>
+    <button name="answer" value="decline" style="margin-left:.4rem">No
+      thanks</button>
+  </form>
+  {% elif state == 'confirm_decline' %}
+  {# Declining is the one answer nobody can undo — invite() refuses to
+     re-ask an address that said no, so a misclick locks BOTH sides out.
+     Accepting needs no such step: it is reversible by asking to be
+     removed. #}
+  <p>Just to be sure — decline the daily summary for
+    <b>{{ email }}</b>?</p>
+  <p class="sub">This is final. {{ invited_by or 'Whoever invited you' }}
+    cannot re-send it afterwards, and nothing further will be sent to this
+    address.</p>
+  <form method="post" action="/recipient-invite" style="margin-top:1rem">
+    <input type="hidden" name="token" value="{{ token }}">
+    <button name="answer" value="decline_confirmed">Yes, decline</button>
+    <button class="pri" name="answer" value="accept"
+            style="margin-left:.4rem">Actually, send it to me</button>
+  </form>
+  {% elif state == 'accepted' %}
+  <p>{% if again %}You already said yes — <b>{{ email }}</b> is on the list.
+    {% else %}You're on the list — <b>{{ email }}</b> will get the daily
+    summary from tomorrow morning.{% endif %}</p>
+  <p class="sub">Changed your mind? Ask whoever added you to remove you in
+    Settings → Email, and it stops immediately.</p>
+  {% elif state == 'declined' %}
+  <p>{% if again %}You already said no — <b>{{ email }}</b> is not receiving
+    this email.{% else %}Done — <b>{{ email }}</b> will not receive this
+    email.{% endif %}</p>
+  {# NOT the generic "ask them to add you again — that sends a fresh link"
+     line, which is false for a declined address: invite() refuses to
+     re-ask one, on purpose, so nobody who says no gets pestered every time
+     the household edits its settings. Say what is actually true. #}
+  <p class="sub">Nothing was sent to this address, and nothing will be. This
+    answer is final — re-adding the address won't ask you again, so you won't
+    hear from us about it a second time.</p>
+  {% else %}
+  <div class="note" style="margin-bottom:.8rem">{{ error }}</div>
+  <p class="sub" style="margin-top:0">If you still want this email, ask the
+    person who invited you to add you again — that sends a fresh link.</p>
+  {% endif %}
+</div>
+{% endblock %}

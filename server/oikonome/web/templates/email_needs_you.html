@@ -1,0 +1,58 @@
+{# ============================================================================
+   "Needs you" — the daily email's closing section, rendered PER RECIPIENT
+   by notify/mailact.render for the addresses that hold an owner or member
+   account. Proposed bills, uncategorized charges and the alert strip, each
+   line with a button that acts through a signed link (GET peeks, POST acts).
+   A viewer's or guest's copy never carries this section, nor the alerts.
+   Email-safe markup only: inline styles, table layout, no forms, no script.
+   The inliner bakes the class names below into style= attributes.
+   ========================================================================== #}
+{% set btn = 'display:inline-block;padding:5px 11px;border-radius:6px;font-size:12.5px;font-weight:600;text-decoration:none;margin:0 6px 4px 0;border:1px solid ' %}
+{% set b_yes = btn ~ 'rgba(92,181,107,.5);color:#5cb56b;background:rgba(92,181,107,.10);' %}
+{% set b_no = btn ~ '#2a323d;color:#8b98a3;background:transparent;' %}
+{% set b_cat = btn ~ 'rgba(79,155,214,.45);color:#4f9bd6;background:rgba(79,155,214,.08);' %}
+<div style="margin-top:22px;padding-top:14px;border-top:1px solid #2a323d;">
+  <h2 style="font-size:17px;margin:0 0 2px;color:#dbe3ea;">Needs you{% if app_base %}<span class="sub" style="font-weight:400;"> · one tap each, no sign-in</span>{% endif %}</h2>
+
+  {% if proposals %}
+  <div class="card" style="padding:10px 12px;margin:10px 0 0;">
+    <div class="sub" style="letter-spacing:.08em;text-transform:uppercase;font-size:11.5px;margin-bottom:4px;">Proposed bills</div>
+    <table cellpadding="0" cellspacing="0" width="100%" role="presentation" style="border-collapse:collapse;">
+      {% for p in proposals %}
+      <tr><td style="padding:7px 0;border-bottom:1px solid #2a323d;font-size:14px;">
+          <b>{{ p.payee }}</b> <span class="sub">· {{ moneyc(p.amount) }} · {{ p.cadence }}{% if p.bill_payee %} · joins {{ p.bill_payee }}{% endif %}</span>
+          {% if p.summary %}<div class="sub" style="font-size:12px;">{{ p.summary }}</div>{% endif %}</td>
+        <td style="padding:7px 0;border-bottom:1px solid #2a323d;text-align:right;white-space:nowrap;vertical-align:top;">
+          <a href="{{ p.yes_url }}" style="{{ b_yes }}">{{ p.yes }}</a><a href="{{ p.no_url }}" style="{{ b_no }}">{{ p.no }}</a></td></tr>
+      {% endfor %}
+    </table>
+    {% if more_proposals %}<div class="sub" style="font-size:12.5px;margin-top:6px;">{{ more_proposals }} more on the <a href="{{ app_base }}/app/bills" style="color:#8b98a3;">Bills page →</a></div>{% endif %}
+  </div>
+  {% endif %}
+
+  {% if uncategorized %}
+  <div class="card" style="padding:10px 12px;margin:10px 0 0;">
+    <div class="sub" style="letter-spacing:.08em;text-transform:uppercase;font-size:11.5px;margin-bottom:4px;">Uncategorized</div>
+    <table cellpadding="0" cellspacing="0" width="100%" role="presentation" style="border-collapse:collapse;">
+      {% for u in uncategorized %}
+      <tr><td style="padding:7px 0 2px;font-size:14px;"><span class="sub">{{ u.date|d }} ·</span> <b>{{ u.payee }}</b> <span class="sub">· {{ moneyc(-u.amount) }}</span></td></tr>
+      <tr><td style="padding:0 0 8px;border-bottom:1px solid #2a323d;">
+          {% for o in u.options %}<a href="{{ o.url }}" style="{{ b_cat }}">{{ o.label }}</a>{% endfor %}
+          <a href="{{ app_base }}/app/transactions?cat=%3F&amp;y={{ (u.date|string)[:4] }}&amp;m={{ (u.date|string)[5:7]|int }}" style="color:#8b98a3;font-size:12px;text-decoration:underline;">other…</a></td></tr>
+      {% endfor %}
+    </table>
+  </div>
+  {% endif %}
+
+  {% if alerts %}
+  <div class="sub" style="letter-spacing:.08em;text-transform:uppercase;font-size:11.5px;margin:14px 0 0;">Alerts</div>
+  {% for a in alerts %}
+  <div class="note" style="margin:8px 0 0;display:flex;gap:.5rem;align-items:baseline;{% if a.severity == 'bad' %}background:rgba(224,105,93,.10);border-color:rgba(224,105,93,.4);color:var(--red){% elif a.severity == 'good' %}background:rgba(92,181,107,.10);border-color:rgba(92,181,107,.35);color:var(--green){% elif a.severity == 'info' %}background:var(--card);border-color:var(--line);color:var(--mut){% endif %};">
+    <span style="flex:1;">{{ '⚠' if a.severity in ('bad','warn') else '✓' if a.severity == 'good' else '•' }}
+      {%- if a.link and app_base %} <a href="{{ app_base ~ '/app' ~ a.link }}" style="color:inherit;text-decoration:underline;">{{ a.message }}</a>
+      {%- else %} {{ a.message }}{% endif %}</span>
+    {% if a.mute_url %}<a href="{{ a.mute_url }}" style="color:#8b98a3;font-size:12px;text-decoration:none;white-space:nowrap;margin-left:8px;">mute ✕</a>{% endif %}
+  </div>
+  {% endfor %}
+  {% endif %}
+</div>

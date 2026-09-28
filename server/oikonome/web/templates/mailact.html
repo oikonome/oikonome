@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block body %}
+{# The page behind a button in the daily email — confirm a proposed bill,
+   file an uncategorized charge, mute an alert. Written for the owner or
+   member the mail reached: one sentence saying what will happen, one
+   button, no sign-in.
+
+   The GET only shows this; the change is the POST. A mail scanner that
+   prefetches every link must not approve a bill on someone's behalf (the
+   same peek-then-act split as /unsubscribe). #}
+<h1>{% if state == 'done' %}Done{% elif state == 'confirm' %}From your email{% else %}Nothing to do{% endif %}</h1>
+<div class="card" style="max-width:30rem">
+  {% if state == 'confirm' %}
+  <p>{{ sentence }}</p>
+  <form method="post" action="/act" style="margin-top:1rem">
+    <input type="hidden" name="token" value="{{ token }}">
+    <button class="pri">{{ button }}</button>
+  </form>
+  <p class="sub">Acting as <b>{{ email }}</b>. Nothing changes until you press the button.</p>
+  {% elif state == 'done' %}
+  <p>{{ sentence }}</p>
+  <p class="sub">You can close this page{% if app_base %}, or <a href="{{ app_base }}/app/">open Oikonome</a>{% endif %}.</p>
+  {% elif state == 'already' %}
+  <p>{{ sentence or 'That was already taken care of.' }}</p>
+  <p class="sub">Nothing was changed. You can close this page.</p>
+  {% elif state == 'expired' %}
+  <div class="note" style="margin-bottom:.8rem">That link has expired.</div>
+  <p class="sub" style="margin-top:0">Email buttons work for {{ ttl_days }} days. Use the buttons in the most recent email, or make the change in the app.</p>
+  {% elif state == 'forbidden' %}
+  <div class="note" style="margin-bottom:.8rem">This address can no longer act on the household from email.</div>
+  <p class="sub" style="margin-top:0">Only an owner or member account can confirm bills, file charges or mute alerts. Sign in to the app to make the change.</p>
+  {% elif state == 'blocked' %}
+  <div class="note" style="margin-bottom:.8rem">Email buttons are off for this household right now{% if sentence %} — {{ sentence }}{% endif %}.</div>
+  <p class="sub" style="margin-top:0">Nothing was changed. Sign in to the app to see what it needs.</p>
+  {% elif state == 'failed' %}
+  <div class="note" style="margin-bottom:.8rem">That did not save{% if sentence %} — {{ sentence }}{% endif %}.</div>
+  <p class="sub" style="margin-top:0">Try the button again in a minute, or make the change in the app.</p>
+  {% else %}
+  <div class="note" style="margin-bottom:.8rem">That link is not valid for this instance.</div>
+  <p class="sub" style="margin-top:0">Use the buttons in the most recent email, or make the change in the app.</p>
+  {% endif %}
+</div>
+{% endblock %}

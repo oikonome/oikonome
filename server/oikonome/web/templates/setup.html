@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block body %}
+<h1>Welcome — set up your instance</h1>
+<div class="card">
+  {% if error %}<div class="note" style="margin-bottom:.8rem;background:rgba(224,105,93,.10);border-color:rgba(224,105,93,.4);color:var(--red)">{{ error }}</div>{% endif %}
+  <form method="post" action="/setup">
+    {% if token %}<input type="hidden" name="token" value="{{ token }}">{% endif %}
+    <p><label>Email<br><input type="email" name="email" required value="{{ email or '' }}"
+        style="width:100%;padding:.5rem;background:var(--hover);border:1px solid var(--line);border-radius:var(--rs);color:var(--ink)"></label></p>
+    <p><label>Password <span class="sub">(10+ characters)</span><br>
+      <input type="password" name="password" required minlength="10"
+        style="width:100%;padding:.5rem;background:var(--hover);border:1px solid var(--line);border-radius:var(--rs);color:var(--ink)"></label></p>
+
+    {# connections + smart categorization live entirely in the guided
+       wizard that follows account creation — this page is just the
+       account. #}
+    <button class="pri">Create my instance</button>
+  </form>
+</div>
+{% endblock %}

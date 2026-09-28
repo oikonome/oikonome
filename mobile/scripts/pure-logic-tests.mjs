@@ -1,0 +1,2228 @@
+// Unit tests for src/lib/pure.ts — mobile has no JS test framework, so
+// these run under plain node (v22.6+):
+//
+//   node --experimental-strip-types scripts/pure-logic-tests.mjs
+//
+// The server suite invokes this too (tests/test_mobile_budget_shape.py),
+// so `make test` goes red if the banker's rounding or the savings-goals
+// merge regresses.
+import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
+import zlib from "node:zlib";
+import test from "node:test";
+
+import { ApiError, countsInTotals, errText, inOperatingProfit,
+         whatIfRefusal } from "../src/lib/api.ts";
+import { categoryForServer, CLEAR_CATEGORY, composeBugReport,
+         filterCategories, dayLabel, daySpend,
+         elevationProof, recoveryNeedsPassword, hostOf,
+         hueOf, isPrivateHost, isValidYmd, logoProxyUrl, monogram,
+         monthYear, serverUrlVerdict, lastSyncPhrase, mergeSavingsGoals,
+         money, moneyParam, numv, pyround, resolveFace, span, whatIfQuery,
+         withDayHeads }
+  from "../src/lib/pure.ts";
+
+import * as pureModule from "../src/lib/pure.ts";
+import { moneyCases } from "./money-cases.mjs";
+
+import { clockLabel, glanceFace, STALE_AFTER_MS, wideEnoughForChips,
+         widgetOwner, widgetOwnerChanged, credentialStamp, ownedCache,
+         saveStillOwned } from "../src/lib/glance-pure.ts";
+
+// ---- the home-screen widget's face: the hero's simple face, decided
+// from the payload alone; stale beats wrong, and no credential is
+// "Sign in", not a zero ----
+const glance = (over = {}) => ({
+  date: "2026-01-15", budgets_set: true, verdict: "ON BUDGET",
+  left_today: 47, day_spent: 29, day_allow: 76, days_left: 16,
+  pace_line: "$12/day ahead",
+  chips: [{ text: "Groceries $22 today", tone: "" },
+          { text: "Gas over by $8", tone: "neg" }],
+  as_of: "2026-01-15T09:40:00Z", ...over });
+const at = (ms) => ({ glance: glance(), fetched_at: ms });
+
+test("widget: no credential is Sign in, no plan is Set a plan", () => {
+  assert.equal(glanceFace(at(0), false, 0).kind, "signin");
+  assert.equal(glanceFace({ glance: glance({ budgets_set: false }),
+                            fetched_at: 0 }, true, 0).kind, "noplan");
+});
+
+test("widget: the number is the hero's headline in whole dollars", () => {
+  const f = glanceFace(at(1000), true, 1000);
+  assert.equal(f.kind, "verdict");
+  assert.equal(f.number, "$47");
+  assert.equal(f.verdict, "On budget");
+  assert.equal(f.tone, "good");
+  assert.equal(f.sub, "$29 of $76 spent");
+  assert.equal(f.pace, "$12/day ahead");
+  assert.ok(Math.abs(f.fill - 29 / 76) < 1e-9);
+  assert.equal(f.over, false);
+  assert.equal(f.stale, false);
+  assert.deepEqual(f.chips, [{ text: "Groceries $22 today", neg: false },
+                             { text: "Gas over by $8", neg: true }]);
+});
+
+test("widget: over is red, the bar is full and the sub-line says by how much", () => {
+  const f = glanceFace({ glance: glance({ verdict: "OVER BUDGET",
+    left_today: 0, day_spent: 94, day_allow: 76, days_left: 9 }),
+    fetched_at: 5 }, true, 5);
+  assert.equal(f.verdict, "Over budget");
+  assert.equal(f.tone, "bad");
+  assert.equal(f.fill, 1);
+  assert.equal(f.over, true);
+  assert.equal(f.sub, "$18 over · 9 days left");
+  assert.equal(f.number, "$0");
+});
+
+test("widget: an hour-old payload is stale, a minute-old one is not", () => {
+  const now = 10_000_000;
+  assert.equal(glanceFace(at(now - STALE_AFTER_MS - 1), true, now).stale, true);
+  assert.equal(glanceFace(at(now - 60_000), true, now).stale, false);
+  // a credential with nothing cached yet is a placeholder, never Sign in
+  const empty = glanceFace(null, true, now);
+  assert.equal(empty.kind, "verdict");
+  assert.equal(empty.number, "…");
+  assert.equal(empty.stale, true);
+});
+
+test("widget: thousands are grouped, the clock reads 12-hour", () => {
+  const f = glanceFace({ glance: glance({ left_today: 1234, day_allow: 2000,
+    day_spent: 766 }), fetched_at: 0 }, true, 0);
+  assert.equal(f.number, "$1,234");
+  assert.equal(f.sub, "$766 of $2,000 spent");
+  const noon = new Date(2026, 0, 15, 12, 5).getTime();
+  assert.equal(clockLabel(noon), "12:05 PM");
+  assert.equal(clockLabel(new Date(2026, 0, 15, 0, 7).getTime()), "12:07 AM");
+  assert.equal(clockLabel(new Date(2026, 0, 15, 7, 15).getTime()), "7:15 AM");
+  assert.equal(wideEnoughForChips(160), false);
+  assert.equal(wideEnoughForChips(320), true);
+});
+
+// ---- the debt planner's labels: a month first is a month, not a day;
+// a duration reads in years and months ----
+
+test("a payoff month is named without its day", () => {
+  assert.equal(monthYear("2029-03-01"), "Mar 2029");
+  assert.equal(monthYear("2026-12-01"), "Dec 2026");
+  assert.equal(monthYear(null), "");
+  assert.equal(monthYear(""), "");
+});
+
+test("a plan's length reads in years and months", () => {
+  assert.equal(span(29), "2 yr 5 mo");
+  assert.equal(span(24), "2 yr");
+  assert.equal(span(7), "7 mo");
+  assert.equal(span(0), "today");
+  assert.equal(span(null), "not within fifty years");
+});
+
+// ---- banker's rounding: whole-dollar figures must match the server's
+// Python round(), the web and the daily email on every .5 boundary ----
+
+test("halves round to the even neighbour, both signs", () => {
+  assert.equal(pyround(2.5), 2);
+  assert.equal(pyround(3.5), 4);
+  assert.equal(pyround(-186.5), -186);
+  assert.equal(pyround(-187.5), -188);
+  assert.equal(pyround(-0.5), 0);
+  assert.equal(pyround(0.5), 0);
+});
+
+test("non-halves round to the nearest integer, both signs", () => {
+  assert.equal(pyround(2.4), 2);
+  assert.equal(pyround(2.6), 3);
+  assert.equal(pyround(-2.4), -2);
+  assert.equal(pyround(-2.6), -3);
+  assert.equal(pyround(187), 187);
+});
+
+test("whole-dollar money() renders via banker's rounding", () => {
+  // Math.round(-186.5) is -186 but Math.round(186.5) is 187 —
+  // half-away/half-up regressions show up on these exact strings
+  assert.equal(money(-186.5, false), "-$186");
+  assert.equal(money(186.5, false), "$186");
+  assert.equal(money(-187.5, false), "-$188");
+  assert.equal(money(2.5, false), "$2");
+  assert.equal(money(1234.56, false), "$1,235");
+});
+
+test("cents money() keeps two decimals and the sign prefix", () => {
+  assert.equal(money(1234.5), "$1,234.50");
+  assert.equal(money(-0.25), "-$0.25");
+});
+
+test("numv strips currency formatting and never yields NaN", () => {
+  assert.equal(numv("$1,234.56"), 1234.56);
+  assert.equal(numv(" 42 "), 42);
+  assert.equal(numv(""), 0);
+  assert.equal(numv("abc"), 0);
+});
+
+// ---- money aggregates the screens add up themselves must agree with
+// the server's, or the phone shows a different number than the web ----
+
+const acct = (bal, link = null) => ({ balance_current: bal, link });
+const sumTotals = (list) => list.filter(countsInTotals)
+  .reduce((t, a) => t + (a.balance_current ?? 0), 0);
+
+test("a dual-sourced account's balance counts once, not once per source",
+     () => {
+  // one real checking account fed by two aggregators: the primary
+  // serves, the backup is a shadow of the SAME $1,000
+  const linked = (rank, primary) =>
+    ({ group_id: "g1", home_rank: rank, primary, healthy: true });
+  const rows = [acct(1000, linked(1, true)), acct(1000, linked(2, false)),
+                acct(250)];
+  assert.equal(sumTotals(rows), 1250);   // not 2250
+  assert.equal(rows.filter(countsInTotals).length, 2);
+});
+
+test("an unlinked account always counts, and a sick primary still does",
+     () => {
+  // health decides which source SERVES, never whether the money is
+  // real — dropping a down primary would erase the account's balance
+  assert.equal(countsInTotals(acct(10)), true);
+  assert.equal(countsInTotals(acct(10, undefined)), true);
+  assert.equal(countsInTotals(
+    acct(10, { group_id: "g", home_rank: 1, primary: true,
+               healthy: false })), true);
+});
+
+// ---- business profit: only operating expenses reduce it ----
+
+const bizRow = (amount, bucket = null, date = "2026-08-04") =>
+  ({ amount, bucket, date });
+const profit = (rows, start) => rows
+  .filter((x) => inOperatingProfit(x, start))
+  .reduce((t, x) => t - x.amount, 0);
+
+test("capitalized start-up and organizational costs stay out of profit",
+     () => {
+  // a $600 filing fee is a §248 organizational cost: the server's
+  // net_operating never saw it, so a month figure that subtracts it
+  // reads as a loss the year figure above it does not show
+  const rows = [bizRow(-2000), bizRow(400, "operating"),
+                bizRow(600, "organizational"), bizRow(300, "startup_195")];
+  assert.equal(profit(rows), 1600);      // not 700
+});
+
+test("an unbucketed expense follows the server's start-date default",
+     () => {
+  // before the business opened it is pre-operating (§195); on or after,
+  // it is an ordinary operating expense
+  assert.equal(inOperatingProfit(bizRow(100, null, "2026-01-05"),
+                                 "2026-06-01"), false);
+  assert.equal(inOperatingProfit(bizRow(100, null, "2026-08-04"),
+                                 "2026-06-01"), true);
+  assert.equal(inOperatingProfit(bizRow(100, null, "2026-01-05"), null),
+               true);
+});
+
+test("revenue counts whatever bucket rides along", () => {
+  // money in is never bucketed server-side; a stale bucket on an income
+  // row must not delete the revenue
+  assert.equal(inOperatingProfit(bizRow(-500, "organizational")), true);
+});
+
+// ---- the category-clear sentinel: the server clears on the empty
+// string; the literal must never reach the wire ----
+
+test("__clear__ maps to the empty string; real names pass through", () => {
+  assert.equal(categoryForServer(CLEAR_CATEGORY), "");
+  assert.equal(categoryForServer("GROCERIES"), "GROCERIES");
+  assert.equal(categoryForServer(""), "");
+});
+
+// ---- last_sync is a server-rendered phrase, never a date ----
+
+test("last_sync phrase reaches the screen verbatim", () => {
+  assert.equal(lastSyncPhrase("synced 12m ago"), "synced 12m ago");
+  assert.equal(lastSyncPhrase("last synced 3 hours ago"),
+               "last synced 3 hours ago");
+});
+
+test("even a timestamp-shaped last_sync is never reformatted", () => {
+  // a Date round-trip would change this string; verbatim proves the
+  // render never parses
+  assert.equal(lastSyncPhrase("2026-08-11 02:00"), "2026-08-11 02:00");
+});
+
+test("missing last_sync yields null so the line is skipped", () => {
+  assert.equal(lastSyncPhrase(""), null);
+  assert.equal(lastSyncPhrase(null), null);
+  assert.equal(lastSyncPhrase(undefined), null);
+});
+
+// ---- YYYY-MM-DD validation: real calendar dates only ----
+
+test("isValidYmd accepts real dates, including leap day", () => {
+  assert.equal(isValidYmd("2026-08-11"), true);
+  assert.equal(isValidYmd("2024-02-29"), true);
+  assert.equal(isValidYmd("1999-12-31"), true);
+});
+
+test("isValidYmd rejects impossible calendar dates", () => {
+  assert.equal(isValidYmd("2026-02-30"), false);
+  assert.equal(isValidYmd("2023-02-29"), false);
+  assert.equal(isValidYmd("2026-13-01"), false);
+  assert.equal(isValidYmd("2026-00-10"), false);
+  assert.equal(isValidYmd("2026-04-31"), false);
+});
+
+test("isValidYmd rejects malformed shapes", () => {
+  assert.equal(isValidYmd("8/11/2026"), false);
+  assert.equal(isValidYmd("2026-8-1"), false);
+  assert.equal(isValidYmd("2026-08-11T00:00"), false);
+  assert.equal(isValidYmd(""), false);
+  assert.equal(isValidYmd("tomorrow"), false);
+});
+
+// ---- savings-goals merge: POST /api/settings replaces the array
+// wholesale, so this merge is the only lost-update guard ----
+
+const draft = (name, over = {}) => ({
+  name, target: "100", target_date: "", monthly_plan: "10",
+  account_id: "", tokens: "", start_balance: "0", mode: "monthly", ...over,
+});
+const goal = (name, over = {}) => ({
+  name, target: 100, target_date: null, monthly_plan: 10,
+  account_id: null, tokens: [], start_balance: 0, ...over,
+});
+const names = (out) => out.map((g) => g.name).sort();
+
+test("untouched row defers to the server's live copy", () => {
+  const out = mergeSavingsGoals(
+    [draft("Trip", { monthly_plan: "10" })],
+    [goal("Trip", { monthly_plan: 999 })],
+    ["Trip"]);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].monthly_plan, 999);
+});
+
+test("a goal deleted elsewhere stays deleted when its row is untouched",
+     () => {
+  const out = mergeSavingsGoals(
+    [draft("Trip"), draft("Car")],
+    [goal("Car")],           // Trip was deleted on another device
+    ["Trip", "Car"]);
+  assert.deepEqual(names(out), ["Car"]);
+});
+
+test("a goal added elsewhere survives a save from this card", () => {
+  const out = mergeSavingsGoals(
+    [draft("Trip", { touched: true, monthly_plan: "25" })],
+    [goal("Trip"), goal("House")],   // House appeared since mount
+    ["Trip"]);
+  assert.deepEqual(names(out), ["House", "Trip"]);
+  assert.equal(out.find((g) => g.name === "Trip").monthly_plan, 25);
+});
+
+test("a touched row overrides the live copy with the draft's values",
+     () => {
+  const out = mergeSavingsGoals(
+    [draft("Trip", { touched: true, target: "$2,000",
+                     tokens: "trip, hawaii" })],
+    [goal("Trip", { target: 1 })],
+    ["Trip"]);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].target, 2000);
+  assert.deepEqual(out[0].tokens, ["trip", "hawaii"]);
+});
+
+test("renaming a goal here neither duplicates nor resurrects the old name",
+     () => {
+  const out = mergeSavingsGoals(
+    [draft("Vacation", { touched: true })],  // was "Trip" at mount
+    [goal("Trip")],
+    ["Trip"]);
+  assert.deepEqual(names(out), ["Vacation"]);
+});
+
+test("the contribution mode survives the merge in both directions", () => {
+  // a touched row carries its drafted mode; an untouched row keeps the
+  // sweep flag another device saved — losing it would silently turn a
+  // conditional contribution back into a fixed monthly outflow
+  const out = mergeSavingsGoals(
+    [draft("Trip", { touched: true, mode: "sweep" }), draft("Car")],
+    [goal("Trip"), goal("Car", { mode: "sweep" })],
+    ["Trip", "Car"]);
+  assert.equal(out.find((g) => g.name === "Trip").mode, "sweep");
+  assert.equal(out.find((g) => g.name === "Car").mode, "sweep");
+});
+
+test("blank rows are dropped, not saved as empty goals", () => {
+  const out = mergeSavingsGoals(
+    [draft("  ", { touched: true }), draft("Trip", { touched: true })],
+    [], []);
+  assert.deepEqual(names(out), ["Trip"]);
+});
+
+// ---- local calendar dates: a Y-M-D built through toISOString() drifts
+// a day across the UTC boundary — east of Greenwich after local Date
+// math, west of Greenwich every evening. These run under a forced
+// non-UTC TZ so a UTC round trip sneaking back in goes red. ----
+
+import { calendarCells, shiftYmd, ymd } from "../src/lib/dates.ts";
+
+// node on linux re-reads TZ per Date call, so the suite can pin both
+// hemispheres in one process
+const withTz = (tz, fn) => {
+  const old = process.env.TZ;
+  process.env.TZ = tz;
+  try { fn(); } finally {
+    if (old === undefined) delete process.env.TZ;
+    else process.env.TZ = old;
+  }
+};
+
+test("ymd reports the LOCAL date on both sides of the UTC boundary",
+     () => {
+  // UTC+14: local midnight is still the previous day in UTC
+  withTz("Etc/GMT-14", () => {
+    assert.equal(ymd(new Date(2026, 7, 12, 0, 30)), "2026-08-12");
+  });
+  // UTC-8: a local evening is already tomorrow in UTC
+  withTz("Etc/GMT+8", () => {
+    assert.equal(ymd(new Date(2026, 7, 12, 21, 0)), "2026-08-12");
+  });
+});
+
+test("shiftYmd steps exactly one calendar day in any timezone", () => {
+  for (const tz of ["Etc/GMT-14", "Etc/GMT+8", "UTC"]) {
+    withTz(tz, () => {
+      assert.equal(shiftYmd("2026-08-12", -1), "2026-08-11");
+      assert.equal(shiftYmd("2026-08-12", 1), "2026-08-13");
+      // month and year boundaries come from Date, not string math
+      assert.equal(shiftYmd("2026-01-01", -1), "2025-12-31");
+      assert.equal(shiftYmd("2026-08-31", 1), "2026-09-01");
+    });
+  }
+});
+
+test("calendar cells sit under their real weekday despite gaps", () => {
+  // events with a 8- and 11-day gap: Wed Aug 12, Thu Aug 20, Mon Aug 31
+  const days = [{ date: "2026-08-12" }, { date: "2026-08-20" },
+                { date: "2026-08-31" }];
+  const cells = calendarCells(days, "2026-08-12", 35);
+  assert.equal(cells.length, 35);
+  // window opens on the Monday of the start's week
+  assert.equal(cells[0].date, "2026-08-10");
+  // each event lands in its own weekday column (index % 7)
+  assert.equal(cells[2].d, days[0]);    // Wednesday
+  assert.equal(cells[10].d, days[1]);   // Thursday, next week
+  assert.equal(cells[21].d, days[2]);   // Monday, week 4
+  // gap days still occupy a cell, with no event attached
+  assert.equal(cells[3].date, "2026-08-13");
+  assert.equal(cells[3].d, undefined);
+  assert.equal(cells.filter((c) => c.d).length, 3);
+});
+
+test("login's server can only come from the connect flow's setter", async () => {
+  // the login screen signs into getVerifiedServerUrl() or bounces to
+  // connect — an app-launch deep link must find the slot empty, and
+  // nothing but the connect flow's own setter may fill it
+  const { getVerifiedServerUrl, setVerifiedServerUrl } =
+    await import("../src/lib/api.ts");
+  assert.equal(getVerifiedServerUrl(), null);
+  setVerifiedServerUrl("https://money.example.org");
+  assert.equal(getVerifiedServerUrl(), "https://money.example.org");
+});
+
+test("the transaction screen only trusts a row handed over in-app", async () => {
+  // /txn is deep-linkable, so the route carries an id and the ROW comes
+  // from the in-memory slot a ledger tap fills — an id nobody deposited
+  // (an outside link) yields nothing
+  const { getHandedOffTxn, setHandedOffTxn } =
+    await import("../src/lib/api.ts");
+  assert.equal(getHandedOffTxn("t-1"), null);
+  assert.equal(getHandedOffTxn(undefined), null);
+  const row = { id: "t-1", date: "2026-08-01", amount: 12.5, payee: "Cafe",
+                category: "dining", account: null, pending: 0 };
+  setHandedOffTxn(row);
+  assert.equal(getHandedOffTxn("t-1"), row);
+  assert.equal(getHandedOffTxn("t-2"), null,
+               "a different id must not see the deposited row");
+});
+
+// ---- plain-http server addresses ----
+// http:// is refused for anything routable from the internet and
+// allowed (with a warning) for the LAN / loopback hosts a self-hosted
+// box answers at; Android's network config can't say this, so this is
+// where the rule lives
+
+test("private hosts: loopback, RFC1918, link-local, CGNAT, mDNS", () => {
+  for (const h of ["localhost", "127.0.0.1", "10.1.2.3", "192.168.1.20",
+                   "172.16.0.1", "172.31.255.254", "169.254.1.1",
+                   "100.64.0.1", "100.127.255.255", "nas.local",
+                   "box.lan", "::1", "fe80::1", "fd12::1", "[::1]"])
+    assert.equal(isPrivateHost(h), true, h);
+  for (const h of ["oikonome.example.com", "8.8.8.8", "172.32.0.1",
+                   "172.15.0.1", "100.128.0.1", "11.0.0.1", "",
+                   "evil.local.example.com", "2001:db8::1",
+                   // hostnames that merely start with the ULA letters
+                   // are public — the fc00::/7 test is for addresses
+                   "homebox.example.org", "fc-remote.example.com",
+                   "fe80host.example.net"])
+    assert.equal(isPrivateHost(h), false, h);
+  assert.equal(serverUrlVerdict("http://homebox.example.org"), "http-public");
+});
+
+test("hostOf strips scheme, userinfo, port and path", () => {
+  assert.equal(hostOf("http://192.168.1.5:8042/api"), "192.168.1.5");
+  assert.equal(hostOf("https://user@money.example.org/"), "money.example.org");
+  assert.equal(hostOf("http://[::1]:8042"), "::1");
+  assert.equal(hostOf("garbage"), "");
+});
+
+test("the connect verdict: https ok, http LAN warned, http public refused",
+     () => {
+  assert.equal(serverUrlVerdict("https://money.example.org"), "ok");
+  assert.equal(serverUrlVerdict("http://192.168.1.20:8042"), "http-private");
+  assert.equal(serverUrlVerdict("http://localhost:8042"), "http-private");
+  assert.equal(serverUrlVerdict("http://money.example.org"), "http-public");
+  assert.equal(serverUrlVerdict("HTTP://8.8.8.8"), "http-public");
+  // the userinfo trick — the host is what follows the @, not what precedes
+  assert.equal(serverUrlVerdict("http://192.168.1.1@evil.example/"),
+               "http-public");
+});
+
+// ---- which hero face the Today page shows ----
+//
+// A demo instance refuses every settings write, so the face is kept on the
+// device there. Everywhere else the account is the durable value and the
+// device must never speak over it — a demo-only preference leaking into an
+// ordinary account would show one person a face nobody chose.
+
+test("the account's saved face wins on an ordinary instance", () => {
+  assert.equal(resolveFace({ saved: "detail" }), "detail");
+  assert.equal(resolveFace({ saved: "summary" }), "summary");
+  // a stale per-device value from some earlier demo must NOT speak over it
+  assert.equal(resolveFace({ saved: "summary", perDevice: "detail" }),
+               "summary");
+});
+
+test("on a demo the device's remembered face wins over the account's", () => {
+  assert.equal(resolveFace({ saved: "summary", perDevice: "detail",
+                             demo: true }), "detail");
+  assert.equal(resolveFace({ saved: "detail", perDevice: "summary",
+                             demo: true }), "summary");
+});
+
+test("a viewer sees the household's saved face, demo or not", () => {
+  assert.equal(resolveFace({ saved: "summary", perDevice: "detail",
+                             demo: true, viewer: true }), "summary");
+});
+
+test("the tap you just made wins over everything", () => {
+  assert.equal(resolveFace({ override: "detail", saved: "summary" }),
+               "detail");
+  assert.equal(resolveFace({ override: "summary", perDevice: "detail",
+                             saved: "detail", demo: true }), "summary");
+});
+
+test("nothing chosen anywhere is the summary face", () => {
+  assert.equal(resolveFace({}), "summary");
+  assert.equal(resolveFace({ demo: true }), "summary");
+});
+
+
+// ---- ledger day dividers: the header before each date change, and the
+// day's spend it carries (mirrors the web's TxnTable dayGroups) ----
+
+const tx = (id, date, amount, category = "FOOD AND DRINK", counts) =>
+  ({ id, date, amount, category,
+     ...(counts === undefined ? {} : { counts_as_spend: counts }) });
+
+test("a header lands before each day, rows keep their order", () => {
+  const out = withDayHeads([
+    tx("a", "2026-08-13", 4.75), tx("b", "2026-08-13", 62.18),
+    tx("c", "2026-08-12", 9.99),
+  ]);
+  assert.deepEqual(out.map((it) => "kind" in it ? "HEAD" : it.id),
+                   ["HEAD", "a", "b", "HEAD", "c"]);
+  assert.equal(out[0].count, 2);
+  assert.equal(out[3].count, 1);
+});
+
+test("the day total sums exactly the rows the server marks as spend", () => {
+  // the server's counts_as_spend flag IS the rule — the same SQL as the
+  // verdict, the email and the Business worksheet. The client must not
+  // second-guess it: row "c" is a card payment whose display category
+  // ("LOAN PAYMENTS", spaces, primary) reveals nothing, and row "b" is a
+  // loan-account row the client cannot identify at all.
+  const spent = daySpend([
+    tx("a", "2026-08-10", 236.44, "MEDICAL", true),
+    tx("b", "2026-08-10", 800, "FOOD AND DRINK", false),
+    tx("c", "2026-08-10", 100, "LOAN PAYMENTS", false),
+    tx("d", "2026-08-10", -2450, "INCOME", false),
+  ]);
+  assert.equal(spent, 236.44);
+});
+
+test("an old server without counts_as_spend still gets a non-zero day total", () => {
+  // graceful degradation: when the field is absent the client falls back
+  // to the display-category approximation (money out, not a transfer)
+  // rather than showing $0 for every day
+  const spent = daySpend([
+    tx("a", "2026-08-10", 236.44, "MEDICAL"),
+    tx("b", "2026-08-10", 800, "TRANSFER_OUT"),
+    tx("c", "2026-08-10", -2450, "INCOME"),
+  ]);
+  assert.equal(spent, 236.44);
+});
+
+test("a day with no spend still reports its count", () => {
+  const [head] = withDayHeads([tx("a", "2026-08-10", -2450, "INCOME")]);
+  assert.equal(head.count, 1);
+  assert.equal(head.spent, 0);
+});
+
+test("an empty ledger produces no headers", () => {
+  assert.deepEqual(withDayHeads([]), []);
+});
+
+test("headers are keyed by their first row, so a revisited date cannot collide", () => {
+  // an unsorted list can return to a date; two headers sharing a key is a
+  // duplicate key in a virtualized list, not a cosmetic problem
+  const out = withDayHeads([
+    tx("a", "2026-08-13", 1), tx("b", "2026-08-12", 1), tx("c", "2026-08-13", 1),
+  ]).filter((it) => "kind" in it);
+  assert.equal(out.length, 3);
+  assert.equal(new Set(out.map((h) => h.key)).size, 3);
+});
+
+test("the day label names the weekday and never slips a day westward", () => {
+  // new Date("2026-08-13") parses as UTC and renders as the 12th in any
+  // negative-offset zone — the label must be built from the parts
+  process.env.TZ = "America/Los_Angeles";
+  assert.match(dayLabel("2026-08-13"), /Aug\s*13/);
+  assert.match(dayLabel("2026-08-13"), /^Thu/);
+});
+
+// ---- merchant monogram / hue: the same merchant draws the same mark on
+// every screen and on the web (identical formula in MerchantAvatar.tsx) ----
+
+test("monogram takes two initials, or two letters of a lone word", () => {
+  assert.equal(monogram("Trader Joe's"), "TJ");
+  assert.equal(monogram("Costco"), "Co");
+  assert.equal(monogram("7-Eleven"), "7E");
+  assert.equal(monogram(""), "?");
+});
+
+test("hue is stable and in range", () => {
+  assert.equal(hueOf("Costco"), hueOf("Costco"));
+  assert.notEqual(hueOf("Costco"), hueOf("Target"));
+  for (const n of ["a", "Costco", "U-Haul", "Zebra Coffee"]) {
+    assert.ok(hueOf(n) >= 0 && hueOf(n) < 360);
+  }
+});
+
+// ---- the logo proxy allowlist: /api/logo serves only the two Plaid CDNs,
+// so a URL it would refuse must never become a request (a guaranteed 400
+// that still spends the shared rate limit) — the monogram covers it ----
+
+test("only the two Plaid logo CDNs get proxied", () => {
+  const b = "https://box.example";
+  assert.equal(
+    logoProxyUrl(b, "https://plaid-merchant-logos.plaid.com/costco.png"),
+    b + "/api/logo?u=https%3A%2F%2Fplaid-merchant-logos.plaid.com%2Fcostco.png");
+  assert.ok(logoProxyUrl(
+    b, "https://plaid-counterparty-logos.plaid.com/x/y.png"));
+  // any other host, scheme, extension, port or query is refused
+  assert.equal(logoProxyUrl(b, "https://evil.example/costco.png"), null);
+  assert.equal(logoProxyUrl(
+    b, "http://plaid-merchant-logos.plaid.com/costco.png"), null);
+  assert.equal(logoProxyUrl(
+    b, "https://plaid-merchant-logos.plaid.com/costco.svg"), null);
+  assert.equal(logoProxyUrl(
+    b, "https://plaid-merchant-logos.plaid.com:8443/costco.png"), null);
+  assert.equal(logoProxyUrl(
+    b, "https://plaid-merchant-logos.plaid.com/costco.png?x=1"), null);
+  assert.equal(logoProxyUrl(
+    b, "https://plaid-merchant-logos.plaid.com/" + "a".repeat(400) + ".png"),
+    null);
+  assert.equal(logoProxyUrl(b, null), null);
+  assert.equal(logoProxyUrl(b, ""), null);
+});
+
+// ---- sign-out keeps its promise: the dialog says the server-side
+// device token is revoked, so a local-only sign-out is never a silent
+// fallback for a devices list that just hadn't loaded yet ----
+
+import { signOutAction } from "../src/lib/pure.ts";
+
+test("sign-out revokes this device's token when it is in the list", () => {
+  const devs = [{ id: "a", current: false }, { id: "b", current: true }];
+  assert.deepEqual(signOutAction(true, devs), { kind: "revoke", id: "b" });
+  // even off a stale-but-successful fetch — the id is what matters
+  assert.deepEqual(signOutAction(false, devs), { kind: "revoke", id: "b" });
+});
+
+test("an unfetched or failed devices list asks, never silently local",
+     () => {
+  // fast tap before the query lands
+  assert.deepEqual(signOutAction(false, undefined), { kind: "ask" });
+  // refetch failed too — the token's fate is unknown
+  assert.deepEqual(signOutAction(false, []), { kind: "ask" });
+});
+
+test("a successful fetch without this device means already revoked — "
+     + "local sign-out keeps the promise", () => {
+  assert.deepEqual(signOutAction(true, []), { kind: "local" });
+  assert.deepEqual(signOutAction(true, [{ id: "a", current: false }]),
+                   { kind: "local" });
+});
+
+// ---- read-only (402) paywall notice: a lapsed subscription refuses
+// every WRITE with 402 while reads keep working — the notice must fire
+// for blocked writes only, collapse repeats into one dialog, prefer the
+// server's sentence, and (asserted here by construction) never share
+// anything with the 401 sign-out path ----
+
+import { isWriteMethod, PAYWALL_FALLBACK, PAYWALL_NOTICE_WINDOW_MS,
+         paywallNotice } from "../src/lib/api.ts";
+
+test("only writes surface the paywall notice — reads never nag", () => {
+  assert.equal(paywallNotice("subscription lapsed", "GET", 0, 60_000),
+               null);
+  assert.equal(paywallNotice("subscription lapsed", "HEAD", 0, 60_000),
+               null);
+  assert.equal(paywallNotice("subscription lapsed", undefined, 0, 60_000),
+               null, "an unknown method must not nag");
+  assert.equal(paywallNotice("subscription lapsed", "POST", 0, 60_000),
+               "subscription lapsed");
+  assert.equal(paywallNotice("subscription lapsed", "DELETE", 0, 60_000),
+               "subscription lapsed");
+  // the req helper lower-cases nothing; the check must not care
+  assert.ok(isWriteMethod("post") && isWriteMethod("Put"));
+  assert.ok(!isWriteMethod("get") && !isWriteMethod(""));
+});
+
+test("repeated blocked writes collapse into one notice per window", () => {
+  const t0 = 1_000_000;
+  assert.ok(paywallNotice("d", "POST", 0, t0), "first write notifies");
+  assert.equal(paywallNotice("d", "POST", t0, t0 + 1), null);
+  assert.equal(
+    paywallNotice("d", "POST", t0, t0 + PAYWALL_NOTICE_WINDOW_MS - 1),
+    null, "inside the window stays quiet");
+  assert.ok(
+    paywallNotice("d", "POST", t0, t0 + PAYWALL_NOTICE_WINDOW_MS),
+    "a later blocked write may remind");
+});
+
+test("the server's sentence wins; the fallback still says read-only", () => {
+  assert.equal(
+    paywallNotice("this account is read-only until its standing is "
+      + "restored", "POST", 0, 60_000),
+    "this account is read-only until its standing is restored");
+  // a bodyless 402 still says something, same wording as the web's toast
+  assert.equal(paywallNotice(undefined, "POST", 0, 60_000),
+               PAYWALL_FALLBACK);
+  assert.equal(paywallNotice("   ", "POST", 0, 60_000), PAYWALL_FALLBACK);
+  assert.match(PAYWALL_FALLBACK, /read-only/);
+});
+
+import { showsProviderDoor } from "../src/lib/pure.ts";
+
+test("hosted hides the SimpleFIN door — the server refuses BYO there", () => {
+  // web parity: the hosted ConnectHub renders no SimpleFIN row, and a
+  // token-paste form on mobile would be a guaranteed 403
+  assert.equal(showsProviderDoor("simplefin", true), false);
+  // the other doors stay, hosted or not
+  for (const key of ["plaid", "mx", "scripts", "files"]) {
+    assert.equal(showsProviderDoor(key, true), true, key);
+    assert.equal(showsProviderDoor(key, false), true, key);
+  }
+  // self-host keeps SimpleFIN first-class
+  assert.equal(showsProviderDoor("simplefin", false), true);
+});
+
+// ---- Step-up: carrying a passkey ticket on the retried request ----
+
+import { withRecoveryCode } from "../src/lib/pure.ts";
+
+const JSON_INIT = { method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ new_password: "x" }) };
+const FORM_INIT = { method: "POST",
+  headers: { "Content-Type": "application/x-www-form-urlencoded" },
+  body: "password=x" };
+
+test("the ticket rides the recovery_code field of a JSON body", () => {
+  const out = withRecoveryCode(JSON_INIT, "pkstep-abc");
+  assert.deepEqual(JSON.parse(out.body),
+                   { new_password: "x", recovery_code: "pkstep-abc" });
+  // everything else about the request survives untouched
+  assert.equal(out.method, "POST");
+  assert.deepEqual(out.headers, JSON_INIT.headers);
+});
+
+test("a form body keeps its encoding and gains one field", () => {
+  const out = withRecoveryCode(FORM_INIT, "pkstep-abc");
+  assert.equal(out.body, "password=x&recovery_code=pkstep-abc");
+});
+
+test("a code the person already typed is never overwritten", () => {
+  // spending a recovery code is their choice; a silent swap would send
+  // the ticket and leave them believing the typed code did the work
+  assert.equal(withRecoveryCode(
+    { headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ recovery_code: "typed" }) }, "pkstep-abc"),
+    null);
+  assert.equal(withRecoveryCode(
+    { headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: "password=x&recovery_code=typed" }, "pkstep-abc"), null);
+});
+
+test("a body the retry cannot extend gives up instead of guessing", () => {
+  // null means "surface the server's refusal", which is what reveals the
+  // card's recovery-code field — never a silently dropped ticket
+  assert.equal(withRecoveryCode(undefined, "pkstep-abc"), null);
+  assert.equal(withRecoveryCode({ method: "GET" }, "pkstep-abc"), null);
+  assert.equal(withRecoveryCode(JSON_INIT, ""), null);
+  assert.equal(withRecoveryCode(
+    { headers: { "Content-Type": "multipart/form-data" },
+      body: "…" }, "pkstep-abc"), null);
+  // a JSON body that is not an object has nowhere to put the field
+  assert.equal(withRecoveryCode(
+    { headers: { "Content-Type": "application/json" },
+      body: "[1,2]" }, "pkstep-abc"), null);
+});
+
+// ---- Card autopay marks on the cash forecast chart ----
+
+import { autopayMarks } from "../src/lib/pure.ts";
+
+const SERIES = [["2026-08-23", 100], ["2026-08-24", 90],
+                ["2026-08-25", 80], ["2026-08-26", 70]];
+
+test("an autopay is marked at its own day, not at an approximation", () => {
+  assert.deepEqual(autopayMarks(SERIES, [["2026-08-25", -40, "Amex"]]),
+                   [{ i: 2, label: "Amex autopay" }]);
+});
+
+test("a date outside the series is dropped, never clamped to an edge", () => {
+  // clamping would draw a line claiming a payment lands on the last day
+  assert.deepEqual(autopayMarks(SERIES, [["2026-12-01", -40, "Amex"]]), []);
+  assert.deepEqual(autopayMarks(SERIES, undefined), []);
+});
+
+test("cards due the same day become one line, and many become a count", () => {
+  assert.deepEqual(
+    autopayMarks(SERIES, [["2026-08-24", -1, "Amex"], ["2026-08-24", -2, "Visa"]]),
+    [{ i: 1, label: "Amex + Visa autopay" }]);
+  assert.deepEqual(
+    autopayMarks(SERIES, [["2026-08-24", -1, "A"], ["2026-08-24", -2, "B"],
+                          ["2026-08-24", -3, "C"]]),
+    [{ i: 1, label: "3 autopays" }]);
+});
+
+// ---- SecureStore keys: a scope may contain anything, a key may not ----
+
+import { secureKey } from "../src/lib/pure.ts";
+
+test("a server URL scope is sanitized into a legal SecureStore key", () => {
+  // SecureStore accepts only [A-Za-z0-9._-]; ':' and '/' make it THROW, and
+  // a caller that swallows storage errors then has a flag that silently
+  // never persists — a wizard whose "left" mark never sticks cannot be left
+  const k = secureKey("oikonome.leftWizard", "https://money.example.org");
+  assert.match(k, /^[A-Za-z0-9._-]+$/);
+  assert.ok(k.startsWith("oikonome.leftWizard."));
+});
+
+test("distinct servers keep distinct keys, and no scope keeps the base", () => {
+  const a = secureKey("k", "https://a.example.com");
+  const b = secureKey("k", "https://b.example.com");
+  assert.notEqual(a, b);
+  assert.equal(secureKey("k"), "k");
+  assert.equal(secureKey("k", undefined), "k");
+});
+
+// ---- a 2xx that is not JSON: the captive-portal case ----
+
+import { makeClient, parseOkBody, UNREADABLE_REPLY }
+  from "../src/lib/api.ts";
+
+test("a JSON 2xx body parses into the value the caller asked for", () => {
+  assert.deepEqual(
+    parseOkBody(200, "application/json; charset=utf-8", '{"ok":true}'),
+    { ok: true });
+});
+
+test("an HTML 200 becomes an ApiError, never a thrown SyntaxError", () => {
+  // a captive Wi-Fi portal / proxy sign-in page answers 200 with HTML;
+  // r.json() on that throws out of whatever awaited the call, with no
+  // ErrorBoundary under it
+  let caught;
+  try {
+    parseOkBody(200, "text/html", "<html><body>Sign in to continue</body></html>");
+  } catch (e) { caught = e; }
+  assert.ok(caught instanceof ApiError, "non-JSON 2xx must be an ApiError");
+  assert.equal(caught.status, 200);
+  assert.equal(errText(caught), UNREADABLE_REPLY);
+});
+
+test("a truncated or empty body with a JSON content-type refuses too", () => {
+  for (const body of ['{"ok":', "", "   "]) {
+    assert.throws(() => parseOkBody(200, "application/json", body),
+                  (e) => e instanceof ApiError && e.detail === UNREADABLE_REPLY);
+  }
+});
+
+test("the refusal carries a snippet of the body, bounded", () => {
+  let caught;
+  try { parseOkBody(200, "text/html", "x".repeat(5000)); }
+  catch (e) { caught = e; }
+  assert.equal(typeof caught.body, "string");
+  assert.equal(caught.body.length, 200);
+});
+
+test("a captive-portal 200 reaches the caller as an ApiError, not a crash",
+     async () => {
+  // the whole point of the helper: pinning it alone would still let the
+  // client go back to a bare r.json() at the call site
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => new Response(
+    "<html><body>Sign in to continue</body></html>",
+    { status: 200, headers: { "content-type": "text/html" } });
+  try {
+    const c = makeClient("https://example.invalid", "tok", () => {});
+    await assert.rejects(
+      () => c.me(),
+      (e) => e instanceof ApiError && e.detail === UNREADABLE_REPLY);
+  } finally { globalThis.fetch = real; }
+});
+
+import { loginAndMintDevice } from "../src/lib/api.ts";
+
+/** A server that answers the login POST normally and the device mint with
+ *  whatever `mintReply` is — the captive-portal shape the sign-in path has
+ *  to survive. */
+function serverWhoseMintAnswers(mintReply) {
+  return async (url) => {
+    if (String(url).endsWith("/api/login")) {
+      return new Response('{"mint_ticket":"tick"}',
+        { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (String(url).endsWith("/api/devices")) return mintReply();
+    return new Response('{"ok":true}',
+      { status: 200, headers: { "content-type": "application/json" } });
+  };
+}
+
+test("a captive portal answering the device mint is the app's own error",
+     async () => {
+  // sign-in is the highest-traffic request in the app and the one most
+  // likely to be made on strange Wi-Fi; a bare .json() here would surface
+  // the parser's own words ("Unexpected character: <") to the person
+  // signing in
+  const real = globalThis.fetch;
+  globalThis.fetch = serverWhoseMintAnswers(() => new Response(
+    "<html><body>Accept the terms to get online</body></html>",
+    { status: 200, headers: { "content-type": "text/html" } }));
+  try {
+    await assert.rejects(
+      () => loginAndMintDevice("https://example.invalid", "a@b.dev", "pw",
+                               "", "Pixel", "android"),
+      (e) => e instanceof ApiError && e.detail === UNREADABLE_REPLY);
+  } finally { globalThis.fetch = real; }
+});
+
+test("a real mint reply still hands back the device credential", async () => {
+  const real = globalThis.fetch;
+  globalThis.fetch = serverWhoseMintAnswers(() => new Response(
+    '{"token":"dev-tok","id":"dev-1"}',
+    { status: 200, headers: { "content-type": "application/json" } }));
+  try {
+    assert.deepEqual(
+      await loginAndMintDevice("https://example.invalid", "a@b.dev", "pw",
+                               "", "Pixel", "android"),
+      { token: "dev-tok", id: "dev-1" });
+  } finally { globalThis.fetch = real; }
+});
+
+// ---- net-worth trend timeframe windows: baseline picking, gain math,
+// shorter-than-range degradation ----
+import { trendWindow } from "../src/lib/pure.ts";
+
+test("trendWindow anchors to the last point and picks the baseline at/before the cutoff", () => {
+  const pts = [
+    ["2023-01-01", 100], ["2024-01-01", 200], ["2025-06-01", 300],
+    ["2026-05-30", 350], ["2026-08-30", 400],
+  ];
+  // 1y back from the LAST point (2026-08-30) cuts at 2025-08-30; the
+  // baseline is the last point at or before it — 2025-06-01 — so the
+  // line starts at the value the gain is measured from
+  const y1 = trendWindow(pts, "1y");
+  assert.equal(pts[y1.start][0], "2025-06-01");
+  assert.equal(y1.gain, 100);
+});
+
+test("trendWindow gain and pct measure from the baseline", () => {
+  const pts = [
+    ["2026-02-28", 100], ["2026-05-30", 200], ["2026-08-30", 300],
+  ];
+  const w = trendWindow(pts, "3m");
+  assert.equal(pts[w.start][0], "2026-05-30");
+  assert.equal(w.gain, 100);
+  assert.equal(w.pct, 50);
+  assert.equal(w.full, false);
+});
+
+test("trendWindow reads month-key points, which is what the net-worth report sends", () => {
+  // the server's trend is one point per month, "YYYY-MM"; with no day to
+  // read, the shift must stay a month key rather than build an invalid Date
+  const pts = [];
+  for (let i = 0; i < 24; i++) {
+    const y = 2025 + Math.floor((i + 8) / 12), mo = ((i + 8) % 12) + 1;
+    pts.push([`${y}-${String(mo).padStart(2, "0")}`, 100 + i]);
+  }
+  const last = pts[pts.length - 1][0];
+  assert.equal(last, "2027-08");
+  for (const r of ["3m", "6m", "1y", "3y", "5y", "all"]) trendWindow(pts, r);
+  const w = trendWindow(pts, "1y");
+  assert.equal(pts[w.start][0], "2026-08");
+  assert.equal(w.gain, 12);
+  assert.equal(trendWindow(pts, "3y").full, true);
+});
+
+test("trendWindow: the two short windows on month-key points", () => {
+  // one point per month, the last being the current month's live value
+  const pts = [["2026-05", 100], ["2026-06", 110], ["2026-07", 130],
+               ["2026-08", 160], ["2026-09", 200]];
+  // This month: since the last month-end — two points, the newest last
+  const cur = trendWindow(pts, "cur");
+  assert.deepEqual([pts[cur.start][0], pts[cur.end][0], cur.gain], ["2026-08", "2026-09", 40]);
+  // 1m: the last COMPLETE month — July's end to August's end, the live
+  // point left out, so the gain is August's alone
+  const m1 = trendWindow(pts, "1m");
+  assert.deepEqual([pts[m1.start][0], pts[m1.end][0], m1.gain], ["2026-07", "2026-08", 30]);
+  // every other window still runs to the newest point
+  const m3 = trendWindow(pts, "3m");
+  assert.deepEqual([pts[m3.start][0], pts[m3.end][0]], ["2026-06", "2026-09"]);
+  // too short to close a month: 1m falls back to the open window
+  const short = trendWindow([["2026-08", 10], ["2026-09", 12]], "1m");
+  assert.deepEqual([short.start, short.end, short.gain, short.full], [0, 1, 2, true]);
+});
+
+test("trendWindow: a range longer than the data is the whole series and says so", () => {
+  const pts = [["2026-07-01", 100], ["2026-08-30", 110]];
+  const w = trendWindow(pts, "5y");
+  assert.equal(w.start, 0);
+  assert.equal(w.full, true);
+  assert.equal(w.gain, 10);
+});
+
+test("trendWindow: non-positive baseline yields no percent", () => {
+  const pts = [["2020-01-01", -50], ["2026-08-30", 100]];
+  const w = trendWindow(pts, "all");
+  assert.equal(w.gain, 150);
+  assert.equal(w.pct, null);
+});
+
+// ---- counting months backwards must not depend on today's day ----
+// Date#setUTCMonth keeps the day-of-month, so a naive shift off a 31st
+// rolls forward into the following month and the window loses its oldest
+// month. Cash Flow's "Saved, by month" is drawn from exactly this cutoff,
+// and the card's heading comes from the SERVER's window for the same
+// range key — so a client that disagrees prints a heading naming a month
+// whose bar it never drew.
+import { rangeCutoffMonth, shiftMonthsUtc } from "../src/lib/pure.ts";
+
+// (day pinned, then the first month each range must include — the same
+// months engine/reporting.py `_range_window` starts its window on)
+const CUTOFFS = [
+  ["a 31st, in a month the shift lands beside 30-day months",
+   "2026-08-31", { "3m": "2026-06", "6m": "2026-03", "1y": "2025-09",
+                   "3y": "2023-09", "5y": "2021-09" }],
+  ["a 31st that crosses the year boundary",
+   "2026-01-31", { "3m": "2025-11", "6m": "2025-08", "1y": "2025-02",
+                   "3y": "2023-02", "5y": "2021-02" }],
+  ["a 30th, which no February can hold",
+   "2026-04-30", { "3m": "2026-02", "6m": "2025-11", "1y": "2025-05",
+                   "3y": "2023-05", "5y": "2021-05" }],
+  ["a leap-day 29th",
+   "2024-02-29", { "3m": "2023-12", "6m": "2023-09", "1y": "2023-03",
+                   "3y": "2021-03", "5y": "2019-03" }],
+  ["an ordinary mid-month day",
+   "2026-07-15", { "3m": "2026-05", "6m": "2026-02", "1y": "2025-08",
+                   "3y": "2023-08", "5y": "2021-08" }],
+];
+
+for (const [what, today, expected] of CUTOFFS)
+  test(`range cutoffs are the same months on ${what}`, () => {
+    const now = new Date(today + "T12:00:00Z");
+    for (const [range, first] of Object.entries(expected))
+      assert.equal(rangeCutoffMonth(range, now), first,
+                   `${range} on ${today}`);
+    // "All" has no cutoff, on any day
+    assert.equal(rangeCutoffMonth("all", now), null);
+  });
+
+test("a month shift clamps the day instead of rolling into the next month", () => {
+  assert.equal(shiftMonthsUtc("2026-05-31", 3), "2026-02-28");
+  assert.equal(shiftMonthsUtc("2024-05-31", 3), "2024-02-29");
+  assert.equal(shiftMonthsUtc("2026-03-31", 1), "2026-02-28");
+  assert.equal(shiftMonthsUtc("2026-08-31", 12), "2025-08-31");
+  assert.equal(shiftMonthsUtc("2026-01-31", 3), "2025-10-31");
+  assert.equal(shiftMonthsUtc("2026-07-15", 6), "2026-01-15");
+});
+
+test("trendWindow keeps the full window when the last point is a 31st", () => {
+  // 3m back from 2026-05-31 is 2026-02-28: the February point is the
+  // baseline. A rolled cutoff (2026-03-03) lands past the March point and
+  // measures the gain from there — a window short by a month, quietly.
+  const pts = [
+    ["2026-02-28", 100], ["2026-03-01", 150], ["2026-05-31", 200],
+  ];
+  const w = trendWindow(pts, "3m");
+  assert.equal(pts[w.start][0], "2026-02-28");
+  assert.equal(w.gain, 100);
+});
+
+// ---- the plan's institution allowance: one predicate behind every
+// add-a-bank door, so no screen can promise what the server refuses ----
+import { institutionAllowance } from "../src/lib/pure.ts";
+
+test("the add-a-bank door closes exactly at the cap", () => {
+  assert.deepEqual(institutionAllowance(3, 2), { known: true, full: false });
+  assert.deepEqual(institutionAllowance(3, 3), { known: true, full: true });
+  // an over-cap household (its ceiling was lowered) is still full, not
+  // handed a door the server would refuse after the bank is authorized
+  assert.deepEqual(institutionAllowance(3, 4), { known: true, full: true });
+  assert.deepEqual(institutionAllowance(2, 0), { known: true, full: false });
+});
+
+test("an unknown or absent cap leaves the door open and the figure unsaid",
+     () => {
+  // self-host reports no cap — genuinely uncapped, and the hub's "as many
+  // as you like" is true there. An /api/me still in flight looks the same
+  // and must not lock an owner out of connecting.
+  for (const [cap, used] of [[null, 3], [undefined, 3], [3, undefined],
+                             [undefined, undefined]])
+    assert.deepEqual(institutionAllowance(cap, used),
+                     { known: false, full: false },
+                     `cap=${cap} used=${used}`);
+});
+
+
+// ---- the elevation sheet's proof: a recovery code stands in for ONE
+// factor, so an account with a password sends both. Getting this wrong
+// strands a person whose authenticator is lost: the sheet then offers no
+// recovery route from the password form, and the shape it would send is
+// one the server refuses. ----
+
+const TOTP_ACCOUNT = { methods: ["password"], totp: true };
+const PASSKEY_ONLY = { methods: ["passkey"], totp: false };
+const BOTH = { methods: ["passkey", "password"], totp: true };
+const HOSTED_PASSKEY_ONLY = { methods: ["passkey", "recovery+password"],
+                              totp: false };
+const typed = (o) => ({ password: "", code: "", recoveryCode: "", ...o });
+
+test("a lost authenticator sends the recovery code beside the password",
+     () => {
+  assert.deepEqual(
+    elevationProof("recovery", TOTP_ACCOUNT,
+                   typed({ password: "pw", recoveryCode: " k7f2-9qtp-m3xz " })),
+    { password: "pw", recovery_code: "k7f2-9qtp-m3xz" });
+  // ...and on an account that also holds a passkey, the same pair
+  assert.deepEqual(
+    elevationProof("recovery", BOTH,
+                   typed({ password: "pw", recoveryCode: "k7f2-9qtp" })),
+    { password: "pw", recovery_code: "k7f2-9qtp" });
+});
+
+test("a bare recovery code is only the passkey-only account's proof", () => {
+  assert.deepEqual(
+    elevationProof("recovery", PASSKEY_ONLY,
+                   typed({ recoveryCode: "k7f2-9qtp" })),
+    { recovery_code: "k7f2-9qtp" });
+  // the password half is missing on an account that has one: nothing to
+  // send yet, rather than a shape the server answers password_required
+  assert.equal(
+    elevationProof("recovery", TOTP_ACCOUNT, typed({ recoveryCode: "k7f2" })),
+    null);
+});
+
+test("a hosted passkey-only account sends the password with the code",
+     () => {
+  // the server refuses a bare code there: the code stands in for the
+  // passkey, and the password is still owed
+  assert.equal(
+    elevationProof("recovery", HOSTED_PASSKEY_ONLY,
+                   typed({ recoveryCode: "k7f2-9qtp" })),
+    null);
+  assert.deepEqual(
+    elevationProof("recovery", HOSTED_PASSKEY_ONLY,
+                   typed({ password: "pw", recoveryCode: " k7f2-9qtp " })),
+    { password: "pw", recovery_code: "k7f2-9qtp" });
+  assert.equal(recoveryNeedsPassword(HOSTED_PASSKEY_ONLY), true);
+  assert.equal(recoveryNeedsPassword(PASSKEY_ONLY), false);
+  assert.equal(recoveryNeedsPassword(null), false);
+});
+
+test("nothing is sent until the recovery form is complete", () => {
+  assert.equal(elevationProof("recovery", TOTP_ACCOUNT,
+                              typed({ password: "pw" })), null);
+  assert.equal(elevationProof("recovery", PASSKEY_ONLY,
+                              typed({ recoveryCode: "   " })), null);
+});
+
+test("the ordinary password pair is unchanged", () => {
+  assert.deepEqual(
+    elevationProof("password", TOTP_ACCOUNT,
+                   typed({ password: "pw", code: "123456" })),
+    { password: "pw", totp_code: "123456" });
+  // a TOTP account owes a full six digits before anything is sent
+  assert.equal(elevationProof("password", TOTP_ACCOUNT,
+                              typed({ password: "pw", code: "123" })), null);
+  assert.deepEqual(
+    elevationProof("password", { methods: ["password"], totp: false },
+                   typed({ password: "pw" })),
+    { password: "pw" });
+});
+
+// ---- the business wizard and the Business page's own arithmetic ----
+//
+// The web keeps the same rules in webapp/src/bizmath.ts; both copies run
+// every case, so the phone and the browser never open the wizard on a
+// different business or show a business a different number.
+
+import * as mobileBiz from "../src/lib/pure.ts";
+import * as webBiz from "../../webapp/src/bizmath.ts";
+
+const WIZ_STEPS = [{ key: "what" }, { key: "when" }, { key: "accounts" },
+                   { key: "startup" }, { key: "done" }];
+const BIZ_SIDES = [["mobile", mobileBiz], ["web", webBiz]];
+
+for (const [side, m] of BIZ_SIDES) {
+  test(`${side}: a run with no business opens at the first question`, () => {
+    // Step marks are household-wide and outlive the business they were
+    // written for, and every step after the questions writes against the
+    // entity — opened with none, "Assign" would send accounts back to
+    // personal and report success.
+    assert.equal(m.bizWizardEntryStep(WIZ_STEPS, false), 0);
+  });
+
+  test(`${side}: a run continuing a business opens at its accounts step`, () => {
+    assert.equal(m.bizWizardEntryStep(WIZ_STEPS, true), 2);
+  });
+
+  const ents = [
+    { id: "e-closed", status: "archived" },
+    { id: "e-first", status: "active" },
+    { id: "e-second", status: "active" },
+  ];
+
+  test(`${side}: guided setup continues the business the link names`, () => {
+    assert.equal(m.bizSetupEntity(ents, "e-second")?.id, "e-second");
+  });
+
+  test(`${side}: a bare setup link continues the oldest ACTIVE business`, () => {
+    // never a closed one, and never a second business next to one that
+    // exists
+    assert.equal(m.bizSetupEntity(ents, null)?.id, "e-first");
+    assert.equal(m.bizSetupEntity(ents, "e-closed")?.id, "e-first");
+    assert.equal(m.bizSetupEntity(ents, "e-gone")?.id, "e-first");
+  });
+
+  test(`${side}: with only closed businesses, setup starts a new one`, () => {
+    assert.equal(m.bizSetupEntity([ents[0]], null), undefined);
+    assert.equal(m.bizSetupEntity([], null), undefined);
+  });
+
+  const row = (amount, extra = {}) => ({
+    date: "2031-05-10", amount, category: "GENERAL_SERVICES",
+    cat_detailed: null, bucket: null, ...extra });
+
+  test(`${side}: month profit counts charges and deposits NET of reimbursement links`, () => {
+    // one invented $1,000 client check repays two $500 business charges:
+    // the charges net to nothing and the deposit's claimed part is not
+    // revenue — gross amounts would show $1,000 revenue against $1,000
+    // of costs that were paid back
+    const rows = [
+      row(500, { net_amount: 0 }),
+      row(500, { net_amount: 0 }),
+      row(-1000, { net_amount: 0, category: "TRANSFER_IN",
+                   cat_original: "INCOME" }),
+      row(120),                          // an ordinary unreimbursed cost
+    ];
+    assert.equal(m.bizPeriodProfit(rows, null, "2031-05"), -120);
+  });
+
+  test(`${side}: a partly-claimed deposit's unclaimed part is revenue`, () => {
+    const rows = [row(-1000, { net_amount: -400, partly_claimed: true,
+                               category: "TRANSFER_IN",
+                               cat_original: "TRANSFER_IN" })];
+    assert.equal(m.bizPeriodProfit(rows, null, "2031-05"), 400);
+  });
+
+  test(`${side}: month profit leaves out transfers, card payments, capitalized costs and other months`, () => {
+    const rows = [
+      row(-900, { category: "INCOME" }),                    // revenue
+      row(300, { category: "TRANSFER_OUT" }),               // owner draw
+      row(200, { cat_detailed: "LOAN_PAYMENTS_CREDIT_CARD_PAYMENT" }),
+      row(150, { bucket: "organizational" }),
+      row(80, { date: "2031-04-02" }),   // before the start date: §195
+      row(-50, { category: "TRANSFER_IN", cat_original: "TRANSFER_IN" }),
+      row(60, { date: "2031-06-01" }),   // next month
+      row(100),
+    ];
+    assert.equal(m.bizPeriodProfit(rows, "2031-05-01", "2031-0"), 740);
+    assert.equal(m.bizPeriodProfit(rows, "2031-05-01", "2031-05"), 800);
+  });
+
+  test(`${side}: a refund reverses its cost in the cost's own bucket`, () => {
+    // an invented $250 purchase returned in the same month, both before
+    // the business opened: the server nets the pair inside the start-up
+    // total, so the month shows no profit — counting the refund as revenue
+    // showed $250 of profit from a returned purchase
+    const pre = [
+      row(250, { category: "GENERAL_MERCHANDISE" }),
+      row(-250, { category: "GENERAL_MERCHANDISE", date: "2031-05-20" }),
+    ];
+    assert.equal(m.bizPeriodProfit(pre, "2031-06-01", "2031-05"), 0);
+    // an explicitly organizational refund stays out of the period too
+    assert.equal(m.bizPeriodProfit(
+      [row(-90, { category: "PROFESSIONAL_SERVICES",
+                  bucket: "organizational" }),
+       row(-400, { category: "INCOME" })], null, "2031-05"), 400);
+    // an operating refund lowers operating cost, not revenue
+    assert.equal(m.bizPeriodProfit(
+      [row(300, { category: "TRAVEL" }), row(-100, { category: "TRAVEL" })],
+      null, "2031-05"), -200);
+    // a partly-claimed deposit is revenue whatever its category says
+    assert.equal(m.bizPeriodProfit(
+      [row(-500, { category: "GENERAL_MERCHANDISE", net_amount: -200,
+                   partly_claimed: true })], "2031-06-01", "2031-05"), 200);
+    // a reclassified transfer is capital, not a refund
+    assert.equal(m.bizPeriodProfit(
+      [row(-700, { category: "GENERAL_SERVICES",
+                   cat_original: "TRANSFER_IN" })], null, "2031-05"), 0);
+  });
+
+  test(`${side}: a refund takes the server's bucket for the cost it reverses`, () => {
+    // an invented $400 desk bought before opening and returned the month
+    // after: the server pairs the refund with its start-up purchase, so the
+    // month's operating profit is untouched — bucketed by its own date the
+    // refund would lower operating cost and show $400 of profit
+    const late = row(-400, { category: "GENERAL_MERCHANDISE",
+                             effective_bucket: "startup_195" });
+    assert.equal(m.bizPeriodProfit([late], "2031-04-01", "2031-05"), 0);
+    // the server's bucket wins over a stale date rule for a cost too
+    assert.equal(m.bizPeriodProfit(
+      [row(90, { effective_bucket: "operating" })], "2031-06-01", "2031-05"),
+      -90);
+    // an older server without the field: the row's own class, else its
+    // date — here an operating refund, which lowers operating cost
+    assert.equal(m.bizPeriodProfit(
+      [row(-400, { category: "GENERAL_MERCHANDISE" })], "2031-04-01",
+      "2031-05"), 400);
+    // money in that is not a refund carries null and stays revenue
+    assert.equal(m.bizPeriodProfit(
+      [row(-300, { category: "INCOME", effective_bucket: null })],
+      "2031-06-01", "2031-05"), 300);
+  });
+
+  test(`${side}: the refund categories are the server's`, (t) => {
+    // run from a copy of mobile/ alone (no server tree beside it) the
+    // server comparison is skipped; it belongs to the full tree
+    const booksUrl = new URL("../../server/oikonome/engine/books.py",
+                             import.meta.url);
+    if (!existsSync(booksUrl)) { t.skip("no server tree beside mobile/"); return; }
+    const books = readFileSync(booksUrl, "utf8");
+    const block = books.match(/_REFUND_CATEGORIES = frozenset\(\{([^}]*)\}/);
+    assert.ok(block, "books._REFUND_CATEGORIES not found");
+    const server = [...block[1].matchAll(/"([A-Z_]+)"/g)].map((x) => x[1]);
+    assert.deepEqual([...m.BIZ_REFUND_CATEGORIES].sort(), server.sort());
+  });
+
+  test(`${side}: a row without net_amount falls back to its gross`, () => {
+    assert.equal(m.bizPeriodProfit([row(-250, { category: "INCOME" })],
+                                   null, "2031-05"), 250);
+  });
+}
+
+test("the two copies of the business rules are the same text", () => {
+  const web = readFileSync(
+    new URL("../../webapp/src/bizmath.ts", import.meta.url), "utf8");
+  const mob = readFileSync(new URL("../src/lib/pure.ts", import.meta.url), "utf8");
+  for (const fn of ["bizSetupEntity", "bizWizardEntryStep", "bizPeriodProfit"]) {
+    const body = (src) => {
+      const i = src.indexOf(`export function ${fn}`);
+      return src.slice(i, src.indexOf("\n}\n", i));
+    };
+    assert.notEqual(body(web).length, 0);
+    assert.equal(body(mob), body(web), fn);
+  }
+});
+
+test("a hidden account's kept balance is not business cash", () => {
+  // hiding a manual account keeps its last balance (no feed restores it
+  // on unhide), so a sum that checked only the link counted money the
+  // owner switched off
+  const hidden = { balance_current: 700, link: null,
+                   user_removed_at: "2031-05-01T00:00:00Z" };
+  for (const counts of [countsInTotals, webBiz.countsInTotals]) {
+    assert.equal(counts(hidden), false);
+    assert.equal(counts({ balance_current: 700, link: null }), true);
+    assert.equal(counts({ balance_current: 700,
+      link: { group_id: "g", home_rank: 2, primary: false, healthy: true } }),
+      false);
+  }
+});
+
+// ---- what the owner is told after minting a household invite ----
+
+import { inviteOutcome } from "../src/lib/pure.ts";
+
+test("a delivered-only invite names the mailbox it went to", () => {
+  // Hosted withholds the URL — the mail IS the delivery. A card that
+  // rendered the URL alone would draw nothing here, so a successful
+  // invitation and a dead button would look identical.
+  assert.deepEqual(
+    inviteOutcome({ url: null, label: "alice@example.dev", emailed: true }),
+    { kind: "emailed", label: "alice@example.dev" });
+});
+
+test("a self-host mint still hands back the copyable share link", () => {
+  assert.deepEqual(
+    inviteOutcome({ url: "https://home.lan/app/invite?token=t",
+                    label: "the sitter", emailed: false }),
+    { kind: "link", url: "https://home.lan/app/invite?token=t",
+      emailed: false, label: "the sitter" });
+});
+
+test("a self-host mint that also mailed the link says both", () => {
+  // Self-host with SMTP configured does both, and the confirmation has to
+  // say so — otherwise the owner shares a link the invitee already has.
+  assert.deepEqual(
+    inviteOutcome({ url: "https://home.lan/app/invite?token=t",
+                    label: "alice@example.dev", emailed: true }),
+    { kind: "link", url: "https://home.lan/app/invite?token=t",
+      emailed: true, label: "alice@example.dev" });
+});
+
+test("a missing url is never rendered as an empty link", () => {
+  // An older server, or a field the client failed to read, must not put
+  // the owner in front of a blank share box.
+  assert.equal(inviteOutcome({ label: "alice@example.dev" }).kind, "emailed");
+  assert.equal(inviteOutcome({ url: "", label: " alice@example.dev " }).kind,
+               "emailed");
+  assert.equal(inviteOutcome({ url: "", label: " alice@example.dev " }).label,
+               "alice@example.dev");
+});
+
+
+// ---- the cash-flow window belongs to the household, not the device ----
+// Every figure on the Cash Flow screen is windowed server-side from the
+// HOUSEHOLD's date (localtime.now_local → reporting._range_window). The
+// device's clock is in a different month for hours around every boundary
+// whenever the household is not on UTC, so a cutoff derived from it draws
+// the chart from one window while the numbers beside it come from another
+// — and the best/worst caption is then computed over the short one.
+import { cashflowCutoffMonth, graphCurrentMonth } from "../src/lib/pure.ts";
+
+// A report built on 2026-08-31 for a household in America/Los_Angeles:
+// history stops before August, the forecast tail opens on August. The
+// real instant is 2026-09-01T01:00Z — the device is already in September.
+const LA_AUG = {
+  points: [["2026-05", 100], ["2026-06", 200], ["2026-07", 300],
+           ["2026-08", 400], ["2026-09", 500]],
+  forecast_from: 3,
+};
+const DEVICE_IN_SEPTEMBER = new Date("2026-09-01T01:00:00Z");
+
+test("the cash-flow window is cut on the household's month, not the device's", () => {
+  // The server's 3m window covers Jun+Jul+Aug, so June must survive the
+  // filter. Cut on the device it would not: its cutoff is 2026-07.
+  assert.equal(cashflowCutoffMonth(LA_AUG, "3m", DEVICE_IN_SEPTEMBER),
+               "2026-06");
+  assert.equal(cashflowCutoffMonth(LA_AUG, "1y", DEVICE_IN_SEPTEMBER),
+               "2025-09");
+  assert.equal(cashflowCutoffMonth(LA_AUG, "all", DEVICE_IN_SEPTEMBER), null);
+  // and the household's month is read off the report, not computed
+  assert.equal(graphCurrentMonth(LA_AUG), "2026-08");
+});
+
+test("the window keeps every month the household's own range covers", () => {
+  const cutoff = cashflowCutoffMonth(LA_AUG, "3m", DEVICE_IN_SEPTEMBER);
+  const history = LA_AUG.points
+    .filter((p, i) => i < LA_AUG.forecast_from && p[0] >= cutoff)
+    .map((p) => p[0]);
+  assert.deepEqual(history, ["2026-06", "2026-07"]);
+});
+
+test("a report with no forecast tail falls back to the device clock", () => {
+  // Nothing in the payload names the household's month then, so the
+  // device's is all there is — but it must still be a window, not a crash.
+  const noTail = { points: [["2026-05", 1], ["2026-06", 2]],
+                   forecast_from: 2 };
+  assert.equal(graphCurrentMonth(noTail), null);
+  assert.equal(cashflowCutoffMonth(noTail, "3m", DEVICE_IN_SEPTEMBER),
+               "2026-07");
+});
+
+
+// ---- removing an account refreshes what the removal freed ----
+// The plan allowance ("3 of 3 institutions") rides /api/me, and the screen
+// offering the removal is the screen showing the allowance. Without ["me"]
+// in the refresh, a household disconnects a bank to make room and the
+// Connect button stays disabled behind a count cached from before.
+import { accountRemoveMoved } from "../src/lib/pure.ts";
+
+test("a disconnect refreshes the institution allowance", () => {
+  for (const mode of ["disconnect", "disconnect_purge", "purge"])
+    assert.ok(accountRemoveMoved(mode).includes("me"),
+              `${mode} must refresh /api/me`);
+});
+
+test("hiding an account moves nothing the server counts", () => {
+  // A hidden account keeps its connection, so the allowance is unchanged
+  // and asking for it again is a request that can only confirm itself.
+  const keys = accountRemoveMoved("hide");
+  assert.ok(!keys.includes("me"));
+  assert.ok(!keys.includes("connections"));
+  assert.deepEqual(keys, ["accounts", "today", "transactions"]);
+});
+
+test("only a purge disturbs the settings view and the bill calendar", () => {
+  // A purge can take the checking anchor or an excluded account with it.
+  for (const mode of ["purge", "disconnect_purge"]) {
+    const keys = accountRemoveMoved(mode);
+    assert.ok(keys.includes("settings"), mode);
+    assert.ok(keys.includes("calendar"), mode);
+  }
+  assert.ok(!accountRemoveMoved("disconnect").includes("settings"));
+  assert.ok(!accountRemoveMoved("disconnect").includes("calendar"));
+});
+
+test("an empty category filter shows every option, not none", () => {
+  // catLabel spells an empty value as "Uncategorized"; passing the typed
+  // text through it would turn an empty filter box into "only options that
+  // contain the word Uncategorized" — i.e. the picker would open blank.
+  const all = ["FOOD_AND_DRINK", "GENERAL_SERVICES", "TRANSFER_OUT", "?"];
+  assert.deepEqual(filterCategories(all, ""), all);
+  assert.deepEqual(filterCategories(all, "   "), all);
+});
+
+test("the category filter matches the display label, underscores as spaces", () => {
+  const all = ["FOOD_AND_DRINK", "GENERAL_SERVICES", "TRANSFER_OUT"];
+  assert.deepEqual(filterCategories(all, "food and"), ["FOOD_AND_DRINK"]);
+  assert.deepEqual(filterCategories(all, "general_serv"), ["GENERAL_SERVICES"]);
+  assert.deepEqual(filterCategories(all, "zzz"), []);
+});
+
+test("every category picker filters on the label, not the raw constant", () => {
+  // The screens below render each option through catLabel — "GENERAL
+  // SERVICES" — so matching the typed text against the underscored
+  // constant would return nothing for what is plainly on screen. The
+  // rule is that the typed text only ever reaches filterCategories; it is
+  // checked here because these are screens, and the pure tests are the
+  // only thing that runs over them.
+  const pickers = {
+    "src/app/txn.tsx": "filter",
+    "src/app/bill-history.tsx": "filter",
+    "src/app/rules.tsx": "catFilter",
+    "src/app/(tabs)/transactions.tsx": "bulkFilter",
+    "src/app/(tabs)/bills.tsx": "nCategory",
+  };
+  for (const [file, typed] of Object.entries(pickers)) {
+    const src = readFileSync(new URL(`../${file}`, import.meta.url), "utf8");
+    assert.ok(src.includes("filterCategories"),
+              `${file}: the category picker must use filterCategories`);
+    const raw = new RegExp(`\\.includes\\(\\s*[^)]*\\b${typed}\\b`);
+    assert.ok(!raw.test(src),
+              `${file}: ${typed} is matched with .includes() — the option `
+              + "list is filtered on the raw category, so the label shown "
+              + "cannot be typed to find it");
+  }
+});
+
+// ---- assets: the Android notification glyph must clear every edge ----
+//
+// Android draws the small icon as a white silhouette clipped to the
+// drawable's bounds, so ink touching an edge is cut off and a mark whose
+// margins differ sits visibly off-centre. The asset is rendered from the
+// canonical SVG; this guards the render, not the renderer. Node has no
+// image library, so this decodes just enough PNG (8-bit RGBA, no
+// interlace) to find the alpha bounding box.
+
+function pngAlphaBbox(bytes) {
+  const sig = [137, 80, 78, 71, 13, 10, 26, 10];
+  assert.deepEqual([...bytes.subarray(0, 8)], sig, "not a PNG");
+  let pos = 8, width = 0, height = 0, depth = 0, ctype = 0, interlace = 0;
+  const idat = [];
+  while (pos < bytes.length) {
+    const len = bytes.readUInt32BE(pos);
+    const type = bytes.toString("latin1", pos + 4, pos + 8);
+    const data = bytes.subarray(pos + 8, pos + 8 + len);
+    if (type === "IHDR") {
+      width = data.readUInt32BE(0); height = data.readUInt32BE(4);
+      depth = data[8]; ctype = data[9]; interlace = data[12];
+    } else if (type === "IDAT") idat.push(data);
+    pos += 12 + len;
+  }
+  assert.equal(depth, 8, "expected 8-bit channels");
+  assert.equal(ctype, 6, "expected RGBA");
+  assert.equal(interlace, 0, "expected a non-interlaced PNG");
+  const raw = zlib.inflateSync(Buffer.concat(idat));
+  const bpp = 4, stride = width * bpp;
+  const px = Buffer.alloc(height * stride);
+  let prev = Buffer.alloc(stride);
+  for (let y = 0; y < height; y++) {
+    const f = raw[y * (stride + 1)];
+    const line = raw.subarray(y * (stride + 1) + 1, (y + 1) * (stride + 1));
+    const out = px.subarray(y * stride, (y + 1) * stride);
+    for (let i = 0; i < stride; i++) {
+      const a = i >= bpp ? out[i - bpp] : 0, b = prev[i],
+            c = i >= bpp ? prev[i - bpp] : 0;
+      let v;
+      if (f === 0) v = line[i];
+      else if (f === 1) v = line[i] + a;
+      else if (f === 2) v = line[i] + b;
+      else if (f === 3) v = line[i] + ((a + b) >> 1);
+      else {                                   // Paeth
+        const p = a + b - c, pa = Math.abs(p - a), pb = Math.abs(p - b),
+              pc = Math.abs(p - c);
+        v = line[i] + (pa <= pb && pa <= pc ? a : pb <= pc ? b : c);
+      }
+      out[i] = v & 255;
+    }
+    prev = out;
+  }
+  let x0 = width, y0 = height, x1 = -1, y1 = -1;
+  for (let y = 0; y < height; y++)
+    for (let x = 0; x < width; x++)
+      if (px[y * stride + x * bpp + 3] > 8) {
+        if (x < x0) x0 = x; if (x > x1) x1 = x;
+        if (y < y0) y0 = y; if (y > y1) y1 = y;
+      }
+  return { width, height, x0, y0, x1, y1 };
+}
+
+test("the notification icon's ink clears every edge and sits centred", () => {
+  const png = readFileSync(
+    new URL("../assets/images/notification-icon.png", import.meta.url));
+  const b = pngAlphaBbox(png);
+  assert.ok(b.x1 >= 0, "the icon has no opaque pixels at all");
+  const margins = { left: b.x0, top: b.y0,
+                    right: b.width - 1 - b.x1, bottom: b.height - 1 - b.y1 };
+  // 10% a side: the glyph must clear the drawable bounds on every side
+  // (Android clips there), but a 20% margin read as a speck in the status
+  // bar. The render is 12%, and the build regenerates the drawables.
+  const min = Math.round(b.width * 0.10);
+  for (const [side, m] of Object.entries(margins))
+    assert.ok(m >= min, `${side} margin is ${m}px; needs at least ${min}px`);
+  // even margins — a glyph pushed to one side reads as clipped even when
+  // it technically is not
+  const slack = Math.round(b.width * 0.02);
+  assert.ok(Math.abs(margins.left - margins.right) <= slack,
+            `off-centre horizontally: ${margins.left} vs ${margins.right}`);
+  assert.ok(Math.abs(margins.top - margins.bottom) <= slack,
+            `off-centre vertically: ${margins.top} vs ${margins.bottom}`);
+});
+
+// ---- the bug-report composer: three prompts, one message ----
+
+test("a bug report folds its prompts into labelled sections, skipping empties", () => {
+  assert.equal(composeBugReport("it broke", "a chart", "Spending"),
+               "What happened:\nit broke\n\nWhat I expected:\na chart\n\n"
+               + "Where:\nSpending");
+  assert.equal(composeBugReport(" it broke ", "", "  "),
+               "What happened:\nit broke");
+  assert.equal(composeBugReport("", "", ""), "");
+});
+
+test("the mobile bug-report composer is the web page's, word for word", () => {
+  const web = readFileSync(
+    new URL("../../webapp/src/pages/Feedback.tsx", import.meta.url), "utf8");
+  const mob = readFileSync(new URL("../src/lib/pure.ts", import.meta.url), "utf8");
+  const body = (src) => {
+    const i = src.indexOf("export function composeBugReport");
+    const j = src.indexOf("\n}\n", i);
+    return src.slice(i, j);
+  };
+  assert.equal(body(mob), body(web));
+});
+
+// ---- the ledger's quick date ranges and the picker's month grid ----
+import { monthGrid } from "../src/lib/dates.ts";
+import { ledgerRange } from "../src/lib/pure.ts";
+
+test("ledgerRange opens on the first of the window's opening month, open-ended", () => {
+  const today = new Date(2026, 8, 8); // Sep 8 2026
+  // the same three calendar months Cash Flow's 3m covers: Jul, Aug, Sep
+  assert.deepEqual(ledgerRange("3m", today), { from: "2026-07-01", to: "" });
+  assert.deepEqual(ledgerRange("6m", today), { from: "2026-04-01", to: "" });
+  assert.deepEqual(ledgerRange("1y", today), { from: "2025-10-01", to: "" });
+  assert.deepEqual(ledgerRange("3y", today), { from: "2023-10-01", to: "" });
+  assert.deepEqual(ledgerRange("5y", today), { from: "2021-10-01", to: "" });
+  assert.deepEqual(ledgerRange("all", today), { from: "", to: "" });
+});
+
+test("ledgerRange crosses the year boundary and ignores the day of month", () => {
+  // Jan 31: a 31st shifted back by months must not roll forward
+  assert.deepEqual(ledgerRange("3m", new Date(2026, 0, 31)),
+                   { from: "2025-11-01", to: "" });
+  assert.deepEqual(ledgerRange("6m", new Date(2026, 2, 1)),
+                   { from: "2025-10-01", to: "" });
+});
+
+test("monthGrid is six Monday-first weeks padded with neighbours", () => {
+  const g = monthGrid(2026, 9); // September 2026 starts on a Tuesday
+  assert.equal(g.length, 6);
+  assert.ok(g.every((w) => w.length === 7));
+  assert.deepEqual(g[0][0], { date: "2026-08-31", inMonth: false });
+  assert.deepEqual(g[0][1], { date: "2026-09-01", inMonth: true });
+  assert.equal(g[4][2].date, "2026-09-30");
+  assert.equal(g[4][3].inMonth, false);
+  // a month starting on Monday has no leading padding
+  assert.deepEqual(monthGrid(2026, 6)[0][0], { date: "2026-06-01", inMonth: true });
+});
+
+// ---- the daily verdict's delivery choice round-trips its two flags ----
+import { deliveryOf, flagsOf } from "../src/lib/pure.ts";
+
+test("delivery reads the email and push flags as one choice and back", () => {
+  for (const d of ["email", "push", "both", "off"]) {
+    const f = flagsOf(d);
+    assert.equal(deliveryOf(f.on, f.push), d);
+  }
+  assert.deepEqual(flagsOf("push"), { on: false, push: true });
+  assert.deepEqual(flagsOf("off"), { on: false, push: false });
+  // the legacy default — no schedule saved — is email on, push off
+  assert.equal(deliveryOf(true, false), "email");
+});
+
+// ---- the ledger's quick date ranges ----
+import { rangeCaption } from "../src/lib/pure.ts";
+
+test("ledgerRange: This month is from the 1st, 1m is the last complete month closed", () => {
+  const sep15 = new Date(2026, 8, 15);
+  assert.deepEqual(ledgerRange("cur", sep15), { from: "2026-09-01", to: "" });
+  assert.deepEqual(ledgerRange("1m", sep15), { from: "2026-08-01", to: "2026-08-31" });
+  assert.deepEqual(ledgerRange("3m", sep15), { from: "2026-07-01", to: "" });
+  assert.deepEqual(ledgerRange("all", sep15), { from: "", to: "" });
+});
+
+test("ledgerRange: month-end days clamp, and January reaches back a year", () => {
+  // 31 March: the month before has 28 days, and no day-of-month may roll
+  assert.deepEqual(ledgerRange("1m", new Date(2026, 2, 31)), { from: "2026-02-01", to: "2026-02-28" });
+  assert.deepEqual(ledgerRange("1m", new Date(2028, 2, 31)), { from: "2028-02-01", to: "2028-02-29" });
+  assert.deepEqual(ledgerRange("1m", new Date(2026, 0, 31)), { from: "2025-12-01", to: "2025-12-31" });
+  assert.deepEqual(ledgerRange("cur", new Date(2026, 0, 31)), { from: "2026-01-01", to: "" });
+  assert.deepEqual(ledgerRange("6m", new Date(2026, 0, 31)), { from: "2025-08-01", to: "" });
+});
+
+test("rangeCaption names the short windows in words", () => {
+  assert.equal(rangeCaption("cur"), "this month");
+  assert.equal(rangeCaption("1m"), "last month");
+  assert.equal(rangeCaption("3m"), "3m");
+  assert.equal(rangeCaption("all"), "all time");
+});
+
+// ---- "use the automatic category": the one write the client can't echo ----
+import { catLabel, isCategoryReset } from "../src/lib/pure.ts";
+
+test("a category reset has no local echo — the empty category is not a category", () => {
+  // the sentinel the picker and the "Use automatic" button send reaches the
+  // server as the empty string, which means "drop the override" — NOT a
+  // category named "". A screen that echoed what it sent would render this…
+  assert.equal(catLabel(categoryForServer(CLEAR_CATEGORY)), "Uncategorized");
+  // …so the reset is the write whose result is read back instead
+  assert.equal(isCategoryReset(categoryForServer(CLEAR_CATEGORY)), true);
+  // every other write IS the client's own answer and echoes immediately
+  assert.equal(isCategoryReset(categoryForServer("FOOD_AND_DRINK")), false);
+  assert.equal(isCategoryReset(categoryForServer("Groceries")), false);
+});
+
+test("one ledger row is read back from its own day, by id", async () => {
+  const real = globalThis.fetch;
+  const asked = [];
+  globalThis.fetch = async (url) => {
+    asked.push(String(url));
+    return new Response(JSON.stringify({ mode: "search", total: 2, rows: [
+      { id: "other", date: "2026-09-04", category: "TRAVEL" },
+      { id: "row-1", date: "2026-09-04", category: "FOOD_AND_DRINK",
+        override_manual: false, category_why: "the bank's own label" }] }),
+      { status: 200, headers: { "content-type": "application/json" } });
+  };
+  try {
+    const c = makeClient("https://example.invalid", "tok", () => {});
+    const row = await c.txnById("row-1", "2026-09-04T00:00:00");
+    assert.equal(row.category, "FOOD_AND_DRINK");
+    // the server's answer, not the caller's guess: the flag the "Use
+    // automatic" button is gated on comes back false with it
+    assert.equal(row.override_manual, false);
+    assert.equal(row.category_why, "the bank's own label");
+    // scoped to the row's own day — never a whole-ledger scan
+    assert.match(asked[0], /date_from=2026-09-04&date_to=2026-09-04/);
+  } finally { globalThis.fetch = real; }
+});
+
+test("a long day is walked page by page, and an absent row is null", async () => {
+  const real = globalThis.fetch;
+  const page = (n, rows) => new Response(
+    JSON.stringify({ mode: "search", total: 250, rows }),
+    { status: 200, headers: { "content-type": "application/json" } });
+  globalThis.fetch = async (url) => {
+    const n = Number(new URL(String(url)).searchParams.get("page"));
+    // 100 rows a page, the row wanted on the last one
+    const rows = Array.from({ length: 100 }, (_, i) => (
+      { id: `p${n}-${i}`, date: "2026-09-04", category: "TRAVEL" }));
+    if (n === 3) rows[7] = { id: "late", date: "2026-09-04",
+                             category: "GENERAL_MERCHANDISE" };
+    return page(n, n > 3 ? [] : rows);
+  };
+  try {
+    const c = makeClient("https://example.invalid", "tok", () => {});
+    assert.equal((await c.txnById("late", "2026-09-04")).category,
+                 "GENERAL_MERCHANDISE");
+    // a row the day's listing does not hold (a hidden account's) is not an
+    // error — the caller keeps what it has rather than showing a guess
+    assert.equal(await c.txnById("nowhere", "2026-09-04"), null);
+  } finally { globalThis.fetch = real; }
+});
+
+// ---- the emailed sign-in link: a refusal the sign-in screen can print ----
+import { requestUnlock, unlockRefusal } from "../src/lib/api.ts";
+
+/** The unlock door answering with `status` and the HTML page that route
+ *  really serves — it is a page route, so even its refusals are HTML. */
+function unlockDoor(status, statusText = "") {
+  return async () => new Response(
+    "<html><body><h1>Slow down</h1></body></html>",
+    { status, statusText, headers: { "content-type": "text/html" } });
+}
+
+test("the hourly cap on sign-in links reads as a rate limit, not a status line",
+     async () => {
+  const real = globalThis.fetch;
+  globalThis.fetch = unlockDoor(429, "Too Many Requests");
+  try {
+    await assert.rejects(
+      () => requestUnlock("https://example.invalid", "a@b.dev"),
+      (e) => e instanceof ApiError && e.status === 429
+             && /wait a few minutes/i.test(errText(e)));
+  } finally { globalThis.fetch = real; }
+});
+
+test("an unlock refusal with no status line still says something", async () => {
+  // React Native's fetch leaves statusText empty on some platforms, which
+  // is how a refused tap became a silently blank error line
+  const real = globalThis.fetch;
+  globalThis.fetch = unlockDoor(500);
+  try {
+    await assert.rejects(
+      () => requestUnlock("https://example.invalid", "a@b.dev"),
+      (e) => e instanceof ApiError && errText(e).trim().length > 10);
+  } finally { globalThis.fetch = real; }
+});
+
+test("the unlock door's 200 is success, HTML page and all", async () => {
+  const real = globalThis.fetch;
+  globalThis.fetch = unlockDoor(200);
+  try {
+    await requestUnlock("https://example.invalid", "a@b.dev");
+  } finally { globalThis.fetch = real; }
+});
+
+test("a demo instance has no unlock door, and says so", () => {
+  assert.match(unlockRefusal(404), /doesn't offer/i);
+  assert.match(unlockRefusal(503), /error 503/);
+});
+
+// ---- what-if screens (debt planner, retirement): a phone keyboard's
+// "1,000" must reach the GET as the number the save door would store,
+// and a refusal is shown at the fields, never as "couldn't reach" ----
+test("what-if money: formatted amounts become plain numbers", () => {
+  assert.equal(moneyParam("1,000"), "1000");
+  assert.equal(moneyParam("$ 250.50"), "250.5");
+  // the save door strips "," too, so a comma decimal reads the same way
+  // in the what-if as in what Save would store
+  assert.equal(moneyParam("50,5"), "505");
+  assert.equal(moneyParam(""), "0");
+  assert.equal(moneyParam("abc"), "0");
+  // whole dollars round the way every other money figure does — half to
+  // even, as the server and the web do — never half away from zero
+  assert.equal(moneyParam("250.50", true), "250");
+  assert.equal(moneyParam("251.50", true), "252");
+  assert.equal(moneyParam("250.51", true), "251");
+  assert.equal(moneyParam("60,000", true), "60000");
+});
+
+test("what-if query: blanks stay off, money parsed, the rest as typed", () => {
+  assert.deepEqual(
+    whatIfQuery({ spend: "60,000", employer_mo: " 1,250.40 ", ret: "7.0",
+                  cash: "", end: " 95 " },
+                ["spend", "employer_mo", "taxable_mo"], true),
+    { spend: "60000", employer_mo: "1250", ret: "7.0", end: "95" });
+});
+
+test("what-if refusal: a 4xx is the server's sentence, not an outage", () => {
+  assert.equal(whatIfRefusal(new ApiError(429, "Too many requests")),
+               "Too many requests");
+  // a FastAPI validation 422 carries its detail as a list, so the client
+  // is left with no sentence: say it failed, with the status
+  assert.equal(whatIfRefusal(new ApiError(422, "")), "Couldn't load: 422");
+  // the connection's failures keep the offline wording
+  assert.equal(whatIfRefusal(new ApiError(502, "Bad Gateway")), null);
+  assert.equal(whatIfRefusal(new TypeError("Network request failed")), null);
+  // the session handler owns 401 (back to sign-in)
+  assert.equal(whatIfRefusal(new ApiError(401, "Not signed in")), null);
+});
+
+// ---- widget cache ownership: a cached glance is one household's day;
+// a sign-in to another household (or server) must drop it ----
+test("widget owner: same household keeps the cache, another drops it", () => {
+  const a = widgetOwner("https://Home.example/", "t-a");
+  assert.equal(a, widgetOwner("https://home.example", "t-a"));
+  assert.equal(widgetOwnerChanged(a, a), false);
+  assert.equal(widgetOwnerChanged(a, widgetOwner("https://home.example", "t-b")),
+               true);
+  assert.equal(widgetOwnerChanged(a, widgetOwner("https://other.example", "t-a")),
+               true);
+  // no record is a change: a cache nobody can vouch for is not shown
+  assert.equal(widgetOwnerChanged(null, a), true);
+});
+
+// a fetch in flight across a change of household must not re-plant the
+// old household's numbers under the new credential
+test("widget cache: an entry is shown only under the credential it was fetched with", () => {
+  const entry = { glance: glance(), fetched_at: 1, owner: credentialStamp("tok-a") };
+  assert.equal(ownedCache(entry, "tok-a"), entry);
+  assert.equal(ownedCache(entry, "tok-b"), null);        // household B now
+  assert.equal(ownedCache(entry, null), null);           // signed out
+  assert.equal(ownedCache({ glance: glance(), fetched_at: 1 }, "tok-a"), null);
+  assert.equal(ownedCache(null, "tok-a"), null);
+  assert.notEqual(credentialStamp("tok-a"), credentialStamp("tok-b"));
+  assert.equal(credentialStamp("tok-a"), credentialStamp("tok-a"));
+  assert.ok(!credentialStamp("tok-a").includes("tok"));  // never the token
+});
+
+test("widget cache: a save whose credential changed mid-fetch is skipped", () => {
+  assert.equal(saveStillOwned("tok-a", "tok-a"), true);
+  assert.equal(saveStillOwned("tok-a", "tok-b"), false);  // re-minted for B
+  assert.equal(saveStillOwned("tok-a", null), false);     // signed out
+  assert.equal(saveStillOwned(null, null), false);
+});
+
+// ---- money drafts, signed totals, the planner's bucket merge (the same
+// table the server suite runs against the web's twin) ----
+for (const [name, fn] of Object.entries(moneyCases(pureModule, assert)))
+  test(`money: ${name}`, fn);
+
+// ---- files left in the app cache for the share sheet ----
+test("cache sweep: every shared download kind is ours, the platform's are not", () => {
+  const { isSharedDownload } = pureModule;
+  for (const n of ["oikonome-export.zip", "dump.sql.gz", "biz.csv",
+                   "continuity.pdf", "calendar.ics", "receipt.JPG",
+                   "receipt.webp", "oikonome-config.oikx"])
+    assert.equal(isSharedDownload(n), true, n);
+  for (const n of ["ImagePicker", "http-cache", "notes.txt", "oikx"])
+    assert.equal(isSharedDownload(n), false, n);
+});
+
+test("cache sweep: sign-out takes every download, a later sweep spares fresh ones", () => {
+  const { downloadsToSweep } = pureModule;
+  const now = 10_000;
+  const files = [{ name: "old.zip", mtimeS: now - 700 },
+                 { name: "fresh.pdf", mtimeS: now - 30 },
+                 { name: "bundle.oikx", mtimeS: now - 5 },
+                 { name: "ImagePicker", mtimeS: now - 9000 }];
+  assert.deepEqual(downloadsToSweep(files, now, 0),
+                   ["old.zip", "fresh.pdf", "bundle.oikx"]);
+  assert.deepEqual(downloadsToSweep(files, now, 600), ["old.zip"]);
+});
+
+// ---- reimburse: the expected-amount editor and the pairing total ----
+test("edit expected: blank or 0 clears, a positive amount sets, the rest is refused", () => {
+  const { expectedFromDraft } = pureModule;
+  assert.deepEqual(expectedFromDraft(""), { ok: true, expected: null });
+  assert.deepEqual(expectedFromDraft("  "), { ok: true, expected: null });
+  assert.deepEqual(expectedFromDraft("0"), { ok: true, expected: null });
+  assert.deepEqual(expectedFromDraft("$1,234.50"),
+                   { ok: true, expected: 1234.5 });
+  for (const bad of ["-20", "12.5.0", "abc", "1-"])
+    assert.deepEqual(expectedFromDraft(bad), { ok: false }, bad);
+});
+
+test("pairing total: a chosen deposit the filter hid still counts", () => {
+  const { pairSelection } = pureModule;
+  const chosen = new Map([["a", { amount: -40 }], ["b", { amount: -15.5 }]]);
+  assert.deepEqual(pairSelection(chosen, ["b", "c"]),
+                   { total: 55.5, count: 2, hidden: 1 });
+  assert.deepEqual(pairSelection(chosen, ["a", "b"]),
+                   { total: 55.5, count: 2, hidden: 0 });
+  assert.deepEqual(pairSelection(new Map(), []),
+                   { total: 0, count: 0, hidden: 0 });
+  // a deposit half spent on other charges gives only what it has left
+  assert.deepEqual(pairSelection(new Map([["a", { amount: -150,
+                                                  left_amount: 50 }]]), ["a"]),
+                   { total: 50, count: 1, hidden: 0 });
+});
+
+// ---- the bill form's ledger-fit hand-off ----
+test("bill prefill: only the in-app hand-off fills the form, once, for its payee", async () => {
+  const { setBillPrefill, takeBillPrefill } = await import("../src/lib/api.ts");
+  // a link that reaches /bill finds nothing to pre-fill
+  assert.equal(takeBillPrefill("Invented Rent"), null);
+  const fit = { amount: "12.00", cadence: "MONTHLY", next_due: "2031-02-03" };
+  setBillPrefill("Invented Rent", fit);
+  // another bill's form does not get this one's values, and the slot is spent
+  assert.equal(takeBillPrefill("Invented Gym"), null);
+  assert.equal(takeBillPrefill("Invented Rent"), null);
+  setBillPrefill("Invented Rent", fit);
+  assert.deepEqual(takeBillPrefill("Invented Rent"), fit);
+  assert.equal(takeBillPrefill("Invented Rent"), null);
+});
+
+// ---- the device-limit picker: finishing a sign-in whose mint hit the
+// device ceiling spends the grant that login left, never a second login
+// with an already-used one-time code ----
+test("device-limit retry: a live grant is spent, whatever the login used", () => {
+  const { deviceLimitRetry, MINT_GRANT_USABLE_MS } = pureModule;
+  const grant = { ticket: "oikm-invented", cookie: "", issuedAt: 1000 };
+  assert.equal(deviceLimitRetry(grant, 1000, true), "mint");
+  assert.equal(deviceLimitRetry(grant, 1000, false), "mint");
+  assert.equal(deviceLimitRetry(grant, 1000 + MINT_GRANT_USABLE_MS - 1, true),
+               "mint");
+  // an older server hands back no ticket; its session cookie still works
+  assert.equal(deviceLimitRetry({ ticket: "", cookie: "s=1", issuedAt: 0 },
+                                10, true), "mint");
+});
+
+test("device-limit retry: without a grant a spent code is never resent", () => {
+  const { deviceLimitRetry, MINT_GRANT_USABLE_MS, mintGrantRefused } =
+    pureModule;
+  const stale = { ticket: "oikm-invented", cookie: "", issuedAt: 0 };
+  assert.equal(deviceLimitRetry(stale, MINT_GRANT_USABLE_MS, true), "ask-code");
+  assert.equal(deviceLimitRetry(stale, MINT_GRANT_USABLE_MS, false), "login");
+  assert.equal(deviceLimitRetry(null, 0, true), "ask-code");
+  assert.equal(deviceLimitRetry(null, 0, false), "login");
+  assert.equal(deviceLimitRetry({ ticket: "", cookie: "", issuedAt: 0 },
+                                0, false), "login");
+  // a clock that ran backwards does not make a grant look fresh
+  assert.equal(deviceLimitRetry(stale, -5, true), "ask-code");
+  assert.equal(mintGrantRefused(401), true);
+  assert.equal(mintGrantRefused(409), false);
+});
+
+test("device-limit retry: the 409 carries the grant and the retry is only the mint", async () => {
+  const { loginAndMintDevice, mintDeviceWithGrant } =
+    await import("../src/lib/api.ts");
+  const calls = [];
+  let atCeiling = true;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    const path = new URL(url).pathname;
+    calls.push({ path, body: init.body ? String(init.body) : "" });
+    const json = (status, obj) => new Response(JSON.stringify(obj), {
+      status, headers: { "content-type": "application/json" } });
+    if (path === "/api/login")
+      return json(200, { ok: true, mint_ticket: "oikm-invented-ticket" });
+    if (path === "/api/devices") {
+      const b = JSON.parse(String(init.body));
+      if (atCeiling && !b.replace)
+        return json(409, { detail: { error: "device_limit",
+          message: "limit", devices: [{ id: "dev-a" }] } });
+      return json(200, { token: "oikd_invented", id: "dev-new" });
+    }
+    return json(200, { ok: true });
+  };
+  try {
+    let err;
+    try {
+      await loginAndMintDevice("https://example.invalid", "a@example.invalid",
+        "pw", "123456", "Phone", "android");
+    } catch (e) { err = e; }
+    assert.equal(err?.status, 409);
+    assert.equal(err.mintGrant?.ticket, "oikm-invented-ticket");
+    calls.length = 0;
+    const r = await mintDeviceWithGrant("https://example.invalid",
+      err.mintGrant, "Phone", "android", "dev-a");
+    assert.equal(r.token, "oikd_invented");
+    assert.equal(calls.some((c) => c.path === "/api/login"), false);
+    const mint = JSON.parse(calls.find((c) => c.path === "/api/devices").body);
+    assert.equal(mint.mint_ticket, "oikm-invented-ticket");
+    assert.equal(mint.replace, "dev-a");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+// ---- a list that never loaded is not an empty list ----
+test("listPhase: a failed first fetch reads as failed, not empty", () => {
+  const { listPhase } = pureModule;
+  assert.equal(listPhase({ isError: true, hasData: false }, 0), "failed");
+  assert.equal(listPhase({ isError: false, hasData: false }, 0), "loading");
+  assert.equal(listPhase({ isError: false, hasData: true }, 0), "empty");
+  // a stale cached answer is still the answer; the banner dates it
+  assert.equal(listPhase({ isError: true, hasData: true }, 0), "empty");
+  assert.equal(listPhase({ isError: true, hasData: true }, 3), "rows");
+});
+
+// ---- the reimbursement matcher's "why" and gap line run from the
+// shared case table (money-cases.mjs), against both clients ----
+
+// ---- Rules empty line: first-run only when there are no rules ----
+test("rulesEmptyLine: a search with no hits is not 'No rules yet'", () => {
+  const { rulesEmptyLine, lastPage } = pureModule;
+  const none = { user: 0, llm: 0, model: 0, seed: 0 };
+  const some = { user: 0, llm: 12, model: 0, seed: 3000 };
+  assert.equal(rulesEmptyLine(none, ""), "first-run");
+  assert.equal(rulesEmptyLine(some, "zzz"), "No matches in this group.");
+  assert.equal(rulesEmptyLine(some, ""), "No rules here yet.");
+  assert.equal(lastPage(0, 50), 1);
+  assert.equal(lastPage(101, 50), 3);
+  assert.equal(lastPage(100, 50), 2);
+});
+
+// ---- a screen that shows a key refetches after every deferred write,
+// even one that lands while an earlier refetch is still running ----
+import { QueryObserver } from "@tanstack/react-query";
+import { AppQueryClient, shownRefetcher } from "../src/lib/shown.ts";
+
+const tick = () => new Promise((r) => setTimeout(r, 0));
+
+function shownScreen(qc, key) {
+  const calls = [];
+  let state = 0;
+  const obs = new QueryObserver(qc, { queryKey: key, retry: false,
+    staleTime: 60_000,
+    queryFn: () => { const saw = state; return new Promise((res) =>
+      calls.push({ saw, land: () => res({ v: saw }) })); } });
+  const unsub = obs.subscribe(() => {});
+  const w = shownRefetcher(qc, key, () => obs.getCurrentResult());
+  const detach = w.attach();
+  return { obs, calls, w, write: (v) => { state = v; },
+           done: () => { detach(); unsub(); } };
+}
+
+test("shown refetch: a write during a refetch is not lost to the older answer", async () => {
+  const qc = new AppQueryClient();
+  const sc = shownScreen(qc, ["bills"]);
+  sc.calls[0].land(); await tick();
+  sc.w.focus();
+  // write A: its refetch goes out
+  sc.write(1);
+  qc.invalidateQueries({ queryKey: ["bills"], refetchType: "none" });
+  await tick();
+  assert.equal(sc.calls.length, 2);
+  // write B lands while A's refetch is still out; no cache patch, so
+  // TanStack itself raises no second "invalidate" event
+  sc.write(2);
+  qc.invalidateQueries({ queryKey: ["bills"], refetchType: "none" });
+  await tick();
+  assert.equal(sc.calls.length, 3, "B must start its own refetch");
+  sc.calls[1].land(); sc.calls[2].land(); await tick();
+  assert.equal(qc.getQueryData(["bills"]).v, 2);
+  sc.done();
+});
+
+test("shown refetch: the patch-then-invalidate order is covered too", async () => {
+  const qc = new AppQueryClient();
+  const sc = shownScreen(qc, ["bills"]);
+  sc.calls[0].land(); await tick();
+  sc.w.focus();
+  sc.write(1);
+  qc.invalidateQueries({ queryKey: ["bills"], refetchType: "none" });
+  await tick();
+  sc.write(2);
+  qc.setQueryData(["bills"], (o) => ({ ...o, patched: true }));
+  qc.invalidateQueries({ queryKey: ["bills"], refetchType: "none" });
+  await tick();
+  sc.calls[1].land(); await tick();
+  sc.calls.at(-1).land(); await tick();
+  assert.equal(qc.getQueryData(["bills"]).v, 2);
+  sc.done();
+});
+
+test("TanStack raises no event for a second invalidation of an invalid query", () => {
+  // why the app announces deferred invalidations itself (shown.ts)
+  const qc = new AppQueryClient();
+  qc.setQueryData(["k"], 1);
+  const seen = [];
+  const off = qc.getQueryCache().subscribe((e) => {
+    if (e.type === "updated" && e.action.type === "invalidate") seen.push(1);
+  });
+  const told = [];
+  const off2 = qc.onDeferredInvalidate(() => told.push(1));
+  qc.invalidateQueries({ queryKey: ["k"], refetchType: "none" });
+  qc.invalidateQueries({ queryKey: ["k"], refetchType: "none" });
+  assert.equal(seen.length, 1);
+  assert.equal(told.length, 2);
+  off(); off2();
+});
+
+test("shown refetch: a write while hidden is caught up on showing, even after a fetch made it look fresh", async () => {
+  const qc = new AppQueryClient();
+  const sc = shownScreen(qc, ["today"]);
+  sc.calls[0].land(); await tick();
+  sc.w.focus(); sc.w.blur();
+  // a refetch goes out (pull-to-refresh), the screen is left, a write
+  // elsewhere lands, then the old answer settles and reads fresh
+  void sc.obs.refetch(); await tick();
+  sc.write(1);
+  qc.invalidateQueries({ queryKey: ["today"], refetchType: "none" });
+  sc.calls[1].land(); await tick();
+  assert.equal(sc.obs.getCurrentResult().isStale, false);
+  const before = sc.calls.length;
+  sc.w.focus(); await tick();
+  assert.equal(sc.calls.length, before + 1);
+  sc.calls.at(-1).land(); await tick();
+  assert.equal(qc.getQueryData(["today"]).v, 1);
+  sc.done();
+});
+
+test("shown refetch: a tab that errored retries once when shown again", async () => {
+  const qc = new AppQueryClient();
+  let fail = true, n = 0;
+  const obs = new QueryObserver(qc, { queryKey: ["txns"], retry: false,
+    queryFn: async () => { n++; if (fail) throw new Error("down"); return 1; } });
+  const unsub = obs.subscribe(() => {});
+  await tick(); await tick();
+  assert.equal(obs.getCurrentResult().isError, true);
+  const w = shownRefetcher(qc, ["txns"], () => obs.getCurrentResult());
+  const detach = w.attach();
+  fail = false;
+  w.focus(); await tick(); await tick();
+  assert.equal(n, 2);
+  assert.equal(qc.getQueryData(["txns"]), 1);
+  detach(); unsub();
+});
+
+test("shown refetch: several invalidations from one write make one fetch", async () => {
+  const qc = new AppQueryClient();
+  const sc = shownScreen(qc, ["today"]);
+  sc.calls[0].land(); await tick();
+  sc.w.focus();
+  qc.invalidateQueries({ queryKey: ["today"], refetchType: "none" });
+  qc.invalidateQueries({ queryKey: ["today"], refetchType: "none" });
+  await tick();
+  assert.equal(sc.calls.length, 2);
+  // another key's write does not touch this screen
+  qc.invalidateQueries({ queryKey: ["bills"], refetchType: "none" });
+  await tick();
+  assert.equal(sc.calls.length, 2);
+  sc.calls[1].land(); await tick();
+  sc.done();
+});
+
+// ---- push: the "already sent" hint is trusted only while the server
+// still holds this device's token live ----
+test("pushStillLive: a dead or missing row re-registers", () => {
+  const { pushStillLive } = pureModule;
+  const me = (push) => [{ current: false, push: "on" },
+                        { current: true, push }];
+  assert.equal(pushStillLive("u t", "u t", me("on")), true);
+  assert.equal(pushStillLive("u t", "u t", me("dead")), false);
+  assert.equal(pushStillLive("u t", "u t", me(null)), false);
+  // token rotated, server changed, or signed in afresh (hint cleared)
+  assert.equal(pushStillLive("u t", "u t2", me("on")), false);
+  assert.equal(pushStillLive(null, "u t", me("on")), false);
+  // no roster to check against: send, as every launch used to
+  assert.equal(pushStillLive("u t", "u t", null), false);
+  assert.equal(pushStillLive("u t", "u t", []), false);
+});
