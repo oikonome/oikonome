@@ -79,8 +79,9 @@ function FeedbackCard({ canEmail, feedbackTo }:
           ? <>Something broke? Say what happened, what you expected, and
               where — a screenshot helps a lot.</>
           : <>Something confusing, missing, or worth changing? Tell us.</>}{" "}
-        Your report is packaged with the system-health diagnostic bundle and the
-        app's recent log lines (no transaction contents, no tokens) and gets a
+        Your report is packaged with the system-health diagnostic bundle (no
+        hostnames, bank names or collector labels) and the app's recent log
+        lines (no transaction contents, no tokens) and gets a
         report number.{" "}
         {canEmail
           ? (feedbackTo

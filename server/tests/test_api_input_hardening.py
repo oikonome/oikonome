@@ -323,3 +323,182 @@ class ExportOrderNamesTheRenameJournal(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NulCharactersAreRefusedNotCrashed(unittest.TestCase):
+    """PostgreSQL text cannot hold a NUL (U+0000): the driver refuses to
+    bind one, and a jsonb value carrying one fails on the server. Either
+    way a NUL in a search box, a body field or an uploaded file is the
+    caller's bad input — a 400 with a plain reason — never a 500."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client, cls.tid = _owner_client(_app())
+        conn = tenancy.tenant_connect(cls.tid)
+        try:
+            seed_accounts(conn)
+            write_config(conn)
+        finally:
+            conn.close()
+
+    def test_a_nul_in_a_search_query_is_a_400_on_every_search_door(self):
+        for path in ("/api/transactions", "/api/integrations/transactions",
+                     "/api/merchants/catalog"):
+            r = self.client.get(path, params={"q": "a\x00b"})
+            self.assertEqual(r.status_code, 400, f"{path}: {r.text}")
+            self.assertIn("NUL", r.json()["detail"], path)
+
+    def test_a_nul_in_a_json_text_field_is_a_400(self):
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            add_txn(conn, "2026-07-01", 12.0, "CORNER SHOP", account="chk",
+                    txn_id="nul-note")
+        finally:
+            conn.close()
+        r = self.client.post("/api/transactions/nul-note/note",
+                             json={"note": "split\u0000with a friend"})
+        self.assertEqual(r.status_code, 400, r.text)
+
+    def test_a_utf16_csv_with_a_bom_imports(self):
+        csv = ("Date,Amount,Description\r\n"
+               "07/01/2026,-42.50,GROCERY MART\r\n"
+               "07/02/2026,-9.99,STREAMFLIX\r\n").encode("utf-16")
+        r = self.client.post(
+            "/api/import", files={"file": ("bank.csv", csv, "text/csv")},
+            data={"account_id": "chk", "amount_sign": "bank"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["result"].get("imported"), 2, r.text)
+
+    def test_a_csv_carrying_nul_bytes_is_refused_with_a_reason(self):
+        csv = b"Date,Amount,Description\n07/01/2026,-1.00,A\x00B\n"
+        r = self.client.post(
+            "/api/import", files={"file": ("bank.csv", csv, "text/csv")},
+            data={"account_id": "chk", "amount_sign": "bank"})
+        self.assertEqual(r.status_code, 200, r.text)
+        err = r.json()["result"].get("error") or ""
+        self.assertIn("NUL", err, r.text)
+
+
+class NumbersPastFloatRangeAreRefused(unittest.TestCase):
+    """JSON `1e400` parses to float infinity, and int() of infinity raises
+    OverflowError rather than ValueError. A door that converts a body number
+    with int() must refuse that as bad input like any other non-number —
+    a 4xx — instead of letting it escape as a 500."""
+
+    INF = b"1e400"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client, cls.tid = _owner_client(_app())
+
+    def _post(self, path, raw: bytes):
+        return self.client.post(path, content=raw,
+                                headers={"content-type": "application/json"})
+
+    def test_settings_number_fields(self):
+        for raw in (b'{"email_send_hour_utc": %s}' % self.INF,
+                    b'{"email_schedule": {"daily": {"on": true, "hour": %s}}}'
+                    % self.INF,
+                    b'{"email_schedule": {"yearly": {"on": true, "hour": %s}}}'
+                    % self.INF):
+            r = self._post("/api/settings", raw)
+            self.assertEqual(r.status_code, 400, f"{raw!r}: {r.text}")
+
+    def test_support_access_hours(self):
+        r = self._post("/api/support-access",
+                       b'{"hours": %s, "password": "%s"}'
+                       % (self.INF, PASSWORD.encode()))
+        self.assertIn(r.status_code, (400, 404), r.text)
+
+    def test_doctor_watch_hours(self):
+        r = self._post("/api/doctor/scripts/coinbase",
+                       b'{"expected_hours": %s}' % self.INF)
+        self.assertEqual(r.status_code, 422, r.text)
+
+    def test_bill_companion_window(self):
+        r = self._post("/api/bills/save",
+                       b'{"payee": "WATER CO", "amount": 40, "companions": '
+                       b'[{"tokens": "late fee", "amount": 5, '
+                       b'"window_days": %s}]}' % self.INF)
+        self.assertEqual(r.status_code, 400, r.text)
+
+    def test_bulk_import_decision_index(self):
+        r = self._post("/api/import/bulk/run",
+                       b'{"token": "no-such-batch", "files": '
+                       b'[{"action": "import", "index": %s}]}' % self.INF)
+        self.assertEqual(r.status_code, 400, r.text)
+
+
+class IntegersTooWideForADoubleAreRefused(unittest.TestCase):
+    """JSON carries integers of any width, and float() of one past the
+    double range raises OverflowError rather than ValueError. A door that
+    turns a body number into a float must answer that with the same 400
+    it gives any other non-number, never a 500."""
+
+    HUGE = b"1" + b"0" * 400
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client, cls.tid = _owner_client(_app())
+
+    def _post(self, path, raw: bytes):
+        return self.client.post(path, content=raw,
+                                headers={"content-type": "application/json"})
+
+    def test_reimbursement_expected_amount(self):
+        r = self._post("/api/reimburse/no-such-txn/flag",
+                       b'{"expected": %s}' % self.HUGE)
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertIn("expected must be a number", r.text)
+
+    def test_plan_activity_balance(self):
+        r = self._post("/api/import/plan-activity",
+                       b'{"plan": "401K", "csv": "Date,Amount\\n", '
+                       b'"balance": %s}' % self.HUGE)
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertIn("balance must be a number", r.text)
+
+    def test_finite_amounts_past_the_money_ceiling_are_refused(self):
+        """1.7e308 is finite, but two of them sum to infinity in every
+        net-worth total — and then no JSON response can carry the total."""
+        for path, raw, word in (
+                ("/api/import/plan-activity",
+                 b'{"plan": "401K", "csv": "Date,Amount\\n", '
+                 b'"balance": 1.7e308}', "balance"),
+                ("/api/reimburse/no-such-txn/flag",
+                 b'{"expected": 1.7e308}', "expected")):
+            r = self._post(path, raw)
+            self.assertEqual(r.status_code, 400, f"{path}: {r.text}")
+            self.assertIn(f"{word} is too large", r.text)
+
+    def test_a_stored_social_security_estimate_does_not_500_retirement(self):
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            seed_accounts(conn)
+            write_config(conn, ss_estimates={"67": 10 ** 400, "70": 3000})
+        finally:
+            conn.close()
+        r = self.client.get("/api/retirement")
+        self.assertEqual(r.status_code, 200, r.text)
+
+
+class ListFieldsMustBeLists(unittest.TestCase):
+    """A body field the door iterates must be a JSON list. A scalar there
+    is a client bug or a probe, and gets a 400 like every other malformed
+    shape — never a TypeError escaping as a 500."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client, cls.tid = _owner_client(_app())
+
+    def test_bulk_import_files_scalar_is_400(self):
+        for bad in (5, True, 1.5, "abc", {"a": 1}):
+            r = self.client.post("/api/import/bulk/run",
+                                 json={"token": "x", "files": bad})
+            self.assertEqual(r.status_code, 400, f"{bad!r}: {r.text}")
+
+    def test_taxdoc_commit_rows_scalar_is_400(self):
+        for bad in (5, True, 1.5, "abc", {"a": 1}):
+            r = self.client.post("/api/import/taxdoc/commit",
+                                 json={"token": "x", "rows": bad})
+            self.assertEqual(r.status_code, 400, f"{bad!r}: {r.text}")

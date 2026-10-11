@@ -165,7 +165,10 @@ class WorkerDemoEmailSkipTests(unittest.TestCase):
         self._seed(email_recipients=["someone@example.dev"])
         # configured proposes, accepted enrols
         accept_recipient_invite(self.tid, "someone@example.dev")
-        with mock.patch.object(report, "send") as send:
+        # a relay is configured: with none, the email channel is off
+        with mock.patch.dict("os.environ",
+                             {"OIKONOME_SMTP_HOST": "smtp.example.com"}), \
+             mock.patch.object(report, "send") as send:
             subject = worker.email_tenant(self.tid, send_it=True)
         send.assert_called_once()
         self.assertTrue(subject)

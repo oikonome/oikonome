@@ -278,6 +278,41 @@ def added_recipients(previous: list | set | None,
     return out
 
 
+def owner_addresses(tenant_id) -> set[str]:
+    """The household's owner addresses, lowercased. The owner is mailed by
+    construction (`worker._recipients_raw`), so an owner is never a
+    recipient to add or invite. Read on the pooled control connection,
+    like the recipient-status view's own membership read."""
+    import uuid
+    from ..db import tenancy
+    try:
+        tid = uuid.UUID(str(tenant_id))
+    except ValueError:
+        return set()
+    cc = tenancy.control_connect()
+    try:
+        return {str(r["email"]).strip().lower() for r in cc.execute(
+            "SELECT email FROM users WHERE tenant_id=%s AND role='owner'",
+            (tid,)).fetchall()}
+    finally:
+        cc.close()
+
+
+def refuse_owner_added(tenant_id, added) -> None:
+    """400 when a one-address add names an owner. That is a person typing
+    their own address into an add box, which can only mean they expect to
+    start receiving mail they already get. A WHOLE list that includes the
+    owner is a different statement and stays accepted: a configured list
+    means "only these people", so `[owner]` is how a household keeps the
+    daily mail to the owner alone, and a list stored that way must keep
+    saving. Either way no owner is ever invited (`invite_added`)."""
+    new = {str(a).strip().lower() for a in (added or []) if str(a).strip()}
+    if new and new & owner_addresses(tenant_id):
+        raise HTTPException(
+            400, "That's you — as the owner you already receive this "
+                 "mail, so there is nothing to add.")
+
+
 def invite_added(user: dict, emails: list[str]) -> None:
     """Mint + send an invite for each newly added address.
 
@@ -305,7 +340,19 @@ def invite_added(user: dict, emails: list[str]) -> None:
     from .app import _deliver_recipient_invite, _tenant_smtp
     import threading
     minted: list[tuple[str, str]] = []
+    # the doors refuse an owner's address as an addition; this covers every
+    # other way one reaches the list (a restore, a stored legacy entry), so
+    # no owner is ever sent an invitation to their own household's mail
+    try:
+        owners = owner_addresses(user["tenant_id"])
+    except Exception:                                    # noqa: BLE001
+        # the doors' own refusal still stands; a failed read here must not
+        # cost every other address its invitation
+        log.exception("owner lookup failed before inviting recipients")
+        owners = set()
     for email in list(emails)[:MAX_RECIPIENTS]:
+        if str(email).strip().lower() in owners:
+            continue
         try:
             token = recipient_invites.invite(
                 user["tenant_id"], email, invited_by=user.get("user_id"))

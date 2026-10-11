@@ -37,7 +37,9 @@ Groups (``importlib.metadata`` entry points):
 
 Discovery runs once per process and never raises: a broken add-on logs
 and the instance runs without it, which is the failure mode an operator
-can see and fix.
+can see and fix. The one exception is a broken GATE on a hosted instance,
+which runs under a gate that refuses rather than one that allows
+everything (see :class:`_FailClosedGate`).
 """
 from __future__ import annotations
 
@@ -120,6 +122,21 @@ class Gate:
         doors open is meant to be escaped inside the app, so /login lets a
         session in that state through to it."""
         return {}
+
+    def unknown_status_lockout(self) -> tuple[int, str, tuple[str, ...]] | None:
+        """The lockout for a tenant status that is not 'active' and that
+        neither the product nor this gate names, in the shape of a
+        lockout_statuses value; None lets it through. Such a status can only
+        come from an add-on, and an installed gate names every status it
+        sets.
+
+        Every door that admits a household by its status must consult this
+        after its own table — the session check (current_user), the
+        script-token door, the write refusal, /login, a device mint and a
+        share-link join — or a household frozen under an add-on's status
+        walks back in whenever the add-on is not there to name it.
+        `lockout_for` is that lookup, in one place."""
+        return None
 
     def sync_priority_sql(self) -> str | None:
         """A SELECT returning ``id`` over active tenants in sync-priority
@@ -259,13 +276,117 @@ class Gate:
         return "this instance is not taking new accounts right now."
 
 
+class GateUnavailable(RuntimeError):
+    """A decision only the gate add-on can make was asked for while it is
+    not loaded. Nothing was changed; the caller says so and the operator
+    retries once the add-on loads.
+
+    Its own type, raised only by the fail-closed gate (reactivate,
+    on_tenant_purge, release_tenant, provision), so a caller can tell "the add-on is
+    missing, stop" from the add-on's own failures, which several callers
+    deliberately log and step past. A caller that swallows add-on failures
+    with a broad except must catch this one first and re-raise or report
+    it, or the stop it signals turns into the very quiet no-op it exists
+    to prevent."""
+
+    def __init__(self, what: str):
+        super().__init__(f"{what} is unavailable while the billing add-on "
+                         "is not loaded")
+
+
+class _FailClosedGate(Gate):
+    """What a HOSTED instance runs under when a gate add-on is registered
+    but failed to load. The operator meant the instance to be gated, and
+    the permissive defaults would lift every cap and lockout for every
+    tenant at once, spending the operator's money on their behalf. So
+    nothing billable is allowed, nothing is written, and no new account is
+    taken, until the add-on loads again.
+
+    Every policy answer fails closed, not only the ones that spend money:
+    a household the add-on froze stays frozen (its status is one only the
+    add-on names, so every such status is locked out), nothing is lifted
+    into 'active' on the add-on's behalf, and every household is taken to
+    have money attached, so no sweep freezes or deletes one that may be
+    paying."""
+
+    name = "unavailable"
+
+    def reactivate(self, admin, tenant_id) -> str:
+        # whether a trial ran out while the household was suspended is the
+        # add-on's to say; landing it in 'active' could not be taken back
+        raise GateUnavailable("reactivating a household")
+
+    def unknown_status_lockout(self) -> tuple[int, str, tuple[str, ...]]:
+        return (503, "this account is unavailable right now — please try "
+                     "again shortly", ())
+
+    def money_attached(self, admin, tenant_id) -> bool:
+        return True
+
+    def on_tenant_delete_scheduled(self, tenant_id) -> str:
+        # nothing that charges the household could be paused
+        return "unavailable"
+
+    def on_tenant_purge(self, admin, tenant_id) -> None:
+        # what the add-on keeps beyond the account's life cannot be
+        # archived; the purge records the failure rather than a quiet no-op
+        raise GateUnavailable("archiving a household's billing record")
+
+    def release_tenant(self, tenant_id) -> str:
+        # what the add-on holds outside the database (a subscription that
+        # keeps charging) cannot be released: never report there is none
+        raise GateUnavailable("releasing a household's billing")
+
+    def provision(self, admin, tenant_id, *, invite: dict | None,
+                  ref: str | None, verified: bool,
+                  reclaim: bool) -> str | None:
+        # a household created now would have no billing record of its own
+        # (no trial end, none of the terms an invite carries), and nothing
+        # writes one later, so it would keep the full plan for good. Every
+        # door that creates a household calls this inside its transaction,
+        # an invited signup and the console's create included, so refusing
+        # here rolls the whole creation back
+        raise GateUnavailable("taking a new account")
+
+    def tier_allows(self, conn, feature: str) -> bool:
+        return False
+
+    def institution_cap(self, conn) -> int | None:
+        return 0
+
+    def institution_cap_message(self, cap: int, used: int) -> str:
+        return ("Connecting institutions is unavailable on this instance "
+                "right now.")
+
+    def enrich_rows_cap(self) -> int | None:
+        return 0                                # 0 is OFF, never uncapped
+
+    def plaid_products(self, conn) -> list[str] | None:
+        return []
+
+    def write_blocked(self, tenant_id) -> bool:
+        return True
+
+    def intake_cap(self) -> int | None:
+        return 0
+
+    def at_cap(self, accounts: int) -> bool:
+        return True
+
+
+# entry-point groups in which a registered extension failed to load
+_LOAD_FAILED: set[str] = set()
+
+
 @functools.cache
 def _group(name: str) -> list[Any]:
     out: list[Any] = []
+    _LOAD_FAILED.discard(name)
     try:
         eps = entry_points(group=name)
     except Exception:                                    # noqa: BLE001
         log.exception("extension discovery failed for %s", name)
+        _LOAD_FAILED.add(name)
         return out
     for ep in eps:
         try:
@@ -273,6 +394,7 @@ def _group(name: str) -> list[Any]:
         except Exception:                                # noqa: BLE001
             log.exception("extension %s (%s) failed to load; skipped",
                           ep.name, name)
+            _LOAD_FAILED.add(name)
     return out
 
 
@@ -286,7 +408,19 @@ class _GateProxy:
     def _resolve(self) -> Gate:
         if self._impl is None:
             found = _group("oikonome.gate")
-            impl = found[0] if found else Gate()
+            if found:
+                impl = found[0]
+            elif ("oikonome.gate" in _LOAD_FAILED
+                  and _env_flag("OIKONOME_HOSTED")):
+                # A hosted instance with NO add-on is a documented mode and
+                # keeps the defaults; one whose registered gate broke must
+                # not silently become ungated.
+                log.error("the gate add-on failed to load on a hosted "
+                          "instance; refusing billable features, writes "
+                          "and new accounts until it loads")
+                impl = _FailClosedGate()
+            else:
+                impl = Gate()
             if len(found) > 1:
                 log.warning("several gate providers registered; using %s",
                             getattr(impl, "name", impl))
@@ -299,7 +433,59 @@ class _GateProxy:
         return getattr(self._resolve(), item)
 
 
+def _env_flag(name: str) -> bool:
+    from .envnum import env_flag
+    return env_flag(name)
+
+
 gate = _GateProxy()
+
+
+def lockout_for(status: str | None, known: dict
+                ) -> tuple[int, str, tuple[str, ...]] | None:
+    """The lockout a household in `status` is under, for every door that
+    admits one by its status: `known` is the product's own table (the web
+    app's LOCKOUT_STATUSES, which carries the gate's lockout_statuses());
+    'active' (or no status) passes; any other status no table names is
+    the installed gate's unknown_status_lockout() — None from a permissive
+    gate, a lockout from the fail-closed one."""
+    if status in known:
+        return known[status]
+    if not status or status == "active":
+        return None
+    return gate.unknown_status_lockout()
+
+
+HOSTED_BILLING_VAR = "OIKONOME_HOSTED_BILLING"
+
+
+def require_hosted_billing() -> None:
+    """A hosted instance says how it bills, or does not start.
+
+    With a gate add-on installed, the add-on owns billing and this is
+    satisfied. Without one, hosted mode would run in the documented
+    no-add-on shape — gating nothing, capping nothing — which cannot be
+    told apart from a hosted build that is missing its add-on, so an
+    explicit opt-out is required: a hosted instance with no add-on must
+    say `OIKONOME_HOSTED_BILLING=none` to run; anything else refuses to
+    start, loudly, at import. (Self-host is untouched: the check applies
+    only when the instance says it is hosted.) A registered add-on that
+    failed to load is the other case, handled by the fail-closed gate."""
+    import os
+    if not _env_flag("OIKONOME_HOSTED"):
+        return
+    if _group("oikonome.gate") or "oikonome.gate" in _LOAD_FAILED:
+        return
+    want = (os.environ.get(HOSTED_BILLING_VAR) or "").strip().lower()
+    if want == "none":
+        log.warning("hosted instance running with no billing add-on "
+                    "(%s=none): nothing is gated or billed", HOSTED_BILLING_VAR)
+        return
+    raise SystemExit(
+        "OIKONOME_HOSTED=1 but no billing add-on is installed. Install the "
+        f"add-on, or set {HOSTED_BILLING_VAR}=none to run a hosted instance "
+        "that bills nobody. Refusing to start rather than silently serve "
+        "paying households for free.")
 
 
 def set_gate(impl: Gate | None) -> None:

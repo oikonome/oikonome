@@ -109,6 +109,13 @@ class RestoreUploadStreamingTests(unittest.TestCase):
         self.assertEqual(pages.RESTORE_MAX_UPLOAD, 500 * MB)
         self.assertGreater(pages.RESTORE_MAX_UPLOAD, pages.MAX_UPLOAD)
 
+    def test_the_oversize_refusal_names_no_door_that_cannot_take_it(self):
+        """The host's restore command loads database dumps, never an export
+        ZIP, so a refusal sending the archive there is a dead end."""
+        self.assertNotIn("oikonome.sh", pages.RESTORE_OVERSIZE_MSG)
+        self.assertIn(f"{pages.RESTORE_MAX_UPLOAD // MB} MB",
+                      pages.RESTORE_OVERSIZE_MSG)
+
 
 class RestoreUploadRouteTests(unittest.TestCase):
     """The import door routes a ZIP through the streaming read, and what it

@@ -280,3 +280,72 @@ class LogoCacheIsCappedTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LogoFetchHoldsNoConnectionTests(unittest.TestCase):
+    """The control pool is small and every signed-in request takes its
+    session check from it. A cache miss must not sit on one of those
+    connections for the length of a CDN round trip, and a page full of rows
+    sharing one logo must reach the CDN once, not once per row."""
+
+    @classmethod
+    def setUpClass(cls):
+        _ensure_db()
+
+    def setUp(self):
+        _clear()
+
+    def tearDown(self):
+        _clear()
+
+    def test_the_fetch_runs_with_no_control_connection_open(self):
+        real = tenancy.control_connect
+        open_now = []
+
+        class Tracked:
+            def __init__(self, conn):
+                self._c = conn
+                open_now.append(self)
+
+            def __getattr__(self, name):
+                return getattr(self._c, name)
+
+            def close(self):
+                if self in open_now:
+                    open_now.remove(self)
+                self._c.close()
+
+        held_during_fetch = []
+
+        def fake_fetch(u):
+            held_during_fetch.append(len(open_now))
+            return ("image/png", PNG)
+        url = "https://plaid-merchant-logos.plaid.com/acme_nohold.png"
+        with mock.patch.object(tenancy, "control_connect",
+                               lambda *a, **k: Tracked(real(*a, **k))), \
+             mock.patch.object(logos, "_fetch", fake_fetch):
+            self.assertEqual(("image/png", PNG), logos.cached_logo(url))
+        self.assertEqual([0], held_during_fetch)
+        self.assertEqual([], open_now, "every connection is returned")
+
+    def test_concurrent_misses_for_one_url_fetch_once(self):
+        import threading
+        import time
+        url = "https://plaid-merchant-logos.plaid.com/acme_flight.png"
+        calls = []
+
+        def slow_fetch(u):
+            calls.append(u)
+            time.sleep(0.3)
+            return ("image/png", PNG)
+        results = []
+        with mock.patch.object(logos, "_fetch", slow_fetch):
+            threads = [threading.Thread(
+                target=lambda: results.append(logos.cached_logo(url)))
+                for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(1, len(calls), calls)
+        self.assertEqual([("image/png", PNG)] * 8, results)

@@ -98,12 +98,16 @@ def start(tenant_id: str, data: bytes) -> dict:
         return {"error": "a restore is already running on this account — "
                          "wait for it to finish"}
 
-    threading.Thread(target=_run, args=(tenant_id, data),
+    # the worker thread runs outside the request, so the credential that
+    # started the restore is captured here, where the request still is
+    from ..web import security
+    starter = security.current_credential()
+    threading.Thread(target=_run, args=(tenant_id, data, starter),
                      name="oikonome-restore", daemon=True).start()
     return {"restore_started": True, "job": JOB_ID}
 
 
-def _run(tenant_id: str, data: bytes) -> None:
+def _run(tenant_id: str, data: bytes, starter: str = "") -> None:
     from ..web.pages import restore_result
     from . import restore
 
@@ -114,6 +118,7 @@ def _run(tenant_id: str, data: bytes) -> None:
     # transaction alive for reasons unrelated to the data
     prog_conn = tenancy.tenant_connect(tenant_id)
     seen: set[str] = set()
+    locked = False
 
     def tick(table: str, rows: int, done: bool) -> None:
         if done:
@@ -143,7 +148,8 @@ def _run(tenant_id: str, data: bytes) -> None:
         if not locked:
             raise ValueError("the account is busy (a sync or delete is "
                              "running) — try the restore again in a minute")
-        counts = restore.restore_zip(conn, data, progress=tick)
+        counts = restore.restore_zip(conn, data, progress=tick,
+                                     starter=starter)
         result = restore_result(counts)
         prog_conn.execute(
             "UPDATE job_progress SET state='done', progress=%s::jsonb, "
@@ -169,8 +175,16 @@ def _run(tenant_id: str, data: bytes) -> None:
         except Exception:                                # noqa: BLE001
             log.warning("could not record restore failure", exc_info=True)
     finally:
-        # a failed unlock drops the connection rather than pooling it
-        # with the lock attached (tenancy.release_lock)
-        tenancy.release_lock(conn, f"oikonome:sync:{tenant_id}")
+        # A failed unlock drops the connection rather than pooling it with
+        # the lock attached (tenancy.release_lock), and a dropped handle can
+        # run nothing more. A sync turned away during the restore left a
+        # nudge; the restore pulls no bank itself, so it queues that sync
+        # now. Only a restore that actually held the lock may answer it — a
+        # refused one would consume the request meant for the real holder,
+        # which then lets go without queueing anything.
+        if locked and not tenancy.release_lock(
+                conn, f"oikonome:sync:{tenant_id}"):
+            from ..jobs import worker
+            worker.answer_sync_nudge(conn, tenant_id)
         conn.close()
         prog_conn.close()

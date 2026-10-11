@@ -30,14 +30,17 @@ class ShortFormRenderTests(unittest.TestCase):
              "reasons": [{"bucket": "Food", "variance": 493.0,
                           "pace": "", "detail": []}],
              "today": dt.date(2026, 7, 21), "days_in_month": 31,
-             "buckets": {"food": {"month_budget": 1500.0, "actual": 1311.0},
-                         "other": {"month_budget": 360.0, "actual": 833.0}}}
+             "buckets": {"food": {"month_budget": 1500.0, "actual": 1311.0,
+                                  "rows": []},
+                         "other": {"month_budget": 360.0, "actual": 833.0,
+                                   "rows": []}}}
         t = render.short_daily(d)
         self.assertIn("OVER budget by $199", t)
         self.assertIn("Food", t)
         self.assertIn("Spend at most", t)
         self.assertIn("11 days left", t)         # 31 - 21 + 1
-        self.assertIn("/day food", t)
+        self.assertIn("/day Food", t)
+        self.assertIn("/day Everything else", t)
         self.assertLess(len(t), 320)             # SMS-sized
         # the push line is the same text on one line, verdict first,
         # without the "Oikonome:" prefix the notification title already
@@ -50,6 +53,37 @@ class ShortFormRenderTests(unittest.TestCase):
         # sentence stops read as stray dots beside the separators
         self.assertNotIn(". ·", p)
         self.assertFalse(p.endswith("."))
+
+    def test_daily_allowance_matches_the_today_tiles_with_a_carve_out(self):
+        """A carve-out has its own Today tile and the parent's tile uses the
+        carved numbers; the text's per-day line must say the same numbers
+        under the same names, never the raw parent bucket (which counts the
+        carve-out's overspend twice) or an internal bucket key."""
+        from oikonome.web import todayview
+        d = {"verdict": "OVER BUDGET", "variance": 40.0, "reasons": [],
+             "today": dt.date(2026, 10, 10), "days_in_month": 31,
+             "buckets": {
+                 "food": {"month_budget": 900.0, "actual": 550.0,
+                          "remaining_budget": 750.0,
+                          "display_actual": 350.0, "rows": [],
+                          "children": [{"name": "Coffee",
+                                        "month_budget": 150.0,
+                                        "actual": 200.0, "rows": []}]},
+                 "other": {"month_budget": 400.0, "actual": 100.0,
+                           "rows": []}}}
+        t = render.short_daily(d)
+        _a, _k, tiles = todayview.allowances(d)
+        for label, a in tiles:
+            self.assertIn(f"${a['rate']:,.0f}/day {label}", t)
+        # (750 - 350) / 22 days, not the raw (900 - 550) / 22
+        self.assertIn("$18/day Food", t)
+        self.assertIn("$0/day Coffee", t)
+        self.assertIn("$14/day Everything else", t)
+        self.assertNotIn("$16/day", t)
+        self.assertNotIn(" else,", t.replace("Everything else", ""))
+        self.assertNotIn("other", t)
+        self.assertIn("22 days left", t)
+        self.assertIn("$18/day Food", render.push_daily(d))
 
     def test_daily_allowance_uses_real_gather_dict(self):
         """short_daily must produce the allowance line from the exact dict
@@ -75,11 +109,7 @@ class ShortFormRenderTests(unittest.TestCase):
                                 "reasons": [], "allow": {}, "days_left": 0})
         self.assertEqual(t, "Oikonome: ON budget.")
 
-    def test_weekly_and_monthly_and_yearly(self):
-        w = render.short_weekly({"verdict": "UNDER BUDGET", "variance": -50,
-                                 "actual": 400, "week_budget": 450},
-                                dt.date(2026, 7, 13))
-        self.assertIn("week of 07/13", w)
+    def test_monthly_and_yearly(self):
         m = render.short_monthly({"verdict": "ON BUDGET", "variance": 2,
                                   "variable_actual": 5000,
                                   "variable_budget": 5500,
@@ -150,12 +180,53 @@ class CadenceScheduleTests(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_yearly_fires_jan_1_only(self):
+    def test_yearly_fires_jan_1_and_catches_up_only_days_after(self):
         sched = {"yearly": {"on": True, "hour": 7}}
         self.assertIn("yearly", self._due(
             sched, dt.datetime(2026, 1, 1, 8)))
-        self.assertEqual([], self._due(sched, dt.datetime(2026, 1, 2, 8)))
+        # an unsent Jan 1 is still sent a day later, never weeks later
+        self.assertEqual(["yearly"],
+                         self._due(sched, dt.datetime(2026, 1, 2, 8)))
+        self.assertEqual([], self._due(sched, dt.datetime(2026, 1, 10, 8)))
         self.assertEqual([], self._due(sched, dt.datetime(2026, 7, 1, 8)))
+
+    def test_a_catch_up_day_waits_for_the_send_hour(self):
+        """Days after the 1st still honour the household's hour: the first
+        sweep after midnight must not send the card at 00:05."""
+        sched = {"monthly": {"on": True, "sms": True, "hour": 7}}
+        self.assertEqual([], self._due(sched, dt.datetime(2026, 10, 2, 0, 5)))
+        self.assertEqual(["monthly"],
+                         self._due(sched, dt.datetime(2026, 10, 2, 7, 5)))
+
+    def test_monthly_sms_push_counts_as_sent_for_the_whole_period(self):
+        """The SMS/push half stamped on the 1st still counts on a catch-up
+        day, so a relay outage retries the mail without re-texting; last
+        month's stamp does not count."""
+        from oikonome.jobs import worker
+        admin = tenancy.admin_connect()
+        try:
+            tid = tenancy.create_tenant(admin, f"n-{uuid.uuid4().hex[:8]}")
+        finally:
+            admin.close()
+        conn = tenancy.tenant_connect(tid)
+        try:
+            from oikonome.engine import budget
+            cfg = budget.load_config(conn)
+            job = "monthly-email:sms-push"
+            now = dt.datetime.now(dt.timezone.utc)
+            day1 = now.replace(day=1, hour=12, minute=0)
+            conn.execute("INSERT INTO job_runs (job, ran_at) VALUES (%s, %s)",
+                         (job, day1))
+            with mock.patch.object(worker, "_tz",
+                                   return_value=dt.timezone.utc), \
+                 mock.patch("oikonome.localtime.instance_tz",
+                            return_value=dt.timezone.utc):
+                self.assertTrue(worker._stamped_this_period(conn, cfg, job))
+                conn.execute("UPDATE job_runs SET ran_at=%s WHERE job=%s",
+                             (day1 - dt.timedelta(days=31), job))
+                self.assertFalse(worker._stamped_this_period(conn, cfg, job))
+        finally:
+            conn.close()
 
     def test_sms_only_cadence_still_fires(self):
         # email off, sms on → the cadence is still scheduled (the worker
@@ -198,13 +269,18 @@ class NotifyApiTests(unittest.TestCase):
             "email": email, "password": "correct-horse-battery"},
             follow_redirects=False)
         assert r.status_code == 303, r.text
+        # setting a phone number is a step-up act; these tests exercise
+        # what happens past that gate, so the session proves itself once
+        r = self.client.post("/api/auth/elevate",
+                             json={"password": "correct-horse-battery"})
+        assert r.status_code == 200, r.text
 
     def test_status_shape(self):
         r = self.client.get("/api/notify")
         self.assertEqual(r.status_code, 200)
         j = r.json()
         for k in ("sms_available", "phone", "phone_verified",
-                  "push_available", "vapid_public_key", "push_subscribed",
+                  "phone_paused_at", "push_available", "vapid_public_key", "push_subscribed",
                   "native_push_available", "native_push_devices"):
             self.assertIn(k, j)
         self.assertFalse(j["phone_verified"])
@@ -249,6 +325,47 @@ class NotifyApiTests(unittest.TestCase):
         r = self.client.post("/api/notify/phone", json={"number": ""})
         self.assertEqual(r.status_code, 200)
         self.assertFalse(self.client.get("/api/notify").json()["phone_verified"])
+
+    def test_a_paused_number_is_reported_and_removable_without_a_code(self):
+        """A credential change pauses the household's verified number. The
+        status must say so (with when), and the owner must be able to drop
+        it through the clear door with no verification code and no fresh
+        step-up — clearing only takes a destination away."""
+        from oikonome.auth import reset as reset_mod
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            from oikonome.engine import budget
+            cfg = budget.load_config(conn)
+            cfg["notify_phone"] = {"number": "+12175551234", "verified": True}
+            budget.save_config(conn, cfg)
+        finally:
+            conn.close()
+        j = self.client.get("/api/notify").json()
+        self.assertTrue(j["phone_verified"])
+        self.assertIsNone(j["phone_paused_at"])
+        cc = tenancy.control_connect()
+        try:
+            self.assertTrue(reset_mod._unverify_sms_number(cc, self.uid))
+        finally:
+            cc.close()
+        j = self.client.get("/api/notify").json()
+        self.assertFalse(j["phone_verified"])
+        self.assertTrue(j["phone"].endswith("1234"))
+        paused = dt.datetime.fromisoformat(j["phone_paused_at"])
+        self.assertLess(abs((dt.datetime.now(dt.timezone.utc) - paused)
+                            .total_seconds()), 300)
+        # the clear asks for no proof at all (elevation would refuse here)
+        from oikonome.web import security
+        security._limiter._hits.clear()
+        with mock.patch("oikonome.web.app._require_elevation",
+                        side_effect=AssertionError("clear asked for proof")), \
+             mock.patch("oikonome.notify.sms.send") as sms_send:
+            r = self.client.post("/api/notify/phone", json={"number": ""})
+        self.assertEqual(r.status_code, 200, r.text)
+        sms_send.assert_not_called()
+        j = self.client.get("/api/notify").json()
+        self.assertIsNone(j["phone"])
+        self.assertIsNone(j["phone_paused_at"])
 
     def test_phone_requires_explicit_sms_consent(self):
         """SMS consent must be its own affirmative action. The SPA gates the
@@ -431,6 +548,11 @@ class NotifyApiTests(unittest.TestCase):
                                    "password": "correct-horse-battery"},
                    follow_redirects=False)
         assert r.status_code == 303, r.text
+        # adding a push destination is a step-up act, like the first
+        # account's in setUp
+        r = c.post("/api/auth/elevate",
+                   json={"password": "correct-horse-battery"})
+        assert r.status_code == 200, r.text
         return c
 
     def test_push_subscribe_rejects_junk(self):
@@ -546,6 +668,93 @@ class WorkerFanoutTests(unittest.TestCase):
         with mock.patch("oikonome.notify.sms.send") as sms_send:
             worker.email_tenant(tid, send_it=True, cadence="daily")
         sms_send.assert_not_called()
+
+
+    def test_a_number_paused_during_the_send_gets_no_text(self):
+        """The sweep reads the number, then gathers the month and mails
+        every recipient — minutes, on a slow relay. An owner who changes
+        their password in that window pauses the number; the text that
+        follows must go nowhere, not to the number read before."""
+        from oikonome.auth import reset as reset_mod
+        from oikonome.jobs import worker
+        from oikonome.web import report
+        admin = tenancy.admin_connect()
+        try:
+            tid = tenancy.create_tenant(admin, f"f-{uuid.uuid4().hex[:8]}")
+            owner = admin.execute(
+                "INSERT INTO users (tenant_id, email, password_hash, role) "
+                "VALUES (%s, %s, 'x', 'owner') RETURNING id",
+                (tid, f"o-{uuid.uuid4().hex[:8]}@example.dev")
+            ).fetchone()["id"]
+            admin.commit()
+        finally:
+            admin.close()
+        conn = tenancy.tenant_connect(tid)
+        try:
+            from oikonome.engine import budget
+            cfg = budget.load_config(conn)
+            cfg["email_schedule"] = {"daily": {"on": False, "sms": True,
+                                               "hour": 7}}
+            cfg["notify_phone"] = {"number": "+12175551234", "verified": True}
+            cfg["food_monthly"] = 800
+            budget.save_config(conn, cfg)
+        finally:
+            conn.close()
+        real_gather = report.gather
+
+        def gather_then_owner_rotates(*a, **kw):
+            d = real_gather(*a, **kw)
+            cc = tenancy.control_connect()
+            try:
+                self.assertTrue(reset_mod._unverify_sms_number(cc, owner))
+            finally:
+                cc.close()
+            return d
+
+        with mock.patch("oikonome.web.report.gather",
+                        side_effect=gather_then_owner_rotates), \
+             mock.patch("oikonome.notify.sms.send") as sms_send:
+            worker.email_tenant(tid, send_it=True, cadence="daily")
+        sms_send.assert_not_called()
+
+    def test_a_pause_still_committing_when_the_text_goes_gets_no_text(self):
+        """The rotation marks the number unverified inside its own
+        transaction and commits after the rest of the rotation. A send
+        reaching the number in that window must wait for the outcome, not
+        read the verified number the rotation is about to pause."""
+        import threading
+        import time
+        from oikonome.jobs import worker
+        admin = tenancy.admin_connect()
+        try:
+            tid = tenancy.create_tenant(admin, f"f-{uuid.uuid4().hex[:8]}")
+        finally:
+            admin.close()
+        conn = tenancy.tenant_connect(tid)
+        try:
+            from oikonome.engine import budget
+            cfg = budget.load_config(conn)
+            cfg["notify_phone"] = {"number": "+12175551234", "verified": True}
+            budget.save_config(conn, cfg)
+        finally:
+            conn.close()
+        self.assertEqual(worker._live_sms_number(tid), "+12175551234")
+        rot = tenancy.admin_connect()
+        got = []
+        try:
+            with rot.transaction():
+                rot.execute(
+                    "UPDATE tenant_settings SET config = jsonb_set(config, "
+                    "'{notify_phone,verified}', 'false') WHERE tenant_id=%s",
+                    (tid,))
+                t = threading.Thread(
+                    target=lambda: got.append(worker._live_sms_number(tid)))
+                t.start()
+                time.sleep(0.5)        # the rotation is still finishing
+        finally:
+            rot.close()
+        t.join(10)
+        self.assertEqual(got, [None])
 
 
 if __name__ == "__main__":

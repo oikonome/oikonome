@@ -12,7 +12,7 @@ import * as SecureStore from "expo-secure-store";
 import { Platform } from "react-native";
 
 import { Client } from "./api";
-import { pushStillLive } from "./pure";
+import { pushStillLive, sharedLock } from "./pure";
 
 // In Expo Go on Android, importing expo-notifications THROWS at module
 // evaluation (remote push left Expo Go in SDK 53) — so the capability
@@ -41,8 +41,20 @@ export function resetPushRegistration(): void {
   SecureStore.deleteItemAsync(KEY_PUSH_SENT).catch(() => {});
 }
 
+/** Stop this install receiving push at all: the platform token is
+ *  dropped, so a server row still holding it has nowhere to deliver. For
+ *  a sign-out whose revoke did not reach the server; the next sign-in
+ *  registers a fresh token. Never throws. */
+export async function unregisterPushLocally(): Promise<void> {
+  if (!pushSupported()) return;
+  try {
+    const Notifications = await import("expo-notifications");
+    await Notifications.unregisterForNotificationsAsync();
+  } catch { /* nothing registered, or the platform refused */ }
+}
+
 export type PushRegistration = "ok" | "denied" | "unsupported" | "failed"
-                              | "skipped";
+                              | "skipped" | "shared";
 
 /** Register this phone for push. The launch-time call runs once per
  *  sign-in; `force` (the setup wizard's "Push" choice) asks again even
@@ -59,6 +71,12 @@ export async function registerNativePush(
   if (attempted && !opts.force && !opts.recheck) return "skipped";
   attempted = true;
   try {
+    // A registered token is a new outbound destination, which the server
+    // refuses the shared demonstration login; asked first so the phone is
+    // never prompted for a notification permission the server won't use.
+    // An unreadable /me falls through: the server still says no.
+    const me = await client.me().catch(() => undefined);
+    if (sharedLock(me, "grant")) return "shared";
     const Notifications = await import("expo-notifications");
     const perm = await Notifications.getPermissionsAsync();
     let status = perm.status;

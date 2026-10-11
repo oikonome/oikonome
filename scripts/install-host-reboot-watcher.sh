@@ -56,10 +56,41 @@ if [ -f "\$stamp" ]; then
         exit 0
     fi
 fi
+# Never under a running operation: a reboot in the middle of a console
+# command (an upgrade mid-build or mid-migrate) or of a backup, restore or
+# reset holding the maintenance lock leaves the schema half upgraded or the
+# dump cut short. The request is refused, not queued — the nightly check
+# asks again on its next run — and the 10-minute stamp is not taken, so
+# that next ask is not suppressed.
+busy() {
+    lock="\$ROOT/ops-state/.cmd-lock"
+    if [ -f "\$lock" ]; then
+        holder=\$(cat "\$lock" 2>/dev/null || true)
+        if [ -n "\$holder" ] && kill -0 "\$holder" 2>/dev/null \\
+           && tr '\\0' ' ' < "/proc/\$holder/cmdline" 2>/dev/null \\
+              | grep -q oikonome-command-run; then
+            echo "reboot refused: a console command is running (pid \$holder)"
+            return 0
+        fi
+    fi
+    if [ -f "\$ROOT/.maintenance.lock" ] && command -v flock >/dev/null 2>&1 \\
+       && ! flock -n "\$ROOT/.maintenance.lock" true 2>/dev/null; then
+        echo "reboot refused: a backup, restore or reset holds the maintenance lock"
+        return 0
+    fi
+    return 1
+}
+busy && exit 0
 mkdir -p "\$ROOT/ops-state"; : > "\$stamp"
 wall "Oikonome operator requested a reboot (60s grace)"
 # grace period: signed-in users are watching a countdown the console set
 sleep 60
+# an operation that started during the grace is asked about once more
+if busy; then
+    rm -f "\$stamp"
+    wall "Oikonome reboot cancelled: an operation started on this instance"
+    exit 0
+fi
 systemctl reboot
 SCRIPT
 chmod 755 /usr/local/bin/oikonome-reboot-check
@@ -93,4 +124,8 @@ rm -f /etc/systemd/system/oikonome-reboot-watcher.path \
 systemctl daemon-reload
 systemctl reset-failed "$SVC.service" "$SVC.path" 2>/dev/null || true
 systemctl enable --now "$SVC.path"
+# the container cannot see host units, so tell it THIS watcher is installed
+# (scripts/watcher-marker.sh has the whole rule)
+. "$(dirname "$0")/watcher-marker.sh"
+watcher_mark "$ROOT" reboot "$TAG"
 echo "reboot watcher installed for $ROOT (unit $SVC, drop-box uid $UID_C, 0700)"

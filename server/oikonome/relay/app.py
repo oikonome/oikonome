@@ -154,7 +154,11 @@ def _key_identity(request: Request) -> str | None:
     return None if matched is None else _fingerprint(matched)
 
 
-# mirror of notify/push_native.py EVENTS — the instance-side allowlist
+# The UNION of every event an instance version still in service may send:
+# the relay is one shared service, and an instance that has not upgraded
+# past the weekly report keeps sending "weekly" — refusing it would drop
+# that household's pushes until it upgrades. The instance-side allowlist
+# (notify/push_native.py EVENTS) may be narrower than this; never wider.
 EVENTS = frozenset({"daily", "weekly", "monthly", "yearly", "alert", "test"})
 
 MAX_BATCH = 500
@@ -300,15 +304,15 @@ def _token_key(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-def _claim_tokens(tokens: list[str], identity: str) -> str | None:
-    """Bind every token in a batch to `identity`, or refuse the batch.
+def _claim_tokens(tokens: list[str], identity: str) -> dict[str, str]:
+    """Bind to `identity` every token in a batch that is its to push —
+    free, expired, or already bound to it — and refresh those bindings.
 
-    Returns None when the whole batch is this sender's to push — every
-    token free, expired, or already bound to it — having claimed and
-    refreshed them all. Otherwise returns the fingerprint that owns the
-    first token that is NOT this sender's, and claims nothing: a batch is
-    all-or-nothing here for the same reason the field validation above is,
-    so a refusal can never leave half a batch re-registered.
+    Returns {token: owning fingerprint} for the tokens that are NOT this
+    sender's, which are neither claimed nor sent. Per token, not per
+    batch: an instance sends one batch per household, and one phone still
+    bound to another instance (signed out there, but that instance kept
+    pushing it) must cost that phone, not every other phone in the house.
     """
     now = time.monotonic()
     keys = [_token_key(t) for t in tokens]
@@ -321,14 +325,17 @@ def _claim_tokens(tokens: list[str], identity: str) -> str | None:
     # rotation from a second instance, and the second instance is the
     # thing this exists to refuse, so the overlap window is the price.)
     live = {_fingerprint(k) for k in _keys()}
+    refused: dict[str, str] = {}
     with _owners_lock:
-        for k in keys:
+        for t, k in zip(tokens, keys):
             held = _owners.get(k)
             if held is None or now - held[1] > TOKEN_BINDING_TTL:
                 continue                       # unclaimed, or gone quiet
             if held[0] != identity and held[0] in live:
-                return held[0]
-        for k in keys:
+                refused[t] = held[0]
+        for t, k in zip(tokens, keys):
+            if t in refused:
+                continue
             _owners[k] = (identity, now)
             _owners.move_to_end(k)
         # A full registry evicts the CLAIMANT's own oldest bindings, never
@@ -341,7 +348,7 @@ def _claim_tokens(tokens: list[str], identity: str) -> str | None:
                 _owners.pop(k, None)
         while len(_owners) > MAX_TRACKED_TOKENS:
             _owners.popitem(last=False)
-    return None
+    return refused
 
 
 # Where the edge gate leaves the caller's identity for the handler. A
@@ -508,22 +515,28 @@ def push(request: Request, body: dict = Body(...)):
     # Whose tokens are these? A key gets the caller past the edge gate; it
     # does not make every token in the batch theirs to wake. Bound AFTER
     # the field validation, so a malformed batch cannot register anything,
-    # and BEFORE a single send, so a refusal means zero notifications
-    # delivered — the same all-or-nothing contract the validation keeps.
+    # and BEFORE a single send. A token bound to another live key is left
+    # out (and named back to the caller, who sent it); the rest of the
+    # batch goes. Only a batch with nothing of the caller's in it is
+    # refused outright.
     #
     # Skipped on an open relay (no OIKONOME_RELAY_KEYS): there is no sender
     # identity there, so binding every token to the one pseudo-identity
     # would record a fact about nobody and refuse nothing.
+    refused: dict[str, str] = {}
     if identity != _OPEN:
-        owner = _claim_tokens([c[0] for c in checked], identity)
-        if owner is not None:
+        refused = _claim_tokens([c[0] for c in checked], identity)
+        if refused:
             # fingerprints only — the token is the thing being protected
             # and saying it here would put it in the operator's logs
-            log.warning("relay: key=%s pushed a token registered to key=%s "
-                        "— refused", identity, owner)
+            log.warning("relay: key=%s pushed %d token(s) registered to "
+                        "key=%s — refused", identity, len(refused),
+                        ",".join(sorted(set(refused.values()))))
+        if refused and all(c[0] in refused for c in checked):
             raise HTTPException(
-                403, "a token in this batch is registered to another "
+                403, "every token in this batch is registered to another "
                      "instance")
+        checked = [c for c in checked if c[0] not in refused]
 
     sent, dead, unavailable = 0, [], set()
     batch = []
@@ -565,6 +578,7 @@ def push(request: Request, body: dict = Body(...)):
     # Which KEY pushed, never which token. The fingerprint is what makes a
     # pattern attributable — a refusal above logs it too, so an instance
     # reaching for tokens that are not its own is visible by name.
-    log.info("relay: push key=%s items=%d sent=%d dead=%d", identity,
-             len(checked), sent, len(dead))
-    return {"sent": sent, "dead": dead, "unavailable": sorted(unavailable)}
+    log.info("relay: push key=%s items=%d sent=%d dead=%d refused=%d",
+             identity, len(checked), sent, len(dead), len(refused))
+    return {"sent": sent, "dead": dead, "unavailable": sorted(unavailable),
+            "refused": sorted(refused)}

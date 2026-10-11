@@ -75,6 +75,30 @@ class CleanLiabilityRawTests(unittest.TestCase):
                 restore.clean_liability_raw({"last_statement_balance": bad}),
                 bad)
 
+    def test_numbers_too_large_for_a_float_are_dropped_not_raised(self):
+        huge = 10 ** 400
+        self.assertNotIn(
+            "last_statement_balance",
+            restore.clean_liability_raw({"last_statement_balance": huge}))
+
+
+class CleanBillRawOverflowTests(unittest.TestCase):
+    """A bill's raw cleaner drops a number it cannot convert — a 400-digit
+    integer or an Infinity, both of which JSON parses — the way it drops
+    any other unusable value."""
+
+    def test_overflowing_numbers_drop_their_field(self):
+        raw = restore.clean_bill_raw({
+            "recurrence": {"interval": float("inf"),
+                           "byMonthDay": [float("inf"), 5]},
+            "envelope_months": float("inf"),
+            "companions": [{"name": "fee", "amount": 10 ** 400},
+                           {"name": "tip", "amount": 2.5}]})
+        self.assertNotIn("interval", raw["recurrence"])
+        self.assertEqual(raw["recurrence"]["byMonthDay"], [5])
+        self.assertNotIn("envelope_months", raw)
+        self.assertEqual(raw["companions"], [{"name": "tip", "amount": 2.5}])
+
 
 class RestoreThenForecastTests(unittest.TestCase):
     def setUp(self):
@@ -101,6 +125,16 @@ class RestoreThenForecastTests(unittest.TestCase):
                     if r["id"] == "card")
         self.assertIsNone(card["card_statement"])
         self.assertIsNone(card["card_due"])
+
+    def test_a_huge_balance_in_the_archive_restores_the_rest(self):
+        """A 400-digit integer is valid JSON; the restore must drop the
+        field it lands in rather than abort the whole archive."""
+        restore.restore_zip(self.conn, _zip([
+            {"account_id": "card",
+             "raw": '{"last_statement_balance": 1' + "0" * 400 + "}"}]))
+        row = self.conn.execute(
+            "SELECT raw FROM liabilities WHERE account_id='card'").fetchone()
+        self.assertEqual(row["raw"], {})
 
 
 class TolerantReadTests(unittest.TestCase):

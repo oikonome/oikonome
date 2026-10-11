@@ -147,13 +147,9 @@ def gather(conn, today: dt.date, *, live: bool = True) -> dict:
     # process's own clock. Re-deciding liveness against dt.date.today()
     # here would mark those sends "historical" and drop the whole
     # fixed-bill schedule from a live daily email.
-    real_today = dt.date.today()
     # when this gather began reading the world: the alert snapshot it
     # writes at the end is only as new as its oldest read
     view_at = dt.datetime.now(dt.timezone.utc)
-    historical = ((not live)
-                  and (today.year, today.month)
-                  != (real_today.year, real_today.month))
     # One gather is one snapshot: the month status, the forecast walk and
     # goal progress each derive the same sweep-goal "posted this month"
     # evidence, and each derivation is a pair of unindexable LIKE scans
@@ -165,6 +161,17 @@ def gather(conn, today: dt.date, *, live: bool = True) -> dict:
     # and once per tenant per email sweep, so a second identical
     # tenant_settings round trip here would be pure waste.
     cfg = budget.load_config(conn, memo=memo)
+    # A past day's month has closed only when it has closed WHERE THE
+    # HOUSEHOLD LIVES. The process clock is UTC on a hosted instance, so
+    # near a month boundary it can sit in the household's next month (an
+    # earlier day of the current month would lose its bill schedule) or
+    # its previous one (a closed month would get today's live schedule).
+    historical = False
+    if not live:
+        from .. import localtime
+        real_today = localtime.now_local(cfg).date()
+        historical = ((today.year, today.month)
+                      != (real_today.year, real_today.month))
     status = budget.month_status(conn, today, historical=historical,
                                  cfg=cfg, memo=memo)
     status["today"] = today
@@ -309,7 +316,9 @@ def gather(conn, today: dt.date, *, live: bool = True) -> dict:
         first = today.replace(day=1)
         nxt = (dt.date(today.year + 1, 1, 1) if today.month == 12
                else dt.date(today.year, today.month + 1, 1))
-        for g in _savings.goals(cfg):
+        # a business's goal is paid from its own checking, which this
+        # household headroom does not start from (savings.household_goals)
+        for g in _savings.household_goals(conn, cfg):
             plan = float(g.get("monthly_plan") or 0)
             # a sweep-mode plan is not a commitment — it moves only if the
             # month's surplus exists, so reserving it against headroom
@@ -355,6 +364,21 @@ def gather(conn, today: dt.date, *, live: bool = True) -> dict:
     try:
         status["savings_goals"] = savings.progress(conn, cfg, today,
                                                   memo=memo)
+        # What each goal received THIS month (savings.month_saved: the
+        # plan evidence the sweep line reads too — the Month lens' own
+        # figure). The money map's Savings row reads "transferred vs
+        # plan" on a this-month card, so it shows this; rate_90d is a
+        # trailing three-month average that can read "on plan" in a month
+        # nothing moved, and stays for the goal's pace. None for a
+        # plan-only goal, which has no ledger to measure.
+        by_name = {str(g["name"]): g for g in savings.goals(cfg)}
+        for g in status["savings_goals"]:
+            src = by_name.get(str(g["name"]))
+            g["saved_this_month"] = (
+                None if src is None or savings.is_plan_only(src)
+                else savings.month_saved(
+                    conn, cfg, src, today.replace(day=1), today,
+                    memo=memo))
     except Exception:
         status["savings_goals"] = []
     try:
@@ -408,8 +432,8 @@ def gather(conn, today: dt.date, *, live: bool = True) -> dict:
         if not historical:
             # the household's day, like the worker's writer: two writers a
             # day apart would let the UTC-evening one outrank the other
-            alerts.log(conn, built, today if live else real_today,
-                       as_of=view_at)
+            # (only a live gather reaches here, so `today` is that day)
+            alerts.log(conn, built, today, as_of=view_at)
         status["alerts"] = alerts.visible(conn, built)
     except Exception:
         status["alerts"] = []
@@ -649,15 +673,21 @@ def build(d: dict, *, summary: bool = False) -> tuple:
         if pc:
             cash_now += (f" · low {_money(pc['min'])} {_d(pc['min_date'])}")
         plain += ["", cash_now]
-    # savings goals — trackable only (plan-only rows have nothing to
-    # report), and the advanced face only: the simple face tracks goals on
-    # the Budget page, matching the HTML and the Today page
+    # savings goals — trackable ones, and the ones that need an account to
+    # become trackable (their line is the prompt to pick it; any other
+    # plan-only row has nothing to report), and the advanced face only: the
+    # simple face tracks goals on the Budget page, matching the HTML and the
+    # Today page
     goals = ([] if view != "detail" else
              [g for g in d.get("savings_goals") or []
-              if not g.get("plan_only")])
+              if not g.get("plan_only") or g.get("needs_account")])
     if goals:
         plain += ["", "Savings goals:"]
         for g in goals:
+            if g.get("plan_only"):
+                plain += [f"  {g['name']}: match words need an account — "
+                          "pick one on the Budget page"]
+                continue
             # open-ended goal (no target): "$X saved" + the measured rate —
             # never "of $0" (mirrors Today.tsx)
             if not g.get("target"):
@@ -701,9 +731,17 @@ def build(d: dict, *, summary: bool = False) -> tuple:
     plain.append(f"{'Fixed bills (info)':<20} posted {_money(fx['actual']):>10}  "
                  f"awaiting {_money(fx.get('unpaid_due', 0)):>10}  "
                  f"month {_money(fx['month_budget'])}")
-    if d.get("overdue_unpaid"):
+    # a charge the bank feed withdrew is not a bill that never posted —
+    # it gets its own line, as on the Today page
+    late = [o for o in budget.overdue_entries(d) if not o[3]]
+    gone = [o for o in budget.overdue_entries(d) if o[3]]
+    if late:
         plain += ["Scheduled but not yet posted: "
-                  + ", ".join(f"{p} {_money(a)}" for p, a, _ in d["overdue_unpaid"][:4])]
+                  + ", ".join(f"{p} {_money(a)}" for p, a, *_ in late[:4])]
+    if gone:
+        plain += ["withdrawn by the bank feed: "
+                  + ", ".join(f"{p} {_money(a)} ({_d(on)})"
+                              for p, a, _, on in gone[:4])]
     plain += ["", f"{yday_label} ({_money(spent_yday)} variable):"]
     if y_rest:
         # cents on transaction rows, like the site's tables
@@ -726,6 +764,11 @@ def _flag_on_unless_disabled(name: str) -> bool:
     the configuration says the opposite."""
     return (envnum.env_flag(name)
             if (os.environ.get(name) or "").strip() else True)
+
+
+def _user_as_sender(user) -> str | None:
+    from .mailguard import valid_address
+    return user if valid_address(user) else None
 
 
 def _env_smtp() -> dict:
@@ -793,6 +836,23 @@ def _relay_on_lan(host: str) -> bool:
             or any(ip in n for n in _LAN_NETS if n.version == ip.version))
 
 
+def _stored_port(raw) -> int:
+    """The saved relay port, or 587 when the stored value is not a usable
+    one. Settings checks the port, but a restored archive or an imported
+    bundle can carry any string, and every send resolves the relay here:
+    a value that raised would fail every mail, every cadence, every hour."""
+    try:
+        port = int(raw or 587)
+    except (TypeError, ValueError, OverflowError):
+        port = 0
+    if not 1 <= port <= 65535:
+        import logging
+        logging.getLogger("oikonome.email").warning(
+            "stored SMTP port is not a port number; using 587")
+        return 587
+    return port
+
+
 def resolve_smtp(conn) -> dict:
     """Effective SMTP settings for this tenant.
 
@@ -812,6 +872,14 @@ def resolve_smtp(conn) -> dict:
     if env_flag("OIKONOME_HOSTED"):
         return _env_smtp()
     cfg = budget.load_config(conn)
+    from ..notify import outbound_pause
+    _p = outbound_pause.paused(cfg)
+    if cfg.get("smtp_host") and _p and _p["smtp"]:
+        # paused by the owner's credential rotation until they confirm
+        # the relay is theirs — the operator's relay (or a logged link)
+        # carries the mail meanwhile, never a relay a hijacker may have
+        # pointed
+        return _env_smtp()
     if cfg.get("smtp_host"):
         # belt: a stored config (restored, or smuggled past a
         # future door) is re-checked at the moment of use — a blocked host
@@ -828,11 +896,14 @@ def resolve_smtp(conn) -> dict:
                 e)
             return _env_smtp()
         return {"host": cfg["smtp_host"],
-                "port": int(cfg.get("smtp_port") or 587),
+                "port": _stored_port(cfg.get("smtp_port")),
                 "user": cfg.get("smtp_user") or None,
                 "password": crypto.decrypt(conn, cfg.get("smtp_password"))
                             if cfg.get("smtp_password") else None,
-                "sender": cfg.get("smtp_from") or "oikonome@localhost",
+                # a relay saved before the settings door filled an empty
+                # From still sends as its own account, as the door now saves
+                "sender": cfg.get("smtp_from") or _user_as_sender(
+                    cfg.get("smtp_user")) or "oikonome@localhost",
                 "starttls": bool(cfg.get("smtp_starttls", True)),
                 # self-host: the operator's env escape hatch reaches a
                 # relay saved here only when it is on their own network
@@ -1063,27 +1134,57 @@ def inline_data_images(html: str) -> tuple[str, list[tuple[str, str, bytes]]]:
     return out, [(cid, sub, data) for cid, (sub, data) in parts.items()]
 
 
+# The submission port that speaks TLS from the first byte (RFC 8314). A
+# relay there waits for a ClientHello and never sends the plaintext greeting
+# smtplib.SMTP waits for, so every send would time out.
+IMPLICIT_TLS_PORT = 465
+
+
+class _PinnedSMTPSSL(smtplib.SMTP_SSL):
+    """SMTP over implicit TLS to a pinned address, verifying the
+    certificate (and sending SNI) for the relay's real name rather than the
+    address connected to."""
+
+    def __init__(self, server_name: str, *a, **kw):
+        self._server_name = server_name
+        super().__init__(*a, **kw)
+
+    def _get_socket(self, host, port, timeout):
+        import socket
+        sock = socket.create_connection((host, port), timeout,
+                                        self.source_address)
+        return self.context.wrap_socket(sock,
+                                        server_hostname=self._server_name)
+
+
+def _smtp_tls_context(s: dict):
+    # smtplib's default context doesn't verify the relay's certificate — a
+    # MITM could read the verdict and the SMTP password.
+    # create_default_context verifies chain + hostname. Self-signed relays
+    # the docs promise (Proton Bridge on localhost, a home postfix) keep
+    # working with OIKONOME_SMTP_NO_VERIFY=1: still encrypted, not verified.
+    import ssl
+    ctx = ssl.create_default_context()
+    # only where the flag is allowed to reach — see tls_unverified
+    if tls_unverified(s):
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
 def _smtp_deliver(msg, s: dict, host: str, connect_host: str, port: int,
                   user, password) -> None:
-    with smtplib.SMTP(connect_host, port, timeout=30) as smtp_conn:
+    implicit = int(port) == IMPLICIT_TLS_PORT
+    opener = (_PinnedSMTPSSL(host, connect_host, port, timeout=30,
+                             context=_smtp_tls_context(s)) if implicit
+              else smtplib.SMTP(connect_host, port, timeout=30))
+    with opener as smtp_conn:
         # smtplib verifies the STARTTLS certificate against the host it
         # connected to — restore the real name so pinning doesn't turn
         # verification into an IP mismatch
         smtp_conn._host = host
-        if s["starttls"]:
-            # smtplib's default context doesn't verify the
-            # relay's certificate — a MITM could read the verdict and the
-            # SMTP password. create_default_context verifies chain +
-            # hostname. Self-signed relays the docs promise (Proton
-            # Bridge on localhost, a home postfix) keep working with
-            # OIKONOME_SMTP_NO_VERIFY=1: still encrypted, not verified.
-            import ssl
-            ctx = ssl.create_default_context()
-            # only where the flag is allowed to reach — see tls_unverified
-            if tls_unverified(s):
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-            smtp_conn.starttls(context=ctx)
+        if s["starttls"] and not implicit:
+            smtp_conn.starttls(context=_smtp_tls_context(s))
         if user and password:
             smtp_conn.login(user, password)
         smtp_conn.send_message(msg)

@@ -25,7 +25,6 @@ def snapshot_months(conn, year: int, *months: int) -> None:
 
 # TODAY = Wed 2026-07-15 (util fixture). The straddle week under test:
 # Mon 2026-06-29 → Sun 2026-07-05 (2 June days, 5 July days).
-STRADDLE_MON = dt.date(2026, 6, 29)
 
 
 class LensBase(unittest.TestCase):
@@ -35,199 +34,6 @@ class LensBase(unittest.TestCase):
 
     def tearDown(self):
         self.conn.close()
-
-
-class TestWeekStraddle(LensBase):
-    def test_snaps_to_monday(self):
-        w = lenses.week_summary(self.conn, dt.date(2026, 7, 2), today=TODAY)
-        self.assertEqual(w["start"], "2026-06-29")
-        self.assertEqual(w["end"], "2026-07-05")
-
-    def test_straddle_budget_sums_per_day_allowances(self):
-        """A Mon–Sun week spanning two months = Σ each day's
-        monthly ÷ days-in-month allowance."""
-        w = lenses.week_summary(self.conn, STRADDLE_MON, today=TODAY)
-        food = 2 * (3000 / 30) + 5 * (3000 / 31)     # June 30d, July 31d
-        other = 2 * (3100 / 30) + 5 * (3100 / 31)
-        self.assertAlmostEqual(w["buckets"]["food"]["week_budget"], food, 2)
-        self.assertAlmostEqual(w["buckets"]["other"]["week_budget"], other, 2)
-        self.assertAlmostEqual(w["week_budget"], food + other, 2)
-        # completed week → expected == the full week budget
-        self.assertEqual(w["status"], "final")
-        self.assertAlmostEqual(w["expected"], w["week_budget"], 2)
-
-    def test_straddle_actuals_only_count_week_rows(self):
-        add_txn(self.conn, dt.date(2026, 6, 25), 500.0, "BEFORE WEEK")
-        add_txn(self.conn, dt.date(2026, 6, 30), 40.0, "JUNE HALF")
-        add_txn(self.conn, dt.date(2026, 7, 3), 60.0, "JULY HALF")
-        add_txn(self.conn, dt.date(2026, 7, 6), 700.0, "AFTER WEEK")
-        w = lenses.week_summary(self.conn, STRADDLE_MON, today=TODAY)
-        self.assertEqual(w["actual"], 100.0)
-        self.assertEqual([d["variable"] for d in w["days"]],
-                         [0, 40.0, 0, 0, 60.0, 0, 0])
-        self.assertEqual({t["payee"] for t in w["txns"]},
-                         {"JUNE HALF", "JULY HALF"})
-
-    def test_week_verdict_is_frozen_formula(self):
-        """Verdict = variance vs max($50, 5% of expected) — the engine's
-        rule at week scope."""
-        w0 = lenses.week_summary(self.conn, STRADDLE_MON, today=TODAY)
-        self.assertEqual(w0["verdict"], "UNDER BUDGET")   # $0 of ~$1.4k
-        # spend exactly the week budget → ON BUDGET
-        add_txn(self.conn, dt.date(2026, 7, 1), w0["week_budget"], "EXACT")
-        w1 = lenses.week_summary(self.conn, STRADDLE_MON, today=TODAY)
-        self.assertEqual(w1["verdict"], "ON BUDGET")
-        self.assertAlmostEqual(
-            w1["tolerance"], max(50.0, w1["expected"] * 0.05), 2)
-        add_txn(self.conn, dt.date(2026, 7, 2),
-                w1["tolerance"] + 1, "PUSH OVER")
-        self.assertEqual(lenses.week_summary(
-            self.conn, STRADDLE_MON, today=TODAY)["verdict"], "OVER BUDGET")
-
-    def test_in_progress_week_prorates_expected(self):
-        """TODAY is Wednesday of the 7/13 week → expected covers Mon–Wed
-        only; the full budget still spans all 7 days."""
-        w = lenses.week_summary(self.conn, dt.date(2026, 7, 13), today=TODAY)
-        self.assertEqual(w["status"], "in_progress")
-        day = (3000 + 3100) / 31
-        self.assertAlmostEqual(w["expected"], 3 * day, 2)
-        self.assertAlmostEqual(w["week_budget"], 7 * day, 2)
-
-    def test_fixed_bills_stay_out_of_the_week_verdict(self):
-        add_bill(self.conn, "Rent", 2000.0, next_due=dt.date(2026, 7, 1),
-                 last_seen=dt.date(2026, 6, 1))
-        add_txn(self.conn, dt.date(2026, 7, 1), 2000.0, "RENT")
-        w = lenses.week_summary(self.conn, STRADDLE_MON, today=TODAY)
-        self.assertEqual(w["actual"], 0.0)                # variable only
-        self.assertEqual(w["buckets"]["fixed"]["actual"], 2000.0)
-        rent = [t for t in w["txns"] if t["payee"] == "RENT"]
-        self.assertTrue(rent and rent[0]["fixed"])
-        self.assertEqual([d["fixed"] for d in w["days"]],
-                         [0, 0, 2000.0, 0, 0, 0, 0])
-
-    def test_envelope_overflow_is_counted_once_in_the_week(self):
-        """A swipe over an envelope's cap is ONE purchase: the capped part
-        is fixed, the rest variable, both on the day it happened. The week
-        must sum to the purchase — not the full swipe as fixed plus the
-        overflow again as variable."""
-        add_bill(self.conn, "Corner Coffee", 100.0, bill_type="envelope",
-                 frequency=None, interval=1)
-        add_txn(self.conn, dt.date(2026, 7, 14), 150.0, "CORNER COFFEE",
-                primary="FOOD_AND_DRINK")
-        w = lenses.week_summary(self.conn, dt.date(2026, 7, 13), today=TODAY)
-        self.assertEqual(w["buckets"]["fixed"]["actual"], 100.0)
-        self.assertEqual(w["buckets"]["food"]["actual"], 50.0)
-        self.assertEqual([d["fixed"] + d["variable"] for d in w["days"]],
-                         [0, 150.0, 0, 0, 0, 0, 0])
-
-    def test_custom_bucket_children_carry_week_scope(self):
-        write_config(self.conn, food_monthly=3000, other_monthly=3100,
-                     custom_buckets=[{"name": "Fun", "parent": "other",
-                                      "monthly": 310, "categories":
-                                      ["ENTERTAINMENT"], "merchants": []}])
-        add_txn(self.conn, dt.date(2026, 7, 2), 80.0, "CINEMA",
-                primary="ENTERTAINMENT")
-        add_txn(self.conn, dt.date(2026, 7, 3), 50.0, "TARGET")
-        w = lenses.week_summary(self.conn, STRADDLE_MON, today=TODAY)
-        other = w["buckets"]["other"]
-        self.assertEqual(other["actual"], 130.0)          # raw — frozen
-        self.assertEqual(other["display_actual"], 50.0)   # after carve-out
-        (fun,) = other["children"]
-        self.assertEqual(fun["actual"], 80.0)
-        self.assertAlmostEqual(fun["week_budget"],
-                               2 * (310 / 30) + 5 * (310 / 31), 2)
-
-
-class TestWeekBills(LensBase):
-    """The week map's Bills row: planned = occurrences due Mon–Sun
-    (engine expansion + matching, no new cadence rules) + envelope share;
-    awaiting = due in the week (≤ today) and unposted."""
-
-    def test_paid_bill_counts_planned_and_posted(self):
-        add_bill(self.conn, "Rent", 2000.0, next_due=dt.date(2026, 7, 1),
-                 last_seen=dt.date(2026, 6, 1))
-        add_txn(self.conn, dt.date(2026, 7, 1), 2000.0, "RENT")
-        w = lenses.week_summary(self.conn, STRADDLE_MON, today=TODAY)
-        fx = w["buckets"]["fixed"]
-        self.assertEqual(fx["actual"], 2000.0)        # posted (green)
-        self.assertEqual(fx["week_budget"], 2000.0)   # planned this week
-        self.assertEqual(fx["awaiting"], 0.0)
-
-    def test_unpaid_due_bill_is_awaiting(self):
-        add_bill(self.conn, "Water", 100.0, next_due=dt.date(2026, 7, 2),
-                 last_seen=dt.date(2026, 6, 2))
-        w = lenses.week_summary(self.conn, STRADDLE_MON, today=TODAY)
-        fx = w["buckets"]["fixed"]
-        self.assertEqual(fx["actual"], 0.0)
-        self.assertEqual(fx["week_budget"], 100.0)
-        self.assertEqual(fx["awaiting"], 100.0)       # due 7/2 ≤ today, unposted
-
-    def test_bill_due_outside_week_is_excluded(self):
-        add_bill(self.conn, "Gym", 50.0, next_due=dt.date(2026, 7, 20),
-                 last_seen=dt.date(2026, 6, 20))
-        w = lenses.week_summary(self.conn, STRADDLE_MON, today=TODAY)
-        self.assertEqual(w["buckets"]["fixed"]["week_budget"], 0.0)
-        self.assertEqual(w["buckets"]["fixed"]["awaiting"], 0.0)
-
-    def test_due_later_this_week_is_planned_not_awaiting(self):
-        # TODAY is Wed 7/15 of the 7/13 week; a bill due Fri 7/17 is in
-        # the plan (light segment) but its due date hasn't arrived
-        add_bill(self.conn, "Insurance", 300.0,
-                 next_due=dt.date(2026, 7, 17), last_seen=dt.date(2026, 6, 17))
-        w = lenses.week_summary(self.conn, dt.date(2026, 7, 13), today=TODAY)
-        fx = w["buckets"]["fixed"]
-        self.assertEqual(fx["week_budget"], 300.0)
-        self.assertEqual(fx["awaiting"], 0.0)
-
-    def test_envelope_share_drips_whats_left_of_the_pool(self):
-        # envelopes have no due dates — the week carries each day's share
-        # of the pool, at the FORECAST's envelope-drip rate: the current
-        # month drips what's left over the days left (untouched pool,
-        # TODAY=7/15 → 310 over the 16 days after today), other months
-        # drip the plan rate (their pool is untouched or final)
-        add_bill(self.conn, "Household Env", 310.0, bill_type="envelope")
-        w = lenses.week_summary(self.conn, dt.date(2026, 7, 13), today=TODAY)
-        self.assertAlmostEqual(w["buckets"]["fixed"]["week_budget"],
-                               7 * (310 / 16), 2)
-        # and a straddle week mixes both months' rates
-        ws = lenses.week_summary(self.conn, STRADDLE_MON, today=TODAY)
-        self.assertAlmostEqual(ws["buckets"]["fixed"]["week_budget"],
-                               2 * (310 / 30) + 5 * (310 / 16), 2)
-
-    def test_untouched_pool_in_another_month_keeps_the_plan_rate(self):
-        # a week in a future month: the pool there is untouched, so the
-        # drip is the classic monthly ÷ days-in-month share, unchanged
-        add_bill(self.conn, "Household Env", 310.0, bill_type="envelope")
-        w = lenses.week_summary(self.conn, dt.date(2026, 8, 10), today=TODAY)
-        self.assertAlmostEqual(w["buckets"]["fixed"]["week_budget"],
-                               7 * (310 / 31), 2)
-
-    def test_exhausted_pool_drips_nothing(self):
-        """A flat monthly ÷ days-in-month share keeps planning envelope
-        money the engine says is already spent."""
-        add_bill(self.conn, "Household Env", 310.0, bill_type="envelope")
-        add_txn(self.conn, dt.date(2026, 7, 6), 310.0, "HOUSEHOLD ENV")
-        w = lenses.week_summary(self.conn, dt.date(2026, 7, 13), today=TODAY)
-        self.assertEqual(w["buckets"]["fixed"]["week_budget"], 0.0)
-
-    def test_exhausted_annual_pool_drips_nothing(self):
-        # an annual pool spent for the year would otherwise still drip
-        # its monthly share on every day of the week
-        add_bill(self.conn, "Domain Registrar", 120.0, bill_type="envelope",
-                 frequency=None, interval=12)
-        add_txn(self.conn, dt.date(2026, 3, 10), 120.0, "DOMAIN REGISTRAR")
-        w = lenses.week_summary(self.conn, dt.date(2026, 7, 13), today=TODAY)
-        self.assertEqual(w["buckets"]["fixed"]["week_budget"], 0.0)
-
-    def test_annual_pool_drips_its_year_remainder(self):
-        # $120/yr untouched, TODAY=7/15 → 120 over the 169 days left in
-        # the year, not the $10/mo plan share over the month
-        add_bill(self.conn, "Domain Registrar", 120.0, bill_type="envelope",
-                 frequency=None, interval=12)
-        w = lenses.week_summary(self.conn, dt.date(2026, 7, 13), today=TODAY)
-        days_left_year = (dt.date(2026, 12, 31) - TODAY).days
-        self.assertAlmostEqual(w["buckets"]["fixed"]["week_budget"],
-                               7 * (120 / days_left_year), 2)
 
 
 class TestMonthFinality(LensBase):
@@ -257,7 +63,9 @@ class TestMonthFinality(LensBase):
         self.assertEqual(r["bills"]["posted"], 2000.0)
         self.assertEqual(r["bills"]["paid"],
                          [{"date": "2026-06-01", "amount": 2000.0,
-                           "payee": "RENT"}])
+                           "payee": "RENT",
+                           "category": "GENERAL MERCHANDISE",
+                           "detailed": None}])
 
     def test_current_month_projects(self):
         add_txn(self.conn, TODAY.replace(day=5), 1500.0, "EARLY BURN")
@@ -281,6 +89,29 @@ class TestMonthFinality(LensBase):
         self.assertAlmostEqual(p["pace_total"], 6100.0, 0)
         self.assertEqual(p["verdict"], "ON BUDGET")
         self.assertEqual(r["verdict"], "ON BUDGET")
+
+    def test_an_on_allowance_household_projects_on_budget(self):
+        """Spending exactly the daily allowance every day, today included:
+        the pace runs over the days through yesterday, so today's spend
+        stays out of the numerator too, the horizon the forecast uses.
+        Counted in, day 2 projected double the budget and day 11 ten per
+        cent over it."""
+        allowance = round(6100.0 / 31, 2)
+        for day in (2, 11):
+            with self.subTest(day=day):
+                self.conn.close()
+                self.conn = make_db()
+                write_config(self.conn, food_monthly=3000, other_monthly=3100)
+                for d in range(1, day + 1):
+                    add_txn(self.conn, dt.date(2026, 7, d), allowance,
+                            f"PLAIN SPEND {d}")
+                today = dt.date(2026, 7, day)
+                r = lenses.month_summary(self.conn, 2026, 7, today=today)
+                p = r["projection"]
+                self.assertAlmostEqual(p["pace_total"], 6100.0, delta=1.0)
+                self.assertEqual(p["verdict"], "ON BUDGET")
+                y = lenses.year_summary(self.conn, 2026, today=today)
+                self.assertEqual(y["cells"][6]["verdict"], "ON BUDGET")
 
     def test_day_one_projects_the_plan(self):
         """Nothing has elapsed on the 1st, so there is no pace to project."""
@@ -366,6 +197,27 @@ class TestYearGrid(LensBase):
         self.assertAlmostEqual(ba["other"]["actual"], 0.0, 2)
 
 
+class TestYearMoneyMapLabelAndItsListingAgree(LensBase):
+    """The year money map shows a whole bucket (carve-outs included, since
+    it draws no child rows), so the listing its label opens must count the
+    same money — carve-out purchases listed, the same total."""
+
+    def test_parent_bucket_listing_counts_what_the_year_label_shows(self):
+        write_config(self.conn, food_monthly=3000, other_monthly=3100,
+                     custom_buckets=[{"name": "Fun", "parent": "other",
+                                      "monthly": 310, "categories":
+                                      ["ENTERTAINMENT"], "merchants": []}])
+        add_txn(self.conn, dt.date(2026, 7, 2), 80.0, "CINEMA",
+                primary="ENTERTAINMENT", txn_id="fun1")
+        add_txn(self.conn, dt.date(2026, 7, 3), 50.0, "TARGET",
+                txn_id="oth1")
+        y = lenses.year_summary(self.conn, 2026, today=TODAY)
+        led = lenses.year_bucket_ledger(self.conn, "other", 2026, TODAY)
+        self.assertEqual(led["amount"], y["buckets_annual"]["other"]["actual"])
+        self.assertEqual(led["amount"], 130.0)
+        self.assertEqual(set(led["txn_ids"]), {"fun1", "oth1"})
+
+
 class TestBudgetSnapshots(LensBase):
     """Closed months are judged against the budget frozen FOR THEM — the
     nightly job upserts the current month's config into budget_snapshots,
@@ -436,6 +288,54 @@ class TestBudgetSnapshots(LensBase):
         self.assertEqual(june["spend"], 900.0)
 
 
+class TestYearLensHonoursExcludedAccounts(LensBase):
+    """An account the household excluded from the budget is out of every
+    Year lens figure, not only the income: spend, saved and savings rate,
+    the category year-over-year rows, a no-snapshot month's net cell and a
+    category label's drill-down all drop its rows, so the year agrees with
+    the Cash Flow report and with its own month cells."""
+
+    def setUp(self):
+        super().setUp()
+        self.conn.execute(
+            "INSERT INTO accounts (id,item_id,name,type,subtype,"
+            "balance_current) VALUES "
+            "('side','it1','Side Card','credit','credit card',0)")
+        write_config(self.conn, food_monthly=3000, other_monthly=3100,
+                     excluded_accounts=["side"])
+        # checking feeds the ledger from January, so the whole year's
+        # income is known and the totals are numbers
+        add_txn(self.conn, dt.date(2026, 1, 5), 200.0, "TO SAVINGS",
+                account="chk", primary="TRANSFER_OUT")
+        add_txn(self.conn, dt.date(2026, 2, 10), -5000.0, "PAYROLL",
+                account="chk", primary="INCOME")
+        add_txn(self.conn, dt.date(2026, 2, 12), 900.0, "SAFEWAY",
+                primary="FOOD_AND_DRINK")
+        add_txn(self.conn, dt.date(2026, 2, 14), 800.0, "BOATYARD",
+                account="side", primary="GENERAL_SERVICES")
+        add_txn(self.conn, dt.date(2026, 2, 15), 70.0, "TEAROOM",
+                account="side", primary="FOOD_AND_DRINK")
+
+    def test_totals_and_categories_leave_the_excluded_account_out(self):
+        y = lenses.year_summary(self.conn, 2026, today=TODAY)
+        self.assertEqual(y["totals"],
+                         {"income": 5000.0, "spend": 900.0,
+                          "saved": 4100.0, "rate": 82.0})
+        self.assertEqual(y["categories"],
+                         [["FOOD AND DRINK", 900.0, 0.0, "FOOD_AND_DRINK"]])
+
+    def test_net_cell_leaves_the_excluded_account_out(self):
+        feb = lenses.year_summary(self.conn, 2026, today=TODAY)["cells"][1]
+        self.assertEqual(feb["status"], "net")
+        self.assertEqual((feb["income"], feb["spend"], feb["net"]),
+                         (5000.0, 900.0, 4100.0))
+
+    def test_category_drill_down_leaves_the_excluded_account_out(self):
+        led = lenses.year_category_ledger(self.conn, "FOOD_AND_DRINK", 2026)
+        self.assertEqual(led["amount"], 900.0)
+        self.assertEqual(len(led["txn_ids"]), 1)
+
+
 class TestPlanSurplus(LensBase):
     """Plan surplus at lens scope: every lens payload carries the STANDING
     monthly plan surplus (income − avg bills − budgets − savings plan, the
@@ -443,21 +343,17 @@ class TestPlanSurplus(LensBase):
     timeframe. No income configured → None (the row stays hidden)."""
 
     def test_none_without_income(self):
-        self.assertIsNone(lenses.week_summary(
-            self.conn, STRADDLE_MON, today=TODAY)["plan_surplus"])
         self.assertIsNone(lenses.month_summary(
             self.conn, 2026, 7, today=TODAY)["plan_surplus"])
         self.assertIsNone(lenses.year_summary(
             self.conn, 2026, today=TODAY)["plan_surplus"])
 
-    def test_monthly_figure_rides_all_three_lenses(self):
+    def test_monthly_figure_rides_both_lenses(self):
         write_config(self.conn, food_monthly=3000, other_monthly=3100,
                      budgeted_income_monthly=10000)
         add_bill(self.conn, "Rent", 2000.0, next_due=dt.date(2026, 8, 1),
                  last_seen=dt.date(2026, 7, 1))
         # income 10000 − avg bills 2000 − 3000 − 3100 − savings 0 = 1900
-        self.assertEqual(lenses.week_summary(
-            self.conn, STRADDLE_MON, today=TODAY)["plan_surplus"], 1900.0)
         self.assertEqual(lenses.month_summary(
             self.conn, 2026, 7, today=TODAY)["plan_surplus"], 1900.0)
         self.assertEqual(lenses.year_summary(
@@ -515,8 +411,8 @@ class LensApiTests(unittest.TestCase):
 
     def test_the_week_lens_endpoint_is_gone(self):
         """There is no Week VIEW — Today | Month |
-        Year only. week_summary stays an engine function because the
-        weekly email digest still renders from it."""
+        Year only; the Week lens and the weekly email it fed were
+        retired."""
         self.assertEqual(self.client.get("/api/lens/week").status_code, 404)
 
     def test_month_and_year_shapes(self):

@@ -26,8 +26,9 @@ import io
 import re
 
 from ..engine.compat import as_date
-from . import flowmap
-from .base import FileImportIds, Transaction, upsert_transactions
+from . import flowmap, reimport
+from .base import (FileImportIds, Transaction, mask_long_digits,
+                   upsert_transactions)
 from .rowcap import capped
 from .dedup import WINDOW_DAYS as DEDUP_WINDOW_DAYS  # noqa: F401 (re-export)
 from .dedup import Deduper
@@ -69,22 +70,35 @@ def _norm_header(h) -> str:
                   str(h).lower().replace("#", " number ")).strip()
 
 
+def _identifier_tail(v):
+    # text and numbers only, as the stored-row migration cuts them: a
+    # nested value or a flag under an identifier-looking key is not a
+    # number anyone could read back out of the last 4
+    if (v not in (None, "") and isinstance(v, (str, int, float))
+            and not isinstance(v, bool)):
+        return str(v).strip()[-4:]
+    return v
+
+
 def scrub_identifiers(raw: dict) -> dict:
     """A copy of one source row with account/routing-shaped COLUMNS cut to
     their last 4 characters (see _ID_HEADERS for the why). Shared by the
     CSV-family importers — mint/ynab/qif detect their formats by column
     subset, so a bank's re-export can carry these columns into any of
-    them."""
+    them.
+
+    A row with more cells than its header has the extras under the key
+    None, as a list (csv.DictReader's restkey): they are the last
+    column's text cut at an unquoted comma, which is exactly where a
+    statement prints an account number, so their long digit runs are
+    masked like a stored name's."""
     out = {}
     for k, v in raw.items():
-        n = _norm_header(k)
-        # text and numbers only, as the stored-row migration cuts them: a
-        # nested value or a flag under an identifier-looking key is not a
-        # number anyone could read back out of the last 4
-        if (v not in (None, "") and isinstance(v, (str, int, float))
-                and not isinstance(v, bool)
-                and any(t in n for t in _ID_HEADERS)):
-            out[k] = str(v).strip()[-4:]
+        n = _norm_header(k) if k is not None else ""
+        if not n and isinstance(v, (list, tuple)):
+            out[k] = [mask_long_digits(x) for x in v]
+        elif n and any(t in n for t in _ID_HEADERS):
+            out[k] = _identifier_tail(v)
         else:
             out[k] = v
     return out
@@ -143,11 +157,48 @@ def _parse_amount(s: str) -> float:
     return float(s)
 
 
-def _cell(row: dict, header: list[str], key):
+_INDEX_REF = re.compile(r"#(\d{1,4})")
+
+
+class _Tap:
+    """The csv.reader under a DictReader, keeping the last row it read as
+    the list of cells. A header that repeats a name (common in bank
+    exports: two Description or two Amount columns) gives the dict only
+    the LAST such column; the mapping step names a column by its position
+    ('#3') so either one can be chosen, and that reads the cells."""
+
+    def __init__(self, it):
+        self.it, self.last = it, []
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.last = next(self.it)
+        return self.last
+
+    @property
+    def line_num(self):
+        return self.it.line_num
+
+
+def _cell(row: dict, header: list[str], key, cells: list | None = None):
+    """One mapped cell. `key` is a column name, an int position, or a
+    '#<position>' reference (what the mapping card sends, so duplicate
+    names stay distinct); a name that is really in the header wins over
+    the reference form."""
     if key is None:
         return None
+    if isinstance(key, str) and key not in header:
+        m = _INDEX_REF.fullmatch(key)
+        if m:
+            key = int(m.group(1))
     if isinstance(key, int):
-        return row.get(header[key]) if 0 <= key < len(header) else None
+        if not 0 <= key < len(header):
+            return None
+        if cells is not None:
+            return cells[key] if key < len(cells) else None
+        return row.get(header[key])
     return row.get(key)
 
 
@@ -159,6 +210,7 @@ def import_csv(conn, account_id: str, text: str, mapping: dict, *,
     unambiguous, so amount_sign is ignored for those); merchant, category
     (optional). Returns counters."""
     reader = csv.DictReader(io.StringIO(text))
+    tap = reader.reader = _Tap(reader.reader)
     header = reader.fieldnames or []
     for req in ("date", "name"):
         if mapping.get(req) is None:
@@ -170,26 +222,36 @@ def import_csv(conn, account_id: str, text: str, mapping: dict, *,
     parsed: list[tuple] = []
     # the date convention is a property of the FILE, read off the whole
     # column before any row is parsed (the cap bounds the list)
-    rows = list(capped(reader, what="transactions"))
-    order = date_order(_cell(r, header, mapping["date"]) for r in rows)
-    for row in rows:
-        raw_date = _cell(row, header, mapping["date"])
-        name = (_cell(row, header, mapping["name"]) or "").strip()
+    rows = [(row, tap.last) for row in capped(reader, what="transactions")]
+    order = date_order(_cell(r, header, mapping["date"], c) for r, c in rows)
+    for row, cells in rows:
+        def at(key, row=row, cells=cells):
+            return _cell(row, header, key, cells)
+        raw_date = at(mapping["date"])
+        name = (at(mapping["name"]) or "").strip()
         if not raw_date or not name:
             continue
         date = _parse_date(raw_date, order)
         if dual:
-            raw_debit = _cell(row, header, mapping.get("debit"))
-            raw_credit = _cell(row, header, mapping.get("credit"))
+            raw_debit = at(mapping.get("debit"))
+            raw_credit = at(mapping.get("credit"))
             if raw_debit in (None, "") and raw_credit in (None, ""):
                 continue
-            # engine sign directly: debit = out (+), credit = in (−)
-            amount = ((_parse_amount(raw_debit)
-                       if raw_debit not in (None, "") else 0.0)
-                      - (_parse_amount(raw_credit)
-                         if raw_credit not in (None, "") else 0.0))
+            # engine sign directly: debit = out (+), credit = in (−).
+            # The column already says the direction, so the printed sign
+            # is dropped: some card exports write credits as -150.00 in the
+            # Credit column (and some banks write debits negative), and
+            # subtracting that signed value would book a refund as a charge.
+            debit = (_parse_amount(raw_debit)
+                     if raw_debit not in (None, "") else 0.0)
+            credit = (_parse_amount(raw_credit)
+                      if raw_credit not in (None, "") else 0.0)
+            amount = abs(debit) - abs(credit)
+            # what an import before that rule stored: the printed signs
+            # subtracted as they stand (see reimport.adopt_rule_change)
+            signed_as = debit - credit
         else:
-            raw_amount = _cell(row, header, mapping["amount"])
+            raw_amount = at(mapping["amount"])
             if raw_amount in (None, ""):
                 continue
             amount = _parse_amount(raw_amount)
@@ -197,29 +259,61 @@ def import_csv(conn, account_id: str, text: str, mapping: dict, *,
             # investment activity exports usually use the same convention
             if amount_sign in ("bank", "investment"):
                 amount = -amount                 # file sign → engine sign
-        merchant = (_cell(row, header, mapping.get("merchant")) or "").strip()
-        category = (_cell(row, header, mapping.get("category")) or "").strip()
+            signed_as = amount
+        merchant = (at(mapping.get("merchant")) or "").strip()
+        category = (at(mapping.get("category")) or "").strip()
         # the mapping names no account column (see web/pages.py CSV_HEADERS —
         # date/name/amount/debit/credit/merchant/category), so the header
         # names are the only signal there is for what must not be stored
         parsed.append((date, amount, name, merchant, category,
-                       scrub_identifiers(row)))
+                       scrub_identifiers(row), signed_as))
     # cross-source dedup: one-to-one, name-aware (an aggregator row at the
     # same amount within ±3 days covers ONE csv row, and only with a name
     # signal unless the dates match exactly)
     deduper = Deduper(conn, account_id, "csv", [p[0] for p in parsed])
     txns: list[Transaction] = []
     ids = FileImportIds("csv", account_id)
+    # the ids the rows had when a sign printed inside a Debit or Credit
+    # cell still flipped the row, numbered over every row the way that
+    # import numbered them; only a row whose amount the rule changed has
+    # a candidate (see reimport.adopt_rule_change)
+    old_ids = FileImportIds("csv", account_id)
+    old_of: list[list[tuple[str, float]]] = []
+    rule_changed = any(round(p[6] * 100) != round(p[1] * 100)
+                       for p in parsed)
     skipped_dupes = 0
-    for date, amount, name, merchant, category, raw in parsed:
+    absorbed = []   # lines the feed now holds whose earlier file row must go
+    for date, amount, name, merchant, category, raw, signed_as in parsed:
         if deduper.claim(date, amount, name, merchant):
             skipped_dupes += 1
+            if rule_changed and round(signed_as * 100) != round(amount * 100):
+                # the earlier import landed (and numbered) this row: its
+                # file row would stay beside the feed row that absorbs it
+                oid = old_ids.id_for(date, signed_as, name)
+                absorbed.append((date, amount, (name, merchant),
+                    [(x, signed_as) for x in (oid, old_ids.legacy_id(oid)) if x],
+                    lambda row, raw=raw, n=name, m=merchant:
+                        reimport.same_line_raw(row["raw"], raw, n, m)))
             continue
         tid = ids.id_for(date, amount, name)
+        if rule_changed:
+            oid = old_ids.id_for(date, signed_as, name)
+            old_of.append(
+                [(x, signed_as) for x in (oid, old_ids.legacy_id(oid)) if x]
+                if round(signed_as * 100) != round(amount * 100) else [])
+        else:
+            old_of.append([])
         # flow strings (card payment / transfer) map to spend-excluded
         # categories; anything else passes through as before. The name
         # disambiguates mixed categories (one issuer's "Payments and Credits")
         primary, detailed = flowmap.flow_category(category, amount, name)
+        # a brokerage export's buys, sales, reinvestments and transfers are
+        # the household's money changing form, read by the same rule as the
+        # account's PDF statement — otherwise the CSV of one account books
+        # a fund purchase as spending that its PDF books as a transfer
+        if (primary is None and amount_sign == "investment"
+                and flowmap.investment_flow(name) == "transfer"):
+            primary, detailed = flowmap.transfer_category(amount), None
         if primary is None:
             primary, detailed = category or None, None
         txns.append(Transaction(
@@ -228,9 +322,13 @@ def import_csv(conn, account_id: str, text: str, mapping: dict, *,
             category_primary=primary, category_detailed=detailed,
             raw=raw))
     txns = ids.resolve(conn, txns)
+    corrected = reimport.adopt_rule_change(
+        conn, account_id, txns, old_of, same_line=reimport.same_line_raw)
+    corrected += reimport.retire_absorbed(conn, account_id, "csv", absorbed,
+                                          taken={t.id for t in txns})
     if batch_id:
         from . import batches
         batches.tag(conn, txns, batch_id)
     added = upsert_transactions(conn, txns)
     return {"imported": added, "rows": len(txns),
-            "skipped_duplicates": skipped_dupes}
+            "skipped_duplicates": skipped_dupes, "corrected": corrected}

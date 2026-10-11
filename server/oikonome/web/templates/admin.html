@@ -100,9 +100,14 @@
   <p>Reset WIPES this instance's data and re-seeds it empty. This cannot be
      undone — check your backups first.</p>
   {% elif cmd_armed == 'upgrade' %}
-  <p>Rebuild / restart tears the stack down and brings it back up from the
-     current checkout — every user on this instance is disconnected for the
-     duration.</p>
+  <p>Upgrade moves this instance to the LATEST release: when the install is
+     a git checkout it pulls the newest code first, then rebuilds and
+     restarts the stack, and the new release's migrations run at start —
+     some of them change stored data for good. A database snapshot is taken
+     into the backups folder first; going back means checking out the
+     previous version and restoring that snapshot (quickstart → Upgrades).
+     Running now: <code>{{ version }}</code>. Every user on this instance is
+     disconnected while it restarts.</p>
   {% else %}
   <p>Uninstall tears this instance's stack down and removes it. This cannot be
      undone — check your backups first.</p>
@@ -236,7 +241,8 @@
         <input type="hidden" name="stage" value="arm">
         <button style="font-size:12px;color:var(--red)">reboot host…</button>
       </form>
-      <span class="sub">two-step: a typed confirm banner appears at the top of the page</span></td></tr>
+      <span class="sub">two-step: a typed confirm banner appears at the top of the page</span>
+      {% if not reboot_watcher_ready %}<span class="sub"> · not configured — run scripts/install-host-reboot-watcher.sh once as root</span>{% endif %}</td></tr>
     {% if host_state.backups_available %}
     {% set bs = host_state.backup_summary %}
     <tr><th>Backups</th><td>
@@ -443,14 +449,14 @@
     </form>
     {% endfor %}
     <span class="sub" style="margin:0 .4rem">·</span>
-    {% for c, label in [('upgrade','Rebuild / restart…'), ('restore','Restore a backup…'), ('reset','Reset (wipe data)…'), ('uninstall','Uninstall…')] %}
+    {% for c, label in [('upgrade','Upgrade to the latest release…'), ('restore','Restore a backup…'), ('reset','Reset (wipe data)…'), ('uninstall','Uninstall…')] %}
     <form method="post" action="/admin/console/run-command" style="margin:0">
       <input type="hidden" name="command" value="{{ c }}">
       <button style="color:var(--red)">{{ label }}</button>
     </form>
     {% endfor %}
   </div>
-  <p class="sub" style="margin:.5rem 0 0">Backup / status / logs run on one click; rebuild, restore, reset and uninstall arm a typed confirmation at the top of the page.</p>
+  <p class="sub" style="margin:.5rem 0 0">Backup / status / logs run on one click; upgrade, restore, reset and uninstall arm a typed confirmation at the top of the page.</p>
   {% else %}
   <p class="mut">Not available — the host command watcher isn't installed. Run
     <code>sudo sh scripts/install-host-command-watcher.sh &lt;install-dir&gt;</code>
@@ -527,9 +533,15 @@
      could otherwise add the thief's own authenticator.
      The server enforces it; this attribute tells pages.js to collect the
      ticket first so the button does not just fail with a 403. #}
+  {# Before the FIRST key there is no assertion to ask for, so the server
+     wants the operator token re-entered instead: the key outlives this
+     session, and the cookie alone is not proof enough for it. #}
   <form data-admin-passkey-enrol{% if passkeys_enrolled %} data-stepup="1"{% endif %}
         style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin:.6rem 0 0">
     <input name="label" placeholder="name this key (e.g. yubikey-5c)" autocomplete="off" required>
+    {% if not passkeys_enrolled and token_login %}
+    <input name="token" type="password" placeholder="operator token" autocomplete="off" required>
+    {% endif %}
     <button class="pri">Enrol a passkey</button>
   </form>
   <div class="note" data-admin-passkey-error hidden

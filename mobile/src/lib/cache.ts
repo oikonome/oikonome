@@ -8,6 +8,7 @@
 // one-liners for that; mirrors webapp/src/api/cache.ts.
 import type { QueryClient, QueryKey } from "@tanstack/react-query";
 import type { Client, SettingsView } from "./api";
+import { smsPauseSentence } from "./pure";
 
 /** Shallow-merge `partial` into a cached object (no-op if nothing cached). */
 export function patchQuery<T extends object>(
@@ -65,6 +66,11 @@ export function removeFromList<T extends object, R>(
  *  springing back until a refetch lands. Also refreshes the two other keys
  *  that are really GET /api/settings under another name. The caller still
  *  decides which OTHER keys (today, calendar, …) the change can have moved. */
+/** The one queue settings saves that write the whole stored view back go
+ *  through, so their replies land in the order they were sent and the last
+ *  one to land holds every change before it. Mirrors the web's. */
+export const SETTINGS_SAVES = { id: "settings-email" };
+
 export function saveSettings(
   qc: QueryClient, client: Client, body: Record<string, unknown>,
 ): Promise<SettingsView> {
@@ -124,3 +130,25 @@ export const invalidateAll = (qc: QueryClient, keys: QueryKey[]): Promise<void> 
     ...(k[0] === "today" || k[0] === "transactions"
         ? { refetchType: "none" as const } : {}) })))
     .then(() => undefined);
+
+/** A password, login-address or second-factor change pauses the
+ *  household's text number until a fresh code is typed back. Returns the
+ *  sentence to add to the change's message, and refetches the notify
+ *  status so the SMS card shows the pause rather than a stale "verified".
+ *  Mirrors smsPauseNote in webapp/src/api/cache.ts. */
+export function smsPauseNote(
+  qc: QueryClient, r: { sms_number_needs_verify?: boolean } | null | undefined,
+): string {
+  const note = smsPauseSentence(r);
+  if (note) qc.invalidateQueries({ queryKey: ["notify-status"] });
+  return note;
+}
+
+/** A credential rotation (password, login address, a first second factor)
+ *  also ends every support-access grant this person made and can pause
+ *  outbound mail to the household's extra recipients — both shown on the
+ *  Settings screens, so both are refetched with the lists it empties. */
+export function invalidateAfterRotation(qc: QueryClient): void {
+  qc.invalidateQueries({ queryKey: ["support-access"] });
+  qc.invalidateQueries({ queryKey: ["settings"] });
+}

@@ -33,7 +33,10 @@ place in that count.
   on a schedule (hourly by default), via SimpleFIN (recommended, US/CA) or Plaid/MX (bring your
   own keys on self-host). Where an operator runs the instance for other
   people, connections run through the operator's provider keys — you never
-  add your own.
+  add your own. After an owner's password, login email or second-factor
+  change, or an account recovery, new links on the household's own Plaid
+  or MX keys are held until the owner confirms those keys in Settings;
+  banks already linked keep syncing (see the security guide).
 - **Community scripts / collectors** — host-side scripts that push
   data for institutions no aggregator covers. They run on **your**
   machine (that's where the credentials stay); the **run** button shows
@@ -141,7 +144,8 @@ click — **reconnect ↗** starts a fresh link (the old connection no
 longer exists, so there is nothing to "fix").
 
 The window is configurable (`OIKONOME_PLAID_REAP_DAYS`; `0` disables
-it).
+it). With `0`, a disconnect you asked for whose removal at Plaid failed
+is still retried: the connection bills until that removal goes through.
 
 ## When an instance caps connected institutions
 
@@ -263,7 +267,8 @@ depend on whether the account still has a live bank connection:
   the connection in Connect.
 - **Disconnect and delete data** — disconnect as above, then
   permanently delete all local accounts and transactions for that
-  institution. Cannot be undone.
+  institution. Cannot be undone. (Imported rows a bank feed relies on are
+  the exception — see below.)
 - **Hide this account only** — soft-removes one account from active
   lists while the bank connection (and its other accounts) keep
   syncing. History is kept. Does **not** free a Plaid slot — use
@@ -273,8 +278,42 @@ depend on whether the account still has a live bank connection:
   already-disconnected accounts only (a live Plaid Item would recreate
   the account on the next sync).
 
+**Rows a bank feed relies on are kept.** When a bank feed found a charge
+you had already imported from a file, it set its own copy aside and will
+not send it again, so the imported row is the only copy. Both deletes
+keep such rows, and the account that holds them, and the reply says how
+many were kept. When the feed did not note which of its accounts set the
+copy aside (older imports), nothing can tell whether it still relies on
+the row, so the delete stops first and asks: **Delete anyway** removes
+those rows with the account; cancelling changes nothing. Undoing an
+import asks the same question for the same rows — see
+[Import history](import-history.md).
+
 Plaid cannot drop a single sub-account under an Item — disconnect is
 always per institution.
+
+## Bringing a disconnected bank back
+
+A disconnected bank stays disconnected until you say otherwise — a
+routine sync, or simply opening a provider's connect widget again, never
+revives it. How it comes back depends on the provider:
+
+- **MX** — open the account's ✎ edit row (on the phone, the account
+  editor) → **reconnect** (owner only;
+  the button appears only on a disconnected MX account). Syncing
+  resumes, history is kept, and the next sync reaches back to a week
+  before the disconnect, so what posted while it was disconnected fills
+  in. The instance's MX keys must still be configured.
+- **SimpleFIN** — a bridge you disconnected comes back by connecting a
+  **new setup token** from the connect section, and the banks that were
+  disconnected with it come back too, their first pull filling the gap
+  since the disconnect. A bank you disconnected on its own comes back
+  with **reconnect** in its account editor, like MX. A bank you removed
+  at the bridge itself must be added there again first; one the bridge
+  no longer carries stays disconnected, and a bank whose history you
+  deleted stays deleted.
+- **Plaid** (and other linked providers) — link the bank again from the
+  connect section; a released connection no longer exists to revive.
 
 ## Gotchas
 

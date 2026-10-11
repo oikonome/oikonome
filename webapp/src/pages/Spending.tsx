@@ -50,34 +50,82 @@ export default function SpendingSection({ range, setRange }: {
   const wq = useQuery({ queryKey: ["report", "spending-window", range],
                         queryFn: () => api.reportSpendingWindow(range),
                         placeholderData: (prev) => prev });
+  // Every range but "This month" holds complete months only, so a ledger
+  // that begins this month reads empty on the default 1y until the month
+  // turns. Only an empty 1y asks whether this month has spend, so the
+  // card below can tell "nothing yet" from "nothing closed yet". A server
+  // that already fell back to the month so far says `live_month`, and its
+  // window is never this empty case.
+  const emptyDefault = !!wq.data && range === "1y" && !wq.data.total
+    && !wq.data.by_month.length && !wq.data.live_month;
+  const curQ = useQuery({ queryKey: ["report", "spending-window", "cur"],
+                          queryFn: () => api.reportSpendingWindow("cur"),
+                          enabled: emptyDefault });
   const [allMerch, setAllMerch] = useState(false);
   if (wq.isPending) return <p className="mut" style={{ marginTop: "2rem" }}>loading…</p>;
   if (wq.isLoadingError) return <div className="note bad">Couldn't load: {String(wq.error)}</div>;
   const w: SpendingWindow = wq.data;
 
   // a ledger with no spend yet: one honest card instead of empty lists
-  if (!w.total && !w.by_month.length && range === "1y") {
+  if (emptyDefault) {
+    // wait for the month-so-far answer rather than flash the wrong copy
+    if (curQ.isPending) return <p className="mut" style={{ marginTop: "2rem" }}>loading…</p>;
+    const thisMonth = curQ.data && (curQ.data.total || curQ.data.by_month.length)
+      ? curQ.data : null;
     return (
       <div className="card" style={{ marginTop: 0 }}>
-        <h2>Spending</h2>
-        <p className="mut">Nothing to chart yet. Once transactions arrive —
-          connect a bank or import a file — this page fills in: what changed,
-          where it went, and your top merchants.</p>
-        <p><Link to="/accounts">Accounts →</Link>{" · "}
-           <Link to="/import">Import →</Link></p>
+        <div style={{ display: "flex", alignItems: "baseline", gap: ".8rem",
+                      flexWrap: "wrap" }}>
+          <h2 style={{ margin: 0 }}>Spending</h2>
+          <span style={{ marginLeft: "auto" }}>
+            <RangePicker value={range} onChange={setRange} />
+          </span>
+        </div>
+        {thisMonth ? (
+          <p className="mut">{w.label} holds complete months only, and your
+            ledger starts this month — {money(thisMonth.total)} spent so far.{" "}
+            <button type="button" className="linklike"
+                    style={{ background: "none", border: "none", padding: 0,
+                             cursor: "pointer", font: "inherit",
+                             color: "var(--ink)", textDecoration: "underline",
+                             textDecorationColor: "var(--mut)" }}
+                    onClick={() => setRange("cur")}>
+              See this month →</button></p>
+        ) : (
+          <>
+            <p className="mut">Nothing to chart yet. Once transactions arrive —
+              connect a bank or import a file — this page fills in: what changed,
+              where it went, and your top merchants.</p>
+            <p><Link to="/accounts">Accounts →</Link>{" · "}
+               <Link to="/import">Import →</Link></p>
+          </>
+        )}
       </div>
     );
   }
 
   const perMonth = w.total / Math.max(w.months, 1);
-  const top = w.categories[0];
-  // the movers: biggest absolute changes vs the previous window, either way
-  const movers = w.prev_total === null ? [] :
-    w.categories
-      .map(([c, v, p]) => ({ c, v, p: p ?? 0, d: v - (p ?? 0) }))
+  // the server follows the ranked categories with ones spent on only in
+  // the previous window, at 0: they belong in "what changed", never in a
+  // ranking of where this window's money went
+  const spent = w.categories.filter(([, v]) => v > 0);
+  const top = spent[0];
+  // the movers: biggest absolute changes vs the previous window, either
+  // way — a category that fell to nothing included — then merchants paid
+  // only in the previous window, in the same row shape
+  const moved = (rows: [string, number, number | null][], n: number,
+                 label: (k: string) => string) =>
+    rows.map(([c, v, p]) => ({ k: c, c: label(c), v, p: p ?? 0,
+                               d: v - (p ?? 0) }))
       .filter((m) => Math.abs(m.d) >= Math.max(25, w.total * 0.005))
       .sort((a, b) => Math.abs(b.d) - Math.abs(a.d))
-      .slice(0, 4);
+      .slice(0, n);
+  const movers = w.prev_total === null ? [] : [
+    ...moved(w.categories, 4, catLabel).map((m) => ({ ...m, k: `c:${m.k}` })),
+    ...moved((w.dropped_merchants ?? []).map(([payee, v, , p]) =>
+               [payee, v, p] as [string, number, number | null]), 3,
+             (k) => k).map((m) => ({ ...m, k: `m:${m.k}` })),
+  ];
   const merchants = allMerch ? w.merchants : w.merchants.slice(0, 10);
 
   return (
@@ -92,10 +140,13 @@ export default function SpendingSection({ range, setRange }: {
         </div>
         <div style={{ display: "flex", gap: ".5rem", alignItems: "baseline",
                       flexWrap: "wrap", marginTop: ".5rem", fontSize: 13 }}>
-          <span className="sub">{w.label}:</span>
+          {/* live_month: the ledger starts this month, so the range shows
+              the month so far — named as such, and a per-month pace over
+              one partial month would only repeat the total */}
+          <span className="sub">{w.live_month ? `${w.label} so far` : w.label}:</span>
           <b style={{ fontSize: "1.15rem" }}>{money(w.total)}</b> spent
-          <span className="mut">·</span>
-          <b>{money(perMonth)}</b>/mo
+          {!w.live_month && <><span className="mut">·</span>
+            <b>{money(perMonth)}</b>/mo</>}
           {w.prev_total !== null && (
             <><span className="mut">·</span>
               <Delta cur={w.total} prev={w.prev_total} downIsGood />
@@ -120,10 +171,10 @@ export default function SpendingSection({ range, setRange }: {
           <h2>What changed <span className="sub" style={{ fontWeight: 400 }}>
             — vs the {PREV_NAME[range]}</span></h2>
           {movers.map((m) => (
-            <div key={m.c} style={{ fontSize: 13, margin: ".25rem 0" }}>
+            <div key={m.k} style={{ fontSize: 13, margin: ".25rem 0" }}>
               <span className={m.d > 0 ? "neg" : "pos"}
                     style={{ fontWeight: 700 }}>
-                {m.d > 0 ? "▲" : "▼"} {catLabel(m.c)}{" "}
+                {m.d > 0 ? "▲" : "▼"} {m.c}{" "}
                 {m.d > 0 ? "+" : "−"}{money(Math.abs(m.d))}
               </span>{" "}
               <span className="sub">
@@ -140,14 +191,14 @@ export default function SpendingSection({ range, setRange }: {
           — share of the window's spend</span></h2>
         <table>
           <tbody>
-            {w.categories.slice(0, 15).map(([c, v, p]) => (
+            {spent.slice(0, 15).map(([c, v, p]) => (
               <tr key={c}>
                 <td style={{ maxWidth: "11rem" }}>{catLabel(c)}</td>
                 <td style={{ width: "34%" }}>
                   <span style={{ display: "inline-block", height: 9,
                                  borderRadius: 3, background: "var(--blue, #4f9bd6)",
                                  verticalAlign: "middle",
-                                 width: `${Math.max(2, (100 * v) / (w.categories[0]?.[1] || 1))}%` }} />
+                                 width: `${Math.max(2, (100 * v) / (spent[0]?.[1] || 1))}%` }} />
                 </td>
                 <td className="num">{money(v)}</td>
                 <td className="num mut" style={{ fontSize: 12 }}>{share(v, w.total)}</td>

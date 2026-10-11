@@ -467,6 +467,59 @@ class BackendRoutingApi(unittest.TestCase):
             conn.close()
         self._save({"llm_backends": [], "llm_roles": {}})
 
+    def test_folding_the_legacy_endpoint_keeps_every_task_on_it(self):
+        """Before the fold, every task with no route resolves to the
+        legacy endpoint. The clients' first AI-card save sends the legacy
+        row with the roles they read, which is none — and the fold retires
+        the legacy keys. Every task must still resolve to that endpoint
+        afterwards, or categorizing, the assistant and receipt reading
+        silently drop to the operator's backend or to nothing."""
+        self._save({"llm_url": "http://cfg.test:9090", "llm_model": "gemma3",
+                    "llm_vision_model": "llava"})
+        self._save({"llm_backends": [
+            {"id": "legacy", "name": "Custom endpoint",
+             "url": "http://cfg.test:9090", "model": "gemma3",
+             "vision_model": "llava"},
+        ], "llm_roles": {}})
+        conn = _tenant_conn_of(self.client)
+        try:
+            with patch.dict(os.environ,
+                            {"OIKONOME_LLM_URL": "http://ollama:11434",
+                             "OIKONOME_LLM_MODEL": "envm"}):
+                for role in llm_categorize.ROLES:
+                    be = llm_categorize._backend(conn, role=role)
+                    self.assertEqual(be["url"], "http://cfg.test:9090", role)
+        finally:
+            conn.close()
+        self._save({"llm_backends": [], "llm_roles": {}})
+
+    def test_a_role_routed_elsewhere_keeps_its_route_across_the_fold(self):
+        self._save({"llm_url": "http://cfg.test:9090", "llm_model": "gemma3"})
+        self._save({"llm_backends": [
+            {"id": "legacy", "name": "Custom endpoint",
+             "url": "http://cfg.test:9090", "model": "gemma3"},
+            {"id": "cloud", "name": "Cloud", "url": "http://cloud.test",
+             "model": "big"},
+        ], "llm_roles": {"assistant": "cloud"}})
+        conn = _tenant_conn_of(self.client)
+        try:
+            self.assertEqual(
+                llm_categorize._backend(conn, role="assistant")["url"],
+                "http://cloud.test")
+            self.assertEqual(
+                llm_categorize._backend(conn, role="categorize")["url"],
+                "http://cfg.test:9090")
+        finally:
+            conn.close()
+        # later saves are not folds: an unrouted role stays unrouted
+        self._save({"llm_backends": [
+            {"id": "legacy", "name": "Custom endpoint",
+             "url": "http://cfg.test:9090", "model": "gemma3"},
+        ], "llm_roles": {"categorize": "legacy"}})
+        cfg = self.client.get("/api/settings").json()
+        self.assertEqual(cfg["llm_roles"], {"categorize": "legacy"})
+        self._save({"llm_backends": [], "llm_roles": {}})
+
     def test_unrouted_roles_keep_legacy_then_env_resolution(self):
         self._save({"llm_backends": [
             {"id": "a", "name": "A", "url": "http://a.test", "model": "m-a"},

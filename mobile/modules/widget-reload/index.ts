@@ -4,7 +4,8 @@
 // guard needed.
 import { requireOptionalNativeModule } from "expo";
 
-type WidgetReload = { reload(): void; clearCache(): void };
+type WidgetReload = { reload(): void; clearCache(): void;
+                      placedCount?: () => Promise<number> };
 
 export function reloadWidgets() {
   requireOptionalNativeModule<WidgetReload>("WidgetReload")?.reload();
@@ -15,4 +16,14 @@ export function reloadWidgets() {
  *  it must go before another household's credential is written. */
 export function clearWidgetCache() {
   requireOptionalNativeModule<WidgetReload>("WidgetReload")?.clearCache();
+}
+
+/** How many of this app's widgets are on the home screen, or null when the
+ *  build's module cannot say (older native build, Expo Go, Android) or
+ *  WidgetKit refused to answer. */
+export async function placedWidgets(): Promise<number | null> {
+  const m = requireOptionalNativeModule<WidgetReload>("WidgetReload");
+  if (!m?.placedCount) return null;
+  const n = await m.placedCount();
+  return n >= 0 ? n : null;
 }

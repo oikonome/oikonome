@@ -48,7 +48,12 @@ specs/               design notes for shipped features
 ```bash
 # a throwaway Postgres for tests + the dev server
 podman run -d --name oikonome-dev-postgres -p 127.0.0.1:5433:5432 \
-  -e POSTGRES_PASSWORD=devpass postgres:18-alpine
+  -e POSTGRES_PASSWORD=devpass --log-driver k8s-file --log-opt max-size=50mb \
+  postgres:18-alpine
+# (the log driver matters on a journald host: the suite deliberately provokes
+#  ERRORs, and Postgres prints each one with its full STATEMENT to stderr,
+#  which podman's journald driver files at priority err - thousands of SQL
+#  lines a day in `journalctl -p err`. `podman logs` still works.)
 
 # server deps
 cd server && python -m venv .venv && .venv/bin/pip install -e .

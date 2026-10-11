@@ -97,6 +97,35 @@ class DoctorTests(unittest.TestCase):
         self.assertTrue(bank["ok"])
         self.assertIn("last sync", bank["detail"])
 
+    def test_the_worker_row_follows_a_stretched_poll_interval(self):
+        """The poll interval is the operator's (OIKONOME_SYNC_BUCKETS), and
+        the alert strip already judges a connection stale only once a few
+        polls are missed. Doctor judges the worker by the same threshold,
+        so a healthy worker on a slow poll does not read as failing here
+        while Today says the connection is fine."""
+        sync_base.upsert_item(self.conn, "sfin-slow", "simplefin",
+                              "SimpleFIN", "https://u:p@bridge.test/simplefin")
+        self.conn.execute(
+            "INSERT INTO job_runs (job, ran_at, note) VALUES "
+            "('sync', now() - interval '8 hours', '') "
+            "ON CONFLICT (tenant_id, job) DO UPDATE SET ran_at = EXCLUDED.ran_at")
+
+        def worker_row(**extra):
+            env = {k: v for k, v in os.environ.items()
+                   if not k.startswith("OIKONOME_LLM")
+                   and k != "OIKONOME_SYNC_BUCKETS"}
+            env.update(extra)
+            with patch.dict(os.environ, env, clear=True):
+                return next(r for r in doctor.checks(self.tid)
+                            if r["name"] == "bank sync (worker)")
+
+        # a 12 h poll: eight hours since the last run is on schedule
+        slow = worker_row(OIKONOME_SYNC_BUCKETS="144")
+        self.assertTrue(slow["ok"], slow["detail"])
+        self.assertNotIn("hourly", slow["detail"])
+        # the default hourly poll: eight hours is overdue
+        self.assertFalse(worker_row()["ok"])
+
     def test_llm_unconfigured_is_informational_not_failure(self):
         rows = [r for r in self._checks()
                 if r["section"] == "Smart categorization"]
@@ -143,6 +172,16 @@ class LlmQueueAndServicesTests(unittest.TestCase):
         self.assertIn("postgres", names)
         self.assertIn("redis (job queue)", names)
         self.assertIn("worker", names)
+
+    def test_a_download_does_not_count_as_the_worker_running(self):
+        """The export records its findings in job_runs, but a download is
+        a request: with no worker job ever run, the worker row still
+        warns."""
+        from oikonome.engine import alerts
+        from oikonome.web import pages
+        alerts.heartbeat(self.conn, pages.EXPORT_LAST_JOB, "[]")
+        row = self._rows("Services", "worker")[0]
+        self.assertFalse(row["ok"], row)
 
     def test_receipt_queue_row_reflects_states(self):
         from .util import TODAY, add_txn

@@ -14,7 +14,9 @@ import { useRefetchWhenShown } from "../lib/focus";
 import { useSession } from "../lib/session";
 import { VERDICT } from "../lib/verdict";
 import { C, money } from "../lib/theme";
-import { catLabel } from "../lib/pure";
+import { catLabel, routeInt } from "../lib/pure";
+import { ESTIMATED_SAVINGS_CAPTION, labelSavingsRow, yearSavings }
+  from "../lib/planner";
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -27,7 +29,8 @@ export default function YearLens() {
   const now = new Date();
   // ?y= deep link (notifications, the month lens's year label)
   const p = useLocalSearchParams<{ y?: string }>();
-  const [y, setY] = useState(Number(p.y) || now.getFullYear());
+  const [y, setY] = useState(
+    () => routeInt(p.y, 1900, 2100) ?? now.getFullYear());
   const query = useQuery({
     queryKey: ["lens", "year", y],
     queryFn: () => client!.lensYear(y),
@@ -49,6 +52,7 @@ export default function YearLens() {
   // scale — "net" months had no plan, so they don't scale the map
   const elapsed = (d?.cells ?? [])
     .filter((c) => c.status === "final" || c.status === "projected").length;
+  const ySav = yearSavings(goal, d?.saved_ytd, elapsed);
 
   return (
     <ScrollView style={s.wrap} contentContainerStyle={{ paddingBottom: 24 }}
@@ -146,7 +150,7 @@ export default function YearLens() {
           {d.buckets_annual && elapsed > 0 && (
             <Card>
               <H>Yearly budget</H>
-              <MoneyMap rows={planRows(
+              <MoneyMap rows={labelSavingsRow(planRows(
                 { food: d.buckets_annual.food,
                   other: d.buckets_annual.other },
                 { // a label opens the year's bucket: the same months
@@ -154,17 +158,11 @@ export default function YearLens() {
                   period: { y },
                   fixedActual: d.buckets_annual.fixed.actual,
                   fixedBudget: d.buckets_annual.fixed.month_budget,
-                  // standing monthly plan × the elapsed months every
-                  // other row here covers; saved_ytd is the ledger's own
-                  // figure, rate_90d × elapsed the fallback
-                  savings: goal && elapsed > 0
-                    ? { plan: goal.monthly_plan * elapsed,
-                        saved: d.saved_ytd
-                          ?? (goal.rate_90d === null ? null
-                              : goal.rate_90d * elapsed) }
-                    : null,
+                  savings: ySav,
                   excess: d.plan_surplus != null && elapsed > 0
-                    ? d.plan_surplus * elapsed : null })} />
+                    ? d.plan_surplus * elapsed : null }),
+                // the 90-day projection is not what was transferred
+                !!ySav?.estimated, ESTIMATED_SAVINGS_CAPTION)} />
             </Card>
           )}
           <Card>
@@ -186,7 +184,8 @@ export default function YearLens() {
                 tone="mut" />
             {d.totals.income === null && (
               <Text style={{ color: C.mut, fontSize: 12 }}>
-                No bank income data for {y} — income and savings are
+                Income isn't known for every month of {y} (no bank
+                account feeds part of it) — income and savings are
                 unknown, not $0.
               </Text>
             )}

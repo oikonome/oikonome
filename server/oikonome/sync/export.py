@@ -7,9 +7,12 @@ from __future__ import annotations
 import csv as _c
 import io as _io
 import json as _json
+import logging
 import zipfile
 
 from .. import ext
+
+log = logging.getLogger(__name__)
 
 
 DATA_MAP = {
@@ -58,6 +61,9 @@ DATA_MAP = {
     "activity_log": "the household's activity log — who changed which "
                     "category, bill, note or rule, and when",
     "account_links": "same-account links across data sources",
+    "account_adoptions": "the ids an account stood under before a bank "
+                         "reconnect moved it (so a re-imported statement "
+                         "finds its earlier rows)",
     "receipts": "receipt images (base64 in the CSV)",
     "receipt_items": "receipt line items",
     "tenant_settings": "your settings (credentials scrubbed)",
@@ -151,6 +157,16 @@ def _control_csv(conn, table: str) -> str:
     return sio.getvalue()
 
 
+def binary_tables(conn) -> set[str]:
+    """Tables with a binary column. Their rows are as large as a file the
+    person uploaded, so a reader streaming them must fetch one at a time.
+    Asked of the catalog rather than listed, so a table that gains such a
+    column is streamed that way without anyone remembering to add it."""
+    return {r["table_name"] for r in conn.execute(
+        """SELECT DISTINCT table_name FROM information_schema.columns
+            WHERE table_schema='public' AND data_type='bytea'""").fetchall()}
+
+
 # Tables whose rows need more than SELECT * to survive a CSV round trip.
 # A link that replaced a person's explicit "no category" pin remembers it
 # as the empty string, and NULL means it replaced nothing; a CSV cell
@@ -179,10 +195,17 @@ def _scrub_snapshot(cfg):
     return scrub_config(cfg)
 
 
-def build_zip(conn, out=None) -> bytes | None:
+def build_zip(conn, out=None, *,
+              warnings: list[str] | None = None) -> bytes | None:
     """The export for the tenant `conn` is scoped to. Credentials never
     travel (tenant_settings is scrubbed; the secret columns are excluded);
-    receipt blobs DO — this is the user's full copy."""
+    receipt blobs DO — this is the user's full copy.
+
+    The archive is checked against what a restore accepts once it is
+    written. One that a restore would refuse is still produced (it is the
+    household's own copy, and every file in it still opens), but the reason
+    is logged, appended to `warnings` for the caller to show, and written
+    into the archive beside the README."""
     from ..web.pages import EXPORT_SKIP, _EXPORT_ORDER, _csv_cell
     # The same RLS-only discovery the portable metadata archive
     # (tenant_export) uses:
@@ -226,8 +249,21 @@ def build_zip(conn, out=None) -> bytes | None:
     # design.
     _blobs = {"raw_bytes", "image", "image_optimized", "content"}
     drop = (_EXCLUDE_COLS - _blobs) | {"tenant_id"}
+    binary = binary_tables(conn)
     buf = out if out is not None else _io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+    # ONE snapshot for the whole archive. Syncs, collectors and other
+    # members keep committing while it streams; read table by table at
+    # their own moments, a charge on an account opened between the
+    # accounts read and the transactions read lands in the ZIP without its
+    # account, and the restore (one transaction, foreign keys) refuses the
+    # whole archive. A read-only REPEATABLE READ transaction makes every
+    # member see the same moment; the per-table blocks below become
+    # savepoints inside it. Row-level security is unchanged: the tenant
+    # setting is on the session, not the transaction.
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z, \
+            conn.transaction():
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, "
+                     "READ ONLY")
         z.writestr("README.txt", readme)
         for tbl in TABLES:
             if tbl in CONTROL_TABLES:
@@ -269,7 +305,13 @@ def build_zip(conn, out=None) -> bytes | None:
                 w = None
                 with conn.transaction():
                     with conn.cursor(name=f"exp_{tbl}") as cur:
-                        cur.itersize = 500
+                        # the prefetch is counted in rows, so it has to be
+                        # sized by the widest row: a ledger row is small
+                        # and comes in batches, a row holding binary
+                        # columns (a receipt's photo and its optimised
+                        # copy) comes one at a time, or memory grows with
+                        # the number of receipts instead of the size of one
+                        cur.itersize = 1 if tbl in binary else 500
                         cur.execute(_EXPORT_SELECT.get(
                             tbl, f"SELECT * FROM {tbl}"))
                         for r in cur:
@@ -285,4 +327,31 @@ def build_zip(conn, out=None) -> bytes | None:
                             w.writerow({k: _csv_cell(r[k]) for k in cols})
                 fh.flush()
                 fh.detach()
+        notes = restore_limits(z.infolist())
+        for note in notes:
+            log.warning("export: %s", note)
+        if warnings is not None:
+            warnings.extend(notes)
+        if notes:
+            z.writestr("RESTORE-NOTE.txt",
+                       "This archive is larger than a restore accepts:\n"
+                       + "".join(f"  {n}\n" for n in notes))
     return buf.getvalue() if out is None else None
+
+
+def restore_limits(infos) -> list[str]:
+    """What, of a written archive, a restore would refuse: the restore's
+    own size rule, and the restore upload's ceiling on the archive file."""
+    from ..web.pages import RESTORE_MAX_UPLOAD
+    from .restore import zip_size_problem
+    infos = list(infos)
+    out = []
+    problem = zip_size_problem(infos)
+    if problem:
+        out.append(problem)
+    packed = sum(i.compress_size for i in infos)
+    if packed > RESTORE_MAX_UPLOAD:
+        out.append(f"the archive is {packed // (1024 * 1024)} MB, over the "
+                   f"{RESTORE_MAX_UPLOAD // (1024 * 1024)} MB a restore "
+                   "upload takes")
+    return out

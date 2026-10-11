@@ -134,17 +134,29 @@ def _as_date(v) -> dt.date | None:
     return d if DATE_MIN <= d <= DATE_MAX else None
 
 
-def facts(row: dict) -> dict:
+def _household_tz(conn):
+    from .. import localtime
+    from . import budget
+    return localtime.tenant_tz(budget.load_config(conn))
+
+
+def facts(row: dict, tz=None) -> dict:
     """The three things the matcher reads off a receipt: total, date, store.
 
     The date is the one printed on the receipt when it is a plausible one —
     not after the day it was snapped (a misread year), not more than a year
     before it. Otherwise the snap date stands in: a receipt photographed
     before its charge posts is almost always photographed the day it was
-    printed."""
+    printed. The snap day is a calendar day in `tz`, the household's zone:
+    the stored timestamp arrives in the database session's zone (UTC), and
+    an evening snap on the US west coast is already tomorrow there."""
     parsed = row.get("parsed") if isinstance(row.get("parsed"), dict) else {}
     total = _finite(parsed.get("total"))
-    snapped = _as_date(row.get("created_at"))
+    created = row.get("created_at")
+    if (tz is not None and isinstance(created, dt.datetime)
+            and created.tzinfo is not None):
+        created = created.astimezone(tz)
+    snapped = _as_date(created)
     printed = _as_date(parsed.get("date"))
     if printed is not None and snapped is not None and not (
             snapped - dt.timedelta(days=366) <= printed
@@ -230,9 +242,9 @@ def candidates(conn, row: dict, *, before: int = OFFER_DAYS_BEFORE,
     return candidates_for(conn, [row], before=before, after=after)[0]
 
 
-def _safe_facts(row: dict) -> dict:
+def _safe_facts(row: dict, tz=None) -> dict:
     try:
-        return facts(row)
+        return facts(row, tz)
     except Exception:                                  # noqa: BLE001
         # facts() guards every value it reads; this is the backstop that
         # keeps one unreadable row from failing the list it sits in
@@ -250,7 +262,8 @@ def candidates_for(conn, rows: list[dict], *,
     matcher pass runs on every sync; a query per receipt made both cost a
     round trip for every receipt waiting."""
     out: list[list[dict]] = [[] for _ in rows]
-    fs = [_safe_facts(r) for r in rows]
+    tz = _household_tz(conn) if rows else None
+    fs = [_safe_facts(r, tz) for r in rows]
     keys, los, his, froms, tos, skips = [], [], [], [], [], []
     for i, (row, f) in enumerate(zip(rows, fs)):
         if f["total"] is None or f["date"] is None:
@@ -516,7 +529,7 @@ def _try_one(conn, row: dict, cands: list[dict],
             or row.get("match_method") is not None):
         return None
     txn_id, _why = decide(cands, closed=window_closed(
-        facts(row)["date"], today))
+        facts(row, _household_tz(conn))["date"], today))
     if txn_id and _attach(conn, str(row["id"]), txn_id, "auto",
                           require_free=True):
         return txn_id
@@ -693,9 +706,10 @@ def waiting(conn, today: dt.date | None = None, *,
     count = conn.execute(
         "SELECT count(*) AS n FROM receipts WHERE txn_id IS NULL"
     ).fetchone()["n"]
+    from .receipts import PARSE_STATE_SQL
     rows = conn.execute(
-        """SELECT id, mime, kind, status, parsed, error, created_at,
-                  unmatched_txn_ids, match_method,
+        f"""SELECT id, mime, kind, status, parsed, error, created_at,
+                  unmatched_txn_ids, match_method, {PARSE_STATE_SQL},
                   (image_optimized IS NOT NULL) AS has_optimized
              FROM receipts WHERE txn_id IS NULL
             ORDER BY created_at DESC, id LIMIT %s OFFSET %s""",
@@ -704,8 +718,9 @@ def waiting(conn, today: dt.date | None = None, *,
     by_id = dict(zip((r["id"] for r in parsed_rows),
                      candidates_for(conn, parsed_rows)))
     out = []
+    tz = _household_tz(conn)
     for r in rows:
-        f = _safe_facts(r)
+        f = _safe_facts(r, tz)
         cands = by_id.get(r["id"], [])
         try:
             why = (decide(cands, closed=window_closed(f["date"], today))[1]
@@ -721,6 +736,8 @@ def waiting(conn, today: dt.date | None = None, *,
             "id": str(r["id"]), "mime": r["mime"], "kind": r["kind"],
             "status": r["status"], "parsed": r["parsed"], "error": r["error"],
             "created_at": _iso(r["created_at"]),
+            "parse_started_at": _iso(r["parse_started_at"]),
+            "parse_stale": bool(r["parse_stale"]),
             "has_optimized": bool(r["has_optimized"]),
             "total": f["total"],
             "date": f["date"].isoformat() if f["date"] else None,

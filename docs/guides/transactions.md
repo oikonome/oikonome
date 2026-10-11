@@ -67,9 +67,11 @@ the totals)" note explains why the three figures look the way they do.
 Beside the from/to boxes sit the same eight range buttons every other
 over-time surface uses — **This month · 1m · 3m · 6m · 1y · 3y · 5y ·
 All**. They are a shortcut into the same from/to filter, cut on calendar
-months: **3m** in September means "from July 1", the same three months
-Cash Flow's 3m covers; **This month** is from the 1st; **1m** is the last
-complete month, closed on its last day (in September, August 1–31).
+months: **3m** in September means "from July 1", the month in progress
+included, because the ledger shows what is there to edit (Cash Flow's
+3m holds complete months only — June through August); **This month** is
+from the 1st; **1m** is the last complete month, closed on its last day
+(in September, August 1–31).
 **All** clears both dates. Type a from/to by hand and none of the eight
 lights up — the boxes are still the precise control, the buttons are the
 quick one.

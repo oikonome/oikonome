@@ -14,7 +14,8 @@ import StaleBanner from "../components/stale-banner";
 import { Card, H, HelpLink, KV, Pill } from "../components/ui";
 import { errText, whatIfRefusal, type DebtMethod, type DebtPlan, type DebtPlanSave,
          type DebtRow, type DebtSchedule } from "../lib/api";
-import { moneyParam, monthYear, span } from "../lib/pure";
+import { interestSaved, moneyParam, monthYear, rebaseFields, rebaseKeyed,
+         span } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { useViewer } from "../lib/viewer";
 import { C, money } from "../lib/theme";
@@ -26,6 +27,7 @@ const OTHER: Record<DebtMethod, DebtMethod> =
   { avalanche: "snowball", snowball: "avalanche" };
 
 type Draft = Record<string, { apr: string; min_payment: string; skip: boolean }>;
+type PlanFields = { method: DebtMethod; extra_monthly: number | string };
 
 const draftOf = (rows: DebtRow[]): Draft =>
   Object.fromEntries(rows.map((d) => [d.id, {
@@ -44,6 +46,8 @@ export default function Debt() {
   const [params, setParams] = useState<Record<string, string>>({});
   const [extra, setExtra] = useState<string | null>(null);
   const [draft, setDraft] = useState<Draft | null>(null);
+  // the overrides as they were when the first box was edited
+  const [opened, setOpened] = useState<Draft | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const query = useQuery({
     queryKey: ["debt-plan", params],
@@ -52,13 +56,31 @@ export default function Debt() {
     placeholderData: (prev) => prev,
   });
   const save = useMutation({
-    mutationFn: (body: DebtPlanSave) => client!.debtPlanSave(body),
+    // The server replaces the whole plan, and the draft is a copy from
+    // when this screen loaded: another device may have saved since. Read
+    // the stored plan now and lay only this screen's changes over it.
+    mutationFn: async (v: { plan: PlanFields; planBase: PlanFields;
+                            mine: Draft; base: Draft }) => {
+      const fresh = await client!.debtPlan({});
+      const plan = rebaseFields(v.plan, v.planBase, fresh.saved);
+      const debts = rebaseKeyed(v.mine, v.base, draftOf(fresh.debts));
+      const body: DebtPlanSave = {
+        method: plan.method, extra_monthly: plan.extra_monthly,
+        debts: Object.fromEntries(Object.entries(debts).map(([id, x]) => [id, {
+          apr: x.apr === "" ? null : x.apr,
+          min_payment: x.min_payment === "" ? null : x.min_payment,
+          skip: x.skip,
+        }])),
+      };
+      return client!.debtPlanSave(body);
+    },
     onSuccess: (d) => {
       // the reply IS the saved plan: seed the unparameterised key and
       // drop the what-if so the screen reads what it just wrote
       qc.setQueryData(["debt-plan", {}], d);
       qc.invalidateQueries({ queryKey: ["debt-plan"] });
-      setParams({}); setExtra(null); setDraft(null); setErr(null);
+      setParams({}); setExtra(null); setDraft(null); setOpened(null);
+      setErr(null);
     },
     onError: (e) => setErr(errText(e)),
   });
@@ -82,15 +104,16 @@ export default function Debt() {
   // store; the what-if GET takes a plain number, so parse it here
   const extraQ = moneyParam(extraStr);
   const pick = (m: DebtMethod) => setParams({ method: m, extra: extraQ });
-  const setRow = (id: string, patch: Partial<Draft[string]>) =>
+  const setRow = (id: string, patch: Partial<Draft[string]>) => {
+    if (draft === null) setOpened(d);
     setDraft({ ...d, [id]: { ...d[id], ...patch } });
-  const persist = () => save.mutate({
-    method, extra_monthly: extraQ,
-    debts: Object.fromEntries(Object.entries(d).map(([id, v]) => [id, {
-      apr: v.apr === "" ? null : v.apr,
-      min_payment: v.min_payment === "" ? null : v.min_payment,
-      skip: v.skip,
-    }])),
+  };
+  const persist = () => r && save.mutate({
+    // extraQ is the typed amount as a plain number, so "1,000" compares
+    // equal to the stored 1000
+    plan: { method, extra_monthly: Number(extraQ) },
+    planBase: { method: r.saved.method, extra_monthly: r.saved.extra_monthly },
+    mine: d, base: opened ?? d,
   });
 
   return (
@@ -121,7 +144,7 @@ export default function Debt() {
         const byId = Object.fromEntries(plan.debts.map((x) => [x.id, x]));
         const ordered = [...r.debts].sort((a, b) =>
           (byId[a.id]?.order ?? 999) - (byId[b.id]?.order ?? 999));
-        const saved = (x: DebtSchedule) => base.total_interest - x.total_interest;
+        const saved = (x: DebtSchedule) => interestSaved(base, x);
         return (
           <>
             <Card>

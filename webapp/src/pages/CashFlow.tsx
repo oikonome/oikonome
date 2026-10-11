@@ -218,7 +218,8 @@ function OverviewSection({ tab, onTab, range, setRange }: {
           </div>
           <div className="sub" style={{ marginTop: ".3rem" }}>
             {best && <>best {best[0]}{" "}
-              <b className="pos">+{money(best[1])}</b></>}
+              <b className={best[1] >= 0 ? "pos" : "neg"}>
+                {best[1] >= 0 ? "+" : ""}{money(best[1])}</b></>}
             {best && worst && " · "}
             {worst && <>worst {worst[0]}{" "}
               <b className={worst[1] < 0 ? "neg" : ""}>{money(worst[1])}</b></>}
@@ -258,12 +259,29 @@ function OverviewSection({ tab, onTab, range, setRange }: {
 
 /** The page states its conclusion: in → out → saved, in one sentence. */
 function FlowStory({ flow }: { flow: FlowPeriod }) {
+  // income unknown (no bank feed covers the window): say so, and claim
+  // no saved figure or rate — a null read as $0 would invent both
+  if (flow.income_unknown || flow.in.total === null || flow.saved === null) {
+    if (!flow.out.total) return null;
+    return (
+      <div style={{ display: "flex", gap: ".5rem", alignItems: "baseline",
+                    flexWrap: "wrap", marginTop: ".5rem", fontSize: 13 }}>
+        <span className="sub">{flow.live_month ? `${flow.label} so far` : flow.label}:</span>
+        <span className="mut">income unknown for this range</span>
+        <span className="mut">·</span>
+        <b style={{ fontSize: "1.15rem" }}>{money(flow.out.total)}</b> went out
+      </div>
+    );
+  }
   if (!flow.in.total && !flow.out.total) return null;
   const saved = flow.saved;
   return (
     <div style={{ display: "flex", gap: ".5rem", alignItems: "baseline",
                   flexWrap: "wrap", marginTop: ".5rem", fontSize: 13 }}>
-      <span className="sub">{flow.label}:</span>
+      {/* the server's label names the window actually totalled — the
+          month so far for a ledger that starts this month, or a range cut
+          to the first month with known income */}
+      <span className="sub">{flow.live_month ? `${flow.label} so far` : flow.label}:</span>
       <b style={{ fontSize: "1.15rem" }}>{money(flow.in.total)}</b> came in
       <span className="mut">→</span>
       <b style={{ fontSize: "1.15rem" }}>{money(flow.out.total)}</b> went out
@@ -310,10 +328,12 @@ function IncomeSection({ range, setRange }: {
         </div>
         <div style={{ display: "flex", gap: ".5rem", alignItems: "baseline",
                       flexWrap: "wrap", marginTop: ".5rem", fontSize: 13 }}>
-          <span className="sub">{w.label}:</span>
+          {/* live_month: the ledger starts this month and the range shows
+              the month so far (no previous window, no per-month pace) */}
+          <span className="sub">{w.live_month ? `${w.label} so far` : w.label}:</span>
           <b style={{ fontSize: "1.15rem" }}>{money(w.total)}</b> came in
-          <span className="mut">·</span>
-          <b>{money(perMonth)}</b>/mo
+          {!w.live_month && <><span className="mut">·</span>
+            <b>{money(perMonth)}</b>/mo</>}
           <span className="mut">·</span>
           <b>{payShare}%</b> <span className="sub">paychecks</span>
           {w.prev_total !== null && (

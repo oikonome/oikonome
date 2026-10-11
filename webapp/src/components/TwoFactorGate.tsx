@@ -1,6 +1,7 @@
 import { useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { type QueryClient, useQueryClient } from "@tanstack/react-query";
 import { api, errText } from "../api/client";
+import { smsPauseNote } from "../api/cache";
 import { signOut } from "../push";
 
 /** a blocking enrollment gate. Hosted accounts must set up a
@@ -12,6 +13,27 @@ const passkeysAvailable = () =>
   typeof window !== "undefined" && window.isSecureContext &&
   !!window.PublicKeyCredential;
 
+/** A first second factor on an owner's account also removes the members
+ *  who joined in the last days through the owner's own invites — the same
+ *  rule the Settings security cards report. The roster, the invite list and
+ *  the settings banner that records the removal are refetched, and the
+ *  owner is told who went before the app opens. Empty when nobody was
+ *  removed. */
+function membersRemovedNote(
+  qc: QueryClient,
+  r: { members_removed?: { email: string }[] } | null | undefined,
+): string {
+  qc.invalidateQueries({ queryKey: ["members"] });
+  qc.invalidateQueries({ queryKey: ["invites"] });
+  qc.invalidateQueries({ queryKey: ["settings"] });
+  const gone = r?.members_removed ?? [];
+  if (!gone.length) return "";
+  return ` Removed ${gone.length} ${gone.length === 1 ? "member" : "members"}`
+    + ` who joined through your recent invites: `
+    + `${gone.map((m) => m.email).join(", ")} — invite back the ones that `
+    + "are yours.";
+}
+
 const inputStyle = {
   width: "100%", padding: ".5rem", background: "var(--hover)",
   border: "1px solid var(--line)", borderRadius: "var(--rs)",
@@ -20,14 +42,31 @@ const inputStyle = {
 
 export default function TwoFactorGate({ onDone }: { onDone: () => void }) {
   const qc = useQueryClient();
-  const [mode, setMode] = useState<"choose" | "totp" | "codes">("choose");
+  const [mode, setMode] = useState<"choose" | "totp" | "codes" | "note">(
+    "choose");
   const [enroll, setEnroll] = useState<{ secret: string; qr: string } | null>(null);
   const [code, setCode] = useState("");
   const [codes, setCodes] = useState<string[]>([]);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // what the enrolment changed besides the factor itself (a paused text
+  // number, members removed) — said before the gate hands over, since the
+  // app it opens has no other place that says it
+  const [note, setNote] = useState<string | null>(null);
 
   const finish = () => { qc.invalidateQueries({ queryKey: ["me"] }); onDone(); };
+  // recovery codes first (they are shown once); otherwise a note holds the
+  // gate open until it is read; otherwise straight into the app
+  const after = (r: { recovery_codes?: string[] | null;
+                      sms_number_needs_verify?: boolean;
+                      members_removed?: { email: string }[] }) => {
+    const n = (smsPauseNote(qc, r) + membersRemovedNote(qc, r)).trim();
+    setNote(n || null);
+    if (r.recovery_codes && r.recovery_codes.length) {
+      setCodes(r.recovery_codes); setMode("codes");
+    } else if (n) { setMode("note"); }
+    else { finish(); }
+  };
 
   const startTotp = async () => {
     setBusy(true); setErr(null);
@@ -42,9 +81,9 @@ export default function TwoFactorGate({ onDone }: { onDone: () => void }) {
     setBusy(true); setErr(null);
     try {
       const r = await api.totpConfirm(enroll!.secret, code.trim());
-      if (r.recovery_codes && r.recovery_codes.length) {
-        setCodes(r.recovery_codes); setMode("codes");
-      } else { finish(); }
+      // the notify card then shows the paused text number, not "verified",
+      // and the roster drops the members the change removed
+      after(r);
     } catch (e) {
       setErr(String(e).includes("match")
         ? "That code didn't match — check your app's clock." : errText(e));
@@ -65,9 +104,7 @@ export default function TwoFactorGate({ onDone }: { onDone: () => void }) {
       const r = await api.passkeyRegister(o.challenge_id, cred, label);
       // a passkey enrolled as the FIRST strong factor returns one-time
       // recovery codes — show them once (lockout protection) before finishing
-      if (r.recovery_codes && r.recovery_codes.length) {
-        setCodes(r.recovery_codes); setMode("codes");
-      } else { finish(); }
+      after(r);
     } catch (e) {
       if (String(e).includes("NotAllowedError")) { /* user cancelled */ }
       else setErr(errText(e));
@@ -80,7 +117,12 @@ export default function TwoFactorGate({ onDone }: { onDone: () => void }) {
         <h1 style={{ marginTop: 0 }}>Secure your account</h1>
         {err && <div className="note bad" style={{ marginBottom: ".7rem" }}>{err}</div>}
 
-        {mode === "codes" ? (
+        {note && (mode === "codes" || mode === "note") && (
+          <div className="note" style={{ marginBottom: ".7rem" }}>{note}</div>
+        )}
+        {mode === "note" ? (
+          <button className="pri" onClick={finish}>Continue</button>
+        ) : mode === "codes" ? (
           <>
             <p>Save these <b>recovery codes</b> somewhere safe — each works
               once to sign in if you lose your authenticator or passkey. They
@@ -138,7 +180,7 @@ export default function TwoFactorGate({ onDone }: { onDone: () => void }) {
         )}
         {/* a session that pre-dates the requirement (or an invite taken by
             mistake) must still be able to leave — the gate is not a trap */}
-        {mode !== "codes" && (
+        {mode !== "codes" && mode !== "note" && (
           <p className="mut" style={{ fontSize: 13, marginTop: "1rem",
                                       marginBottom: 0 }}>
             <a href="#" onClick={(e) => { e.preventDefault();

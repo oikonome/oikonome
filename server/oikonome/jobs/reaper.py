@@ -4,8 +4,8 @@ An aggregator bills per Item for as long as it exists on its side —
 disconnect calls /item/remove, but an Item stuck in an unrecoverable
 error (login expired, consent revoked) just keeps failing the hourly
 sync and stays billable. The reaper releases Items that have been failing
-for OIKONOME_PLAID_REAP_DAYS consecutive days (default 30; 0 disables
-the whole job), archives them locally with archived_reason='auto-reap',
+for OIKONOME_PLAID_REAP_DAYS consecutive days (default 30; 0 turns off
+the reaping and the orphan reconcile), archives them locally with archived_reason='auto-reap',
 and stamps the slot ledger. The user is told twice: a persistent
 "reconnect" state on the Accounts page (pages._connections serves
 reaped items with status 'reaped') and a one-line notice in the daily
@@ -46,7 +46,8 @@ log = logging.getLogger("oikonome.jobs")
 def reap_days() -> int:
     """Days of consecutive failure before an Item is released.
     OIKONOME_PLAID_REAP_DAYS, default 30; 0 (or negative, or junk)
-    disables the reaper AND the orphan reconcile."""
+    disables the reaper AND the orphan reconcile. It never stops the retry
+    of a release the household asked for (see `reap`)."""
     try:
         return int(os.environ.get("OIKONOME_PLAID_REAP_DAYS", "30"))
     except ValueError:
@@ -118,14 +119,20 @@ _ledger_removed = plaid.stamp_ledger_removed
 def reap(conn, client: plaid.Client | None = None,
          now: dt.datetime | None = None) -> dict:
     """One tenant's reap + reconcile pass on a tenant-scoped conn.
-    Returns {'reaped': [...], 'orphaned': [...], 'disabled': bool}."""
+    Returns {'reaped': [...], 'orphaned': [...], 'released_archived': [...],
+    'disabled': bool}.
+
+    OIKONOME_PLAID_REAP_DAYS=0 stops the app removing connections on its
+    own: no reaping, no orphan reconcile. The retry of a removal the
+    household ASKED for (a disconnect whose /item/remove failed) still
+    runs, because it is the only thing that ever finishes that removal,
+    and without it the Item bills at Plaid every month."""
     days = reap_days()
-    if days <= 0:
-        return {"reaped": [], "orphaned": [], "disabled": True}
+    disabled = days <= 0
     now = now or dt.datetime.now(dt.timezone.utc)
     out: dict = {"reaped": [], "orphaned": [], "released_archived": [],
-                 "disabled": False}
-    items = conn.execute(
+                 "disabled": disabled}
+    items = [] if disabled else conn.execute(
         "SELECT id, institution_name, status, webhook_status, "
         "webhook_status_at FROM items WHERE aggregator='plaid' "
         "AND COALESCE(status,'') != 'archived' "
@@ -273,6 +280,12 @@ def reap_tenant(tenant_id: str) -> dict:
         try:
             return reap(conn)
         finally:
-            tenancy.release_lock(conn, f"oikonome:sync:{tenant_id}")
+            # a sync turned away while the reap held the lock left a nudge;
+            # the reap pulls no bank itself, so it queues that sync now —
+            # unless the unlock failed, which discards the connection
+            # (tenancy.release_lock) and leaves nothing to claim it with
+            if not tenancy.release_lock(conn, f"oikonome:sync:{tenant_id}"):
+                from . import worker
+                worker.answer_sync_nudge(conn, tenant_id)
     finally:
         conn.close()

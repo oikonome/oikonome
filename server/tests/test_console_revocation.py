@@ -162,3 +162,67 @@ class SecurityLogCannotBeForgedTests(unittest.TestCase):
     def test_an_ipv6_address_survives(self):
         line = self._emit(banned="[2001:db8::1]")
         self.assertIn("banned=[2001:db8::1]", line)
+
+
+class TokenRotationEndsTokenSessionsTests(_Base):
+    """Rotating a leaked operator token is the documented response to the
+    leak; every console session the old value opened must end with it,
+    not live on for the rest of its four hours."""
+
+    def test_rotating_the_token_ends_the_sessions_it_opened(self):
+        import os
+        self._token_login()
+        self.assertEqual(200, self.client.get("/admin/console").status_code)
+        self.assertNotIn("Operator token",
+                         self.client.get("/admin/console").text)
+        os.environ["OIKONOME_ADMIN_TOKEN"] = "a-rotated-operator-token-value"
+        page = self.client.get("/admin/console").text
+        self.assertIn("Operator token", page,
+                      "a session opened by the old token still signs in")
+        self.assertEqual([], _admin("SELECT 1 FROM admin_sessions "
+                                    "WHERE credential_id IS NULL"))
+
+    def test_the_same_token_keeps_its_session(self):
+        self._token_login()
+        for _ in range(2):
+            self.assertNotIn("Operator token",
+                             self.client.get("/admin/console").text)
+
+    def test_the_cookie_carries_nothing_computed_from_the_token(self):
+        """A copied cookie must not be a way to test guesses at the operator
+        token offline: with the same random draw, two different tokens
+        must produce the same cookie, so the cookie is independent of the
+        token, and the binding is checked on the server's side."""
+        import os
+        from unittest import mock
+        from oikonome.web import adminconsole
+        cookies = []
+        for tok in ("first-operator-token-value", "other-operator-token"):
+            os.environ["OIKONOME_ADMIN_TOKEN"] = tok
+            self.client.cookies.clear()
+            with mock.patch.object(adminconsole.secrets, "token_urlsafe",
+                                   return_value="fixed-random-part"):
+                r = self.client.post("/admin/console/login",
+                                     data={"token": tok},
+                                     follow_redirects=False)
+            self.assertEqual(303, r.status_code, r.text)
+            cookies.append(r.cookies.get(adminconsole.COOKIE))
+            _admin("DELETE FROM admin_sessions RETURNING 1")
+        self.assertEqual(cookies[0], cookies[1],
+                         "the console cookie changes with the operator "
+                         "token, so it carries a verifier for it")
+
+    def test_a_token_session_with_no_server_binding_is_ended(self):
+        self._token_login()
+        _admin("UPDATE admin_sessions SET token_fp = NULL RETURNING 1")
+        self.assertIn("Operator token",
+                      self.client.get("/admin/console").text)
+
+    def test_a_passkey_session_survives_a_token_rotation(self):
+        import os
+        self._token_login()
+        self._enrol()
+        self._passkey_login()
+        os.environ["OIKONOME_ADMIN_TOKEN"] = "a-rotated-operator-token-value"
+        self.assertTrue(_admin("SELECT 1 FROM admin_sessions "
+                               "WHERE credential_id IS NOT NULL"))

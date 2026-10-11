@@ -75,6 +75,21 @@ class BooksPerTxnTests(_EntBase):
         self.assertIn("OFFICE DEPOT", v)
 
 
+class BooksRowOrderTests(_EntBase):
+    def test_ties_on_date_and_amount_come_back_in_a_fixed_order(self):
+        """The worksheet pages over this list, so rows sharing a date and
+        an amount (a run of identical fees) need a final key — otherwise a
+        row can appear on two pages and another on none."""
+        ids = [f"tie-{uuid.uuid4().hex[:6]}-{c}" for c in "dcba"]
+        for t in ids:                 # inserted in reverse of id order
+            add_txn(self.conn, TODAY, 9.99, "BANK FEE", account="card",
+                    txn_id=t)
+            entities.assign_transaction(self.conn, t, self.ent["id"])
+        got = [r["id"] for r in books._select_rows(
+            self.conn, self.ent["id"], None) if r["id"] in ids]
+        self.assertEqual(got, sorted(ids))
+
+
 class EquityDirectionTests(_EntBase):
     def test_contribute_rejects_revenue_txn(self):
         rev = add_txn(self.conn, TODAY, -500.0, "CLIENT PAYMENT",
@@ -162,6 +177,42 @@ class SelfEmployEdgeTests(_EntBase):
         # collapsed to one canonical vendor at $2,400 (over the threshold)
         self.assertIn("Jane Plumbing", v)
         self.assertEqual(v["Jane Plumbing"]["paid"], 2400.0)
+
+
+class MarksFollowAMergeTests(_EntBase):
+    """A business can hold a name-only mark beside one bound to the same
+    merchant (an earlier merge left the name behind). Merging a third
+    merchant into that one must fold all three into the single mark the
+    merchant may hold, not fail the whole merge on the one-mark rule."""
+
+    def _merchant(self, name):
+        return str(self.conn.execute(
+            "INSERT INTO merchants (name, name_source) VALUES (%s, 'manual') "
+            "RETURNING id", (name,)).fetchone()["id"])
+
+    def _mark(self, merchant, mid, *, tin=None):
+        self.conn.execute(
+            "INSERT INTO vendor_1099 (entity_id, merchant, merchant_id, "
+            "reportable, tin_last4) VALUES (%s,%s,%s,true,%s)",
+            (self.ent["id"], merchant, mid, tin))
+
+    def test_a_name_only_mark_folds_into_the_survivors_mark(self):
+        survivor = self._merchant("Bridgeport Joinery")
+        other = self._merchant("Bridgeport Joinery Co")
+        self._mark("Bridgeport Joinery", None, tin="1111")    # name only
+        self._mark("Bridgeport Old Name", survivor)
+        self._mark("Bridgeport Joinery Co", other)
+        selfemploy.follow_merchant(
+            self.conn, "Bridgeport Joinery Co", [other],
+            (survivor, "Bridgeport Joinery"), ["BRIDGEPORT JOINERY CO"])
+        marks = self.conn.execute(
+            "SELECT merchant, merchant_id::text AS mid, tin_last4 "
+            "FROM vendor_1099 WHERE entity_id = %s",
+            (self.ent["id"],)).fetchall()
+        self.assertEqual(len(marks), 1)
+        self.assertEqual(marks[0]["mid"], survivor)
+        self.assertEqual(marks[0]["merchant"], "Bridgeport Joinery")
+        self.assertEqual(marks[0]["tin_last4"], "1111")
 
 
 if __name__ == "__main__":

@@ -176,3 +176,81 @@ def render(points: list[tuple[str, float]],
     buf = io.BytesIO()
     out.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
+
+
+# ---- the category pie, for the monthly email ------------------------------
+PIE_W, PIE_H_MIN, PIE_R = 720, 220, 80
+# the SPA's categorical palette (charts.PALETTE), as RGB
+PIE_COLOURS = [(79, 155, 214), (232, 131, 58), (58, 145, 136), (138, 95, 176),
+               (79, 157, 91), (217, 164, 65), (198, 92, 78), (122, 138, 153),
+               (106, 176, 214), (176, 137, 74)]
+INK = (219, 227, 234)
+
+
+def _title(label: str) -> str:
+    """'FOOD AND DRINK' -> 'Food and drink'; a label already in mixed case
+    (a merchant cluster such as 'Northwind - Fuel') passes through."""
+    s = str(label)
+    if s.isupper():
+        s = s.capitalize()
+    return s
+
+
+def pie(slices: list[tuple[str, float, float]]) -> bytes:
+    """`slices` = [(label, amount, share 0..1)], largest first, already
+    reduced to what should be drawn (the caller folds the tail into one
+    "Other"). A ring on the left with the total in its middle; a legend on
+    the right, one line per slice — swatch, name, then "36% · $812" on
+    the right edge — in the slice order. Same density and output path as
+    the cash chart. The image grows with the legend so nothing is cut."""
+    if not slices:
+        return b""
+    s = SS
+    row_h = 24
+    legend_h = row_h * len(slices) + 24
+    W_, H_ = PIE_W, max(PIE_H_MIN, legend_h, 2 * PIE_R + 40)
+    img = Image.new("RGB", (W_ * s, H_ * s), BG)
+    d = ImageDraw.Draw(img)
+    cx, cy, r = (PIE_R + 40) * s, H_ / 2 * s, PIE_R * s
+    f13 = _font(13)
+    total = sum(a for _, a, _ in slices) or 1.0
+    def colour(i, label):
+        return (91, 107, 122) if label == "Other" else PIE_COLOURS[i % len(PIE_COLOURS)]
+
+    start = -90.0
+    for i, (label, amount, share) in enumerate(slices):
+        sweep = 360.0 * amount / total
+        d.pieslice([cx - r, cy - r, cx + r, cy + r], start, start + sweep,
+                   fill=colour(i, label), outline=BG, width=round(1.5 * s))
+        start += sweep
+    hole = r * 0.55
+    d.ellipse([cx - hole, cy - hole, cx + hole, cy + hole], fill=BG)
+    d.text((cx, cy - 7 * s), f"${round(total):,}", font=_font(16), fill=INK,
+           anchor="mm")
+    d.text((cx, cy + 9 * s), "spent", font=_font(11), fill=MUT, anchor="mm")
+    # legend: one row per slice, top-aligned with the ring's centre block
+    lx = (2 * PIE_R + 80) * s
+    rx = (W_ - 20) * s
+    y0 = cy - (row_h * len(slices) / 2 - row_h / 2) * s
+    for i, (label, amount, share) in enumerate(slices):
+        y = y0 + i * row_h * s
+        sw = 6 * s
+        d.rounded_rectangle([lx, y - sw, lx + 2 * sw, y + sw], radius=2 * s,
+                            fill=colour(i, label))
+        right = f"{round(share * 100)}% · ${round(amount):,}"
+        d.text((rx, y), right, font=f13, fill=INK, anchor="rm")
+        room = rx - f13.getlength(right) - 14 * s - (lx + 3 * sw)
+        name = _title(label)
+        if f13.getlength(name) > room:
+            while name and f13.getlength(name + "…") > room:
+                name = name[:-1]
+            name += "…"
+        d.text((lx + 3 * sw + 6 * s, y), name, font=f13, fill=INK, anchor="lm")
+        if i < len(slices) - 1:
+            yy = y + row_h / 2 * s
+            d.line([(lx, yy), (rx, yy)], fill=GRID, width=max(1, round(0.8 * s)))
+    out = img.resize((W_ * OUT, H_ * OUT), Image.LANCZOS)
+    out = out.quantize(colors=128, method=Image.Quantize.MEDIANCUT, dither=0)
+    buf = io.BytesIO()
+    out.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()

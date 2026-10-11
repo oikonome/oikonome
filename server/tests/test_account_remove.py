@@ -191,6 +191,35 @@ class AccountRemoveTests(unittest.TestCase):
         self.assertEqual(n_txn, 0)
         self.assertEqual(st["status"], "archived")
 
+    def test_a_purge_that_keeps_rows_says_so(self):
+        """Rows a bank feed relies on survive a delete, and so does the
+        account holding them. The reply carries the purge's own sentence
+        about them instead of claiming everything went."""
+        from oikonome.sync import plaid as plaid_mod
+        kept = {"accounts": 0, "transactions": 3, "holdings": 0,
+                "crypto_holdings": 0, "kept_transactions": 2,
+                "note": "2 rows were kept: the bank feed already relies "
+                        "on them. The accounts holding them stay."}
+        r = self.client.post("/api/accounts/add", json={
+            "name": "Shoebox", "kind": "depository/cash", "balance": "40"})
+        aid = r.json()["account_id"]
+        with mock.patch.object(sync_base, "purge_account_data",
+                               return_value=dict(kept)):
+            r = self.client.post(f"/api/accounts/{aid}/remove",
+                                 json={"mode": "purge"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("2 rows were kept", r.json()["note"])
+        self._as_plaid(token="tok-kept")
+        with mock.patch.object(plaid_mod.Client, "for_tenant",
+                               return_value=mock.MagicMock()), \
+                mock.patch.object(sync_base, "purge_item_accounts",
+                                  return_value=dict(kept)):
+            r = self.client.post("/api/accounts/chk/remove",
+                                 json={"mode": "disconnect_purge"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("deleted local data", r.json()["note"])
+        self.assertIn("2 rows were kept", r.json()["note"])
+
     def test_purge_manual_account(self):
         r = self.client.post("/api/accounts/add", json={
             "name": "Shoebox", "kind": "depository/cash", "balance": "40"})
@@ -202,6 +231,106 @@ class AccountRemoveTests(unittest.TestCase):
         ids = {a["id"] for a in
                self.client.get("/api/accounts").json()["accounts"]}
         self.assertNotIn(aid, ids)
+
+    def _file_account_with_noted_row(self, accounts):
+        """A manual account holding one file-imported row whose note says a
+        feed set its copy aside — naming `accounts`, or none — and a bank
+        feed that still syncs."""
+        r = self.client.post("/api/accounts/add", json={
+            "name": "Old Card (file)", "kind": "credit/credit card",
+            "balance": "0"})
+        self.assertEqual(r.status_code, 200, r.text)
+        aid = r.json()["account_id"]
+        conn = self._conn()
+        try:
+            add_txn(conn, "2025-02-03", 18.0, "MAPLE DINER", account=aid,
+                    txn_id="csv:noted")
+            sync_base.mark_stood_in(conn, {"csv:noted": accounts}, "feed")
+            conn.execute(
+                "INSERT INTO items (id, aggregator, institution_name)"
+                " VALUES ('feedit', 'plaid', 'Sample Bank')")
+        finally:
+            conn.close()
+        return aid
+
+    def _exists(self, table, ident):
+        conn = self._conn()
+        try:
+            return conn.execute(f"SELECT 1 FROM {table} WHERE id=%s",
+                                (ident,)).fetchone() is not None
+        finally:
+            conn.close()
+
+    def test_rows_kept_by_a_note_naming_no_account_ask_first(self):
+        aid = self._file_account_with_noted_row([])
+        r = self.client.post(f"/api/accounts/{aid}/remove",
+                             json={"mode": "purge"})
+        self.assertEqual(r.status_code, 409, r.text)
+        body = r.json()
+        self.assertEqual(body["error"], "kept_rows_unconfirmed")
+        self.assertEqual(body["kept_transactions"], 1)
+        self.assertIn("1 imported row", body["detail"])
+        self.assertIn("may never send", body["detail"])
+        # nothing was deleted on the way to the question
+        self.assertTrue(self._exists("accounts", aid))
+        self.assertTrue(self._exists("transactions", "csv:noted"))
+        r = self.client.post(f"/api/accounts/{aid}/remove",
+                             json={"mode": "purge", "force_kept": True})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["purged"]["kept_transactions"], 0)
+        self.assertFalse(self._exists("accounts", aid))
+        self.assertFalse(self._exists("transactions", "csv:noted"))
+
+    def test_only_a_literal_true_forces(self):
+        aid = self._file_account_with_noted_row([])
+        r = self.client.post(f"/api/accounts/{aid}/remove",
+                             json={"mode": "purge", "force_kept": "yes"})
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertTrue(self._exists("transactions", "csv:noted"))
+
+    def test_a_row_a_live_feed_account_relies_on_is_kept_even_forced(self):
+        aid = self._file_account_with_noted_row(["chk"])
+        r = self.client.post(f"/api/accounts/{aid}/remove",
+                             json={"mode": "purge"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["purged"]["kept_transactions"], 1)
+        r = self.client.post(f"/api/accounts/{aid}/remove",
+                             json={"mode": "purge", "force_kept": True})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["purged"]["kept_transactions"], 1)
+        self.assertTrue(self._exists("transactions", "csv:noted"))
+        self.assertTrue(self._exists("accounts", aid))
+
+    def test_with_no_feed_left_a_note_naming_no_account_holds_nothing(self):
+        aid = self._file_account_with_noted_row([])
+        conn = self._conn()
+        try:
+            conn.execute("UPDATE items SET status='archived'"
+                         " WHERE id='feedit'")
+        finally:
+            conn.close()
+        r = self.client.post(f"/api/accounts/{aid}/remove",
+                             json={"mode": "purge"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["purged"]["kept_transactions"], 0)
+        self.assertFalse(self._exists("transactions", "csv:noted"))
+
+    def test_an_archived_feed_whose_account_remains_still_holds_the_row(self):
+        aid = self._file_account_with_noted_row([])
+        conn = self._conn()
+        try:
+            conn.execute(
+                "INSERT INTO accounts (id, item_id, name, type, subtype)"
+                " VALUES ('feedacct', 'feedit', 'Card', 'credit',"
+                " 'credit card')")
+            conn.execute("UPDATE items SET status='archived'"
+                         " WHERE id='feedit'")
+        finally:
+            conn.close()
+        r = self.client.post(f"/api/accounts/{aid}/remove",
+                             json={"mode": "purge"})
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertTrue(self._exists("transactions", "csv:noted"))
 
     def test_purging_an_account_takes_every_pointer_at_it_with_it(self):
         """Account ids are named by string from four places the schema
@@ -246,6 +375,41 @@ class AccountRemoveTests(unittest.TestCase):
         self.assertEqual(r.status_code, 400)
         self.assertIn("disconnect_purge", r.json()["detail"])
 
+    def test_an_account_purged_from_a_disconnected_bank_stays_deleted(self):
+        """The bridge still carries the deleted account. Brought back by
+        the reconnect door, the bank's next pull would recreate it with
+        its history — so the door refuses, saying why."""
+        conn = self._conn()
+        try:
+            sync_base.upsert_item(conn, "sfin-main", "simplefin",
+                                  "SimpleFIN bridge",
+                                  "https://u:p@bridge.test/simplefin")
+            child = "sfin-main:demo-bank"
+            sync_base.upsert_item(conn, child, "simplefin-org", "Demo Bank",
+                                  None)
+            conn.execute(
+                "UPDATE items SET aggregator='simplefin-org', "
+                "status='archived', archived_at=now() WHERE id=%s", (child,))
+            for aid in ("sf-chk", "sf-sav"):
+                conn.execute(
+                    "INSERT INTO accounts (id, item_id, name, type) "
+                    "VALUES (%s,%s,%s,'depository')", (aid, child, aid))
+        finally:
+            conn.close()
+        r = self.client.post("/api/accounts/sf-chk/remove",
+                             json={"mode": "purge"})
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.client.post(f"/api/connections/{child}/reconnect")
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertIn("sync would recreate it", r.json()["detail"])
+        conn = self._conn()
+        try:
+            self.assertEqual(conn.execute(
+                "SELECT status FROM items WHERE id=%s",
+                (child,)).fetchone()["status"], "archived")
+        finally:
+            conn.close()
+
     def test_bad_mode_400(self):
         r = self.client.post("/api/accounts/chk/remove",
                              json={"mode": "vaporize"})
@@ -272,6 +436,42 @@ class AccountRemoveTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertTrue(r.json()["plaid_released"])
         fake.remove_item.assert_called_once_with("tok-y")
+
+    def test_disconnect_waits_for_a_running_sync(self):
+        """Archiving a connection while its sync is in flight must be
+        refused, not raced: the pull would re-upsert the item it is
+        working on. The door answers 409 and changes nothing."""
+        from oikonome.sync import plaid as plaid_mod
+        self._as_plaid(token="access-token-x")
+        holder = self._conn()
+        try:
+            key = f"oikonome:sync:{self.tid}"
+            got = holder.execute(
+                "SELECT pg_try_advisory_lock(hashtext(%s)) AS ok", (key,)
+            ).fetchone()["ok"]
+            self.assertTrue(got)
+            fake = mock.MagicMock()
+            with mock.patch.object(plaid_mod.Client, "for_tenant",
+                                   return_value=fake):
+                r = self.client.post("/api/accounts/chk/remove",
+                                     json={"mode": "disconnect"})
+                self.assertEqual(r.status_code, 409, r.text)
+                r = self.client.post("/api/accounts/chk/remove",
+                                     json={"mode": "disconnect_purge"})
+                self.assertEqual(r.status_code, 409, r.text)
+                r = self.client.post("/api/connections/it1/disconnect")
+                self.assertEqual(r.status_code, 409, r.text)
+            fake.remove_item.assert_not_called()
+            conn = self._conn()
+            try:
+                st = conn.execute(
+                    "SELECT status FROM items WHERE id='it1'").fetchone()
+            finally:
+                conn.close()
+            self.assertNotEqual(st["status"], "archived")
+        finally:
+            holder.execute("SELECT pg_advisory_unlock_all()")
+            holder.close()
 
 
 if __name__ == "__main__":

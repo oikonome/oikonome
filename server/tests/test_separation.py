@@ -810,10 +810,18 @@ class ReviewQueueTests(unittest.TestCase):
         # under test (no line chosen ⇒ not committable) is unchanged
         b = self._src("pages/Business.tsx")
         i = b.index("function ReviewQueue")
-        self.assertRegex(b[i:i + 4000],
+        self.assertRegex(b[i:i + 8000],
                          r"disabled=\{[^}]*\|\| !chosen \|\| ro\}",
                          "a row with no line selected must not be committable")
 
+
+
+def _component(src, name):
+    """The whole body of one top-level component, however long it grows —
+    a fixed window once cut a card's copy off the end."""
+    i = src.index(f"function {name}")
+    j = src.find("\nfunction ", i + 1)
+    return src[i:] if j < 0 else src[i:j]
 
 class TaxSetAsideTests(unittest.TestCase):
     """Owed vs what's actually in the business.
@@ -839,8 +847,7 @@ class TaxSetAsideTests(unittest.TestCase):
     def test_rate_is_derived_not_hardcoded(self):
         """A flat 25% would be a downgrade from the real computation."""
         b = self._src("pages/Business.tsx")
-        i = b.index("function TaxSetAside")
-        block = b[i:i + 2500]
+        block = _component(b, "TaxSetAside")
         self.assertIn("owed / profit", block)
         self.assertNotIn("0.25", block)
 
@@ -851,8 +858,7 @@ class TaxSetAsideTests(unittest.TestCase):
         there somewhere", which is the weaker claim and must not be allowed
         to read as the stronger one."""
         b = self._src("pages/Business.tsx")
-        i = b.index("function TaxSetAside")
-        block = b[i:i + 4000]
+        block = _component(b, "TaxSetAside")
         self.assertIn("is it ring-fenced", block)
         self.assertIn("is the money\n              there", block)
         self.assertIn("const ringFenced", block)
@@ -861,8 +867,7 @@ class TaxSetAsideTests(unittest.TestCase):
         """An account purged or reassigned out of the business must not
         make the card read $0 saved — a scarier number than the truth."""
         b = self._src("pages/Business.tsx")
-        i = b.index("function TaxSetAside")
-        block = b[i:i + 4000]
+        block = _component(b, "TaxSetAside")
         self.assertIn("const stale =", block)
         self.assertIn("no longer", block)
 

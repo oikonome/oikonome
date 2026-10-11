@@ -14,9 +14,29 @@ from __future__ import annotations
 
 import math
 
-from ..engine.compat import as_date, jsonb
+from ..engine.compat import MAX_AMOUNT, as_date, jsonb, strip_nul
 
 MAX_ORDERS = 10_000
+
+# the order's text fields; each is stored in a text column
+_TEXT_FIELDS = ("dedup_key", "account", "payee", "seller", "memo",
+                "category", "order_number", "payment_method")
+
+
+def _texts_ok(r: dict) -> bool:
+    """Every text field a string (a number is read as its digits) or
+    absent. An object or a list would reach the INSERT as a value psycopg
+    cannot store, and one such row would fail the whole push as a server
+    error; like a bad date or amount, it skips its own row instead."""
+    return all(r.get(k) is None
+               or (isinstance(r.get(k), (str, int, float))
+                   and not isinstance(r.get(k), bool))
+               for k in _TEXT_FIELDS)
+
+
+def _clean(r: dict) -> dict:
+    return {**r, **{k: str(r[k]) for k in _TEXT_FIELDS
+                    if r.get(k) is not None}}
 
 
 def import_orders(conn, orders: list[dict]) -> dict:
@@ -24,6 +44,8 @@ def import_orders(conn, orders: list[dict]) -> dict:
         raise ValueError("payload needs a non-empty orders list")
     if len(orders) > MAX_ORDERS:
         raise ValueError(f"too many orders (max {MAX_ORDERS})")
+    # a collector relays the portal's text; U+0000 cannot be stored
+    orders = strip_nul(orders)
 
     def count():
         return conn.execute(
@@ -34,8 +56,9 @@ def import_orders(conn, orders: list[dict]) -> dict:
     # rows in THIS push are never re-dates of each other: a re-date sends
     # the new key in place of the old one, while a split shipment charged
     # twice sends both keys side by side
-    pushed_keys = [str(r.get("dedup_key")) for r in orders
-                   if isinstance(r, dict) and r.get("dedup_key")]
+    orders = [_clean(r) for r in orders
+              if isinstance(r, dict) and _texts_ok(r)]
+    pushed_keys = [r["dedup_key"] for r in orders if r.get("dedup_key")]
     with conn.transaction():
         # one push at a time per tenant: the drift re-date is a read
         # (no row under the new key, one candidate under the old) followed
@@ -75,9 +98,12 @@ def import_orders(conn, orders: list[dict]) -> dict:
                 if isinstance(r.get("amount"), bool):
                     raise TypeError
                 amount = float(r["amount"])
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError, OverflowError):
+                # OverflowError: a JSON integer too wide for a double
                 continue
-            if not math.isfinite(amount):
+            # finite is not enough: the matchers work in cents, and an
+            # amount past any real charge overflows on the way there
+            if not math.isfinite(amount) or abs(amount) > MAX_AMOUNT:
                 continue
             order_number = str(r.get("order_number") or "")
             accepted += 1

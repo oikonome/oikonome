@@ -272,9 +272,16 @@ class YearLensSavedYtdTests(unittest.TestCase):
         # last year — a different lens year's figure
         add_txn(self.conn, dt.date(2025, 12, 5), -999.0, "TO SAVINGS",
                 account="sav", primary="TRANSFER_IN")
+        # every elapsed month had a budget, so the map covers each of them
+        self._budgeted(2025, range(1, 13))
+        self._budgeted(2026, range(1, 7))
 
     def tearDown(self):
         self.conn.close()
+
+    def _budgeted(self, year, months):
+        for m in months:
+            budget.snapshot_month(self.conn, dt.date(year, m, 1))
 
     def _year(self, y):
         from oikonome.web import lenses
@@ -314,6 +321,21 @@ class YearLensSavedYtdTests(unittest.TestCase):
         add_txn(self.conn, dt.date(2026, 2, 15), 500.0, "TO SAVINGS",
                 account="chk", primary="TRANSFER_OUT")
         self.assertEqual(self._year(2026)["saved_ytd"], 1000.0)
+
+    def test_saved_ytd_covers_only_the_months_the_map_budgets(self):
+        """The row's plan is the monthly plan times the budgeted months,
+        so the actual must be measured over those same months. A month
+        with no budget (history imported from before signup) is a cash-flow
+        cell the map leaves out, and its transfers stay out of the row."""
+        self.conn.execute("DELETE FROM budget_snapshots")
+        self._budgeted(2026, range(4, 7))      # Apr–Jun budgeted, Jan–Mar not
+        # Feb +500 falls in an unbudgeted month; May +300 counts, and June's
+        # −100 withdrawal subtracts
+        self.assertEqual(self._year(2026)["saved_ytd"], 200.0)
+
+    def test_a_year_with_no_budgeted_month_has_no_saved_figure(self):
+        self.conn.execute("DELETE FROM budget_snapshots")
+        self.assertIsNone(self._year(2025)["saved_ytd"])
 
 
 class RetirementDebtResidualTests(unittest.TestCase):

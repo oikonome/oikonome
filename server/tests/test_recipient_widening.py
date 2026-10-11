@@ -33,7 +33,7 @@ class RecipientWideningTests(unittest.TestCase):
         """Structural: the every-verified-user query must not be guarded by
         anything that a configured-but-emptied list can satisfy."""
         import inspect
-        src = inspect.getsource(worker._recipients_raw)
+        src = inspect.getsource(worker._recipient_lists)
         self.assertNotIn("if owners or recips:", src)
         # the configured branch returns unconditionally (the return now
         # rides through the per-person mute filter — same invariant)

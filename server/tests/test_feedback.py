@@ -54,6 +54,25 @@ class FeedbackTests(unittest.TestCase):
             logs = z.read("FB-20260713-abcd/app-logs.txt").decode()
             self.assertIn("ring-buffer-marker", logs)
 
+    def test_the_bundles_note_says_what_the_log_lines_keep(self):
+        """The bundle withholds host and bank names; the log lines beside
+        it only lose secret shapes. The package says so where a reader
+        deciding whether to post it will look."""
+        import json
+        for single in (True, False):
+            with mock.patch.object(feedback, "_single_tenant_instance",
+                                   return_value=single):
+                pkg = feedback.build_package(self.conn, self.tid, "FB-1", "x")
+            with zipfile.ZipFile(io.BytesIO(pkg)) as z:
+                note = json.loads(z.read("FB-1/doctor-bundle.json"))[
+                    "redacted"]
+                has_logs = "FB-1/app-logs.txt" in z.namelist()
+            self.assertEqual(has_logs, single)
+            self.assertIn("withheld", note)
+            self.assertEqual("app-logs.txt" in note, single, note)
+            if single:
+                self.assertIn("host names and bank names are not", note)
+
     def test_no_smtp_downloads(self):
         with mock.patch.dict("os.environ", {"OIKONOME_SMTP_HOST": ""}):
             r = feedback.submit(self.conn, self.tid, "broken thing")

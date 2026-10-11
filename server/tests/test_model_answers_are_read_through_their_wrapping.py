@@ -25,6 +25,7 @@ from oikonome.engine import llm_categorize, receipts, taxdocs
 
 from .test_llm_categorize import ENV
 from .test_receipts import LLM_JSON, _enable_llm
+from .test_taxdocs import W2_PNG
 from .util import TODAY, add_txn, make_db, write_config
 
 THINK = ("<think>The user wants JSON like {\"example\": 1}. The total "
@@ -169,7 +170,7 @@ class OtherReaders(unittest.TestCase):
                         return_value={"url": "http://localhost:11434",
                                       "model": "vl", "api_key": "",
                                       "extra_body": ""}):
-            out = taxdocs.analyze(conn, "w2.png", b"\x89PNG...", "image/png")
+            out = taxdocs.analyze(conn, "w2.png", W2_PNG, "image/png")
         self.assertEqual(out["kind"], "w2")
         self.assertEqual(out["rows"][0]["year"], 2024)
 

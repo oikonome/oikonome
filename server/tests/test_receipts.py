@@ -440,6 +440,59 @@ class UnreadablePdfTests(unittest.TestCase):
             receipts._pdf_first_page_png(b"")
 
 
+class PdfBombTests(unittest.TestCase):
+    """A receipt PDF whose first page inflates to tens of megabytes must be
+    refused before the rasterizer inflates it: pdfium caps nothing, and a
+    40 KB attachment would otherwise take the app's whole memory."""
+
+    def test_a_flate_bomb_receipt_is_refused_before_rendering(self):
+        import resource
+        import time
+
+        from .test_pdfimport import flate_page_pdf
+        bomb = flate_page_pdf(b"BT /F1 1 Tf 0 0 Td (a) Tj ET\n" * 500_000)
+        self.assertLess(len(bomb), 60_000)
+        before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        t0 = time.perf_counter()
+        with self.assertRaises(ValueError) as cm:
+            receipts._pdf_first_page_png(bomb)
+        self.assertLess(time.perf_counter() - t0, 3.0)
+        self.assertLess(
+            resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 - before,
+            150)
+        self.assertIn("size limit", str(cm.exception))
+
+    def test_an_ordinary_one_page_pdf_still_renders(self):
+        from .test_pdfimport import flate_page_pdf
+        png = receipts._pdf_first_page_png(
+            flate_page_pdf(b"BT /F1 12 Tf 20 700 Td (Total 12.00) Tj ET\n"))
+        self.assertTrue(png.startswith(b"\x89PNG"))
+
+    def test_an_image_bomb_is_refused_before_pdfium_opens_it(self):
+        from unittest import mock
+
+        import pypdfium2
+
+        from .test_pdfimport import image_page_pdf, image_stream
+        bomb = image_page_pdf(30_000, 30_000,
+                              image_stream(30_000, 30_000, b"\x80" * 3))
+        with mock.patch.object(pypdfium2, "PdfDocument") as opened:
+            with self.assertRaises(ValueError) as cm:
+                receipts._pdf_first_page_png(bomb)
+        opened.assert_not_called()
+        self.assertIn("size limit", str(cm.exception))
+
+    def test_a_receipt_with_a_small_embedded_image_still_renders(self):
+        import random
+
+        from .test_pdfimport import image_page_pdf, image_stream
+        rng = random.Random(7)
+        pixels = bytes(rng.randrange(256) for _ in range(120 * 40 * 3))
+        png = receipts._pdf_first_page_png(
+            image_page_pdf(120, 40, image_stream(120, 40, pixels)))
+        self.assertTrue(png.startswith(b"\x89PNG"))
+
+
 class ImageShrinkTests(unittest.TestCase):
     """A 3072x4080 phone photo alone exceeds ollama's default
     4,096-token context, so big images downscale before the vision call

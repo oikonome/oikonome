@@ -24,6 +24,7 @@ The routes:
 from __future__ import annotations
 
 import calendar
+import contextlib
 import datetime as dt
 import decimal
 import functools
@@ -39,7 +40,7 @@ import psycopg
 
 from fastapi import (APIRouter, Body, Depends, File, Form, HTTPException,
                      Query, Request, UploadFile)
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from pydantic import BeforeValidator
 from starlette.concurrency import run_in_threadpool
 
@@ -250,6 +251,25 @@ def _log_merge(conn, user, pid: str, action: str, r: dict) -> None:
                      label=pair or "two merchants")
 
 
+def _budgets_set(conn) -> bool:
+    """Has the household a budget of its own? Read from the stored
+    settings row, not the loaded document: under a month of history the
+    loader fills in a provisional seed that is never saved, and a seed is
+    the app's guess, not a plan the household made."""
+    row = conn.execute(
+        "SELECT config->'food_monthly' AS f, config->'other_monthly' AS o "
+        "FROM tenant_settings").fetchone()
+    if not row:
+        return False
+
+    def amount(v) -> float:
+        try:
+            return float(v or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    return bool(amount(row["f"]) or amount(row["o"]))
+
+
 def _today(conn) -> dt.date:
     """The household's OWN calendar day, for every live request that does
     day/month math. The instance clock may be UTC while
@@ -347,6 +367,7 @@ def today_full(user: dict = Depends(_user()), date: str = ""):
     bucket math as-of that day (gather's historical notion, not a fork),
     with the now-facts — cash forecast, runway, alerts — suppressed
     (live=False). Out-of-range dates clamp to [first transaction, today]."""
+    from ..engine import budget
     from . import report, todayview
     if date:
         try:
@@ -454,9 +475,11 @@ def today_full(user: dict = Depends(_user()), date: str = ""):
                            if scale else None),
         "irregular_bills": [dict(i, amount=round(i["amount"], 2))
                             for i in st.get("irregular_bills") or []],
-        # "Scheduled but not yet posted" line: [payee, amount, due] rows
-        "overdue_unpaid": [[p, round(a, 2), due]
-                           for p, a, due in st.get("overdue_unpaid") or []],
+        # "Scheduled but not yet posted" line: [payee, amount, due,
+        # withdrawn_on] rows — withdrawn_on is the date the bank feed took
+        # the charge back (null when it never posted)
+        "overdue_unpaid": [[p, round(a, 2), due, gone]
+                           for p, a, due, gone in budget.overdue_entries(st)],
         # month-to-date by category (Amazon subcategories clustered)
         "mtd": [[cat, round(amt, 2)] for cat, amt in day["mtd"]],
         "amazon_subs": [[s, round(a, 2)] for s, a in day["amazon_subs"]],
@@ -522,7 +545,7 @@ def today_full(user: dict = Depends(_user()), date: str = ""):
 
 # ---- timeframe lenses ----------------------------------------
 # Week/Month/Year summaries composed from the frozen engine by web/lenses.py
-# — the same functions the weekly/monthly emails render, so API and email
+# — the same functions the monthly/yearly emails render, so API and email
 # cannot diverge.
 
 def _ck_ym(y: int, m: int) -> None:
@@ -570,6 +593,56 @@ def _body_text(body: dict, *keys: str, default: str = "") -> str:
     return default
 
 
+def _relay_default_from(relay_host: str) -> str | None:
+    """The From for a relay saved with neither a username nor a From:
+    no-reply at the host name in OIKONOME_BASE_URL, else at the relay's
+    own host name. None when neither is a name (an IP address is not a
+    mail domain)."""
+    import ipaddress
+    from urllib.parse import urlsplit
+    for host in ((urlsplit(os.environ.get("OIKONOME_BASE_URL", "")).hostname
+                  or ""), relay_host or ""):
+        host = host.strip().strip("[]").lower()
+        if not host:
+            continue
+        try:
+            ipaddress.ip_address(host)
+            continue
+        except ValueError:
+            pass
+        addr = f"no-reply@{host}"
+        if mailguard.valid_address(addr):
+            return addr
+    return None
+
+
+def _category_long_ok(user: dict, name: str) -> bool:
+    """May a name over the length cap be written anyway? Only when the
+    household already uses it. Older versions, and imports, stored longer
+    names, and the pickers keep offering them; refusing one would freeze
+    the household's own category in place, with renaming it shorter the
+    only way out. The cap is for names that do not exist yet."""
+    conn = _conn(user)
+    try:
+        return bool(data.category_in_use(conn, name))
+    finally:
+        conn.close()
+
+
+def _category_text(body: dict, *keys: str, user: dict) -> str:
+    """A category NAME a request is about to write: _body_text plus the
+    one length every category door keeps for a NEW name. A category is
+    stored on every row, rule and split it touches and rendered in every
+    picker and email, so a name with no bound is a cheap way to bloat the
+    ledger by the kilobyte per row."""
+    v = _body_text(body, *keys)
+    if len(v) > data.CATEGORY_MAX_LEN and not _category_long_ok(user, v):
+        raise HTTPException(
+            400, f"a category name is at most {data.CATEGORY_MAX_LEN} "
+                 f"characters")
+    return v
+
+
 @router.get("/today/glance")
 def today_glance(request: Request, user: dict = Depends(_user())):
     """The home-screen widget's payload: the Today hero's simple face, and
@@ -587,13 +660,11 @@ def today_glance(request: Request, user: dict = Depends(_user())):
     import hashlib
     import json
     from fastapi.responses import Response
-    from ..engine import budget
     from . import report, todayview
     conn = tenancy.tenant_connect(user["tenant_id"])
     try:
         today = _today(conn)
-        cfg = budget.load_config(conn)
-        budgets_set = bool(cfg.get("food_monthly") or cfg.get("other_monthly"))
+        budgets_set = _budgets_set(conn)
         if budgets_set:
             st = report.gather(conn, today, live=True)
             day = todayview.build_context(st)["day"]
@@ -623,10 +694,13 @@ def today_glance(request: Request, user: dict = Depends(_user())):
     payload = json.dumps({k: v for k, v in body.items() if k != "as_of"},
                          sort_keys=True)
     etag = 'W/"' + hashlib.sha256(payload.encode()).hexdigest()[:32] + '"'
+    headers = {"ETag": etag, "Cache-Control": "private, no-cache"}
     if request.headers.get("if-none-match") == etag:
-        return Response(status_code=304, headers={"ETag": etag})
+        # the 304 restates the cache policy: a bare one would pick up the
+        # API-wide no-store and tell the client to drop the copy it holds
+        return Response(status_code=304, headers=headers)
     return Response(json.dumps(body), media_type="application/json",
-                    headers={"ETag": etag, "Cache-Control": "private, no-cache"})
+                    headers=headers)
 
 
 @router.get("/lens/month")
@@ -794,6 +868,24 @@ def _per_day(total, start, end, today: dt.date):
     return round(total / days, 2), days
 
 
+def _per_day_over_months(total, year: int, months, today: dt.date):
+    """Average daily spend over the named months of `year`: each month's
+    days up to today (a month in progress counts its elapsed days, a
+    closed one all of them). (None, None) when nothing was spent or no
+    named month has begun."""
+    if not total:
+        return None, None
+    days = 0
+    for m in months:
+        first = dt.date(year, m, 1)
+        last = dt.date(year, m, calendar.monthrange(year, m)[1])
+        if first <= today:
+            days += (min(last, today) - first).days + 1
+    if days <= 0:
+        return None, None
+    return round(total / days, 2), days
+
+
 def _json_default(v):
     if isinstance(v, (dt.date, dt.datetime)):
         return v.isoformat()
@@ -898,15 +990,21 @@ def transactions(user: dict = Depends(_user()), y: int = 0, m: int = 0,
             _stamp_recurring(conn, out)
             avg = (round(spend["sum"] / spend["count"], 2)
                    if spend["count"] else None)
-            # a bucket is one month's (or one year's) number: its daily pace
-            # is over that period's days up to the day it was read on
-            per_day, per_day_days = (
-                _per_day(spend["sum"], dt.date(yy, 1, 1), dt.date(yy, 12, 31),
-                         read_on)
-                if year_scope else
-                _per_day(spend["sum"], dt.date(yy, mm, 1),
-                         dt.date(yy, mm, calendar.monthrange(yy, mm)[1]),
-                         read_on))
+            # A bucket is one month's (or one year's) number, and its daily
+            # pace is THAT number — the figure the label wore, reimbursements
+            # netted and envelope overflow counted only past the envelope —
+            # over the days it was counted across, up to the day it was read
+            # on. The listed rows' raw sum is neither: an overflowing
+            # purchase is listed whole. A year's figure sums only its
+            # budgeted months, so its days are those months' days, not every
+            # day since January 1.
+            if year_scope:
+                per_day, per_day_days = _per_day_over_months(
+                    info["amount"], yy, info.get("months") or [], read_on)
+            else:
+                per_day, per_day_days = _per_day(
+                    info["amount"], dt.date(yy, mm, 1),
+                    dt.date(yy, mm, calendar.monthrange(yy, mm)[1]), read_on)
             return {"mode": "search", "rows": out,
                     "total": total, "amount_sum": amount_sum,
                     "amazon_items": amazon_items, "page": page,
@@ -1027,6 +1125,9 @@ def transactions(user: dict = Depends(_user()), y: int = 0, m: int = 0,
         # owner/reimb quick-filters narrow the LIST but the headline stays
         # the month's — a display filter must not change what the month
         # cost. `biz_count` says how many listed rows are a business's.
+        # In and net are null for a month before the bank feed starts:
+        # its income is unknown (the Month lens says the same), and $0 in
+        # would read the month's whole spend as a loss.
         from ..engine import entities as _ent, reporting as _reporting
         combined = _ent.is_combined(conn)
         flows = _reporting.month_flows(conn, y or today.year,
@@ -1052,7 +1153,7 @@ def transactions(user: dict = Depends(_user()), y: int = 0, m: int = 0,
 @router.post("/transactions/{txn_id}/category")
 def set_category(txn_id: str, user: dict = Depends(_user()),
                  body: dict = Body(...)):
-    category = _body_text(body, "category")
+    category = _category_text(body, "category", user=user)
     # "one" (default) corrects THIS row only and writes no rule; "all" also
     # teaches the merchant, which is what the Rules page then shows. An
     # unconditional "all" would let one correction on a generic payee
@@ -1070,17 +1171,20 @@ def set_category(txn_id: str, user: dict = Depends(_user()),
         demoguard.deny(user)
     conn = _conn(user)
     try:
-        exists = conn.execute(
-            "SELECT COALESCE(category_override, category_primary) AS cat "
-            "FROM transactions WHERE id=%s AND removed=0",
-            (txn_id,)).fetchone()
-        if not exists:
-            raise HTTPException(404, "transaction not found")
-        res = None
-        if category:
-            res = data.set_category(conn, txn_id, category, scope=scope)
-        else:
-            data.clear_category(conn, txn_id)
+        # the row is checked and written under the shared pairing lock, so
+        # a settlement cannot retire it in between (see _live_txn_for_edit)
+        with conn.transaction():
+            txn_id = _live_txn_for_edit(conn, txn_id)
+            exists = txn_id and conn.execute(
+                "SELECT COALESCE(category_override, category_primary) AS cat "
+                "FROM transactions WHERE id=%s", (txn_id,)).fetchone()
+            if not exists:
+                raise HTTPException(404, "transaction not found")
+            res = None
+            if category:
+                res = data.set_category(conn, txn_id, category, scope=scope)
+            else:
+                data.clear_category(conn, txn_id)
         _activity.record(
             conn, user, "category", "set" if category else "cleared",
             target=txn_id, label=_activity.txn_label(conn, txn_id),
@@ -1114,7 +1218,11 @@ def set_split_api(txn_id: str, user: dict = Depends(_user()),
     conn = _conn(user)
     try:
         try:
-            clean = _splits.set_split(conn, txn_id, parts)
+            # under the pairing lock, onto the live row (live_edit_ids)
+            with conn.transaction():
+                txn_id = data.live_edit_ids(conn, [txn_id]).get(txn_id,
+                                                                 txn_id)
+                clean = _splits.set_split(conn, txn_id, parts)
         except LookupError:
             raise HTTPException(404, "transaction not found")
         except _splits.SplitError as e:
@@ -1133,14 +1241,15 @@ def clear_split_api(txn_id: str, user: dict = Depends(_user())):
     from ..engine import splits as _splits
     conn = _conn(user)
     try:
-        exists = conn.execute(
-            "SELECT 1 FROM transactions WHERE id=%s AND removed=0",
-            (txn_id,)).fetchone()
-        if not exists:
-            raise HTTPException(404, "transaction not found")
-        had = conn.execute("SELECT 1 FROM transaction_splits WHERE txn_id=%s "
-                           "LIMIT 1", (txn_id,)).fetchone() is not None
-        _splits.clear_split(conn, txn_id)
+        # under the pairing lock, onto the live row (live_edit_ids)
+        with conn.transaction():
+            txn_id = data.live_edit_ids(conn, [txn_id]).get(txn_id)
+            if not txn_id:
+                raise HTTPException(404, "transaction not found")
+            had = conn.execute(
+                "SELECT 1 FROM transaction_splits WHERE txn_id=%s LIMIT 1",
+                (txn_id,)).fetchone() is not None
+            _splits.clear_split(conn, txn_id)
         if had:
             _activity.record(conn, user, "split", "cleared", target=txn_id,
                              label=_activity.txn_label(conn, txn_id))
@@ -1197,22 +1306,67 @@ def transactions_bulk(user: dict = Depends(_user()), body: dict = Body(...)):
     demoguard.deny(user)
     _may_edit(user)
     ids = body.get("ids") or []
-    if not isinstance(ids, list) or len(ids) > 1000:
-        raise HTTPException(400, "ids must be a list of at most 1000")
+    # "Select all shown" on an unpaged view (a merchant's whole history, a
+    # month shown in full) routinely selects well over a thousand rows, so
+    # the cap sits far above what a screen shows rather than at it.
+    if not isinstance(ids, list) or len(ids) > BULK_MAX_IDS:
+        raise HTTPException(400, f"ids must be a list of at most "
+                                 f"{BULK_MAX_IDS}")
     action = str(body.get("action") or "")
+    category = _category_text(body, "category", user=user) \
+        if action == "category" else ""
+    ids = [str(i) for i in dict.fromkeys(str(i) for i in ids)]
     conn = _conn(user)
     try:
+        # A bulk set offers only names that already exist: the standard
+        # set and the household's own categories (a new custom name is made
+        # on one row, through the row's own picker). Ten thousand rows of a
+        # name nobody picked from a list is a typo or a flood, either way
+        # not something to stamp across a selection.
+        if category:
+            from ..engine import categories as _cat
+            if category not in _cat.PLAID_PRIMARIES \
+                    and category not in data.all_categories(conn):
+                raise HTTPException(
+                    400, "not a known category — pick one of the standard "
+                         "categories or one of your own")
+        out = {"applied": 0, "missing": 0, "flow": 0}
         try:
-            out = data.bulk_apply(conn, [str(i) for i in ids], action,
-                                  str(body.get("category") or ""))
+            # Worked through in slices so no single statement carries an
+            # unbounded id array, but inside ONE transaction: the person
+            # chose one act over one selection, and a failure part-way
+            # must leave none of it applied rather than an arbitrary prefix.
+            with conn.transaction():
+                # each id resolved under the pairing lock to the row it now
+                # stands as: a pending hold a settlement retired is edited
+                # through its posted row, and none lands on a hidden hold
+                if action in ("reimb_flag", "reimb_unflag"):
+                    # flagging takes the pairing lock exclusively per row;
+                    # take it exclusive up front, because upgrading the
+                    # shared hold below deadlocks two concurrent bulk flags
+                    # (each holds it shared and waits for the other)
+                    conn.execute(data._REIMB_LOCK)
+                live = data.live_edit_ids(conn, ids)
+                ids = list(dict.fromkeys(live.get(i, i) for i in ids))
+                for at in range(0, len(ids), _BULK_SLICE):
+                    part = data.bulk_apply(conn, ids[at:at + _BULK_SLICE],
+                                           action, category)
+                    for k in out:
+                        out[k] += int(part.get(k) or 0)
+                if not ids:
+                    # still validates the action and category
+                    data.bulk_apply(conn, [], action, category)
         except ValueError as e:
             raise HTTPException(400, str(e))
         if out.get("applied"):
-            _log_bulk(conn, user, action, str(body.get("category") or ""),
-                      [str(i) for i in ids], out)
+            _log_bulk(conn, user, action, category, ids, out)
         return {"ok": True, **out}
     finally:
         conn.close()
+
+
+BULK_MAX_IDS = 10_000
+_BULK_SLICE = 1_000
 
 
 @router.post("/transactions/retire-pending")
@@ -1253,7 +1407,9 @@ def retire_pending(user: dict = Depends(_user()), body: dict = Body(...)):
 
 @router.get("/merchants/catalog")
 def merchants_catalog(user: dict = Depends(_user()), q: str = "",
-                      limit: int = 200, order: str = "count"):
+                      limit: int = 200, order: str = "count",
+                      sort: str | None = None, filter: str = "all",
+                      offset: int = 0):
     """Merchants as the ledger shows them, with the raw strings underneath.
 
     Distinct from GET /merchants, which is the bill picker's flat list of
@@ -1274,8 +1430,14 @@ def merchants_catalog(user: dict = Depends(_user()), q: str = "",
         raise HTTPException(400, "order must be 'count' or 'alpha'")
     conn = _conn(user)
     try:
-        rows = merchant_dedup.listing(conn, q, min(500, max(1, limit)),
-                                      order=order)
+        try:
+            # filter and sort apply before the cap, so a filtered view
+            # reaches the long tail the cap would otherwise cut
+            rows = merchant_dedup.listing(conn, q, min(500, max(1, limit)),
+                                          order=order, sort=sort,
+                                          filter=filter, offset=offset)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
         recent = conn.execute(
             "SELECT id, raw_merchant, from_canonical, to_canonical, at "
             "FROM merchant_renames ORDER BY at DESC LIMIT 20").fetchall()
@@ -1361,12 +1523,20 @@ def merchant_rename(user: dict = Depends(_user()), body: dict = Body(...)):
     to = _body_text(body, "to")
     if not display or not to:
         raise HTTPException(400, "display and to are both required")
-    # the target name is written into merchant_canonical for every variant,
-    # journalled once per variant, and rendered on every surface — so cap it
-    for _field, _val in (("display", display), ("to", to)):
-        _merchant_name_or_400(_field, _val)
+    # The source is read the way the detail read reads it — uncapped: an
+    # imported descriptor over the cap is a real name the catalog lists and
+    # opens, and the long ones are exactly those that most need renaming.
+    # An unknown source is a 404 below. The TARGET is written into
+    # merchant_canonical for every variant, journalled once per variant and
+    # rendered on every surface, so a new name keeps the cap; a target the
+    # ledger already displays writes nothing new (a merge into it), so its
+    # length is not held against it.
+    _merchant_name_or_400("display", display, max_len=None)
+    _merchant_name_or_400("to", to, max_len=None)
     conn = _conn(user)
     try:
+        if len(to) > 200 and not merchant_dedup.raw_strings_for(conn, to):
+            _merchant_name_or_400("to", to)
         # a rename onto a name the ledger already shows is a merge: read
         # that before the act, for the sentence
         _into_exists = conn.execute(
@@ -1418,6 +1588,37 @@ def merchant_undo(user: dict = Depends(_user()), body: dict = Body(...)):
         conn.close()
 
 
+# The pairing lock in SHARED mode: person-written edits on one row run side
+# by side, and wait only for a writer holding it exclusively — a feed
+# settling a pending hold into its posted row, which carries the hold's
+# note and category across and retires it in one commit.
+_PAIRING_LOCK_SHARED = data._REIMB_LOCK.replace(
+    "pg_advisory_xact_lock(", "pg_advisory_xact_lock_shared(", 1)
+
+
+def _live_txn_for_edit(conn, txn_id: str) -> str | None:
+    """Inside the caller's transaction: take the shared pairing lock, then
+    name the live row an edit of `txn_id` belongs on — the row itself, or,
+    when a settlement has just retired it, the posted row that names it as
+    its pending authorization. None when there is neither.
+
+    Checked and written under the lock: read before it, a settlement could
+    commit between the check and the write, and the note or category would
+    land on the retired hold after its carry had already run — hidden, with
+    the posted row showing nothing the person wrote."""
+    conn.execute(_PAIRING_LOCK_SHARED)
+    if conn.execute("SELECT 1 FROM transactions WHERE id=%s AND removed=0",
+                    (txn_id,)).fetchone():
+        return txn_id
+    twin = conn.execute(
+        """SELECT t.id FROM transactions t
+             JOIN transactions p ON p.id = %s AND p.removed = 1
+            WHERE t.removed = 0 AND t.account_id = p.account_id
+              AND t.raw->>'pending_transaction_id' = p.id
+            ORDER BY t.id LIMIT 1""", (txn_id,)).fetchone()
+    return twin["id"] if twin else None
+
+
 @router.post("/transactions/{txn_id}/note")
 def set_txn_note(txn_id: str, user: dict = Depends(_user()),
                  body: dict = Body(...)):
@@ -1426,13 +1627,15 @@ def set_txn_note(txn_id: str, user: dict = Depends(_user()),
     _may_edit(user)
     conn = _conn(user)
     try:
-        if not conn.execute("SELECT 1 FROM transactions WHERE id=%s AND "
-                            "removed=0", (txn_id,)).fetchone():
-            raise HTTPException(404, "transaction not found")
-        prev = conn.execute("SELECT note FROM transaction_notes WHERE txn_id=%s",
-                            (txn_id,)).fetchone()
-        prev = prev["note"] if prev else ""
-        note = data.set_note(conn, txn_id, str(body.get("note") or ""))
+        with conn.transaction():
+            txn_id = _live_txn_for_edit(conn, txn_id)
+            if not txn_id:
+                raise HTTPException(404, "transaction not found")
+            prev = conn.execute(
+                "SELECT note FROM transaction_notes WHERE txn_id=%s",
+                (txn_id,)).fetchone()
+            prev = prev["note"] if prev else ""
+            note = data.set_note(conn, txn_id, str(body.get("note") or ""))
         if note != prev:
             _activity.record(
                 conn, user, "note",
@@ -1451,10 +1654,15 @@ def set_txn_owner_api(txn_id: str, user: dict = Depends(_user()),
     owner = _body_text(body, "owner")
     conn = _conn(user)
     try:
-        n = data.set_txn_owner(conn, txn_id, owner or None)
-        if not n:
-            raise HTTPException(404, "transaction not found")
-        return {"ok": True, "owner": owner or None}
+        # under the pairing lock, onto the live row: a settlement retiring
+        # the hold between the check and the write would strand the owner
+        # on the hidden hold (see _live_txn_for_edit)
+        with conn.transaction():
+            txn_id = _live_txn_for_edit(conn, txn_id)
+            n = txn_id and data.set_txn_owner(conn, txn_id, owner or None)
+            if not n:
+                raise HTTPException(404, "transaction not found")
+        return {"ok": True, "owner": owner or None, "id": txn_id}
     finally:
         conn.close()
 
@@ -1552,11 +1760,22 @@ def accounts(user: dict = Depends(_user())):
 @router.post("/accounts/mx/keys")
 def mx_keys(user: dict = Depends(_user()), body: dict = Body(...)):
     """Save BYO MX credentials — validated LIVE first (rule: you
-    can't finish a setup flow with broken keys). api_key encrypted."""
+    can't finish a setup flow with broken keys). api_key encrypted.
+
+    The aggregator client decides where the household's bank data is
+    delivered, so repointing it is a step-up door like the relay, the AI
+    endpoint and the webhooks: a session cookie alone is not proof of the
+    owner, and the write runs under the factor lock so a request that
+    authenticated just before a reset cannot land after it."""
     demoguard.deny(user)
+    demoguard.deny_shared_grant(user)
+    from .app import _require_elevation
+    _require_elevation(user, password=str(body.get("password") or ""),
+                       totp_code=str(body.get("totp_code") or ""),
+                       recovery_code=str(body.get("recovery_code") or ""))
+    # the mode answer comes after the step-up: an unelevated caller
+    # learns nothing about the instance from this door
     _no_byo_on_hosted()
-    from ..db import crypto
-    from ..engine import budget
     from ..sync import mx as mx_mod
     client_id = str(body.get("client_id") or "").strip()
     api_key = str(body.get("api_key") or "").strip()
@@ -1573,31 +1792,110 @@ def mx_keys(user: dict = Depends(_user()), body: dict = Body(...)):
         raise
     except Exception as e:                        # noqa: BLE001
         raise HTTPException(400, f"couldn't reach MX: {type(e).__name__}")
+    from ..sync.base import tenant_sync_lock
     conn = _conn(user)
     try:
-        with budget.config_txn(conn) as cfg:
-            cfg["mx_client_id"] = client_id
-            cfg["mx_api_key"] = crypto.encrypt(conn, api_key)
-            cfg["mx_env"] = env
-            cfg.pop("mx_user_guid", None)  # new keys → new MX user next use
+        # MX members only appear through a sync, which holds this lock:
+        # with it held, no member can land under the old client between the
+        # live-connection check and the key write
+        with tenant_sync_lock(conn, user["tenant_id"]) as held:
+            if not held:
+                raise HTTPException(409, "a sync is running — save the "
+                                         "keys again in a moment")
+            from .app import _still_signed_in_under_factor_lock
+            with _still_signed_in_under_factor_lock(user):
+                _mx_keys_save(conn, user, client_id, api_key, env)
     finally:
         conn.close()
     return {"ok": True, "env": env}
 
 
+def _mx_keys_save(conn, user: dict, client_id: str, api_key: str,
+                  env: str) -> None:
+    from ..db import crypto
+    from ..engine import budget
+    from ..sync import mx as mx_mod
+    cur = budget.load_config(conn)
+    # An MX user belongs to the client (and its environment), not to one
+    # API key: rotating the key keeps the user, and with it every bank
+    # linked under it. Dropping the guid here would create a fresh, empty
+    # user on the next sync and leave every linked bank behind at MX.
+    moving = bool(cur.get("mx_user_guid")) and (
+        cur.get("mx_client_id") != client_id
+        or (cur.get("mx_env") or "production") != env)
+    if moving:
+        # a different client cannot see the old user at all, so its
+        # banks would stop syncing with nothing left to release them by
+        _refuse_live_connections(conn, "mx", "MX")
+        # nothing live is left under the old user: release it (and the
+        # financial data MX holds for it) while its keys still work
+        mx_mod.release_tenant_user(user["tenant_id"])
+    with budget.config_txn(conn) as cfg:
+        cfg["mx_client_id"] = client_id
+        cfg["mx_api_key"] = crypto.encrypt(conn, api_key)
+        cfg["mx_env"] = env
+        # when these keys were saved, for the bank-link hold's banner;
+        # written by the server only, never through the Settings save
+        cfg["mx_keys_saved_at"] = _keys_saved_now()
+        if moving:
+            cfg.pop("mx_user_guid", None)  # the new client's user next use
+
+
+def _keys_saved_now() -> str:
+    """The `<provider>_keys_saved_at` stamp: when the household's own
+    aggregator keys were saved, so the bank-link hold's banner can tell the
+    owner whether the held keys predate the record."""
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def _refuse_live_connections(conn, aggregator: str, label: str) -> None:
+    """400 naming the live connections of one aggregator. Their handle at
+    the provider (a Plaid access token, an MX user) only works with the keys
+    that made it, so swapping or clearing those keys now would leave the
+    connections syncing nothing — and still billing — with no way to
+    release them. Disconnecting is the door that releases them."""
+    tok = "AND access_token IS NOT NULL " if aggregator == "plaid" else ""
+    live = conn.execute(
+        "SELECT id, institution_name FROM items WHERE aggregator=%s "
+        + tok + "AND COALESCE(status,'ok') <> 'archived' ORDER BY id",
+        (aggregator,)).fetchall()
+    if live:
+        names = ", ".join(r["institution_name"] or r["id"] for r in live)
+        raise HTTPException(
+            400,
+            f"Disconnect these {label} connections first: {names}. They "
+            f"only work with the keys saved now — replacing or clearing "
+            f"those keys would leave the connections billing at {label} "
+            f"with no way to release them.")
+
+
 @router.post("/accounts/mx/connect")
 def mx_connect(user: dict = Depends(_user())):
-    """A fresh MX Connect-widget URL to link (or repair) banks."""
+    """A fresh MX Connect-widget URL to link (or repair) banks. A bank
+    disconnected earlier and relinked here comes back live on the next
+    sync (mx.connect_widget_url notes when the widget was opened)."""
     demoguard.deny(user)
     from ..sync import mx as mx_mod
+    from ..sync.base import tenant_sync_lock
     conn = _conn(user)
     try:
-        try:
-            return {"url": mx_mod.connect_widget_url(conn)}
-        except ValueError as e:
-            raise HTTPException(400, str(e))
-        except Exception as e:                    # noqa: BLE001
-            raise HTTPException(400, f"MX error: {type(e).__name__}")
+        # Opening the widget may create the household's MX user, under the
+        # keys read at the start; saving new keys holds this same lock. Held
+        # here too, the two cannot interleave: otherwise a user created
+        # under the old client could be stored beside the new client's
+        # keys, every later sync would fail on it, and the banks linked
+        # into it would stay at the old client with nothing to release
+        # them by.
+        with tenant_sync_lock(conn, user["tenant_id"]) as held:
+            if not held:
+                raise HTTPException(409, "a sync is running — try again "
+                                         "in a moment")
+            try:
+                return {"url": mx_mod.connect_widget_url(conn)}
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+            except Exception as e:                # noqa: BLE001
+                raise HTTPException(400, f"MX error: {type(e).__name__}")
     finally:
         conn.close()
 
@@ -1638,19 +1936,51 @@ def mx_sync_now(user: dict = Depends(_user())):
 @router.post("/accounts/plaid/keys")
 def plaid_keys(user: dict = Depends(_user()), body: dict = Body(...)):
     """Save BYO Plaid credentials after a LIVE validation —
-    the guided flow's final step. Secret encrypted at rest."""
+    the guided flow's final step. Secret encrypted at rest. A step-up
+    door written under the factor lock, for the reason the MX one is."""
     demoguard.deny(user)
+    demoguard.deny_shared_grant(user)
+    from .app import _require_elevation
+    _require_elevation(user, password=str(body.get("password") or ""),
+                       totp_code=str(body.get("totp_code") or ""),
+                       recovery_code=str(body.get("recovery_code") or ""))
+    # the mode answer comes after the step-up: an unelevated caller
+    # learns nothing about the instance from this door
     _no_byo_on_hosted()
+    from .app import _still_signed_in_under_factor_lock
     from ..db import crypto
     from ..engine import budget
+    from ..sync import plaid as plaid_mod
     r = plaid_validate(user=user, body=body)     # raises 400 on bad keys
+    new_id = str(body["client_id"]).strip()
     conn = _conn(user)
     try:
-        with budget.config_txn(conn) as cfg:
-            cfg["plaid_client_id"] = str(body["client_id"]).strip()
-            cfg["plaid_secret"] = crypto.encrypt(conn,
-                                                 str(body["secret"]).strip())
-            cfg["plaid_env"] = r["env"]
+        if _plaid_client_moves(conn, new_id, r["env"]):
+            # another Plaid account (or environment) cannot use the access
+            # tokens this one minted: the same stranding clearing the keys
+            # refuses. Archived Items still holding a token get their last
+            # release here, under the keys that can still make it. Which
+            # Items is decided under the lock; the releases run after it,
+            # because each is a Plaid round-trip that can take minutes and a
+            # link finishing meanwhile waits on that lock holding a pooled
+            # connection.
+            _plaid_release_stragglers(conn, _plaid_straggler_ids(conn))
+        # under the lock a new Item's row is written under, so a link in
+        # flight either lands before the live-connection check or sees the
+        # keys it exchanged under replaced and hands its Item back. The
+        # check is asked again here because the release above ran unlocked.
+        with _still_signed_in_under_factor_lock(user), \
+                conn.transaction():
+            plaid_mod.link_lock(conn)
+            if _plaid_client_moves(conn, new_id, r["env"]):
+                _refuse_live_connections(conn, "plaid", "Plaid")
+            with budget.config_txn(conn) as cfg:
+                cfg["plaid_client_id"] = new_id
+                cfg["plaid_secret"] = crypto.encrypt(
+                    conn, str(body["secret"]).strip())
+                cfg["plaid_env"] = r["env"]
+                # the bank-link hold's banner says when (server-written)
+                cfg["plaid_keys_saved_at"] = _keys_saved_now()
     finally:
         conn.close()
     return {"ok": True, "env": r["env"]}
@@ -1675,43 +2005,92 @@ def plaid_keys_clear(user: dict = Depends(_user())):
     """
     demoguard.deny(user)
     from ..engine import budget
+    from ..notify import outbound_pause
+    from ..sync import plaid as plaid_mod
     conn = _conn(user)
     try:
-        live = conn.execute(
-            "SELECT id, institution_name FROM items WHERE aggregator='plaid' "
-            "AND access_token IS NOT NULL "
-            "AND COALESCE(status,'ok') <> 'archived' ORDER BY id").fetchall()
-        if live:
-            names = ", ".join(r["institution_name"] or r["id"] for r in live)
-            raise HTTPException(
-                400,
-                f"Disconnect these Plaid connections first: {names}. Their "
-                f"access tokens only work with these keys — clearing the keys "
-                f"now would leave the connections billing at Plaid with no "
-                f"way to release them.")
-        released, stranded = _plaid_release_stragglers(conn)
-        with budget.config_txn(conn) as cfg:
-            for k in ("plaid_client_id", "plaid_secret", "plaid_env"):
-                cfg.pop(k, None)
+        # Refused before Plaid is called at all, and the Items to release
+        # are listed under the link lock; the releases themselves run with
+        # no transaction open and no lock held: each is a Plaid round-trip
+        # that can take minutes, and a bank link finishing meanwhile would
+        # wait on the link lock holding a pooled connection the whole time.
+        # Only the listed Items are released, so a bank linked while Plaid
+        # was answering is never removed by this door — the check below
+        # refuses it as live instead.
+        released, _ = _plaid_release_stragglers(conn,
+                                                _plaid_straggler_ids(conn))
+        # the link lock, as the swap takes it: a link in flight must not
+        # land a token minted under keys about to be forgotten. The live
+        # check is asked again under it — a bank linked while Plaid was
+        # answering above still stops the keys from going — and whatever
+        # still holds a token now is what the clear strands.
+        with conn.transaction():
+            plaid_mod.link_lock(conn)
+            _refuse_live_connections(conn, "plaid", "Plaid")
+            stranded = conn.execute(
+                "SELECT count(*) AS n FROM items WHERE aggregator='plaid' "
+                "AND access_token IS NOT NULL").fetchone()["n"]
+            with budget.config_txn(conn) as cfg:
+                for k in ("plaid_client_id", "plaid_secret", "plaid_env",
+                          "plaid_keys_saved_at"):
+                    cfg.pop(k, None)
+                # the bank-link hold stops naming the client just forgotten
+                # (and goes if that was all it held), so a later rotation
+                # writes its own record and saving the same client again is
+                # not held by this one
+                outbound_pause.drop_stale_hold(cfg)
     finally:
         conn.close()
     return {"ok": True, "released": released, "stranded": stranded}
 
 
-def _plaid_release_stragglers(conn) -> tuple[int, int]:
-    """Best-effort /item/remove for every Plaid Item still holding a token
-    (the caller has already refused if any of them is live), clearing the
-    token on the ones that release. Returns (released, stranded). Never
-    raises: the keys are going either way, and a Plaid outage must not wedge
-    the door shut — the same trade erasure makes.
+def _plaid_client_moves(conn, new_id: str, new_env: str) -> bool:
+    """True when saving (new_id, new_env) changes the Plaid client or
+    environment the household's tokens are bound to. No stored client id
+    means the household's Items were linked under the instance's own keys
+    (credentials() falls back to them), and those tokens are just as bound
+    to that client."""
+    from ..engine import budget
+    cur = budget.load_config(conn)
+    had_id = (cur.get("plaid_client_id")
+              or os.environ.get("OIKONOME_PLAID_CLIENT_ID"))
+    had_env = ((cur.get("plaid_env") if cur.get("plaid_client_id") else None)
+               or os.environ.get("OIKONOME_PLAID_ENV", "production"))
+    return had_id != new_id or had_env != new_env
+
+
+def _plaid_straggler_ids(conn) -> list[str]:
+    """Under the link lock: refuse while any Plaid connection is live, then
+    list the Items that still hold a token — every one of them archived,
+    since the refusal passed. A link can only add an Item under this same
+    lock, so the list is exactly what was there when the keys were asked to
+    go. Raises the refusal's 400."""
+    from ..sync import plaid as plaid_mod
+    with conn.transaction():
+        plaid_mod.link_lock(conn)
+        _refuse_live_connections(conn, "plaid", "Plaid")
+        # archived named again, not left to the refusal above: a live
+        # Item must never be released by this door, whatever the order
+        return [r["id"] for r in conn.execute(
+            "SELECT id FROM items WHERE aggregator='plaid' "
+            "AND access_token IS NOT NULL "
+            "AND COALESCE(status,'ok') = 'archived' ORDER BY id").fetchall()]
+
+
+def _plaid_release_stragglers(conn, ids: list[str]) -> tuple[int, int]:
+    """Best-effort /item/remove for the listed archived Plaid Items (see
+    `_plaid_straggler_ids`), clearing the token on the ones that release.
+    Returns (released, stranded). Called with no transaction open and no
+    lock held — the calls are network round-trips, and each cleared token
+    stands on its own. Never raises: the keys are going either way, and a
+    Plaid outage must not wedge the door shut — the same trade erasure
+    makes.
     """
     import logging
 
     from ..sync import base as sync_base
     from ..sync import plaid as plaid_mod
-    rows = conn.execute(
-        "SELECT id FROM items WHERE aggregator='plaid' "
-        "AND access_token IS NOT NULL ORDER BY id").fetchall()
+    rows = [{"id": i} for i in ids]
     if not rows:
         return 0, 0
     try:
@@ -1743,16 +2122,39 @@ def _plaid_release_stragglers(conn) -> tuple[int, int]:
 
 @router.delete("/accounts/mx/keys")
 def mx_keys_clear(user: dict = Depends(_user())):
+    """Forget the tenant's BYO MX credentials.
+
+    Refused while live MX connections exist, for the reason the Plaid door
+    refuses: the MX user holding them is only reachable with these keys.
+    Once nothing is live, the MX user is deleted at MX before the keys go —
+    it holds the household's bank credentials and history, and after this
+    nothing here could ever ask MX to remove them (erasure included).
+    Best-effort, like the Plaid release: an MX outage must not wedge the
+    door shut, and `mx_user` reports what happened."""
     demoguard.deny(user)
     from ..engine import budget
+    from ..notify import outbound_pause
+    from ..sync import mx as mx_mod
+    from ..sync.base import tenant_sync_lock
     conn = _conn(user)
     try:
-        with budget.config_txn(conn) as cfg:
-            for k in ("mx_client_id", "mx_api_key", "mx_env", "mx_user_guid"):
-                cfg.pop(k, None)
+        # under the sync lock, as saving keys is: a sync adding a member
+        # must not land between the check and forgetting the keys
+        with tenant_sync_lock(conn, user["tenant_id"]) as held:
+            if not held:
+                raise HTTPException(409, "a sync is running — try again "
+                                         "in a moment")
+            _refuse_live_connections(conn, "mx", "MX")
+            released = mx_mod.release_tenant_user(user["tenant_id"])
+            with budget.config_txn(conn) as cfg:
+                for k in ("mx_client_id", "mx_api_key", "mx_env",
+                          "mx_user_guid", "mx_keys_saved_at"):
+                    cfg.pop(k, None)
+                # as the Plaid door does: the hold forgets this client
+                outbound_pause.drop_stale_hold(cfg)
     finally:
         conn.close()
-    return {"ok": True}
+    return {"ok": True, "mx_user": released}
 
 
 @router.post("/connections/export",
@@ -1762,7 +2164,7 @@ def connections_export(user: dict = Depends(_user()), body: dict = Body(...)):
     SMTP, and live bank links — master-key-independent so it survives a move
     to a fresh environment. Owner only: these are instance-wide credentials,
     not one member's view."""
-    demoguard.deny(user)
+    demoguard.deny_shared_credentials(user)
     from fastapi.responses import Response
 
     from ..sync import connections_bundle as cb
@@ -1786,6 +2188,15 @@ def connections_export(user: dict = Depends(_user()), body: dict = Body(...)):
                        password=str(body.get("password") or ""),
                        totp_code=str(body.get("totp_code") or ""),
                        recovery_code=str(body.get("recovery_code") or ""))
+    # In hosted mode every bank link was made under the operator's provider
+    # keys: its access tokens must stay on the server, and the import side
+    # drops them anyway, so the bundle has no use there. Refused here, not
+    # only hidden in the app, because the file cannot be recalled once made.
+    if env_flag("OIKONOME_HOSTED"):
+        raise HTTPException(
+            403, "in hosted mode bank connections run under the operator's "
+                 "provider keys and stay on the server — there is no "
+                 "connections bundle to export")
     passphrase = str(body.get("passphrase") or "")
     conn = _conn(user)
     try:
@@ -1813,6 +2224,11 @@ def connections_import(user: dict = Depends(_user()),
     """Merge a sealed config bundle into this instance, re-encrypting every
     secret under the local master key. Idempotent (items upsert)."""
     demoguard.deny(user)
+    # a bundle carries the AI endpoints, their routing and the mail relay,
+    # and lands them wholesale — the same new destinations a Settings save
+    # refuses to the shared demonstration login, whose step-up below proves
+    # nothing because its password is handed out
+    demoguard.deny_shared_grant(user)
     from ..sync import connections_bundle as cb
     if user["role"] != "owner":
         raise HTTPException(403, "owner only")
@@ -1824,12 +2240,40 @@ def connections_import(user: dict = Depends(_user()),
     _require_elevation(user, fresh_seconds=60, password=password,
                        totp_code=totp_code, recovery_code=recovery_code)
     data = file.file.read(4 * 1024 * 1024)        # a bundle is KBs; cap sanely
+    import copy
+    import json as _json
+    from ..sync.base import tenant_sync_lock
+    from .app import _still_signed_in_under_factor_lock
+    # The slow work happens before any lock: the passphrase KDF takes its
+    # cost from the file, and the endpoint hostnames are resolved here so
+    # the write below, which checks them again, answers from that lookup.
+    try:
+        payload = _json.loads(cb._open(data, passphrase))
+        if isinstance(payload, dict):
+            config, _secrets, _items = cb._checked_shapes(
+                copy.deepcopy(payload))
+            cb._check_urls(config)
+            cb._clean_backends(copy.deepcopy(payload.get("llm_backends")))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     conn = _conn(user)
     try:
-        try:
-            summary = cb.import_bytes(conn, data, passphrase)
-        except ValueError as e:
-            raise HTTPException(400, str(e))
+        # under the sync lock, as the MX key door is: a sync creating the
+        # household's MX user, or adding a member to it, must not land
+        # between the bundle's live-connection check and its key write.
+        # The bundle carries aggregator keys, the mail relay and the AI
+        # endpoint, so it writes only while the caller is still signed in,
+        # under the factor lock a reset takes: an import authenticated just
+        # before a reset lands before it (and is paused by it) or not at all.
+        with tenant_sync_lock(conn, user["tenant_id"]) as held:
+            if not held:
+                raise HTTPException(409, "a sync is running — import the "
+                                         "file again in a moment")
+            with _still_signed_in_under_factor_lock(user):
+                try:
+                    summary = cb.apply_payload(conn, payload)
+                except ValueError as e:
+                    raise HTTPException(400, str(e))
     finally:
         conn.close()
     return {"ok": True, **summary}
@@ -2056,15 +2500,27 @@ def reimburse_unlink(user: dict = Depends(_user()), body: dict = Body(...)):
     conn = _conn(user)
     try:
         expense_id = str(body.get("expense_id") or "")
-        removed = data.unlink_reimbursement(
-            conn, expense_id, str(body.get("reimburse_id") or ""))
+        reimburse_id = str(body.get("reimburse_id") or "")
+        # A settlement moves a pending hold's pairs onto its posted row
+        # under the pairing lock, so a list read before it names the hold.
+        # Resolved under that same lock (exclusive, as the unlink writes),
+        # each side follows its hold to the row the pair now stands on;
+        # with the hold's id the unlink would find nothing and the pair
+        # would quietly stay.
+        with conn.transaction():
+            conn.execute(data._REIMB_LOCK)
+            live = data.live_edit_ids(conn, [expense_id, reimburse_id])
+            expense_id = live.get(expense_id, expense_id)
+            reimburse_id = live.get(reimburse_id, reimburse_id)
+            removed = data._unlink_locked(conn, expense_id, reimburse_id)
         # logged only when a pair really went: a second tap, the other
         # device or a retry finds nothing to remove and records nothing
         if removed:
             _activity.record(conn, user, "reimbursement", "unlinked",
                              target=expense_id,
                              label=_activity.txn_label(conn, expense_id))
-        return {"ok": True, "removed": bool(removed)}
+        return {"ok": True, "removed": bool(removed),
+                "expense_id": expense_id, "reimburse_id": reimburse_id}
     finally:
         conn.close()
 
@@ -2076,7 +2532,8 @@ def reimburse_flag(txn_id: str, user: dict = Depends(_user()),
     expected = body.get("expected")
     try:
         expected = float(expected) if expected not in (None, "") else None
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: a JSON integer too wide for a double
         raise HTTPException(400, "expected must be a number")
     # NaN/Infinity parse fine and slip past the <=0 check (all NaN comparisons
     # are False), then poison the DOUBLE column and 500 every later
@@ -2084,13 +2541,22 @@ def reimburse_flag(txn_id: str, user: dict = Depends(_user()),
     import math
     if expected is not None and not math.isfinite(expected):
         raise HTTPException(400, "expected must be a finite number")
+    from ..engine.compat import MAX_AMOUNT
+    if expected is not None and expected > MAX_AMOUNT:
+        raise HTTPException(400, "expected is too large")
     if expected is not None and expected <= 0:
         raise HTTPException(400, "expected must be positive")
     conn = _conn(user)
     try:
-        refused = data.flag_reimbursement(conn, txn_id,
-                                          partial=bool(body.get("partial")),
-                                          expected=expected)
+        # a hold that settled since the list was read is flagged on the
+        # posted row it became, resolved under the pairing lock the
+        # settlement holds (exclusive up front: the flag takes it so)
+        with conn.transaction():
+            conn.execute(data._REIMB_LOCK)
+            txn_id = data.live_edit_ids(conn, [txn_id]).get(txn_id, txn_id)
+            refused = data.flag_reimbursement(
+                conn, txn_id, partial=bool(body.get("partial")),
+                expected=expected)
         if refused == data.NO_SUCH_FLAG_TXN:
             raise HTTPException(404, refused)
         if refused:
@@ -2099,7 +2565,7 @@ def reimburse_flag(txn_id: str, user: dict = Depends(_user()),
                          label=_activity.txn_label(conn, txn_id),
                          detail={"expected": expected,
                                  "partial": bool(body.get("partial"))})
-        return {"ok": True}
+        return {"ok": True, "id": txn_id}
     finally:
         conn.close()
 
@@ -2108,13 +2574,20 @@ def reimburse_flag(txn_id: str, user: dict = Depends(_user()),
 def reimburse_unflag(txn_id: str, user: dict = Depends(_user())):
     conn = _conn(user)
     try:
+        # A settlement moves a hold's flag onto its posted row under the
+        # pairing lock; resolved under it, the unflag follows the hold
+        # there instead of deleting nothing and leaving the flag counted.
+        with conn.transaction():
+            conn.execute(data._REIMB_LOCK)
+            txn_id = data.live_edit_ids(conn, [txn_id]).get(txn_id, txn_id)
+            dropped = data.unflag_reimbursement(conn, txn_id)
         # logged only when a flag really went, as unlink is: a second tap
         # or the other device finds nothing to drop and records nothing
-        if data.unflag_reimbursement(conn, txn_id):
+        if dropped:
             _activity.record(conn, user, "reimbursement", "unflagged",
                              target=txn_id,
                              label=_activity.txn_label(conn, txn_id))
-        return {"ok": True}
+        return {"ok": True, "removed": bool(dropped), "id": txn_id}
     finally:
         conn.close()
 
@@ -2123,7 +2596,7 @@ def reimburse_unflag(txn_id: str, user: dict = Depends(_user())):
 # fresh tenant) still carries the stats keys — the SPA renders "·" from zeros
 _EMPTY_BILL_STATS = {"occurrences": 0, "paid": 0, "paid_amount": 0.0,
                      "used": None, "overflow": None, "next_unpaid": None,
-                     "pool": None, "period_months": None,
+                     "withdrawn_on": None, "pool": None, "period_months": None,
                      "period_used": None, "period_left": None}
 
 
@@ -2148,6 +2621,9 @@ def _month_bill_stats(conn, cfg: dict, today: dt.date) -> dict[str, dict]:
     from ..engine import budget
     from ..engine.compat import as_date
     month_start = today.replace(day=1)
+    # the accounts the "excl" toggle drops, read the way month_status reads
+    # them — a malformed setting means "nothing excluded", never a 500
+    excluded = budget.excluded_account_ids(cfg)
     # Two schedules, on purpose. The DISPLAY set is every active bill, so a
     # disabled one still shows its own Paid x/y. The BUDGET set is the one
     # month_status expands — caps, `disabled_bills`, and the card-payment
@@ -2185,7 +2661,7 @@ def _month_bill_stats(conn, cfg: dict, today: dt.date) -> dict[str, dict]:
     match_rows = budget._spend_rows(
         conn, month_start - dt.timedelta(days=budget.PREPAY_MATCH_DAYS),
         today + dt.timedelta(days=1),
-        excluded=cfg.get("excluded_accounts"))
+        excluded=excluded)
     in_month = [i for i, r in enumerate(match_rows)
                 if as_date(r["date"]) >= month_start]
     _pos = {src: dst for dst, src in enumerate(in_month)}
@@ -2219,6 +2695,12 @@ def _month_bill_stats(conn, cfg: dict, today: dt.date) -> dict[str, dict]:
         leftover = [r for i, r in enumerate(match_rows) if i not in matched_all]
         _, extra_occs = _match(extra, leftover)
         occs += extra_occs
+    # the same withdrawn-charge reading Today gives its overdue line, so a
+    # bill the feed took back says so on both pages
+    budget.mark_withdrawn(
+        conn, occs, today,
+        since=month_start - dt.timedelta(days=budget.PREPAY_MATCH_DAYS),
+        cfg=cfg)
     # Rows the BUDGET occurrences claimed (payment plus the fees that rode
     # with it), translated to `rows` indices for the envelope pass. A match
     # on a prior-month payment has no in-month row and simply drops out.
@@ -2246,7 +2728,7 @@ def _month_bill_stats(conn, cfg: dict, today: dt.date) -> dict[str, dict]:
             conn,
             month_start - dt.timedelta(days=budget.PREPAY_MATCH_DAYS),
             today + dt.timedelta(days=1),
-            excluded=cfg.get("excluded_accounts"))
+            excluded=excluded)
         py, pm = ((today.year, today.month - 1) if today.month > 1
                   else (today.year - 1, 12))
         decoys = budget.month_occurrences(income_bills, py, pm)
@@ -2264,7 +2746,7 @@ def _month_bill_stats(conn, cfg: dict, today: dt.date) -> dict[str, dict]:
         # its category and the Bills page reports a pool spent by bills
         # that were never its, while Today reports it untouched.
         prior_used=budget._envelope_prior_used(
-            conn, envelopes, today, excluded=cfg.get("excluded_accounts"),
+            conn, envelopes, today, excluded=excluded,
             bills=budget_bills))
     per: dict[str, dict] = {}
     for occ in occs:
@@ -2286,6 +2768,11 @@ def _month_bill_stats(conn, cfg: dict, today: dt.date) -> dict[str, dict]:
         elif (not occ["floored"]
               and (e["next_unpaid"] is None or occ["due"] < e["next_unpaid"])):
             e["next_unpaid"] = occ["due"]
+            # only a missed occurrence can be explained by a withdrawal;
+            # one not yet due is just upcoming
+            on = occ.get("withdrawn_on")
+            e["withdrawn_on"] = (on.isoformat()
+                                 if on and occ["due"] <= today else None)
     for e in per.values():
         e["paid_amount"] = round(e["paid_amount"], 2)
         if e["next_unpaid"] is not None:
@@ -2305,20 +2792,38 @@ def _month_bill_stats(conn, cfg: dict, today: dt.date) -> dict[str, dict]:
             "period_months": st["bill"]["period_months"],
             "period_used": round(drawn, 2),
             "period_left": round(max(0.0, st["bill"]["pool"] - drawn), 2),
-            "next_unpaid": None}
+            "next_unpaid": None, "withdrawn_on": None}
     return per
 
 
 @router.get("/bills")
-def bills_list(user: dict = Depends(_user())):
+def bills_list(user: dict = Depends(_user()),
+               month: str | None = Query(None)):
     """Proposals + bills — the SPA Bills page's data. Each bill row
     carries health, this month's occurrence/envelope stats (Paid x/y,
     envelope Used/Chgs/Paid), and the ledger-fit hint (💡): the fit summary,
     whether it diverges from the config, and its dismissed flag. `archived`
-    lists soft-removed bills (active=0) for the archived section."""
+    lists soft-removed bills (active=0) for the archived section.
+
+    `month=YYYY-MM` reads a PAST month instead: the same stats as that
+    month ended (paid x of y, received, envelope used), so the page can
+    step back through the year. The schedule itself (the bills, their
+    health, the totals) is always the live one — a bill added since shows
+    with no occurrence in a month it did not exist for. The answer names
+    the month it describes (`month`) and whether it is closed
+    (`month_final`)."""
+    import calendar as _calendar
     from ..engine import bills, budget
     from ..engine.compat import as_dict
     from .pages import _cadence_label, _proposal_summary
+    want_month = None
+    if month:
+        try:
+            yy, mm = (int(x) for x in month.split("-"))
+            dt.date(yy, mm, 1)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "month must be YYYY-MM")
+        want_month = (yy, mm)
     conn = _conn(user)
     try:
         # payday roll: a received paycheck's Next date
@@ -2360,7 +2865,16 @@ def bills_list(user: dict = Depends(_user())):
         dismissed = cfg.get("dismissed_hints") or {}
         dismissed_health = cfg.get("dismissed_health") or {}
         disabled_bills = set(cfg.get("disabled_bills") or [])
-        stats = _month_bill_stats(conn, cfg, today)
+        # the month the stats describe: this one as of today, or a past
+        # one as of its last day — the same reading the Month lens gives
+        as_of, month_key, month_final = today, f"{today:%Y-%m}", False
+        if want_month and want_month != (today.year, today.month):
+            if want_month > (today.year, today.month):
+                raise HTTPException(400, "that month has not started")
+            yy, mm = want_month
+            as_of = dt.date(yy, mm, _calendar.monthrange(yy, mm)[1])
+            month_key, month_final = f"{yy:04d}-{mm:02d}", True
+        stats = _month_bill_stats(conn, cfg, as_of)
         caps = cfg.get("occurrence_caps") or {}
         rows = []          # response rows ("bills" key) — `bills` is the module
         for b in conn.execute(
@@ -2443,6 +2957,16 @@ def bills_list(user: dict = Depends(_user())):
                                         for c in bills.companions_of(raw)],
                          "fee_total": bills.fee_total(raw),
                          **(stats.get(b["payee"]) or _EMPTY_BILL_STATS)})
+            # Two dates, two meanings, kept apart. `withdrawn_on` (from the
+            # month stats) is THIS month's missed occurrence, and only it may
+            # turn the row's status amber; `health_withdrawn_on` is the
+            # earlier cycle behind a "withdrawn" health verdict, for the
+            # health pill alone. Folding one into the other dressed a later
+            # cycle that was never charged — or one not yet due — in last
+            # cycle's withdrawal, while Today called it overdue.
+            rows[-1]["health_withdrawn_on"] = (
+                h["withdrawn_on"].isoformat() if h.get("withdrawn_on")
+                else None)
         archived = [{"payee": r["payee"], "amount": r["amount"],
                      "frequency": r["frequency"],
                      "synced_at": (r["synced_at"].isoformat()
@@ -2456,13 +2980,16 @@ def bills_list(user: dict = Depends(_user())):
         # the bills whose health is actually wrong, so the headline can point
         # at the only rows that want a decision.
         totals = budget.recurring_load(conn, today)
+        # "withdrawn" is left out on purpose: the bill WAS charged, and a
+        # charge the feed took back is a warning to check, not a decision
         totals["attention"] = sum(
             1 for r in rows
             if (r.get("health") or "") in ("stale", "mismatch", "misdated",
                                            "drifting")
             and not r.get("health_dismissed") and not r.get("disabled"))
         return {"proposals": props, "bills": rows, "archived": archived,
-                "totals": totals, "cadences": CADENCES}
+                "totals": totals, "cadences": CADENCES,
+                "month": month_key, "month_final": month_final}
     finally:
         conn.close()
 
@@ -2480,6 +3007,13 @@ def bills_detect_api(user: dict = Depends(_user())):
             "drift_applied": stats["drift_applied"]}
 
 
+def _proposal_superseded(conn, pid: str) -> bool:
+    """Was this offer withdrawn because what it offered already exists?"""
+    row = conn.execute("SELECT status FROM bill_proposals WHERE id=%s",
+                       (pid,)).fetchone()
+    return bool(row and row["status"] == "superseded")
+
+
 @router.post("/bills/proposal")
 def bills_proposal_api(user: dict = Depends(_user()),
                            body: dict = Body(...)):
@@ -2493,8 +3027,15 @@ def bills_proposal_api(user: dict = Depends(_user()),
         r = bills.apply_proposal(conn, pid, action)
         if not r.get("error"):
             _log_proposal(conn, user, pid, action, r)
+        superseded = bool(r.get("error")) and _proposal_superseded(conn, pid)
     finally:
         conn.close()
+    if superseded:
+        # the offer is gone (the bill it offered is already tracked), so a
+        # client drops its card rather than keep offering a dead button
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"detail": r["error"], "superseded": True},
+                            status_code=400)
     if r.get("error"):
         raise HTTPException(400, r["error"])
     return {"ok": True,
@@ -2521,7 +3062,9 @@ def bills_proposals_approve_all(user: dict = Depends(_user())):
         for pid in pids:
             r = bills.apply_proposal(conn, pid, "approve")
             if r.get("error"):
-                failed.append({"pid": pid, "error": r["error"]})
+                failed.append({"pid": pid, "error": r["error"],
+                               "superseded": _proposal_superseded(conn,
+                                                                  pid)})
             else:
                 approved.append(r.get("approved"))
                 _log_proposal(conn, user, pid, "approve", r)
@@ -2608,6 +3151,14 @@ def bills_bill_api(user: dict = Depends(_user()), payee: str = ""):
             "cadences": CADENCES}
 
 
+class _ArchivedBillExists(Exception):
+    """An add named a bill that is archived; the save writes nothing."""
+
+    def __init__(self, payee: str):
+        super().__init__(payee)
+        self.payee = payee
+
+
 @router.post("/bills/save")
 def bills_save_api(user: dict = Depends(_user()), body: dict = Body(...)):
     """Add or edit a bill.
@@ -2618,7 +3169,10 @@ def bills_save_api(user: dict = Depends(_user()), body: dict = Body(...)):
     key is present), merchant (match key for NEW bills only), merchants
     (the display names of the merchants the bill pays — its identity),
     show_today / match_category (bools) and category (string) — each only
-    touched when its key is present."""
+    touched when its key is present. An add (no orig_payee) over an
+    archived bill's name answers 409 {detail, archived: true, payee} unless
+    the body carries restore: true, which brings the bill back with the
+    values sent."""
     from ..engine import bills, budget
     from ..engine.compat import as_dict
     payee = _body_text(body, "payee")
@@ -2675,7 +3229,8 @@ def bills_save_api(user: dict = Depends(_user()), body: dict = Body(...)):
     category_v = None
     if "category" in body:
         cat_s = str(body["category"] or "").strip()
-        if len(cat_s) > 64:
+        if (len(cat_s) > data.CATEGORY_MAX_LEN
+                and not _category_long_ok(user, cat_s)):
             raise HTTPException(400, "category too long")
         category_v = cat_s or None
     # the TRANSACTION category the bill stamps on matched rows: only touched
@@ -2700,7 +3255,7 @@ def bills_save_api(user: dict = Depends(_user()), body: dict = Body(...)):
                          f"${bills.COMPANION_MAX_AMOUNT:.0f}")
             try:
                 win = int(c.get("window_days", bills.COMPANION_WINDOW_DAYS))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 raise HTTPException(400, "companion window must be days")
             if not 0 <= win <= 14:
                 raise HTTPException(400, "companion window is 0–14 days")
@@ -2708,7 +3263,8 @@ def bills_save_api(user: dict = Depends(_user()), body: dict = Body(...)):
                                  "window_days": win})
     if "txn_category" in body:
         txn_cat_v = str(body["txn_category"] or "").strip()
-        if len(txn_cat_v) > 64:
+        if (len(txn_cat_v) > data.CATEGORY_MAX_LEN
+                and not _category_long_ok(user, txn_cat_v)):
             raise HTTPException(400, "txn_category too long")
         # never a FLOW category: stamping TRANSFER_OUT / INCOME / LOAN
         # PAYMENTS on a bill's charges would silently drop them from spend
@@ -2729,7 +3285,10 @@ def bills_save_api(user: dict = Depends(_user()), body: dict = Body(...)):
         for m in body["merchants"]:
             if not isinstance(m, str):
                 raise HTTPException(400, "bad merchant name")
-            _merchant_name_or_400("merchant", m)
+            # uncapped: a chip must name a merchant the ledger already has
+            # (checked below), so it writes no new name, and an imported
+            # descriptor over the rename cap is a real merchant a bill pays
+            _merchant_name_or_400("merchant", m, max_len=None)
             if m.strip():
                 merchants_v.append(m.strip())
     # Validate next_due up front too: save_bill parses it via as_date only
@@ -2768,22 +3327,130 @@ def bills_save_api(user: dict = Depends(_user()), body: dict = Body(...)):
             for m in added:
                 if m.lower() not in known:
                     raise HTTPException(400, f"no merchant named {m!r}")
-        # rename: move the row + migrate the payee-keyed config entries.
-        # A rename onto an EXISTING different bill aborts the whole save —
-        # falling through would overwrite the unrelated target.
-        if orig_payee and orig_payee != payee:
-            # the existence check and the UPDATE are two statements; two
-            # renames racing onto one name both pass the check and the
-            # loser trips the (tenant_id, id) primary key — same answer
+        # The edit form names the bill it was opened on (`orig_payee`), so
+        # under that bill's row lock the save can tell that it was archived
+        # or deleted since: an archived bill stays out of the plan until it
+        # is restored, and a deleted one is not quietly recreated by the
+        # insert path. The queue's amount accept sends `orig_payee` too, so
+        # it is an edit and never brings an archived bill back. A save
+        # without `orig_payee` is an add. An add whose name an ARCHIVED
+        # bill already holds would otherwise write into that row and leave
+        # it archived while the form reports the bill added, so it is
+        # refused with `archived: true` unless the body says
+        # `restore: true` — the explicit ask to bring the bill back with
+        # the values just entered. The rename, the bill write and these
+        # checks commit together, so a refusal leaves no half-applied
+        # rename behind either.
+        renamed = bool(orig_payee and orig_payee != payee)
+        revive = False
+        with conn.transaction():
+            if not orig_payee:
+                held = conn.execute(
+                    "SELECT payee, active FROM bills WHERE id=%s FOR UPDATE",
+                    (bills._slug(payee),)).fetchone()
+                if held is not None and not held["active"]:
+                    if body.get("restore") is not True:
+                        raise _ArchivedBillExists(held["payee"] or payee)
+                    revive = True
+            if orig_payee:
+                if renamed:
+                    # the rename's own lock order — pending proposals first,
+                    # then the bill — so taking the bill here cannot invert
+                    # the order an approval locks them in
+                    conn.execute(
+                        "SELECT id FROM bill_proposals WHERE status='pending' "
+                        "AND (payee=%s OR (kind IN ('attach','merchant') "
+                        "AND evidence->>'bill_payee'=%s)) FOR UPDATE",
+                        (orig_payee, orig_payee))
+                held = conn.execute(
+                    "SELECT active FROM bills WHERE payee=%s FOR UPDATE",
+                    (orig_payee,)).fetchone()
+                if held is None:
+                    raise HTTPException(
+                        409, "this bill was deleted after the form was "
+                             "opened — add it again to keep tracking it")
+                if not held["active"]:
+                    raise HTTPException(
+                        409, "this bill was archived after the form was "
+                             "opened — restore it to edit it")
+            # rename: move the row (its payee-keyed config follows below).
+            # A rename onto an EXISTING different bill aborts the whole save —
+            # falling through would overwrite the unrelated target.
+            if renamed:
+                # the existence check and the UPDATE are two statements; two
+                # renames racing onto one name both pass the check and the
+                # loser trips the (tenant_id, id) primary key — same answer
+                try:
+                    taken = (bills.get_bill(conn, payee) is not None
+                             or bills.rename_bill(conn, orig_payee, payee) == 0)
+                except psycopg.errors.UniqueViolation:
+                    taken = True
+                if taken:
+                    raise HTTPException(
+                        409, f"a bill named {payee!r} already exists")
+            old = bills.get_bill(conn, payee)
+            if "cadence" not in body and old is not None:
+                # an amount-only edit (the attention queue's Accept from a
+                # client whose row lacks cadence_value) must not silently turn
+                # a yearly bill monthly through the default — keep its own
+                _f, _, _i = _bill_cadence(as_dict(old["raw"])).partition(":")
+                # raw can arrive verbatim from a restore ZIP: only a cadence
+                # that would have passed the explicit path's own checks is
+                # carried forward, else the parsed default stands
+                try:
+                    _n = int(_i or 1)
+                except (TypeError, ValueError):
+                    _n = 0
+                if (_f.upper() in ("DAILY", "WEEKLY", "MONTHLY", "YEARLY",
+                                   "ENVELOPE", "ONE_TIME")
+                        and 1 <= _n <= 240):
+                    freq, interval = _f.upper(), _n
+            src, last_seen = "manual", None
+            if old is not None:
+                old_raw = as_dict(old["raw"])
+                src = old_raw.get("source", "manual")
+                # keep the series' history floor — editing must not re-floor the
+                # bill as brand-new
+                last_seen = old_raw.get("lastDueOn")
+            # New bill: pin its match key from the merchant it was added from or,
+            # failing that, the payee itself — so it matches the ledger
+            # immediately. Edits pass None so save_bill keeps the derived merchant.
+            merchant_val = (None if old is not None
+                            else _body_text(body, "merchant", default=payee))
+            # Direction: an explicit flag wins. Absent, an existing bill
+            # (archived included) keeps its own, as it keeps its cadence and
+            # category; a new bill takes the direction its payee's history
+            # shows — the same majority vote the history page renders as
+            # "received" — so adding an employer from its own history page
+            # saves income, not an expense that would match no row and read
+            # as an unpaid paycheck-sized charge every cycle.
+            if "income" in body:
+                income_v = bool(body.get("income"))
+            elif old is not None:
+                income_v = (old["amount"] or 0) > 0
+            else:
+                income_v = bool(bills.merchant_history(
+                    conn, merchant_val or payee, months=None)["inflow"])
             try:
-                taken = (bills.get_bill(conn, payee) is not None
-                         or bills.rename_bill(conn, orig_payee, payee) == 0)
-            except psycopg.errors.UniqueViolation:
-                taken = True
-            if taken:
-                raise HTTPException(
-                    409, f"a bill named {payee!r} already exists")
-
+                bills.save_bill(
+                    conn, payee=payee, amount=amount,
+                    bill_type="envelope" if freq == "ENVELOPE" else "occurrence",
+                    frequency=None if freq in ("ONE_TIME", "ENVELOPE") else freq,
+                    interval=interval,
+                    next_due=next_due_in or None,
+                    source=src,
+                    category=(category_v if "category" in body
+                              else old["category"] if old is not None else None),
+                    last_seen=last_seen, income=income_v,
+                    merchant=merchant_val,
+                    manual_touch=True,  # human edit → drift grace
+                    show_today=show_today_v, match_category=match_cat_v,
+                    txn_category=txn_cat_v, companions=companions_v,
+                    merchants=merchants_v, revive=revive)
+            except ValueError as e:     # $0 amount / slug collision / bad date
+                raise HTTPException(400, str(e))
+        if renamed:
+            # payee-keyed settings follow the rename once it has committed
             def _migrate(cfg):
                 changed = False
                 dis = cfg.get("disabled_bills") or []
@@ -2798,53 +3465,6 @@ def bills_save_api(user: dict = Depends(_user()), body: dict = Body(...)):
                     changed = True
                 return changed
             _save_payee_config(conn, _migrate)
-        old = bills.get_bill(conn, payee)
-        if "cadence" not in body and old is not None:
-            # an amount-only edit (the attention queue's Accept from a
-            # client whose row lacks cadence_value) must not silently turn
-            # a yearly bill monthly through the default — keep its own
-            _f, _, _i = _bill_cadence(as_dict(old["raw"])).partition(":")
-            # raw can arrive verbatim from a restore ZIP: only a cadence
-            # that would have passed the explicit path's own checks is
-            # carried forward, else the parsed default stands
-            try:
-                _n = int(_i or 1)
-            except (TypeError, ValueError):
-                _n = 0
-            if (_f.upper() in ("DAILY", "WEEKLY", "MONTHLY", "YEARLY",
-                               "ENVELOPE", "ONE_TIME")
-                    and 1 <= _n <= 240):
-                freq, interval = _f.upper(), _n
-        src, last_seen = "manual", None
-        if old is not None:
-            old_raw = as_dict(old["raw"])
-            src = old_raw.get("source", "manual")
-            # keep the series' history floor — editing must not re-floor the
-            # bill as brand-new
-            last_seen = old_raw.get("lastDueOn")
-        # New bill: pin its match key from the merchant it was added from or,
-        # failing that, the payee itself — so it matches the ledger
-        # immediately. Edits pass None so save_bill keeps the derived merchant.
-        merchant_val = (None if old is not None
-                        else _body_text(body, "merchant", default=payee))
-        try:
-            bills.save_bill(
-                conn, payee=payee, amount=amount,
-                bill_type="envelope" if freq == "ENVELOPE" else "occurrence",
-                frequency=None if freq in ("ONE_TIME", "ENVELOPE") else freq,
-                interval=interval,
-                next_due=next_due_in or None,
-                source=src,
-                category=(category_v if "category" in body
-                          else old["category"] if old is not None else None),
-                last_seen=last_seen, income=bool(body.get("income")),
-                merchant=merchant_val,
-                manual_touch=True,  # human edit → drift grace
-                show_today=show_today_v, match_category=match_cat_v,
-                txn_category=txn_cat_v, companions=companions_v,
-                merchants=merchants_v)
-        except ValueError as e:     # $0 amount / slug collision / bad date
-            raise HTTPException(400, str(e))
         # (re)stamp this bill's rows right away — an edit that sets or
         # changes the transaction category should show on the ledger on
         # the next load, not after the nightly pass. Also on a plain edit:
@@ -2867,10 +3487,17 @@ def bills_save_api(user: dict = Depends(_user()), body: dict = Body(...)):
             _save_payee_config(conn, _set_cap)
         _now = _activity.bill_snapshot(bills.get_bill(conn, payee))
         _activity.record(conn, user, "bill",
-                         "edited" if _was is not None else "added",
+                         "restored" if revive
+                         else "edited" if _was is not None else "added",
                          target=payee, label=payee,
                          detail={"before": _was, "after": _now})
-        return {"ok": True, "payee": payee}
+        return ({"ok": True, "payee": payee, "restored": True} if revive
+                else {"ok": True, "payee": payee})
+    except _ArchivedBillExists as e:
+        return JSONResponse(status_code=409, content={
+            "detail": f"an archived bill named {e.payee!r} already exists — "
+                      "restore it to track it again",
+            "archived": True, "payee": e.payee})
     finally:
         conn.close()
 
@@ -3099,26 +3726,46 @@ def bills_history_api(user: dict = Depends(_user()), payee: str = "",
     6m 1y 3y 5y all; bills.HISTORY_WINDOWS) and bounds the transaction
     list only; the lifetime aggregate is lifetime by definition. An unknown
     value reads as all."""
-    from ..engine import bills, budget
+    from ..engine import bills, budget, merchant_dedup
     from ..engine.compat import as_dict
     from .pages import _cadence_label, _proposal_summary
     conn = _conn(user)
     try:
+        # whether this name is a merchant the ledger files rows under — the
+        # clients offer "Merge into…" only then (a bill's own label that no
+        # row displays has nothing to merge)
+        merchant_in_use = bool(payee.strip()) and merchant_dedup.display_in_use(
+            conn, payee)
         hist = bills.merchant_history(
             conn, payee, window=window if window in bills.HISTORY_WINDOWS else "all")
         bill = bills.get_bill(conn, payee)
         # a merchant clicked from Transactions may already be covered by a
         # bill under a different display name — link to it instead of
         # offering a duplicate add. Uses the bill's REAL matcher.
+        #
+        # Several bills can match one string (the matcher keys on a brand's
+        # leading word, so "Zenith Gas" and "Zenith Coffee" both match a
+        # coffee-shop descriptor). The answer has to be the same on every
+        # load and the bill that names this merchant most closely: the one
+        # whose match key shares the most words with the text, then the
+        # longer key, then the payee name as a stable tiebreak. Only live
+        # bills are candidates — an archived one covers nothing.
         covered_by = None
         if bill is None and payee.strip():
+            text = payee.lower()
+            words = set(re.findall(r"[a-z0-9]+", text))
+            best = None
             for b in conn.execute(
                     "SELECT payee, merchant FROM bills "
-                    "WHERE active=1 AND amount<0").fetchall():
+                    "WHERE active=1 AND amount<0 ORDER BY payee").fetchall():
                 if b["merchant"] and budget.text_matches_merchant(
-                        payee.lower(), b["merchant"]):
-                    covered_by = b["payee"]
-                    break
+                        text, b["merchant"]):
+                    key = b["merchant"].lower()
+                    shared = len(words & set(re.findall(r"[a-z0-9]+", key)))
+                    rank = (-shared, -len(key), b["payee"])
+                    if best is None or rank < best[0]:
+                        best = (rank, b["payee"])
+            covered_by = best[1] if best else None
         bill_info = health = None
         if bill is not None and bill["active"]:
             raw = as_dict(bill["raw"])
@@ -3176,6 +3823,11 @@ def bills_history_api(user: dict = Depends(_user()), payee: str = "",
                            "summary": summaries[p["id"]]}
                           for p in props],
             "covered_by": covered_by, "hint_dismissed": hint_dismissed,
+            # an archived bill under this payee: `bill` is null for it (it
+            # is not live), so a client offering "add as recurring" here
+            # would edit that bill instead — offer Restore on true
+            "bill_archived": bill is not None and not bill["active"],
+            "merchant_in_use": merchant_in_use,
             "cadences": CADENCES}
 
 
@@ -3202,7 +3854,7 @@ def merchant_category_preview_api(user: dict = Depends(_user()),
     demoguard.deny(user)
     _may_edit(user)
     payee = _body_text(body, "payee")
-    category = _body_text(body, "category")
+    category = _category_text(body, "category", user=user)
     if not payee or not category:
         raise HTTPException(400, "payee and category required")
     canon_only = canon_only or bool(body.get("canon_only"))
@@ -3220,7 +3872,7 @@ def merchant_category_apply_api(user: dict = Depends(_user()),
     demoguard.deny(user)
     _may_edit(user)
     payee = _body_text(body, "payee")
-    category = _body_text(body, "category")
+    category = _category_text(body, "category", user=user)
     if not payee or not category:
         raise HTTPException(400, "payee and category required")
     conn = _conn(user)
@@ -3292,7 +3944,7 @@ def rules_set_api(user: dict = Depends(_user()), body: dict = Body(...)):
     demoguard.deny(user)
     _may_edit(user)
     merchant = _body_text(body, "merchant")
-    category = _body_text(body, "category")
+    category = _category_text(body, "category", user=user)
     if not merchant or not category:
         raise HTTPException(400, "merchant and category required")
     conn = _conn(user)
@@ -3325,7 +3977,7 @@ def categories_rename_api(user: dict = Depends(_user()),
     demoguard.deny(user)
     _may_edit(user)
     old = _body_text(body, "old", "from")
-    new = _body_text(body, "new", "to")
+    new = _category_text(body, "new", "to", user=user)
     if not old or not new:
         raise HTTPException(400, "old and new names are required")
     conn = _conn(user)
@@ -3741,7 +4393,8 @@ _SETTINGS_FIELDS = ("food_monthly", "other_monthly", "custom_buckets",
                     # card (secrets stay write-only)
                     "plaid_client_id", "plaid_env",
                     "mx_client_id", "mx_env",
-                    # pinned UI theme (absent = follow the OS)
+                    # the owner's UI theme: auto/light/dark (absent = the
+                    # dark default)
                     "theme",
                     # default landing page per client (absent = Today):
                     # a web route / a mobile tab name
@@ -3780,7 +4433,7 @@ _SETTINGS_FIELDS = ("food_monthly", "other_monthly", "custom_buckets",
                     # reported, so the Settings card can show what is
                     # already handled without the user retyping it
                     "merchant_cities_seen",
-                    # {daily,weekly,monthly} local-time schedule
+                    # {daily,monthly,yearly} local-time schedule
                     "email_schedule")
 
 
@@ -3922,8 +4575,103 @@ def _drop_stale_readds(conn, cfg: dict, prev: set, recips: list,
     return [r for r in recips if r.strip().lower() not in drop]
 
 
+
+def _apply_recipient_deltas(conn, cfg: dict, body: dict, user: dict) -> None:
+    """An add or a remove names the one address it changes instead of
+    posting the whole list. A whole list is a copy loaded earlier: saved
+    from a second device, it silently drops whatever the first device
+    added since. Applied to the STORED list inside the caller's config
+    transaction, so two edits made at once both land.
+
+    Without a whole list in the body, `email_recipients_added` is the add
+    itself; alongside one it stays the hint `_drop_stale_readds` reads.
+    An added address passes the same rules as one in a whole list: valid,
+    under the cap, and on hosted a member of this household."""
+    deltas = {}
+    for key in ("email_recipients_added", "email_recipients_removed"):
+        if key not in body:
+            continue
+        if not isinstance(body[key], (list, str)):
+            raise HTTPException(400, f"{key} must be a list of addresses")
+        deltas[key] = mailguard.parse_recipients(body[key], cap=None)
+    if not deltas:
+        return
+    added = deltas.get("email_recipients_added") or []
+    removed = {a.strip().lower()
+               for a in deltas.get("email_recipients_removed") or []}
+    if demoguard.people_hidden(user):
+        # the shared demonstration login is shown only its own row, so
+        # the only entry it can mean to take off is its own
+        mine = str(user.get("email") or "").strip().lower()
+        removed &= {mine}
+    stored = mailguard.parse_recipients(cfg.get("email_recipients") or [],
+                                        cap=None)
+    have = {r.strip().lower() for r in stored}
+    fresh = [a for a in added
+             if a.strip().lower() not in have
+             and a.strip().lower() not in removed]
+    mailguard.check_recipients(conn, fresh)
+    mailguard.refuse_owner_added(user["tenant_id"], fresh)
+    out = [r for r in stored if r.strip().lower() not in removed] + fresh
+    if len(out) > mailguard.MAX_RECIPIENTS:
+        raise HTTPException(
+            400, f"that is {len(out)} recipients — the limit is "
+                 f"{mailguard.MAX_RECIPIENTS}. Remove some and save again.")
+    if added and cfg.get(_REMOVED_KEY):
+        # an address someone deliberately adds back is theirs to add
+        meant = {_address_digest(a) for a in added}
+        keep = [x for x in cfg[_REMOVED_KEY] if x not in meant]
+        if keep:
+            cfg[_REMOVED_KEY] = keep
+        else:
+            cfg.pop(_REMOVED_KEY, None)
+    if out:
+        cfg["email_recipients"] = out
+    else:
+        cfg.pop("email_recipients", None)
+
+def _apply_email_pref(cfg: dict, change, user: dict) -> None:
+    """One address, one kind, on or off — applied to the stored choices
+    inside the caller's config transaction, so two devices changing two
+    boxes at once both land. The owner decides for anyone on the mail;
+    everyone else, and the shared demonstration login (which is shown no
+    one else's row), only for their own address."""
+    from ..notify import email_prefs
+    if not isinstance(change, dict):
+        raise HTTPException(
+            400, "email_prefs_set must be {address, kind, on}")
+    kind, on = change.get("kind"), change.get("on")
+    if kind not in email_prefs.KINDS:
+        raise HTTPException(
+            400, f"kind must be one of {', '.join(email_prefs.KINDS)}")
+    if not isinstance(on, bool):
+        raise HTTPException(400, "on must be true or false")
+    boxes = mailguard.parse_recipients(
+        change.get("address") if isinstance(change.get("address"), str)
+        else "", cap=None)
+    if len(boxes) != 1:
+        raise HTTPException(400, "address must be one email address")
+    address = boxes[0].strip().lower()
+    mine = str(user.get("email") or "").strip().lower()
+    if address != mine and (user.get("role") != "owner"
+                            or demoguard.people_hidden(user)):
+        raise HTTPException(
+            403, "you can only change which emails you receive yourself")
+    try:
+        email_prefs.set_pref(cfg, address, kind, on,
+                             cap=mailguard.MAX_RECIPIENTS)
+    except OverflowError as e:
+        raise HTTPException(400, str(e))
+
+
 def _settings_view(cfg: dict) -> dict:
     out = {k: cfg.get(k) for k in _SETTINGS_FIELDS}
+    # publish the schedule the worker actually runs, so no client has to
+    # invent a default for a household that never saved one. Here, not in
+    # one handler: the read and the save reply both build from this view,
+    # and clients seed their cache from either.
+    from ..notify.schedule import effective_email_schedule
+    out["email_schedule"] = effective_email_schedule(cfg)
     # business-wizard step marks — always present so the SPA renders one
     # shape whether or not a business has ever been set up
     out["biz_wizard_steps"] = cfg.get("biz_wizard_steps") or {}
@@ -3947,6 +4695,9 @@ def _settings_view(cfg: dict) -> dict:
     out["llm_extra_body_set"] = bool(cfg.get("llm_extra_body"))
     out["smtp_password_set"] = bool(cfg.get("smtp_password"))
     out["plaid_secret_set"] = bool(cfg.get("plaid_secret"))
+    # what a credential rotation paused, for the banner (None = nothing)
+    from ..notify import outbound_pause as _outbound
+    out["outbound_paused"] = _outbound.paused(cfg)
     # Hosted: the host owns mail and the aggregator, so these are not the
     # tenant's to see. Withheld rather than blanked — a blank field reads
     # as "unset, go ahead and fill me in", which is exactly the invitation
@@ -4041,7 +4792,8 @@ def _settings_view(cfg: dict) -> dict:
 
 
 def _recipient_status(tenant_id, configured: list[str],
-                      muted: list[str] | None = None) -> list[dict]:
+                      muted: list[str] | None = None,
+                      cfg: dict | None = None) -> list[dict]:
     """Who receives the scheduled mail, and whether it reaches them.
 
     A plain list of addresses can only tell you what you typed. It cannot say
@@ -4064,6 +4816,9 @@ def _recipient_status(tenant_id, configured: list[str],
     standing to make about someone else's mailbox.
     delivery — the provider says mail to it is failing; the cadence is
     HELD until it is fixed.
+    prefs — which kinds of mail this address receives
+    (`email_prefs.KINDS`), as the worker reads them; a mute
+    still stops all of it.
     invite — `invited` (asked, no answer yet), `accepted`,
     `declined`, `expired`, or null for an address that has
     never been asked. This is the one that decides whether
@@ -4074,6 +4829,7 @@ def _recipient_status(tenant_id, configured: list[str],
     from ..db import tenancy as _ten
     from ..notify import delivery as _delivery
     from ..notify import recipient_invites as _invites
+    from ..notify import email_prefs as _email_prefs
     rows, owner_email = [], None
     try:
         # users is a control-plane table the app role reads on every
@@ -4128,6 +4884,7 @@ def _recipient_status(tenant_id, configured: list[str],
             # asked not to receive the scheduled mail (per-person opt-out;
             # the owner can mute themselves too)
             "muted": e.lower() in muted_set,
+            "prefs": _email_prefs.row(cfg or {}, e),
             "member": bool(m),
             "verified": (bool(m["verified_at"]) if m else None),
             "delivery": (state["state"] if state else None),
@@ -4151,6 +4908,93 @@ def _recipient_status(tenant_id, configured: list[str],
     return rows
 
 
+def _hide_people(view: dict, user: dict) -> dict:
+    """Cut the settings view's recipient lists to the caller's own row
+    when people are hidden from it. Every door that returns the view calls
+    this one helper, so the read and the write answer alike."""
+    if demoguard.people_hidden(user):
+        for k in ("email_recipients", "email_muted"):
+            if k in view:
+                view[k] = demoguard.own_addresses_only(user, view.get(k))
+        if "email_recipient_status" in view:
+            mine = set(demoguard.own_addresses_only(
+                user, [r.get("email") for r in
+                       view["email_recipient_status"]]))
+            view["email_recipient_status"] = [
+                r for r in view["email_recipient_status"]
+                if r.get("email") in mine]
+        # the rotation's record names the paused recipients too; a record
+        # left naming nothing the caller may see is no record for it
+        paused = view.get("outbound_paused")
+        if isinstance(paused, dict):
+            paused = {**paused, "recipients": demoguard.own_addresses_only(
+                user, paused.get("recipients"))}
+            # and the members a recovery removed, by address
+            if "removed_members" in paused:
+                gone = [m for m in (paused.get("removed_members") or [])
+                        if isinstance(m, dict)]
+                mine = set(demoguard.own_addresses_only(
+                    user, [m.get("email") for m in gone]))
+                paused["removed_members"] = [
+                    m for m in gone if m.get("email") in mine]
+            view["outbound_paused"] = (
+                paused if (paused["smtp"] or paused["llm"]
+                           or paused["recipients"]
+                           or paused.get("aggregator")
+                           or paused.get("removed_members")) else None)
+    paused = view.get("outbound_paused")
+    if (isinstance(paused, dict) and paused.get("removed_members")
+            and user.get("role") != "owner"):
+        # who an owner's recovery removed is the owner's to review; anyone
+        # else reading the household's settings learns how many, not who
+        paused = dict(paused)
+        paused["removed_members_count"] = len(paused.pop("removed_members"))
+        view["outbound_paused"] = paused
+    paused = view.get("outbound_paused")
+    if (isinstance(paused, dict) and "aggregator_keys" in paused
+            and (user.get("role") != "owner"
+                 or demoguard.people_hidden(user))):
+        # which Plaid or MX client the bank-link hold is about is the
+        # owner's to judge (they confirm or remove it); anyone else learns
+        # that new links are held, not which client
+        paused = dict(paused)
+        paused.pop("aggregator_keys")
+        view["outbound_paused"] = paused
+    return view
+
+
+def _merge_unseen_people(body: dict, cfg: dict, user: dict) -> None:
+    """The shared demonstration login is shown only its own row of the
+    recipient and mute lists, and both clients save those lists whole — so
+    its save carries only what it saw. Put back every stored entry it was
+    not shown before the save reads the body, or one toggle of its own
+    stops everyone else's mail and clears their mutes. Its own row is
+    whatever it posted."""
+    if not demoguard.people_hidden(user):
+        return
+    mine = str(user.get("email") or "").strip().lower()
+    for key, stored in (
+            ("email_recipients",
+             mailguard.parse_recipients(cfg.get("email_recipients") or [])),
+            ("email_muted", list(cfg.get("email_muted") or []))):
+        if key not in body:
+            continue
+        posted = body[key]
+        if isinstance(posted, str):
+            posted = mailguard.parse_recipients(posted)
+        if not isinstance(posted, list):
+            continue                    # the save's own type check answers
+        unseen = [a for a in stored if str(a).strip().lower() != mine]
+        kept = {str(u).strip().lower() for u in unseen}
+        if key == "email_muted":
+            # a mute is the one entry here that needs no step-up: an
+            # address it was never shown, posted on this list, would
+            # silence that member's mail. Only its own mute is its to set.
+            posted = demoguard.own_addresses_only(user, posted)
+        body[key] = unseen + [p for p in posted
+                              if str(p).strip().lower() not in kept]
+
+
 @router.get("/settings")
 def settings_get(user: dict = Depends(_user())):
     from ..engine import budget
@@ -4160,13 +5004,10 @@ def settings_get(user: dict = Depends(_user())):
     finally:
         conn.close()
     view = _settings_view(cfg)
-    # publish the schedule the worker actually runs, so no client has to
-    # invent a default for a household that never saved one
-    from ..notify.schedule import effective_email_schedule
-    view["email_schedule"] = effective_email_schedule(cfg)
     view["email_recipient_status"] = _recipient_status(
         user["tenant_id"], cfg.get("email_recipients") or [],
-        cfg.get("email_muted") or [])
+        cfg.get("email_muted") or [], cfg)
+    _hide_people(view, user)
     if demoguard.is_demo(user["tenant_id"]):
         # Feedback is OFF on a demo and cannot be switched on: the tab
         # would invite bug reports about synthetic
@@ -4189,7 +5030,8 @@ _DEMO_DOOR_KEYS = frozenset({
     "smtp_starttls",
     "llm_url", "llm_model", "llm_api_key", "llm_vision_model",
     "llm_extra_body", "llm_backends", "llm_roles",
-    "email_recipients", "taxdocs_allow_remote_llm",
+    "email_recipients", "email_recipients_added", "email_recipients_removed",
+    "taxdocs_allow_remote_llm",
 })
 
 
@@ -4238,10 +5080,14 @@ def _outbound_repointed(conn, before: dict, after: dict) -> list[str]:
         # runs on every settings save, including the one that fixes it
         try:
             port = int(c.get("smtp_port") or 587)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             port = str(c.get("smtp_port"))
-        return (str(c.get("smtp_host") or ""), port,
-                str(c.get("smtp_user") or ""), str(c.get("smtp_from") or ""),
+        # an empty From sends as the relay account when that is an
+        # address (report.resolve_smtp), so filling it in is no repoint
+        user_s = str(c.get("smtp_user") or "")
+        from_s = str(c.get("smtp_from") or "") or (
+            user_s if mailguard.valid_address(user_s) else "")
+        return (str(c.get("smtp_host") or ""), port, user_s, from_s,
                 c.get("smtp_starttls", True) is not False,
                 str(c.get("smtp_password") or ""))
     if after.get("smtp_host") and _relay(before) != _relay(after):
@@ -4339,10 +5185,12 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                 _prev_entries = list(_prev_entries)
             _prev_recips, _prev_asked = mailguard.stored_mailboxes(
                 _prev_entries)
+            _merge_unseen_people(body, cfg, user)
             # the whole document before the save, so the activity log can
             # name the KEYS that changed (never a value)
             import copy as _copy
             _cfg_was = _copy.deepcopy(cfg)
+            _smtp_from_missing = _smtp_user_given = False
             def _num(v, field):
                 if v is None or v == "":
                     return 0.0
@@ -4469,8 +5317,10 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                             400, "step state must be done|skipped|null")
                 cfg["ret_wizard_steps"] = steps
             if "email_schedule" in body:
-                # {daily:{on,hour}, weekly:{on,hour,weekday}, monthly:
-                # {on,hour}} — hours LOCAL (OIKONOME_TZ), weekday 0=Monday
+                # {daily:{on,hour}, monthly:{on,hour}, yearly:{on,hour}} —
+                # hours LOCAL (OIKONOME_TZ). (The weekly report is
+                # retired; a stored `weekly` entry is dropped
+                # on the next save and ignored by the worker.)
                 raw = body["email_schedule"]
                 if raw in (None, {}):
                     cfg.pop("email_schedule", None)   # legacy daily behavior
@@ -4478,25 +5328,31 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                     raise HTTPException(400, "email_schedule must be an object")
                 else:
                     clean = {}
+                    # A cadence the body leaves out keeps what the worker
+                    # runs for it now (the effective schedule, so a
+                    # household that never saved one keeps its default
+                    # daily email): a client saving only the monthly card
+                    # must not switch the daily email off by omission.
+                    # Turning one off is an explicit {"on": false}.
+                    from ..notify.schedule import effective_email_schedule
+                    _was_sched = effective_email_schedule(cfg)
                     # each cadence (yearly included) carries
                     # per-channel flags — `on` stays email (back-compat),
                     # sms/push are additive
-                    for cad in ("daily", "weekly", "monthly", "yearly"):
+                    for cad in ("daily", "monthly", "yearly"):
+                        if cad not in raw:
+                            if isinstance(_was_sched.get(cad), dict):
+                                raw = {**raw, cad: _was_sched[cad]}
                         c = raw.get(cad) or {}
                         if not isinstance(c, dict):
                             raise HTTPException(400, f"{cad} must be an object")
                         try:
                             hour = int(c.get("hour", 7))
-                            weekday = int(c.get("weekday", 0))
-                        except (TypeError, ValueError):
-                            raise HTTPException(400, "hour/weekday must be numbers")
+                        except (TypeError, ValueError, OverflowError):
+                            raise HTTPException(400, "hour must be a number")
                         if not 0 <= hour <= 23:
                             raise HTTPException(400, "hour must be 0-23")
-                        if not 0 <= weekday <= 6:
-                            raise HTTPException(400, "weekday must be 0-6")
                         entry = {"on": bool(c.get("on")), "hour": hour}
-                        if cad == "weekly":
-                            entry["weekday"] = weekday
                         if c.get("sms"):
                             entry["sms"] = True
                         if c.get("push"):
@@ -4548,6 +5404,15 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                 # and the page would keep promising an hour nobody keeps.
                 from .. import localtime
                 z = str(body["timezone"] or "").strip()
+                # A client adopting the device's zone on its own says so.
+                # That adoption is only right while the household still
+                # follows the instance default: two phones in two places,
+                # or a phone restoring an old snapshot, must not overwrite
+                # a zone someone chose by hand in the meantime.
+                if body.get("timezone_adopted") and localtime.valid_zone(
+                        cfg.get("timezone")):
+                    raise HTTPException(
+                        409, "the household already keeps its own time zone")
                 if not z:
                     cfg.pop("timezone", None)
                 elif not localtime.valid_zone(z):
@@ -4568,11 +5433,16 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                     else:
                         cfg[key] = v
             if "theme" in body:
-                t = str(body["theme"] or "auto")
-                if t not in ("auto", "light", "dark"):
+                # "auto" (follow the OS) is a choice of its own and is
+                # stored as one: both clients read an absent theme as the
+                # dark default, so storing auto as absence would turn it
+                # back into dark on the next reconcile. Only an empty
+                # value clears the key, back to that default.
+                t = str(body["theme"] or "")
+                if t and t not in ("auto", "light", "dark"):
                     raise HTTPException(400, "theme must be auto, light or dark")
-                if t == "auto":
-                    cfg.pop("theme", None)     # absent = follow the OS
+                if not t:
+                    cfg.pop("theme", None)
                 else:
                     cfg["theme"] = t
             if "today_view" in body:
@@ -4613,7 +5483,7 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                     try:
                         port = int(body.get("smtp_port",
                                             cfg.get("smtp_port") or 587) or 587)
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError, OverflowError):
                         raise HTTPException(400, "smtp_port must be a number")
                     if not 1 <= port <= 65535:
                         raise HTTPException(400, "smtp_port out of range")
@@ -4622,6 +5492,31 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                         cfg["smtp_user"] = str(body["smtp_user"] or "").strip()
                     if "smtp_from" in body:
                         cfg["smtp_from"] = str(body["smtp_from"] or "").strip()
+                    if not cfg.get("smtp_from"):
+                        # An empty From would send as a made-up local
+                        # address that an authenticated relay refuses (the
+                        # sender is not one the account owns) or the
+                        # recipient's DMARC check drops, and the daily
+                        # email would stop with nothing saying why. The
+                        # relay account is almost always the mailbox, so it
+                        # stands in, as the setup wizard already does.
+                        # Without one the save is refused, after the
+                        # step-up check below so an unproven session learns
+                        # nothing from the order of the answers.
+                        relay_user = str(cfg.get("smtp_user") or "")
+                        if mailguard.valid_address(relay_user):
+                            cfg["smtp_from"] = relay_user
+                        elif not relay_user and (
+                                default_from := _relay_default_from(host)):
+                            # an unauthenticated LAN relay, which is all
+                            # the setup wizard asks for: it accepts any
+                            # sender, so a no-reply address on the
+                            # instance's own name (or the relay's) is one
+                            # it and the recipient can both read
+                            cfg["smtp_from"] = default_from
+                        else:
+                            _smtp_from_missing = True
+                            _smtp_user_given = bool(relay_user)
                     if "smtp_starttls" in body:
                         # `resolve_smtp` reads this key, so it needs a writer:
                         # without one, configuring SMTP in the UI silently forces
@@ -4703,6 +5598,17 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                                                      f"bucket '{name}' monthly")),
                             "categories": cats, "merchants": merch})
                     cfg["custom_buckets"] = cleaned
+            # A phone sends the one-address delta AND the whole list from
+            # its copy, because a server older than the delta keys knows
+            # only the list; here the delta wins, so the stale copy never
+            # drops an address another device added. The delta wins only
+            # when it actually names an address: older phones and web tabs
+            # always send an empty `email_recipients_added` beside the whole
+            # list, and for them the shortened list IS the edit — taking an
+            # empty delta over it would silently keep the removed address
+            _delta_keys = ("email_recipients_added", "email_recipients_removed")
+            if "email_recipients" in body and any(body.get(k) for k in _delta_keys):
+                body = {k: v for k, v in body.items() if k != "email_recipients"}
             if "email_recipients" in body:
                 # Every sibling list key isinstance-checks and 400s; without
                 # one a dict/int/bool feeds straight into parse_recipients'
@@ -4736,6 +5642,14 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                     cfg["email_recipients"] = recips
                 else:
                     cfg.pop("email_recipients", None)
+            else:
+                _apply_recipient_deltas(conn, cfg, body, user)
+            if "email_muted" in body and (body.get("email_muted_add")
+                                           or body.get("email_muted_remove")):
+                # same rule as the recipient list: a delta that names an
+                # address wins over the fallback copy an older server would
+                # have used; an empty one leaves the whole list in charge
+                body = {k: v for k, v in body.items() if k != "email_muted"}
             if "email_muted" in body:
                 # per-person opt-out from the scheduled mail, the owner
                 # included. Stored lowercased — the worker filters
@@ -4764,11 +5678,40 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                     cfg["email_muted"] = muted_in
                 else:
                     cfg.pop("email_muted", None)
+            # A toggle names the one address it changes instead of posting
+            # the whole list: two members muting themselves from two phones,
+            # or one phone working from a cached copy, must not un-mute
+            # each other. Applied to the stored list inside this write.
+            for key, add in (("email_muted_add", True),
+                             ("email_muted_remove", False)):
+                if key not in body:
+                    continue
+                if not isinstance(body[key], (list, str)):
+                    raise HTTPException(400, f"{key} must be a list of addresses")
+                delta = {m.lower() for m in
+                         mailguard.parse_recipients(body[key], cap=None)}
+                # the shared demonstration login is shown only its own
+                # address, so its own is the only mute it can mean to
+                # change: anyone else's would silence (or un-silence) a
+                # member it was never shown
+                delta = set(demoguard.own_addresses_only(user, delta))
+                have = {str(m).lower() for m in (cfg.get("email_muted") or [])}
+                have = have | delta if add else have - delta
+                if len(have) > mailguard.MAX_RECIPIENTS:
+                    raise HTTPException(
+                        400, f"that is {len(have)} muted addresses — "
+                             f"the limit is {mailguard.MAX_RECIPIENTS}.")
+                if have:
+                    cfg["email_muted"] = sorted(have)
+                else:
+                    cfg.pop("email_muted", None)
+            if "email_prefs_set" in body:
+                _apply_email_pref(cfg, body["email_prefs_set"], user)
             if "email_send_hour_utc" in body:
                 try:
                     cfg["email_send_hour_utc"] = max(0, min(23,
                                                      int(body["email_send_hour_utc"])))
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     raise HTTPException(400, "hour must be 0-23")
             if "birthdate" in body:
                 v = str(body["birthdate"] or "").strip()
@@ -4854,6 +5797,13 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                 if not isinstance(goals_in, list):
                     raise HTTPException(400, "savings_goals must be a list")
                 out_goals, names = [], set()
+                # the stored goals by name, for the match-words rule below:
+                # both editors and the balance planner post the WHOLE list,
+                # so an untouched legacy row rides along on every save
+                stored_goals = {
+                    str(sg.get("name") or "").strip().lower(): sg
+                    for sg in (cfg.get("savings_goals") or [])
+                    if isinstance(sg, dict)}
                 for g in goals_in[:30]:
                     if not isinstance(g, dict):
                         raise HTTPException(400, "each goal must be an object")
@@ -4888,15 +5838,42 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                     if mode not in ("", "monthly", "sweep"):
                         raise HTTPException(
                             400, "mode must be 'monthly' or 'sweep'")
+                    # the match words are a list: an object or a number
+                    # cannot be sliced (a 500), and a bare string would be
+                    # sliced into single letters that match everything
+                    tokens_in = g.get("tokens") or []
+                    if not isinstance(tokens_in, list):
+                        raise HTTPException(
+                            400, f"goal '{name}': tokens must be a list")
                     goal = {"name": name, "target": round(max(0.0, target), 2),
                             "monthly_plan": plan,
                             "account_id": str(g.get("account_id") or "") or None,
                             "tokens": [str(t).strip()[:60]
-                                       for t in (g.get("tokens") or [])[:8]
+                                       for t in tokens_in[:8]
                                        if str(t).strip()],
                             "start_balance": round(
                                 _num(g.get("start_balance") or 0,
                                      "start_balance"), 2)}
+                    # Match words with no account cannot be measured: they
+                    # match both legs of a transfer and nothing says which
+                    # side is the fund, so the goal would read as plan-only
+                    # forever. Refuse the shape on the way in, except for a
+                    # stored goal posted back with the same (absent) account
+                    # and the same words: refusing that row would lock every
+                    # later save of the list, the planner's included.
+                    if goal["tokens"] and goal["account_id"] is None:
+                        was = stored_goals.get(name.lower())
+                        was_tokens = ([str(t).strip()[:60]
+                                       for t in (was.get("tokens") or [])[:8]
+                                       if str(t).strip()]
+                                      if was and isinstance(
+                                          was.get("tokens"), list) else None)
+                        if not (was and not was.get("account_id")
+                                and was_tokens == goal["tokens"]):
+                            raise HTTPException(
+                                400, f"goal '{name}': match words need an "
+                                     "account — pick the account the money "
+                                     "lands in, or clear the match words")
                     if mode == "sweep":
                         goal["mode"] = "sweep"
                     td = str(g.get("target_date") or "").strip()
@@ -5062,6 +6039,7 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
             # "legacy" the first time the list carries one, inheriting the
             # stored key — nothing is lost crossing over. URLs were all
             # guarded above the lock (_sup_bk).
+            _folded = False
             if "llm_backends" in body:
                 from ..db import crypto as _crypto
                 raw_bk = body["llm_backends"] or []
@@ -5169,6 +6147,8 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                 # the fold-in retires the legacy keys so one endpoint never
                 # lives in two places (the resolver would prefer the routed
                 # entry anyway; the leftover would only mislead)
+                _folded = (_fold_legacy
+                           and any(e["id"] == "legacy" for e in entries))
                 if any(e["id"] == "legacy" for e in entries):
                     for k in ("llm_url", "llm_model", "llm_api_key",
                               "llm_extra_body", "llm_vision_model"):
@@ -5210,6 +6190,24 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                     cfg["llm_roles"] = roles_out
                 else:
                     cfg.pop("llm_roles", None)
+            # Nothing is lost crossing over: before the fold, every task
+            # without a live route resolved to the legacy endpoint
+            # (llm_categorize.resolve_role). The fold retires the keys that
+            # resolution read, so each such task is routed to the folded
+            # entry explicitly — otherwise the clients' first AI-card save,
+            # which sends the roles it read (none), silently moves every
+            # task to the operator's backend or to nothing. Only on the save
+            # that folds: afterwards an unrouted task means what it says.
+            if _folded:
+                from ..engine.llm_categorize import ROLES as _LLM_ROLES
+                _live = {str(b.get("id")) for b in (cfg.get("llm_backends")
+                                                    or [])
+                         if isinstance(b, dict)}
+                _routes = dict(cfg.get("llm_roles") or {})
+                for _r in _LLM_ROLES:
+                    if _routes.get(_r) != "bundled" and _routes.get(_r) not in _live:
+                        _routes[_r] = "legacy"
+                cfg["llm_roles"] = _routes
             # standalone vision-model save. The AI settings card pairs a
             # tenant-picked vision model with the BUNDLED endpoint and
             # sends {llm_vision_model} alone — were the write path only
@@ -5251,11 +6249,21 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
             # save actually stored, so the refusal rolls every field of
             # this save back and a re-save of unchanged values never asks.
             if _outbound_repointed(conn, _cfg_was, cfg):
+                # the shared demonstration login's step-up proves nothing
+                # (its password is handed out, its factor waived), so it
+                # cannot point the household's mail or data anywhere new
+                demoguard.deny_shared_grant(user)
                 from .app import _require_elevation
                 _require_elevation(
                     user, password=_proof.get("password", ""),
                     totp_code=_proof.get("totp_code", ""),
                     recovery_code=_proof.get("recovery_code", ""))
+            if _smtp_from_missing:
+                raise HTTPException(
+                    400, "smtp_from: enter the From address mail is sent "
+                         "as — the relay username is not an email address, "
+                         "so it cannot stand in" if _smtp_user_given else
+                         "smtp_from: enter the From address mail is sent as")
         # OUTSIDE the lock and after it commits: sending mail while
         # holding a row lock would hold it for the length of an SMTP
         # conversation, and an invite must only go out once the save it
@@ -5274,7 +6282,9 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
         # save stored it as, BEFORE the invite diff, so nobody who already
         # said yes is asked again; a joined entry's mailboxes were never
         # asked one by one, so the diff invites them
-        if "email_recipients" in body and _prev_entries:
+        if _prev_entries and ("email_recipients" in body
+                              or "email_recipients_added" in body
+                              or "email_recipients_removed" in body):
             from ..notify import recipient_invites as _ri
             _ri.carry_acceptance(user["tenant_id"], _prev_entries)
         added = mailguard.added_recipients(_prev_asked,
@@ -5284,8 +6294,8 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
             mailguard.invite_added(user, added)
         view["email_recipient_status"] = _recipient_status(
             user["tenant_id"], cfg.get("email_recipients") or [],
-            cfg.get("email_muted") or [])
-        return view
+            cfg.get("email_muted") or [], cfg)
+        return _hide_people(view, user)
     finally:
         conn.close()
 
@@ -5305,6 +6315,10 @@ def settings_recipient_resend(user: dict = Depends(_user()),
     email = str(body.get("email") or "").strip()
     if not email:
         raise HTTPException(400, "email is required")
+    if demoguard.own_address_only(user, email) != email:
+        # the shared demonstration login may re-invite only itself: an
+        # answer for any other address would say whether it is on the list
+        raise HTTPException(400, "that address is not a saved recipient")
     conn = _conn(user)
     try:
         cfg = budget.load_config(conn)
@@ -5323,11 +6337,91 @@ def settings_recipient_resend(user: dict = Depends(_user()),
         mailguard.check_recipients(conn, [email])
     finally:
         conn.close()
-    mailguard.invite_added(user, [email])
-    return {"ok": True,
-            "email_recipient_status": _recipient_status(
-                user["tenant_id"], cfg.get("email_recipients") or [],
-                cfg.get("email_muted") or [])}
+    # an owner may sit on a list stored before additions were checked, and
+    # is still mailed by construction: there is no invitation to resend
+    if email.lower() in mailguard.owner_addresses(user["tenant_id"]):
+        raise HTTPException(400, "That's you — as the owner you already "
+                                 "receive this mail.")
+    # The answer says whether mail actually went out. The cooldown and the
+    # hourly cap stop a send without any error, and a bare `ok` let both
+    # clients tell the owner an invitation was on its way when nothing
+    # was. `ok` stays true (the request was valid and nothing failed);
+    # `sent` is the truth, and `reason` names why when it is false.
+    from ..notify import recipient_invites as _ri
+    try:
+        res = _ri.resend(user["tenant_id"], email,
+                         invited_by=user.get("user_id"),
+                         inviter=user.get("email"))
+    except Exception:                                    # noqa: BLE001
+        import logging
+        logging.getLogger("oikonome.api").exception(
+            "recipient invite resend failed for %s", email)
+        res = None
+    if not isinstance(res, dict):
+        res = {"sent": False, "reason": "error"}
+    out = {"ok": True, "sent": bool(res.get("sent"))}
+    if not out["sent"]:
+        reason = str(res.get("reason") or "").strip()
+        out["reason"] = reason if reason in _RESEND_REASONS else "held"
+    out["email_recipient_status"] = _recipient_status(
+        user["tenant_id"], cfg.get("email_recipients") or [],
+        cfg.get("email_muted") or [], cfg)
+    return _hide_people(out, user)
+
+
+# The words a not-sent resend may carry. `cooldown` and `cap` are the two
+# throttles; the rest say the address's own state stopped it (answered,
+# refused, or undeliverable) or the instance cannot send. Anything else
+# collapses to `held`, so a client keyed on these words never meets an
+# unknown one.
+_RESEND_REASONS = frozenset({
+    "cooldown", "cap", "held", "accepted", "declined", "complained",
+    "blocked", "undelivered", "no_mail", "invalid", "error"})
+
+
+@router.post("/settings/outbound/resume",
+             dependencies=[Depends(limit("outbound-resume", 10, 3600))])
+def settings_outbound_resume(user: dict = Depends(_user()),
+                             body: dict | None = Body(default=None)):
+    """The owner confirmed the relay, the extra recipients and the AI
+    endpoint a credential rotation paused are theirs: the senders use them
+    again. Owner only — the pause exists to protect the owner's account.
+    Nothing to confirm is not an error.
+
+    Resuming re-opens the same destinations that typing them in fresh
+    opens (`_outbound_repointed`), so it is guarded the same way and the
+    same way a paused webhook is switched back on: the shared
+    demonstration login may not do it, the caller steps up, and the write
+    runs under the factor lock after a re-check that the caller is still
+    signed in. Without that last part a request that authenticated a
+    moment before a reset would wait on the settings row and lift the
+    pause the reset had just written, from a session the reset evicted."""
+    demoguard.deny(user)
+    if user.get("script_token") or user["role"] != "owner":
+        raise HTTPException(403, "owner only")
+    demoguard.deny_shared_grant(user)
+    body = body if isinstance(body, dict) else {}
+    from .app import _require_elevation, _still_signed_in_under_factor_lock
+    _require_elevation(user, password=str(body.get("password") or ""),
+                       totp_code=str(body.get("totp_code") or ""),
+                       recovery_code=str(body.get("recovery_code") or ""))
+    from ..notify import outbound_pause as _outbound
+    conn = _conn(user)
+    try:
+        # the banner sends back the fingerprint of the record it showed;
+        # one that has changed since is refused, and the client reloads
+        version = body.get("version")
+        with _still_signed_in_under_factor_lock(user):
+            try:
+                lifted = _outbound.resume(
+                    conn, None if version is None else str(version))
+            except _outbound.StaleConfirmation:
+                raise HTTPException(
+                    409, "what is paused changed since this page loaded — "
+                         "reload Settings and check it again")
+    finally:
+        conn.close()
+    return {"ok": True, "resumed": lifted}
 
 
 @router.post("/settings/smtp-test",
@@ -5352,19 +6446,41 @@ def settings_smtp_test(user: dict = Depends(_user())):
     try:
         smtp = report.resolve_smtp(conn)
         recipients, raw = _recipients_and_raw(conn, user["tenant_id"])
-        configured = list(budget.load_config(conn).get("email_recipients")
-                          or [])
+        _cfg = budget.load_config(conn)
+        configured = list(_cfg.get("email_recipients") or [])
     finally:
         conn.close()
+    from ..notify import outbound_pause as _outbound
+    held = _outbound.paused(_cfg) or {}
+    # While a credential rotation holds the Settings relay, resolve_smtp
+    # answers with the instance's own relay or with nothing, so a test
+    # would either refuse as though the form were empty or prove a relay
+    # the form does not show. Say what is actually going on instead.
+    if held.get("smtp") and _cfg.get("smtp_host"):
+        raise HTTPException(
+            400, "your mail relay is paused since your password or second "
+                 "factor changed — check it below, then press “These are "
+                 "mine — resume” at the top of Settings and test again")
+    held_recipients = set(held.get("recipients") or [])
+    # the shared demonstration login tests delivery to itself only: the
+    # answer names every recipient, and the mail would reach members it is
+    # never shown
+    recipients = demoguard.own_addresses_only(user, recipients)
+    configured = demoguard.own_addresses_only(user, configured)
     # Who is on the list but will NOT be mailed, and why. `_recipients`
     # filters to accepted invites (and, hosted, to members) — correctly —
     # but the button exists to answer "did adding this person work?", so a
     # green tick that says nothing about them is not an answer.
     mailed = {e.lower() for e in recipients}
     delivered_raw = {e.lower() for e in raw}
+    # a paused recipient is left out of `raw` too, so it is named before
+    # the invitation reason could claim it
     skipped = [
         {"email": e,
-         "reason": ("delivery is failing to this address"
+         "reason": ("paused since your password, login email or second factor changed "
+                    "— confirm on the banner at the top of Settings"
+                    if e.strip().lower() in held_recipients
+                    else "delivery is failing to this address"
                     if e.lower() in delivered_raw
                     else "they have not accepted their invitation yet")}
         for e in configured if e.lower() not in mailed]
@@ -5531,12 +6647,23 @@ def retirement_api(user: dict = Depends(_user()),
         # key (the Settings-save path validates it as an int in [62,70], but
         # the restore config-merge does not) — a bad key must be dropped, not
         # 500 the whole Retirement page, same as the birthdate guard above.
+        # The amounts get the same guard: text, null, a list, a negative or
+        # a non-finite figure would reach the simulation as its monthly SS
+        # and fail it on every load, so such an entry is dropped too.
+        import math
         sched = {}
-        for k, v in (cfg.get("ss_estimates") or {}).items():
-            try:
-                sched[int(k)] = v
-            except (ValueError, TypeError):
+        raw_sched = cfg.get("ss_estimates")
+        for k, v in (raw_sched.items() if isinstance(raw_sched, dict)
+                     else ()):
+            if isinstance(v, bool):
                 continue
+            try:
+                amt = float(v)
+                age_k = int(k)
+            except (ValueError, TypeError, OverflowError):
+                continue
+            if math.isfinite(amt) and amt >= 0:
+                sched[age_k] = amt
         your_ss = sched.get(ssage, 0)           # from the SSA statement
         resume_age = resume or age              # default: resume saving now
         r = retire.project(conn, age=age, end_age=end, spend=spend,
@@ -5625,10 +6752,16 @@ def continuity_get(user: dict = Depends(_user())):
         out = continuity.settings_of(cfg)
         out["mail_configured"] = bool(resolve_smtp(conn)["configured"])
         out["members_only"] = mailguard.members_only()
-        out["members"] = [r["email"] for r in conn.execute(
-            "SELECT email FROM users WHERE tenant_id = "
-            "current_setting('app.tenant_id')::uuid ORDER BY created_at"
-        ).fetchall()]
+        # every member's address, which the shared demonstration login is
+        # shown only its own of; and the owner's note (where the will and
+        # the passwords are) and who it is for are withheld from it too
+        out["members"] = demoguard.own_addresses_only(user, [
+            r["email"] for r in conn.execute(
+                "SELECT email FROM users WHERE tenant_id = "
+                "current_setting('app.tenant_id')::uuid ORDER BY created_at"
+            ).fetchall()])
+        if demoguard.people_hidden(user):
+            out["note"], out["prepared_for"] = "", ""
         out["note_max"] = continuity.NOTE_MAX
         return out
     finally:
@@ -5641,6 +6774,10 @@ def continuity_put(user: dict = Depends(_user()), body: dict = Body(...)):
     will and the passwords are, which is the owner's to write."""
     _owner_only(user)
     demoguard.deny(user)
+    if demoguard.people_hidden(user):
+        # it is shown an empty note, so a save from it would erase the
+        # owner's
+        raise HTTPException(403, demoguard.SHARED_PEOPLE_DENIED)
     from ..engine import budget, continuity
     try:
         note = (continuity.clean_note(body.get("note"))
@@ -5670,6 +6807,11 @@ def continuity_put(user: dict = Depends(_user()), body: dict = Body(...)):
         return {"ok": True, **out}
     finally:
         conn.close()
+
+
+# An address anywhere inside free text. Bounded classes and no nested
+# quantifiers, so a long run of dots cannot make it backtrack.
+_ADDRESS_IN_TEXT = re.compile(r"[\w.+'-]+@[\w-]+(?:\.[\w-]+)+")
 
 
 @router.post("/continuity/email",
@@ -5748,13 +6890,51 @@ def activity_api(user: dict = Depends(_user()),
     timestamp, `kind` / `who` / `target` filter."""
     if kind and kind not in _activity.KINDS:
         raise HTTPException(400, "unknown kind")
+    hidden = demoguard.people_hidden(user)
+    if hidden and who and not demoguard.own_addresses_only(user, [who]):
+        # filtering by another member's address would confirm who acts here,
+        # and the anonymised name matches no stored row
+        return {"rows": [], "more": False, "next": None,
+                "actors": [], "kinds": list(_activity.KINDS)}
     conn = _conn(user)
     try:
-        return _activity.list_activity(
+        out = _activity.list_activity(
             conn, limit=limit_, before=before or None, kind=kind or None,
             actor=who or None, target=target or None)
     finally:
         conn.close()
+    if hidden:
+        # the actor column is the acting member's address; the label (and
+        # the sentence built from it) can be one too — the continuity
+        # packet's row names who it was mailed to
+        def _mask(value):
+            if isinstance(value, str):
+                return _ADDRESS_IN_TEXT.sub(
+                    lambda m: demoguard.own_address_only(user, m.group(0)),
+                    value)
+            if isinstance(value, dict):
+                return {k: _mask(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [_mask(v) for v in value]
+            return value
+        for r in out["rows"]:
+            r["actor"] = demoguard.own_address_only(user, r.get("actor"))
+            label = r.get("label")
+            masked = _mask(label)
+            if masked != label:
+                r["label"] = masked
+                r["summary"] = _activity.sentence(
+                    r.get("kind") or "", r.get("action") or "", masked,
+                    r.get("detail"))
+            # a note's text or a merchant name can quote an address as well,
+            # and the detail (before/after values) is returned beside it
+            r["summary"] = _mask(r.get("summary"))
+            r["detail"] = _mask(r.get("detail"))
+        # the filter offers only the caller: a chip for "a household
+        # member" could only ever return nothing
+        out["actors"] = list(dict.fromkeys(
+            demoguard.own_addresses_only(user, out["actors"])))
+    return out
 
 
 @router.post("/alerts/dismiss")
@@ -5900,6 +7080,15 @@ async def receipt_upload(txn_id: str, user: dict = Depends(_user()),
                                           mime, kind)
         except ValueError as e:
             raise HTTPException(400, str(e))
+        # add attaches to the row the charge stands as NOW: a pending hold
+        # that settled since the client read it hands its receipt to the
+        # posted row. The log, the answer and the id the clients re-key on
+        # all name that row, or the upload reads back empty from the
+        # retired hold and invites a second, duplicate upload.
+        landed = conn.execute("SELECT txn_id FROM receipts WHERE id = %s",
+                              (rid,)).fetchone()
+        if landed and landed["txn_id"]:
+            txn_id = landed["txn_id"]
         _activity.record(conn, user, "receipt", "attached", target=txn_id,
                          label=_activity.txn_label(conn, txn_id),
                          detail={"receipt_kind": kind, "receipt_id": rid})
@@ -5907,7 +7096,7 @@ async def receipt_upload(txn_id: str, user: dict = Depends(_user()),
             # claim before responding so the first poll already shows
             # 'parsing' — and so a racing retry can't double-parse
             _parse_receipt_async(str(user["tenant_id"]), rid)
-        return {"id": rid,
+        return {"id": rid, "txn_id": txn_id,
                 "receipts": receipts.for_txn(conn, txn_id)}
     finally:
         conn.close()
@@ -6089,6 +7278,12 @@ def receipt_list(txn_id: str, user: dict = Depends(_user())):
     from ..engine import receipts
     conn = _conn(user)
     try:
+        # a pending hold that settled since the client read it is shown as
+        # the posted row it became, which is where its receipts went; read
+        # from the retired hold, a refetch after an upload would come back
+        # empty
+        with conn.transaction():
+            txn_id = data.live_edit_ids(conn, [txn_id]).get(txn_id, txn_id)
         # the charge's own amount and date ride along: the panel ranks the
         # waiting receipts against them, so the one that fits this charge is
         # offered first however many are waiting
@@ -6299,7 +7494,7 @@ def tokens_list_api(user: dict = Depends(_user())):
 
 @router.post("/tokens", dependencies=[Depends(limit("tokens", 10, 3600))])
 def tokens_mint_api(user: dict = Depends(_user()), body: dict = Body(...)):
-    demoguard.deny(user)
+    demoguard.deny_shared_grant(user)
     from ..auth import api_tokens
     from .app import _control_conn, _require_elevation
     _owner_only(user)
@@ -6321,7 +7516,12 @@ def tokens_mint_api(user: dict = Depends(_user()), body: dict = Body(...)):
     scope = str(body.get("scope") or "push")
     if scope not in api_tokens.SCOPES:
         raise HTTPException(400, "scope must be push or read")
-    with _control_conn() as conn:
+    from .app import _caller_still_signed_in, _lock_user_factors
+    with _control_conn() as conn, conn.transaction():
+        # a reset landing during the step-up must not be outlived by the
+        # token it was meant to revoke
+        _lock_user_factors(conn, user["user_id"])
+        _caller_still_signed_in(conn, user)
         token, row = api_tokens.mint(conn, user["tenant_id"],
                                      user.get("user_id"),
                                      str(body.get("name") or ""), scope)
@@ -6417,6 +7617,7 @@ async def import_bulk_analyze(user: dict = Depends(_user()),
         raise HTTPException(400, f"too many files (max "
                                  f"{bulk_import.MAX_FILES})")
     from ..db.staging import TENANT_BUDGET
+    budget = min(TENANT_BUDGET, bulk_import.MAX_BATCH_BYTES)
     staged: list[tuple[str, bytes]] = []
     total = 0
     for f in files:
@@ -6425,13 +7626,11 @@ async def import_bulk_analyze(user: dict = Depends(_user()),
         data = await read_capped(f)
         total += len(data or b"")
         # The per-FILE cap alone would let 200 × 50 MB sit in this worker's
-        # RAM — refuse the batch outright once the AGGREGATE blows the same
-        # budget the staging table enforces at rest
-        if total > TENANT_BUDGET:
-            raise HTTPException(
-                413, f"these files total more than "
-                     f"{TENANT_BUDGET // (1024*1024)} MB — import in "
-                     f"smaller batches")
+        # RAM — refuse the batch outright once the AGGREGATE blows the
+        # batch budget (sized to fit inside the body ceiling, so this
+        # message is reachable rather than pre-empted at the edge)
+        if total > budget:
+            raise HTTPException(413, bulk_import.BATCH_TOO_LARGE)
         staged.append((f.filename or "?", data if data is not None else b""))
 
     # the parse (sniff + decode + stage) is CPU- and DB-bound: it must not
@@ -6448,10 +7647,25 @@ async def import_bulk_analyze(user: dict = Depends(_user()),
             # flag them so the UI can keep the import checkbox disabled;
             # size 0 would mislead, so report the cap instead
             cap_mb = MAX_UPLOAD // (1024 * 1024)
+            from .pages import RESTORE_MAX_UPLOAD
+            restore_mb = RESTORE_MAX_UPLOAD // (1024 * 1024)
             for entry, (name, data) in zip(plan["files"], staged):
                 if not data and entry.get("kind") != "unsupported":
                     entry.update(action="skip", oversized=True,
                                  note=f"file too large (over {cap_mb} MB)")
+                    if name.lower().endswith(".zip"):
+                        # not a dead end: the restore door takes the
+                        # archive alone, streamed to disk, ten times larger
+                        entry.update(
+                            restore_door=bulk_import.RESTORE_DOOR,
+                            note=f"an export ZIP over {cap_mb} MB is "
+                                 f"restored on its own (up to "
+                                 f"{restore_mb} MB) — upload it by itself")
+            # one export ZIP and nothing else is a restore, whatever its
+            # size: say which door takes it
+            if (len(staged) == 1
+                    and staged[0][0].lower().endswith(".zip")):
+                plan["restore_door"] = bulk_import.RESTORE_DOOR
             return plan
         finally:
             conn.close()
@@ -6459,41 +7673,116 @@ async def import_bulk_analyze(user: dict = Depends(_user()),
     return await run_in_threadpool(_analyze)
 
 
-@router.post("/import/bulk/run")
+# The run door SUBMITS a folder plan: it freezes the plan as a background
+# job (jobs/bulk_import_job) and answers at once, so its cost is the
+# submit, and the analyze limit already bounds the jobs that do work.
+# This bounds the posts that are refused before spending a stage (no
+# step-up yet, another folder still importing) and the retries that only
+# read a job back.
+@router.post("/import/bulk/run",
+             dependencies=[Depends(limit("import_bulk_run", 60, 3600))])
 def import_bulk_run(user: dict = Depends(_user()), body: dict = Body(...)):
+    """Submit an analyzed folder's plan. A client that sends
+    `background: true` gets 202 and the job's status at once, and polls
+    the job doors below; an older build, which reads `results`, gets 200
+    after a short wait with one row per file, those still importing marked
+    pending. Posting the same token again answers the same job, whatever
+    plan it carries."""
     demoguard.deny(user)
     from . import bulk_import
-    from ..sync import heartbeat
-    # interactive imports must not auto-watch collector heartbeats
-    _watch = heartbeat.AUTO_WATCH.set(bool(user.get("script_token")))
-    _via = heartbeat.PUSH_VIA.set(
-        "token" if user.get("script_token") else "app")
-    conn = _conn(user)
-    try:
+    # the plan is iterated below: a scalar there is a malformed body (400),
+    # never a TypeError escaping as a 500
+    files = body.get("files") or []
+    if not isinstance(files, list):
+        raise HTTPException(400, "files must be a list")
+
+    def step_up():
         # a plan that restores an export ZIP owes the step-up the single
         # upload door asks for (the archive repoints mail and AI
-        # endpoints). Checked on a peek, before the run consumes the
-        # stage, so the client's retry after elevating finds its batch.
-        if bulk_import.restores_archive(conn, str(body.get("token") or ""),
-                                        list(body.get("files") or []),
-                                        role=str(user.get("role") or "")):
-            from .app import _require_elevation
-            _require_elevation(
-                user, password=str(body.get("password") or ""),
-                totp_code=str(body.get("totp_code") or ""),
-                recovery_code=str(body.get("recovery_code") or ""))
+        # endpoints), asked by this request before the stage is spent, so
+        # the client's retry after elevating finds its batch — and the
+        # shared demonstration login, whose step-up proves nothing, may
+        # not land an archive's endpoints at all
+        demoguard.deny_shared_grant(user)
+        from .app import _require_elevation
+        _require_elevation(
+            user, password=str(body.get("password") or ""),
+            totp_code=str(body.get("totp_code") or ""),
+            recovery_code=str(body.get("recovery_code") or ""))
+
+    conn = _conn(user)
+    try:
         try:
-            results = bulk_import.run(conn, str(body.get("token") or ""),
-                                      list(body.get("files") or []),
-                                      role=str(user.get("role") or ""))
+            out = bulk_import.submit(conn, str(body.get("token") or ""),
+                                     list(files), user, step_up=step_up)
+        except bulk_import.Busy as e:
+            raise HTTPException(409, str(e))
+        except PermissionError as e:
+            raise HTTPException(403, str(e))
         except ValueError as e:
             raise HTTPException(400, str(e))
-        _categorize_after_import(str(user["tenant_id"]))
-        return {"results": results}
     finally:
-        heartbeat.AUTO_WATCH.reset(_watch)
-        heartbeat.PUSH_VIA.reset(_via)
+        # given back before any wait below: the tenant pool is shared by
+        # every household on the instance
         conn.close()
+    existing = out.pop("existing", False)
+    if body.get("background") is True:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(out, status_code=202)
+    from ..jobs import bulk_import_job
+    # Only the post that created the job waits for it; a repost of the
+    # token reads it back as it stands, so reposting cannot buy a second
+    # wait.
+    st = out if existing else (bulk_import.wait_for(
+        user["tenant_id"], out["job_id"],
+        bulk_import.COMPAT_WAIT_SECONDS) or out)
+    return {"job_id": st.get("job_id"), "state": st.get("state"),
+            "results": bulk_import_job.compat_results(st)}
+
+
+@router.get("/import/bulk/jobs/current")
+def import_bulk_job_current(user: dict = Depends(_user())):
+    """The household's folder import in progress, or the one that finished
+    in the last hour, or `{state: "idle"}` — read by the Import page on
+    load so a reload or a second device finds the job again."""
+    from ..jobs import bulk_import_job
+    conn = _conn(user)
+    try:
+        return bulk_import_job.current(conn)
+    finally:
+        conn.close()
+
+
+@router.get("/import/bulk/jobs/{job_id}")
+def import_bulk_job(job_id: str, user: dict = Depends(_user())):
+    """One folder import's progress: N of M files and each file's outcome
+    as it settles."""
+    from ..jobs import bulk_import_job
+    conn = _conn(user)
+    try:
+        st = bulk_import_job.status(conn, job_id)
+    finally:
+        conn.close()
+    if st is None:
+        raise HTTPException(404, "no such import")
+    return st
+
+
+# Cancelling only removes work (the file in hand finishes, the rest are
+# skipped), so it asks no step-up; it is bounded like the run door.
+@router.post("/import/bulk/jobs/{job_id}/cancel",
+             dependencies=[Depends(limit("import_bulk_cancel", 60, 3600))])
+def import_bulk_job_cancel(job_id: str, user: dict = Depends(_user())):
+    demoguard.deny(user)
+    from ..jobs import bulk_import_job
+    conn = _conn(user)
+    try:
+        st = bulk_import_job.cancel(conn, job_id)
+    finally:
+        conn.close()
+    if st is None:
+        raise HTTPException(404, "no such import")
+    return st
 
 
 @router.get("/restore/progress")
@@ -6520,10 +7809,18 @@ async def import_api(user: dict = Depends(_user()),
                      file: UploadFile = File(...),
                      password: str = Form(""),
                      totp_code: str = Form(""),
-                     recovery_code: str = Form("")):
+                     recovery_code: str = Form(""),
+                     ynab_choice: str = Form("")):
     demoguard.deny(user)
     from ..sync import heartbeat
-    from .pages import OVERSIZE_MSG, dispatch_import, read_capped
+    from .pages import (OVERSIZE_MSG, _dispatch_import_unlocked,
+                        read_capped)
+    # a client that can ask where each account of a multi-account YNAB
+    # register goes says so; one that does not is refused such a file by
+    # name rather than handed a card it cannot draw. Passed only when set,
+    # so the dispatcher's other callers keep their exact call.
+    choice = {"ynab_choice": True} if ynab_choice.strip() in (
+        "1", "true", "yes") else {}
     filename = file.filename or ""
     # the same fork pages.import_submit makes: a whole-ledger archive is
     # streamed to disk under the restore cap, everything else is one
@@ -6537,7 +7834,10 @@ async def import_api(user: dict = Depends(_user()),
         # a restore merges the archive's mail relay and AI endpoints over
         # the household's own — the destinations a Settings save may only
         # repoint after a step-up — so it owes the same proof, asked here
-        # because the job it starts cannot refuse once it is running
+        # because the job it starts cannot refuse once it is running. The
+        # shared demonstration login's step-up proves nothing, so it is
+        # refused outright, as the Settings save refuses it a new endpoint.
+        demoguard.deny_shared_grant(user)
         from .app import _require_elevation
         _require_elevation(user, password=password, totp_code=totp_code,
                            recovery_code=recovery_code)
@@ -6579,19 +7879,55 @@ async def import_api(user: dict = Depends(_user()),
             "token" if user.get("script_token") else "app")
         conn = _conn(user)
         try:
-            dest = account_id
-            # the single-file page can create the destination account
-            # inline, like bulk already could — same slug-collision-safe
-            # helper, so two different "Chase" accounts never merge
-            if not dest and new_account_name.strip():
-                from .bulk_import import _ensure_account
-                # the sign convention also types the account (card /
-                # investment), exactly as the bulk path does
-                dest = _ensure_account(conn, new_account_name.strip(),
-                                       amount_sign)
-            result, mapping_needed = dispatch_import(
-                conn, dest, amount_sign, filename, data,
-                role=str(user.get("role") or ""))
+            # the collector scripts push statements through this door too,
+            # so it joins the push writer lock like the other push doors:
+            # an erasure that began after the request authenticated must
+            # not have the file's accounts and rows written back under it
+            #
+            # The sync lock is taken OUTSIDE the push transaction: it is a
+            # session lock, and releasing it inside the transaction would
+            # free it (and queue a nudged sync) before the rows commit, so
+            # that sync would filter its pull against a ledger without the
+            # file and insert rows the file already covers.
+            from ..sync.base import tenant_sync_lock
+            with tenant_sync_lock(conn, str(user["tenant_id"])) as held:
+                if not held:
+                    # an erasure holds the sync lock too (it is one of the
+                    # writer locks it takes after flipping the household's
+                    # status), so a push refused here must still answer
+                    # the erasure's 409, not "try again in a moment"
+                    from .. import erasure
+                    if erasure.being_deleted(user["tenant_id"], conn):
+                        raise HTTPException(
+                            409, "this household is being deleted; "
+                                 "nothing was imported")
+                    result, mapping_needed = (
+                        {"error": "a sync is running for this household — "
+                                  "try the import again in a moment"}, None)
+                else:
+                    with _push_write(conn, user):
+                        # the pairing and identity locks before the first
+                        # row this transaction writes (see there). A PDF
+                        # takes them inside import_pdf, after its slow
+                        # sandboxed read: taken here, every edit in the
+                        # household would wait out the extraction.
+                        if not filename.lower().endswith(".pdf"):
+                            from .bulk_import import hold_ledger_write_locks
+                            hold_ledger_write_locks(conn)
+                        dest = account_id
+                        # the single-file page can create the destination
+                        # account inline, like bulk already could — same
+                        # slug-collision-safe helper, so two different
+                        # "Chase" accounts never merge
+                        if not dest and new_account_name.strip():
+                            from .bulk_import import _ensure_account
+                            # the sign convention also types the account
+                            # (card / investment), as the bulk path does
+                            dest = _ensure_account(
+                                conn, new_account_name.strip(), amount_sign)
+                        result, mapping_needed = _dispatch_import_unlocked(
+                            conn, dest, amount_sign, filename, data,
+                            role=str(user.get("role") or ""), **choice)
             if result and not mapping_needed and not (
                     isinstance(result, dict) and result.get("error")):
                 _categorize_after_import(str(user["tenant_id"]))
@@ -6608,6 +7944,16 @@ async def import_api(user: dict = Depends(_user()),
 @router.post("/import/mapped")
 def import_mapped_api(user: dict = Depends(_user()), body: dict = Body(...)):
     demoguard.deny(user)
+    # The token and the column names reach SQL and the CSV engine. Anything
+    # but text is a malformed request; refused here, before the staged
+    # upload is touched, so a bad body never consumes it.
+    token = body.get("token") or ""
+    if not isinstance(token, str):
+        raise HTTPException(400, "token must be a string")
+    for k in ("date_col", "name_col", "amount_col", "debit_col",
+              "credit_col", "merchant_col", "category_col"):
+        if body.get(k) is not None and not isinstance(body.get(k), str):
+            raise HTTPException(400, f"{k} must be a string")
     from ..sync import heartbeat
     from .pages import run_mapped_import
     _watch = heartbeat.AUTO_WATCH.set(bool(user.get("script_token")))
@@ -6615,8 +7961,75 @@ def import_mapped_api(user: dict = Depends(_user()), body: dict = Body(...)):
         "token" if user.get("script_token") else "app")
     conn = _conn(user)
     try:
-        result = run_mapped_import(conn, body.get("token") or "", body)
+        result = run_mapped_import(conn, token, body)
         if not (isinstance(result, dict) and result.get("error")):
+            _categorize_after_import(str(user["tenant_id"]))
+        return {"result": result}
+    finally:
+        heartbeat.AUTO_WATCH.reset(_watch)
+        heartbeat.PUSH_VIA.reset(_via)
+        conn.close()
+
+
+@router.post("/import/ynab-accounts")
+def import_ynab_accounts_api(user: dict = Depends(_user()),
+                             body: dict = Body(...)):
+    """Finish a multi-account YNAB register /api/import parked: the person's
+    destination for each YNAB account (an account id, "skip", or
+    {"new": name}), and for each, whether rows an earlier import of the
+    whole register left on the picked account are to be removed.
+
+    The same gates as the upload door it finishes: the demo refusal, the
+    role gate (app.py, by path), the sync lock outside the push writer
+    transaction, the erasure 409, the categorize pass after."""
+    demoguard.deny(user)
+    token = body.get("token")
+    accounts = body.get("accounts")
+    remove_earlier = body.get("remove_earlier")
+    # malformed is refused before the parked upload is touched
+    if not isinstance(token, str) or not token:
+        raise HTTPException(400, "token must be a string")
+    if not isinstance(accounts, dict) or not all(
+            isinstance(k, str) and (isinstance(v, str) or (
+                isinstance(v, dict) and isinstance(v.get("new"), str)))
+            for k, v in accounts.items()):
+        raise HTTPException(400, "accounts must map each YNAB account to "
+                                 "an account id, \"skip\" or {\"new\": name}")
+    if remove_earlier is None:
+        remove_earlier = {}
+    if not isinstance(remove_earlier, dict) or not all(
+            isinstance(v, bool) for v in remove_earlier.values()):
+        raise HTTPException(400, "remove_earlier must map YNAB accounts to "
+                                 "true or false")
+    if user.get("script_token"):
+        raise HTTPException(403, "script tokens cannot import a YNAB "
+                                 "register of several accounts")
+    from ..sync import heartbeat
+    from .pages import _run_ynab_import_unlocked
+    _watch = heartbeat.AUTO_WATCH.set(False)
+    _via = heartbeat.PUSH_VIA.set("app")
+    conn = _conn(user)
+    try:
+        # the sync lock OUTSIDE the push transaction, as /api/import takes
+        # it (see there): released inside, it would free a nudged sync to
+        # filter its pull against a ledger without this file's rows
+        from ..sync.base import tenant_sync_lock
+        with tenant_sync_lock(conn, str(user["tenant_id"])) as held:
+            if not held:
+                from .. import erasure
+                if erasure.being_deleted(user["tenant_id"], conn):
+                    raise HTTPException(
+                        409, "this household is being deleted; "
+                             "nothing was imported")
+                return {"result": {"error": "a sync is running for this "
+                                            "household — try the import "
+                                            "again in a moment"}}
+            with _push_write(conn, user):
+                from .bulk_import import hold_ledger_write_locks
+                hold_ledger_write_locks(conn)
+                result = _run_ynab_import_unlocked(conn, token, accounts,
+                                                   remove_earlier)
+        if not result.get("error"):
             _categorize_after_import(str(user["tenant_id"]))
         return {"result": result}
     finally:
@@ -6643,12 +8056,34 @@ async def taxdoc_analyze_api(user: dict = Depends(_user()),
 
     # PDF/OCR/LLM parse is slow and blocking — keep it off the event loop
     def _analyze():
+        import httpx
+
+        from ..engine.llm_categorize import LLMError
         conn = _conn(user)
         try:
             try:
                 return taxdocs.analyze(conn, filename, data, ctype)
             except ValueError as e:
                 raise HTTPException(400, str(e))
+            # The W-2 image and 1040 paths ask the AI backend, and a backend
+            # that is down, names a model it does not have, or sends back
+            # something unusable is a fault in Settings → AI, not in the
+            # document. Say so, naming the kind of failure (never the reply),
+            # instead of the bare 500 an uncaught error becomes.
+            except httpx.TransportError as e:
+                raise HTTPException(
+                    503, "the AI backend in Settings → AI could not be "
+                         f"reached ({type(e).__name__}) — check that the "
+                         "endpoint is up")
+            except (httpx.HTTPStatusError, LLMError, KeyError,
+                    IndexError) as e:
+                cause = (f"HTTP {e.response.status_code}"
+                         if isinstance(e, httpx.HTTPStatusError)
+                         else type(e).__name__)
+                raise HTTPException(
+                    502, "the AI backend in Settings → AI could not read "
+                         f"this document ({cause}) — check the vision model "
+                         "and that the endpoint is up")
         finally:
             conn.close()
 
@@ -6659,11 +8094,14 @@ async def taxdoc_analyze_api(user: dict = Depends(_user()),
 def taxdoc_commit_api(user: dict = Depends(_user()), body: dict = Body(...)):
     demoguard.deny(user)
     from ..engine import taxdocs
+    rows = body.get("rows") or []
+    if not isinstance(rows, list):
+        raise HTTPException(400, "rows must be a list")
     conn = _conn(user)
     try:
         try:
             return taxdocs.commit(conn, str(body.get("token") or ""),
-                                  list(body.get("rows") or []))
+                                  list(rows))
         except ValueError as e:
             raise HTTPException(400, str(e))
     finally:
@@ -6680,14 +8118,62 @@ def import_batches_api(user: dict = Depends(_user())):
         conn.close()
 
 
+def kept_rows_refusal(user: dict, e) -> JSONResponse:
+    """The 409 an undo answers when it would keep rows held only by a note
+    naming no feed account. Only the owner may delete those rows
+    (force_kept), so only the owner is asked "undo anyway?" — error
+    `kept_rows_unconfirmed`. Anyone else gets error `kept_rows`: the same
+    count, and a note that says what happened and who can finish it, with
+    no question attached, because the retry it would invite is refused."""
+    if user.get("role") == "owner" and not user.get("script_token"):
+        return JSONResponse(status_code=409, content={
+            "detail": str(e), "error": "kept_rows_unconfirmed",
+            "kept_transactions": e.kept})
+    rows = f"{e.kept} imported row{'s' if e.kept != 1 else ''}"
+    return JSONResponse(status_code=409, content={
+        "detail": (f"Nothing was undone. {rows} in this import may stand "
+                   f"in for charges an older bank feed set aside, so "
+                   f"{'they are' if e.kept != 1 else 'it is'} kept for now. "
+                   f"Only the household's owner can undo this import."),
+        "error": "kept_rows", "kept_transactions": e.kept})
+
+
 @router.post("/import/rollback")
 def import_rollback_api(user: dict = Depends(_user()),
                         body: dict = Body(...)):
     demoguard.deny(user)
     from ..sync import batches
+    from ..sync.base import SyncRunning
+    batch_id = str(body.get("batch_id") or "")
+    # Rows held only by a note naming no feed account may be the only copy
+    # of charges an older bank feed set aside; nothing can check whether a
+    # feed still relies on them, so the undo asks first (409, with the
+    # count) and deletes them only on the owner's literal `force_kept:
+    # true` — the account-remove door's contract, for the same rows.
+    force_kept = body.get("force_kept") is True
+    if force_kept and (user.get("role") != "owner" or user.get("script_token")):
+        # the option, not the door, is the owner's: a member may still undo
+        raise HTTPException(403, "owner only")
     conn = _conn(user)
     try:
-        n = batches.rollback(conn, str(body.get("batch_id") or ""))
+        # An archived business is read-only and its rows are retention
+        # records: every door that moves or deletes them refuses, and only
+        # the owner's delete-forever may destroy them. Undoing an import
+        # hard-deletes the rows it alone owns — with their Schedule C
+        # classes — so the rollback refuses while any of those rows
+        # belongs to an archived business, looking under its own lock so
+        # an archive landing after this request began cannot slip past.
+        n = batches.rollback(conn, batch_id, force_kept=force_kept,
+                             ask_first=not force_kept)
+    except batches.KeptRowsUnconfirmed as e:
+        # nothing was changed: the owner is told the count and may answer
+        # with force_kept; anyone else is told plainly, with no offer they
+        # could not take up
+        return kept_rows_refusal(user, e)
+    except (SyncRunning, batches.ArchivedBusinessRows) as e:
+        # nothing was deleted: the client retries once the sync is done, or
+        # once the business is restored
+        raise HTTPException(409, str(e))
     finally:
         conn.close()
     return {"ok": True, "deleted": int(n),
@@ -6713,6 +8199,7 @@ def onboarding_api(user: dict = Depends(_user())):
                       (SELECT COUNT(*) FROM bill_proposals
                        WHERE status='pending') AS pending_proposals""").fetchone()
         cfg = budget.load_config(conn)
+        budgets_set = _budgets_set(conn)
     finally:
         conn.close()
     return {"accounts": counts["accounts"],
@@ -6723,8 +8210,7 @@ def onboarding_api(user: dict = Depends(_user())):
             # recurring-proposal queue for the wizard's Recurring step
             "connections": counts["connections"],
             "pending_proposals": counts["pending_proposals"],
-            "budgets_set": bool(cfg.get("food_monthly")
-                                or cfg.get("other_monthly")),
+            "budgets_set": budgets_set,
             "primary_checking_set": bool(cfg.get("checking_account_id")),
             # the guided wizard is offered until every step is
             # done or the user dismisses it for good
@@ -6994,7 +8480,10 @@ def business_flag(txn_id: str, user: dict = Depends(_user())):
     conn = _conn(user)
     try:
         _require_business(conn)
-        data.flag_business(conn, txn_id)
+        # under the pairing lock, onto the live row (live_edit_ids)
+        with conn.transaction():
+            txn_id = data.live_edit_ids(conn, [txn_id]).get(txn_id, txn_id)
+            data.flag_business(conn, txn_id)
         _activity.record(conn, user, "business", "flagged", target=txn_id,
                          label=_activity.txn_label(conn, txn_id))
         return {"ok": True}
@@ -7007,7 +8496,10 @@ def business_unflag(txn_id: str, user: dict = Depends(_user())):
     conn = _conn(user)
     try:
         _require_business(conn)
-        data.unflag_business(conn, txn_id)
+        # under the pairing lock, onto the live row (live_edit_ids)
+        with conn.transaction():
+            txn_id = data.live_edit_ids(conn, [txn_id]).get(txn_id, txn_id)
+            data.unflag_business(conn, txn_id)
         _activity.record(conn, user, "business", "unflagged", target=txn_id,
                          label=_activity.txn_label(conn, txn_id))
         return {"ok": True}
@@ -7272,8 +8764,11 @@ def entities_delete_forever(entity_id: str, user: dict = Depends(_user()),
 @router.post("/business/entities/{entity_id}/members")
 def entities_add_member(entity_id: str, user: dict = Depends(_user()),
                         body: dict = Body(...)):
+    """Add one member. The owner's door, like correcting or removing one:
+    a new member's ownership share changes how a multi-member estimate
+    splits the profit just as an edited share does."""
     demoguard.deny(user)
-    _may_edit(user)
+    _owner_only(user)
     from ..engine import entities
     conn = _conn(user)
     try:
@@ -7283,14 +8778,94 @@ def entities_add_member(entity_id: str, user: dict = Depends(_user()),
         except ValueError as _e:
             raise HTTPException(409 if "archived" in str(_e) else 404, str(_e))
         try:
-            return entities.add_member(
-                conn, entity_id, member_name=_body_text(body, "member_name"),
-                ownership_pct=body.get("ownership_pct"),
-                is_manager=bool(body.get("is_manager")))
+            with _entity_write(conn, entity_id):
+                return entities.add_member(
+                    conn, entity_id,
+                    member_name=_body_text(body, "member_name"),
+                    ownership_pct=body.get("ownership_pct"),
+                    is_manager=bool(body.get("is_manager")),
+                    is_household=bool(body.get("is_household")))
         except ValueError as e:
             raise HTTPException(400, str(e))
     finally:
         conn.close()
+
+
+@contextlib.contextmanager
+def _entity_write(conn, entity_id: str):
+    """The transaction a write into an entity's own records runs in, opened
+    by the active check: the business row is held FOR SHARE until the write
+    commits, so an archive landing meanwhile waits for it rather than
+    closing the books under it. A door's own check before this, outside any
+    transaction, is only the early answer. For writes that lock no
+    transaction or account row; those take their row first and check the
+    entity after it (entities.require_active)."""
+    from ..engine import entities
+    with conn.transaction():
+        try:
+            entities.require_active(conn, entity_id)
+        except ValueError as e:
+            raise HTTPException(409 if "archived" in str(e) else 404, str(e))
+        yield
+
+
+def _member_write(user: dict, entity_id: str, write):
+    """Run one member edit or removal, refusing an archived business. Both
+    doors are the owner's (checked in each handler), as adding is:
+    ownership shares
+    decide how a multi-member estimate splits the profit. The
+    business row is held FOR SHARE while the write runs, so an archive
+    landing meanwhile waits for it rather than closing the books under it."""
+    _require_entity_id(entity_id)
+    conn = _conn(user)
+    try:
+        _require_business(conn)
+        try:
+            with conn.transaction():
+                row = conn.execute(
+                    "SELECT status FROM business_entity WHERE id = %s "
+                    "FOR SHARE", (entity_id,)).fetchone()
+                if row is None:
+                    raise HTTPException(404, "no such entity")
+                if row["status"] != "active":
+                    raise HTTPException(409, "entity is archived (read-only)")
+                out = write(conn)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        if not out:
+            raise HTTPException(404, "no such member")
+        return out
+    finally:
+        conn.close()
+
+
+@router.patch("/business/entities/{entity_id}/members/{member_id}")
+def entities_update_member(entity_id: str, member_id: str,
+                           user: dict = Depends(_user()),
+                           body: dict = Body(...)):
+    """Correct one member: any of member_name, ownership_pct (0–100, or
+    null for none) and is_manager (true/false). Keys left out keep their
+    value. Answers the member as list_members shows it."""
+    demoguard.deny(user)
+    _owner_only(user)
+    from ..engine import entities
+    fields = {k: body[k] for k in ("member_name", "ownership_pct",
+                                   "is_manager", "is_household") if k in body}
+    return _member_write(user, entity_id, lambda conn: entities.update_member(
+        conn, entity_id, member_id, **fields))
+
+
+@router.delete("/business/entities/{entity_id}/members/{member_id}")
+def entities_delete_member(entity_id: str, member_id: str,
+                           user: dict = Depends(_user())):
+    """Remove one member. A capital movement that named them keeps its
+    amount and stops naming them."""
+    demoguard.deny(user)
+    _owner_only(user)
+    from ..engine import entities
+    _member_write(user, entity_id, lambda conn: entities.delete_member(
+        conn, entity_id, member_id))
+    return {"ok": True}
 
 
 @router.get("/business/entities/{entity_id}/equity")
@@ -7320,12 +8895,15 @@ def equity_record(entity_id: str, user: dict = Depends(_user()),
         except ValueError as _e:
             raise HTTPException(409 if "archived" in str(_e) else 404, str(_e))
         try:
-            return equity.record_movement(
-                conn, entity_id, kind=body.get("kind"),
-                amount=body.get("amount"), date=body.get("date"),
-                member_id=_body_text(body, "member_id") or None,
-                form=_body_text(body, "form") or None,
-                note=_body_text(body, "note") or None)
+            with _entity_write(conn, entity_id):
+                return equity.record_movement(
+                    conn, entity_id, kind=body.get("kind"),
+                    amount=body.get("amount"), date=body.get("date"),
+                    member_id=_body_text(body, "member_id") or None,
+                    form=_body_text(body, "form") or None,
+                    note=_body_text(body, "note") or None)
+        except equity.FrontedExpenseConflict as e:
+            raise HTTPException(409, str(e))
         except (ValueError, TypeError) as e:
             raise HTTPException(400, str(e))
     finally:
@@ -7348,9 +8926,11 @@ def equity_delete(entity_id: str, movement_id: str,
             entities.require_active(conn, entity_id)
         except ValueError as _e:
             raise HTTPException(409 if "archived" in str(_e) else 404, str(_e))
-        if not equity.delete_movement(
-                conn, _require_record_id(movement_id, "movement"), entity_id):
-            raise HTTPException(404, "no such movement")
+        with _entity_write(conn, entity_id):
+            if not equity.delete_movement(
+                    conn, _require_record_id(movement_id, "movement"),
+                    entity_id):
+                raise HTTPException(404, "no such movement")
         return {"ok": True}
     finally:
         conn.close()
@@ -7383,8 +8963,13 @@ def equity_reimburse(entity_id: str, user: dict = Depends(_user()),
                 raise HTTPException(400, "mode must be contribute or reimburse")
             return fn(conn, entity_id, txn_id,
                       member_id=body.get("member_id") or None)
+        except equity.FrontedExpenseConflict as e:
+            # the expense is already explained for another business, or the
+            # other way: a conflict with what is recorded, not a bad request
+            raise HTTPException(409, str(e))
         except ValueError as e:
-            raise HTTPException(400, str(e))
+            # an archive that landed after the early check above
+            raise HTTPException(409 if "archived" in str(e) else 400, str(e))
     finally:
         conn.close()
 
@@ -7416,14 +9001,26 @@ def business_suggestions(entity_id: str, user: dict = Depends(_user())):
 
 @router.get("/business/entities/{entity_id}/transactions")
 def business_txns(entity_id: str, user: dict = Depends(_user()),
-                  year: int | None = None):
+                  year: int | None = None,
+                  limit: int | None = Query(None, ge=1, le=1000),
+                  offset: int = Query(0, ge=0, le=10_000_000)):
+    """The entity's worksheet rows, newest first. With no `limit` the reply
+    is every row, the shape older clients read. With `limit` (and
+    `offset`) it is one page plus `total`, every row in scope — the
+    effective bucket of a refund on the page is still decided against the
+    entity's whole history, so paging never changes a row's bucket."""
     _require_entity_id(entity_id)
     _ck_year(year, "year")
     from ..engine import books
     conn = _conn(user)
     try:
         _require_business(conn)
-        return {"transactions": books.entity_transactions(conn, entity_id, year)}
+        rows = books.entity_transactions(conn, entity_id, year)
+        if limit is None and not offset:
+            return {"transactions": rows}
+        page = rows[offset:offset + limit] if limit else rows[offset:]
+        return {"transactions": page, "total": len(rows),
+                "limit": limit, "offset": offset}
     finally:
         conn.close()
 
@@ -7442,16 +9039,56 @@ def business_classify(entity_id: str, txn_id: str,
             entities.require_active(conn, entity_id)   # archived = read-only
         except ValueError as _e:
             raise HTTPException(409 if "archived" in str(_e) else 404, str(_e))
-        # the class row is keyed by txn alone, so the URL's entity must
-        # actually own the transaction — without this, entity A's endpoint
-        # could classify (and rewrite) entity B's rows, archived ones
-        # included, sidestepping the read-only guard above
-        if not books.txn_belongs_to_entity(conn, entity_id, txn_id):
-            raise HTTPException(404, "no such transaction for this entity")
+        line = _body_text(body, "sched_c_line") or None
+        # free text bound straight into the row: anything but a string is
+        # the client's mistake (400), never a driver error (500)
+        note = _body_text(body, "note") or None
+        bucket = body.get("bucket")
+        # the request is judged as sent, even when the stored bucket wins
+        if not isinstance(bucket, str) or bucket not in books.BUCKETS:
+            raise HTTPException(400, f"bucket must be one of {books.BUCKETS}")
         try:
-            books.classify(conn, txn_id, body.get("bucket"),
-                           sched_c_line=body.get("sched_c_line") or None,
-                           note=body.get("note") or None)
+            with conn.transaction():
+                # The review queue lists pending holds, and the sync may
+                # post one while this request is in flight: the row that
+                # stands for it now is found, and locked, under the lock
+                # the settlement holds from its carry to its retire. The
+                # class then lands on the row every reader counts, never
+                # on a retired hold after its one-time carry has run.
+                live = entities.live_txn_id(conn, txn_id)
+                # The class row is keyed by txn alone, so the URL's entity
+                # must own the transaction — otherwise entity A's endpoint
+                # could classify (and rewrite) entity B's rows, archived
+                # ones included. Checked on the live row, under its lock.
+                if live is None or not books.txn_belongs_to_entity(
+                        conn, entity_id, live):
+                    raise HTTPException(
+                        404, "no such transaction for this entity")
+                txn_id = live
+                # and the entity checked again under this transaction, after
+                # the row lock (entities.require_active gives the order), so
+                # an archive cannot land between the check and the class
+                try:
+                    entities.require_active(conn, entity_id)
+                except ValueError as _e:
+                    raise HTTPException(
+                        409 if "archived" in str(_e) else 404, str(_e))
+                # A save that carries a Schedule C line is the review
+                # queue's confirm, and its bucket is the queue's date-derived
+                # default for a row that had none. A bucket chosen since (on
+                # the Books tab, which sends a bucket alone, or on another
+                # device) is the person's decision and stays. Both saves
+                # hold the transaction row's lock (taken by live_txn_id
+                # above), so a queue confirm and a bucket change cannot
+                # interleave and the later write cannot undo the earlier one.
+                if line is not None:
+                    have = conn.execute(
+                        "SELECT bucket FROM business_txn_class "
+                        "WHERE txn_id=%s", (txn_id,)).fetchone()
+                    if have is not None and have["bucket"]:
+                        bucket = have["bucket"]
+                books.classify(conn, txn_id, bucket, sched_c_line=line,
+                               note=note)
         except ValueError as e:
             raise HTTPException(400, str(e))
         return {"ok": True}
@@ -7472,6 +9109,91 @@ def business_pnl(entity_id: str, user: dict = Depends(_user()),
         return books.pnl(conn, entity_id, year)
     finally:
         conn.close()
+
+
+def _year_end_sheet(conn, entity_id: str, year: int | None,
+                    today: dt.date, lifetime: list[dict]) -> dict:
+    """The balance sheet as of December 31 of `year`, for the year-end
+    package. With no year, or a year still in progress, it is today's
+    sheet and says so.
+
+    No balance history is recorded, so a past year-end balance is rebuilt:
+    today's balance with every posted transaction dated after the year end
+    undone. That only holds when the account's ledger reaches back to the
+    year end, and only for cash and debt — an investment account's value
+    moved with the market, which no transaction records. Any other account
+    is listed without an amount and left out of the totals, with the
+    reason, rather than passed off as a year-end figure.
+
+    The capital account counts the movements dated on or before the year
+    end and the net income of every year up to and including it."""
+    from ..engine import books, reporting, selfemploy
+    if not year or year >= today.year:
+        sheet = selfemploy.balance_sheet(conn, entity_id)
+        sheet["as_of"] = today.isoformat()
+        sheet["as_of_note"] = ("balances as of the download date — the "
+                               "year is not over")
+        sheet["unknown"] = []
+        return sheet
+    as_of = dt.date(year, 12, 31)
+    rows = conn.execute(
+        f"""SELECT COALESCE(a.display_name, a.name) AS name, a.type,
+                   a.balance_current AS bal,
+                   (SELECT MIN(t.date) FROM transactions t
+                     WHERE t.account_id = a.id AND t.removed = 0) AS first,
+                   (SELECT COALESCE(SUM(t.amount), 0) FROM transactions t
+                     WHERE t.account_id = a.id AND t.removed = 0
+                       AND COALESCE(t.pending, 0) = 0
+                       AND t.date > %s) AS after
+            FROM accounts a WHERE a.entity_id = %s
+              AND a.balance_current IS NOT NULL
+              {reporting._NOT_SHADOW.format(col="a.id")}""",
+        (as_of, entity_id)).fetchall()
+    assets, liabilities, unknown = [], [], []
+    ta = tl = 0.0
+    for r in rows:
+        if r["type"] == "investment":
+            unknown.append({"name": r["name"], "reason":
+                            "market value at year end is not recorded"})
+            continue
+        if r["first"] is None or r["first"] > as_of:
+            unknown.append({"name": r["name"], "reason":
+                            "transaction history starts after year end"})
+            continue
+        # amounts are positive for money out: undoing a later charge puts
+        # it back into a cash balance and takes it off a debt
+        if r["type"] in ("credit", "loan"):
+            bal = float(r["bal"]) - float(r["after"])
+            liabilities.append({"name": r["name"], "amount": round(bal, 2)})
+            tl += bal
+        else:
+            bal = float(r["bal"]) + float(r["after"])
+            assets.append({"name": r["name"], "amount": round(bal, 2)})
+            ta += bal
+    from ..engine import equity
+    # the same movements the live capital account counts: one fronted for
+    # a charge the bank feed withdrew explains a cost the books skip
+    by = {m["kind"]: float(m["s"]) for m in conn.execute(
+        f"""SELECT m.kind, COALESCE(SUM(m.amount), 0) AS s
+              FROM equity_movement m
+             WHERE m.entity_id = %s AND m.date <= %s
+               AND {equity.COUNTS_IN_CAPITAL}
+             GROUP BY m.kind""",
+        (entity_id, as_of)).fetchall()}
+    upto = [t for t in lifetime
+            if (books._row_date(t) or as_of) <= as_of]
+    net_income = float(books._pnl_core(conn, entity_id, None, upto,
+                                       lifetime=upto)
+                       .get("net_operating") or 0)
+    capital = (by.get("contribution", 0.0) + net_income
+               - by.get("draw", 0.0) - by.get("distribution", 0.0))
+    return {"assets": assets, "liabilities": liabilities,
+            "total_assets": round(ta, 2), "total_liabilities": round(tl, 2),
+            "net": round(ta - tl, 2), "capital_account": round(capital, 2),
+            "as_of": as_of.isoformat(),
+            "as_of_note": ("year-end balances, rebuilt from today's balance "
+                           "and the transactions since"),
+            "unknown": unknown}
 
 
 @router.get("/business/entities/{entity_id}/package.zip")
@@ -7507,10 +9229,19 @@ def business_year_package(entity_id: str, request: Request,
             raise HTTPException(404, "no such entity")
         txns = books.entity_transactions(conn, entity_id, year)
         pnl = books.pnl(conn, entity_id, year, txns=txns)
-        sheet = selfemploy.balance_sheet(conn, entity_id)
-        vendors = selfemploy.vendor_totals(conn, entity_id, year)
+        today = _today(conn)
+        # the package is a year's: its balance sheet and capital account
+        # stand at that year's end, not at the day it was downloaded
+        sheet = _year_end_sheet(
+            conn, entity_id, year, today,
+            txns if year is None
+            else books.entity_transactions(conn, entity_id, None))
+        # the 1099 and mileage figures are per tax year; with no year asked
+        # for, that is the household's current one, not the instance clock's
+        tax_year = year or today.year
+        vendors = selfemploy.vendor_totals(conn, entity_id, tax_year)
         trips = selfemploy.list_trips(conn, entity_id, year)
-        miles = selfemploy.mileage_deduction(conn, entity_id, year)
+        miles = selfemploy.mileage_deduction(conn, entity_id, tax_year)
     finally:
         conn.close()
 
@@ -7537,8 +9268,12 @@ def business_year_package(entity_id: str, request: Request,
                    "                       amount (what was not paid back)\n"
                    "                       is what the P&L adds up\n"
                    "  balance-sheet.csv    assets, liabilities, capital account\n"
-                   "  vendors-1099.csv     paid vendors with totals, for 1099\n"
-                   "                       reporting decisions\n"
+                   f"                       as of {sheet['as_of']} "
+                   f"({sheet['as_of_note']})\n"
+                   "  vendors-1099.csv     paid vendors: total paid, the part\n"
+                   "                       paid by card (reported on a 1099-K,\n"
+                   "                       not a 1099-NEC) and the 1099-NEC\n"
+                   "                       amount the threshold is judged on\n"
                    "  mileage.csv          trip log and the standard-rate\n"
                    "                       deduction it implies\n\n"
                    "These figures are bookkeeping output, NOT tax advice or a\n"
@@ -7580,7 +9315,8 @@ def business_year_package(entity_id: str, request: Request,
              _csv_safe(x.get("sched_c_line") or "Unclassified"),
              _csv_safe(x.get("category") or "")] for x in txns]))
         z.writestr("balance-sheet.csv", _csv(
-            [["Assets", "Amount"]]
+            [["As of", sheet["as_of"]], ["Basis", sheet["as_of_note"]], []]
+            + [["Assets", "Amount"]]
             + [[_csv_safe(a["name"]), f'{a["amount"]:.2f}']
                for a in sheet.get("assets", [])]
             + [["Total assets", f'{sheet.get("total_assets", 0):.2f}'], []]
@@ -7589,10 +9325,22 @@ def business_year_package(entity_id: str, request: Request,
                for l in sheet.get("liabilities", [])]
             + [["Total liabilities", f'{sheet.get("total_liabilities", 0):.2f}'],
                [], ["Net", f'{sheet.get("net", 0):.2f}'],
-               ["Capital account", f'{sheet.get("capital_account", 0):.2f}']]))
+               ["Capital account", f'{sheet.get("capital_account", 0):.2f}']]
+            # an account whose year-end balance cannot be rebuilt is named,
+            # with why, instead of being counted at today's figure
+            + ([[], ["Not included", "Why"]]
+               + [[_csv_safe(u["name"]), u["reason"]]
+                  for u in sheet["unknown"]] if sheet["unknown"] else [])))
+        # No column may be headed as the whole when it holds a part: a
+        # preparer reads "Total paid" as everything and subtracts the card
+        # column from it. So the total is the true total, and the form
+        # amount is its own column.
         z.writestr("vendors-1099.csv", _csv(
-            [["Vendor", "Total paid", "Marked reportable"]]
+            [["Vendor", "Total paid", "Paid by card (not 1099-NEC)",
+              "1099-NEC amount", "Marked reportable"]]
             + [[_csv_safe(v.get("merchant") or ""),
+                f'{float(v.get("paid") or 0) + float(v.get("paid_by_card") or 0):.2f}',
+                f'{float(v.get("paid_by_card") or 0):.2f}',
                 f'{float(v.get("paid") or 0):.2f}',
                 "yes" if v.get("reportable") else ""] for v in vendors]))
         z.writestr("mileage.csv", _csv(
@@ -7631,6 +9379,13 @@ def business_pnl_csv(entity_id: str, request: Request,
             raise HTTPException(404, "no such entity")
         txns = books.entity_transactions(conn, entity_id, year)
         p = books.pnl(conn, entity_id, year, txns=txns)   # reuse, don't re-query
+        # a past year's export states the capital account at that year's
+        # end, like the year-end package — not today's running balance
+        capital = (p["capital"]["capital_balance"] if year is None else
+                   _year_end_sheet(conn, entity_id, year, _today(conn),
+                                   books.entity_transactions(
+                                       conn, entity_id, None))
+                   ["capital_account"])
     finally:
         conn.close()
     buf = _io.StringIO()
@@ -7650,7 +9405,7 @@ def business_pnl_csv(entity_id: str, request: Request,
                 f'{p["startup_deduction"]["immediate"]:.2f}'])
     w.writerow(["  §195 amortizable over 180 mo (est.)",
                 f'{p["startup_deduction"]["amortizable"]:.2f}'])
-    w.writerow(["Capital account balance", f'{p["capital"]["capital_balance"]:.2f}'])
+    w.writerow(["Capital account balance", f'{capital:.2f}'])
     w.writerow([])
     # "Net amount" is what the summary above counts (a charge less what was
     # paid back); "Amount" is what the bank recorded. Both, so the rows
@@ -7685,7 +9440,10 @@ def compliance_list(entity_id: str, user: dict = Depends(_user())):
         ent = entities.get_entity(conn, entity_id)
         if not ent:
             raise HTTPException(404, "no such entity")
-        return {"obligations": compliance.obligations(conn, ent)}
+        # the household's own day: on a UTC instance a deadline due today
+        # would drop off the list hours early, in the evening of its due date
+        return {"obligations": compliance.obligations(
+            conn, ent, today=_today(conn))}
     finally:
         conn.close()
 
@@ -7704,12 +9462,13 @@ def compliance_add(entity_id: str, user: dict = Depends(_user()),
         except ValueError as _e:
             raise HTTPException(409 if "archived" in str(_e) else 404, str(_e))
         try:
-            return compliance.add_obligation(
-                conn, entity_id, title=_body_text(body, "title"),
-                due_date=body.get("due_date"),
-                recurrence=body.get("recurrence", "yearly"),
-                fee=body.get("fee"), url=_body_text(body, "url") or None,
-                note=_body_text(body, "note") or None)
+            with _entity_write(conn, entity_id):
+                return compliance.add_obligation(
+                    conn, entity_id, title=_body_text(body, "title"),
+                    due_date=body.get("due_date"),
+                    recurrence=body.get("recurrence", "yearly"),
+                    fee=body.get("fee"), url=_body_text(body, "url") or None,
+                    note=_body_text(body, "note") or None)
         except (ValueError, TypeError) as e:
             raise HTTPException(400, str(e))
     finally:
@@ -7732,10 +9491,11 @@ def compliance_delete(entity_id: str, obligation_id: str,
             entities.require_active(conn, entity_id)
         except ValueError as _e:
             raise HTTPException(409 if "archived" in str(_e) else 404, str(_e))
-        if not compliance.delete_obligation(
-                conn, _require_record_id(obligation_id, "obligation"),
-                entity_id):
-            raise HTTPException(404, "no such obligation")
+        with _entity_write(conn, entity_id):
+            if not compliance.delete_obligation(
+                    conn, _require_record_id(obligation_id, "obligation"),
+                    entity_id):
+                raise HTTPException(404, "no such obligation")
         return {"ok": True}
     finally:
         conn.close()
@@ -7754,7 +9514,7 @@ def compliance_ics(entity_id: str, request: Request,
         ent = entities.get_entity(conn, entity_id)
         if not ent:
             raise HTTPException(404, "no such entity")
-        body = compliance.ics(conn, ent)
+        body = compliance.ics(conn, ent, today=_today(conn))
     finally:
         conn.close()
     return Response(body, media_type="text/calendar",
@@ -7774,7 +9534,10 @@ def se_estimated_tax(entity_id: str, user: dict = Depends(_user()),
         if not entities.get_entity(conn, entity_id):
             raise HTTPException(404, "no such entity")
         _ck_year(year, "year")
-        return selfemploy.estimated_tax(conn, entity_id, year)
+        # the household's day decides which tax year is in progress and how
+        # much of it has elapsed; the instance clock rolls the year early
+        return selfemploy.estimated_tax(conn, entity_id, year,
+                                        today=_today(conn))
     finally:
         conn.close()
 
@@ -7804,7 +9567,8 @@ def se_mileage_list(entity_id: str, user: dict = Depends(_user()),
         if not entities.get_entity(conn, entity_id):
             raise HTTPException(404, "no such entity")
         return {"trips": selfemploy.list_trips(conn, entity_id, year),
-                "summary": selfemploy.mileage_deduction(conn, entity_id, year)}
+                "summary": selfemploy.mileage_deduction(
+                    conn, entity_id, year or _today(conn).year)}
     finally:
         conn.close()
 
@@ -7823,11 +9587,12 @@ def se_mileage_add(entity_id: str, user: dict = Depends(_user()),
         except ValueError as _e:
             raise HTTPException(409 if "archived" in str(_e) else 404, str(_e))
         try:
-            return selfemploy.add_trip(conn, entity_id, date=body.get("date"),
-                                       miles=body.get("miles"),
-                                       purpose=_body_text(body, "purpose")
-                                       or None,
-                                       note=_body_text(body, "note") or None)
+            with _entity_write(conn, entity_id):
+                return selfemploy.add_trip(
+                    conn, entity_id, date=body.get("date"),
+                    miles=body.get("miles"),
+                    purpose=_body_text(body, "purpose") or None,
+                    note=_body_text(body, "note") or None)
         except (ValueError, TypeError) as e:
             raise HTTPException(400, str(e))
     finally:
@@ -7850,9 +9615,10 @@ def se_mileage_delete(entity_id: str, trip_id: str,
             entities.require_active(conn, entity_id)
         except ValueError as _e:
             raise HTTPException(409 if "archived" in str(_e) else 404, str(_e))
-        if not selfemploy.delete_trip(
-                conn, _require_record_id(trip_id, "trip"), entity_id):
-            raise HTTPException(404, "no such trip")
+        with _entity_write(conn, entity_id):
+            if not selfemploy.delete_trip(
+                    conn, _require_record_id(trip_id, "trip"), entity_id):
+                raise HTTPException(404, "no such trip")
         return {"ok": True}
     finally:
         conn.close()
@@ -7870,7 +9636,7 @@ def se_vendors(entity_id: str, user: dict = Depends(_user()),
             raise HTTPException(404, "no such entity")
         # the year's 1099-NEC line, so the panel states the figure its
         # flags were measured against instead of a hard-coded one
-        yr = year or dt.date.today().year
+        yr = year or _today(conn).year
         return {"vendors": selfemploy.vendor_totals(conn, entity_id, yr),
                 "threshold": selfemploy.reportable_1099_threshold(yr)}
     finally:
@@ -7898,10 +9664,11 @@ def se_vendor_mark(entity_id: str, user: dict = Depends(_user()),
                                 or not isinstance(tin, (str, int))):
             raise HTTPException(400, "tin_last4 must be a string")
         try:
-            selfemploy.mark_vendor(
-                conn, entity_id, merchant,
-                reportable=bool(body.get("reportable", True)),
-                tin_last4=tin)
+            with _entity_write(conn, entity_id):
+                selfemploy.mark_vendor(
+                    conn, entity_id, merchant,
+                    reportable=bool(body.get("reportable", True)),
+                    tin_last4=tin)
         except ValueError as e:
             raise HTTPException(400, str(e))
         return {"ok": True}
@@ -7953,7 +9720,8 @@ def entities_import_flags(entity_id: str, user: dict = Depends(_user())):
             entities.require_active(conn, entity_id)
         except ValueError as _e:
             raise HTTPException(409 if "archived" in str(_e) else 404, str(_e))
-        moved = entities.import_flagged_transactions(conn, entity_id)
+        with _entity_write(conn, entity_id):
+            moved = entities.import_flagged_transactions(conn, entity_id)
         return {"ok": True, "moved": moved}
     finally:
         conn.close()
@@ -7986,6 +9754,41 @@ def account_assign_entity(account_id: str, user: dict = Depends(_user()),
         conn.close()
 
 
+def _refuse_moving_a_fronted_expense(conn, txn_id: str,
+                                     entity_id: str | None) -> None:
+    """A capitalized or reimbursable expense belongs to the one entity its
+    movement names. Moving the row elsewhere (or back to personal) would
+    leave that entity counting a contribution or a debt for a cost its books
+    no longer carry, so the move is refused until the movement is deleted —
+    the same rule the capitalize/reimburse doors apply. Takes the row lock
+    those doors take, so the check and the move cannot interleave with a
+    concurrent pick. Raises equity.FrontedExpenseConflict (a ValueError)."""
+    from ..engine import equity
+    row = conn.execute(
+        "SELECT a.entity_id AS acct FROM transactions t "
+        "LEFT JOIN accounts a ON a.id = t.account_id "
+        "WHERE t.id = %s FOR UPDATE OF t", (txn_id,)).fetchone()
+    if row is None:
+        return                        # assign_transaction answers the 404
+    after = entity_id or row["acct"]
+    after = str(after) if after else None
+    p = conn.execute(
+        """SELECT m.kind, m.entity_id, e.name AS entity_name
+             FROM equity_movement m
+             LEFT JOIN business_entity e ON e.id = m.entity_id
+            WHERE m.txn_id = %s AND m.kind = ANY(%s)
+              AND m.entity_id::text IS DISTINCT FROM %s
+            ORDER BY m.created_at, m.id LIMIT 1""",
+        (txn_id, list(equity.FRONTED_KINDS), after)).fetchone()
+    if p is not None:
+        how = ("capitalized" if p["kind"] == "contribution"
+               else "marked reimbursable")
+        raise equity.FrontedExpenseConflict(
+            f"that expense is {how} for "
+            f"{p['entity_name'] or 'another business'}: delete that "
+            "movement first")
+
+
 @router.post("/transactions/{txn_id}/entity")
 def txn_assign_entity(txn_id: str, user: dict = Depends(_user()),
                       body: dict = Body(...)):
@@ -8004,8 +9807,15 @@ def txn_assign_entity(txn_id: str, user: dict = Depends(_user()),
                 raise HTTPException(409 if "archived" in str(_e) else 404,
                                     str(_e))
         try:                             # …and so is moving OUT of one
-            if not entities.assign_transaction(conn, txn_id, eid):
-                raise HTTPException(404, "no such transaction")
+            with conn.transaction():
+                # the pairing lock before the row lock, the order the
+                # settlement takes them in; and the check reads the row the
+                # move will land on, which for a hold that has since posted
+                # is the posted charge
+                txn_id = entities.live_txn_id(conn, txn_id) or txn_id
+                _refuse_moving_a_fronted_expense(conn, txn_id, eid)
+                if not entities.assign_transaction(conn, txn_id, eid):
+                    raise HTTPException(404, "no such transaction")
         except ValueError as _e:
             raise HTTPException(409, str(_e))
         return {"ok": True, "txn_id": txn_id, "entity_id": eid}
@@ -8070,8 +9880,10 @@ def enrich_status_api(user: dict = Depends(_user())):
              dependencies=[Depends(limit("import-enrich", 20, 3600.0))])
 def enrich_run_api(user: dict = Depends(_user()), body: dict = Body(default={})):
     """Send a batch of imported rows to Plaid Enrich (owner, on request —
-    billed per row, so never automatic; capped per month)."""
-    demoguard.deny(user)
+    billed per row, so never automatic; capped per month). Refused to the
+    shared demonstration login: its password is handed out, and every run
+    bills the Plaid account behind the instance."""
+    demoguard.deny_shared_credentials(user)
     _owner_only(user)
     from ..sync import plaid as _plaid
     try:
@@ -8098,6 +9910,23 @@ def enrich_run_api(user: dict = Depends(_user()), body: dict = Body(default={}))
         conn.close()
 
 
+@contextlib.contextmanager
+def _push_write(conn, user: dict):
+    """The write transaction of a collector push door. The push was
+    authenticated before it got here, and an account erasure flips the
+    household's status and then wipes its rows: a push landing after that
+    would write the rows back under a tenant id nothing ever sweeps again.
+    Holding the push writer lock for the transaction makes an erasure that
+    starts now wait for this push (and then delete it); one already under
+    way answers 409 and nothing is written."""
+    from .. import erasure
+    with conn.transaction():
+        if not erasure.push_may_write(conn, user["tenant_id"]):
+            raise HTTPException(
+                409, "this household is being deleted; nothing was imported")
+        yield
+
+
 @router.post("/import/coinbase")
 def coinbase_import_api(user: dict = Depends(_user()),
                         body: dict = Body(...)):
@@ -8113,7 +9942,8 @@ def coinbase_import_api(user: dict = Depends(_user()),
     conn = _conn(user)
     try:
         try:
-            return coinbase_push.import_payload(conn, body)
+            with _push_write(conn, user):
+                return coinbase_push.import_payload(conn, body)
         except (KeyError, TypeError, ValueError) as e:
             raise HTTPException(400, f"bad payload: {e}")
     finally:
@@ -8135,8 +9965,9 @@ def amazon_import_api(user: dict = Depends(_user()), body: dict = Body(...)):
     conn = _conn(user)
     try:
         try:
-            return amazon_orders.import_orders(conn,
-                                               body.get("orders") or [])
+            with _push_write(conn, user):
+                return amazon_orders.import_orders(
+                    conn, body.get("orders") or [])
         except (KeyError, TypeError, ValueError) as e:
             raise HTTPException(400, f"bad payload: {e}")
     finally:
@@ -8157,8 +9988,9 @@ def costco_import_api(user: dict = Depends(_user()), body: dict = Body(...)):
     conn = _conn(user)
     try:
         try:
-            return costco_receipts.import_receipts(
-                conn, body.get("receipts") or [])
+            with _push_write(conn, user):
+                return costco_receipts.import_receipts(
+                    conn, body.get("receipts") or [])
         except (KeyError, TypeError, ValueError) as e:
             raise HTTPException(400, f"bad payload: {e}")
     finally:
@@ -8195,11 +10027,17 @@ def plan_activity_import_api(user: dict = Depends(_user()), body: dict = Body(..
     if balance not in (None, ""):
         try:
             balance = float(balance)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError: a JSON integer too wide for a double
             raise HTTPException(400, "balance must be a number")
         import math as _math
         if not _math.isfinite(balance):
             raise HTTPException(400, "balance must be a finite number")
+        # finite alone is not enough: two balances near the float ceiling
+        # add up to infinity in every net-worth total that carries them
+        from ..engine.compat import MAX_AMOUNT
+        if abs(balance) > MAX_AMOUNT:
+            raise HTTPException(400, "balance is too large")
     else:
         balance = None
     # the plan number's trailing digits, as an aggregator would report
@@ -8220,9 +10058,11 @@ def plan_activity_import_api(user: dict = Depends(_user()), body: dict = Body(..
     conn = _conn(user)
     try:
         try:
-            r = plan_csv.import_csv(conn, plan, body["csv"], balance=balance,
-                                    mask=mask, provider=provider,
-                                    institution=institution)
+            with _push_write(conn, user):
+                r = plan_csv.import_csv(conn, plan, body["csv"],
+                                        balance=balance, mask=mask,
+                                        provider=provider,
+                                        institution=institution)
         except (KeyError, TypeError, ValueError) as e:
             # a CSV nothing parses out of, or one past the row ceiling, is a
             # statement about the POSTed document — same 400 the coinbase
@@ -8261,24 +10101,111 @@ def jobs_sync_api(user: dict = Depends(_user())):
             "started": True, "results": results}
 
 
+def _disconnect_under_sync_lock(conn, tenant_id: str, item_id: str) -> dict:
+    """Archive an item only while no sync is running for the tenant.
+
+    A pull that is already in flight re-upserts the item it is syncing, so
+    archiving underneath it races the aggregator's own status writes; the
+    guards on those writes keep 'archived' from being overwritten, and this
+    lock keeps the two from interleaving at all. 409 tells the client to
+    try again in a moment rather than leaving it to guess."""
+    from ..sync import base as sync_base
+    with sync_base.tenant_sync_lock(conn, tenant_id) as held:
+        if not held:
+            raise HTTPException(409, "a sync is running for this household — "
+                                     "try again in a moment")
+        try:
+            return sync_base.disconnect_item(conn, item_id)
+        except KeyError:
+            raise HTTPException(404, "no such connection")
+
+
 @router.post("/connections/{item_id}/disconnect")
 def connection_disconnect(item_id: str, user: dict = Depends(_user())):
     """Archive a connection so it stops syncing; transaction history is
     kept. For Plaid this ALSO releases the Item on Plaid's side
     (/item/remove) — that's what frees a slot on limited plans; a local
-    archive alone never would."""
-    demoguard.deny(user)
+    archive alone never would. That release cannot be undone, so the
+    shared demonstration login may not make it for the household."""
+    demoguard.deny_shared_credentials(user)
+    if user["role"] != "owner":
+        raise HTTPException(403, "owner only")
+    conn = _conn(user)
+    try:
+        r = _disconnect_under_sync_lock(conn, user["tenant_id"], item_id)
+        return {"ok": True, "plaid_released": r["plaid_released"],
+                "note": r["note"]}
+    finally:
+        conn.close()
+
+
+# Where each other aggregator's disconnected connection comes back from: the
+# reconnect door serves MX and single SimpleFIN banks, because for the others
+# a new link or token is what brings the bank back. A SimpleFIN bank
+# disconnected on its own is the exception among the bridge's: a new token
+# brings back only the banks that went down with the bridge.
+_RECONNECT_ELSEWHERE = {
+    "plaid": "a disconnected Plaid bank comes back by linking it again "
+             "from Connect a bank",
+    "simplefin": "a disconnected SimpleFIN bridge comes back by connecting "
+                 "a new SimpleFIN setup token; the banks that were "
+                 "disconnected with it come back too, with what they "
+                 "posted while disconnected",
+    "coinbase": "a disconnected Coinbase account comes back by linking it "
+                "again from Connect a bank",
+}
+
+
+@router.post("/connections/{item_id}/reconnect")
+def connection_reconnect(item_id: str, user: dict = Depends(_user())):
+    """Bring a disconnected MX or SimpleFIN bank back. The member was left alive at MX,
+    so only the owner saying so can tell a bank they want back from one MX
+    merely refreshed; the next sync then reaches back over the time it was
+    disconnected (mx.reconnect). Taken under the tenant sync lock like the
+    disconnect door, so a pull in flight never sees half of it. It
+    restarts syncing and billing, so the shared demonstration login is
+    refused like every other door that brings a bank in."""
+    demoguard.deny_shared_credentials(user)
     if user["role"] != "owner":
         raise HTTPException(403, "owner only")
     from ..sync import base as sync_base
+    from ..sync import mx as mx_mod
     conn = _conn(user)
     try:
-        try:
-            r = sync_base.disconnect_item(conn, item_id)
-        except KeyError:
+        it = conn.execute("SELECT aggregator FROM items WHERE id=%s",
+                          (item_id,)).fetchone()
+        if it is None:
             raise HTTPException(404, "no such connection")
-        return {"ok": True, "plaid_released": r["plaid_released"],
-                "note": r["note"]}
+        if it["aggregator"] == "simplefin-org":
+            from . import setup as setup_mod
+            with sync_base.tenant_sync_lock(conn, user["tenant_id"]) as held:
+                if not held:
+                    raise HTTPException(409, "a sync is running for this "
+                                             "household — try again in a "
+                                             "moment")
+                try:
+                    return setup_mod.reconnect_bank(conn, item_id)
+                except KeyError:
+                    raise HTTPException(404, "no such connection")
+                except ValueError as e:
+                    raise HTTPException(400, str(e))
+        if it["aggregator"] != "mx":
+            raise HTTPException(400, _RECONNECT_ELSEWHERE.get(
+                it["aggregator"] or "",
+                "only an MX connection is reconnected here"))
+        if mx_mod.creds(conn) is None:
+            raise HTTPException(400, "MX keys are not configured — add them "
+                                     "again before reconnecting")
+        with sync_base.tenant_sync_lock(conn, user["tenant_id"]) as held:
+            if not held:
+                raise HTTPException(409, "a sync is running for this "
+                                         "household — try again in a moment")
+            try:
+                return mx_mod.reconnect(conn, item_id)
+            except KeyError:
+                raise HTTPException(404, "no such connection")
+            except ValueError as e:
+                raise HTTPException(400, str(e))
     finally:
         conn.close()
 
@@ -8417,9 +10344,18 @@ def accounts_remove_api(account_id: str, user: dict = Depends(_user()),
     if user["role"] != "owner":
         raise HTTPException(403, "owner only")
     mode = _body_text(body, "mode").lower()
+    # the owner's answer to the refusal below: delete the rows kept only
+    # by a note that names no feed account
+    force_kept = body.get("force_kept") is True
     if mode not in ("hide", "disconnect", "disconnect_purge", "purge"):
         raise HTTPException(
             400, "mode must be hide, disconnect, disconnect_purge, or purge")
+    if mode in ("disconnect", "disconnect_purge"):
+        # disconnecting releases a Plaid Item for good (and the purge
+        # deletes the institution's history); the shared demonstration
+        # login may hide an account or purge a manual one, never cut the
+        # household's bank links
+        demoguard.deny_shared_credentials(user)
     from ..sync import base as sync_base
     conn = _conn(user)
     try:
@@ -8467,10 +10403,7 @@ def accounts_remove_api(account_id: str, user: dict = Depends(_user()),
                 raise HTTPException(400, "account has no connection to disconnect")
             if not conn_live:
                 raise HTTPException(400, "connection is already disconnected")
-            try:
-                r = sync_base.disconnect_item(conn, item_id)
-            except KeyError:
-                raise HTTPException(404, "no such connection")
+            r = _disconnect_under_sync_lock(conn, user["tenant_id"], item_id)
             result["plaid_released"] = r["plaid_released"]
             result["note"] = r["note"] or "Disconnected; history kept."
             if siblings:
@@ -8485,23 +10418,36 @@ def accounts_remove_api(account_id: str, user: dict = Depends(_user()),
             if not item_id:
                 raise HTTPException(
                     400, "account has no connection — use purge instead")
+            # asked before anything changes: the disconnect below commits
+            if not force_kept:
+                ids = sync_base.item_account_ids(conn, item_id)
+                refusal = _kept_without_account_refusal(conn, ids, tuple(ids))
+                if refusal is not None:
+                    return refusal
             if conn_live:
-                try:
-                    r = sync_base.disconnect_item(conn, item_id)
-                except KeyError:
-                    raise HTTPException(404, "no such connection")
+                r = _disconnect_under_sync_lock(conn, user["tenant_id"], item_id)
                 result["plaid_released"] = r["plaid_released"]
                 result["note"] = r["note"]
             # all accounts under this item (incl. simplefin children)
-            all_ids = [r["id"] for r in conn.execute(
-                "SELECT id FROM accounts WHERE item_id=%s OR item_id LIKE %s",
-                (item_id, item_id + ":%")).fetchall()]
+            all_ids = sync_base.item_account_ids(conn, item_id)
             result["affected_accounts"] = all_ids
-            result["purged"] = sync_base.purge_item_accounts(conn, item_id)
+            try:
+                result["purged"] = sync_base.purge_item_accounts(
+                    conn, item_id, force_kept=force_kept)
+            except sync_base.SyncRunning as e:
+                # A disconnect made above has already committed; only the
+                # delete waits. Say so, so the client reports neither a
+                # clean failure nor a purge that did not happen — the
+                # data can be deleted once the sync finishes.
+                raise HTTPException(
+                    409, (f"Disconnected, but the local data was not "
+                          f"deleted: {e}") if conn_live else str(e))
             if not result["note"]:
                 result["note"] = "Disconnected and deleted local data."
             else:
                 result["note"] = (result["note"] + " Local data deleted.")
+            result["note"] = _with_kept_rows(result["note"],
+                                             result["purged"])
             return result
 
         # mode == "purge" — single-account hard delete
@@ -8511,7 +10457,29 @@ def accounts_remove_api(account_id: str, user: dict = Depends(_user()),
                 "can't purge a live connected account (sync would recreate it) "
                 "— use disconnect_purge for the institution, or hide to keep "
                 "the connection")
-        result["purged"] = sync_base.purge_account_data(conn, account_id)
+        if not force_kept:
+            refusal = _kept_without_account_refusal(conn, [account_id],
+                                                    (account_id,))
+            if refusal is not None:
+                return refusal
+        try:
+            result["purged"] = sync_base.purge_account_data(
+                conn, account_id, force_kept=force_kept)
+        except sync_base.SyncRunning as e:
+            raise HTTPException(409, str(e))
+        if agg == "simplefin-org":
+            # The bridge may still carry this account, so any later pull of
+            # the bank would recreate it with its history. The bank is
+            # marked so that neither a new setup token (which brings back
+            # only banks marked as gone with the bridge) nor the reconnect
+            # door brings it back. A bank a new link took over keeps that
+            # mark: it is refused by both already, and says why.
+            from . import setup as setup_mod
+            conn.execute(
+                "UPDATE items SET archived_reason=%s WHERE id=%s "
+                "AND (archived_reason IS NULL OR archived_reason=%s)",
+                (setup_mod.ACCOUNT_PURGED, item_id,
+                 sync_base.BRIDGE_DISCONNECT))
         # drop orphan empty item shells (manual / archived with no accounts)
         if item_id:
             left = conn.execute(
@@ -8527,10 +10495,42 @@ def accounts_remove_api(account_id: str, user: dict = Depends(_user()),
             elif left == 0 and agg not in (
                     "plaid", "mx", "simplefin", "simplefin-org"):
                 conn.execute("DELETE FROM items WHERE id=%s", (item_id,))
-        result["note"] = "Account and its transactions deleted."
+        result["note"] = _with_kept_rows(
+            "Account and its transactions deleted.", result["purged"])
         return result
     finally:
         conn.close()
+
+
+def _kept_without_account_refusal(conn, account_ids: list[str],
+                                  dropping: tuple[str, ...]):
+    """A delete whose kept rows are ALL held only by a note naming no feed
+    account would keep the account for ever: the note cannot be checked
+    against any feed, so no later delete releases it either. Instead of
+    that dead end the owner is asked, with the count, and answers with
+    `force_kept: true`. None when the delete can simply go ahead."""
+    from ..sync import base as sync_base
+    kept, accountless = sync_base.kept_without_account(conn, account_ids,
+                                                       dropping)
+    if not kept or accountless != kept:
+        return None
+    rows = f"{kept} imported row{'s' if kept != 1 else ''}"
+    return JSONResponse(status_code=409, content={
+        "detail": (f"{rows} on this account may stand in for charges a "
+                   f"bank feed set aside, and the feed may never send "
+                   f"those charges again. Delete anyway to remove "
+                   f"{'them' if kept != 1 else 'it'} with the account."),
+        "error": "kept_rows_unconfirmed",
+        "kept_transactions": kept})
+
+
+def _with_kept_rows(note: str, purged: dict | None) -> str:
+    """The purge's own sentence about rows it could not delete — imported
+    rows a bank feed relies on, and the account kept to hold them — so the
+    reply never claims a delete that only partly happened."""
+    if purged and purged.get("kept_transactions") and purged.get("note"):
+        return f"{note} {purged['note']}"
+    return note
 
 
 # the wizard's Sync step — start the sweep in the background and
@@ -8721,6 +10721,7 @@ def jobs_email_api(user: dict = Depends(_user())):
 @router.get("/notify")
 def notify_status_api(user: dict = Depends(_user())):
     from .. import notify  # noqa: F401
+    from ..auth import device_tokens as _device_tokens
     from ..notify import push as _push, push_native as _push_native, \
         sms as _sms
     from .app import _control_conn
@@ -8742,26 +10743,38 @@ def notify_status_api(user: dict = Depends(_user())):
     with _control_conn() as cc:
         subs = cc.execute(
             "SELECT count(*) AS n FROM push_subscriptions "
-            "WHERE user_id=%s AND dead_at IS NULL",
+            f"WHERE user_id=%s AND {_push.LIVE}",
             (user["user_id"],)).fetchone()["n"]
-        # phones with a live native push registration — tenant-wide, like
-        # the delivery fan-out itself (notify/push_native.py)
-        native = cc.execute(
-            """SELECT count(*) AS n FROM device_tokens
-               WHERE tenant_id=%s AND revoked_at IS NULL
-                     AND expires_at > now() AND push_token IS NOT NULL
-                     AND push_dead_at IS NULL""",
-            (user["tenant_id"],)).fetchone()["n"]
+        # phones push would actually reach: the delivery fan-out's own
+        # target list (notify/push_native.py), so a phone it skips — one
+        # the shared demonstration login registered — never makes the
+        # clients offer push that nothing would carry
+        native = len(_device_tokens.push_targets(cc, user["tenant_id"]))
         vapid_pub = None
         if _push.available():
             try:
                 _priv, vapid_pub = _push.vapid_keys(cc)
             except Exception:                    # noqa: BLE001
                 vapid_pub = None
+    # A number an owner's credential change paused (auth/reset.py
+    # _unverify_sms_number) stays on file, unverified, with the moment it
+    # was paused — so the clients can say why the texts stopped and offer
+    # to confirm it again or remove it. A number that was never verified
+    # has no pause time.
+    paused_at = None
+    if phone.get("number") and not phone.get("verified") \
+            and phone.get("unverified_at"):
+        raw = str(phone["unverified_at"])
+        try:
+            paused_at = dt.datetime.fromisoformat(raw).astimezone(
+                dt.timezone.utc).isoformat()
+        except ValueError:
+            paused_at = raw
     return {"sms_available": _sms.configured() and sms_entitled,
             "sms_entitled": sms_entitled,
             "phone": _sms.mask(phone.get("number")),
             "phone_verified": bool(phone.get("verified")),
+            "phone_paused_at": paused_at,
             "phone_pending": _sms.mask(pending.get("number")),
             "push_available": _push.available() and vapid_pub is not None,
             "vapid_public_key": vapid_pub,
@@ -8770,7 +10783,25 @@ def notify_status_api(user: dict = Depends(_user())):
             # no VAPID key can still reach the mobile apps through the relay,
             # so a phone-only household must not be told push is impossible
             "native_push_available": _push_native.available(),
-            "native_push_devices": native}
+            "native_push_devices": native,
+            # mail is on but invitations cannot carry a link: an added
+            # recipient is never invited, so never receives the daily email
+            "invites_need_base_url": _invites_need_base_url(user)}
+
+
+def _invites_need_base_url(user) -> bool:
+    from ..notify import recipient_invites
+    from .app import _tenant_smtp
+    try:
+        return recipient_invites.need_base_url(
+            _tenant_smtp(user["tenant_id"]))
+    except Exception:                            # noqa: BLE001
+        # a status read must not fail on the mail config it only reports
+        import logging
+        logging.getLogger("oikonome.api").warning(
+            "could not read the mail relay for the notify status",
+            exc_info=True)
+        return False
 
 
 @router.post("/notify/phone",
@@ -8779,12 +10810,25 @@ def notify_phone_api(user: dict = Depends(_user()), body: dict = Body(...)):
     """Set (or clear) the tenant's SMS number. Setting sends a 6-digit
     verification code to the number — summaries only ever go to a number
     that typed its code back (a typo must not leak a household's budget
-    to a stranger)."""
-    demoguard.deny(user)
+    to a stranger). The shared demonstration login can neither set nor
+    clear it: a number a visitor verified keeps receiving the household's
+    summaries after the visit and after the shared password is rotated."""
+    demoguard.deny_shared_grant(user)
     _owner_only(user)
     from ..engine import budget
     from ..notify import sms as _sms
     number = str(body.get("number") or "").strip().replace(" ", "")
+    if number:
+        # A number is a durable destination for the household's summaries,
+        # like a mail relay or a daily-mail recipient, and the code that
+        # verifies it goes to the number being set — so a cookie alone
+        # would verify a thief's own phone. Setting one is a step-up act;
+        # clearing stays free, because it only takes a destination away.
+        from .app import _require_elevation
+        _require_elevation(
+            user, password=str(body.get("password") or ""),
+            totp_code=str(body.get("totp_code") or ""),
+            recovery_code=str(body.get("recovery_code") or ""))
     conn = _conn(user)
     try:
         if not number:                        # clear
@@ -8879,7 +10923,9 @@ def notify_phone_api(user: dict = Depends(_user()), body: dict = Body(...)):
              dependencies=[Depends(limit("notify-verify", 10, 3600))])
 def notify_phone_verify_api(user: dict = Depends(_user()),
                             body: dict = Body(...)):
-    demoguard.deny(user)
+    # the step that actually opens the SMS channel, refused for the same
+    # reason as the number itself
+    demoguard.deny_shared_grant(user)
     _owner_only(user)
     import hashlib
     from ..engine import budget
@@ -8928,14 +10974,44 @@ def _valid_push_endpoint(endpoint: str) -> bool:
 @router.post("/notify/push/subscribe")
 def push_subscribe_api(user: dict = Depends(_user()), body: dict = Body(...)):
     """Store this browser's PushSubscription (upsert on endpoint — a
-    re-subscribe refreshes keys instead of duplicating)."""
-    demoguard.deny(user)
-    from .app import _control_conn
+    re-subscribe refreshes keys instead of duplicating).
+
+    The shared demonstration login is refused: a subscription is a
+    channel to one visitor's browser that every later alert for the
+    household is sent down, and it stays when that visitor leaves and the
+    shared password is rotated."""
+    demoguard.deny_shared_grant(user)
+    from .app import _control_conn, _require_elevation
     endpoint = str(body.get("endpoint") or "")
     keys = body.get("keys") or {}
-    if not _valid_push_endpoint(endpoint) or not keys.get("p256dh") \
-            or not keys.get("auth"):
+    if not isinstance(keys, dict) or not _valid_push_endpoint(endpoint) \
+            or not keys.get("p256dh") or not keys.get("auth"):
         raise HTTPException(400, "bad subscription")
+    # A subscription lives as long as the browser session that made it
+    # (push_subscriptions.session_id cascades from sessions), so a cookie
+    # that expires, signs out or is revoked takes its channel with it.
+    # Only a browser session can make one: a script or device token has
+    # no session for it to die with.
+    if not user.get("session_id") or user.get("device_id") \
+            or user.get("script_token"):
+        raise HTTPException(
+            403, "web push is turned on from a signed-in browser")
+    # A new destination for the household's verdicts and alerts is a
+    # step-up act, like an SMS number, a webhook or a mail recipient: a
+    # stolen cookie alone would otherwise add the thief's own browser.
+    # The same browser refreshing the subscription it already holds (its
+    # endpoint and keys, on this account) is not a new destination.
+    with _control_conn() as conn:
+        held = conn.execute(
+            "SELECT 1 FROM push_subscriptions WHERE endpoint=%s "
+            "AND user_id=%s AND p256dh=%s AND auth=%s",
+            (endpoint, user["user_id"], str(keys["p256dh"]),
+             str(keys["auth"]))).fetchone()
+    if held is None:
+        _require_elevation(
+            user, password=str(body.get("password") or ""),
+            totp_code=str(body.get("totp_code") or ""),
+            recovery_code=str(body.get("recovery_code") or ""))
     # Reassigning user_id/tenant_id on ANY endpoint conflict would let a
     # posted endpoint string that belongs to someone else silently take the
     # row over. push_subscriptions has no RLS (control plane), so nothing
@@ -8948,15 +11024,23 @@ def push_subscribe_api(user: dict = Depends(_user()), body: dict = Body(...)):
     # re-subscribing presents the SAME keys, which is exactly the legitimate
     # case (a second person logging in on a shared browser profile). Knowing
     # only the endpoint proves nothing and is refused.
-    with _control_conn() as conn:
+    from .app import _caller_still_signed_in, _lock_user_factors
+    with _control_conn() as conn, conn.transaction():
+        # a reset deletes the account's subscriptions; one stored after it
+        # would keep receiving the household's alerts with no session, so
+        # the row is written under the reset's own lock
+        _lock_user_factors(conn, user["user_id"])
+        _caller_still_signed_in(conn, user)
         row = conn.execute(
             """INSERT INTO push_subscriptions
-                 (user_id, tenant_id, endpoint, p256dh, auth, user_agent)
-               VALUES (%s, %s, %s, %s, %s, %s)
+                 (user_id, tenant_id, endpoint, p256dh, auth, user_agent,
+                  session_id)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)
                ON CONFLICT (endpoint) DO UPDATE SET
                  user_id=EXCLUDED.user_id, tenant_id=EXCLUDED.tenant_id,
                  p256dh=EXCLUDED.p256dh, auth=EXCLUDED.auth,
                  user_agent=EXCLUDED.user_agent,
+                 session_id=EXCLUDED.session_id,
                  dead_at=NULL
                WHERE push_subscriptions.user_id = EXCLUDED.user_id
                   OR (push_subscriptions.p256dh = EXCLUDED.p256dh
@@ -8964,7 +11048,8 @@ def push_subscribe_api(user: dict = Depends(_user()), body: dict = Body(...)):
                RETURNING id""",
             (user["user_id"], user["tenant_id"], endpoint,
              str(keys["p256dh"]), str(keys["auth"]),
-             str(body.get("user_agent") or "")[:200])).fetchone()
+             str(body.get("user_agent") or "")[:200],
+             user["session_id"])).fetchone()
     if row is None:
         raise HTTPException(
             409, "that push endpoint is registered to another account")
@@ -9023,11 +11108,14 @@ def notify_test_api(user: dict = Depends(_user()), body: dict = Body(...)):
     if channel == "push":
         from ..notify import push_native as _native
         native_detail: dict = {}
-        with _control_conn() as cc:
-            n = _push.send_tenant(cc, user["tenant_id"],
-                                  "Oikonome test", short)
-            n += _native.send_tenant(cc, user["tenant_id"], "test",
-                                     detail=native_detail)
+        # connect, not a held connection: the sends wait on outside push
+        # services, and a request holding one of the control pool's few
+        # connections across them takes it from everyone's session check
+        n = _push.send_tenant(None, user["tenant_id"], "Oikonome test",
+                              short, connect=_control_conn)
+        n += _native.send_tenant(None, user["tenant_id"], "test",
+                                 detail=native_detail,
+                                 connect=_control_conn)
         if not n:
             # a registered phone whose platform leg isn't live is a
             # CONFIG story, not an account one — say the true reason
@@ -9039,6 +11127,14 @@ def notify_test_api(user: dict = Depends(_user()), body: dict = Body(...)):
                          "no push relay configured "
                          "(OIKONOME_PUSH_RELAY_URL) — native pushes "
                          "can't be delivered")
+            # the relay said why it would not deliver (the device is bound
+            # to another server, a rate limit, no answer at all) — that
+            # sentence is the true story; "enable push" would send the
+            # owner to sign in on the phone they are already holding
+            if native_detail.get("targets") and native_detail.get("reason"):
+                raise HTTPException(
+                    400, f"your device is registered, but "
+                         f"{native_detail['reason']}")
             if (native_detail.get("targets")
                     and native_detail.get("unavailable")):
                 legs = ", ".join(native_detail["unavailable"])
@@ -9076,7 +11172,7 @@ def support_access_grant_api(user: dict = Depends(_user()),
                              body: dict = Body(...)):
     """Grant support access for a bounded window (hours, 1–168, default
     24). Revokes any prior live grant first so there is at most one."""
-    demoguard.deny(user)
+    demoguard.deny_shared_grant(user)
     _owner_only(user)
     # Session alone must not open a support window (stolen cookie
     # → operator data access). Same posture as invites/tokens/passkeys.
@@ -9089,12 +11185,18 @@ def support_access_grant_api(user: dict = Depends(_user()),
                        recovery_code=str(body.get("recovery_code") or ""))
     try:
         hours = int(body.get("hours", 24))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise HTTPException(400, "hours must be a number")
     if not 1 <= hours <= 168:
         raise HTTPException(400, "hours must be 1–168")
     reason = str(body.get("reason") or "")[:200]
-    with _control_conn() as conn:
+    from .app import _caller_still_signed_in, _lock_user_factors
+    with _control_conn() as conn, conn.transaction():
+        # a recovery revokes the grants this account made, under the
+        # factor lock; a grant that authenticated before it and wrote
+        # after would open the window the recovery just closed
+        _lock_user_factors(conn, user["user_id"])
+        _caller_still_signed_in(conn, user)
         conn.execute(
             "UPDATE support_consents SET revoked_at=now() "
             "WHERE tenant_id=%s AND revoked_at IS NULL", (user["tenant_id"],))

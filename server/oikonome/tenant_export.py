@@ -49,18 +49,28 @@ def _select(conn, table: str):
     table is unreadable / fully excluded."""
     from psycopg import sql
     try:
-        cols = [r["column_name"] for r in conn.execute(
-            """SELECT column_name FROM information_schema.columns
+        cols = [(r["column_name"], r["data_type"]) for r in conn.execute(
+            """SELECT column_name, data_type FROM information_schema.columns
                WHERE table_schema='public' AND table_name=%s
                ORDER BY ordinal_position""", (table,)).fetchall()]
     except Exception:                                     # noqa: BLE001
         return None, []
-    keep = [c for c in cols if c not in _EXCLUDE_COLS]
+    keep = [(c, t) for c, t in cols if c not in _EXCLUDE_COLS]
     if not keep:
         return None, []
+
+    # A binary column is written as its size only (see _json_safe), so the
+    # database is asked for the size and the bytes never cross the wire: a
+    # staged upload or a model artifact read whole just to be measured
+    # would put a batch of files in the process at once.
+    def col(c, t):
+        if t != "bytea":
+            return sql.Identifier(c)
+        return sql.SQL("'<' || octet_length({c}) || ' bytes omitted>' "
+                       "AS {c}").format(c=sql.Identifier(c))
     return sql.SQL("SELECT {} FROM {}").format(
-        sql.SQL(", ").join(sql.Identifier(c) for c in keep),
-        sql.Identifier(table)), keep
+        sql.SQL(", ").join(col(c, t) for c, t in keep),
+        sql.Identifier(table)), [c for c, _ in keep]
 
 
 def _dump_table(conn, table: str, fh) -> int:
@@ -81,7 +91,8 @@ def _dump_table(conn, table: str, fh) -> int:
     n = 0
     if q is not None:
         # named cursor => server-side; itersize bounds the client-side
-        # prefetch. Must run inside a transaction to hold the portal open.
+        # prefetch. Must run inside a transaction to hold the portal open
+        # (a savepoint inside build_archive's one snapshot).
         with conn.transaction():
             with conn.cursor(name=f"exp_{table}") as cur:
                 cur.itersize = 1000
@@ -239,6 +250,27 @@ ARCHIVE_TABLE_SKIP = {
     "webhook_deliveries": "the webhook outbox — each payload is a copy of "
                           "ledger rows already in the archive, addressed "
                           "to a receiver the archive does not name",
+    # The rest match the household's own export (web/pages.EXPORT_SKIP),
+    # and a test holds the two lists together: a table the household's
+    # export leaves out for what it carries must not ride out of the
+    # operator's archive instead.
+    "tenant_keys": "envelope key material — a secret, never travels",
+    "job_progress": "job bookkeeping — the categorizer's record of a run "
+                    "names the AI endpoint it used, credentials and all",
+    "job_runs": "job bookkeeping and heartbeats",
+    "import_staging": "import scratch — parsed rows waiting on a preview, "
+                      "and the tokens that commit them",
+    "bulk_import_jobs": "import scratch and job bookkeeping — a folder "
+                        "import's frozen plan and its progress",
+    "bulk_import_files": "import scratch and job bookkeeping — the files "
+                         "a folder import has not reached yet, as "
+                         "uploaded",
+    "sync_log": "sync history, which carries providers' raw error text",
+    "feedback_reports": "an operational ring buffer that may embed log "
+                        "lines",
+    "script_heartbeats": "collector liveness, meaningless off-instance",
+    "categorizer_model": "a binary model artifact derived from "
+                         "merchant_categories, which the archive carries",
 }
 
 
@@ -308,7 +340,17 @@ def build_archive(tenant_id: str, *, operator: str,
     buf = io.BytesIO()
     conn = tenancy.tenant_connect(tenant_id)
     try:
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        # ONE snapshot for every table. Read each at its own moment, a sync
+        # committing mid-export (a pending charge settling, its splits and
+        # receipts moving to the posted row) leaves the archive holding rows
+        # that point at transactions it does not contain. A read-only
+        # REPEATABLE READ transaction gives every table the same moment;
+        # _dump_table's blocks become savepoints inside it. Row-level
+        # security is unchanged: the tenant setting is on the session.
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z, \
+                conn.transaction():
+            conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, "
+                         "READ ONLY")
             for t in tables:
                 # write THROUGH the zip member instead of building the whole
                 # JSON string first — the deflater sees the rows

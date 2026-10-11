@@ -204,3 +204,102 @@ class AssistantLocalityTests(unittest.TestCase):
             st = assistant.status(self.conn)
         self.assertEqual(st, {"available": True, "local": False,
                               "host": "api.example.com"})
+
+
+class SpendLookupMatchesSpendingTests(unittest.TestCase):
+    """spend_lookup's answer is meant to be the Spending page's number. Two
+    tools in one conversation must not quote two totals for one question,
+    so it drops the accounts the household excluded and counts a hand-split
+    row under each category for that part's share only."""
+
+    def setUp(self):
+        self.conn = make_db()
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _split(self, txn_id, parts):
+        for i, (cat, amt) in enumerate(parts, 1):
+            self.conn.execute(
+                "INSERT INTO transaction_splits (txn_id, line, category, "
+                "amount) VALUES (%s,%s,%s,%s)", (txn_id, i, cat, amt))
+
+    def test_an_excluded_account_is_left_out_of_every_figure(self):
+        from .util import write_config
+        add_txn(self.conn, "2025-03-01", 40.0, "EXAMPLE MART",
+                merchant="Example Mart", account="chk",
+                primary="FOOD_AND_DRINK")
+        add_txn(self.conn, "2025-03-02", 900.0, "EXAMPLE MART",
+                merchant="Example Mart", account="card",
+                primary="FOOD_AND_DRINK")
+        write_config(self.conn, excluded_accounts=["card"])
+        for args in ({"merchant": "example mart", "year": 2025},
+                     {"category": "food and drink"}, {"year": 2025}):
+            out = assistant._run_tool(self.conn, "spend_lookup", args)
+            self.assertEqual(out["total"], 40.0, args)
+            self.assertEqual(out["transactions"], 1, args)
+            self.assertEqual(out["by_year"], [["2025", 40.0, 1]], args)
+            self.assertEqual(out["top_merchants"][0][1], 40.0, args)
+
+    def test_a_split_row_counts_only_its_matching_part(self):
+        add_txn(self.conn, "2025-05-01", 300.0, "EXAMPLE WAREHOUSE",
+                merchant="Example Warehouse", primary="GENERAL_MERCHANDISE",
+                txn_id="split-a")
+        self._split("split-a", [("FOOD_AND_DRINK", 100.0),
+                                ("HOME_IMPROVEMENT", 200.0)])
+        # its own category says food, but no part of it is food
+        add_txn(self.conn, "2025-05-02", 80.0, "EXAMPLE DINER",
+                merchant="Example Diner", primary="FOOD_AND_DRINK",
+                txn_id="split-b")
+        self._split("split-b", [("ENTERTAINMENT", 50.0),
+                                ("HOME_IMPROVEMENT", 30.0)])
+        out = assistant._run_tool(self.conn, "spend_lookup",
+                                  {"category": "food and drink",
+                                   "year": 2025})
+        self.assertEqual(out["total"], 100.0)
+        self.assertEqual(out["transactions"], 1)
+        self.assertEqual(out["by_year"], [["2025", 100.0, 1]])
+        self.assertEqual(out["top_merchants"],
+                         [["Example Warehouse", 100.0, 1]])
+        home = assistant._run_tool(self.conn, "spend_lookup",
+                                   {"category": "home improvement"})
+        self.assertEqual(home["total"], 230.0)
+        # a lookup that does not name a category still counts whole rows
+        self.assertEqual(assistant._run_tool(
+            self.conn, "spend_lookup", {"year": 2025})["total"], 380.0)
+
+
+class AssistantLocalityByAddressTests(unittest.TestCase):
+    """'Nothing leaves the box' is a privacy promise, so it is judged from
+    the endpoint's address for every backend, the operator's included: a
+    loopback, private-range or same-box name is local, anything else is not.
+    The operator's host is still never named to a tenant."""
+
+    def setUp(self):
+        self.conn = make_db()
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _status(self, url, source):
+        from unittest import mock
+        with mock.patch.object(assistant._llm, "_backend",
+                               return_value={**_BE, "url": url,
+                                             "source": source}):
+            return assistant.status(self.conn)
+
+    def test_a_remote_operator_backend_is_not_local(self):
+        from unittest import mock
+        with mock.patch("oikonome.web.netguard._resolved_ips",
+                        return_value=["192.0.2.1", "8.8.8.8"]):
+            st = self._status("https://api.example.com/v1", "env")
+        self.assertEqual(st, {"available": True, "local": False, "host": ""})
+
+    def test_the_bundled_operator_backend_is_still_local(self):
+        for url in ("http://ollama:11434", "http://127.0.0.1:11434",
+                    "http://10.1.2.3:11434"):
+            self.assertTrue(self._status(url, "env")["local"], url)
+
+    def test_a_household_backend_on_the_lan_is_local(self):
+        self.assertEqual(self._status("http://192.168.1.50:11434", "tenant"),
+                         {"available": True, "local": True, "host": ""})

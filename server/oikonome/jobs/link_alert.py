@@ -2,10 +2,15 @@
 recovers. Called from the worker's sync sweep with the item-status
 transitions that run observed.
 
-Dedup is free: only healthy<->link-issue TRANSITIONS alert, so a
-steady-state outage (old == new == error:...) fires exactly once — not
-every hour — and a later recovery, or a fresh break after a recovery,
-re-triggers. No separate state file: the items table IS the memory.
+Dedup: only healthy<->link-issue TRANSITIONS alert, so a steady-state
+outage (old == new == error:...) fires exactly once — not every hour — and
+a later recovery, or a fresh break after a recovery, re-triggers. The
+"old" side of the edge is what was last ANNOUNCED for the item (a job_runs
+row per item, `announced_edges` / `stamp_announced`), not the status the
+sweep read when its pass began: every door that pulls a bank writes that
+status itself — a bank-webhook pull, a one-bank refresh — so whichever of
+them meets a break first would otherwise leave the sweep reading the
+error as the old status, finding no edge, and never telling anyone.
 
 Recipients are per-tenant (the same resolution as the daily email),
 delivery goes through web/report.send, and the re-link CTA points at
@@ -55,6 +60,103 @@ def _describe(status: str) -> str:
     if status.startswith("error:"):
         return "connection error (" + status.split("error:", 1)[1] + ")"
     return status
+
+
+# job_runs key prefix of the per-item announced state: note = "issue" when
+# a break was last announced, "ok" when a healthy state (or a recovery) was
+_ANNOUNCED = "link-alert:"
+# the same per-item state for the connection.changed webhook, kept apart
+# from the mail's: the webhook does not go through the mail relay, so an
+# edge held back for a mail retry must not be posted to the receiver again
+# on every retry pass, and the receiver must still hear the edge the moment
+# it is seen rather than when the relay comes back
+HOOK_ANNOUNCED = "link-hook:"
+
+
+def _health(status: str | None) -> str | None:
+    """"issue" / "ok" for the two states an announcement is about; None for
+    a transient blip, which announces nothing and changes nothing."""
+    if _is_link_issue(status):
+        return "issue"
+    return "ok" if status == "ok" else None
+
+
+def announced_edges(conn, transitions: list[dict],
+                    prefix: str = _ANNOUNCED) -> list[dict]:
+    """`transitions` with each item's `old` replaced by what was last
+    announced for it, where that is known. An item never announced (a
+    fresh link, or the first sweep after this memory existed) keeps the
+    status the pass read, which is the best evidence there is. `prefix`
+    picks whose announcements: the mail's, or the webhook's."""
+    ids = [t["id"] for t in transitions if t.get("id")]
+    if not ids:
+        return transitions
+    state = {r["job"][len(prefix):]: r["note"] for r in conn.execute(
+        "SELECT job, note FROM job_runs WHERE job = ANY(%s)",
+        ([prefix + i for i in ids],)).fetchall()}
+    out = []
+    for t in transitions:
+        s = state.get(t.get("id"))
+        if s == "issue":
+            t = dict(t, old=t["old"] if _is_link_issue(t["old"])
+                     else "login_required")
+        elif s == "ok":
+            t = dict(t, old="ok")
+        out.append(t)
+    return out
+
+
+def stamp_announced(conn, transitions: list[dict],
+                    prefix: str = _ANNOUNCED) -> None:
+    """Record, per item, the state this sweep has now announced (or found
+    nothing to announce about). Written only when it changes."""
+    for t in transitions:
+        h = _health(t.get("new"))
+        if not t.get("id") or h is None:
+            continue
+        conn.execute(
+            """INSERT INTO job_runs (job, ran_at, note)
+               VALUES (%s, now(), %s)
+               ON CONFLICT (tenant_id, job) DO UPDATE
+               SET ran_at = now(), note = EXCLUDED.note
+               WHERE job_runs.note IS DISTINCT FROM EXCLUDED.note""",
+            (prefix + t["id"], h))
+
+
+# job_runs row that bounds the retry of a link alert whose mail every
+# recipient refused: ran_at = the first refusal, note = how many sweeps
+# have failed it. A relay that stays broken (a wrong password on a
+# self-host) must not hold the edge, and the push waiting on it, forever.
+_MAIL_RETRY = "link-alert-mail-retry"
+MAIL_RETRY_SWEEPS = 6
+MAIL_RETRY_HOURS = 24
+
+
+def mail_retry_exhausted(conn) -> bool:
+    """Record one more refused send of the pending link alert and say
+    whether to stop retrying: True once the mail has failed on
+    MAIL_RETRY_SWEEPS sweeps or for MAIL_RETRY_HOURS since the first
+    refusal. The caller then announces the edge without the mail."""
+    row = conn.execute(
+        """INSERT INTO job_runs (job, ran_at, note) VALUES (%s, now(), '1')
+           ON CONFLICT (tenant_id, job) DO UPDATE
+           SET note = ((COALESCE(NULLIF(job_runs.note, ''), '0'))::int + 1)::text
+           RETURNING note, ran_at <= now() - make_interval(hours => %s) AS old""",
+        (_MAIL_RETRY, MAIL_RETRY_HOURS)).fetchone()
+    try:
+        n = int(row["note"])
+    except (TypeError, ValueError):
+        n = MAIL_RETRY_SWEEPS
+    if n >= MAIL_RETRY_SWEEPS or row["old"]:
+        clear_mail_retry(conn)
+        return True
+    return False
+
+
+def clear_mail_retry(conn) -> None:
+    """The pending alert went out (or there is none): start counting
+    afresh at the next refusal."""
+    conn.execute("DELETE FROM job_runs WHERE job=%s", (_MAIL_RETRY,))
 
 
 def _transitions_split(transitions: list[dict]):
@@ -146,8 +248,14 @@ def notify(transitions: list[dict], recipients: list[str],
         return None
     subject, plain, html_body = built
     from ..web import report
-    report.send_each(subject, plain, html_body, recipients, smtp=smtp,
-                     unsubscribe=unsubscribe)
+    results = report.send_each(subject, plain, html_body, recipients,
+                               smtp=smtp, unsubscribe=unsubscribe)
     broke, fixed = _transitions_split(transitions)
+    # `delivered` False = every recipient's send failed on a relay that is
+    # configured: the caller must not record these edges as announced, or
+    # the outage that refused the mail loses the alert for good. No relay
+    # at all is a setting, not a failure — retrying it would never end.
+    no_relay = isinstance(smtp, dict) and smtp.get("configured") is False
     return {"broke": [t["name"] for t in broke],
-            "fixed": [t["name"] for t in fixed]}
+            "fixed": [t["name"] for t in fixed],
+            "delivered": no_relay or any(r.get("ok") for r in results or [])}

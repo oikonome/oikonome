@@ -28,7 +28,8 @@ const TODAY_KEY = ["today"];
 import { useSession } from "../../lib/session";
 import { hasLeftWizard } from "../../lib/storage";
 import { heroLabel, VERDICT } from "../../lib/verdict";
-import { useDemo, useViewer } from "../../lib/viewer";
+import { labelSavingsRow, monthSavings } from "../../lib/planner";
+import { useDemo, useOwner, useViewer } from "../../lib/viewer";
 import { C, mmddyy, money } from "../../lib/theme";
 
 // where a demo instance keeps the hero face, since it cannot keep it on
@@ -63,6 +64,7 @@ export default function Today() {
   }, [homeQ.isSuccess, homeQ.data?.home_mobile, router0]);
   const router = useRouter();
   const viewer = useViewer();
+  const owner = useOwner();
   const demo = useDemo();
   const { width } = useWindowDimensions();
   const qc = useQueryClient();
@@ -75,13 +77,16 @@ export default function Today() {
     placeholderData: (prev) => prev,
   });
   useRefetchWhenShown(q, TODAY_KEY);
-  // the home-screen widget shows this hero's simple face; whenever the
-  // live Today payload settles, refresh the widget from the same door so
-  // opening the app never leaves the launcher showing an older verdict
+  // the home-screen widget shows this hero's simple face; when the live
+  // Today payload settles and a widget is placed, refresh it so opening
+  // the app never leaves the launcher showing an older verdict. The
+  // refresh costs the server a second Today computation, so it is skipped
+  // when no widget is placed and spaced out when that cannot be known.
   useEffect(() => {
     if (!client || viewDate || !q.data || q.isFetching) return;
-    import("../../lib/glance").then(({ refreshWidget }) =>
-      refreshWidget(client)).catch(() => {});
+    const stamp = JSON.stringify(q.data);
+    import("../../lib/glance").then(({ refreshWidgetIfPlaced }) =>
+      refreshWidgetIfPlaced(client, stamp)).catch(() => {});
   }, [client, viewDate, q.data, q.isFetching]);
   const ob = useQuery({
     queryKey: ["onboarding"],
@@ -254,7 +259,11 @@ export default function Today() {
     hasLeftWizard(tenantId).then((v) => { if (live) setLeftWiz(v); });
     return () => { live = false; };
   }, [tenantId]);
-  const wantsWizard = !!setupOpen && !ob.data?.wizard_done && leftWiz === false;
+  // The redirect is the OWNER's alone, as on the web: the wizard connects
+  // banks and configures the instance, so a member sent there would land
+  // on a page that only tells them to ask someone else.
+  const wantsWizard = owner && !!setupOpen && !ob.data?.wizard_done
+    && leftWiz === false;
   // once per mount: every onboarding refetch that flips this false→true
   // (a step marked done invalidates it) would otherwise REPLACE the
   // wizard route again, remounting the wizard mid-run and dropping it
@@ -309,6 +318,10 @@ export default function Today() {
   // dates carry the year, like the web's mmdd() — a truncated 08/10
   // reads wrong the moment a forecast or ETA crosses New Year
   const mmdd = mmddyy;
+  // the footnote's two kinds of missed bill: never posted, and posted then
+  // withdrawn by the bank feed (the fourth slot; an older server omits it)
+  const lateBills = (d?.overdue_unpaid ?? []).filter((o) => !o[3]);
+  const goneBills = (d?.overdue_unpaid ?? []).filter((o) => !!o[3]);
   // the web's converged rule: the two card scenarios collapse to one
   // line only when min AND min_date agree (same trough on a different
   // day is still two stories)
@@ -667,6 +680,7 @@ export default function Today() {
                     {b.status ? (
                       <Text style={{ color: b.status_tone === "neg" ? C.bad
                                        : b.status_tone === "pos" ? C.good
+                                       : b.status_tone === "warn" ? C.warn
                                        : C.mut, fontSize: 12 }}>
                         {b.status}
                       </Text>
@@ -800,9 +814,11 @@ export default function Today() {
           </View>
           </>)}
 
-          {/* only when a TRACKABLE goal exists — a card of plan-only
-              zero rows is chrome, not information (the web's filter) */}
-          {adv && (d.savings_goals ?? []).some((g) => !g.plan_only) && (
+          {/* only when a TRACKABLE goal exists, or one that needs an
+              account to become trackable — a card of plan-only zero rows
+              is chrome, not information (the web's filter) */}
+          {adv && (d.savings_goals ?? []).some(
+              (g) => !g.plan_only || g.needs_account) && (
             <View style={s.card}>
               <Text style={s.h2}>Savings goals</Text>
               {d.savings_goals.filter((g) =>
@@ -810,7 +826,10 @@ export default function Today() {
                 // the web's pace phrase, verbatim priority order — and the
                 // web's gate: plan_only alone (a null saved with a real
                 // destination is "no contributions", not "plan only")
-                const pace = g.plan_only
+                const pace = g.needs_account
+                  ? "match words need an account — pick one on the "
+                    + "Budget page"
+                  : g.plan_only
                   ? "plan only — set a destination account on the "
                     + "Budget page to track progress"
                   : g.saved === null
@@ -834,13 +853,15 @@ export default function Today() {
                     <Text style={{ color: C.text, fontSize: 14,
                                    fontWeight: "600" }}>{g.name}</Text>
                     <Text style={{ color: C.mut, fontSize: 13 }}>
-                      {g.plan_only || g.saved === null
+                      {/* the web's figure: a goal with a destination
+                          but nothing posted yet reads $0, not its plan */}
+                      {g.plan_only
                         ? `plan ${money(g.monthly_plan, false)}/mo`
                         : g.target
-                          ? `${money(g.saved, false)} of ${
+                          ? `${money(g.saved ?? 0, false)} of ${
                               money(g.target, false)}${
                               g.pct != null ? ` (${g.pct}%)` : ""}`
-                          : `${money(g.saved, false)} saved`}
+                          : `${money(g.saved ?? 0, false)} saved`}
                     </Text>
                   </View>
                   <Text style={{ color: paceColor, fontSize: 12 }}>
@@ -861,22 +882,23 @@ export default function Today() {
                headline lives in the hero card; plan-only rows fold into
                the map's own footer line). DETAIL-ONLY, the same rule as
                the web: in summary the verdict card is the whole page. */}
-          {adv && d.buckets && (
+          {adv && d.buckets && (() => {
+            // the month's posted contribution when the server sends it;
+            // otherwise the goal's 90-day average, labelled as one
+            const g = (d.savings_goals ?? [])
+              .find((x) => x.name === "Savings");
+            const sav = g ? monthSavings(g) : null;
+            return (
             <View style={s.card}>
               <Text style={s.h2}>Monthly budget</Text>
               <MoneyMap
-                rows={planRows(d.buckets, { period,
+                rows={labelSavingsRow(planRows(d.buckets, { period,
                   fixedActual: d.buckets.fixed?.actual ?? 0,
                   fixedBudget: d.buckets.fixed?.month_budget ?? 0,
                   fixedPending: d.fixed_unpaid_due,
-                  savings: (() => {
-                    const g = (d.savings_goals ?? [])
-                      .find((x) => x.name === "Savings");
-                    return g ? { plan: g.monthly_plan, saved: g.rate_90d }
-                             : null;
-                  })(),
+                  savings: sav,
                   excess: d.plan_surplus,
-                })}
+                }), !!sav?.averaged)}
                 footnote={((d.overdue_unpaid ?? []).length > 0
                            || (d.irregular_bills ?? []).length > 0) ? (
                   <Text style={{ color: C.mut, fontSize: 12, marginTop: 4,
@@ -894,24 +916,42 @@ export default function Today() {
                       </>
                     )}
                     {(d.irregular_bills ?? []).length > 0
-                      && (d.overdue_unpaid ?? []).length > 0 && "\n"}
-                    {(d.overdue_unpaid ?? []).length > 0 && (
+                      && lateBills.length > 0 && "\n"}
+                    {lateBills.length > 0 && (
                       <>
                         Scheduled but not yet posted:{" "}
-                        {d.overdue_unpaid!.slice(0, 4).map(([p, a, due], k) => (
+                        {lateBills.slice(0, 4).map(([p, a, due], k) => (
                           <Text key={k}>
                             {p} {money(a, false)} (due {mmdd(due)})
-                            {k < Math.min(d.overdue_unpaid!.length, 4) - 1
+                            {k < Math.min(lateBills.length, 4) - 1
                               ? ", " : ""}
                           </Text>
                         ))}
                       </>
                     )}
+                    {/* a charge the bank feed withdrew is not a bill that
+                        never posted — its own line, as on the web */}
+                    {((d.irregular_bills ?? []).length > 0
+                      || lateBills.length > 0)
+                      && goneBills.length > 0 && "\n"}
+                    {goneBills.length > 0 && (
+                      <Text style={{ color: C.warn }}>
+                        withdrawn by the bank feed:{" "}
+                        {goneBills.slice(0, 4).map(([p, a, , on], k) => (
+                          <Text key={k}>
+                            {p} {money(a, false)} ({mmdd(on)})
+                            {k < Math.min(goneBills.length, 4) - 1
+                              ? ", " : ""}
+                          </Text>
+                        ))}
+                      </Text>
+                    )}
                   </Text>
                 ) : undefined}
               />
             </View>
-          )}
+            );
+          })()}
 
           {/* detail-only, like the map */}
           {adv && (fc || d.recent.length > 0 || paidRows.length > 0) && (
@@ -1018,7 +1058,7 @@ export default function Today() {
               )}
               {paidRows.map((r, i) => (
                 <View key={`p${i}`} style={s.tlRow}>
-                  <Text style={s.tlDate}>{mmdd(r.date)}</Text>
+                  <Text style={s.tlDate} numberOfLines={1}>{mmdd(r.date)}</Text>
                   <Text style={[s.tlLabel, { color: C.mut }]}
                         numberOfLines={1}>{r.label}</Text>
                   <Text style={s.tlAmt}>{money(r.amount, false)}</Text>
@@ -1040,7 +1080,7 @@ export default function Today() {
               )}
               {shownFuture.map((r, i) => (
                 <View key={`f${i}`} style={s.tlRow}>
-                  <Text style={s.tlDate}>{mmdd(r.date)}</Text>
+                  <Text style={s.tlDate} numberOfLines={1}>{mmdd(r.date)}</Text>
                   <Text style={[s.tlLabel,
                                 r.bal_now === null && { color: C.mut }]}
                         numberOfLines={1}>{r.label}</Text>
@@ -1121,7 +1161,9 @@ const s = StyleSheet.create({
            borderTopColor: C.border,
            borderTopWidth: StyleSheet.hairlineWidth,
            paddingVertical: 5 },
-  tlDate: { color: C.mut, fontSize: 12, width: 38 },
+  // wide enough for a dated-with-year 09/08/26 on one line — the column
+  // was sized for 09/08 and wrapped the year onto a second line
+  tlDate: { color: C.mut, fontSize: 12, width: 54 },
   tlLabel: { color: C.text, fontSize: 13, flex: 1 },
   tlAmt: { color: C.text, fontSize: 13, fontVariant: ["tabular-nums"] },
   tlBal: { color: C.mut, fontSize: 13, fontVariant: ["tabular-nums"],

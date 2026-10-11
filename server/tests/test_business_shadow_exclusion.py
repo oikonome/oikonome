@@ -43,6 +43,7 @@ class ShadowAccountDoubleCountTests(unittest.TestCase):
             self.skipTest("webapp/ not present")
         s = spa.read_text()
         i = s.index("function TaxSetAside")
-        self.assertIn(".filter(countsInTotals)", s[i:i + 1200])
+        j = s.index("function ", i + 1)
+        self.assertIn(".filter(countsInTotals)", s[i:j])
         rule = (spa.parent.parent / "bizmath.ts").read_text()
         self.assertIn("!a.link || a.link.primary", rule)

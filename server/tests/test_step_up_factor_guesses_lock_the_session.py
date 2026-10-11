@@ -349,6 +349,24 @@ class PasskeyOnlyRecoveryTests(_Base):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertTrue(r.json()["elevated"])
 
+    def test_a_spent_session_is_still_prompted_for_the_password_beside_a_code(  # noqa: E501
+            self):
+        """Leaving the password out beside a recovery code is the prompt for
+        it. A session that has spent its guesses must still be told a
+        password is needed, spending nothing, while a real attempt is
+        refused as locked."""
+        c, email, codes = self._passkey_only_user()
+        _lock_session(c, email)
+        spent = _session_fails(c, email)
+        r = c.post("/api/auth/elevate",
+                   json={"password": "", "recovery_code": codes[0]})
+        self.assertEqual(r.status_code, 401, r.text)
+        self.assertIn("password_required", r.text)
+        self.assertEqual(_session_fails(c, email), spent)
+        r = c.post("/api/auth/elevate",
+                   json={"password": PW, "recovery_code": codes[0]})
+        self.assertEqual(r.status_code, 429, r.text)
+
     def test_wrong_recovery_code_at_a_legacy_step_up_counts_toward_the_session_lock(  # noqa: E501
             self):
         c, email, _ = self._passkey_only_user()
@@ -375,6 +393,266 @@ class PasskeyOnlyRecoveryTests(_Base):
                    json={"password": PW, "recovery_code": codes[0]})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertTrue(c.get("/api/auth/elevation").json()["elevated"])
+
+
+class PasswordGuessTests(_Base):
+    """The password is the half of every step-up a cookie thief lacks, so a
+    wrong one offered from inside a session spends the same per-session
+    budget a wrong code does — at elevate, at the legacy per-request doors
+    and at the doors that re-prove the password in their own body — and a
+    locked session is refused before the password is even checked, so the
+    responses stop answering "was that the password"."""
+
+    def _password_user(self):
+        client = TestClient(self.app)
+        email = f"lockpw-{uuid.uuid4().hex[:10]}@example.dev"
+        r = client.post("/api/signup", data={"email": email, "password": PW})
+        self.assertEqual(r.status_code, 200, r.text)
+        return client, email
+
+    def test_wrong_password_at_elevate_counts_toward_the_session_lock(self):
+        for c, email in (self._password_user(), self._totp_user()[:2]):
+            before, acct = _session_fails(c, email), _fails(email)
+            r = c.post("/api/auth/elevate", json={"password": "not-it"})
+            self.assertEqual(r.status_code, 401, r.text)
+            self.assertEqual(_session_fails(c, email), before + 1)
+            self.assertEqual(_fails(email), acct)
+
+    def test_a_locked_session_cannot_elevate_with_the_right_password(self):
+        c, email = self._password_user()
+        _lock_session(c, email)
+        r = c.post("/api/auth/elevate", json={"password": PW})
+        self.assertEqual(r.status_code, 429, r.text)
+        self.assertFalse(c.get("/api/auth/elevation").json()["elevated"])
+
+    def test_a_locked_totp_session_learns_nothing_from_the_right_password(
+            self):
+        """Without the lock the right password answers totp_required and a
+        wrong one password_required — an oracle for the password."""
+        c, email, _ = self._totp_user()
+        _lock_session(c, email)
+        r = c.post("/api/auth/elevate", json={"password": PW})
+        self.assertEqual(r.status_code, 429, r.text)
+
+    def test_wrong_password_at_a_legacy_step_up_counts_toward_the_session_lock(  # noqa: E501
+            self):
+        c, email = self._password_user()
+        before = _session_fails(c, email)
+        r = c.post("/api/totp/recovery-regenerate",
+                   data={"password": "not-it"})
+        self.assertEqual(r.status_code, 401, r.text)
+        self.assertEqual(_session_fails(c, email), before + 1)
+        _lock_session(c, email)
+        r = c.post("/api/totp/recovery-regenerate", data={"password": PW})
+        self.assertEqual(r.status_code, 429, r.text)
+
+    def test_in_body_password_doors_honour_the_session_lock(self):
+        for path, data in (
+                ("json:/api/password/change",
+                 {"current_password": "not-it",
+                  "new_password": "another-long-passphrase-9"}),
+                ("/api/email/change",
+                 {"new_email": "moved@example.dev", "password": "not-it"}),
+                ("/api/account/delete", {"password": "not-it"})):
+            with self.subTest(path=path):
+                c, email = self._password_user()
+                before, acct = _session_fails(c, email), _fails(email)
+                def post(body):
+                    if path.startswith("json:"):
+                        return c.post(path[5:], json=body)
+                    return c.post(path, data=body)
+                r = post(data)
+                self.assertEqual(r.status_code, 401, r.text)
+                self.assertEqual(_session_fails(c, email), before + 1)
+                self.assertEqual(_fails(email), acct)
+                _lock_session(c, email)
+                right = {k: (PW if v == "not-it" else v)
+                         for k, v in data.items()}
+                r = post(right)
+                self.assertEqual(r.status_code, 429, r.text)
+
+    def test_an_empty_password_is_a_prompt_not_a_guess(self):
+        c, email = self._password_user()
+        before = _session_fails(c, email)
+        r = c.post("/api/totp/recovery-regenerate",
+                   data={"recovery_code": "x"})
+        self.assertEqual(r.status_code, 401, r.text)
+        self.assertEqual(_session_fails(c, email), before)
+
+    def test_a_spent_session_is_still_prompted_for_its_password(self):
+        """An empty password is the prompt for one. Once the session has
+        spent its guesses it must still be told a password is needed (and
+        spend nothing asking), while a wrong one is refused as locked."""
+        c, email = self._password_user()
+        _lock_session(c, email)
+        spent = _session_fails(c, email)
+        r = c.post("/api/totp/recovery-regenerate",
+                   data={"recovery_code": "x"})
+        self.assertEqual(r.status_code, 401, r.text)
+        self.assertIn("password_required", r.text)
+        self.assertEqual(_session_fails(c, email), spent)
+        r = c.post("/api/totp/recovery-regenerate",
+                   data={"password": "not-it"})
+        self.assertEqual(r.status_code, 429, r.text)
+
+
+class ConcurrentGuessTests(_Base):
+    """The session's guess budget holds under a burst, not only in
+    sequence: each guess takes its slot before it is verified, so a burst
+    of concurrent wrong guesses cannot all be verified by reading a count
+    that none of them has added to yet."""
+
+    BURST = 20
+
+    def setUp(self):
+        super().setUp()
+        import threading
+        self.verified = []
+        self._lock = threading.Lock()
+
+    def _slow_miss(self, *_a, **_k):
+        """A wrong answer that takes as long as a real verify, to widen the
+        window between reading the budget and spending it."""
+        import time
+        with self._lock:
+            self.verified.append(1)
+        time.sleep(0.05)
+        return None
+
+    def _burst(self, guess):
+        import threading
+        from fastapi import HTTPException
+        from oikonome.web import security
+        user_id = str(uuid.uuid4())
+        refused = []
+        gate = threading.Barrier(self.BURST)
+
+        def one():
+            gate.wait()
+            try:
+                guess(user_id)
+            except HTTPException as e:
+                refused.append(e.status_code)
+        threads = [threading.Thread(target=one) for _ in range(self.BURST)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertLessEqual(len(self.verified), security._STEP_UP_FAIL_MAX)
+        self.assertEqual(len(self.verified) + len(refused), self.BURST)
+        self.assertEqual(set(refused), {429})
+
+    def test_a_burst_of_wrong_passwords_is_capped_at_the_budget(self):
+        from unittest import mock
+        import oikonome.web.app as appmod
+        with mock.patch.object(appmod.passwords, "verify_password",
+                               side_effect=lambda *a: bool(self._slow_miss())):
+            self._burst(lambda uid: appmod._in_session_password_ok(
+                uid, {"password_hash": "x"}, "wrong-guess",
+                "burst@example.dev", "elevate"))
+
+    def test_a_burst_of_wrong_codes_is_capped_at_the_budget(self):
+        from unittest import mock
+        import oikonome.web.app as appmod
+        from oikonome.auth import totp as totp_mod
+        with mock.patch.object(totp_mod, "verify_used",
+                               side_effect=self._slow_miss), \
+                mock.patch.object(appmod.crypto, "decrypt_cp",
+                                  side_effect=lambda v: v):
+            self._burst(lambda uid: appmod._totp_consume(
+                uid, "secret", "000000"))
+
+    def test_right_passwords_do_not_spend_the_budget(self):
+        from oikonome.auth import passwords
+        from oikonome.web import security
+        import oikonome.web.app as appmod
+        user_id = str(uuid.uuid4())
+        row = {"password_hash": passwords.hash_password(PW)}
+        for _ in range(security._STEP_UP_FAIL_MAX + 2):
+            self.assertTrue(appmod._in_session_password_ok(
+                user_id, row, PW, "owner@example.dev", "elevate"))
+
+
+class ConcurrentLoginGuessTests(_Base):
+    """The sign-in door's account lock holds under a burst too. With the
+    password in hand, a burst of concurrent wrong codes from many
+    addresses must not all be verified by reading a failure count that none
+    of them has added to yet: each takes its slot in the lock first."""
+
+    BURST = 20
+
+    def _request(self, n: int):
+        from starlette.requests import Request
+        return Request({"type": "http", "method": "POST", "path": "/api/login",
+                        "headers": [], "query_string": b"",
+                        "client": (f"198.51.100.{n + 1}", 40000)})
+
+    def test_a_burst_of_wrong_codes_at_sign_in_is_capped_at_the_lock(self):
+        import threading
+        import time
+        from unittest import mock
+        from fastapi import HTTPException
+        import oikonome.web.app as appmod
+        from oikonome.auth import recovery
+        from oikonome.auth import totp as totp_mod
+        from oikonome.web import security
+        _, email, _ = self._totp_user()
+        verified, refused, lock = [], [], threading.Lock()
+
+        def slow_miss(*_a, **_k):
+            with lock:
+                verified.append(1)
+            time.sleep(0.05)
+            return None
+        gate = threading.Barrier(self.BURST)
+
+        def one(n):
+            gate.wait()
+            try:
+                appmod.login(self._request(n), email=email, password=PW,
+                             totp_code="000000", cf_token="")
+            except HTTPException as e:
+                refused.append(e.status_code)
+        with mock.patch.object(totp_mod, "verify_used",
+                               side_effect=slow_miss), \
+                mock.patch.object(recovery, "redeem", return_value=False), \
+                mock.patch.object(appmod.turnstile, "verify_login",
+                                  return_value=True):
+            threads = [threading.Thread(target=one, args=(n,))
+                       for n in range(self.BURST)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertLessEqual(len(verified), security._ACCT_FAIL_MAX)
+        self.assertEqual(len(refused), self.BURST)
+        self.assertEqual(refused.count(429), self.BURST - len(verified))
+        self.assertEqual(_fails(email), len(verified))
+
+    def test_a_wrong_code_at_sign_in_counts_once(self):
+        _, email, _ = self._totp_user()
+        r = TestClient(self.app).post("/api/login", data={
+            "email": email, "password": PW, "totp_code": "000000"})
+        self.assertEqual(r.status_code, 401, r.text)
+        self.assertEqual(_fails(email), 1)
+
+    def test_a_replayed_right_code_at_sign_in_is_not_a_guess(self):
+        """A right code that a concurrent request spent first is refused,
+        but it is not a guess at the factor: both sign-in doors give its
+        slot in the account lock back."""
+        from unittest import mock
+        import oikonome.web.app as appmod
+        from oikonome.auth import totp as totp_mod
+        for path in ("/login", "/api/login"):
+            with self.subTest(path=path):
+                _, email, secret = self._totp_user()
+                with mock.patch.object(appmod, "_burn_totp_counter",
+                                       return_value=False):
+                    r = TestClient(self.app).post(path, data={
+                        "email": email, "password": PW,
+                        "totp_code": totp_mod.code_now(secret)})
+                self.assertEqual(r.status_code, 401, r.text)
+                self.assertEqual(_fails(email), 0)
 
 
 if __name__ == "__main__":

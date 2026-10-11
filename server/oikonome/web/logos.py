@@ -20,6 +20,7 @@ header. The rate limit stays on top of the session.
 from __future__ import annotations
 
 import logging
+import threading
 from urllib.parse import urlsplit
 
 import httpx
@@ -131,24 +132,31 @@ def _prune(conn) -> None:
         (_MISS_TYPE, _CAP_ROWS, _CAP_BYTES))
 
 
-def cached_logo(url: str) -> tuple[str, bytes] | None:
-    """Bytes for a Plaid logo URL, from the cache or Plaid (then cached).
-    None when the host is not allowed or the fetch failed."""
-    if not allowed(url):
-        return None
-    # Pooled app-role connection: this runs once per ledger row on a page
-    # load, and admin_connect opens a fresh unpooled superuser connection
-    # per call. The app role's write grant on logo_cache is deliberate
-    # (see migrate.py) — the table holds no tenant data and is capped.
+# One in-flight fetch per URL. A ledger page asks for the same logo once
+# per row, dozens at once; the first miss fetches and the rest wait for its
+# answer instead of each going to the CDN. Entries are dropped when the
+# fetch finishes, so the dict only ever holds what is in flight.
+_inflight: dict[str, threading.Event] = {}
+_inflight_lock = threading.Lock()
+# How long a follower waits on the leader's fetch before trying itself;
+# just past _fetch's own timeout, so a wedged leader cannot hold it forever.
+_FOLLOW_WAIT = 8.0
+
+
+def _read(url: str):
     conn = tenancy.control_connect()
     try:
-        row = conn.execute(
+        return conn.execute(
             "SELECT content_type, bytes FROM logo_cache WHERE url=%s "
             "AND (content_type <> %s OR fetched_at > now() - interval '1 day')",
             (url, _MISS_TYPE)).fetchone()
-        if row:
-            return None if row["content_type"] == _MISS_TYPE else (row["content_type"], bytes(row["bytes"]))
-        got = _fetch(url)
+    finally:
+        conn.close()
+
+
+def _write(url: str, got: tuple[str, bytes] | None) -> None:
+    conn = tenancy.control_connect()
+    try:
         conn.execute(
             """INSERT INTO logo_cache (url, content_type, bytes, fetched_at)
                VALUES (%s,%s,%s,now())
@@ -156,9 +164,51 @@ def cached_logo(url: str) -> tuple[str, bytes] | None:
                    bytes=EXCLUDED.bytes, fetched_at=now()""",
             (url, got[0] if got else _MISS_TYPE, got[1] if got else b""))
         _prune(conn)
-        return got
     finally:
         conn.close()
+
+
+def _answer(row) -> tuple[str, bytes] | None:
+    return None if row["content_type"] == _MISS_TYPE else (row["content_type"], bytes(row["bytes"]))
+
+
+def cached_logo(url: str) -> tuple[str, bytes] | None:
+    """Bytes for a Plaid logo URL, from the cache or Plaid (then cached).
+    None when the host is not allowed or the fetch failed."""
+    if not allowed(url):
+        return None
+    # Pooled app-role connections: this runs once per ledger row on a page
+    # load, and admin_connect opens a fresh unpooled superuser connection
+    # per call. The app role's write grant on logo_cache is deliberate
+    # (see migrate.py) — the table holds no tenant data and is capped.
+    # The CDN fetch runs with NO connection held: the control pool is small
+    # and every signed-in request draws its session check from it, so a few
+    # slow fetches holding connections would stall the whole instance.
+    row = _read(url)
+    if row:
+        return _answer(row)
+    with _inflight_lock:
+        waiting = _inflight.get(url)
+        if waiting is None:
+            _inflight[url] = done = threading.Event()
+    if waiting is not None:
+        waiting.wait(_FOLLOW_WAIT)
+        row = _read(url)
+        if row:
+            return _answer(row)
+        # the leader gave up or its write failed: fetch for ourselves,
+        # without registering, so a stuck leader is not waited on twice
+        got = _fetch(url)
+        _write(url, got)
+        return got
+    try:
+        got = _fetch(url)
+        _write(url, got)
+        return got
+    finally:
+        with _inflight_lock:
+            _inflight.pop(url, None)
+        done.set()
 
 
 def _current_user(request: Request) -> dict:

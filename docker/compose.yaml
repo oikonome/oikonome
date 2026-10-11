@@ -15,6 +15,10 @@ services:
     # would let rebuilding one silently change what the other runs from on
     # its next container recreate
     image: oikonome:${COMPOSE_PROJECT_NAME:-local}
+    # Docker's daemon applies every service's restart policy at boot, so a
+    # Docker host brings the stack back after a reboot. Podman has no
+    # daemon and does not: there `./oikonome.sh start-at-boot` installs the
+    # systemd unit that does (docs/quickstart.md).
     restart: unless-stopped
     mem_limit: 768m
     pids_limit: 512
@@ -54,6 +58,9 @@ services:
       OIKONOME_BIND_ADDRESS: ${OIKONOME_BIND_ADDRESS:-}
       # Hosted mode (invite-gated signup, email verify)
       OIKONOME_HOSTED: ${OIKONOME_HOSTED:-}
+      # a hosted instance with no billing add-on must say so (=none) or it
+      # refuses to start (ext.require_hosted_billing)
+      OIKONOME_HOSTED_BILLING: ${OIKONOME_HOSTED_BILLING:-}
       # A hosted-shape TEST instance may mail a recipient who holds no
       # account here; never set on a production instance
       OIKONOME_HOSTED_FREEFORM_RECIPIENTS: ${OIKONOME_HOSTED_FREEFORM_RECIPIENTS:-}
@@ -163,6 +170,11 @@ services:
       # liabilities + investments). "none" is the opt-out.
       OIKONOME_PLAID_PRODUCTS_EXTRA: ${OIKONOME_PLAID_PRODUCTS_EXTRA:-}
       OIKONOME_PLAID_REAP_DAYS: ${OIKONOME_PLAID_REAP_DAYS:-30}
+      # The worker's poll interval, read here too: the Today page and the
+      # alert strip judge a connection stale against it, and with the
+      # default alone a slower poll reads as stale for part of every cycle.
+      # Must match the worker's value below. Empty = the code's 12.
+      OIKONOME_SYNC_BUCKETS: ${OIKONOME_SYNC_BUCKETS:-}
       # SMS summaries (all three or SMS stays off)
       OIKONOME_TWILIO_ACCOUNT_SID: ${OIKONOME_TWILIO_ACCOUNT_SID:-}
       OIKONOME_TWILIO_AUTH_TOKEN: ${OIKONOME_TWILIO_AUTH_TOKEN:-}
@@ -172,6 +184,8 @@ services:
       OIKONOME_PUSH_RELAY_KEY: ${OIKONOME_PUSH_RELAY_KEY:-}
       # 1 = routing-only pushes: the daily verdict line never leaves the instance
       OIKONOME_PUSH_CONTENT_FREE: ${OIKONOME_PUSH_CONTENT_FREE:-}
+      # the contact browser push names to the push services
+      OIKONOME_PUSH_CONTACT: ${OIKONOME_PUSH_CONTACT:-}
       OIKONOME_DELETE_GRACE_DAYS: ${OIKONOME_DELETE_GRACE_DAYS:-7}
       # hosted: signups nobody ever confirmed are reminded on day 7 and
       # frozen on this day (0 = off); the nightly sweep reads it
@@ -184,6 +198,9 @@ services:
       OIKONOME_CONTROL_POOL_MAX: ${OIKONOME_CONTROL_POOL_MAX:-}
       OIKONOME_TENANT_POOL_TIMEOUT: ${OIKONOME_TENANT_POOL_TIMEOUT:-}
       OIKONOME_CONTROL_POOL_TIMEOUT: ${OIKONOME_CONTROL_POOL_TIMEOUT:-}
+      OIKONOME_CONTROL_LOCK_TIMEOUT_MS: ${OIKONOME_CONTROL_LOCK_TIMEOUT_MS:-}
+      OIKONOME_CONTROL_IDLE_TXN_TIMEOUT_MS: ${OIKONOME_CONTROL_IDLE_TXN_TIMEOUT_MS:-}
+      OIKONOME_CONTROL_STATEMENT_TIMEOUT_MS: ${OIKONOME_CONTROL_STATEMENT_TIMEOUT_MS:-}
       # Spam defense: forwarded for the same reason
       OIKONOME_SPAM_DEFENSE: ${OIKONOME_SPAM_DEFENSE:-}
       OIKONOME_SPAM_API: ${OIKONOME_SPAM_API:-}
@@ -191,6 +208,7 @@ services:
       OIKONOME_SPAM_CACHE_TTL_DAYS: ${OIKONOME_SPAM_CACHE_TTL_DAYS:-}
       OIKONOME_SPAM_SAFELIST_EXTRA: ${OIKONOME_SPAM_SAFELIST_EXTRA:-}
       OIKONOME_SMTP_NO_VERIFY: ${OIKONOME_SMTP_NO_VERIFY:-}
+      OIKONOME_RECOVERY_MEMBER_WINDOW_DAYS: ${OIKONOME_RECOVERY_MEMBER_WINDOW_DAYS:-}
     # Read-only visibility for the admin console's backup and
     # host-health cards (install.sh pre-creates both dirs; ops-state is
     # written by the optional scripts/host-health.sh timer on the host)
@@ -236,6 +254,9 @@ services:
       OIKONOME_BASE_URL: ${OIKONOME_BASE_URL:-}
       # Hosted mode (invite-gated signup, email verify)
       OIKONOME_HOSTED: ${OIKONOME_HOSTED:-}
+      # a hosted instance with no billing add-on must say so (=none) or it
+      # refuses to start (ext.require_hosted_billing)
+      OIKONOME_HOSTED_BILLING: ${OIKONOME_HOSTED_BILLING:-}
       # the scheduled mail sweep lives here, so the recipient policy has to
       # reach the worker or the settings door and the send disagree
       OIKONOME_HOSTED_FREEFORM_RECIPIENTS: ${OIKONOME_HOSTED_FREEFORM_RECIPIENTS:-}
@@ -295,6 +316,10 @@ services:
       OIKONOME_PUSH_RELAY_KEY: ${OIKONOME_PUSH_RELAY_KEY:-}
       # 1 = routing-only pushes: the daily verdict line never leaves the instance
       OIKONOME_PUSH_CONTENT_FREE: ${OIKONOME_PUSH_CONTENT_FREE:-}
+      # the contact browser push names to the push services (falling back
+      # to the support address, as the app's own sends do)
+      OIKONOME_PUSH_CONTACT: ${OIKONOME_PUSH_CONTACT:-}
+      OIKONOME_SUPPORT_EMAIL: ${OIKONOME_SUPPORT_EMAIL:-}
       OIKONOME_DELETE_GRACE_DAYS: ${OIKONOME_DELETE_GRACE_DAYS:-7}
       # hosted: signups nobody ever confirmed are reminded on day 7 and
       # frozen on this day (0 = off); the nightly sweep reads it
@@ -307,6 +332,9 @@ services:
       OIKONOME_CONTROL_POOL_MAX: ${OIKONOME_CONTROL_POOL_MAX:-}
       OIKONOME_TENANT_POOL_TIMEOUT: ${OIKONOME_TENANT_POOL_TIMEOUT:-}
       OIKONOME_CONTROL_POOL_TIMEOUT: ${OIKONOME_CONTROL_POOL_TIMEOUT:-}
+      OIKONOME_CONTROL_LOCK_TIMEOUT_MS: ${OIKONOME_CONTROL_LOCK_TIMEOUT_MS:-}
+      OIKONOME_CONTROL_IDLE_TXN_TIMEOUT_MS: ${OIKONOME_CONTROL_IDLE_TXN_TIMEOUT_MS:-}
+      OIKONOME_CONTROL_STATEMENT_TIMEOUT_MS: ${OIKONOME_CONTROL_STATEMENT_TIMEOUT_MS:-}
       # Spam defense: forwarded for the same reason
       OIKONOME_SPAM_DEFENSE: ${OIKONOME_SPAM_DEFENSE:-}
       OIKONOME_SPAM_API: ${OIKONOME_SPAM_API:-}
@@ -314,7 +342,8 @@ services:
       OIKONOME_SPAM_CACHE_TTL_DAYS: ${OIKONOME_SPAM_CACHE_TTL_DAYS:-}
       OIKONOME_SPAM_SAFELIST_EXTRA: ${OIKONOME_SPAM_SAFELIST_EXTRA:-}
       OIKONOME_SMTP_NO_VERIFY: ${OIKONOME_SMTP_NO_VERIFY:-}
-      # graceful nightly maintenance reboot (worker cron, 09:04 UTC):
+      OIKONOME_RECOVERY_MEMBER_WINDOW_DAYS: ${OIKONOME_RECOVERY_MEMBER_WINDOW_DAYS:-}
+      # graceful nightly maintenance reboot (worker cron, 09:37 UTC):
       # set to 1 ONLY on the instance that owns the host's reboot lever
       OIKONOME_AUTO_REBOOT: ${OIKONOME_AUTO_REBOOT:-}
     # same state binds as app: the nightly reboot cron reads host-health

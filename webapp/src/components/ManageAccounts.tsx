@@ -16,6 +16,7 @@ import { openPlaidHostedLink, plaidLinkOutcome } from "./ConnectHub";
 import { KINDS, RemoveAccountPanel, type DoneFn,
          type Moved } from "./RemoveAccountPanel";
 import { isOwner } from "../role";
+import { sharedLock } from "../sharedlogin";
 
 interface Grp {
   itemId: string;
@@ -68,6 +69,10 @@ export default function ManageAccounts() {
   if (!accounts.data || !conns.data)
     return <p className="mut">loading…</p>;
 
+  // Link's fix and shared-accounts sessions renew a bank credential, which
+  // the shared demonstration login is refused: those buttons are shown
+  // switched off, with the refusal's sentence said once above the list
+  const credLock = sharedLock(me.data, "credential");
   const primary = settings.data?.checking_account_id ?? null;
   const excluded = new Set(settings.data?.excluded_accounts ?? []);
   const connById = new Map(conns.data.connections.map((c) => [c.id, c]));
@@ -92,8 +97,12 @@ export default function ManageAccounts() {
         <p className="note" role="status" onClick={() => setNotice(null)}>
           {notice}</p>
       )}
+      {credLock && ordered.some((g) => g.conn !== null) && (
+        <p className="sub" style={{ color: "var(--amber)" }}>{credLock}</p>
+      )}
       {ordered.map((g) => (
         <GroupPanel key={g.itemId || g.institution} g={g} primary={primary}
+                    credLock={credLock}
                     excluded={excluded} openId={openId} setOpenId={setOpenId}
                     syncing={syncing === g.itemId}
                     onSync={() => sync.mutate(g.itemId)} onDone={done} />
@@ -106,9 +115,10 @@ export default function ManageAccounts() {
   );
 }
 
-function GroupPanel({ g, primary, excluded, openId, setOpenId, syncing,
-                      onSync, onDone }: {
-  g: Grp; primary: string | null; excluded: Set<string>;
+function GroupPanel({ g, primary, credLock, excluded, openId, setOpenId,
+                      syncing, onSync, onDone }: {
+  g: Grp; primary: string | null; credLock: string | null;
+  excluded: Set<string>;
   openId: string | null; setOpenId: (id: string | null) => void;
   syncing: boolean; onSync: () => void; onDone: DoneFn;
 }) {
@@ -154,11 +164,15 @@ function GroupPanel({ g, primary, excluded, openId, setOpenId, syncing,
               {syncing ? "syncing…" : "↻ sync"}</button>
           )}
           {broken && plaid && (
-            <button type="button" className="pri" disabled={linking}
-                    title="re-authenticate this connection"
+            <button type="button" className="pri"
+                    disabled={linking || !!credLock}
+                    title={credLock ?? "re-authenticate this connection"}
                     onClick={() => {
                       setLinking(true);
-                      void openPlaidHostedLink(g.itemId)
+                      // new accounts at the bank are offered only with
+                      // Link's account checklist switched on
+                      void openPlaidHostedLink(g.itemId,
+                          { manageAccounts: c!.status === "new_accounts" })
                       .then((s) => onDone(plaidLinkOutcome(s, "fix").text))
                       .catch((e) => onDone(errText(e)))
                       .finally(() => setLinking(false));
@@ -170,7 +184,8 @@ function GroupPanel({ g, primary, excluded, openId, setOpenId, syncing,
               <summary title="more connection actions">⋯</summary>
               <div className="usermenu-panel">
                 {plaid && (
-                  <button type="button" disabled={linking} onClick={(e) => {
+                  <button type="button" disabled={linking || !!credLock}
+                    onClick={(e) => {
                       closeMenu(e);
                       setLinking(true);
                       void openPlaidHostedLink(g.itemId,
@@ -180,13 +195,15 @@ function GroupPanel({ g, primary, excluded, openId, setOpenId, syncing,
                         .catch((err) => onDone(errText(err)))
                         .finally(() => setLinking(false));
                     }}
-                    title={"choose what " + g.institution + " shares — "
+                    title={credLock ?? "choose what " + g.institution
+                           + " shares — "
                            + "unshared accounts stop syncing and stop "
                            + "counting toward Plaid usage"}>
                     edit connected accounts ↗</button>
                 )}
                 <button type="button" style={{ color: "var(--red, #c44)" }}
-                        disabled={disc.isPending}
+                        disabled={disc.isPending || !!credLock}
+                        title={credLock ?? undefined}
                         onClick={(e) => {
                           closeMenu(e);
                           if (window.confirm(
@@ -250,14 +267,22 @@ function Editor({ a, isPrimary, isExcluded, live, hidden, onDone }: {
   const [ownerLbl, setOwnerLbl] = useState(a.owner ?? "");
   const [prim, setPrim] = useState(isPrimary);
   const [excl, setExcl] = useState(isExcluded);
+  // What the two switches showed when this editor opened (or last saved).
+  // A switch counts as moved only against this, never against the live
+  // props: a settings refetch replaces those, and comparing with them would
+  // send a pin or exclusion the person never touched, undoing one another
+  // device just made.
+  const [seed, setSeed] = useState({ primary: isPrimary,
+                                     excluded: isExcluded });
+  const primMoved = prim !== seed.primary;
+  const exclMoved = excl !== seed.excluded;
   const [bal, setBal] = useState(
     a.balance_current === null ? "" : String(a.balance_current));
   const [removing, setRemoving] = useState(false);
   const manual = a.institution_name === "Manual" || a.aggregator === "manual";
 
   const dirty = name !== a.name || kind !== a.kind
-    || ownerLbl !== (a.owner ?? "") || prim !== isPrimary
-    || excl !== isExcluded
+    || ownerLbl !== (a.owner ?? "") || primMoved || exclMoved
     || (manual && bal.trim() !== "" &&
         Number(bal.replace(/[$,]/g, "")) !== a.balance_current);
 
@@ -270,12 +295,14 @@ function Editor({ a, isPrimary, isExcluded, live, hidden, onDone }: {
       const steps: [string, () => Promise<unknown>][] = [];
       if (name.trim() && name !== a.name)
         steps.push(["name", () => api.accountRename(a.id, name)]);
-      if (kind !== a.kind || prim !== isPrimary)
+      if (kind !== a.kind || primMoved)
         steps.push([
-          kind !== a.kind && prim !== isPrimary ? "type/primary"
+          kind !== a.kind && primMoved ? "type/primary"
             : kind !== a.kind ? "type" : "primary flag",
-          () => api.accountClassify(a.id, kind, prim)]);
-      if (excl !== isExcluded)
+          // the anchor rides along only when its switch moved
+          () => api.accountClassify(a.id, kind,
+                                    primMoved ? prim : undefined)]);
+      if (exclMoved)
         steps.push(["exclusion", () => api.accountExclude(a.id, excl)]);
       if (ownerLbl.trim() !== (a.owner ?? ""))
         steps.push(["owner", () => api.setAccountOwner(a.id,
@@ -308,17 +335,23 @@ function Editor({ a, isPrimary, isExcluded, live, hidden, onDone }: {
         { name: name.trim() || a.name, kind, owner: ownerLbl.trim() || null,
           ...(manual && bal.trim() !== "" && Number.isFinite(newBal)
               ? { balance_current: newBal } : {}) });
-      const moved = prim !== isPrimary || excl !== isExcluded;
+      const moved = primMoved || exclMoved;
+      // only the switch that was sent is predicted; the other keeps
+      // whatever the cache holds now
       if (moved)
         qc.setQueryData<Settings>(["settings"], (old) => old && {
           ...old,
-          checking_account_id: prim ? a.id
+          ...(primMoved ? { checking_account_id: prim ? a.id
             : old.checking_account_id === a.id ? null
-            : old.checking_account_id,
-          excluded_accounts: excl
+            : old.checking_account_id } : {}),
+          ...(exclMoved ? { excluded_accounts: excl
             ? [...new Set([...(old.excluded_accounts ?? []), a.id])]
-            : (old.excluded_accounts ?? []).filter((id) => id !== a.id),
+            : (old.excluded_accounts ?? []).filter((id) => id !== a.id) }
+            : {}),
         });
+      // the editor stays open, so what was just written is the new
+      // starting point for the next save
+      setSeed({ primary: prim, excluded: excl });
       // the anchor and the exclusion move the verdict; a rename does not
       onDone(`Saved ${name || a.name}.`,
              moved ? ["accounts", "today"] : ["accounts"]);

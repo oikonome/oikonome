@@ -18,6 +18,11 @@ re-linking and TOTP re-enrolling.
   `OIKONOME_MASTER_KEY=` line) somewhere that is *not* this machine: a
   password manager entry is ideal.
 - Re-capture it whenever it changes (rotation below).
+- `./oikonome.sh reset` and `./oikonome.sh uninstall` write the key,
+  owner-only, beside the backups they keep
+  (`backups/master-key-before-reset-<date>.env`,
+  `~/oikonome-backups-<project>-<date>/master-key.env`). Move it into your
+  password manager and delete the file.
 - After any restore, verify key/data agreement:
 
   ```bash
@@ -45,14 +50,31 @@ they stop working; the next email carries fresh ones.
    ```
 
 2. In `docker/.env`: set `OIKONOME_MASTER_KEY=` to the **new** key. The
-   old key never needs to enter `.env` or `compose.yaml` — pass it inline
-   to the one command that needs it:
+   old key never needs to enter `.env` or `compose.yaml`. It also must not
+   be typed into the command line: a key written there is saved in your
+   shell history, and other accounts on the host can read it in `ps`
+   while the command runs. Type it at a hidden prompt instead, and hand it
+   to the one command that needs it on standard input:
 
    ```bash
    docker compose -f docker/compose.yaml up -d   # app picks up the new key
-   docker compose -f docker/compose.yaml exec \
-     -e OIKONOME_MASTER_KEY_OLD=<old key> app \
-     python -m oikonome.cli rotate-master-key
+   read -rs -p 'Old master key: ' OLD_KEY; echo
+   printf '%s\n' "$OLD_KEY" | docker compose -f docker/compose.yaml exec -T app \
+     sh -c 'read -r OIKONOME_MASTER_KEY_OLD && export OIKONOME_MASTER_KEY_OLD &&
+            exec python -m oikonome.cli rotate-master-key'
+   unset OLD_KEY
+   ```
+
+   (`printf` is a shell builtin, so the key never becomes a process
+   argument.) If the old key is in an owner-only file instead — such as
+   the `master-key-*.env` that `./oikonome.sh reset --new-key` saves
+   beside the backups — read it from there in place of the prompt:
+
+   ```bash
+   sed -n 's/^OIKONOME_MASTER_KEY=//p' backups/master-key-before-reset-<date>.env \
+     | docker compose -f docker/compose.yaml exec -T app \
+         sh -c 'read -r OIKONOME_MASTER_KEY_OLD && export OIKONOME_MASTER_KEY_OLD &&
+                exec python -m oikonome.cli rotate-master-key'
    ```
 
    The command is idempotent — if it is interrupted, re-run it; rows

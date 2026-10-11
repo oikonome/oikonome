@@ -29,12 +29,12 @@ import math
 
 from . import categories as _cats
 from .budget import SPEND_ONLY_SQL
+# far past any charge a household ledger holds, and far inside what a
+# double rounds to exact cents
+from .compat import MAX_AMOUNT
 
 MAX_PARTS = 20
 MAX_CATEGORY_LEN = 80
-# Far past any charge a household ledger holds, and far inside what a
-# double rounds to exact cents.
-MAX_AMOUNT = 1e12
 
 
 class SplitError(ValueError):

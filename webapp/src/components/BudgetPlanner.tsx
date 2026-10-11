@@ -3,7 +3,8 @@ import { type CSSProperties, useEffect, useState } from "react";
 import { Link } from "react-router";
 import { api } from "../api/client";
 import { saveSettings } from "../api/cache";
-import { mergePlannerBuckets, type PlannerRow } from "../moneymath";
+import { mergePlannerBuckets, plannerUnallocAuto, type PlannerRow }
+  from "../moneymath";
 
 // The balance-your-budget planner — the wizard's budgets step AND the
 // standing /balance page share it.
@@ -36,6 +37,9 @@ export default function BudgetPlanner({ onSaved, standalone = false,
   const [unallocEdited, setUnallocEdited] = useState<string | null>(null);
   const [savings, setSavings] = useState("");
   const [savingsTouched, setSavingsTouched] = useState(false);
+  // the Savings plan as saved when the planner opened: "Everything else"
+  // is already net of it, so only a change from it moves the pool
+  const [savingsSeed, setSavingsSeed] = useState(0);
   const numv = (v: string) => Number((v || "0").replace(/[$,\s]/g, "")) || 0;
   // unsaved edits signal — the Budget page skips remounting
   // this card after a sibling's save while it holds a draft
@@ -101,6 +105,7 @@ export default function BudgetPlanner({ onSaved, standalone = false,
     // leftover. Only a truly absent goal lets the auto value fill first.
     if (userSaved && savedGoal != null) {
       setSavings(String(savedGoal.monthly_plan ?? 0));
+      setSavingsSeed(numv(String(savedGoal.monthly_plan ?? 0)));
       setSavingsTouched(true);
     }
     setInit(true);
@@ -115,9 +120,8 @@ export default function BudgetPlanner({ onSaved, standalone = false,
   // catch-all shrinks by that much so the plan still balances instead of
   // the same dollars sitting in both boxes. An explicit Everything-else
   // edit still wins over the auto value.
-  const savingsTyped = savingsTouched ? numv(savings) : 0;
-  const unallocAuto = Math.max(0, Math.round(otherBase - catsTotal
-                                              - savingsTyped));
+  const unallocAuto = plannerUnallocAuto({ otherBase, catsTotal,
+    savingsTouched, savingsTyped: numv(savings), savingsSeed });
   const unalloc = unallocEdited !== null ? numv(unallocEdited) : unallocAuto;
   const inc = numv(income);
   const savingsAuto = Math.max(0, Math.round(

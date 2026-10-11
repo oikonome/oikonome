@@ -106,8 +106,11 @@ NET_AMOUNT = budget.NET_AMOUNT
 # TRANSFER_IN category) would lose the part that really was income — a
 # paycheck that carried one expense back with it. Floored at 0 for the
 # same reason NET_AMOUNT is. `t` must be the transactions alias.
+# A link to a charge that has left the ledger claims nothing (see
+# budget.NET_AMOUNT).
 INCOME_NET = """GREATEST(-t.amount - COALESCE((SELECT SUM(pr.amount)
     FROM reimbursements pr
+    JOIN transactions pe ON pe.id = pr.expense_id AND pe.removed = 0
     WHERE pr.reimburse_id = t.id AND pr.partial = 1), 0), 0)"""
 
 # The same net, as a join. NET_AMOUNT's correlated subquery is re-run for
@@ -119,9 +122,12 @@ INCOME_NET = """GREATEST(-t.amount - COALESCE((SELECT SUM(pr.amount)
 # `FROM transactions t {REIMB_PARTIAL_JOIN}` and `SUM({NET_AMOUNT_JOINED})`.
 # Row-level readers (budget._spend_rows) keep NET_AMOUNT; the join form is
 # for the full-scan aggregates in this module and the lenses.
-REIMB_PARTIAL_JOIN = ("LEFT JOIN (SELECT expense_id, SUM(amount) AS s "
-                      "FROM reimbursements WHERE partial = 1 "
-                      "GROUP BY expense_id) pr ON pr.expense_id = t.id")
+# Like NET_AMOUNT, only links on a deposit still on the ledger count.
+REIMB_PARTIAL_JOIN = ("LEFT JOIN (SELECT r.expense_id, SUM(r.amount) AS s "
+                      "FROM reimbursements r JOIN transactions rd "
+                      "ON rd.id = r.reimburse_id AND rd.removed = 0 "
+                      "WHERE r.partial = 1 "
+                      "GROUP BY r.expense_id) pr ON pr.expense_id = t.id")
 NET_AMOUNT_JOINED = "GREATEST(t.amount - COALESCE(pr.s, 0), 0)"
 # a part's share of the joined net (see PART_CAT)
 PART_NET_JOINED = _categories.part_net(NET_AMOUNT_JOINED)
@@ -690,6 +696,18 @@ def _reconstruct_trend(conn, today_total, today: dt.date | None = None):
     return [[d[:7], round(v, 2)] for d, v in zip(months, vals)]
 
 
+def _pl_scope(conn) -> tuple[str, list]:
+    """The accounts an investment P/L panel may read, as an AND fragment on
+    alias `a` with its params: the ones net worth counts (_live_accounts).
+    A linked twin is one real account reached through two feeds, and a
+    business account stays out of the personal figures unless the combined
+    view is on; a panel that read every account would show a linked
+    brokerage at twice the value the headline counts for it."""
+    from . import links
+    return ("\n                 AND (" + budget.COMBINE_OR + "a.entity_id IS NULL)"
+            "\n                 AND NOT (a.id = ANY(%s))", [links.shadow_ids(conn)])
+
+
 def _retirement_pl(conn) -> list[dict]:
     """Workplace-plan P/L: contributions (the clean cost basis, straight
     off the payroll 'Contribution' rows) vs current value, per plan + a combined
@@ -698,12 +716,14 @@ def _retirement_pl(conn) -> list[dict]:
     cost basis exists for them."""
     out = []
     tot_c = tot_v = 0.0
+    scope, sp = _pl_scope(conn)
     for a in conn.execute(
             """SELECT a.id, COALESCE(a.display_name, a.name) nm, a.balance_current v,
                       COALESCE(i.institution_name, 'Workplace plan') inst
                FROM accounts a JOIN items i ON i.id=a.item_id
-               WHERE i.aggregator='plan_csv' AND a.balance_current IS NOT NULL
-               ORDER BY a.balance_current DESC""").fetchall():
+               WHERE i.aggregator='plan_csv' AND a.balance_current IS NOT NULL"""
+            + scope + """
+               ORDER BY a.balance_current DESC, a.id""", sp).fetchall():
         c = conn.execute(
             """SELECT COALESCE(SUM((raw ->> 'amount')::float8),0) c
                FROM transactions WHERE account_id=%s AND removed=0
@@ -743,30 +763,39 @@ def _brokerage_pl(conn) -> list[dict]:
     those contribute value to BOTH sides (0 gain). Each row names its
     institution so the combined view can group by it."""
     override = budget.load_config(conn).get("investment_basis_override", {})
+    scope, sp = _pl_scope(conn)
+    # One entry per ACCOUNT: two accounts can share an institution and a
+    # display name (two spouses' "Roth IRA"), and merged they would read as
+    # one account whose manual basis override replaced both bases.
     per: dict = {}
     for h in conn.execute(
-            """SELECT COALESCE(a.display_name, a.name) nm, a.mask, h.value, h.raw,
+            """SELECT a.id, COALESCE(a.display_name, a.name) nm, a.mask,
+                      h.value, h.raw,
                       COALESCE(i.institution_name, 'Brokerage') inst
                FROM holdings h JOIN accounts a ON a.id=h.account_id
                JOIN items i ON i.id=a.item_id
-               WHERE COALESCE(i.aggregator, '') <> ALL(%s)""",
-            (list(_OWN_PL_AGGREGATORS),)):
-        d = per.setdefault((h["inst"], h["nm"]), [0.0, 0.0, h["mask"]])   # [value, cost_basis, mask]
+               WHERE COALESCE(i.aggregator, '') <> ALL(%s)""" + scope + """
+               ORDER BY a.id""",
+            [list(_OWN_PL_AGGREGATORS)] + sp):
+        d = per.setdefault(h["id"], {"name": h["nm"], "inst": h["inst"],
+                                     "mask": h["mask"], "v": 0.0, "c": 0.0})
         val = h["value"] or 0.0
-        d[0] += val
+        d["v"] += val
         try:
             cb = as_dict(h["raw"]).get("cost_basis")
         except (TypeError, ValueError):
             cb = None
-        d[1] += cb if cb is not None else val      # no basis → basis=value (0 gain)
+        d["c"] += cb if cb is not None else val    # no basis → basis=value (0 gain)
     out = []
     tot_v = tot_c = 0.0
-    for (inst, nm), (v, c, mask) in sorted(per.items(), key=lambda x: -x[1][0]):
+    for d in sorted(per.values(), key=lambda x: (-x["v"], x["name"] or "")):
+        v, c, mask = d["v"], d["c"], d["mask"]
         if v < 1:                                  # skip drained/closed lineages
             continue
         if mask in override:                       # manual dashboard basis
             c = float(override[mask])
-        out.append({"name": nm, "institution": inst, "basis": round(c, 2),
+        out.append({"name": d["name"], "institution": d["inst"],
+                    "basis": round(c, 2),
                     "value": round(v, 2), "pl": round(v - c, 2),
                     "pct": round(100 * (v - c) / c, 1) if c else None})
         tot_v += v; tot_c += c
@@ -788,10 +817,12 @@ def _coinbase_pl(conn) -> list[dict]:
     FIAT = {"buy", "sell", "fiat_deposit", "fiat_withdrawal"}
     out = []
     tot_in = tot_out = tot_val = 0.0
+    scope, sp = _pl_scope(conn)
     for acct in conn.execute(
             """SELECT a.id, COALESCE(a.display_name, a.name) AS name FROM accounts a
-               WHERE a.subtype='crypto' AND a.balance_current IS NOT NULL
-               ORDER BY a.balance_current DESC""").fetchall():
+               WHERE a.subtype='crypto' AND a.balance_current IS NOT NULL"""
+            + scope + """
+               ORDER BY a.balance_current DESC, a.id""", sp).fetchall():
         cash_in = cash_out = 0.0
         for r in conn.execute(
                 "SELECT raw FROM transactions WHERE account_id=%s AND removed=0",
@@ -910,11 +941,13 @@ def _cumulative_savings(conn):
         f"SELECT to_char(t.date,'YYYY') yr, SUM({NET_AMOUNT_JOINED}) amt "
         f"FROM transactions t {REIMB_PARTIAL_JOIN} WHERE {SPEND_WHERE} {excl} GROUP BY yr", ex_p)}
     income = {r["p"]: r["amt"] for r in _income_by(conn, "year")}
-    covered = _bank_coverage_years(conn)
+    cov = _income_coverage(conn)
     years = sorted(set(spend) | set(income))
     run = 0.0; out = []
     for y in years:
-        if y not in covered:  # no bank data → net unknowable; hold the line flat
+        # a year not wholly covered by bank data has an unknowable net (the
+        # Cash Flow table's rule); hold the line flat
+        if not _income_known(cov, f"{y}-01"):
             out.append([y, round(run, 2)])
             continue
         run += (income.get(y, 0) or 0) - (spend.get(y, 0) or 0)
@@ -1048,12 +1081,22 @@ def _bank_account_ids(conn) -> list[str]:
 # construction, so a transfer set by hand on one reads the same way. Not a
 # deposit with a full pair (a full link spends all of it), and not one the
 # aggregator itself called a transfer — that was never income.
+#
+# Links to a charge that has left the ledger claim nothing: a deposit
+# whose every charge was withdrawn is income again in full until the pair
+# is released. It still has to carry some pair, so a transfer set by hand
+# on a deposit nobody linked stays a transfer.
 PARTLY_CLAIMED_DEPOSIT = """(t.category_override = 'TRANSFER_IN'
     AND COALESCE(t.category_primary, '') NOT IN ('TRANSFER_IN','TRANSFER_OUT')
+    AND EXISTS (SELECT 1 FROM reimbursements ar WHERE ar.reimburse_id = t.id)
     AND NOT EXISTS (SELECT 1 FROM reimbursements fr
+                    JOIN transactions fe ON fe.id = fr.expense_id
+                                        AND fe.removed = 0
                     WHERE fr.reimburse_id = t.id AND fr.partial = 0)
-    AND (SELECT SUM(pr.amount) FROM reimbursements pr
-         WHERE pr.reimburse_id = t.id AND pr.partial = 1)
+    AND COALESCE((SELECT SUM(pr.amount) FROM reimbursements pr
+                  JOIN transactions pe ON pe.id = pr.expense_id
+                                      AND pe.removed = 0
+                  WHERE pr.reimburse_id = t.id AND pr.partial = 1), 0)
         < -t.amount - 0.005)"""
 
 # The income definition, as SQL over bank rows. Own-money inflows a bank
@@ -1110,7 +1153,11 @@ def month_flows(conn, year: int, month: int) -> dict:
     month header states: a raw sum of the listed rows counts card spend
     twice (once at the swipe, once at the payment) and calls a transfer
     between own accounts money out, which makes the header useless for the
-    question it exists to answer — did the month cost more than it paid."""
+    question it exists to answer — did the month cost more than it paid.
+
+    `in` and `net` are None for a month before the bank feed starts (the
+    Month lens's rule): its income is unknown, and $0 in would show the
+    month's whole spend as a loss."""
     start = dt.date(year, month, 1)
     end = (start + dt.timedelta(days=32)).replace(day=1)
     excl, ex_p = excluded_accounts_sql(conn)
@@ -1124,6 +1171,8 @@ def month_flows(conn, year: int, month: int) -> dict:
             FROM transactions t
             WHERE {_INCOME_WHERE} AND t.date >= %s AND t.date < %s {excl}""",
         (_bank_account_ids(conn), start, end, *ex_p)).fetchone()["amt"]
+    if not _income_known(_income_coverage(conn), f"{year:04d}-{month:02d}"):
+        return {"out": out, "in": None, "net": None}
     return {"out": out, "in": inc, "net": round(inc - out, 2)}
 
 
@@ -1140,12 +1189,12 @@ FLOW_RANGES = {"cur": 1, "1m": 1, "3m": 3, "6m": 6, "1y": 12, "3y": 36,
                "5y": 60, "all": None}
 
 # (tenant, inputs fingerprint, month-start iso) -> (fixed actual,
-# expires-at). Closed months only — see _fixed_for. Ten minutes bounds a
-# cache miss nobody notices; the fingerprint bounds the one they would.
-# Keyed on time alone, a bill edit or a combined-entities toggle would
-# leave the Cash Flow page showing the pre-edit fixed split for up to ten
-# minutes, process-wide — the page disagreeing with the Budget page it
-# promises to agree with. The stamp is the bills the match runs against,
+# expires-at). Closed months only — see _fixed_for. The expiry (a day,
+# below) bounds a cache miss nobody notices; the fingerprint bounds the one
+# they would. Keyed on time alone, a bill edit or a combined-entities
+# toggle would leave the Cash Flow page showing the pre-edit fixed split
+# until the entry expired, process-wide — the page disagreeing with the
+# Budget page it promises to agree with. The stamp is the bills the match runs against,
 # the config it runs under, AND the ledger the match reads: a closed
 # month's fixed total is the sum of the charges the bills matched, so a
 # charge re-filed, reimbursed, split or removed, or an account hidden,
@@ -1222,8 +1271,9 @@ def _span_months(start: dt.date, last: dt.date) -> int:
     show. Counted from the CALENDAR, never from which months had a row:
     $300 a quarter over a year is $100/mo, and a divisor that shrinks to
     the four months with a deposit puts $300/mo on the Income headline.
-    The live month counts whole, like every month the range label
-    promises ("Sep 2025–Aug 2026" is twelve).
+    Every month the range label names counts whole ("Sep 2025–Aug 2026"
+    is twelve); a range of months holds closed months only, and the one
+    window that runs to today ("This month") is one month, not a fraction.
 
     `last` is the window's OWN last day, not the wall clock. "1m" closes
     before today (see _range_window); measured to today it would count the
@@ -1232,64 +1282,111 @@ def _span_months(start: dt.date, last: dt.date) -> int:
     return (last.year - start.year) * 12 + last.month - start.month + 1
 
 
-def _first_bank_month(conn, bank: list[str]) -> dt.date | None:
-    """First of the month the ledger begins in, or None for an empty one.
+def _first_ledger_month(conn, accounts: list[str] | None) -> dt.date | None:
+    """First of the month the rows a window totals begin in, or None when
+    there are none. `accounts` names the accounts the window sums — the
+    bank accounts for income, None for spend, which counts every account
+    (a card imported back to 2022 is spend from 2022, whenever checking was
+    linked). Anchored on checking alone, a spend window would start where
+    checking does and drop the older card rows, and its `/mo` divisor
+    would count fewer months than the total holds.
+
     The `/mo` divisor is capped at this: uncapped, a household three weeks
     old on the default 1y range divides its spend by twelve — $2,400 reading
     as $200/mo on every windowed tab until the ledger catches up with the
     label."""
     excl, ex_p = excluded_accounts_sql(conn)
-    first = conn.execute(
-        f"SELECT MIN(date) AS d FROM transactions t WHERE account_id = ANY(%s) {excl}",
-        (bank, *ex_p)).fetchone()["d"]
+    if accounts is None:
+        # Spend's own predicate, not every row: 401k plan history, loan
+        # rows and business-entity rows are never spend, and a plan CSV
+        # back to 2016 would otherwise open "All" in 2016 and divide two
+        # years of spend by ten years of months.
+        first = conn.execute(
+            f"SELECT MIN(t.date) AS d FROM transactions t "
+            f"WHERE {SPEND_WHERE} {excl}",
+            ex_p or None).fetchone()["d"]
+    else:
+        # The rows the income total can count: business-entity and shadow
+        # rows never reach it, so they must not anchor it either. An LLC's
+        # checking imported back years before the personal feed would
+        # otherwise open "All" at the LLC's first row, divide a few months
+        # of personal income by years of months, and hide that the
+        # personal ledger has no complete month yet.
+        where, params = _counted_rows_where(conn, accounts)
+        first = conn.execute(
+            f"SELECT MIN(t.date) AS d FROM transactions t WHERE {where}",
+            params).fetchone()["d"]
     return as_date(first).replace(day=1) if first else None
 
 
-def _pace_months(conn, bank: list[str], start: dt.date, last: dt.date) -> int:
-    first = _first_bank_month(conn, bank)
+def _pace_months(conn, accounts: list[str] | None, start: dt.date,
+                 last: dt.date) -> int:
+    first = _first_ledger_month(conn, accounts)
     # Never below one: a window that closes before the ledger even opens
     # (a brand-new household reading "1m") spans zero or fewer calendar
     # months, and a zero divisor is a crash or an infinity on the page.
     return max(1, _span_months(max(start, first) if first else start, last))
 
 
-def _range_window(conn, today: dt.date, range_key: str, bank: list[str],
-                  ) -> tuple[dt.date, dt.date, dt.date | None, str]:
-    """(start, end, prev_start, label) for a site-wide range key. `end` is
-    EXCLUSIVE: the day after today for every window that runs to now, the
-    first of this month for "1m", the last complete month. `prev_start`
-    opens the previous window — the thing "vs the year before" compares
-    against — and _prev_window_end cuts where it stops, like-for-like with
-    this window's partial month; None for 'all', which has no previous
-    window."""
+def _window_label(start: dt.date, last: dt.date) -> str:
+    if start.year == last.year:
+        return (f"{_MON[start.month]}–{_MON[last.month]} {last.year}"
+                if start.month != last.month
+                else f"{_MON[last.month]} {last.year}")
+    return f"{_MON[start.month]} {start.year}–{_MON[last.month]} {last.year}"
+
+
+def _range_window(conn, today: dt.date, range_key: str,
+                  accounts: list[str] | None,
+                  ) -> tuple[dt.date, dt.date, dt.date | None, str, bool]:
+    """(start, end, prev_start, label, live_month) for a site-wide range
+    key. `end` is EXCLUSIVE: the day after today for "cur" (this month, the
+    one window that runs to now), the first of this month for every other
+    key — a range of months holds COMPLETE months only, so "3y" on the 6th
+    of a month is the 36 months that have closed, not 35 and six days: a
+    partial month read beside whole ones looks like a collapse every
+    morning after a month turns, and a per-month pace over it is wrong.
+    `prev_start` opens the previous window — the thing "vs the year
+    before" compares against — and _prev_window_end cuts where it stops,
+    like-for-like with this month's partial days; None for 'all', which
+    has no previous window.
+
+    `accounts` are the accounts the window totals (see _first_ledger_month):
+    'all' starts at their first row.
+
+    A ledger whose first row is in the month in progress has no complete
+    month yet, so every range of months would be empty — a household
+    reading Cash Flow in its first month would see nothing at all, while
+    Today shows the month's spend. Those ranges fall back to the month so
+    far (the "cur" window, with no previous one) and `live_month` says so,
+    so the page can name the window it is showing."""
     months = FLOW_RANGES[range_key]      # KeyError = caller's bug; route validates
     month_start = today.replace(day=1)
-    end = today + dt.timedelta(days=1)
-    last = today
-    if months is None:
-        excl, ex_p = excluded_accounts_sql(conn)
-        first = conn.execute(
-            f"SELECT MIN(date) AS d FROM transactions t WHERE account_id = ANY(%s) {excl}",
-            (bank, *ex_p)).fetchone()["d"]
-        start = (as_date(first).replace(day=1) if first else month_start)
-        prev = None
-    elif range_key == "1m":
-        # the last complete month: closes where this month opens
+    live = False
+    if range_key != "cur":
+        # judged on the rows this window totals, the same anchor as its
+        # start: older rows it never counts (plan history, loans) would
+        # otherwise hide that it has no complete month yet
+        first_own = _first_ledger_month(conn, accounts)
+        live = first_own is not None and first_own >= month_start
+    if range_key == "cur" or live:
+        end = today + dt.timedelta(days=1)
+        last = today
+        start = month_start
+        prev = None if live else _months_back(start, 1)
+    else:
+        # the last complete month closes where this month opens
         end = month_start
         last = month_start - dt.timedelta(days=1)
-        start = last.replace(day=1)
-        prev = _months_back(start, 1)
-    else:
-        start = _months_back(month_start, months - 1)
-        prev = _months_back(start, months)
-    if start.year == last.year:
-        label = (f"{_MON[start.month]}–{_MON[last.month]} {last.year}"
-                 if start.month != last.month
-                 else f"{_MON[last.month]} {last.year}")
-    else:
-        label = (f"{_MON[start.month]} {start.year}–"
-                 f"{_MON[last.month]} {last.year}")
-    return start, end, prev, label
+        if months is None:
+            first = _first_ledger_month(conn, accounts)
+            start = (min(first, last.replace(day=1))
+                     if first else last.replace(day=1))
+            prev = None
+        else:
+            start = _months_back(last.replace(day=1), months - 1)
+            prev = _months_back(start, months)
+    return start, end, prev, _window_label(start, last), live
 
 
 def _prev_window_end(today: dt.date, range_key: str, start: dt.date,
@@ -1302,9 +1399,9 @@ def _prev_window_end(today: dt.date, range_key: str, start: dt.date,
     month set against a partial one reads as a collapse every morning
     after a month turns. On the last day of a month the current month is
     whole, so the previous one is too (Feb 28 against all of January).
-    "1m" and 'all' are unaffected: the first is whole months on both
-    sides, the second has no previous window."""
-    if prev is None or range_key == "1m" or FLOW_RANGES[range_key] is None:
+    Every other key is whole months on both sides, so the previous window
+    simply stops where this one starts; 'all' has no previous window."""
+    if prev is None or range_key != "cur":
         return start if prev is not None else None
     months = FLOW_RANGES[range_key]
     pm = _months_back(today.replace(day=1), months)
@@ -1369,12 +1466,14 @@ def spending_window(conn, today: dt.date, range_key: str) -> dict:
     merchants ranked over one site-wide timeframe, each with its total over
     the PREVIOUS equal window so the page can lead with what changed. Pure
     SQL aggregation — no month walk — so every range is cheap."""
-    bank = _bank_account_ids(conn)
-    start, end, prev, label = _range_window(conn, today, range_key, bank)
-    # the last day the window covers — today for every range open to now,
-    # the end of last month for "1m", which closes before today. Both the
-    # reported end and the "/mo" divisor are the WINDOW's, never the wall
-    # clock's (flow_breakdown reads the same day off `end`).
+    # spend is summed over every account, cards included, so the window
+    # is anchored on the first row of any account, not of checking
+    start, end, prev, label, live = _range_window(conn, today, range_key, None)
+    # the last day the window covers — today for "cur" (and for a ledger
+    # still in its first month), the end of the last complete month for
+    # every other key. Both the reported end and the "/mo" divisor are the
+    # WINDOW's, never the wall clock's (flow_breakdown reads the same day
+    # off `end`).
     last_day = end - dt.timedelta(days=1)
     amt2 = _R2.format(f"SUM({NET_AMOUNT_JOINED})")
     excl, ex_p = excluded_accounts_sql(conn)
@@ -1405,27 +1504,46 @@ def spending_window(conn, today: dt.date, range_key: str) -> dict:
             f"GROUP BY payee ORDER BY amt DESC", (a, b, *ex_p)).fetchall()
         return _fold_merchants(rows, limit)
 
-    merch = _merchants(start, end, 25)
-    prev_merch = ({k: round(v["amt"], 2) for k, v in _merchants(prev, prev_end, None)}
-                  if prev else {})
+    merch_all = _merchants(start, end, None)
+    merch = merch_all[:25]
+    prev_folded = _merchants(prev, prev_end, None) if prev else []
+    prev_merch = {k: round(v["amt"], 2) for k, v in prev_folded}
+    # Spend that stopped is a change too, and often the largest: the
+    # headline delta already counts it, so a row list without it cannot
+    # add up to the headline. Prev-only categories follow the ranked
+    # current ones at 0; prev-only merchants get their own list, so the
+    # ranked merchant list stays a list of where money went this window.
+    current_keys = {k for k, _f in merch_all}
+    dropped_merch = [(k, f) for k, f in prev_folded
+                     if k not in current_keys and f["amt"] > 0][:10]
     total = round(sum(cats.values()), 2)
     prev_total = round(sum(prev_cats.values()), 2) if prev else None
     return {
         "from": start.isoformat(), "to": last_day.isoformat(), "label": label,
-        "months": _pace_months(conn, bank, start, last_day),
+        "months": _pace_months(conn, None, start, last_day),
+        # true when the ledger has no complete month yet and the range shows
+        # the month so far instead (see _range_window)
+        "live_month": live,
         "total": total, "prev_total": prev_total,
         "by_month": by_month,
         # [category, amount, previous-window amount|null], ranked
         "categories": [[c, round(v, 2),
                         round(prev_cats[c], 2) if prev and c in prev_cats
                         else (0.0 if prev else None)]
-                       for c, v in sorted(cats.items(), key=lambda x: -x[1])],
+                       for c, v in sorted(cats.items(), key=lambda x: -x[1])]
+                      + [[c, 0.0, round(v, 2)]
+                         for c, v in sorted(prev_cats.items(),
+                                            key=lambda x: -x[1])
+                         if c not in cats and round(v, 2) > 0],
         # [payee, amount, visits, previous-window amount|null, logo] —
         # prev looked up by the same fold key, so a renamed variant still
         # compares against its own history
         "merchants": [[f["payee"], round(f["amt"], 2), f["n"],
                        (prev_merch.get(k, 0.0) if prev else None),
                        f["logo"]] for k, f in merch],
+        # same shape, for merchants paid only in the previous window
+        "dropped_merchants": [[f["payee"], 0.0, 0, round(f["amt"], 2),
+                               f["logo"]] for _k, f in dropped_merch],
     }
 
 
@@ -1435,7 +1553,7 @@ def income_window(conn, today: dt.date, range_key: str) -> dict:
     monthly series, and the previous equal window's figures for the delta.
     Pure SQL plus a per-row classify pass — cheap at any range."""
     bank = _bank_account_ids(conn)
-    start, end, prev, label = _range_window(conn, today, range_key, bank)
+    start, end, prev, label, live = _range_window(conn, today, range_key, bank)
     # the window's own last day, as on the Spending tab — "1m" ends where
     # last month did, so its pace divides by that one month
     last_day = end - dt.timedelta(days=1)
@@ -1479,12 +1597,18 @@ def income_window(conn, today: dt.date, range_key: str) -> dict:
             (bank, a, b, *ex_p)).fetchall()
         return _fold_merchants(rows, limit)
 
-    src = _sources(start, end, 15)
-    prev_src = ({k: round(v["amt"], 2) for k, v in _sources(prev, prev_end, None)}
-                if prev else {})
+    src_all = _sources(start, end, None)
+    src = src_all[:15]
+    prev_folded = _sources(prev, prev_end, None) if prev else []
+    prev_src = {k: round(v["amt"], 2) for k, v in prev_folded}
+    # a payer who stopped paying is a change, as on the Spending tab
+    current_keys = {k for k, _f in src_all}
+    dropped_src = [(k, f) for k, f in prev_folded
+                   if k not in current_keys and f["amt"] > 0][:10]
     return {
         "from": start.isoformat(), "to": last_day.isoformat(), "label": label,
         "months": _pace_months(conn, bank, start, last_day),
+        "live_month": live,
         "total": round(sum(kinds.values()), 2),
         "prev_total": (round(sum(prev_kinds.values()), 2)
                        if prev_kinds is not None else None),
@@ -1494,6 +1618,9 @@ def income_window(conn, today: dt.date, range_key: str) -> dict:
         "sources": [[f["payee"], round(f["amt"], 2), f["n"],
                      (prev_src.get(k, 0.0) if prev else None),
                      f["logo"]] for k, f in src],
+        # same shape, for payers seen only in the previous window
+        "dropped_sources": [[f["payee"], 0.0, 0, round(f["amt"], 2),
+                             f["logo"]] for _k, f in dropped_src],
     }
 
 
@@ -1509,10 +1636,72 @@ def flow_breakdown(conn, today: dt.date, range_key: str) -> dict:
     Same predicates as every other figure on the page (_INCOME_WHERE /
     SPEND_WHERE), so the picture and the table agree."""
     bank = _bank_account_ids(conn)
-    start, end, _prev, label = _range_window(conn, today, range_key, bank)
-    # the last day the window covers — today, or the end of the last
-    # complete month for "1m"
+    # the picture totals spend over every account, so 'all' starts at the
+    # ledger's first row of any kind
+    start, end, _prev, label, live = _range_window(conn, today, range_key, None)
+    # the last day the window covers — today for "cur", the end of the
+    # last complete month for every other key
     last_day = end - dt.timedelta(days=1)
+    # Income is known only from the first bank month on (the rule the Year
+    # and Month lenses follow). A window opening before it would set part
+    # of its income against all of its spend and call the difference
+    # overspending, so the picture starts where income is known and its
+    # label says so.
+    cov = _income_coverage(conn)
+    cov_start = cov[1]
+    clipped = False
+    # No bank feed at all (a cards-only household), or one that starts
+    # after the window closes: no month of the window has known income.
+    # Summing it would read $0 came in and call all spend a loss, which
+    # the Year and Month lenses report as unknown for the same months.
+    income_unknown = cov_start is None
+    if cov_start is not None:
+        cov_first = dt.date(int(cov_start[:4]), int(cov_start[5:]), 1)
+        if start < cov_first <= last_day:
+            start, clipped = cov_first, True
+            label = _window_label(start, last_day)
+        elif cov_first > last_day:
+            income_unknown = True
+    # The window is summed over the runs of months whose income is known,
+    # month by month under the lenses' rule (_income_known). A year with no
+    # bank rows inside the window — cards only, or a gap in the checking
+    # history — has unknown income, not $0: summing it would set none of
+    # its income against all of its spend and report the difference as
+    # overspending. Its months are left out on BOTH sides and the label
+    # says so; a window with no known month at all is income_unknown.
+    runs: list[tuple[dt.date, dt.date]] = []
+    gap_months: list[str] = []
+    if not income_unknown:
+        cur = start
+        while cur <= last_day:
+            nxt = (cur + dt.timedelta(days=32)).replace(day=1)
+            stop = min(nxt, end)
+            if _income_known(cov, cur.strftime("%Y-%m")):
+                if runs and runs[-1][1] == cur:
+                    runs[-1] = (runs[-1][0], stop)
+                else:
+                    runs.append((cur, stop))
+            else:
+                gap_months.append(cur.strftime("%Y-%m"))
+            cur = nxt
+        if not runs:
+            income_unknown, gap_months = True, []
+    if income_unknown:
+        # spend is still measured over the whole window
+        runs = [(start, end)]
+    elif gap_months:
+        # each stretch named on its own: one span from the first gap to
+        # the last would claim the known months between them were left out
+        spans: list[list[dt.date]] = []
+        for ym in gap_months:
+            d = dt.date(int(ym[:4]), int(ym[5:]), 1)
+            if spans and _months_back(d, 1) == spans[-1][1]:
+                spans[-1][1] = d
+            else:
+                spans.append([d, d])
+        label = (f"{label}, without "
+                 f"{', '.join(_window_label(a, b) for a, b in spans)}"
+                 f" (no bank feed)")
     periods = {range_key: (start, label)}
     _kind = _income_kind_fn(conn)
 
@@ -1542,7 +1731,7 @@ def flow_breakdown(conn, today: dt.date, range_key: str) -> dict:
 
     stamp = _fixed_inputs_stamp(conn, cfg)
 
-    def _fixed_for(start: dt.date) -> float:
+    def _fixed_for(start: dt.date, stop: dt.date) -> float:
         # CLOSED months land in a short-lived process cache — an
         # all-history window on a decades-long ledger is hundreds of
         # month_status calls (seconds); the stamp in the key misses on
@@ -1550,14 +1739,14 @@ def flow_breakdown(conn, today: dt.date, range_key: str) -> dict:
         total, cur = 0.0, start
         month_start = today.replace(day=1)
         now = dt.datetime.now().timestamp()
-        while cur <= last_day:
+        while cur <= stop:
             key = (tid, stamp, cur.isoformat())
             hit = _FIXED_MONTH_CACHE.get(key)
             if hit is not None and cur < month_start and hit[1] > now:
                 total += hit[0]
                 cur = (cur + dt.timedelta(days=32)).replace(day=1)
                 continue
-            last = min(last_day, (cur + dt.timedelta(days=32)).replace(day=1)
+            last = min(stop, (cur + dt.timedelta(days=32)).replace(day=1)
                        - dt.timedelta(days=1))
             try:
                 st = budget.month_status(conn, last, historical=False,
@@ -1576,53 +1765,134 @@ def flow_breakdown(conn, today: dt.date, range_key: str) -> dict:
     out: dict = {}
     for key, (start, label) in periods.items():
         inc = {"paychecks": 0.0, "interest": 0.0, "other": 0.0}
-        for r in conn.execute(
-                f"""SELECT t.name, COALESCE(t.category_detailed,'') AS d,
-                          {INCOME_NET} AS amt
-                     FROM transactions t
-                    WHERE {_INCOME_WHERE} AND t.date >= %s AND t.date < %s
+        total_out = 0.0
+        fixed = 0.0
+        for a, b in runs:
+            for r in conn.execute(
+                    f"""SELECT t.name, COALESCE(t.category_detailed,'') AS d,
+                              {INCOME_NET} AS amt
+                         FROM transactions t
+                        WHERE {_INCOME_WHERE} AND t.date >= %s AND t.date < %s
+                        {excl_sql}""",
+                    (bank, a, b, *ex_p)):
+                # the same exclusion on the IN side as on the OUT side
+                # below — judged under different rules, an excluded account
+                # that takes $6k in and pays $5.5k out reads as "+$5,500
+                # stayed"
+                inc[_kind(r["name"], r["d"])] += float(r["amt"] or 0)
+            run_out = float(conn.execute(
+                f"""SELECT {_R2.format(f"COALESCE(SUM({NET_AMOUNT_JOINED}), 0)")} amt
+                     FROM transactions t {REIMB_PARTIAL_JOIN}
+                    WHERE {SPEND_WHERE} AND t.date >= %s AND t.date < %s
                     {excl_sql}""",
-                (bank, start, end, *ex_p)):
-            # the same exclusion on the IN side as on the OUT side below —
-            # judged under different rules, an excluded account that takes
-            # $6k in and pays $5.5k out reads as "+$5,500 stayed"
-            inc[_kind(r["name"], r["d"])] += float(r["amt"] or 0)
-        total_out = float(conn.execute(
-            f"""SELECT {_R2.format(f"COALESCE(SUM({NET_AMOUNT_JOINED}), 0)")} amt
-                 FROM transactions t {REIMB_PARTIAL_JOIN}
-                WHERE {SPEND_WHERE} AND t.date >= %s AND t.date < %s
-                {excl_sql}""",
-            (start, end, *ex_p)).fetchone()["amt"] or 0)
-        fixed = min(_fixed_for(start), total_out)
+                (a, b, *ex_p)).fetchone()["amt"] or 0)
+            total_out += run_out
+            fixed += min(_fixed_for(a, b - dt.timedelta(days=1)), run_out)
         sp = {"fixed": round(fixed, 2), "variable": round(total_out - fixed, 2)}
         total_in = round(sum(inc.values()), 2)
         total_out = round(total_out, 2)
         saved = round(total_in - total_out, 2)
+        inc_out = {"total": total_in,
+                   **{k: round(v, 2) for k, v in inc.items()}}
+        # an empty window misreports nothing (0 in, 0 out, nothing lost),
+        # and the clients draw no picture for it, so it keeps its zeros
+        unknown = income_unknown and total_out != 0
+        if unknown:
+            inc_out = {k: None for k in inc_out}
+            saved = None
         out[key] = {
             "from": start.isoformat(), "to": last_day.isoformat(),
             "label": label,
-            "in": {"total": total_in, **{k: round(v, 2) for k, v in inc.items()}},
+            "live_month": live,
+            # true when the window was cut to start at the first month with
+            # known income (the bank feed's first month)
+            "income_clipped": clipped,
+            # months inside the window left out on both sides because no
+            # bank feed covers them (their income is unknown, not $0)
+            "income_gap_months": len(gap_months),
+            # true when no month of the window has known income: in, saved
+            # and rate are then null (unknown), never $0 and a loss
+            "income_unknown": unknown,
+            "in": inc_out,
             "out": {"total": total_out, **{k: round(v, 2) for k, v in sp.items()}},
             "saved": saved,
-            "rate": round(100 * saved / total_in, 1) if total_in else None,
+            "rate": (round(100 * saved / total_in, 1)
+                     if total_in and saved is not None else None),
         }
     return out[range_key]
 
 
-def _bank_coverage_years(conn) -> set[str]:
-    """Years with any bank-account (real-bank depository) rows at all.
-    Years with card spend but no checking data have unknown income, not $0.
-    Excluded accounts don't count as coverage: their rows are invisible to
-    the income figure, so a year covered only by an excluded checking
-    account would report $0 income as if it were measured."""
+def _counted_rows_where(conn, accounts: list[str]) -> tuple[str, tuple]:
+    """(WHERE clause over `transactions t`, its parameters) selecting the
+    rows of `accounts` that an income total over them can count: live,
+    not on an excluded account, not on a shadow (a HIDDEN account or the
+    non-primary copy of a linked pair), not business-entity money. Every
+    question of the form "from when, and in which years, is income
+    measured" reads these rows and no others. A row the income total
+    drops must not decide coverage either: an old checking account the
+    user hid still holds years of payroll, and judged on its rows those
+    years read as "$0 came in" against their card spend, a loss nobody
+    made, where the honest answer is that the income is unknown."""
     excl, ex_p = excluded_accounts_sql(conn)
-    return {r["yr"] for r in conn.execute(
-        f"""SELECT DISTINCT to_char(t.date,'YYYY') yr FROM transactions t
-           WHERE t.removed=0 AND t.account_id = ANY(%s) {excl}
-             {budget.PERSONAL_ONLY_SQL}""",
-        (_bank_account_ids(conn), *ex_p))}
+    return (f"""t.removed=0 AND t.account_id = ANY(%s) {excl}
+             {_NOT_SHADOW.format(col="t.account_id")}
+             {budget.PERSONAL_ONLY_SQL}""", (accounts, *ex_p))
 
 
+def _bank_coverage_years(conn) -> set[str]:
+    """Years with any bank-account (real-bank depository) rows the income
+    total counts. Years with card spend but no checking data have unknown
+    income, not $0. Excluded, hidden and linked-backup accounts don't count
+    as coverage: their rows are invisible to the income figure, so a year
+    covered only by one of them would report $0 income as if it were
+    measured. See _income_coverage, which this is the year half of."""
+    return _income_coverage(conn)[0]
+
+
+def _income_coverage(conn) -> tuple[set[str], str | None]:
+    """(years with bank rows, first bank month 'YYYY-MM' or None) — the
+    per-month income rule the Year and Month lenses use: a month's income
+    is known from the month of the first bank row on, in a year with bank
+    rows. A year is known only when every month of it is, i.e. its January
+    is. Judging a year by whether it has ANY bank rows reads the months
+    before the feed starts as income $0, which sets part of a year's income
+    against all of its spend and reports a loss nobody made.
+
+    Both halves come from one pass over the rows the income total counts
+    (_counted_rows_where, the predicate _first_ledger_month uses for the
+    bank accounts), so the months a window or a lens calls known are the
+    months whose deposits are actually summed."""
+    where, params = _counted_rows_where(conn, _bank_account_ids(conn))
+    rows = conn.execute(
+        f"""SELECT to_char(t.date,'YYYY') yr, MIN(t.date) AS d
+            FROM transactions t WHERE {where}
+            GROUP BY yr""", params).fetchall()
+    if not rows:
+        return set(), None
+    d = min(as_date(r["d"]) for r in rows)
+    return {r["yr"] for r in rows}, f"{d.year:04d}-{d.month:02d}"
+
+
+def _income_known(cov: tuple[set[str], str | None], key: str) -> bool:
+    """`key` is 'YYYY-MM'; for a whole year pass 'YYYY-01'."""
+    years, start = cov
+    return start is not None and key >= start and key[:4] in years
+
+
+def _known_months(cov: tuple[set[str], str | None], through: str) -> list[str]:
+    """Every 'YYYY-MM' from the first bank month through `through`
+    (inclusive) whose income is known, in order — a month with no deposit
+    included, since its income is a measured $0, not a missing one."""
+    years, start = cov
+    if start is None:
+        return []
+    out = []
+    for y in sorted(years):
+        for mo in range(1, 13):
+            key = f"{y}-{mo:02d}"
+            if start <= key <= through:
+                out.append(key)
+    return out
 
 
 def _investment_funding(conn) -> list[list]:
@@ -1681,10 +1951,11 @@ def _investment_funding(conn) -> list[list]:
 
 
 def _cash_graph(conn, income_m: dict, spend_m: dict,
-                today: dt.date | None = None) -> dict:
+                today: dt.date | None = None,
+                cov: tuple[set[str], str | None] | None = None) -> dict:
     """One continuous monthly net-cash-flow series — every
-    historical month with bank income data (the same income − spend the
-    per-year charts render), then the forward forecast (forecast.HORIZON_DAYS)
+    historical month whose income is known (_income_known: the same
+    income − spend the per-year charts render), then the forward forecast (forecast.HORIZON_DAYS)
     folded into calendar months. The forward part is DERIVED from engine/forecast's
     autopay-statement balance series (balance delta over each month =
     net flow), so it reconciles with the Today page by construction —
@@ -1703,8 +1974,9 @@ def _cash_graph(conn, income_m: dict, spend_m: dict,
     cur_next = (cur_start.replace(year=cur_start.year + 1, month=1)
                 if cur_start.month == 12
                 else cur_start.replace(month=cur_start.month + 1))
-    points = [[k, round(income_m[k] - spend_m.get(k, 0.0), 2)]
-              for k in sorted(income_m) if k < cur_key]
+    points = [[k, round(income_m.get(k, 0.0) - spend_m.get(k, 0.0), 2)]
+              for k in _known_months(cov or _income_coverage(conn), cur_key)
+              if k < cur_key]
     forecast_from = len(points)
     try:
         # forecast.HORIZON_DAYS, not a second hard-coded horizon. A longer
@@ -1845,13 +2117,14 @@ def _cash_graph(conn, income_m: dict, spend_m: dict,
     # Both sides read posted_for_plan — the same helper the walk nets against —
     # so checking-leg-only transfers count here exactly once too, and
     # token-less goals sharing an account partition instead of each
-    # claiming the full net.
+    # claiming the full net. A business's goal is the walk's exception too
+    # (savings.household_goals): the walk leaves it out, so this does.
     from . import savings as _savings
     cfg = budget.load_config(conn)
     first = today.replace(day=1)
     mtd_savings = sum(
         max(0.0, _savings.posted_for_plan(conn, cfg, g, since=first))
-        for g in _savings.goals(cfg)
+        for g in _savings.household_goals(conn, cfg)
         if float(g.get("monthly_plan") or 0) > 0
         and not _savings.is_plan_only(g))
     mtd_actual = (income_m.get(cur_key, 0.0) - mtd_spend_cash
@@ -1881,41 +2154,41 @@ def compute_cashflow(conn, today: dt.date | None = None) -> dict:
         else:
             spend_m[r["p"]] = r["amt"]
     income_y, income_m = _income_year_month(conn)
-    covered = _bank_coverage_years(conn)
+    cov = _income_coverage(conn)
     years = sorted(set(spend_y) | set(income_y))
     savings = []
     for y in years:
         sp = spend_y.get(y, 0)
-        if y not in covered:  # card spend exists but no bank data → income unknown
+        # income unknown for a year without every month covered: card spend
+        # with no bank data, or a year the bank feed starts partway into
+        if not _income_known(cov, f"{y}-01"):
             savings.append([y, None, round(sp, 2), None, None])
             continue
         inc = income_y.get(y, 0)
         rate = round(100 * (inc - sp) / inc, 1) if inc else None
         savings.append([y, round(inc, 2), round(sp, 2), round(inc - sp, 2), rate])
     # per-year monthly net cash flow (income − spend), for the expandable
-    # per-year line chart. Keyed only on months that HAVE bank income data
-    # (avoids a phantom -spend dip in a covered year's pre-coverage months).
-    # Month labels are abbreviations so the chart's x-axis ticks read by month.
+    # per-year line chart. Keyed on months whose income is KNOWN, not on
+    # months that happened to receive a deposit: a covered month with no
+    # pay and real spend is the month that lost the most, and dropping it
+    # leaves the bars summing to more than the year's Saved figure. Months
+    # before the feed starts stay out (unknown, not $0). Month labels are abbreviations so the chart's x-axis ticks read by month.
     _MO = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    today = today or dt.date.today()
+    cur_key = today.strftime("%Y-%m")
     monthly_by_year: dict = {}
-    for y in years:
-        if y not in covered:
-            continue
-        pts = []
-        for mo in range(1, 13):
-            key = f"{y}-{mo:02d}"
-            if key not in income_m:
-                continue
-            pts.append([_MO[mo - 1],
-                        round(income_m[key] - spend_m.get(key, 0.0), 2)])
-        if pts:
-            monthly_by_year[y] = pts
+    for key in _known_months(cov, cur_key):
+        y, mo = key[:4], int(key[5:])
+        # the month in progress is in the year's Saved figure, so it is a
+        # bar too; months still ahead are not
+        monthly_by_year.setdefault(y, []).append(
+            [_MO[mo - 1],
+             round(income_m.get(key, 0.0) - spend_m.get(key, 0.0), 2)])
     # investment funding: net external cash into investments per year
     funding = _investment_funding(conn)
     # investment-funding shortfall signal (budget.cash_events, current
     # month; guarded — a cash_events failure must not sink the page)
-    today = today or dt.date.today()
     try:
         # `until` is exclusive: month_status passes tomorrow so a pull that
         # landed TODAY — the one the Today page is flagging this morning —
@@ -1948,7 +2221,8 @@ def compute_cashflow(conn, today: dt.date | None = None) -> dict:
     return {
         "savings_by_year": savings,
         "monthly_by_year": monthly_by_year,
-        "cash_graph": _cash_graph(conn, income_m, spend_m, today=today),
+        "cash_graph": _cash_graph(conn, income_m, spend_m, today=today,
+                                  cov=cov),
         "reported_income": reported,
         "career_income": career,
         "income_by_month": [[p, income_m[p]] for p in sorted(income_m)],

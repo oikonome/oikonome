@@ -479,9 +479,12 @@ class WhyHeadlineNeverContradictsTheVerdict(unittest.TestCase):
         # the combined variance clears max(50, 5% of combined expected)
         exp = 1300 * frac
         spend = exp * 1.07                       # +7% each — under 8%
-        add_txn(self.conn, today, spend, "GROCER A",
+        # dated yesterday: spend on the day in progress earns that day's
+        # allowance into expected, which would move the fixture's bars
+        spent_on = today - dt.timedelta(days=1)
+        add_txn(self.conn, spent_on, spend, "GROCER A",
                 primary="FOOD_AND_DRINK")
-        add_txn(self.conn, today, spend, "SHOP B",
+        add_txn(self.conn, spent_on, spend, "SHOP B",
                 primary="GENERAL_MERCHANDISE")
         st = budget.month_status(self.conn, today)
         self.assertEqual(st["verdict"], "OVER BUDGET")

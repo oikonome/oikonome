@@ -56,11 +56,12 @@ Or use the subcommands directly:
 ./oikonome.sh logs              # follow app + worker logs
 ./oikonome.sh backup            # pg_dump into ./backups inside the install
 ./oikonome.sh restore <file>    # replace the database from a dump (confirm-gated)
-./oikonome.sh reset             # wipe data + secrets, fresh setup wizard (confirm-gated)
+./oikonome.sh reset             # wipe the data + generated passwords, fresh setup wizard; keeps your settings and the master key your backups need (confirm-gated; --new-key replaces the key; either way it is saved beside the backups)
 ./oikonome.sh reset-data [tenant-id]  # wipe the data but keep logins; wizard runs again (confirm-gated)
 ./oikonome.sh reset-password <email>  # locked out? one-time reset link, no SMTP needed
 ./oikonome.sh clear-2fa <email> # lost the authenticator AND the recovery codes (confirm-gated)
 ./oikonome.sh uninstall         # remove the whole instance (confirm-gated)
+./oikonome.sh start-at-boot     # Podman only: start the stack after a host reboot (off: start-at-boot off)
 ```
 
 `demo`, `https`, `llm` and `script` are covered in their own sections
@@ -254,9 +255,13 @@ recurring-bill tagging). Three ways to run the LLM, easiest first:
   `docker/.env` overrides it.
 
 - **Bring your own local endpoint**: already run llama.cpp, Ollama, or LM
-  Studio elsewhere? Point the wizard (or Settings → AI)
-  at its URL (e.g.
-  `http://localhost:11434`) + model name, no API key.
+  Studio elsewhere? Point the wizard (or Settings → AI) at its URL + model
+  name, no API key. The URL is resolved from INSIDE the app container, so
+  `localhost` there is the container itself, not the machine running it:
+  for a model server on the same host use `http://host.docker.internal:11434`
+  (Docker Desktop), `http://host.containers.internal:11434` (Podman), or the
+  host's LAN address (Docker Engine on Linux, where the server must also
+  listen on that address rather than loopback only).
 - **Cloud**: any OpenAI-compatible API — endpoint URL + model name + your
   API key (encrypted at rest, never shown again).
 
@@ -272,8 +277,21 @@ Set in `.env`: `OIKONOME_SMTP_HOST`, `OIKONOME_SMTP_PORT` (587; use 2525 on clou
 `OIKONOME_SMTP_USER`, `OIKONOME_SMTP_PASSWORD`, `OIKONOME_SMTP_FROM`.
 Any provider works (Fastmail, Proton bridge, SES SMTP, your own postfix).
 Saving a new relay in Settings (host, port, user, sender, password or
-STARTTLS) asks you to confirm who you are first — the relay carries your
-password-reset link.
+STARTTLS) asks you to confirm who you are first — with no relay in
+`.env`, the Settings relay is what carries your password-reset link. When
+`.env` has a relay, password-reset and sign-in links and the
+second-factor-cleared notices always go through that one, even if a
+relay is saved in Settings (the Settings relay still wins for the reports
+and other household mail), so keep it working: the mail health check
+probes it, and when it fails the link is written to the app log instead
+(`./oikonome.sh logs`). For
+the same reason, an owner's password, email or 2FA change, a mailed reset
+and a cleared set of factors pause a relay saved in Settings (along with
+any extra email recipients and an AI endpoint saved there) until the owner presses
+**These are mine — resume** on the banner in Settings. Meanwhile mail goes
+through the relay in `.env`; with none there, nothing is sent, and a
+password-reset or sign-in link is written to the app log instead
+(`./oikonome.sh logs`).
 
 STARTTLS certificates are verified. If your relay presents a
 self-signed certificate — Proton Mail Bridge on your own network is the
@@ -402,10 +420,53 @@ in `.env`. See [integrations.md](integrations.md).
 ./oikonome.sh install
 ```
 (It pulls the latest code first when the folder is a git checkout, then
-rebuilds — safe to re-run anytime.)
+rebuilds — safe to re-run anytime. `./oikonome.sh upgrade` is the same
+command, and so is **Upgrade to the latest release** in the admin console.)
 Migrations run automatically at start (advisory-locked; multi-node safe).
-Roll back = restore your nightly `pg_dump` and pin the previous image tag
-(`./oikonome.sh restore <file>` does the database side).
+
+Before it changes anything, an upgrade that brings in new code saves a
+snapshot of the running database into `./backups` as
+`oikonome-pre-upgrade-<date>.sql.gz`, and prints how to undo the upgrade
+with it. "New code" means any code other than what last installed
+successfully on this instance, however it arrived: the upgrade's own pull,
+a `git pull` you ran first, a downloaded release, or `main` checked out
+again after a rollback. If the database has accounts in it
+and the snapshot cannot be written (a full disk, say), the upgrade stops
+with nothing changed. When the database is not running there is nothing
+to snapshot; the upgrade says so and points at your newest backup.
+
+**Rolling back.** The image is rebuilt in place, so there is no previous
+image to switch back to: going back means the previous code plus the
+pre-upgrade snapshot.
+
+```bash
+git tag --list 'v*' --sort=-v:refname | head   # find the version you ran
+git checkout <that tag>
+./install.sh                                   # rebuild the old code
+./oikonome.sh restore oikonome-pre-upgrade-<date>.sql.gz
+```
+
+Restore the snapshot only with the old code in place: on the new code
+its migrations would simply run again. Anything recorded between the
+upgrade and the restore is lost. To follow new releases again later,
+`git checkout main` and `./oikonome.sh install` (that upgrade snapshots
+the restored database first, like any other).
+
+**"The published history was recreated."** If an upgrade stops saying this
+checkout's history and the upstream's no longer share a commit, the public
+repository was recreated and a pull can never succeed. Your `docker/.env`,
+data and backups are not tracked by git, so moving the code across is safe:
+
+```bash
+./oikonome.sh backup
+git reset --hard '@{upstream}'   # discards edits to tracked files (git status lists them)
+./oikonome.sh install
+```
+
+Any other failed pull (usually your own edits to tracked files) is shown
+with git's message. At a terminal the upgrade then warns and carries on
+with the code as it is; run by the admin console or a script it stops
+instead, so it is never recorded as done.
 
 Most migrations are instant. A few add a column that Postgres has to
 write onto every existing row, and those hold a lock on the table while
@@ -418,14 +479,41 @@ older index builds still run inside their migration's transaction.
 
 Some migrations tidy data already stored, once. Upgrading cuts any full
 account, routing or loan number left in the raw copy of an account, loan
-or transaction to its last four digits, as new rows already are. An
+or transaction to its last four digits, as new rows already are —
+including any run of eight or more digits in a file-imported row's memo,
+payee, description or other free-text cell, or in cells past its header
+row. A weekly or daily bill saved before bills used the average-year rate
+has its stored monthly figure restated at that rate,
+so the Budget page and the Bills headline agree; restoring an older
+archive does the same. An
 account id that contains a comma is renamed, each comma becoming a dash
 (with a short suffix if that name is taken), and everything that names the
 account follows it; a script that pushes to such an account by id needs
-the new id (`/api/integrations/accounts` lists every id). Under rootless Podman,
+the new id (`/api/integrations/accounts` lists every id). A connection
+you disconnected earlier has its stored credential (an exchange key, a
+SimpleFIN bridge URL) dropped, as a new disconnect now does; it was never
+read again, and history is untouched.
+
+The weekly report email no longer exists: a household that had it
+switched on simply stops receiving it, and the daily, monthly and yearly
+emails carry on as set. A hosted instance (`OIKONOME_HOSTED=1`) with no
+billing add-on installed now refuses to start until `docker/.env` says
+`OIKONOME_HOSTED_BILLING=none`; a single-household install is unaffected. Under rootless Podman,
 `./oikonome.sh install` now prints a warning about client addresses —
 see [reverse-proxy.md](reverse-proxy.md) → "Rootless Podman hides client
 addresses".
+
+## External database (optional)
+
+`docker/compose.external-db.yaml` runs the stack against a managed or
+self-run PostgreSQL server instead of the bundled one (its header lists the
+`docker/.env` settings). That server must run **PostgreSQL 16 or newer**:
+the schema and the app use functions older versions do not have. The
+migrate step checks the version before it changes anything and stops with
+a message naming the version it found. `OIKONOME_DB_NAME` may use letters,
+digits, `_` and `-` (at most 63 characters), and the name is used exactly
+as written, upper case included — `restore` and `reset` drop and recreate
+that database by that exact name and refuse any other spelling.
 
 ## Backups
 
@@ -448,7 +536,8 @@ confirms, snapshots the current database first (so a bad dump rolls back
 instead of leaving you empty; if that snapshot can't be taken and the
 database has data, the restore refuses to proceed), swaps the database in
 place, and then checks the restored database really has your tables and
-accounts rather than trusting that nothing errored.
+accounts rather than trusting that nothing errored. If the app then does
+not come back up on it, the restore loads its snapshot back.
 
 Backups live **inside the install folder** by default — the whole install
 stays one self-contained directory. Because of that, `./oikonome.sh
@@ -456,13 +545,26 @@ uninstall` offers to move them out to `~/oikonome-backups-<project>-<date>/`
 before deleting the folder (Enter keeps them; deleting them is the
 explicit opt-in). For scheduled backups, run `scripts/backup.sh` from
 cron/systemd with a destination **outside** the install — ideally another
-disk or machine. Backup, restore, reset and uninstall share one lock
-(`.maintenance.lock` in the install folder), so a scheduled dump never
-starts under a restore; a run that cannot get the lock within ten minutes
+disk or machine. Backup, restore, reset, uninstall and an upgrade (from
+its pull and pre-upgrade snapshot through the rebuild, and any Postgres
+major-version migration) share one lock (`.maintenance.lock` in
+the install folder), so a scheduled dump never starts under a restore or
+a migration; a run that cannot get the lock within ten minutes
 says so and exits instead of racing. The wait is `OIKONOME_MAINT_LOCK_WAIT`
 (seconds), read from the shell environment of the command — not from
 `docker/.env` — so set it inline (`OIKONOME_MAINT_LOCK_WAIT=1200
-./oikonome.sh backup`) or in the cron/systemd unit's environment. Back up the encryption master key too — a dump alone
+./oikonome.sh backup`) or in the cron/systemd unit's environment. Whatever
+takes the lock records itself in `.maintenance.lock.holder` (process,
+time, operation) and removes that file when it lets go, so a skipped
+backup names what it waited for. A holder that still has the lock open
+is reported as running, however long it takes — a Postgres migration of a
+large database can take hours. The lock is reported as **stale** only
+when the recorded process no longer holds it and took it more than
+`OIKONOME_MAINT_LOCK_STALE_HOURS` (default 6) ago: then something that
+inherited it is holding on, and the message says how to find it
+(`fuser .maintenance.lock`). Never delete `.maintenance.lock` to clear a
+skip — a backup that then starts under a running restore or migration can
+capture a half-loaded database. Back up the encryption master key too — a dump alone
 can't decrypt stored bank-connection secrets; see
 [master-key.md](master-key.md) (backup + rotation).
 
@@ -477,6 +579,44 @@ them by hand needs sudo. `OIKONOME_DATA_DIR` in
 `docker/.env` moves the database elsewhere if you want it separate — the
 uninstaller then leaves that data in place and asks (typed confirmation)
 before deleting it.
+
+What `reset` and `uninstall` keep, and what they lose:
+
+- **`./oikonome.sh reset`** deletes the database (on an external
+  database, it drops and recreates it there) and replaces the generated
+  database and queue passwords and the setup link. It keeps the code,
+  your backups and every other setting in `docker/.env` — port, HTTPS
+  domain, bind address, external-database connection, admin console,
+  SMTP, LLM, data folder, provider keys. The master key is kept too
+  (`--new-key` replaces it), and either way a copy is saved owner-only
+  beside the backups before anything is deleted; a value in `docker/.env`
+  that is not a valid key stops the reset with nothing touched. Linked
+  banks are disconnected at the provider first, so after the reset —
+  and after restoring any backup — banks are linked again; the key is
+  what lets a backup's two-factor seeds, webhook secrets and API keys
+  come back.
+- **`./oikonome.sh uninstall`** removes the folder: code, `docker/.env`,
+  the database inside it, and the backups unless you keep them (kept
+  backups take their master key with them). Linked banks are disconnected
+  at the provider first. A database that lives elsewhere is never
+  deleted by it: an `OIKONOME_DATA_DIR` outside the folder is offered for
+  deletion at the end (typed confirmation), and an external database is
+  left on its server untouched — drop it there yourself. For both, the
+  `docker/.env` that opens it (passwords and master key) is saved
+  owner-only before anything is removed, and their bank links are left
+  as they are.
+
+**Podman and reboots.** Every service is `restart: unless-stopped`.
+Docker's daemon applies that at boot, so a Docker host brings the
+instance back by itself (with `docker.service` enabled). Podman has no
+daemon, so a rebooted Podman host leaves the instance down. That holds
+too where `docker` is podman's wrapper (the podman-docker package); the
+scripts recognise it and treat the host as Podman. Run
+`./oikonome.sh start-at-boot` once: it writes a systemd unit that starts
+the stack at boot — a user unit for rootless Podman, with lingering
+turned on (`loginctl enable-linger`) so it starts without a login, or a
+system unit when run as root. `./oikonome.sh start-at-boot off` removes
+it.
 Filesystem snapshots of the folder work; `pg_dump` stays the recommended
 routine backup.
 
@@ -484,4 +624,5 @@ routine backup.
 
 Start at **/doctor** — every common failure (dead worker, bad SMTP, stale
 sync, missing master key) is a named check there. Filing a bug? Attach the
-diagnostic bundle from that page (never contains tokens or transactions).
+diagnostic bundle from that page (never contains tokens or transactions,
+hostnames, bank names or collector labels).

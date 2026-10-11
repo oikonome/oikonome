@@ -14,7 +14,6 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import math
 import re
 
 # NOT xml.etree — the SSA earnings record is a file the USER uploads, and
@@ -122,12 +121,22 @@ def parse_ssa_xml(data: bytes) -> list[dict]:
     return [rows[y] for y in sorted(rows)]
 
 
+# Label/value patterns for the transcript text. Every whitespace run is
+# HORIZONTAL ([ \t]) and every run sits between two different character
+# classes, so no two adjacent quantifiers can both claim the same spaces:
+# a `\s*` under re.M runs across newlines, so on a file of blank lines it
+# would consume the rest of the document from every line start and then
+# backtrack — quadratic work inside one C call that holds the GIL for the
+# whole server. The value may still sit on the line below its label (one
+# optional line break), since a wrapped transcript prints it there.
+_LABEL_TAIL = r"[ \t:.]*(?:\r?\n[ \t]*)?\$?([-()\d,.]+)"
 _TRANSCRIPT_FIELDS = (
-    ("total_income", r"^\s*TOTAL INCOME\s*[:.]*\s*\$?([-()\d,.]+)"),
-    ("agi", r"^\s*ADJUSTED GROSS INCOME\s*[:.]*\s*\$?([-()\d,.]+)"),
-    ("taxable_income", r"^\s*TAXABLE INCOME\s*[:.]*\s*\$?([-()\d,.]+)"),
-    ("tax_paid", r"^\s*TOTAL TAX(?: LIABILITY[A-Z ]*)?\s*[:.]*\s*\$?([-()\d,.]+)"),
-    ("wages", r"^\s*WAGES, SALARIES, TIPS, ETC\.?\s*[:.]*\s*\$?([-()\d,.]+)"),
+    ("total_income", r"^[ \t]*TOTAL INCOME" + _LABEL_TAIL),
+    ("agi", r"^[ \t]*ADJUSTED GROSS INCOME" + _LABEL_TAIL),
+    ("taxable_income", r"^[ \t]*TAXABLE INCOME" + _LABEL_TAIL),
+    ("tax_paid",
+     r"^[ \t]*TOTAL TAX(?: LIABILITY(?:[ \t]+[A-Z]+)*)?" + _LABEL_TAIL),
+    ("wages", r"^[ \t]*WAGES, SALARIES, TIPS, ETC\.?" + _LABEL_TAIL),
 )
 
 
@@ -256,13 +265,65 @@ def _year_of(out: dict, complaint: str) -> int:
         raise ValueError(complaint)
 
 
-def parse_w2(conn, data: bytes, mime: str) -> list[dict]:
+BUSY_ERROR = ("server is busy reading documents — try again in a "
+              "minute")
+
+
+def _require_vision(conn) -> None:
+    """Refuse before any decode when there is no model to read the image:
+    a decode with nowhere to send its result is memory spent for an error
+    the caller would have had for free."""
+    from . import llm_categorize as llm
+    if not llm._backend(conn, role="vision").get("url"):
+        raise ValueError("this document type needs the LLM — configure it "
+                         "under Settings → AI")
+
+
+def _w2_image(data: bytes, mime: str) -> tuple[bytes, str]:
+    """The W-2 as an image the vision model can take, decoded under the
+    receipts' decode gate and inside their measured limits.
+
+    The tax-document door shares the receipt decoder and must share its
+    bounds: a few-KB PNG can declare tens of millions of pixels, and a
+    burst of them decoded side by side on the request threads holds
+    gigabytes at once on a shared server. So an image is held to the
+    receipt byte cap and pixel ceiling — an image whose size cannot be read
+    is refused rather than sent on raw — and every decode, PDF or image,
+    waits its turn at the same gate the receipt parses queue on."""
+    import io
+
+    from PIL import Image
+
     from . import receipts
+    if mime != "application/pdf":
+        if mime not in receipts.IMAGE_MIMES:
+            raise ValueError("a W-2 image must be PNG, JPEG, WebP or GIF")
+        if len(data) > receipts.MAX_IMAGE:
+            raise ValueError("this image is too large (5 MB max) — "
+                             "upload a smaller scan or the PDF")
+        try:
+            with Image.open(io.BytesIO(data)) as im:
+                px = (im.width or 0) * (im.height or 0)
+        except Exception:                         # noqa: BLE001
+            raise ValueError("couldn't read this image — upload a PNG or "
+                             "JPEG scan of the W-2")
+        if not px or px > receipts.MAX_DECODE_PX:
+            raise ValueError("this image is too large to read — upload a "
+                             "smaller scan or the PDF")
+    if not receipts._DECODE_GATE.acquire(timeout=receipts._DECODE_WAIT_S):
+        raise ValueError(BUSY_ERROR)
+    try:
+        if mime == "application/pdf":
+            return receipts._pdf_first_page_png(data), "image/png"
+        return receipts._shrink_image(data, mime)
+    finally:
+        receipts._DECODE_GATE.release()
+
+
+def parse_w2(conn, data: bytes, mime: str) -> list[dict]:
     _require_offbox_consent(conn, "W-2")
-    if mime == "application/pdf":
-        img, mime = receipts._pdf_first_page_png(data), "image/png"
-    else:
-        img, mime = receipts._shrink_image(data, mime)
+    _require_vision(conn)
+    img, mime = _w2_image(data, mime)
     b64 = base64.b64encode(img).decode()
     out = _chat_json(conn, [{"role": "user", "content": [
         {"type": "text", "text": _W2_PROMPT},
@@ -333,6 +394,14 @@ def analyze(conn, filename: str, data: bytes, mime: str) -> dict:
             from ..sync import pdfimport
             text = pdfimport.extract_text(data)
         else:
+            # The PDF branch is capped by extract_text; a plain-text upload
+            # gets the same ceiling, since every parser below reads the
+            # whole text and nothing a tax document holds comes near it.
+            from ..sync.pdfimport import MAX_TEXT_BYTES
+            if len(data) > MAX_TEXT_BYTES:
+                raise ValueError(
+                    "this file is far larger than any tax document — upload "
+                    "the transcript, W-2 or return itself")
             text = data.decode("utf-8", errors="replace")
         upper = text.upper()
         if "TAX PERIOD" in upper and "ADJUSTED GROSS INCOME" in upper:
@@ -404,11 +473,20 @@ def _insert_income_document(conn, year: int, payer, ein, primary_amount,
     raise ValueError("couldn't allocate a document id — please retry")
 
 
+def _money(v) -> bool:
+    """A box or amount the database and every yearly sum can hold: finite
+    and within a plausible bound. Same rule as the split editor's."""
+    from .splits import _money as money
+    return money(v)
+
+
 def commit(conn, token: str, rows: list[dict]) -> dict:
     """Write the (possibly user-edited) previewed rows. Annual kinds merge
     per column into income_annual; W-2s insert income_documents and fill
     primary_wages only when the year had none."""
     from ..db import staging
+    if not isinstance(rows, list):
+        raise ValueError("rows must be a list")
     if len(rows) > MAX_ROWS:
         raise ValueError(f"too many rows (max {MAX_ROWS})")
     # Validate EVERY row before anything is written or the token is spent:
@@ -419,7 +497,8 @@ def commit(conn, token: str, rows: list[dict]) -> dict:
     for r in rows:
         try:
             year = int(r["year"])
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError, OverflowError):
+            # OverflowError: JSON's Infinity is a float int() cannot take
             raise ValueError("every row needs a year")
         if not 1900 <= year <= 2100:
             raise ValueError(f"implausible year {year}")
@@ -449,9 +528,15 @@ def _commit_rows(conn, kind, rows, years) -> dict:
             boxes = {k: v for k, v in (raw_boxes or {}).items()
                      if isinstance(v, (int, float))}
             # a NaN/inf reaches DOUBLE PRECISION unchanged and every
-            # report that sums the year 500s from then on
-            if any(not math.isfinite(v) for v in boxes.values()):
+            # report that sums the year 500s from then on; a 400-digit JSON
+            # integer is an int that math.isfinite itself overflows on
+            if not all(_money(v) for v in boxes.values()):
                 raise ValueError("every box must be a finite number")
+            for f in ("employer", "ein"):
+                # bound straight into a text column: anything but text is
+                # an adapter error at the database, not a refusal
+                if r.get(f) is not None and not isinstance(r[f], str):
+                    raise ValueError(f"`{f}` must be text")
             _insert_income_document(conn, year, r.get("employer"),
                                     r.get("ein"), boxes.get("1"),
                                     json.dumps(boxes))
@@ -468,10 +553,11 @@ def _commit_rows(conn, kind, rows, years) -> dict:
             continue
         if not isinstance(r, dict):
             raise ValueError("each row must be an object")
-        fields = {f: float(r[f]) for f in ANNUAL_FIELDS
+        picked = {f: r[f] for f in ANNUAL_FIELDS
                   if isinstance(r.get(f), (int, float))}
-        if any(not math.isfinite(v) for v in fields.values()):
+        if not all(_money(v) for v in picked.values()):
             raise ValueError("every amount must be a finite number")
+        fields = {f: float(v) for f, v in picked.items()}
         if not fields:
             continue
         existed = conn.execute(

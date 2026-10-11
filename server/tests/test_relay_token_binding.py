@@ -10,7 +10,10 @@ attributable only as far as "some instance".
 So the first push carrying a token REGISTERS it to the key that sent it
 (the relay hears of a token at no other moment — devices register with
 their own instance), and a later push for that token from a different key
-is refused with a 403 and logged. The registering key keeps pushing as
+is left out and logged — the rest of the batch still goes, because an
+instance sends one batch per household and one phone still held by
+another instance must not silence the others; a batch with nothing of the
+caller's in it is refused with a 403. The registering key keeps pushing as
 before, and an open relay — one with no keys at all, a self-hoster
 relaying only for themselves — binds nothing, because there is no sender
 identity there to bind to.
@@ -76,20 +79,32 @@ class RelayTokenBindingTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(len(sends), 1)
 
-    def test_a_refused_batch_sends_nothing_and_registers_nothing(self):
-        """All-or-nothing, like the field validation: a 403 means zero
-        notifications delivered, and the tokens the refused batch also
-        carried are not quietly re-registered to the sender that was just
-        turned away."""
+    def test_a_held_token_costs_only_itself(self):
+        """A household batch carrying one phone still held by another
+        instance delivers to every other phone, never wakes the held one,
+        and names it back so the caller can say why."""
         self._push("key-one", TOKEN)
         r, sends = self._push("key-two", OTHER, TOKEN)
-        self.assertEqual(r.status_code, 403)
-        self.assertEqual(sends, [])
-        # OTHER was never claimed by the refused batch, so its real owner
-        # can still register it
-        r, sends = self._push("key-one", OTHER)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual([a[0] for a in sends], [OTHER])
+        self.assertEqual(r.json()["refused"], [TOKEN])
+        self.assertEqual(r.json()["sent"], 1)
+        # the held token stays its owner's
+        r, sends = self._push("key-one", TOKEN)
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(len(sends), 1)
+        # and the delivered one is now the sender's own
+        r, sends = self._push("key-one", OTHER)
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertEqual(sends, [])
+
+    def test_a_batch_of_only_held_tokens_is_refused_and_claims_nothing(self):
+        self._push("key-one", TOKEN)
+        r, sends = self._push("key-two", TOKEN)
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(sends, [])
+        r, _ = self._push("key-one", TOKEN)
+        self.assertEqual(r.status_code, 200, r.text)
 
     def test_an_open_relay_binds_nothing(self):
         """No keys configured: every caller is the same anonymous sender,

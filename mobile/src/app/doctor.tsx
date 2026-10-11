@@ -113,10 +113,16 @@ export default function Doctor() {
             {new Date(query.dataUpdatedAt).toLocaleTimeString()}
             {query.isFetching ? " ⟳" : ""}
           </Text>
-          {/* the bundle is what bug reports ask for (the web's link) */}
+          {/* the bundle is what bug reports ask for (the web's link); it
+              is JSON, so it is saved under the web's name */}
           <DownloadButton path="/api/doctor/bundle"
-                          filename="oikonome-doctor-bundle.zip"
+                          filename="oikonome-system-health.json"
                           label="Download diagnostic bundle" />
+          <Text style={s.mut}>
+            Check output and versions only — no tokens and no transaction
+            contents. Hostnames, bank names and collector labels are not
+            included.
+          </Text>
         </Card>
       )}
       {sections.map((sec) => (

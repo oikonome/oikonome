@@ -15,14 +15,23 @@ const money = (v: number | null | undefined) => money$(v, true);  // cents on tr
 
 const PER_PAGE = 100;
 
+// A link can carry any y/m at all; a month the server would refuse opens on
+// the current one instead (the mobile twin is routeInt in mobile/src/lib/pure.ts).
+function linkInt(v: string | null, lo: number, hi: number, dflt: number) {
+  if (v === null || !/^\s*-?\d+\s*$/.test(v)) return dflt;
+  const n = Number(v);
+  return n >= lo && n <= hi ? n : dflt;
+}
+
 
 export default function Transactions() {
   const now = new Date();
   const [sp] = useSearchParams();         // /transactions?… deep links
   // honor the full query the /transactions→/app redirect forwards
   // (q, cat, y, m, date range) — not just acct
-  const [y, setY] = useState(Number(sp.get("y")) || now.getFullYear());
-  const [m, setM] = useState(Number(sp.get("m")) || now.getMonth() + 1);
+  const [y, setY] = useState(
+    linkInt(sp.get("y"), 1900, 2100, now.getFullYear()));
+  const [m, setM] = useState(linkInt(sp.get("m"), 1, 12, now.getMonth() + 1));
   const [q, setQ] = useState(sp.get("q") ?? "");     // text box
   const [live, setLive] = useState(sp.get("q") ?? "");  // submitted search
   const [acct, setAcct] = useState(sp.get("acct") ?? "");
@@ -104,8 +113,8 @@ export default function Transactions() {
   const spKey = sp.toString();
   useEffect(() => {
     const n = new Date();
-    setY(Number(sp.get("y")) || n.getFullYear());
-    setM(Number(sp.get("m")) || n.getMonth() + 1);
+    setY(linkInt(sp.get("y"), 1900, 2100, n.getFullYear()));
+    setM(linkInt(sp.get("m"), 1, 12, n.getMonth() + 1));
     setQ(sp.get("q") ?? ""); setLive(sp.get("q") ?? "");
     setAcct(sp.get("acct") ?? ""); setCat(sp.get("cat") ?? "");
     setBucket(sp.get("bucket") ?? ""); setAsOf(sp.get("as_of") ?? "");
@@ -329,17 +338,26 @@ export default function Transactions() {
               {query.data?.out_sum !== undefined && (
                 <span style={{ fontSize: "1.35rem", fontWeight: 700,
                                letterSpacing: "-.01em" }}>
-                  <span className="pos">{money(query.data.in_sum ?? 0)}</span>
+                  {/* in and net are null for a month before the bank feed
+                      starts — its income is unknown, so it reads "—", and
+                      there is no net to show rather than a false loss */}
+                  {query.data.in_sum == null
+                    ? <span className="sub">—</span>
+                    : <span className="pos">{money(query.data.in_sum)}</span>}
                   <span className="sub" style={{ fontWeight: 400 }}> in</span>
                   {" · "}
                   {money(query.data.out_sum)}
                   <span className="sub" style={{ fontWeight: 400 }}> out</span>
-                  {" · "}
-                  <span className={(query.data.net_sum ?? 0) < 0 ? "neg" : "pos"}>
-                    {(query.data.net_sum ?? 0) < 0 ? "" : "+"}
-                    {money(query.data.net_sum ?? 0)}
-                  </span>
-                  <span className="sub" style={{ fontWeight: 400 }}> net</span>
+                  {query.data.net_sum != null && (
+                    <>
+                      {" · "}
+                      <span className={query.data.net_sum < 0 ? "neg" : "pos"}>
+                        {query.data.net_sum < 0 ? "" : "+"}
+                        {money(query.data.net_sum)}
+                      </span>
+                      <span className="sub" style={{ fontWeight: 400 }}> net</span>
+                    </>
+                  )}
                   {query.data.per_day != null && (
                     <>
                       {" · "}

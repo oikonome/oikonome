@@ -3,20 +3,27 @@
 // proposals, lifetime totals, monthly table, and the transactions over the
 // site-wide timeframe picker (All by default) with matcher ✓.
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
-import { Link, useSearchParams } from "react-router";
-import { api, errText, mmdd, money as money$, type BillsHistoryData, catLabel } from "../api/client";
-import { patchQuery, removeFromList } from "../api/cache";
+import { useEffect, useState } from "react";
+import { Link, useNavigate, useSearchParams } from "react-router";
+import { api, errText, mmdd, money as money$, type BillsData, type BillsHistoryData,
+         catLabel, proposalSuperseded, toast } from "../api/client";
+import { invalidateRollups, patchQueries, patchQuery,
+         removeFromList } from "../api/cache";
 import { RANGES, RangePicker, type Range } from "../components/RangePicker";
 import MerchantAvatar from "../components/MerchantAvatar";
 import TxnTable from "../components/TxnTable";
 import { SIMPLE_CADENCES } from "./Bills";
 import { canEdit } from "../role";
+import { cadenceChoices, cadenceWords } from "../cadence";
 const money = (v: number | null | undefined) => money$(v, true);  // cents on transaction/recurring surfaces
 
 
-const hpill = (h: string) =>
+const hpill = (h: string, withdrawnOn?: string | null) =>
   h === "ok" ? <span className="pill g">matching</span>
+  // named and toned as the Bills page names it: the missed cycle WAS
+  // charged, and the bank feed took the charge back — a warning
+  : h === "withdrawn" ? <span className="pill a"
+        title={`charge withdrawn by the bank feed${withdrawnOn ? ` (${mmdd(withdrawnOn)})` : ""}`}>withdrawn</span>
   : h === "drifting" ? <span className="pill a">drifting</span>
   : h === "stale" ? <span className="pill r">stale</span>
   : h === "mismatch" ? <span className="pill a">amounts differ</span>
@@ -41,6 +48,8 @@ export default function RecurringHistory() {
   // writes — viewers keep the whole history read view
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const mayEdit = canEdit(me);
+  // the demo instance refuses the rename door, so the merge is not offered
+  const demo = !!me.data?.demo;
   const refetch = () => {
     qc.invalidateQueries({ queryKey: ["bills-history", payee] });
     qc.invalidateQueries({ queryKey: ["bills"] });
@@ -53,6 +62,7 @@ export default function RecurringHistory() {
     qc.invalidateQueries({ queryKey: ["merchant-detail"] });
     qc.invalidateQueries({ queryKey: ["txns"] });
     qc.invalidateQueries({ queryKey: ["today"] });
+    invalidateRollups(qc);
   };
   const hint = useMutation({
     mutationFn: (action: "dismiss" | "restore") => api.billsHint(payee, action),
@@ -68,22 +78,35 @@ export default function RecurringHistory() {
   const proposal = useMutation({
     mutationFn: ({ pid, action }: { pid: string; action: "approve" | "reject" }) =>
       api.billsProposal(pid, action),
-    onSuccess: (_r, v) => {
+    onSuccess: (r, v) => {
+      const gone = proposalSuperseded(r);
+      if (gone) toast(`${r.payee} is already tracked — the offer was withdrawn`);
       // the decided proposal leaves the list now — the server has already
       // committed it, and waiting on the history payload to re-prove that
       // left the row sitting there
       removeFromList<BillsHistoryData, BillsHistoryData["proposals"][number]>(
         qc, histKey, "proposals", (p) => p.id === v.pid);
       qc.invalidateQueries({ queryKey: ["bills"] });
-      // rejecting writes no bill; approving changes one, which moves this
-      // page's header, the verdict and the calendar
-      if (v.action === "approve") {
+      // rejecting (or a withdrawn offer) writes no bill; approving changes
+      // one, which moves this page's header, the verdict and the calendar
+      if (v.action === "approve" && !gone) {
         qc.invalidateQueries({ queryKey: ["bills-history", payee] });
         qc.invalidateQueries({ queryKey: ["today"] });
         qc.invalidateQueries({ queryKey: ["calendar"] });
       }
       // the budgets prefill reads pending income proposals either way
       qc.invalidateQueries({ queryKey: ["budgets-suggest"] });
+    },
+    onError: (e, v) => {
+      toast(errText(e));
+      // an offer for a bill already tracked is withdrawn by the server as
+      // it refuses: the card could neither be approved nor dismissed
+      if (proposalSuperseded(e)) {
+        removeFromList<BillsHistoryData, BillsHistoryData["proposals"][number]>(
+          qc, histKey, "proposals", (p) => p.id === v.pid);
+        qc.invalidateQueries({ queryKey: ["bills"] });
+        qc.invalidateQueries({ queryKey: histKey });
+      }
     },
   });
   // only the proposal being decided is busy, not every row's buttons
@@ -96,7 +119,8 @@ export default function RecurringHistory() {
   const d: BillsHistoryData = q.data;
   const bill = d.bill;
   const fit = d.fit;
-  const cadLabel = (v: string) => d.cadences.find(([cv]) => cv === v)?.[1] ?? v;
+  const cadLabel = (v: string) =>
+    d.cadences.find(([cv]) => cv === v)?.[1] ?? cadenceWords(v);
   const showDismiss = d.health &&
     (["mismatch", "stale", "misdated"].includes(d.health.health) || d.health.fit_diverges);
 
@@ -106,7 +130,7 @@ export default function RecurringHistory() {
       <div className="card" style={{ marginTop: 0 }}>
         <h2><MerchantAvatar name={d.payee} logo={d.logo} size={26}
                             style={{ marginRight: 8 }} />{d.payee}{" "}
-          {d.health && <>{hpill(d.health.health)}{" "}</>}
+          {d.health && <>{hpill(d.health.health, d.health.withdrawn_on)}{" "}</>}
           {bill && <><span className="pill m">{bill.bill_type}</span>{" "}
             {bill.income && <span className="pill m">income</span>}</>}
         </h2>
@@ -154,7 +178,15 @@ export default function RecurringHistory() {
             )}
           </div>
         )}
-        {!bill && !d.covered_by && mayEdit && <AddAsBill d={d} onDone={refetch} />}
+        {/* an archived bill under this payee is restored, not added
+            again — a save here would edit that archived row */}
+        {!bill && !d.covered_by && mayEdit && (d.bill_archived
+          ? <RestoreArchived payee={d.payee} onDone={refetch} />
+          : <AddAsBill d={d} onDone={refetch} />)}
+        {/* keyed by payee: landing on the target's page must not carry the
+            source's half-typed search or open confirm along with it */}
+        {mayEdit && !demo && <MergeInto key={d.payee} payee={d.payee}
+                                        inUse={d.merchant_in_use} />}
       </div>
 
       {mayEdit && <MerchantCategory payee={d.payee} onDone={refetchAfterRecat} />}
@@ -250,6 +282,142 @@ export default function RecurringHistory() {
   );
 }
 
+// The automatic resolver sometimes gives a renamed feed string its own
+// merchant ("Northwind" arriving later as "Northwind Supply"). This is the
+// Merchants page's merge, offered where the duplicate is noticed: the same
+// journalled rename, so it shows under Recent changes there and undoes the
+// same way. The picker searches the catalog, so the target always exists —
+// a typo cannot fork a third merchant.
+function MergeInto({ payee, inUse }: { payee: string; inUse?: boolean }) {
+  const qc = useQueryClient();
+  const nav = useNavigate();
+  const [open, setOpen] = useState(false);
+  const [pick, setPick] = useState("");
+  const [pickQ, setPickQ] = useState("");
+  const [target, setTarget] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  useEffect(() => {
+    const t = window.setTimeout(() => setPickQ(pick.trim()), 250);
+    return () => window.clearTimeout(t);
+  }, [pick]);
+  const cands = useQuery({ queryKey: ["merchants", pickQ, "count"],
+                           queryFn: () => api.merchantCatalog(pickQ, "count"),
+                           enabled: open && pickQ.length > 0,
+                           placeholderData: (prev) => prev });
+  const options = (cands.data?.merchants ?? [])
+    .filter((m) => m.display !== payee).slice(0, 8);
+  // The merge renames what ledger rows display. A bill can carry a name of
+  // its own that no row shows, and the rename door has nothing to move for
+  // it, so the control only appears for a name the ledger displays. A
+  // server that does not say so is asked through the catalog instead.
+  const known = useQuery({ queryKey: ["merchants", payee, "count"],
+                           queryFn: () => api.merchantCatalog(payee, "count"),
+                           enabled: inUse === undefined && !!payee });
+  const isMerchant = inUse ?? !!known.data?.merchants.some((m) => m.display === payee);
+  const close = () => { setOpen(false); setPick(""); setTarget(null); setErr(null); };
+  const merge = useMutation({
+    mutationFn: (to: string) => api.merchantRename({ display: payee, to }),
+    onMutate: () => setErr(null),
+    onSuccess: (_r, to) => {
+      // the source name is gone from every merchant list the moment the
+      // server answers — both the catalog shape and the bill picker's flat
+      // list live under ["merchants"]
+      patchQueries<{ merchants: (string | { display: string })[] }>(
+        qc, ["merchants"], (old) => Array.isArray(old.merchants)
+          ? { ...old, merchants: old.merchants.filter((m) =>
+              (typeof m === "string" ? m : m.display) !== payee) }
+          : old);
+      // what the merge moved: the target's counts and detail, every ledger
+      // row that printed the old name, the bill that followed it
+      qc.invalidateQueries({ queryKey: ["merchants"] });
+      qc.invalidateQueries({ queryKey: ["merchant-detail"] });
+      qc.invalidateQueries({ queryKey: ["txns"] });
+      qc.invalidateQueries({ queryKey: ["bills"] });
+      qc.invalidateQueries({ queryKey: ["bills-history", to] });
+      qc.invalidateQueries({ queryKey: ["today"] });
+      nav(`/bills/history?payee=${encodeURIComponent(to)}`, { replace: true });
+      // the source's history names a merchant that no longer exists; dropped
+      // after the page has moved off it, so nothing refetches it
+      qc.removeQueries({ queryKey: ["bills-history", payee] });
+    },
+    onError: (e) => setErr(errText(e)),
+  });
+  if (!isMerchant && !open) return null;
+  if (!open) return (
+    <div style={{ marginTop: ".7rem" }}>
+      <button onClick={() => setOpen(true)}>Merge into…</button>
+    </div>
+  );
+  return (
+    <div style={{ marginTop: ".7rem", fontSize: 13 }}>
+      {target ? (
+        <div className="note" style={{ display: "block" }}>
+          <div>Rows named <b>{payee}</b> will be filed under <b>{target}</b>;
+            the bill, if any, follows.</div>
+          <div style={{ marginTop: ".5rem", display: "flex", gap: ".5rem" }}>
+            <button className="pri" disabled={merge.isPending}
+                    onClick={() => merge.mutate(target)}>
+              {merge.isPending ? "merging…" : "Yes, merge"}</button>
+            <button disabled={merge.isPending}
+                    onClick={() => setTarget(null)}>Back</button>
+          </div>
+        </div>
+      ) : (
+        <>
+          <div style={{ display: "flex", gap: ".4rem", alignItems: "center", flexWrap: "wrap" }}>
+            <input autoFocus value={pick} placeholder="merge into which merchant?"
+                   aria-label="merge into" onChange={(e) => setPick(e.target.value)}
+                   onKeyDown={(e) => { if (e.key === "Escape") close(); }}
+                   style={{ width: "min(18rem, 100%)" }} />
+            <button onClick={close}>Cancel</button>
+          </div>
+          <div style={{ display: "flex", gap: ".35rem", flexWrap: "wrap", marginTop: ".4rem" }}>
+            {options.map((o) => (
+              <button key={o.display} type="button" className="chip"
+                      onClick={() => setTarget(o.display)}>
+                <MerchantAvatar name={o.display} logo={o.logo} size={14} />{" "}
+                {o.display}
+                <span className="mut" style={{ fontSize: 11 }}> · {o.rows}</span>
+              </button>
+            ))}
+            {pickQ && !cands.isPending && options.length === 0 && (
+              <span className="sub">No merchant matches that.</span>
+            )}
+          </div>
+        </>
+      )}
+      {err && <div className="bad" style={{ marginTop: ".4rem" }}>{err}</div>}
+    </div>
+  );
+}
+
+function RestoreArchived({ payee, onDone }: { payee: string; onDone: () => void }) {
+  const qc = useQueryClient();
+  const [err, setErr] = useState<string | null>(null);
+  const restore = useMutation({
+    mutationFn: () => api.billsRestore(payee),
+    onMutate: () => setErr(null),
+    onSuccess: () => {
+      removeFromList<BillsData, BillsData["archived"][number]>(
+        qc, ["bills"], "archived", (b) => b.payee === payee);
+      qc.invalidateQueries({ queryKey: ["today"] });
+      qc.invalidateQueries({ queryKey: ["calendar"] });
+      onDone();
+    },
+    onError: (e) => setErr(errText(e)),
+  });
+  return (
+    <div style={{ marginTop: ".7rem", display: "flex", gap: ".5rem",
+                  alignItems: "center", flexWrap: "wrap", fontSize: 13 }}>
+      <span className="mut">This bill is archived.</span>
+      <button className="pri" disabled={restore.isPending}
+              onClick={() => restore.mutate()}>
+        {restore.isPending ? "restoring…" : "Restore"}</button>
+      {err && <span className="bad">{err}</span>}
+    </div>
+  );
+}
+
 function AddAsBill({ d, onDone }: { d: BillsHistoryData; onDone: () => void }) {
   const [amount, setAmount] = useState(d.fit ? d.fit.amount.toFixed(2) : "");
   const [cadence, setCadence] = useState(d.fit?.cadence ?? "MONTHLY:1");
@@ -280,6 +448,9 @@ function AddAsBill({ d, onDone }: { d: BillsHistoryData; onDone: () => void }) {
     mutationFn: () => api.billsSave({
       payee: d.payee, merchant: d.payee, amount,
       cadence: effCadence, next_due: nextDue,
+      // a mostly-inflow merchant (a paycheck) is recurring income; saved
+      // as a bill it would wait on a charge that never comes
+      income: !!d.inflow,
     }),
     onSuccess: onDone,
     onError: (e) => setErr(errText(e)),
@@ -288,19 +459,19 @@ function AddAsBill({ d, onDone }: { d: BillsHistoryData; onDone: () => void }) {
     <form style={{ marginTop: ".7rem", display: "flex", gap: ".5rem",
                    alignItems: "center", flexWrap: "wrap", fontSize: 13 }}
           onSubmit={(e) => { e.preventDefault(); add.mutate(); }}>
-      <strong>Add as recurring bill:</strong>
+      <strong>{d.inflow ? "Add as recurring income:"
+                        : "Add as recurring bill:"}</strong>
       $<input type="number" step="0.01" required style={{ width: "7rem" }}
               value={amount} onChange={(e) => setAmount(e.target.value)} />
       <select value={cadence} onChange={(e) => setCadence(e.target.value)}>
-        {SIMPLE_CADENCES.map(([v, label]) => (
-          <option key={v} value={v}>{label}</option>
-        ))}
         {/* a ledger suggestion may be an unusual cadence not in the short
-            list — keep it selectable/visible rather than silently mis-showing */}
-        {cadence !== "CUSTOM" && !SIMPLE_CADENCES.some(([v]) => v === cadence) && (
-          <option value={cadence}>
-            {d.cadences.find(([v]) => v === cadence)?.[1] ?? cadence}</option>
-        )}
+            list — keep it selectable/visible rather than silently
+            mis-showing, and still there after another option is tried */}
+        {cadenceChoices(SIMPLE_CADENCES,
+                        [d.fit?.cadence, cadence === "CUSTOM" ? null : cadence])
+          .map(([v, label]) => (
+            <option key={v} value={v}>{label}</option>
+          ))}
         <option value="CUSTOM">Custom interval…</option>
       </select>
       {cadence === "CUSTOM" && (

@@ -129,7 +129,10 @@ def import_mint(conn, account_id: str, text: str,
     reader = csv.DictReader(io.StringIO(text))
     parsed: list[tuple] = []
     # day-first or month-first is decided per FILE (csvimport.date_order)
-    rows = list(capped(reader, what="transactions"))
+    # overflow cells past the header arrive under the key None (a trailing
+    # comma, an unquoted comma in a memo) — dropped, not fatal to the file
+    rows = [{k: v for k, v in row.items() if k is not None}
+            for row in capped(reader, what="transactions")]
     lows = [{k.strip().lower(): (v or "") for k, v in row.items()}
             for row in rows]
     order = date_order(low.get("date", "") for low in lows)

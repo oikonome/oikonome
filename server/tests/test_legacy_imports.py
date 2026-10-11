@@ -169,6 +169,102 @@ class YnabImportTests(unittest.TestCase):
         self.assertEqual(rows[("Transfer : Savings", -250.0)], "TRANSFER_IN")
         self.assertIsNone(rows[("Safeway", 42.5)])
 
+    def test_signed_value_in_a_direction_column_keeps_the_column_direction(self):
+        """Outflow/Inflow name the direction; a converter that writes an
+        inflow as a negative number must not turn it into money out."""
+        from oikonome.sync import ynabimport
+        ynab = ('"Date","Payee","Memo","Outflow","Inflow"\n'
+                '"2026-07-10","Bike Shop","","$0.00","-$85.00"\n'
+                '"2026-07-11","Bakery","","-$12.40","$0.00"\n')
+        ynabimport.import_ynab(self.conn, "chk", ynab)
+        rows = {r["name"]: r["amount"] for r in self.conn.execute(
+            "SELECT name, amount FROM transactions WHERE id LIKE 'ynab:%'")}
+        self.assertEqual(rows["Bike Shop"], -85.0)
+        self.assertEqual(rows["Bakery"], 12.4)
+
+    # A register a converter wrote with signs inside the direction columns,
+    # as the earlier rule read it (out - in, the printed sign kept) and as
+    # the current rule reads it (the column names the direction).
+    SIGNED = ('"Date","Payee","Memo","Outflow","Inflow"\n'
+              '"2026-07-10","Bike Shop","","$0.00","-$85.00"\n'
+              '"2026-07-11","Bakery","","-$12.40","$0.00"\n')
+    SIGNED_LINES = ((dt.date(2026, 7, 10), "Bike Shop", 85.0, -85.0),
+                    (dt.date(2026, 7, 11), "Bakery", -12.4, 12.4))
+
+    def _signed_ids(self):
+        from oikonome.sync.base import FileImportIds
+        new, old = FileImportIds("ynab", "chk"), FileImportIds("ynab", "chk")
+        return ([new.id_for(d, a, n) for d, n, _, a in self.SIGNED_LINES],
+                [old.id_for(d, a, n) for d, n, a, _ in self.SIGNED_LINES])
+
+    def _store_the_printed_sign_reading(self, *, keep_new_too=False):
+        """Rows as the earlier rule stored them: each line under the id and
+        amount its printed sign gave, with a note a person added."""
+        from oikonome.sync import ynabimport
+        ynabimport.import_ynab(self.conn, "chk", self.SIGNED)
+        new, old = self._signed_ids()
+        for i, (_, _, amount, _) in enumerate(self.SIGNED_LINES):
+            if keep_new_too:
+                self.conn.execute(
+                    "INSERT INTO transactions (id, account_id, date, amount,"
+                    " name, merchant_name, removed, raw)"
+                    " SELECT %s, account_id, date, %s, name, merchant_name,"
+                    "        0, raw FROM transactions WHERE id = %s",
+                    (old[i], amount, new[i]))
+            else:
+                self.conn.execute(
+                    "UPDATE transactions SET id=%s, amount=%s WHERE id=%s",
+                    (old[i], amount, new[i]))
+            self.conn.execute(
+                "INSERT INTO transaction_notes (txn_id, note) VALUES (%s,%s)",
+                (old[i], f"note {i}"))
+        return new, old
+
+    def _live_signed(self):
+        return sorted((r["name"], float(r["amount"])) for r in
+                      self.conn.execute(
+                          "SELECT name, amount FROM transactions"
+                          " WHERE account_id='chk' AND removed=0"
+                          "   AND id LIKE 'ynab:%'"))
+
+    def test_ynab_reimport_corrects_a_row_stored_under_the_printed_sign(self):
+        """Importing the register again moves each row the earlier reading
+        stored onto the id the current reading gives it, with its note —
+        never adds the corrected row beside the old one, which counts the
+        money once each way."""
+        from oikonome.sync import ynabimport
+        new, old = self._store_the_printed_sign_reading()
+        r = ynabimport.import_ynab(self.conn, "chk", self.SIGNED)
+        self.assertEqual(self._live_signed(),
+                         [("Bakery", 12.4), ("Bike Shop", -85.0)])
+        self.assertEqual(r["corrected"], 2)
+        have = {x["id"] for x in self.conn.execute(
+            "SELECT id FROM transactions WHERE id LIKE 'ynab:%'")}
+        self.assertEqual(have, set(new))
+        notes = {x["txn_id"]: x["note"] for x in self.conn.execute(
+            "SELECT txn_id, note FROM transaction_notes")}
+        self.assertEqual(notes, {new[0]: "note 0", new[1]: "note 1"})
+
+    def test_ynab_reimport_retires_the_opposite_signed_twin(self):
+        """A household that already re-imported once holds both readings of
+        a line; the next import retires the old one onto the corrected one
+        and carries its note across."""
+        from oikonome.sync import ynabimport
+        new, old = self._store_the_printed_sign_reading(keep_new_too=True)
+        ynabimport.import_ynab(self.conn, "chk", self.SIGNED)
+        self.assertEqual(self._live_signed(),
+                         [("Bakery", 12.4), ("Bike Shop", -85.0)])
+        for i in (0, 1):
+            gone = self.conn.execute(
+                "SELECT removed, retired_at FROM transactions WHERE id=%s",
+                (old[i],)).fetchone()
+            self.assertEqual(gone["removed"], 1)
+            self.assertIsNotNone(gone["retired_at"])
+        notes = {x["txn_id"]: x["note"] for x in self.conn.execute(
+            "SELECT txn_id, note FROM transaction_notes")}
+        self.assertEqual(notes.get(new[0]), "note 0")
+        self.assertEqual(notes.get(new[1]), "note 1")
+
 
 class RawIdentifierScrubTests(unittest.TestCase):
     """transactions.raw leaves the instance verbatim (/export + the

@@ -3,10 +3,10 @@
 // property table, which is editable here by the owner (Settings does not
 // own manual_assets).
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Link } from "react-router";
 import { saveSettings } from "../api/cache";
-import { parseMoneyDraft } from "../moneymath";
+import { nameKeys, parseMoneyDraft, rebaseNamedSave } from "../moneymath";
 import { api, errText,  money, type FeesReport, type ManualAsset, type NetWorthReport,
          type PLRow, catLabel } from "../api/client";
 import AreaChart from "../components/AreaChart";
@@ -323,16 +323,38 @@ function ManualAssetsEditor() {
   const s = useQuery({ queryKey: ["settings"], queryFn: api.settings,
                        enabled: canEdit(me) });
   // `draft` is the value TEXT while it is typed; it is parsed only at
-  // save, so "-", "-0." and "1200." can be typed on the way to a number
-  const [rows, setRows] = useState<(ManualAsset & { draft?: string })[]
-                                   | null>(null);
+  // save, so "-", "-0." and "1200." can be typed on the way to a number.
+  // `orig` is the row's key in `opened`, the list as it was when Edit was
+  // pressed (absent: added here). `sent` is the row's place in the list
+  // the last Save wrote, and `lastSent` that list: when its reply is lost
+  // the next Save checks whether it landed, so nothing goes in twice.
+  type Row = ManualAsset & { draft?: string; orig?: string; sent?: number };
+  type Edited = ManualAsset & { orig?: string; sent?: number };
+  const [rows, setRows] = useState<Row[] | null>(null);
+  const [opened, setOpened] = useState<ManualAsset[]>([]);
+  const lastSent = useRef<ManualAsset[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const save = useMutation({
-    // the save returns the full settings view, so the editor reopens on
+    // The server replaces the whole list, and this one is a copy from
+    // when Edit was pressed: the nightly valuation or another device may
+    // have saved since. Read the stored list now and lay only this
+    // editor's changes over it.
+    // The save returns the full settings view, so the editor reopens on
     // the saved rows at once; the report is recomputed server-side from
-    // them, so it is the one thing left to refetch
-    mutationFn: (assets: ManualAsset[]) =>
-      saveSettings(qc, { manual_assets: assets }),
+    // them, so it is the one thing left to refetch.
+    mutationFn: async ({ edited, at }: { edited: Edited[]; at: number[] }) => {
+      const live = (await api.settings()).manual_assets ?? [];
+      const r = rebaseNamedSave(edited, opened, live, lastSent.current);
+      lastSent.current = r.list;
+      setOpened(r.baseline);
+      setRows((cur) => cur && cur.flatMap((row, j) => {
+        const n = at.indexOf(j);
+        if (n < 0) return [row];
+        const k = r.rows[n];
+        return k ? [{ ...row, ...k }] : [];
+      }));
+      return saveSettings(qc, { manual_assets: r.list });
+    },
     onSuccess: () => {
       setErr(null); setRows(null);
       qc.invalidateQueries({ queryKey: ["report", "networth"] });
@@ -343,19 +365,26 @@ function ManualAssetsEditor() {
   const saved = s.data.manual_assets ?? [];
   if (rows === null) {
     return (
-      <button style={{ marginTop: ".6rem" }} onClick={() =>
-        setRows(saved.map((a) => ({ ...a })))}>
+      <button style={{ marginTop: ".6rem" }} onClick={() => {
+        const keys = nameKeys(saved);
+        setOpened(saved);
+        lastSent.current = null;
+        setRows(saved.map((a, i) => ({ ...a, orig: keys[i] })));
+      }}>
         {saved.length ? "Edit assets" : "Add property, vehicle or mortgage"}
       </button>
     );
   }
-  const upd = (i: number, patch: Partial<ManualAsset & { draft: string }>) =>
+  const upd = (i: number, patch: Partial<Row>) =>
     setRows(rows.map((r, j) => (j === i ? { ...r, ...patch } : r)));
   // settle every typed value; one that is not a number stops the save
   // and says which row, rather than going out as NaN (sent as null → $0)
   const submit = () => {
-    const out: ManualAsset[] = [];
-    for (const { draft, ...r } of rows.filter((x) => x.name.trim())) {
+    const out: Edited[] = [];
+    const at: number[] = [];
+    for (const [j, { draft, ...r }] of rows.entries()) {
+      if (!r.name.trim()) continue;
+      at.push(j);
       if (draft === undefined) { out.push(r); continue; }
       const v = draft.trim() === "" ? 0 : parseMoneyDraft(draft);
       if (v === null) {
@@ -364,7 +393,7 @@ function ManualAssetsEditor() {
       }
       out.push({ ...r, value: v });
     }
-    save.mutate(out);
+    save.mutate({ edited: out, at });
   };
   return (
     <div style={{ marginTop: ".8rem" }}>

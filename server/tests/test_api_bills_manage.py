@@ -9,11 +9,13 @@ the bills table.
 import datetime as dt
 import unittest
 import uuid
+from unittest import mock
 
 from fastapi.testclient import TestClient
 
 from oikonome.db import tenancy
 from oikonome.engine import budget
+from oikonome.sync import base
 
 from .util import _ensure_db, add_txn, seed_accounts, write_config
 
@@ -101,6 +103,76 @@ class RecurringManageApiTests(unittest.TestCase):
         b = self.client.get("/api/bills/bill?payee=Acme Payroll").json()
         self.assertTrue(b["income"])
         self.assertEqual(b["cadence"], "WEEKLY:2")
+
+    def test_a_new_bill_from_an_income_merchant_defaults_to_income(self):
+        """A save that leaves `income` out takes the direction from the
+        payee's own history: a merchant whose ledger is mostly deposits is
+        an income series. Saved as an expense it would match no row, read
+        unpaid every cycle and deduct a paycheck-sized phantom charge."""
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            for d in (dt.date(2026, 5, 1), dt.date(2026, 6, 1),
+                      dt.date(2026, 7, 1)):
+                add_txn(conn, d, -1800.0, "Harbor Works Payroll",
+                        account="chk", primary="INCOME")
+        finally:
+            conn.close()
+        r = self.client.post("/api/bills/save", json={
+            "payee": "Harbor Works Payroll", "amount": 1800,
+            "cadence": "MONTHLY:1", "merchant": "Harbor Works Payroll"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertGreater(self._row("Harbor Works Payroll")["amount"], 0)
+        # an explicit flag still wins over the history
+        r = self.client.post("/api/bills/save", json={
+            "payee": "Harbor Works Payroll", "amount": 1800,
+            "cadence": "MONTHLY:1", "income": False})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertLess(self._row("Harbor Works Payroll")["amount"], 0)
+
+    def test_a_new_bill_from_a_spend_merchant_stays_an_expense(self):
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            add_txn(conn, dt.date(2026, 6, 3), 42.0, "Lantern Gym")
+        finally:
+            conn.close()
+        self.client.post("/api/bills/save", json={
+            "payee": "Lantern Gym", "amount": 42, "cadence": "MONTHLY:1"})
+        self.assertLess(self._row("Lantern Gym")["amount"], 0)
+
+    def test_an_edit_without_the_flag_keeps_the_bills_direction(self):
+        """An edit that leaves `income` out keeps the bill's own direction,
+        as it keeps its cadence and category — an archived income bill
+        saved from its history page stays income too."""
+        self.client.post("/api/bills/save", json={
+            "payee": "Quay Rental Income", "amount": 900,
+            "cadence": "MONTHLY:1", "income": True})
+        r = self.client.post("/api/bills/save", json={
+            "payee": "Quay Rental Income", "amount": 950,
+            "cadence": "MONTHLY:1"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self._row("Quay Rental Income")["amount"], 950)
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            conn.execute("UPDATE bills SET active=0 "
+                         "WHERE payee='Quay Rental Income'")
+        finally:
+            conn.close()
+        h = self.client.get("/api/bills/history",
+                            params={"payee": "Quay Rental Income"}).json()
+        self.assertIsNone(h["bill"])
+        self.assertTrue(h["bill_archived"])
+        # an add over the archived name is refused until it asks to
+        # restore; the restored bill keeps its direction
+        r = self.client.post("/api/bills/save", json={
+            "payee": "Quay Rental Income", "amount": 975,
+            "cadence": "MONTHLY:1"})
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertIs(r.json()["archived"], True)
+        r = self.client.post("/api/bills/save", json={
+            "payee": "Quay Rental Income", "amount": 975,
+            "cadence": "MONTHLY:1", "restore": True})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self._row("Quay Rental Income")["amount"], 975)
 
     def test_save_envelope_and_one_time(self):
         self.client.post("/api/bills/save", json={
@@ -447,6 +519,85 @@ class RecurringManageApiTests(unittest.TestCase):
         self.assertTrue(row["disabled"])
         self.assertEqual(data["totals"]["attention"], base_attn - 1)
 
+    def test_a_withdrawn_cycle_is_a_dated_warning_not_attention(self):
+        """The missed cycle's charge was withdrawn by the bank feed: the row
+        reads health "withdrawn" with the charge's date, carries no
+        suggestion, and is not counted as needing attention."""
+        today = dt.date.today()
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            for days in (100, 70, 40):
+                add_txn(conn, today - dt.timedelta(days=days), 61.0,
+                        "LAKESIDE WATER", account="chk",
+                        merchant="Lakeside Water")
+            gone = add_txn(conn, today - dt.timedelta(days=10), 61.0,
+                           "LAKESIDE WATER", account="chk",
+                           merchant="Lakeside Water")
+            base.mark_removed(conn, [gone])
+        finally:
+            conn.close()
+        self.client.post("/api/bills/save", json={
+            "payee": "Lakeside Water", "amount": 61, "cadence": "MONTHLY:1",
+            "next_due": (today + dt.timedelta(days=20)).isoformat()})
+        data = self.client.get("/api/bills").json()
+        row = {b["payee"]: b for b in data["bills"]}["Lakeside Water"]
+        self.assertEqual(row["health"], "withdrawn")
+        # the verdict's date rides apart from this month's own reading
+        self.assertEqual(row["health_withdrawn_on"],
+                         (today - dt.timedelta(days=10)).isoformat())
+        self.assertIsNone(row["suggestion"])
+        attn = data["totals"]["attention"]
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            conn.execute("DELETE FROM transactions WHERE id=%s", (gone,))
+        finally:
+            conn.close()
+        data = self.client.get("/api/bills").json()
+        row = {b["payee"]: b for b in data["bills"]}["Lakeside Water"]
+        self.assertEqual(row["health"], "stale")
+        self.assertEqual(data["totals"]["attention"], attn + 1)
+
+    def _withdrawn_last_cycle(self, payee: str, next_due: dt.date,
+                              today: dt.date) -> dict:
+        """A monthly bill paid live through May 20th whose June 20th charge
+        the bank feed withdrew, read from /api/bills on `today`."""
+        word = payee.upper()
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            for d in (dt.date(2026, 3, 20), dt.date(2026, 4, 20),
+                      dt.date(2026, 5, 20)):
+                add_txn(conn, d, 77.0, word, account="chk", merchant=payee)
+            base.mark_removed(conn, [add_txn(
+                conn, dt.date(2026, 6, 20), 77.0, word, account="chk",
+                merchant=payee)])
+        finally:
+            conn.close()
+        self.client.post("/api/bills/save", json={
+            "payee": payee, "amount": 77, "cadence": "MONTHLY:1",
+            "next_due": next_due.isoformat()})
+        now = dt.datetime.combine(today, dt.time(12))
+        with mock.patch("oikonome.localtime.now_local", return_value=now):
+            data = self.client.get("/api/bills").json()
+        return {b["payee"]: b for b in data["bills"]}[payee]
+
+    def test_a_later_cycle_never_charged_is_not_last_cycles_withdrawal(self):
+        """July's charge never posted: on July 22nd the row is overdue for
+        July, not "withdrawn" on June's date — that date belongs to the
+        health pill alone, as Today's overdue line says."""
+        row = self._withdrawn_last_cycle(
+            "Brookfield Gas", dt.date(2026, 7, 20), dt.date(2026, 7, 22))
+        self.assertEqual(row["health"], "withdrawn")
+        self.assertEqual(row["health_withdrawn_on"], "2026-06-20")
+        self.assertEqual(row["next_unpaid"], "2026-07-20")
+        self.assertIsNone(row["withdrawn_on"])
+
+    def test_a_cycle_not_yet_due_carries_no_withdrawn_status(self):
+        row = self._withdrawn_last_cycle(
+            "Kestrel Internet", dt.date(2026, 7, 20), dt.date(2026, 7, 16))
+        self.assertEqual(row["health"], "withdrawn")
+        self.assertEqual(row["health_withdrawn_on"], "2026-06-20")
+        self.assertIsNone(row["withdrawn_on"])
+
     def test_a_chip_no_merchant_answers_to_is_refused(self):
         """The identity a person types must name a merchant this ledger
         HAS. A name nothing answers to is stored as a ref with no id, and
@@ -484,6 +635,27 @@ class RecurringManageApiTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_a_chip_may_name_an_over_long_merchant_the_ledger_has(self):
+        """A chip names a merchant that already exists, so the name's
+        length is not a reason to refuse it: an imported descriptor over
+        the rename cap is a real merchant a bill can pay."""
+        long_name = ("Very Long Imported Utility Descriptor " * 6).strip()
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            conn.execute("INSERT INTO merchants (name, name_source) "
+                         "VALUES (%s, 'manual')", (long_name,))
+        finally:
+            conn.close()
+        r = self.client.post("/api/bills/save", json={
+            "payee": "Long Chip Bill", "amount": 20, "cadence": "MONTHLY:1",
+            "merchants": [long_name]})
+        self.assertEqual(r.status_code, 200, r.text)
+        # an unknown long name is refused as unknown, not saved
+        r = self.client.post("/api/bills/save", json={
+            "payee": "Long Chip Bill", "amount": 20, "cadence": "MONTHLY:1",
+            "merchants": ["Z" * 230]})
+        self.assertEqual(r.status_code, 400, r.text)
+
     def test_a_mirrored_name_this_instance_lacks_can_still_be_saved(self):
         """A bill that arrived from another instance can carry a ref naming
         a merchant this one has never seen. Editing the amount must not be
@@ -516,11 +688,22 @@ class RecurringManageApiTests(unittest.TestCase):
     def test_history_covered_by_and_arbitrary_merchant(self):
         self.client.post("/api/bills/save", json={
             "payee": "Zenith Coffee", "amount": 25, "cadence": "WEEKLY:1"})
+        # Other live bills whose match keys also match the string (the
+        # matcher keys on the brand's leading word): the answer must not
+        # depend on which row the database returns first, and it is the
+        # bill naming the merchant most closely — not the one that sorts
+        # first, nor whichever was found first.
+        self.client.post("/api/bills/save", json={
+            "payee": "Zenith Gas", "amount": 45, "cadence": "MONTHLY:1"})
+        self.client.post("/api/bills/save", json={
+            "payee": "Aaa Zenith Generic", "merchant": "Zenith",
+            "amount": 9, "cadence": "MONTHLY:1"})
         # a merchant string already covered by an existing bill's matcher
-        h = self.client.get("/api/bills/history",
-                            params={"payee": "Zenith Coffee. Cafe"}).json()
-        self.assertIsNone(h["bill"])
-        self.assertEqual(h["covered_by"], "Zenith Coffee")
+        for _ in range(3):
+            h = self.client.get("/api/bills/history",
+                                params={"payee": "Zenith Coffee. Cafe"}).json()
+            self.assertIsNone(h["bill"])
+            self.assertEqual(h["covered_by"], "Zenith Coffee")
         # a totally unknown merchant: empty history, no fit, no bill
         h = self.client.get("/api/bills/history",
                             params={"payee": "Totally Unknown Vendor"}).json()

@@ -308,7 +308,10 @@ class CadenceHoldTests(unittest.TestCase):
         from unittest import mock
         from oikonome.jobs import worker
         from oikonome.web import report
-        with mock.patch.object(report, "send_each", return_value=[]) as m:
+        # a relay is configured: with none, the email channel is off
+        with mock.patch.dict(os.environ,
+                             {"OIKONOME_SMTP_HOST": "smtp.example.com"}), \
+             mock.patch.object(report, "send_each", return_value=[]) as m:
             worker.email_tenant(self.tid, send_it=True)
         return m
 

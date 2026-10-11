@@ -1,29 +1,31 @@
 // Email & Push — the per-cadence matrix: on/off, hour, and the
 // SMS/push channels, saved to the same settings the web edits.
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Linking, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput,
          View } from "react-native";
 import PullRefresh from "../components/pull-refresh";
 
-import { Card, H } from "../components/ui";
+import { Card, H, SharedLock } from "../components/ui";
 import { errText, Client, EmailSchedule, Me, SettingsView } from "../lib/api";
-import { patchList, patchQuery, seedSettings } from "../lib/cache";
+import { patchList, patchQuery, seedSettings, SETTINGS_SAVES } from "../lib/cache";
 import { useSession } from "../lib/session";
 import { ext } from "../ext";
-import { C } from "../lib/theme";
-import { useOwner } from "../lib/viewer";
+import { C, mmddyy } from "../lib/theme";
+import { EMAIL_KIND_LABEL, EMAIL_KINDS, kindOffNote, localDayOf, looksLikeMailbox,
+         NEED_BASE_URL, prefOn, recipientDuplicate, recipientEditBody, resendHeld,
+         withPref }
+  from "../lib/pure";
+import { CADENCES, cadenceOf, rebaseSched, storedSched }
+  from "../lib/schedule";
+import { useOwner, useSharedLock } from "../lib/viewer";
 import { deviceZone, knownZones, zoneLabel } from "../lib/zone";
 
-const CADENCES = ["daily", "weekly", "monthly", "yearly"] as const;
 // the web's cadence row names — a report card is not just "Monthly"
 const CADENCE_TITLE: Record<string, string> = {
-  daily: "Daily verdict", weekly: "Weekly report",
+  daily: "Daily verdict",
   monthly: "Monthly report card", yearly: "Year in review",
 };
-// index = the server's weekday value (the web's WEEKDAYS list order)
-const WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
-                  "Saturday", "Sunday"];
 
 export default function Notifications() {
   const { client } = useSession();
@@ -52,8 +54,12 @@ export default function Notifications() {
     && !!notify.data?.phone_verified;
   // any channel that can deliver: web push (VAPID), a relay for the mobile
   // app (this phone can register itself), or a phone already registered
-  const pushOk = !!notify.data?.push_available
-    || !!notify.data?.native_push_available
+  // The shared demonstration login cannot register this phone (the server
+  // refuses it a new outbound destination), so for it only a phone that is
+  // already registered can carry push.
+  const pushLock = useSharedLock("grant");
+  const pushOk = (!pushLock && (!!notify.data?.push_available
+                                || !!notify.data?.native_push_available))
     || (notify.data?.native_push_devices ?? 0) > 0;
   const [sched, setSched] = useState<EmailSchedule | null>(null);
   const [openCad, setOpenCad] = useState<string | null>(null);
@@ -95,29 +101,46 @@ export default function Notifications() {
       qc.invalidateQueries({ queryKey: ["me"] });
     },
   });
-  useEffect(() => {
-    if (query.data !== undefined && sched === null) {
-      setSched(query.data ?? {});
-    }
-  }, [query.data, sched]);
   // auto-save like the web: every change posts immediately; an error
   // refetches back to server truth instead of leaving a lying switch
+  // The schedule saves whole and `sched` is a copy from when the screen
+  // opened, so each edit is laid over the schedule stored NOW: only the
+  // fields it changed move, and a change saved on another device
+  // meanwhile is kept. One save at a time, so each edit's read sees the
+  // one before it.
   const save = useMutation({
-    mutationFn: (next: EmailSchedule) =>
-      client!.settingsSaveSchedule(next),
-    onSuccess: (v) => seedSettings(qc, v),
+    mutationFn: async (v: { mine: EmailSchedule; base: EmailSchedule;
+                            cad: (typeof CADENCES)[number] }) => {
+      const live = (await client!.settingsSchedule()) ?? {};
+      const sent = rebaseSched(v.mine, v.base, live, v.cad);
+      const r = await client!.settingsSaveSchedule(sent);
+      return { r, stored: storedSched(r, sent) };
+    },
+    scope: SETTINGS_SAVES,
+    onSuccess: ({ r, stored }, v) => {
+      seedSettings(qc, { ...r, email_schedule: stored });
+      // show what was stored, keeping any edit made since this one went out
+      setSched((cur) => cur && rebaseSched(cur, v.mine, stored));
+    },
     onError: () => { setSched(null); void query.refetch(); },
   });
+  // The copy on screen follows the stored schedule whenever no edit is on
+  // its way: the first answer may be the disk cache from days ago, and the
+  // refetch behind it is what is stored now.
+  useEffect(() => {
+    if (query.data !== undefined && !save.isPending)
+      setSched(query.data ?? {});
+  }, [query.data, save.isPending]);
   // a state updater must stay pure (React may run it twice); the POST
   // goes out beside the setState, from the same computed value
   const upd = (cad: (typeof CADENCES)[number],
                patch: Record<string, unknown>) => {
-    const next: EmailSchedule = { ...sched,
-      [cad]: { on: false, hour: 7,
-               ...(cad === "weekly" ? { weekday: 0 } : {}),
-               ...(sched?.[cad] ?? {}), ...patch } };
+    const was = cadenceOf(sched, cad);
+    const next: EmailSchedule = { ...sched, [cad]: { ...was, ...patch } };
     setSched(next);
-    save.mutate(next);
+    // the base carries the same filled-in cadence, so only `patch` counts
+    // as this edit's change
+    save.mutate({ mine: next, base: { ...sched, [cad]: was }, cad });
   };
   const hourLabel = (h: number) =>
     `${h % 12 === 0 ? 12 : h % 12}:00 ${h < 12 ? "am" : "pm"}`;
@@ -193,16 +216,11 @@ export default function Notifications() {
         </Card>
       )}
       {sched && CADENCES.map((cad) => {
-        const c = (sched[cad] ?? { on: false, hour: 7 }) as
-          { on: boolean; hour: number; weekday?: number; sms?: boolean;
-            push?: boolean; summary?: boolean };
+        const c = cadenceOf(sched, cad);
         // the web's resting-state sentence: when · the channels that
         // actually reach you, or "off"
         const when = cad === "daily"
           ? `every day at ${hourLabel(c.hour ?? 7)}`
-          : cad === "weekly"
-            ? `every ${WEEKDAYS[c.weekday ?? 0]} at ${
-                hourLabel(c.hour ?? 7)}`
           : cad === "monthly"
             ? `on the 1st at ${hourLabel(c.hour ?? 7)}`
             : `on Jan 1 at ${hourLabel(c.hour ?? 7)}`;
@@ -250,21 +268,7 @@ export default function Notifications() {
                           trackColor={{ true: C.accent, false: C.hover }}
                           thumbColor={C.text} />
                 </View>
-                {cad === "weekly" && (
-                  <View style={{ flexDirection: "row", flexWrap: "wrap",
-                                 gap: 6, paddingVertical: 4 }}>
-                    {WEEKDAYS.map((w, i) => (
-                      <Pressable key={w}
-                        style={[s.day,
-                          ((sched.weekly?.weekday ?? 0) === i) && s.dayOn]}
-                        onPress={() => upd("weekly", { weekday: i })}>
-                        <Text style={{ color:
-                          (sched.weekly?.weekday ?? 0) === i
-                            ? C.text : C.mut, fontSize: 12 }}>{w}</Text>
-                      </Pressable>
-                    ))}
-                  </View>
-                )}
+                <SharedLock note={pushOk ? null : pushLock}>
                 <View style={s.row}>
                   <Text style={s.lbl}>Push to phones</Text>
                   <Switch value={!!c.push} disabled={!pushOk}
@@ -272,7 +276,8 @@ export default function Notifications() {
                           trackColor={{ true: C.accent, false: C.hover }}
                           thumbColor={C.text} />
                 </View>
-                {!pushOk && (
+                </SharedLock>
+                {!pushOk && !pushLock && (
                   <Text style={s.gateHint}>
                     push needs a signed-in phone with notifications
                     allowed
@@ -333,9 +338,11 @@ export default function Notifications() {
                 </View>
                 {!smsOk && (
                   <Text style={s.gateHint}>
-                    {notify.data?.sms_available
-                      ? "verify a phone number below first"
-                      : "SMS isn't configured on this server"}
+                    {!notify.data?.sms_available
+                      ? "SMS isn't configured on this server"
+                      : notify.data.phone
+                        ? "texts are paused until you confirm the number below"
+                        : "verify a phone number below first"}
                   </Text>
                 )}
               </>
@@ -357,7 +364,17 @@ export default function Notifications() {
           via the mobile app
         </Text>
       )}
-      <RecipientsCard schedule={sched} />
+      {pushLock && pushOk && (
+        // push still reaches the household's registered phones; this one
+        // is not among them and cannot be added
+        <Text style={[s.center, { fontSize: 11, color: C.warn }]}>
+          {pushLock}</Text>
+      )}
+      <RecipientsCard />
+      {sched && (
+        <EmailPrefsCard sending={Object.fromEntries(CADENCES.map(
+          (c) => [c, !!cadenceOf(sched, c).on]))} />
+      )}
       <PhoneCard />
       <SendNowCard />
     </ScrollView>
@@ -365,18 +382,20 @@ export default function Notifications() {
 }
 
 // ---- who receives the email — every add/remove/mute IS the save
-// (the web's auto-save idiom); the complete trio posts each time so
-// rapid edits are last-write-wins under the server's settings lock ----
+// (the web's auto-save idiom). Each tap posts only the field it changed
+// (pure.recipientEditBody): the schedule and the mute list ride from a
+// copy loaded earlier, and sent along with an unrelated edit they would
+// put back a cadence changed on another device or a member's own
+// "turn off for me" ----
 type RecipStatus = {
   email: string; owner: boolean; muted?: boolean;
   delivery: "bouncing" | "complained" | null;
   delivery_reason: string | null;
   invite?: "invited" | "accepted" | "declined" | "expired" | null;
   via?: string;
+  prefs?: Partial<Record<string, boolean>>;
 };
-function RecipientsCard({ schedule }: {
-  schedule: EmailSchedule | null;
-}) {
+function RecipientsCard() {
   const { client } = useSession();
   const qc = useQueryClient();
   const settings = useQuery({ queryKey: ["settings"],
@@ -387,33 +406,43 @@ function RecipientsCard({ schedule }: {
     .map((x) => x.toLowerCase());
   const status = (d?.email_recipient_status as RecipStatus[] | null)
     ?? [];
+  // a new recipient is a new destination for the household's mail, which
+  // the shared demonstration login may not add; mute and remove stay live
+  const lockAdd = useSharedLock("grant");
+  // an added address is mailed only after it accepts an invitation, and a
+  // server with no public address cannot send one — adding would save an
+  // address that never receives anything
+  const notify = useQuery({ queryKey: ["notify"],
+    queryFn: () => client!.notifyStatus(), enabled: !!client });
+  const needBaseUrl = !!notify.data?.invites_need_base_url;
   const [draft, setDraft] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [resending, setResending] = useState<string | null>(null);
   const save = useMutation({
-    // never post an EMPTY schedule — before the schedule query resolves
-    // that would wipe every cadence; the card waits instead
-    // The list goes whole, so the add is named: the server keeps an
-    // address it has not seen before only when this edit added it — a
-    // cached list older than a member's removal cannot put them back.
-    mutationFn: (body: { email_recipients: string[];
-                         email_muted: string[];
-                         email_recipients_added?: string[] }) => {
-      if (schedule === null)
-        throw new Error("still loading — try again in a second");
-      return client!.settingsSave({ ...body,
-        email_recipients_added: body.email_recipients_added ?? [],
-        email_schedule: schedule });
-    },
+    mutationFn: (body: Record<string, unknown>) =>
+      client!.settingsSave(body),
     // the list, the mute marks and the new row all read ["settings"]:
     // patch it on the tap so they move at once, and let the reply (the
     // full view, with the server's recipient status) settle it
     onMutate: async (body) => {
       await qc.cancelQueries({ queryKey: ["settings"] });
       const prev = qc.getQueryData<SettingsView>(["settings"]);
-      patchQuery<SettingsView>(qc, ["settings"], {
-        email_recipients: body.email_recipients,
-        email_muted: body.email_muted });
+      const patch: Partial<SettingsView> = {};
+      // a recipient edit names one address; apply it to the cached list
+      // so the row moves on the tap, before the reply brings the stored one
+      const plus = body.email_recipients_added as string[] | undefined;
+      const minus = new Set(((body.email_recipients_removed as
+        string[] | undefined) ?? []).map((x) => x.toLowerCase()));
+      if (plus || minus.size) {
+        const cur = (prev?.email_recipients as string[] | null) ?? [];
+        const kept = cur.filter((x) => !minus.has(x.toLowerCase()));
+        const have = new Set(kept.map((x) => x.toLowerCase()));
+        patch.email_recipients = [...kept, ...(plus ?? []).filter(
+          (x) => !have.has(x.toLowerCase()))];
+      }
+      if ("email_muted" in body)
+        patch.email_muted = body.email_muted as string[];
+      patchQuery<SettingsView>(qc, ["settings"], patch);
       return { prev };
     },
     onSuccess: (v) => seedSettings(qc, v),
@@ -424,27 +453,23 @@ function RecipientsCard({ schedule }: {
       else qc.invalidateQueries({ queryKey: ["settings"] });
     },
   });
-  const setMuted = (email: string, on: boolean) => {
-    const low = email.toLowerCase();
-    save.mutate({ email_recipients: recipients,
-      email_muted: on ? [...new Set([...muted, low])]
-                      : muted.filter((x) => x !== low) });
-  };
+  const setMuted = (email: string, on: boolean) =>
+    save.mutate(recipientEditBody({ kind: "mute", email, on, muted }));
   const remove = (email: string) =>
-    save.mutate({ email_recipients:
-        recipients.filter((x) => x !== email),
-      email_muted: muted });
+    save.mutate(recipientEditBody({ kind: "remove", email, recipients }));
   const add = () => {
     const v = draft.trim();
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)) {
+    if (needBaseUrl) { setErr(NEED_BASE_URL); return; }
+    if (!looksLikeMailbox(v)) {
       setErr("That doesn't look like an email address."); return;
     }
-    if (recipients.some((x) => x.toLowerCase() === v.toLowerCase())) {
-      setErr("Already on the list."); setDraft(""); return;
-    }
+    // same words as the web add box, the owner's own address included:
+    // the owner is mailed by construction
+    const dupe = recipientDuplicate(v, recipients,
+      status.find((x) => x.owner)?.email);
+    if (dupe) { setErr(dupe); setDraft(""); return; }
     setErr(null); setDraft("");
-    save.mutate({ email_recipients: [...recipients, v],
-                  email_muted: muted, email_recipients_added: [v] });
+    save.mutate(recipientEditBody({ kind: "add", email: v, recipients }));
   };
   const badge = (st: RecipStatus | undefined,
                  isOwner: boolean): [string, string] => {
@@ -500,7 +525,11 @@ function RecipientsCard({ schedule }: {
                     onPress={() => {
                       setResending(email);
                       client!.recipientInviteResend(email)
-                        .then(() => {
+                        .then((r) => {
+                          // a held-back resend says why; nothing moved
+                          const held = resendHeld(r, email);
+                          if (held) { setErr(held); return; }
+                          setErr(null);
                           // the badge flips to "invite sent" now; the
                           // refetch brings the server's full status
                           patchList<SettingsView, RecipStatus>(qc,
@@ -527,6 +556,9 @@ function RecipientsCard({ schedule }: {
           </View>
         );
       })}
+      {lockAdd ? (
+        <Text style={[s.gateHint, { textAlign: "left" }]}>{lockAdd}</Text>
+      ) : (<>
       <View style={{ flexDirection: "row", gap: 8, marginTop: 6 }}>
         <TextInput style={[s.hour, { flex: 1, textAlign: "left" }]}
                    placeholder="partner@example.com"
@@ -539,7 +571,12 @@ function RecipientsCard({ schedule }: {
           <Text style={s.btnText}>Add</Text>
         </Pressable>
       </View>
-      {draft.trim() && !err ? (
+      {needBaseUrl && !err ? (
+        <Text style={[s.gateHint, { textAlign: "left", color: C.warn }]}>
+          {NEED_BASE_URL}
+        </Text>
+      ) : null}
+      {draft.trim() && !err && !needBaseUrl ? (
         <Text style={s.gateHint}>
           Not added yet — press Add to save and invite.
         </Text>
@@ -552,6 +589,101 @@ function RecipientsCard({ schedule }: {
         Adding someone emails them an invitation right away — they
         start receiving the summary once they accept.
       </Text>
+      </>)}
+    </Card>
+  );
+}
+
+// ---- who gets which email — the web's grid: a row per person on the
+// mail, a switch per kind. Each tap posts the one change it makes and the
+// server applies it to the stored choices, so two phones never undo each
+// other. A muted address gets nothing, so its row is shown off; a cadence
+// the household does not send dims its column. ----
+function EmailPrefsCard({ sending }: {
+  sending: Partial<Record<string, boolean>>;
+}) {
+  const { client } = useSession();
+  const qc = useQueryClient();
+  const settings = useQuery({ queryKey: ["settings"],
+    queryFn: () => client!.settingsFull(), enabled: !!client });
+  const status = ((settings.data as Record<string, unknown> | undefined)
+    ?.email_recipient_status as RecipStatus[] | null) ?? [];
+  const [err, setErr] = useState<string | null>(null);
+  // Taps not yet answered, oldest first. The saves go out one at a time
+  // (the scope), and each reply is the whole stored view, which cannot hold
+  // a tap still waiting its turn; drawing these over whatever the cache
+  // holds keeps a later switch from flicking back when an earlier reply
+  // lands, and a refused tap simply drops out.
+  const [pending, setPending] = useState<
+    { id: number; email: string; kind: string; on: boolean }[]>([]);
+  const nextId = useRef(0);
+  const save = useMutation({
+    mutationFn: (v: { email: string; kind: string; on: boolean }) =>
+      client!.settingsSave({ email_prefs_set:
+        { address: v.email, kind: v.kind, on: v.on } }),
+    scope: SETTINGS_SAVES,
+    // the switch moves on the tap; the reply (the full view) settles it
+    onMutate: (v) => {
+      const id = ++nextId.current;
+      setPending((p) => [...p, { id, ...v }]);
+      return { id };
+    },
+    onSuccess: (v) => { setErr(null); seedSettings(qc, v); },
+    onError: (e) => {
+      setErr(errText(e));
+      qc.invalidateQueries({ queryKey: ["settings"] });
+    },
+    onSettled: (_r, _e, _v, ctx) =>
+      setPending((p) => p.filter((x) => x.id !== ctx?.id)),
+  });
+  const rows = pending.reduce(
+    (acc, x) => withPref(acc, x.email, x.kind, x.on), status);
+  if (!rows.length) return null;
+  return (
+    <Card>
+      <H>Who gets which email</H>
+      {rows.map((r) => (
+        <View key={r.email} style={{ paddingVertical: 6,
+                                     opacity: r.muted ? 0.6 : 1 }}>
+          <Text style={{ color: C.text, fontSize: 13 }} numberOfLines={1}>
+            {r.email}
+            <Text style={{ color: C.mut, fontSize: 11 }}>
+              {r.owner ? " · you" : ""}{r.muted ? " · not receiving" : ""}
+            </Text>
+          </Text>
+          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6,
+                         marginTop: 4 }}>
+            {EMAIL_KINDS.map((k) => {
+              const on = !r.muted && prefOn(r.prefs, k);
+              const off = kindOffNote(k, sending);
+              return (
+                <Pressable key={k} disabled={!!r.muted}
+                  accessibilityLabel={`${r.email} receives ${
+                    EMAIL_KIND_LABEL[k].toLowerCase()} email`}
+                  accessibilityState={{ checked: on, disabled: !!r.muted }}
+                  style={[s.day, on && s.dayOn, off ? { opacity: 0.5 } : null]}
+                  onPress={() => save.mutate({ email: r.email, kind: k,
+                                               on: !on })}>
+                  <Text style={{ color: on ? C.text : C.mut, fontSize: 12 }}>
+                    {on ? "☑" : "☐"} {EMAIL_KIND_LABEL[k]}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
+        </View>
+      ))}
+      {EMAIL_KINDS.map((k) => kindOffNote(k, sending)).filter(Boolean)
+        .length ? (
+        <Text style={[s.gateHint, { textAlign: "left" }]}>
+          {EMAIL_KINDS.map((k) => kindOffNote(k, sending)).filter(Boolean)
+            .join(" · ")}
+        </Text>
+      ) : null}
+      {err ? (
+        <Text style={{ color: C.bad, fontSize: 12 }}
+              onPress={() => setErr(null)}>{err}</Text>
+      ) : null}
     </Card>
   );
 }
@@ -568,6 +700,10 @@ function PhoneCard() {
     queryFn: () => client!.notifyStatus(),
     enabled: !!client,
   });
+  // setting, verifying or clearing the number is refused the shared
+  // demonstration login: a number a visitor verified would keep receiving
+  // the household's summaries after the visit
+  const phoneLock = useSharedLock("grant");
   const [phone, setPhone] = useState("");
   const [code, setCode] = useState("");
   const [consent, setConsent] = useState(false);
@@ -583,6 +719,25 @@ function PhoneCard() {
     patchQuery<NotifyStatus>(qc, ["notify-status"], patch);
     qc.invalidateQueries({ queryKey: ["notify-status"] });
   };
+  // the same clear door for a verified number and a paused one: a paused
+  // number may be a phone the owner doesn't recognise, and it must not stay
+  // on the card until some other number is verified
+  const removeBtn = (
+    <Pressable style={[s.btn, { backgroundColor: C.hover },
+                       busy === "remove" && { opacity: 0.5 }]}
+               disabled={busy !== null}
+               onPress={() => { setBusy("remove");
+                 client!.notifyPhone("")
+                   .then(() => done({ phone: null, phone_verified: false,
+                                      phone_pending: null,
+                                      phone_paused_at: null }))
+                   .catch((e) => setMsg(errText(e)))
+                   .finally(() => setBusy(null)); }}>
+      <Text style={[s.btnText, { color: C.mut }]}>
+        {busy === "remove" ? "removing…" : "remove"}
+      </Text>
+    </Pressable>
+  );
   if (!n || !n.sms_available) {
     if (n && n.sms_entitled === false)
       return (
@@ -623,23 +778,30 @@ function PhoneCard() {
                 {testing ? "sending…" : "send test SMS"}
               </Text>
             </Pressable>
-            <Pressable style={[s.btn, { backgroundColor: C.hover },
-                               busy === "remove" && { opacity: 0.5 }]}
-                       disabled={busy !== null}
-                       onPress={() => { setBusy("remove");
-                         client!.notifyPhone("")
-                           .then(() => done({ phone: null,
-                                              phone_verified: false }))
-                           .catch((e) => setMsg(errText(e)))
-                           .finally(() => setBusy(null)); }}>
-              <Text style={[s.btnText, { color: C.mut }]}>
-                {busy === "remove" ? "removing…" : "remove"}
-              </Text>
-            </Pressable>
+            <SharedLock note={phoneLock}>{removeBtn}</SharedLock>
           </View>
         </>
       ) : (
-        <>
+        <SharedLock note={phoneLock}>
+          {n.phone ? (
+            // A password, login-address or two-factor change pauses the
+            // number until a fresh code sent to it is typed back, so a
+            // phone someone else verified stops receiving the summaries.
+            // No code goes out by itself: the owner retypes the number (it
+            // is only shown masked), or removes one they don't recognise.
+            <View style={{ marginBottom: 6 }}>
+              <Text style={{ color: C.warn, fontSize: 13 }}>
+                Texts to {n.phone} are paused
+                {/* a UTC timestamp: the local day it fell on */}
+                {n.phone_paused_at
+                  ? ` since ${mmddyy(localDayOf(n.phone_paused_at))}` : ""} until you
+                confirm the number again — type it below and tap send code.
+              </Text>
+              <View style={{ flexDirection: "row", marginTop: 6 }}>
+                {removeBtn}
+              </View>
+            </View>
+          ) : null}
           <Pressable style={{ flexDirection: "row", gap: 8,
                               alignItems: "flex-start" }}
                      onPress={() => setConsent((x) => !x)}>
@@ -731,7 +893,7 @@ function PhoneCard() {
               </Pressable>
             </View>
           )}
-        </>
+        </SharedLock>
       )}
       {msg ? (
         <Text style={{ color: msg.endsWith(".") && !msg.includes(":")

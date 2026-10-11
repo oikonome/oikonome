@@ -44,6 +44,8 @@ STEPUP_CALLS = ("_step_up(", "_require_passkey_stepup(",
 
 # PINNED: these step up today and must continue to.
 STEPUP_REQUIRED = {
+    "POST /api/accounts/mx/keys",
+    "POST /api/accounts/plaid/keys",
     "DELETE /api/passkeys/{pk_id}",
     "DELETE /api/users/{user_id}",
     "POST /api/users/{user_id}/role",
@@ -138,10 +140,9 @@ STEPUP_EXEMPT = {
     "POST /admin/console/passkey/options":
         "issues an enrolment challenge; POST /admin/console/passkey persists",
     "POST /admin/console/passkey":
-        "bootstrap: the FIRST operator key must be enrollable from a token "
-        "session or the feature can never start; audited, and once a key "
-        "exists OIKONOME_ADMIN_REQUIRE_PASSKEY makes that session a passkey "
-        "session anyway",
+        "console's own proofs: the FIRST key needs the operator token "
+        "re-entered (there is no key to assert with yet), every later key a "
+        "_stepup_ok assertion, and a host-issued ticket stands in for both",
     "POST /admin/console/passkey/delete":
         "steps up with the console's own primitive (_stepup_ok) and refuses "
         "to remove the last key under the require-flag",
@@ -216,15 +217,17 @@ class ReauthClassificationTests(unittest.TestCase):
         import re
         import oikonome
         root = pathlib.Path(oikonome.__file__).parent
-        spa = (root.parent.parent / "webapp" / "src" / "main.tsx")
+        spa = (root.parent.parent / "webapp" / "src" / "reauth.ts")
         if not spa.exists():
             self.skipTest("webapp/ not present")
-        m = re.search(r"const reauth = /([^/]+)/i", spa.read_text())
+        m = re.search(r"const REAUTH = /([^/]+)/i", spa.read_text())
         self.assertIsNotNone(m, "the re-auth pattern moved — update this test")
         pattern = re.compile(m.group(1), re.I)
 
         # every 401 the server raises for a STEP-UP (not a lost session)
-        details = []
+        # a spent code is refused through a shared message, not a literal
+        from oikonome.web import app as web_app
+        details = [("app.py", web_app._TOTP_CODE_USED_MSG)]
         for path in root.rglob("*.py"):
             src = path.read_text()
             for hit in re.finditer(

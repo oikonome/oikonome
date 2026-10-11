@@ -171,6 +171,32 @@ class ConnectionsBundleTests(unittest.TestCase):
         out = cb.apply_payload(conn, payload)
         self.assertEqual(out["items"], 4)
 
+    def test_malformed_shapes_are_a_bad_file_not_a_crash(self):
+        """Any passphrase seals a valid file, so every value in it is
+        attacker-shaped: a list where an id goes, a number where a secret
+        goes, are refused as a bad file (ValueError, the door's 400) and
+        nothing lands."""
+        from oikonome.sync import connections_bundle as cb
+        conn = self._db()
+        good_item = {"id": "sf-ok", "aggregator": "simplefin",
+                     "access_token": "https://u:p@bridge.simplefin.org/x"}
+        for bad in (
+                {"items": [{"id": ["x"], "aggregator": "plaid"}]},
+                {"items": [{"id": "x", "aggregator": {"a": 1}}]},
+                {"items": [dict(good_item, access_token=5)]},
+                {"items": [dict(good_item, raw=[1])]},
+                {"secrets": {"llm_api_key": 5}},
+                {"secrets": ["llm_api_key"]},
+                {"config": {"llm_model": {"x": 1}}},
+                {"config": "llm_model"}):
+            payload = {"oikonome_config": cb.FORMAT, "config": {},
+                       "secrets": {}, "items": [good_item], **bad}
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    cb.apply_payload(conn, payload)
+        self.assertIsNone(conn.execute(
+            "SELECT 1 FROM items WHERE id = 'sf-ok'").fetchone())
+
     def test_short_passphrase_rejected(self):
         src = self._db()
         with self.assertRaises(ValueError):

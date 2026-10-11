@@ -38,6 +38,26 @@ class ImportCreateAccountTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_the_sync_lock_is_let_go_only_after_the_rows_commit(self):
+        """The import's session sync lock must outlive its push
+        transaction: a sync queued on release must find the file's rows
+        committed, or it pulls again what the file already covers."""
+        from unittest import mock
+        from psycopg import pq
+        seen = []
+
+        def answer(conn, tenant_id):
+            seen.append(conn.info.transaction_status)
+            return False
+        with mock.patch("oikonome.jobs.worker.answer_sync_nudge", answer):
+            r = self.client.post(
+                "/api/import",
+                data={"account_id": "", "amount_sign": "bank",
+                      "new_account_name": "Lock Order Checking"},
+                files={"file": ("lock.csv", CSV, "text/csv")})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(seen, [pq.TransactionStatus.IDLE])
+
     def test_import_into_a_new_account(self):
         r = self.client.post(
             "/api/import",

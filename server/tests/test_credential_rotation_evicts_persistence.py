@@ -338,8 +338,12 @@ class PasskeyOnlyResetNeedsRecovery(_Base):
         self.assertNotIn("Recovery code", TestClient(self.app).get(
             "/reset", params={"token": token}).text)
         self._enroll_passkey()
+        # the first passkey is a rotation, so the link minted before it is
+        # dead; a link asked for afterwards is the one that wants a code
+        self.assertIn("invalid, expired, or already used", TestClient(
+            self.app).get("/reset", params={"token": token}).text)
         self.assertIn("Recovery code", TestClient(self.app).get(
-            "/reset", params={"token": token}).text)
+            "/reset", params={"token": self._reset_link()}).text)
 
 
 class MintTicketDiesWithTheSession(_Base):

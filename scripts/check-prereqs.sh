@@ -45,6 +45,17 @@ prereq_detect_compose() {
   # (case, not `[ ] &&`: a false test as a function's last command would
   # return 1 and set -e would kill the sourcing script)
   case $ENGINE in podman-compose) ENGINE=podman;; esac
+  # The podman-docker package installs a `docker` that is a wrapper around
+  # podman. It answers `docker compose` like the real thing, but there is
+  # no Docker daemon behind it, so nothing applies the stack's restart
+  # policy at boot and the rootless caveats all hold. Judge the engine by
+  # what the CLI is, not by its name.
+  case $ENGINE in docker)
+    if command -v podman >/dev/null 2>&1 \
+       && docker --version 2>/dev/null | grep -qi podman; then
+      ENGINE=podman
+    fi ;;
+  esac
   # podman-compose ≥1.1 puts every service in ONE pod, whose isolated
   # userns maps container UIDs differently than a standalone `podman run`.
   # The bind-mounted postgres data dir (created under the classic rootless
@@ -54,7 +65,8 @@ prereq_detect_compose() {
   # with). Exported here so every compose invocation inherits it; docker
   # and podman's native `compose` ignore the var. `podman compose` on
   # Fedora often SHELLS OUT to podman-compose, so match either.
-  case $COMPOSE in *podman*compose*|"podman compose")
+  # (the docker shim's `docker compose` reaches the same podman provider)
+  case $ENGINE in podman)
     export PODMAN_COMPOSE_IN_POD=false ;;
   esac
 }

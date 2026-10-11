@@ -154,8 +154,9 @@ class RestoreDoorsWantElevationTests(unittest.TestCase):
                           new_account_name="Checking")
                      for f in plan["files"]]
         r = self.c.post("/api/import/bulk/run",
-                        json={"token": plan["token"], "files": decisions})
-        self.assertEqual(r.status_code, 200, r.text)
+                        json={"token": plan["token"], "files": decisions,
+                              "background": True})
+        self.assertEqual(r.status_code, 202, r.text)
 
 
 if __name__ == "__main__":

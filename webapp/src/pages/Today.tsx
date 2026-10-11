@@ -16,6 +16,7 @@ import AreaChart from "../components/AreaChart";
 import MoneyMap, { Track } from "../components/MoneyMap";
 import { planRows } from "../components/PlanBars";
 import { canEdit } from "../role";
+import { monthSavings } from "../moneymath";
 
 /** Card autopays as chart marks: the series is one point per day starting
  *  today, so a due date is found by its own index. A date the window does
@@ -206,6 +207,10 @@ export default function Today({ date = null }: { date?: string | null }) {
   // start of the recent window: yesterday, or today itself on the 1st
   const yesterday = d.yesterday ?? d.date;
   const recentSum = d.recent.reduce((s, r) => s + r.amount, 0);
+  // the footnote's two kinds of missed bill: never posted, and posted then
+  // withdrawn by the bank feed (the fourth slot; an older server omits it)
+  const lateBills = d.overdue_unpaid.filter((o) => !o[3]);
+  const goneBills = d.overdue_unpaid.filter((o) => !!o[3]);
 
   // ---- cash timeline: recent activity + scheduled events, one table ----
   // Past = the month's paid ✓ bill rows (they arrive in forecast_rows with
@@ -638,10 +643,12 @@ export default function Today({ date = null }: { date?: string | null }) {
       )}
 
       {/* ---- savings goals — ledger-verified progress + pace.
-           The card renders only when a TRACKABLE goal exists — plan-only
-           rows and the $0/$0 marker have nothing to report, so a card of
-           only those is chrome, not information ---- */}
-      {adv && (d.savings_goals ?? []).some((g) => !g.plan_only) && (
+           The card renders only when a TRACKABLE goal exists, or one
+           that needs an account to become trackable — plan-only rows and
+           the $0/$0 marker have nothing to report, so a card of only
+           those is chrome, not information ---- */}
+      {adv && (d.savings_goals ?? []).some(
+          (g) => !g.plan_only || g.needs_account) && (
         <div className="card">
           <div className="sub" style={{ textTransform: "uppercase",
                 letterSpacing: ".03em" }}>Savings goals</div>
@@ -657,8 +664,11 @@ export default function Today({ date = null }: { date?: string | null }) {
                       plan {money(g.monthly_plan)}/mo</span>
                     <span className="mut" style={{ fontSize: 13,
                           marginLeft: "auto" }}>
-                      plan only — set a destination account on the Budget
-                      page to track progress</span>
+                      {g.needs_account
+                        ? "match words need an account — pick one on the "
+                          + "Budget page"
+                        : "plan only — set a destination account on the "
+                          + "Budget page to track progress"}</span>
                   </>
                 ) : (
                   <>
@@ -711,7 +721,9 @@ export default function Today({ date = null }: { date?: string | null }) {
             fixedPending: d.fixed_unpaid_due,
             savings: (() => {
               const g = (d.savings_goals ?? []).find((x) => x.name === "Savings");
-              return g ? { plan: g.monthly_plan, saved: g.rate_90d } : null;
+              // this month's posted contribution when the payload has it;
+              // otherwise the trailing 90-day average, labelled as one
+              return g ? monthSavings(g, g.saved_this_month) : null;
             })(),
             excess: d.plan_surplus,
           })}
@@ -724,13 +736,24 @@ export default function Today({ date = null }: { date?: string | null }) {
                       {k < Math.min(d.irregular_bills.length, 4) - 1 ? " · " : ""}</span>
                   ))}</>
               )}
-              {d.irregular_bills.length > 0 && d.overdue_unpaid.length > 0 && <br />}
-              {d.overdue_unpaid.length > 0 && (
+              {d.irregular_bills.length > 0 && lateBills.length > 0 && <br />}
+              {lateBills.length > 0 && (
                 <>Scheduled but not yet posted:{" "}
-                  {d.overdue_unpaid.slice(0, 4).map(([p, a, due], i) => (
+                  {lateBills.slice(0, 4).map(([p, a, due], i) => (
                     <span key={i}>{p} {money(a)} (due {mmdd(due)})
-                      {i < Math.min(d.overdue_unpaid.length, 4) - 1 ? ", " : ""}</span>
+                      {i < Math.min(lateBills.length, 4) - 1 ? ", " : ""}</span>
                   ))}</>
+              )}
+              {/* a charge the bank feed withdrew is not a bill that never
+                  posted — its own line, in the email's words */}
+              {(d.irregular_bills.length > 0 || lateBills.length > 0)
+                && goneBills.length > 0 && <br />}
+              {goneBills.length > 0 && (
+                <span style={{ color: "var(--amber)" }}>withdrawn by the bank feed:{" "}
+                  {goneBills.slice(0, 4).map(([p, a, , on], i) => (
+                    <span key={i}>{p} {money(a)} ({mmdd(on)})
+                      {i < Math.min(goneBills.length, 4) - 1 ? ", " : ""}</span>
+                  ))}</span>
               )}
             </div>
           )} />

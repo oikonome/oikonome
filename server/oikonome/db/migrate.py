@@ -291,9 +291,39 @@ def _apply_schema(conn, sql: str, sleep=None) -> None:
     conn.execute(sql)
 
 
+# The oldest PostgreSQL server the schema, the migrations and the runtime
+# queries work on. They use functions added in 16 (pg_input_is_valid), and a
+# function an older server lacks fails when its statement is parsed — so on
+# an older external server the migrations would stop part-way with a bare
+# "function does not exist" and the app would never start. The bundled
+# database is always new enough; an external one is checked before anything
+# is changed.
+MIN_SERVER_VERSION_NUM = 160000
+
+
+def _require_server_version(conn) -> None:
+    num = int(conn.execute(
+        "SELECT current_setting('server_version_num')::int AS v"
+    ).fetchone()["v"])
+    if num < MIN_SERVER_VERSION_NUM:
+        shown = conn.execute(
+            "SELECT current_setting('server_version') AS v").fetchone()["v"]
+        print(f"Oikonome needs PostgreSQL {MIN_SERVER_VERSION_NUM // 10000} "
+              f"or newer; the database server at {conn.info.host!r} runs "
+              f"{shown}. Nothing was changed. Upgrade the server (or point "
+              "OIKONOME_DB_HOST at a newer one) and start again.",
+              file=sys.stderr)
+        raise SystemExit(1)
+
+
 def run(admin_dsn: str | None = None) -> list[str]:
     applied = []
     conn = admin_connect(admin_dsn)
+    try:
+        _require_server_version(conn)
+    except BaseException:
+        conn.close()
+        raise
     conn.execute("SELECT pg_advisory_lock(%s)", (LOCK_KEY,))
     try:
         pw = os.environ.get("OIKONOME_APP_PASSWORD")
@@ -589,44 +619,162 @@ def run(admin_dsn: str | None = None) -> list[str]:
             conn.execute(_sql)
         if admin_owns:
             conn.execute(ADMIN_OWNERSHIP_SQL)
-        _encrypt_totp_secrets(conn)
+        _encrypt_cp_secrets(conn)
     finally:
         conn.execute("SELECT pg_advisory_unlock(%s)", (LOCK_KEY,))
         conn.close()
     return applied
 
 
-def _encrypt_totp_secrets(conn) -> int:
-    """Encrypt any control-plane TOTP seed still stored in plaintext.
+# Every control-plane column holding a secret written by crypto.encrypt_cp —
+# encrypted DIRECTLY under the master key, no tenant data key in between —
+# as (table, primary-key column, secret column). The startup sweep below
+# encrypts what is still plaintext, and cli's keycheck and
+# rotate-master-key read this same list, so a secret added here is swept,
+# probed and re-wrapped alike.
+CP_SECRET_COLUMNS = (
+    ("users", "id", "totp_secret"),            # per-user TOTP seed
+    ("push_vapid", "id", "private_key"),       # the instance web-push key
+)
 
-    Rows enrolled on a build without seed encryption keep their secret in
-    the clear; this sweeps them under the master key. Runs on every boot
-    (migrate precedes serve), is a no-op once swept, and cannot be a .sql
-    migration because Fernet isn't SQL. Without a master key (dev) it
-    leaves rows alone; decrypt_cp passes them through."""
+
+def _encrypt_cp_secrets(conn) -> int:
+    """Encrypt any control-plane secret still stored in plaintext.
+
+    encrypt_cp is a passthrough while no master key exists, so a TOTP seed
+    enrolled, or the web-push signing key minted, before the operator added
+    one is in the clear; this sweeps them under the master key. Runs on
+    every boot (migrate precedes serve), is a no-op once swept, and cannot
+    be a .sql migration because Fernet isn't SQL. Without a master key
+    (dev) it leaves rows alone; decrypt_cp passes them through."""
     from . import crypto
     if not crypto.master_key():
         return 0
-    rows = conn.execute(
-        "SELECT id, totp_secret FROM users WHERE totp_secret IS NOT NULL "
-        "AND totp_secret NOT LIKE %s", (crypto.CP_PREFIX + "%",)).fetchall()
-    for r in rows:
-        conn.execute("UPDATE users SET totp_secret=%s WHERE id=%s",
-                     (crypto.encrypt_cp(r["totp_secret"]), r["id"]))
-    return len(rows)
+    swept = 0
+    for table, pk, col in CP_SECRET_COLUMNS:
+        rows = conn.execute(
+            f"SELECT {pk} AS k, {col} AS v FROM {table} "
+            f"WHERE {col} IS NOT NULL AND {col} <> '' "
+            f"AND {col} NOT LIKE %s", (crypto.CP_PREFIX + "%",)).fetchall()
+        for r in rows:
+            # compare-and-set on the value read: a seed the user turned off
+            # or re-enrolled between the read and this write is left as
+            # they made it, never put back (see _encrypt_unless_changed)
+            swept += _encrypt_unless_changed(
+                conn, table, pk, col, r, crypto.encrypt_cp(r["v"]))
+    return swept
 
 
-# config keys holding tenant secrets (mirror connections_bundle._SECRET_KEYS)
-_CFG_SECRET_KEYS = ("plaid_secret", "mx_api_key", "llm_api_key",
-                    "smtp_password")
+def _encrypt_unless_changed(conn, table: str, key: str, col: str, row,
+                            sealed: str) -> int:
+    """Write `sealed` over a secret only while it still holds the plaintext
+    the sweep read. The sweeps read first and write later while the app
+    serves: an unconditional write would bring back a factor the user just
+    turned off, or overwrite the one they just enrolled with the old one. A
+    row changed in between is skipped — it was written through the
+    encrypting path, or the next boot's sweep takes it. Returns 1 when
+    written."""
+    return conn.execute(
+        f"UPDATE {table} SET {col}=%s WHERE {key}=%s AND {col}=%s",
+        (sealed, row["k"], row["v"])).rowcount
+
+
+# Every tenant secret stored outside the settings document, as (table,
+# key column, secret column). Each is written through crypto.encrypt, which
+# stores plaintext when no master key exists yet.
+_SECRET_COLUMNS = (
+    ("items", "id", "access_token"),
+    ("business_entity", "id", "ein_enc"),
+    ("webhooks", "id", "secret"),
+)
+
+
+def _secret_keys() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The flat settings keys and the per-AI-backend fields that hold a
+    secret — read from the config bundle, which has to know them to carry
+    them across master keys, so the two lists cannot drift apart."""
+    from ..sync import connections_bundle as cb
+    return cb._SECRET_KEYS, cb._BACKEND_SECRETS
+
+
+def _plain(v) -> bool:
+    from . import crypto
+    return bool(v) and not str(v).startswith(crypto.PREFIX)
+
+
+def _plain_in_config(cfg: dict) -> int:
+    flat, per_backend = _secret_keys()
+    n = sum(1 for k in flat if _plain(cfg.get(k)))
+    for b in cfg.get("llm_backends") or []:
+        if isinstance(b, dict):
+            n += sum(1 for k in per_backend if _plain(b.get(k)))
+    return n
+
+
+def plaintext_tenant_secrets(conn) -> int:
+    """How many secrets this tenant still stores unencrypted. On a
+    tenant-scoped connection; what the doctor should count before it says
+    secrets are encrypted at rest."""
+    from . import crypto
+    from ..engine import budget
+    n = 0
+    for table, _key, col in _SECRET_COLUMNS:
+        n += conn.execute(
+            f"SELECT count(*) AS n FROM {table} WHERE {col} IS NOT NULL "
+            f"AND {col} <> '' AND {col} NOT LIKE %s",
+            (crypto.PREFIX + "%",)).fetchone()["n"]
+    return n + _plain_in_config(budget.load_config(conn))
+
+
+def _reencrypt_tenant(conn) -> int:
+    from . import crypto
+    from ..engine import budget
+    swept = 0
+    for table, key, col in _SECRET_COLUMNS:
+        rows = conn.execute(
+            f"SELECT {key} AS k, {col} AS v FROM {table} "
+            f"WHERE {col} IS NOT NULL AND {col} <> '' AND {col} NOT LIKE %s",
+            (crypto.PREFIX + "%",)).fetchall()
+        for r in rows:
+            swept += _encrypt_unless_changed(
+                conn, table, key, col, r, crypto.encrypt(conn, r["v"]))
+    # per-tenant `tenant_connect`, so config_txn's unqualified FOR UPDATE
+    # is RLS-scoped to this tenant's row (it must never be run on an
+    # admin_connect — see config_txn's docstring)
+    # ONE load for the probe. Calling load_config per key would re-read a
+    # whole settings document each time — and load_config is not even
+    # read-only: it seed-persists, so the "is there anything to do here"
+    # check would itself write, repeatedly.
+    if not _plain_in_config(budget.load_config(conn)):
+        return swept
+    flat, per_backend = _secret_keys()
+    with budget.config_txn(conn) as cfg:
+        for k in flat:
+            if _plain(cfg.get(k)):
+                cfg[k] = crypto.encrypt(conn, cfg[k])
+                swept += 1
+        backends = cfg.get("llm_backends")
+        if isinstance(backends, list):
+            out = []
+            for b in backends:
+                if isinstance(b, dict):
+                    b = dict(b)
+                    for k in per_backend:
+                        if _plain(b.get(k)):
+                            b[k] = crypto.encrypt(conn, b[k])
+                            swept += 1
+                out.append(b)
+            cfg["llm_backends"] = out
+    return swept
 
 
 def reencrypt_tenant_secrets() -> int:
     """A box run WITHOUT a master key, then given one, keeps its
     already-stored TENANT secrets in plaintext — the
-    TOTP sweep above only covers control-plane seeds. Re-encrypt the
-    untagged per-tenant secrets (items.access_token + the config secret
-    keys) under each tenant's own key. Runs on a tenant-scoped (app-role)
+    TOTP sweep above only covers control-plane seeds. Re-encrypt every
+    untagged per-tenant secret (the columns in _SECRET_COLUMNS, the flat
+    settings secrets and each AI backend's) under each tenant's own key.
+    Runs on a tenant-scoped (app-role)
     connection so the ambient tenant key + RLS apply — hence it lives in
     the worker's startup, NOT the migrate one-shot (which has only the
     superuser DSN and would grab the wrong tenant_keys row under
@@ -641,36 +789,11 @@ def reencrypt_tenant_secrets() -> int:
                 admin.execute("SELECT id FROM tenants").fetchall()]
     finally:
         admin.close()
-    from ..engine import budget
     swept = 0
     for tid in tids:
         conn = tenancy.tenant_connect(tid)
         try:
-            rows = conn.execute(
-                "SELECT id, access_token FROM items WHERE access_token "
-                "IS NOT NULL AND access_token NOT LIKE %s",
-                (crypto.PREFIX + "%",)).fetchall()
-            for r in rows:
-                conn.execute(
-                    "UPDATE items SET access_token=%s WHERE id=%s",
-                    (crypto.encrypt(conn, r["access_token"]), r["id"]))
-                swept += 1
-            # per-tenant `tenant_connect` above, so config_txn's unqualified
-            # FOR UPDATE is RLS-scoped to this tenant's row (it must never be
-            # run on an admin_connect — see config_txn's docstring)
-            # ONE load for the probe. Calling load_config per key would
-            # re-read a whole settings document each time — and load_config
-            # is not even read-only: it seed-persists, so the "is there
-            # anything to do here" check would itself write, repeatedly.
-            probe = budget.load_config(conn)
-            if any(v and not str(v).startswith(crypto.PREFIX)
-                   for v in (probe.get(k) for k in _CFG_SECRET_KEYS)):
-                with budget.config_txn(conn) as cfg:
-                    for k in _CFG_SECRET_KEYS:
-                        v = cfg.get(k)
-                        if v and not str(v).startswith(crypto.PREFIX):
-                            cfg[k] = crypto.encrypt(conn, v)
-                            swept += 1
+            swept += _reencrypt_tenant(conn)
         except Exception:                                   # noqa: BLE001
             # one tenant's failure must not block the rest — log and move on
             import logging

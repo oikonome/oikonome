@@ -164,16 +164,27 @@ def set_push(conn, user_id, device_id, token: str | None,
     return n
 
 
-def push_targets(conn, tenant_id) -> list[dict]:
+def push_targets(conn, tenant_id, user_id=None) -> list[dict]:
     """Live push destinations for a tenant: every unrevoked, unexpired
     device with a registered token the push service hasn't declared
-    dead. Control-plane read with an explicit tenant filter (this table
-    has no RLS)."""
+    dead — with `user_id`, only that user's devices. Control-plane read
+    with an explicit tenant filter (this table has no RLS).
+
+    A device of the shared demonstration login is never a target. The
+    register door now refuses that login, but a token it registered before
+    the refusal existed would otherwise keep carrying the household's
+    notices to whichever visitor's phone planted it. The condition is the
+    same column demoguard.is_shared_login reads, so the two cannot drift
+    on who that login is."""
     return conn.execute(
-        """SELECT push_token, push_platform FROM device_tokens
-           WHERE tenant_id = %s AND revoked_at IS NULL
-                 AND expires_at > now() AND push_token IS NOT NULL
-                 AND push_dead_at IS NULL""", (tenant_id,)).fetchall()
+        """SELECT d.push_token, d.push_platform
+           FROM device_tokens d JOIN users u ON u.id = d.user_id
+           WHERE d.tenant_id = %s AND d.revoked_at IS NULL
+                 AND d.expires_at > now() AND d.push_token IS NOT NULL
+                 AND d.push_dead_at IS NULL
+                 AND NOT u.second_factor_waived
+                 AND (%s::uuid IS NULL OR d.user_id = %s::uuid)""",
+        (tenant_id, user_id, user_id)).fetchall()
 
 
 def mark_push_dead(conn, tokens: list[str]) -> int:
@@ -284,6 +295,22 @@ def revoke_mint_tickets(conn, user_id) -> int:
         """DELETE FROM webauthn_challenges
            WHERE purpose = 'device-mint-ticket' AND user_id = %s""",
         (user_id,)).rowcount
+
+
+def mint_ticket_owner_hint(conn, ticket: str):
+    """The user a live ticket names, read without locking or spending it —
+    only so the mint can take that user's factor lock BEFORE redeeming.
+    Redeeming first would hold the ticket row while waiting for the lock,
+    and a rotation holding the lock waits on that row to burn it: a
+    deadlock. The redeem re-checks the ticket under the lock; this read
+    decides nothing on its own."""
+    if not ticket or not ticket.startswith(MINT_TICKET_PREFIX):
+        return None
+    row = conn.execute(
+        """SELECT user_id FROM webauthn_challenges
+           WHERE purpose = 'device-mint-ticket' AND challenge = %s
+             AND expires_at > now()""", (_h(ticket),)).fetchone()
+    return row["user_id"] if row else None
 
 
 def redeem_mint_ticket(conn, ticket: str):

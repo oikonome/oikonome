@@ -10,6 +10,7 @@ puts them to the person. Approving goes through the journalled rename
 
 import datetime as dt
 import unittest
+from unittest import mock
 
 from oikonome.engine import merchant_merge as mm
 
@@ -527,7 +528,10 @@ class SideFactsSurviveALedgerThatMovesBetweenTheReads(unittest.TestCase):
               "line": "ASHBURY TOYWO", "account": "Test Card"},
              {"id": self.FRESH, "date": TODAY, "amount": 5.0,
               "line": "ASHBURY TOYWO", "account": "Test Card"}])
-        facts = mm.side_facts(conn, [self.KNOWN, self.FRESH])
+        # the canned connection answers only the two ledger reads
+        from oikonome.engine import links
+        with mock.patch.object(links, "shadow_ids", return_value=[]):
+            facts = mm.side_facts(conn, [self.KNOWN, self.FRESH])
         self.assertEqual([r["amount"] for r in facts[self.KNOWN]["recent"]], [20.0])
         # no half-stated side: without totals there is nothing honest to show
         self.assertNotIn(self.FRESH, facts)

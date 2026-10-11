@@ -22,6 +22,7 @@ const KIND_ROUTE: Record<string, string> = {
   setup: "/bills", proposals: "/bills", drift: "/bills", merges: "/merchants",
   reimb: "/reimburse", funding: "/networth", transfer: "/transactions",
   anomaly: "/transactions", bonus: "/transactions",
+  "llm-backend": "/doctor", "collector-token-revoked": "/settings/scripts",
 };
 // "fix this" is the right verb for something BROKEN — a dead connection, a
 // funding gap. It is the wrong verb for a queue: a detected bill waiting on

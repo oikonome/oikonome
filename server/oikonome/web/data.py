@@ -203,7 +203,7 @@ def transactions_by_ids(conn, ids: list[str]):
                 LEFT JOIN items i ON i.id = a.item_id
                 {_MC_JOIN} {_TXN_JOINS}
            WHERE t.removed = 0 AND t.id = ANY(%s)
-           ORDER BY t.date DESC, ABS(t.amount) DESC"""
+           ORDER BY t.date DESC, ABS(t.amount) DESC, t.id"""
     return conn.execute(q, [ids]).fetchall()
 
 
@@ -279,7 +279,7 @@ def transactions(conn, year: int, month: int, *, search: str = "",
                              JOIN receipt_items ri ON ri.receipt_id = rc2.id
                             WHERE LOWER(ri.description) LIKE %s))"""
         args += [_like(search)] * 4
-    q += " ORDER BY t.date DESC, ABS(t.amount) DESC"
+    q += " ORDER BY t.date DESC, ABS(t.amount) DESC, t.id"
     return conn.execute(q, args).fetchall()
 
 
@@ -300,6 +300,39 @@ def set_txn_owner(conn, txn_id: str, owner: str | None) -> int:
         "UPDATE transactions SET owner_override=%s WHERE id=%s AND removed=0",
         (owner or None, txn_id))
     return cur.rowcount
+
+
+def live_edit_ids(conn, ids: list[str]) -> dict[str, str]:
+    """Inside the caller's transaction: take the pairing lock in shared
+    mode, then map each id to the live row a person's edit of it belongs
+    on — the row itself, or the posted row a settled pending hold became.
+    Ids with neither are left out.
+
+    A settlement holds the lock exclusively from carrying a hold's user
+    state onto its posted row to retiring the hold. An edit that checked
+    the hold outside the lock could commit between the two and land on a
+    row every read hides; under it, the edit either commits first and is
+    carried, or waits and is sent to the posted row."""
+    conn.execute(_REIMB_LOCK.replace(
+        "pg_advisory_xact_lock(", "pg_advisory_xact_lock_shared(", 1))
+    ids = [i for i in dict.fromkeys(ids) if i]
+    if not ids:
+        return {}
+    out = {r["id"]: r["id"] for r in conn.execute(
+        "SELECT id FROM transactions WHERE id = ANY(%s) AND removed = 0",
+        (ids,)).fetchall()}
+    gone = [i for i in ids if i not in out]
+    if gone:
+        for r in conn.execute(
+                """SELECT DISTINCT ON (p.id) p.id AS hold, t.id
+                     FROM transactions p
+                     JOIN transactions t
+                       ON t.removed = 0 AND t.account_id = p.account_id
+                      AND t.raw->>'pending_transaction_id' = p.id
+                    WHERE p.id = ANY(%s) AND p.removed = 1
+                    ORDER BY p.id, t.id""", (gone,)).fetchall():
+            out[r["hold"]] = r["id"]
+    return out
 
 
 def list_owners(conn) -> list[str]:
@@ -500,7 +533,7 @@ def search_transactions(conn, search: str, *, account_id: str | None = None,
     # slice of the ordered ids, so ORDER BY below only re-sorts 100 rows.
     ids = [r["id"] for r in conn.execute(
         f"SELECT t.id FROM transactions t WHERE {where_sql} "
-        f"ORDER BY t.date DESC, ABS(t.amount) DESC", args).fetchall()]
+        f"ORDER BY t.date DESC, ABS(t.amount) DESC, t.id", args).fetchall()]
     row = conn.execute(
         f"SELECT COUNT(*) AS n, "
         f"       COALESCE(SUM({amount_expr}) FILTER (WHERE TRUE {money_scope}), 0) AS s, "
@@ -552,11 +585,16 @@ def search_transactions(conn, search: str, *, account_id: str | None = None,
                  LEFT JOIN items i ON i.id = a.item_id
                  {_MC_JOIN} {_TXN_JOINS}
             WHERE t.id = ANY(%s)
-            ORDER BY t.date DESC, ABS(t.amount) DESC""",
+            ORDER BY t.date DESC, ABS(t.amount) DESC, t.id""",
         (page_ids,)).fetchall() if page_ids else []
     return (rows, total, round(amount_sum, 2), amazon_items,
             {"count": spend_n, "sum": spend_sum, "biz_count": biz_n},
             account_hits)
+
+
+# The longest category name any door writes. The rename door keeps it too,
+# so a name too long to set cannot arrive by renaming another into it.
+CATEGORY_MAX_LEN = 64
 
 
 def all_categories(conn) -> list[str]:
@@ -575,6 +613,20 @@ def all_categories(conn) -> list[str]:
         "JOIN transactions t ON t.tenant_id = sp.tenant_id AND t.id = sp.txn_id "
         "WHERE t.removed = 0").fetchall()}
     return sorted(cats)
+
+
+def category_in_use(conn, name: str) -> bool:
+    """Does any live row, or any split of one, already carry this category?
+    The same places all_categories reads, as one existence probe."""
+    return conn.execute(
+        """SELECT EXISTS (SELECT 1 FROM transactions WHERE removed = 0
+                            AND (category_primary = %(n)s
+                                 OR category_override = %(n)s))
+               OR EXISTS (SELECT 1 FROM transaction_splits sp
+                          JOIN transactions t ON t.tenant_id = sp.tenant_id
+                                             AND t.id = sp.txn_id
+                          WHERE t.removed = 0 AND sp.category = %(n)s)
+               AS used""", {"n": name}).fetchone()["used"]
 
 
 def all_accounts(conn):
@@ -719,10 +771,24 @@ def retire_pending(conn, txn_id: str, today: dt.date | None = None) -> dict:
     # every writer that retires a row takes the pairing lock first, so a
     # link being made on this row lands on the live twin, not on a row
     # that is about to leave every read
+    #
+    # The checks above ran outside the lock, and the lock can wait behind a
+    # sync that is settling this very hold under the same id. The UPDATE
+    # re-checks that the row is still a live hold, so a charge that posted
+    # meanwhile is never retired as one: a person's retirement outlives
+    # every later sync, and the posted charge would stay hidden for good.
     with conn.transaction():
         conn.execute(_REIMB_LOCK)
-        conn.execute("UPDATE transactions SET removed=1, retired_at=now() "
-                     "WHERE id=%s AND removed=0", (txn_id,))
+        done = conn.execute(
+            "UPDATE transactions SET removed=1, retired_at=now() "
+            "WHERE id=%s AND removed=0 AND pending=1", (txn_id,)).rowcount
+    if not done:
+        live = conn.execute(
+            "SELECT 1 FROM transactions WHERE id=%s AND removed=0",
+            (txn_id,)).fetchone()
+        if live is None:
+            raise LookupError("transaction not found")
+        raise ValueError(NOT_PENDING)
     return {"id": txn_id}
 
 
@@ -760,8 +826,11 @@ def rename_category(conn, old: str, new: str) -> dict:
     new = (new or "").strip()
     if not old or not new:
         raise ValueError("both the current and new names are required")
-    if len(new) > 120:
-        raise ValueError("new name is too long (max 120 characters)")
+    # the cap is for a name that does not exist yet: folding into one the
+    # household already uses, however long, is allowed
+    if len(new) > CATEGORY_MAX_LEN and not category_in_use(conn, new):
+        raise ValueError(f"new name is too long (max {CATEGORY_MAX_LEN} "
+                         "characters)")
     if new in cat_mod.FLOW:
         raise ValueError(
             f"'{new}' is a transfer / income category — a custom category "
@@ -778,6 +847,12 @@ def rename_category(conn, old: str, new: str) -> dict:
             "you created can be renamed")
 
     with conn.transaction():
+        # The bills that stamp the old name are locked before any charge is
+        # rewritten, in id order: an approval holds its bill while it
+        # stamps that bill's charges, so a rename that rewrote the charges
+        # first and reached for the bill after would close a cycle with it.
+        conn.execute("SELECT 1 FROM bills WHERE raw->>'txn_category' = %s "
+                     "ORDER BY id FOR UPDATE", (old,))
         overrides = conn.execute(
             "UPDATE transactions SET category_override=%s "
             "WHERE category_override=%s", (new, old)).rowcount
@@ -1325,6 +1400,14 @@ def bulk_apply(conn, ids: list[str], action: str,
     return {"applied": applied, "missing": len(ids) - len(live), "flow": flow}
 
 
+def _lock_identity_first(conn) -> None:
+    """Take the household merchant-identity lock, for the rest of the
+    enclosing transaction, before a merchant-wide category write touches a
+    rule or a ledger row — the order every rename and merge keeps."""
+    from ..engine import merchant_identity
+    merchant_identity._lock_identity(conn)
+
+
 def set_merchant_category(conn, payee: str, category: str,
                           family: bool = True) -> dict:
     """Apply `category` to every canonical the page's token match covers,
@@ -1342,6 +1425,12 @@ def set_merchant_category(conn, payee: str, category: str,
     if not category or category in _cats.FLOW:
         raise ValueError("a bulk category must be a spend category")
     with conn.transaction():
+        # The merchant-identity lock before any rule or ledger row: a rename
+        # takes identity, moves the rows, and locks the rules last, so a
+        # write that took a rule and then the rows would cross it on that
+        # pair and one side would be killed as a deadlock. Holding identity
+        # first, the two take turns.
+        _lock_identity_first(conn)
         canon = _canonical_of(conn, payee)
         # narrow: the rule's merchant under every casing the ledger files
         # it by — the Rules page counts a rule's rows case-insensitively,
@@ -1436,9 +1525,13 @@ def list_rules(conn, source: str | None = None, q: str = "",
         # per-source headers report unfiltered counts, and an underscore would
         # match anything. ESCAPE pins the
         # escape character instead of trusting the server default.
+        # A category is also matched the way the page shows it, with its
+        # underscores as spaces, so typing the label on screen finds it.
         where += (" AND (m.merchant ILIKE %s ESCAPE '\\'"
-                  " OR m.category_primary ILIKE %s ESCAPE '\\')")
-        params += [_like(q.strip())] * 2
+                  " OR m.category_primary ILIKE %s ESCAPE '\\'"
+                  " OR replace(m.category_primary, '_', ' ')"
+                  " ILIKE %s ESCAPE '\\')")
+        params += [_like(q.strip())] * 3
     counts = {s: 0 for s in RULE_SOURCES}
     for r in conn.execute(
             f"""SELECT m.source, COUNT(*) AS n FROM merchant_categories m
@@ -1489,6 +1582,9 @@ def set_rule_disabled(conn, merchant: str, disabled: bool) -> None:
     so it moves to "Your rules" and the Model-learned group stays purely
     untouched inferences. Re-enabling keeps source='user'."""
     with conn.transaction():
+        # identity before the rule and the rows it re-files: a rename moves
+        # rows and then locks rules (see set_merchant_category)
+        _lock_identity_first(conn)
         if disabled:
             conn.execute("UPDATE merchant_categories "
                          "SET disabled=true, source='user' "
@@ -1643,6 +1739,8 @@ def undo_merchant_category(conn, undo: dict) -> int:
         return 0
     restored = 0
     with conn.transaction():
+        # identity before the rules and the rows, as set_merchant_category
+        _lock_identity_first(conn)
         # The snapshot is client-held and has no expiry, so by the time
         # Undo is pressed someone else — another member, the other app, the
         # categorizer — may have moved on from this write. Undo reverses
@@ -1869,7 +1967,9 @@ def _deposit_fully_applied(conn, dep_id: str) -> bool:
                             WHERE f.reimburse_id = t.id AND f.partial = 0
                               AND e.removed = 0), 0) AS repaid,
                   COALESCE((SELECT SUM(p.amount) FROM reimbursements p
-                            WHERE p.reimburse_id = t.id AND p.partial = 1), 0)
+                            JOIN transactions pe ON pe.id = p.expense_id
+                            WHERE p.reimburse_id = t.id AND p.partial = 1
+                              AND pe.removed = 0), 0)
                       AS applied
            FROM transactions t WHERE t.id = %s""", (dep_id,)).fetchone()
     if row is None:
@@ -2223,10 +2323,14 @@ def _deposit_left(conn, reimb: dict) -> float:
 
 # What of a deposit (`t` = its transactions alias) no link has claimed:
 # its face value less its partial links and the charges fully paired to it.
+# A link to a charge that has left the ledger (the feed withdrew it) claims
+# nothing, as in NET_AMOUNT.
 # _deposit_left and the matcher's list read the same expression.
 _DEPOSIT_LEFT = """(ABS(t.amount)
     - COALESCE((SELECT SUM(pl.amount) FROM reimbursements pl
-                WHERE pl.reimburse_id = t.id AND pl.partial = 1), 0)
+                JOIN transactions pe ON pe.id = pl.expense_id
+                WHERE pl.reimburse_id = t.id AND pl.partial = 1
+                  AND pe.removed = 0), 0)
     - COALESCE((SELECT SUM(e.amount) FROM reimbursements fl
                 JOIN transactions e ON e.id = fl.expense_id
                 WHERE fl.reimburse_id = t.id AND fl.partial = 0

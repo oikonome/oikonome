@@ -17,6 +17,7 @@ from oikonome.db import staging, tenancy
 from oikonome.engine import taxdocs
 from oikonome.web import bulk_import
 
+from .bulk_job_util import submit_and_run
 from .util import make_db, write_config
 
 
@@ -68,6 +69,46 @@ class StagingStoreTests(unittest.TestCase):
             "UPDATE import_staging SET created_at = now() - interval "
             "'2 hours' WHERE token = %s", (token,))
         self.assertIsNone(staging.pop(self.conn, "bulk", token))
+
+    def test_an_abandoned_stage_is_swept_without_its_household_returning(self):
+        """The sweep inside put/pop/peek reaches only the household making
+        the call, and a staged upload still holds the full account numbers
+        the importers cut down. The instance-wide sweep reaches every
+        household's expired stages and leaves fresh ones alone."""
+        other = _second_tenant()
+        try:
+            stale_a = staging.put(self.conn, "bulk", files=[("a.csv", b"x")])
+            stale_b = staging.put(other, "csv", files=[("b.csv", b"y")])
+            fresh = staging.put(self.conn, "bulk", files=[("c.csv", b"z")])
+            for c, tok in ((self.conn, stale_a), (other, stale_b)):
+                c.execute("UPDATE import_staging SET created_at = now() - "
+                          "interval '2 hours' WHERE token = %s", (tok,))
+            self.assertGreaterEqual(staging.sweep_all(), 2)
+            left = {r["token"] for r in self.conn.execute(
+                "SELECT token FROM import_staging").fetchall()}
+            self.assertEqual(left, {fresh})
+            self.assertIsNone(other.execute(
+                "SELECT 1 FROM import_staging").fetchone())
+        finally:
+            other.close()
+
+    def test_the_worker_runs_the_instance_wide_sweep_every_hour(self):
+        """Nothing else calls the instance-wide sweep, so without its cron
+        entry an abandoned upload outlives its hour indefinitely."""
+        import asyncio
+        from oikonome.jobs import worker
+        job = next((j for j in worker.WorkerSettings.cron_jobs
+                    if j.coroutine is worker.staging_sweep), None)
+        self.assertIsNotNone(job)
+        self.assertIsNone(job.hour)
+        self.assertIsInstance(job.minute, int)
+        stale = staging.put(self.conn, "bulk", files=[("a.csv", b"x")])
+        self.conn.execute("UPDATE import_staging SET created_at = now() - "
+                          "interval '2 hours' WHERE token = %s", (stale,))
+        self.assertGreaterEqual(asyncio.run(worker.staging_sweep({})), 1)
+        self.assertIsNone(self.conn.execute(
+            "SELECT 1 FROM import_staging WHERE token = %s",
+            (stale,)).fetchone())
 
     def test_byte_budget_refuses_loudly(self):
         with mock.patch.object(staging, "TENANT_BUDGET", 1000):
@@ -151,16 +192,16 @@ class BulkStagingTests(unittest.TestCase):
         other = _second_tenant()
         try:
             with self.assertRaises(ValueError) as e:
-                bulk_import.run(other, plan["token"],
-                                [{"index": 0, "action": "import",
-                                  "account_id": "chk"}])
+                submit_and_run(other, plan["token"],
+                               [{"index": 0, "action": "import",
+                                 "account_id": "chk"}])
             self.assertIn("expired", str(e.exception))
         finally:
             other.close()
         # the rightful tenant's run still works
-        out = bulk_import.run(self.conn, plan["token"],
-                              [{"index": 0, "action": "import",
-                                "account_id": "chk"}])
+        out = submit_and_run(self.conn, plan["token"],
+                             [{"index": 0, "action": "import",
+                               "account_id": "chk"}])
         self.assertTrue(out[0]["ok"], out)
 
     def test_bulk_survives_a_worker_swap(self):
@@ -173,9 +214,9 @@ class BulkStagingTests(unittest.TestCase):
             "SELECT current_setting('app.tenant_id') AS t").fetchone()["t"]
         worker2 = tenancy.tenant_connect(tid)
         try:
-            out = bulk_import.run(worker2, plan["token"],
-                                  [{"index": 0, "action": "import",
-                                    "account_id": "chk"}])
+            out = submit_and_run(worker2, plan["token"],
+                                 [{"index": 0, "action": "import",
+                                   "account_id": "chk"}])
             self.assertTrue(out[0]["ok"], out)
         finally:
             worker2.close()

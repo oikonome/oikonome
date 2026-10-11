@@ -11,6 +11,7 @@ the live path is exercised only via monkeypatch.
 
 import os
 import unittest
+from unittest import mock
 
 from fastapi.testclient import TestClient
 
@@ -134,7 +135,7 @@ class SpamModuleTests(unittest.TestCase):
     def test_live_flag_blocks_and_caches(self):
         os.environ["OIKONOME_SPAM_API"] = "on"
         orig_sfs = spamdefense._sfs_lookup
-        spamdefense._sfs_lookup = lambda e, ip, t: {
+        spamdefense._sfs_lookup = lambda e, t: {
             "blacklisted": 1, "confidence": 99.9, "frequency": 255}
         try:
             res = spamdefense.check("request", "x@fresh-live.test")
@@ -152,7 +153,7 @@ class SpamModuleTests(unittest.TestCase):
     def test_live_clean_allows_and_caches(self):
         os.environ["OIKONOME_SPAM_API"] = "on"
         orig_sfs = spamdefense._sfs_lookup
-        spamdefense._sfs_lookup = lambda e, ip, t: {
+        spamdefense._sfs_lookup = lambda e, t: {
             "blacklisted": 0, "confidence": 0, "frequency": 0}
         try:
             self.assertFalse(
@@ -166,7 +167,7 @@ class SpamModuleTests(unittest.TestCase):
     def test_live_timeout_fails_open(self):
         os.environ["OIKONOME_SPAM_API"] = "on"
         orig_sfs = spamdefense._sfs_lookup
-        spamdefense._sfs_lookup = lambda e, ip, t: None   # timeout / API down
+        spamdefense._sfs_lookup = lambda e, t: None   # timeout / API down
         try:
             self.assertFalse(
                 spamdefense.check("request", "x@unknown-live.test")["blocked"])
@@ -184,7 +185,7 @@ class SpamModuleTests(unittest.TestCase):
         seen = {}
         orig_sfs = spamdefense._sfs_lookup
 
-        def _cap(email, ip, t):
+        def _cap(email, t):
             seen["email"] = email
             return {"blacklisted": 0, "confidence": 0}
         spamdefense._sfs_lookup = _cap
@@ -194,6 +195,32 @@ class SpamModuleTests(unittest.TestCase):
             spamdefense._sfs_lookup = orig_sfs
         self.assertEqual(seen["email"], "probe@novel-probe.test")
         self.assertNotIn("realperson", seen["email"])
+
+    def test_live_probe_sends_nothing_about_the_visitor(self):
+        """The verdict is read from the domain block alone and cached by
+        domain, so the lookup carries the synthetic address and nothing
+        else — not the visitor's IP, which would tell a third party who
+        signed up and when, for no effect on the outcome."""
+        import httpx
+        os.environ["OIKONOME_SPAM_API"] = "on"
+        seen = []
+        real = httpx.Client
+
+        def handler(req):
+            seen.append(dict(req.url.params))
+            return httpx.Response(200, json={"success": 1, "email": {
+                "blacklisted": 0, "confidence": 0}})
+
+        def client(*a, **k):
+            k["transport"] = httpx.MockTransport(handler)
+            return real(*a, **k)
+        with mock.patch("httpx.Client", client):
+            spamdefense.check("signup", "visitor@quiet-probe.test")
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(set(seen[0]), {"email", "json"})
+        self.assertEqual(seen[0]["email"], "probe@quiet-probe.test")
+        import inspect
+        self.assertNotIn("ip", inspect.signature(spamdefense.check).parameters)
 
     def test_manual_block_of_safelisted_domain_is_honored(self):
         # an explicit operator block must not be shadowed

@@ -6,7 +6,9 @@
 // `impl` is a module exposing parseMoneyDraft, signedBalance,
 // mergePlannerBuckets, reimbOwed, spendPickerGroups, localYmd,
 // adoptsDeviceZone, the reimbursement matcher's reimbCandidateWhy,
-// pairGapHint and reimbLeft, and receiptDetailsDraft.
+// pairGapHint and reimbLeft, receiptDetailsDraft, and the whole-value
+// save rebase (rebaseFields, rebaseKeyed, rebaseNamedList, rebaseNamedSave,
+// assetListLanded).
 
 // The awaiting-reimbursement rows the owed-back case runs, exported so the
 // server suite can seed the same rows and check the server's own figure
@@ -35,8 +37,99 @@ export const REIMB_OWED = 60 + 25 + 0 + 0 + 0 + 12 + 100 + 0;
 export function moneyCases(impl, assert) {
   const { parseMoneyDraft, signedBalance, mergePlannerBuckets, reimbOwed,
           spendPickerGroups, localYmd, adoptsDeviceZone, reimbCandidateWhy,
-          pairGapHint, reimbLeft, receiptDetailsDraft } = impl;
+          pairGapHint, reimbLeft, receiptDetailsDraft, rebaseFields,
+          rebaseKeyed, rebaseNamedList, rebaseNamedSave, assetListLanded } = impl;
   return {
+    "a whole-value save keeps what another device saved meanwhile": () => {
+      // one field changed here, another changed elsewhere: both survive
+      assert.deepEqual(
+        rebaseFields({ on: true, hour: 7 }, { on: false, hour: 7 },
+                     { on: false, hour: 9 }),
+        { on: true, hour: 9 });
+      // a field changed both places: this save's edit wins
+      assert.deepEqual(
+        rebaseFields({ hour: 8 }, { hour: 7 }, { hour: 9 }), { hour: 8 });
+      // keyed (debt overrides, schedule cadences): untouched keys follow
+      // the stored copy, a key deleted elsewhere stays gone unless edited
+      // here, a key added elsewhere is kept, one removed here stays removed
+      const base = { a: { apr: "", skip: false }, b: { apr: "5", skip: false },
+                     c: { apr: "", skip: false }, d: { apr: "1", skip: false } };
+      const live = { a: { apr: "19", skip: false }, b: { apr: "5", skip: true },
+                     e: { apr: "", skip: false } };
+      const mine = { a: { apr: "", skip: true }, b: { apr: "6", skip: false },
+                     c: { apr: "2", skip: false } };
+      assert.deepEqual(rebaseKeyed(mine, base, live), {
+        a: { apr: "19", skip: true }, b: { apr: "6", skip: true },
+        e: { apr: "", skip: false }, c: { apr: "2", skip: false } });
+      // nothing edited: the save writes back exactly what is stored
+      assert.deepEqual(rebaseKeyed(base, base, live), live);
+    },
+    "the asset list saves only this editor's rows over the stored list": () => {
+      const opened = [
+        { name: "Home", kind: "property", value: 400000, as_of: "2026-01-01",
+          auto: "zillow" },
+        { name: "Car", kind: "vehicle", value: 20000, as_of: "2026-01-01" },
+        { name: "Boat", kind: "other", value: 5000, as_of: "2026-01-01" }];
+      // since the editor opened: the nightly valuation moved Home, another
+      // device added a Loan and deleted the Boat
+      const stored = [
+        { ...opened[0], value: 410000, as_of: "2026-02-01" }, opened[1],
+        { name: "Loan", kind: "mortgage", value: -90000, as_of: "2026-02-01" }];
+      const keys = ["Home\u00000", "Car\u00000", "Boat\u00000"];
+      // here: Car's value edited (as_of cleared), Home untouched, Boat
+      // left alone, one new row
+      const rows = [
+        { ...opened[0], orig: keys[0] },
+        { ...opened[1], value: 18000, as_of: null, orig: keys[1] },
+        { ...opened[2], orig: keys[2] },
+        { name: "Bike", kind: "vehicle", value: 900 }];
+      assert.deepEqual(rebaseNamedList(rows, opened, stored), [
+        stored[0],
+        { name: "Car", kind: "vehicle", value: 18000, as_of: null },
+        stored[2],
+        { name: "Bike", kind: "vehicle", value: 900 }]);
+      // a row removed here stays removed; a rename keeps the row's
+      // stored fields under the new name
+      assert.deepEqual(rebaseNamedList(
+        [{ ...opened[0], name: "House", orig: keys[0] }], opened.slice(0, 2),
+        stored.slice(0, 2)),
+        [{ ...stored[0], name: "House" }]);
+      // two rows of one name are two rows
+      const twins = [{ name: "Lot", value: 1 }, { name: "Lot", value: 2 }];
+      assert.deepEqual(rebaseNamedList(
+        [{ ...twins[0], orig: "Lot\u00000" }, { name: "Lot", value: 3, orig: "Lot\u00001" }],
+        twins, twins), [{ name: "Lot", value: 1 }, { name: "Lot", value: 3 }]);
+    },
+    "saving the asset list again after a lost reply adds nothing twice": () => {
+      // opened on [House]; House renamed Home, Car added; the first Save
+      // lands but its reply is lost, so the editor is still open
+      const opened = [{ name: "House", kind: "property", value: 300000,
+                        as_of: "2026-01-01" }];
+      const rows = [{ ...opened[0], name: "Home", orig: "House\u00000" },
+                    { name: " Car ", kind: "vehicle", value: 9000.004 }];
+      const first = rebaseNamedSave(rows, opened, opened, null);
+      assert.deepEqual(first.list.map((a) => a.name), ["Home", " Car "]);
+      // the server stored it its own way: names trimmed, a date stamped
+      const stored = [{ ...opened[0], name: "Home" },
+                      { name: "Car", kind: "vehicle", value: 9000,
+                        as_of: "2026-10-02" }];
+      assert.equal(assetListLanded(first.list, stored), true);
+      const kept = rows.map((r, i) => ({ ...r, ...first.rows[i] }));
+      const again = rebaseNamedSave(kept, first.baseline, stored, first.list);
+      assert.deepEqual(again.list.map((a) => a.name.trim()), ["Home", "Car"]);
+      assert.deepEqual(again.baseline, stored);
+      // the old rebase, given the same retry, wrote both rows twice
+      assert.equal(rebaseNamedList(rows, opened, stored).length, 4);
+      // an edit made after the lost reply still goes in, once
+      const edited = kept.map((r, i) => (i === 1 ? { ...r, value: 8000 } : r));
+      const third = rebaseNamedSave(edited, first.baseline, stored, first.list);
+      assert.equal(third.list.length, 2);
+      assert.equal(third.list[1].value, 8000);
+      // the first Save never landed: the retry is the ordinary rebase
+      const retry = rebaseNamedSave(kept, first.baseline, opened, first.list);
+      assert.deepEqual(retry.list, first.list);
+      assert.equal(assetListLanded(first.list, opened), false);
+    },
     "a receipt's typed details are money in, a real day and a short store": () => {
       assert.deepEqual(receiptDetailsDraft("$12.34", "2030-03-01"),
         { ok: true, body: { total: 12.34, date: "2030-03-01" } });

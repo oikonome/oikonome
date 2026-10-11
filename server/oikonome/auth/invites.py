@@ -118,6 +118,16 @@ def peek(conn, token: str) -> dict | None:
     return {**row, "email": bound_address(row["label"])}
 
 
+def minted_by_shared_login(conn, token: str) -> bool:
+    """Was this pending invite minted by a login whose second factor is
+    waived — the shared demonstration login, whose password is handed out?"""
+    row = conn.execute(
+        """SELECT u.second_factor_waived FROM invites i
+             JOIN users u ON u.id = i.created_by
+            WHERE i.token_hash = %s""", (_h(token),)).fetchone()
+    return bool(row and row["second_factor_waived"])
+
+
 # ONE message for bad-invite AND taken-email. A distinct pair ("invalid,
 # used, or expired" vs "an account with that email already exists"), plus a
 # burn that rolls back on the email check, would make a valid invite a
@@ -227,6 +237,13 @@ def claim(conn, token: str, email: str, password: str,
             conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
                          ("oikonome:tenant-members:"
                           + str(inv["tenant_id"]),))
+            # The burn committed on its own, so an owner's recovery may have
+            # run since: it takes this lock and deletes the invites burned
+            # just before it, and the member this claim would create is one
+            # the recovery neither removed nor named. Gone means refused.
+            if not conn.execute("SELECT 1 FROM invites WHERE token_hash = %s",
+                                (_h(token),)).fetchone():
+                raise ValueError(CLAIM_FAILED)
             n = conn.execute(
                 "SELECT count(*) AS n FROM users WHERE tenant_id = %s",
                 (inv["tenant_id"],)).fetchone()["n"]

@@ -6,8 +6,8 @@
 // timeframe chips (All by default), monthly totals.
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { useMemo, useState } from "react";
-import { Pressable, ScrollView, StyleSheet, Text, TextInput,
+import { useEffect, useMemo, useState } from "react";
+import { Alert, Pressable, ScrollView, StyleSheet, Text, TextInput,
          View } from "react-native";
 
 import StaleBanner from "../components/stale-banner";
@@ -16,14 +16,14 @@ import TxnRow from "../components/txn-row";
 import { Card, H, KV, Pill } from "../components/ui";
 import { errText, setBillPrefill, setHandedOffTxn, type Bill, type BillsData, type BillsHistoryData,
          type Proposal } from "../lib/api";
-import { patchDismissedHint, patchList, patchQuery,
+import { patchDismissedHint, patchList, patchQueries, patchQuery,
          removeFromList } from "../lib/cache";
 import { useSession } from "../lib/session";
 import { useDemo, useViewer } from "../lib/viewer";
 import { C, mmddyy, money } from "../lib/theme";
 import MerchantAvatar from "../components/merchant-avatar";
-import { catLabel, filterCategories, RANGE_LABEL, TREND_RANGES,
-         type TrendRange } from "../lib/pure";
+import { cadenceChoices, cadenceWords, catLabel, filterCategories, missedBillPill,
+         proposalSuperseded, RANGE_LABEL, TREND_RANGES, type TrendRange } from "../lib/pure";
 
 // the web page's health pill wording
 const HEALTH_LABEL: Record<string, { text: string;
@@ -33,6 +33,9 @@ const HEALTH_LABEL: Record<string, { text: string;
   stale: { text: "stale", tone: "bad" },
   mismatch: { text: "amounts differ", tone: "warn" },
   misdated: { text: "misdated", tone: "warn" },
+  // the missed cycle WAS charged; the bank feed took the charge back — the
+  // date is spelled out under the header (missedBillPill)
+  withdrawn: { text: "withdrawn", tone: "warn" },
 };
 // any unknown health falls through to off-ledger, like the web's hpill
 const healthPill = (h: string) =>
@@ -107,20 +110,35 @@ export default function BillHistory() {
     mutationFn: ({ pid, action }:
         { pid: string; action: "approve" | "reject" }) =>
       client!.billsProposal(pid, action),
-    onSuccess: (_r, v) => {
+    onSuccess: (r, v) => {
+      const gone = proposalSuperseded(r);
+      if (gone) Alert.alert("Already tracked",
+        `${r.payee} is already tracked — the offer was withdrawn.`);
       removeFromList<BillsHistoryData, Proposal>(qc, histKey,
         "proposals", (p) => p.id === v.pid);
       removeFromList<BillsData, Proposal>(qc, ["bills"], "proposals",
         (p) => p.id === v.pid);
-      if (v.action === "approve") afterBillWrite(); else refetch();
+      if (v.action === "approve" && !gone) afterBillWrite(); else refetch();
       qc.invalidateQueries({ queryKey: ["budgets-suggest"] });
+    },
+    onError: (e, v) => {
+      Alert.alert("Couldn't decide the proposal", errText(e));
+      // an offer for a bill already tracked is withdrawn by the server as
+      // it refuses: the card could neither be approved nor dismissed
+      if (proposalSuperseded(e)) {
+        removeFromList<BillsHistoryData, Proposal>(qc, histKey,
+          "proposals", (p) => p.id === v.pid);
+        removeFromList<BillsData, Proposal>(qc, ["bills"], "proposals",
+          (p) => p.id === v.pid);
+        refetch();
+      }
     },
   });
   const d = q.data;
   const bill = d?.bill;
   const fit = d?.fit;
   const cadLabel = (v: string) =>
-    d?.cadences.find(([cv]) => cv === v)?.[1] ?? v;
+    d?.cadences.find(([cv]) => cv === v)?.[1] ?? cadenceWords(v);
   const health = d?.health ? healthPill(d.health.health) : null;
   const showDismiss = !!d?.health
     && (["mismatch", "stale", "misdated"].includes(d.health.health)
@@ -147,6 +165,12 @@ export default function BillHistory() {
               {bill && <Pill text={bill.bill_type} />}
               {bill?.income && <Pill text="income" tone="good" />}
             </View>
+            {d.health?.health === "withdrawn"
+              && missedBillPill(d.health.withdrawn_on).note ? (
+              <Text style={{ color: C.warn, fontSize: 12, marginTop: 4 }}>
+                {missedBillPill(d.health.withdrawn_on).note}
+              </Text>
+            ) : null}
             <Text style={s.mut}>
               {bill ? (
                 <>
@@ -222,9 +246,18 @@ export default function BillHistory() {
                 </Pressable>
               ) : null}
             </View>
-            {!bill && !d.covered_by && !viewer && (
+            {/* an archived bill under this payee is restored, not added
+                again — a save here would edit that archived row */}
+            {!bill && !d.covered_by && !viewer && (d.bill_archived ? (
+              <RestoreArchived payee={d.payee} onDone={afterBillWrite} />
+            ) : (
               <AddAsBill payee={d.payee} fit={fit ?? null}
-                         cadences={d.cadences} onDone={afterBillWrite} />
+                         inflow={!!d.inflow} onDone={afterBillWrite} />
+            ))}
+            {/* hidden on the demo instance, whose rename door refuses;
+                keyed by payee so the target's screen starts closed */}
+            {!viewer && !demo && (
+              <MergeInto key={d.payee} payee={d.payee} inUse={d.merchant_in_use} />
             )}
           </Card>
 
@@ -273,7 +306,7 @@ export default function BillHistory() {
               })}
               {proposal.isError ? (
                 <Text style={{ color: C.bad, fontSize: 12 }}>
-                  {String(proposal.error)}
+                  {errText(proposal.error)}
                 </Text>
               ) : null}
             </Card>
@@ -355,7 +388,7 @@ export default function BillHistory() {
             <Card>
               <H>Monthly totals</H>
               {d.monthly.map((m) => (
-                <KV key={m.month} k={mmddyy(m.month + "-01").slice(0, 5)}
+                <KV key={m.month} k={mmddyy(m.month + "-01")}
                     v={`${money(m.total, false)} · ${m.count}`} tone="mut" />
               ))}
             </Card>
@@ -366,11 +399,167 @@ export default function BillHistory() {
   );
 }
 
-function AddAsBill({ payee, fit, cadences, onDone }: {
+// The automatic resolver sometimes gives a renamed feed string its own
+// merchant ("Northwind" arriving later as "Northwind Supply"). This is the
+// Merchants screen's merge, offered where the duplicate is noticed: the
+// same journalled rename, undone the same way from the Merchants list. The
+// picker searches the catalog, so the target always exists — a typo cannot
+// fork a third merchant.
+function MergeInto({ payee, inUse }: { payee: string; inUse?: boolean }) {
+  const { client } = useSession();
+  const router = useRouter();
+  const qc = useQueryClient();
+  const [open, setOpen] = useState(false);
+  const [pick, setPick] = useState("");
+  const [pickQ, setPickQ] = useState("");
+  const [target, setTarget] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  useEffect(() => {
+    const id = setTimeout(() => setPickQ(pick.trim()), 250);
+    return () => clearTimeout(id);
+  }, [pick]);
+  const cands = useQuery({ queryKey: ["merchants", pickQ, "count"],
+                           queryFn: () => client!.merchantCatalog(pickQ, "count"),
+                           enabled: !!client && open && pickQ.length > 0,
+                           placeholderData: (prev) => prev });
+  const options = (cands.data?.merchants ?? [])
+    .filter((m) => m.display !== payee).slice(0, 8);
+  // The merge renames what ledger rows display. A bill can carry a name of
+  // its own that no row shows, and the rename door has nothing to move for
+  // it, so the control only appears for a name the ledger displays. A
+  // server that does not say so is asked through the catalog instead.
+  const known = useQuery({ queryKey: ["merchants", payee, "count"],
+                           queryFn: () => client!.merchantCatalog(payee, "count"),
+                           enabled: !!client && inUse === undefined && !!payee });
+  const isMerchant = inUse ?? !!known.data?.merchants.some((m) => m.display === payee);
+  const close = () => { setOpen(false); setPick(""); setTarget(null); setErr(null); };
+  const merge = useMutation({
+    mutationFn: (to: string) => client!.merchantRename(payee, to),
+    onMutate: () => setErr(null),
+    onSuccess: (_r, to) => {
+      // the source name is gone from every merchant list the moment the
+      // server answers — both the catalog shape and the bill picker's flat
+      // list live under ["merchants"]
+      patchQueries<{ merchants: (string | { display: string })[] }>(
+        qc, ["merchants"], (old) => Array.isArray(old.merchants)
+          ? { ...old, merchants: old.merchants.filter((m) =>
+              (typeof m === "string" ? m : m.display) !== payee) }
+          : old);
+      // what the merge moved: the target's counts and detail, every ledger
+      // row that printed the old name, the bill that followed it
+      qc.invalidateQueries({ queryKey: ["merchants"] });
+      qc.invalidateQueries({ queryKey: ["merchant-detail"] });
+      qc.invalidateQueries({ queryKey: ["transactions"], refetchType: "none" });
+      qc.invalidateQueries({ queryKey: ["bills"], refetchType: "none" });
+      qc.invalidateQueries({ queryKey: ["payee-history", to] });
+      qc.invalidateQueries({ queryKey: ["today"], refetchType: "none" });
+      // replace, not push: back must not land on a merchant that is gone
+      router.replace({ pathname: "/bill-history",
+                       params: { payee: to } } as never);
+      // the source's history names a merchant that no longer exists
+      qc.removeQueries({ queryKey: ["payee-history", payee] });
+    },
+    onError: (e) => setErr(errText(e)),
+  });
+  if (!isMerchant && !open) return null;
+  if (!open) return (
+    <Pressable style={[s.btn, s.btnQuiet, { alignSelf: "flex-start", marginTop: 10 }]}
+               onPress={() => setOpen(true)}>
+      <Text style={[s.btnText, { color: C.accent }]}>Merge into…</Text>
+    </Pressable>
+  );
+  return (
+    <View style={{ marginTop: 10, gap: 8 }}>
+      {target ? (
+        <>
+          <Text style={{ color: C.text, fontSize: 14 }}>
+            Rows named <Text style={{ fontWeight: "700" }}>{payee}</Text> will
+            be filed under <Text style={{ fontWeight: "700" }}>{target}</Text>;
+            the bill, if any, follows.
+          </Text>
+          <View style={{ flexDirection: "row", gap: 8 }}>
+            <Pressable style={[s.btn, merge.isPending && { opacity: 0.5 }]}
+                       disabled={merge.isPending}
+                       onPress={() => merge.mutate(target)}>
+              <Text style={s.btnText}>
+                {merge.isPending ? "Merging…" : "Yes, merge"}</Text>
+            </Pressable>
+            <Pressable style={[s.btn, s.btnQuiet]} disabled={merge.isPending}
+                       onPress={() => setTarget(null)}>
+              <Text style={[s.btnText, { color: C.mut }]}>Back</Text>
+            </Pressable>
+          </View>
+        </>
+      ) : (
+        <>
+          <TextInput style={s.input} value={pick} onChangeText={setPick} autoFocus
+                     placeholder="merge into which merchant?" placeholderTextColor={C.mut}
+                     autoCapitalize="none" autoCorrect={false} />
+          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
+            {options.map((o) => (
+              <Pressable key={o.display} style={s.chip}
+                         onPress={() => setTarget(o.display)}>
+                <Text style={{ color: C.accent, fontSize: 12 }}>
+                  {o.display}<Text style={{ color: C.mut }}> · {o.rows}</Text></Text>
+              </Pressable>
+            ))}
+            {pickQ.length > 0 && !cands.isPending && options.length === 0 && (
+              <Text style={s.mut}>No merchant matches that.</Text>
+            )}
+          </View>
+          <Pressable style={[s.btn, s.btnQuiet, { alignSelf: "flex-start" }]}
+                     onPress={close}>
+            <Text style={[s.btnText, { color: C.mut }]}>Cancel</Text>
+          </Pressable>
+        </>
+      )}
+      {err ? (
+        <Text style={{ color: C.bad, fontSize: 12 }}
+              onPress={() => setErr(null)}>{err}</Text>
+      ) : null}
+    </View>
+  );
+}
+
+function RestoreArchived({ payee, onDone }: {
+  payee: string; onDone: () => void;
+}) {
+  const { client } = useSession();
+  const qc = useQueryClient();
+  const [err, setErr] = useState<string | null>(null);
+  const restore = useMutation({
+    mutationFn: () => client!.billsRestore(payee),
+    onMutate: () => setErr(null),
+    onSuccess: () => {
+      removeFromList<BillsData, BillsData["archived"][number]>(
+        qc, ["bills"], "archived", (b) => b.payee === payee);
+      onDone();
+    },
+    onError: (e) => setErr(errText(e)),
+  });
+  return (
+    <View style={{ marginTop: 10, gap: 8 }}>
+      <Text style={s.mut}>This bill is archived.</Text>
+      <Pressable style={[s.btn, { alignSelf: "flex-start" },
+                   restore.isPending && { opacity: 0.5 }]}
+                 disabled={restore.isPending}
+                 onPress={() => restore.mutate()}>
+        <Text style={s.btnText}>
+          {restore.isPending ? "Restoring…" : "Restore"}
+        </Text>
+      </Pressable>
+      {err ? <Text style={{ color: C.bad, fontSize: 12 }}>{err}</Text> : null}
+    </View>
+  );
+}
+
+function AddAsBill({ payee, fit, inflow, onDone }: {
   payee: string;
+  // a mostly-inflow payee (a paycheck) is recurring income; saved as a
+  // bill it would wait for a charge that never comes
+  inflow: boolean;
   fit: { kind: string; amount: number; cadence: string;
          next_due: string; label: string } | null;
-  cadences: [string, string][];
   onDone: () => void;
 }) {
   const { client } = useSession();
@@ -386,25 +575,21 @@ function AddAsBill({ payee, fit, cadences, onDone }: {
     : cadence;
   const add = useMutation({
     mutationFn: () => client!.billsSave({
-      payee, amount, cadence: effCadence, next_due: nextDue || undefined }),
+      payee, amount, cadence: effCadence, next_due: nextDue || undefined,
+      income: inflow }),
     onSuccess: onDone,
     onError: (e) => setErr(errText(e)),
   });
   // a ledger suggestion may be an unusual cadence not in the short list —
   // keep it selectable/visible rather than silently mis-showing
   const options: [string, string][] = [
-    ...SIMPLE_CADENCES,
-    ...(fit && !SIMPLE_CADENCES.some(([v]) => v === fit.cadence)
-      ? [[fit.cadence,
-          cadences.find(([v]) => v === fit.cadence)?.[1] ?? fit.cadence] as
-          [string, string]]
-      : []),
+    ...cadenceChoices(SIMPLE_CADENCES, [fit?.cadence]),
     ["CUSTOM", "custom interval…"],
   ];
   return (
     <View style={{ marginTop: 10, gap: 8 }}>
       <Text style={{ color: C.text, fontSize: 14, fontWeight: "700" }}>
-        Add as recurring bill
+        {inflow ? "Add as recurring income" : "Add as recurring bill"}
       </Text>
       <TextInput style={s.input} placeholder="amount"
                  placeholderTextColor={C.mut} value={amount}

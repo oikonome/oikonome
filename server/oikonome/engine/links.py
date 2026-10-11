@@ -109,6 +109,27 @@ def groups(conn) -> list[dict]:
     return result
 
 
+def effective_account(conn, account_id: str | None) -> str | None:
+    """The account that currently stands for `account_id`: the effective
+    primary of its link group when it is a linked member, else itself.
+
+    Something pinned to one source of a dual-sourced account — a savings
+    goal, say — must keep reading that account's money when the group fails
+    over. Every aggregate drops shadow rows, so a pin left on a member that
+    has become the shadow would read nothing at all while the money sits in
+    the twin. A group nobody serves (every member hidden) leaves the pin as
+    it is: there is no live copy to read instead."""
+    if not account_id:
+        return account_id
+    for g in groups(conn):
+        ids = [m["account_id"] for m in g["members"]]
+        if account_id in ids:
+            primary = next((m["account_id"] for m in g["members"]
+                            if m["primary"]), None)
+            return primary or account_id
+    return account_id
+
+
 def shadow_ids(conn) -> list[str]:
     """Every account the money math must ignore.
 

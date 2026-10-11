@@ -146,7 +146,11 @@ def stranded(conn, ids: list[str] | None = None) -> list[dict]:
     that hold is not a charge, the retirement is meant to be reversible by
     flipping one column back, and when such a hold does post the aggregator
     names it as the predecessor — so the settlement carry moves the work
-    with the link in hand instead of this module guessing at one."""
+    with the link in hand instead of this module guessing at one. The
+    twin dedup stamps the same column on the row it retires, after running
+    this module's own move onto the survivor it chose: what that left
+    behind is an answer the survivor refused, which no twin hunt can place
+    either."""
     refs = " OR ".join(
         f"EXISTS (SELECT 1 FROM {t} c WHERE c.{col} = t.id)"
         for t, col in CHILD_TABLES)
@@ -187,7 +191,21 @@ def find_twin(conn, row: dict) -> tuple[str | None, str]:
     exactly a week away is what a weekly subscription looks like, and a
     lone same-amount stranger is a different purchase that happened to cost
     the same. Either would take the person's note and receipts onto a
-    charge they never wrote them about."""
+    charge they never wrote them about.
+
+    A posted row that names the retired one as its pending authorization
+    is its twin whatever it settled at: a tip, a fuel pre-auth posting at
+    the pump total. The feed stored that link at settlement, so no amount
+    or name has to vouch for it — but it must still be on the same account,
+    as the settlement itself requires."""
+    linked = conn.execute(
+        """SELECT id FROM transactions
+            WHERE removed = 0 AND id <> %s AND account_id = %s
+              AND raw->>'pending_transaction_id' = %s
+            ORDER BY id""",
+        (row["id"], row["account_id"], row["id"])).fetchall()
+    if len(linked) == 1:
+        return linked[0]["id"], "matched"
     cands = conn.execute(
         """SELECT id, COALESCE(merchant_name, name) AS mname, name,
                   merchant_name_set_aside AS aside, date
@@ -341,11 +359,14 @@ def _move(conn, old_id: str, new_id: str) -> dict | None:
     n = carry_unmatch_memory(conn, [old_id], [new_id])
     if n:
         moved["unmatched_receipts"] = n
+    # the twin's own contribution or reimbursement already answers the one
+    # fronted question a transaction has (see base.SAME_EQUITY_ANSWER)
+    from .base import SAME_EQUITY_ANSWER
     moved["equity_movement"] = conn.execute(
-        """UPDATE equity_movement e SET txn_id = %s
+        f"""UPDATE equity_movement e SET txn_id = %s
             WHERE e.txn_id = %s AND NOT EXISTS
                   (SELECT 1 FROM equity_movement k
-                    WHERE k.txn_id = %s AND k.kind = e.kind)""",
+                    WHERE k.txn_id = %s AND {SAME_EQUITY_ANSWER})""",
         (new_id, old_id, new_id)).rowcount
     # a reimbursement pairing names two rows; either side may be the one
     n = conn.execute(
@@ -394,11 +415,21 @@ def _move(conn, old_id: str, new_id: str) -> dict | None:
     return {k: v for k, v in moved.items() if v}
 
 
-def reanchor_stranded(conn, ids: list[str] | None = None) -> dict:
+def reanchor_stranded(conn, ids: list[str] | None = None, *,
+                      release_after_days: int | None = None) -> dict:
     """Re-anchor every stranded removed row (or just `ids`) onto its live
     twin. Returns {"moved", "ambiguous", "no_twin", "left", "raced",
-    "tables"}; the log line names the counts, so a sweep that finds nothing
-    is silent.
+    "released", "tables"}; the log line names the counts, so a sweep that
+    finds nothing is silent.
+
+    `release_after_days`: the sweep's second job. A reimbursement pair on a
+    row the bank feed withdrew more than that many days ago, which this
+    pass's twin search still found no twin for, is released the way an
+    unlink is, so the surviving charge (or deposit) gets back the category
+    the full pair's transfer stamp set aside. Only after the wait: a
+    re-numbered twin can arrive pages, syncs or a re-link later, and a pair
+    released before then is a person's hand-made pairing lost for good. An
+    "ambiguous" row is never released — something there may be its twin.
 
     A carried row ends up in exactly one of two counts: "moved" when
     nothing is left on it, "left" when the live twin had its own answer and
@@ -406,11 +437,15 @@ def reanchor_stranded(conn, ids: list[str] | None = None) -> dict:
     sweep, which is the honest state — nothing can move it automatically
     without overwriting somebody's work."""
     out: dict = {"moved": 0, "ambiguous": 0, "no_twin": 0, "left": 0,
-                 "raced": 0, "tables": {}}
+                 "raced": 0, "released": 0, "fronted_released": 0,
+                 "tables": {}}
+    orphans: list[str] = []
     for row in stranded(conn, ids):
         twin, verdict = find_twin(conn, row)
         if twin is None:
             out[verdict] += 1
+            if verdict == "no_twin":
+                orphans.append(row["id"])
             continue
         try:
             with conn.transaction():
@@ -427,10 +462,31 @@ def reanchor_stranded(conn, ids: list[str] | None = None) -> dict:
                         exc_info=True)
             continue
         out["left" if left else "moved"] += 1
-    if out["moved"] or out["ambiguous"] or out["left"]:
+    if release_after_days is not None and orphans:
+        from ..engine import budget
+        try:
+            out["released"] = budget.release_withdrawn_pairs(
+                conn, orphans, older_than_days=release_after_days)
+        except Exception:                                 # noqa: BLE001
+            log.warning("releasing withdrawn pairs failed", exc_info=True)
+        # the same wait and the same rows for a capitalized or reimbursable
+        # cost: the books stop counting the withdrawn charge, and the
+        # movement explaining who paid for it must leave with it. Its own
+        # guard, so a failure on one kind still releases the other.
+        from ..engine import equity
+        try:
+            out["fronted_released"] = equity.release_withdrawn_fronted(
+                conn, orphans, older_than_days=release_after_days)
+        except Exception:                                 # noqa: BLE001
+            log.warning("releasing withdrawn fronted movements failed",
+                        exc_info=True)
+    if (out["moved"] or out["ambiguous"] or out["left"] or out["released"]
+            or out["fronted_released"]):
         log.info("re-anchored %d stranded row(s) onto their live twins "
                  "(%d ambiguous, %d without a twin, %d left on the retired "
-                 "row, %d overtaken by a pull): %s",
+                 "row, %d overtaken by a pull, %d withdrawn pair(s) and %d "
+                 "fronted movement(s) released): %s",
                  out["moved"], out["ambiguous"], out["no_twin"], out["left"],
-                 out["raced"], out["tables"])
+                 out["raced"], out["released"], out["fronted_released"],
+                 out["tables"])
     return out

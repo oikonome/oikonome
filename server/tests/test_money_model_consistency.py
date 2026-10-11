@@ -386,17 +386,18 @@ class GoalProgressShadowTests(unittest.TestCase):
 
     def _saved(self):
         cfg = {"savings_goals": [{"name": "trip", "target": 3000.0,
-                                  "monthly_plan": 0.0, "tokens": ["trip"]}]}
+                                  "monthly_plan": 0.0, "account_id": "sav1",
+                                  "tokens": ["trip"]}]}
         return savings.progress(self.conn, cfg, TODAY)[0]["saved"]
 
     def test_dual_source_transfer_counts_once(self):
         links.create(self.conn, ["sav1", "sav2"])
         self.assertEqual(self._saved(), 500.0)
 
-    def test_unlinked_accounts_all_count(self):
-        """No links → nothing is a shadow; two genuinely separate savings
-        accounts both count."""
-        self.assertEqual(self._saved(), 1000.0)
+    def test_a_goal_reads_only_its_own_account(self):
+        """No links → nothing is a shadow; the other savings account is a
+        separate account, and a goal pinned to one never counts it."""
+        self.assertEqual(self._saved(), 500.0)
 
 
 if __name__ == "__main__":

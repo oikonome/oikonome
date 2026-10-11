@@ -10,17 +10,21 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import * as Clipboard from "expo-clipboard";
 import { useState } from "react";
-import { Alert, Image, Pressable, ScrollView, StyleSheet, Switch, Text,
+import { Alert, Pressable, ScrollView, StyleSheet, Switch, Text,
          TextInput, View } from "react-native";
+import { SvgXml } from "react-native-svg";
 import PullRefresh from "../components/pull-refresh";
 
-import { Card, H, Pill } from "../components/ui";
-import { Me } from "../lib/api";
-import { patchList, patchQuery, removeFromList } from "../lib/cache";
-import { inviteOutcome, type InviteOutcome } from "../lib/pure";
+import { Card, H, Pill, SharedLock } from "../components/ui";
+import { errText, Me, NextCodeNeeded } from "../lib/api";
+import { invalidateAfterRotation, patchList, patchQuery, removeFromList,
+         smsPauseNote }
+  from "../lib/cache";
+import { inviteOutcome, membersRemovedNote, oneTimeCodeSentence,
+         svgFromDataUri, type InviteOutcome } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { C, mmddyy } from "../lib/theme";
-import { useOwner, useViewer } from "../lib/viewer";
+import { useOwner, useSharedLock, useViewer } from "../lib/viewer";
 
 // the web's error → sentence map, shared across the cards
 function explain(e: unknown): string {
@@ -29,8 +33,8 @@ function explain(e: unknown): string {
     return "Two-factor is on — enter your 6-digit code to confirm.";
   if (s0.includes("wrong password") || s0.includes("password_required"))
     return "That password didn't match.";
-  if (s0.includes("one-time code") || s0.includes("doesn't match"))
-    return "That code didn't match — check your app's clock.";
+  const codeSentence = oneTimeCodeSentence(s0);
+  if (codeSentence) return codeSentence;
   if (s0.includes("recovery_required"))
     return "This account signs in with a passkey — confirm with a "
       + "recovery code below.";
@@ -44,7 +48,9 @@ function explain(e: unknown): string {
     return "New password must be at least 10 characters.";
   if (s0.includes("last_factor"))
     return "This is your only two-factor method — add another first.";
-  return s0.replace(/^\d+:\s*/, "");
+  // String(e) leads with "Error: " before the status, so stripping a
+  // leading status alone still showed "Error: 409: {...}"
+  return errText(e);
 }
 
 function browserLabel(ua: string): string {
@@ -78,6 +84,11 @@ export default function Security() {
   const mayEdit = !useViewer();
   const owner = useOwner();
   const demo = !!me.data?.demo;
+  // the shared demonstration login is refused every change to itself and
+  // every grant that would outlive it, so those cards stay visible but
+  // switched off, each saying why (null = live)
+  const lockLogin = useSharedLock("login");
+  const lockGrant = useSharedLock("grant");
   const resend = useMutation({
     mutationFn: () => client!.verifyResend(),
     onSuccess: (r) => Alert.alert(r.verified
@@ -164,19 +175,27 @@ export default function Security() {
           web renders the same cards inside a disabled fieldset */}
       <View pointerEvents={demo ? "none" : "auto"}
             style={demo ? { opacity: 0.55 } : undefined}>
-        <PasswordCard />
-        {/* a view-only login cannot change its own address — the server
-            403s it, so mirror the web and don't offer the card */}
-        {mayEdit && <EmailCard email={me.data?.email ?? ""} />}
-        {me.data?.factor_reset_pending ? (
-          <PendingRecoveryCard lands={me.data.factor_reset_pending} />
-        ) : null}
-        <TwoFactorCard enabled={!!me.data?.totp_enabled}
-                       left={me.data?.recovery_codes_left} />
+        <SharedLock note={lockLogin}>
+          <PasswordCard />
+          {/* a view-only login cannot change its own address — the server
+              403s it, so mirror the web and don't offer the card */}
+          {mayEdit && <EmailCard email={me.data?.email ?? ""} />}
+          {me.data?.factor_reset_pending ? (
+            <PendingRecoveryCard lands={me.data.factor_reset_pending} />
+          ) : null}
+          <TwoFactorCard enabled={!!me.data?.totp_enabled}
+                         left={me.data?.recovery_codes_left} />
+        </SharedLock>
+        {/* the shared login's roster is withheld, so this renders
+            nothing for it — no sign-out buttons to switch off */}
         <SessionsCard />
-        <FamilyCard owner={owner} />
-        {owner ? <DeleteCard onDeleted={signOut} />
-               : <LeaveCard onDeleted={signOut} />}
+        <SharedLock note={lockGrant}>
+          <FamilyCard owner={owner} />
+        </SharedLock>
+        <SharedLock note={lockLogin}>
+          {owner ? <DeleteCard onDeleted={signOut} />
+                 : <LeaveCard onDeleted={signOut} />}
+        </SharedLock>
       </View>
     </ScrollView>
   );
@@ -211,11 +230,16 @@ function PasswordCard() {
         r.tokens_revoked ? `${r.tokens_revoked} script token(s) revoked` : "",
       ].filter(Boolean).join(", ");
       setMsg({ text: "Password changed — every other session was signed out"
-                     + (cost ? `; ${cost}.` : "."), bad: false });
+                     + (cost ? `; ${cost}.` : ".") + smsPauseNote(qc, r)
+                     + membersRemovedNote(r),
+               bad: false });
       setCur(""); setNext(""); setConfirm("");
-      // the rotation empties all four lists, not just sessions
-      for (const k of ["sessions", "devices", "tokens", "invites"])
+      // the rotation empties all four lists, not just sessions, and an
+      // owner's rotation also removes members who joined through the
+      // owner's recent invites
+      for (const k of ["sessions", "devices", "tokens", "invites", "members"])
         qc.invalidateQueries({ queryKey: [k] });
+      invalidateAfterRotation(qc);
     },
     onError: (e) => setMsg({ text: explain(e), bad: true }),
   });
@@ -279,13 +303,21 @@ function EmailCard({ email }: { email: string }) {
               ? ` ${r.passkeys_kept} passkey(s) kept — your only second `
                 + `factor.`
               : "")
-          + (r.hint ? ` Did you mean ${r.hint}?` : "") });
+          + (r.hint ? ` Did you mean ${r.hint}?` : "")
+          // the household's mail list named the old address, and it went
+          // with it
+          + (r.mail_list_entry_dropped
+              ? " Your old address was removed from the household's email "
+                + "list — ask the owner to add the new one."
+              : "")
+          + smsPauseNote(qc, r) + membersRemovedNote(r) });
       setNext("");
       patchQuery<Me>(qc, ["me"], { email: r.email,
         ...(r.verify_sent ? { verified: false } : {}) });
       // the same credential rotation a password change is
-      for (const k of ["sessions", "devices", "tokens", "invites"])
+      for (const k of ["sessions", "devices", "tokens", "invites", "members"])
         qc.invalidateQueries({ queryKey: [k] });
+      invalidateAfterRotation(qc);
     },
     onError: (e) => setMsg({ text: explain(e), bad: true }),
   });
@@ -394,24 +426,44 @@ function TwoFactorCard({ enabled, left }: {
       setEnroll(null); setCode("");
       if (r.recovery_codes?.length) setCodes(r.recovery_codes);
       setMsg({ text: "Two-factor is on — every other session was "
-                     + "signed out.", bad: false });
+                     + "signed out." + smsPauseNote(qc, r)
+                     + membersRemovedNote(r), bad: false });
       // setEnroll(null) above already re-rendered the card; without this
       // it shows the "off" form under the "on" message until ["me"] lands
       patchQuery<Me>(qc, ["me"], { totp_enabled: true,
         ...(r.recovery_codes ? { recovery_codes_left: r.recovery_codes.length }
                              : {}) });
-      qc.invalidateQueries({ queryKey: ["sessions"] });
+      // a second-factor change removes members who joined through the
+      // owner's recent invites, the same as a password change
+      for (const k of ["sessions", "members", "invites"])
+        qc.invalidateQueries({ queryKey: [k] });
+      invalidateAfterRotation(qc);
     },
     onError: fail,
   });
   const disable = useMutation({
     mutationFn: () => client!.totpDisable(code),
-    onSuccess: () => {
+    onSuccess: (r) => {
       setCode("");
-      setMsg({ text: "Two-factor is off.", bad: false });
+      setMsg({ text: "Two-factor is off." + smsPauseNote(qc, r)
+                     + membersRemovedNote(r), bad: false });
       patchQuery<Me>(qc, ["me"], { totp_enabled: false });
+      // turning the factor off removes the members who joined through the
+      // owner's recent invites, and the settings banner records them
+      for (const k of ["members", "invites", "settings"])
+        qc.invalidateQueries({ queryKey: [k] });
     },
-    onError: fail,
+    onError: (e) => {
+      if (e instanceof NextCodeNeeded) {
+        // the sheet may have spent the step the typed code belongs to
+        setCode("");
+        setMsg({ text: "Confirmed. Enter the next code from your app to "
+                       + "turn 2FA off.", bad: false });
+        return;
+      }
+      if (/code_used|already (been )?used/i.test(String(e))) setCode("");
+      fail(e);
+    },
   });
   const regen = useMutation({
     mutationFn: () => client!.recoveryRegenerate(),
@@ -460,8 +512,8 @@ function TwoFactorCard({ enabled, left }: {
           </Text>
           <View style={{ backgroundColor: "#fff", padding: 8,
                          alignSelf: "flex-start", borderRadius: 8 }}>
-            <Image source={{ uri: enroll.qr }}
-                   style={{ width: 180, height: 180 }} />
+            <SvgXml xml={svgFromDataUri(enroll.qr)}
+                    width={180} height={180} />
           </View>
           <Text style={s.mut} selectable>
             Secret (base32):{" "}

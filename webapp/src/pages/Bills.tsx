@@ -4,12 +4,31 @@
 // Status is ONE column, not a state pill beside a health pill: a healthy
 // bill says nothing, so the only coloured rows want a decision.
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Fragment, useEffect, useRef, useState } from "react";
+import { createContext, Fragment, useContext, useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
-import { api, errText, mmdd, money as money$, toast, type Bill, type BillsData, catLabel } from "../api/client";
+import { api, errText, mmdd, money as money$, toast, type Bill, type BillsData, catLabel, proposalSuperseded } from "../api/client";
 import { patchList, removeFromList } from "../api/cache";
 import { canEdit } from "../role";
+import { cadenceChoices } from "../cadence";
 const money = (v: number | null | undefined) => money$(v, true);  // cents on transaction/recurring surfaces
+
+// ---- stepping back through the months ----
+// The page's stats are one month's: this month as of today, or a past
+// month as it ended (?month=YYYY-MM, the server's own reading). The rows
+// learn which from this context rather than a prop threaded through the
+// table: a past month has no "in 12 days" — a bill was paid, missed, or
+// not due.
+const PastMonthCtx = createContext<string | null>(null);   // the label, when past
+const ymOf = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+export const shiftYm = (ym: string, by: number) => {
+  const [y, m] = ym.split("-").map(Number);
+  const d = new Date(y, m - 1 + by, 1);
+  return ymOf(d);
+};
+export const ymLabel = (ym: string) => {
+  const [y, m] = ym.split("-").map(Number);
+  return new Date(y, m - 1, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" });
+};
 
 
 // cadence select value → group heading (the list order is the rank)
@@ -29,7 +48,8 @@ const groupOf = (cadence: string) =>
 // The ADD pickers stay short: the common cadences + the
 // envelopes; anything unusual (every 2 weeks/3 months/2 years…) is one
 // "Custom interval…" click. GROUPS above still labels + groups every cadence,
-// and inline EDIT keeps the full server list, so existing bills are unaffected.
+// and inline EDIT keeps the full server list plus the bill's own interval
+// when that list lacks it, so an existing custom bill can always keep it.
 export const SIMPLE_CADENCES: [string, string][] = [
   ["DAILY:1", "daily"], ["WEEKLY:1", "weekly"], ["MONTHLY:1", "monthly"],
   ["YEARLY:1", "yearly"], ["ENVELOPE:1", "envelope (monthly pool)"],
@@ -82,8 +102,13 @@ const dueText = (n: number, income?: boolean) =>
 const SOON_DAYS = 3;
 
 const hpill = (h: string | null,
-               seen?: { date: string; amount: number } | null) =>
+               seen?: { date: string; amount: number } | null,
+               withdrawnOn?: string | null) =>
   h === "ok" ? <span className="pill g hide-m" title="ledger matches">✓</span>
+  // the missed cycle WAS charged; the bank feed took the charge back — a
+  // warning to check, not a bill gone quiet
+  : h === "withdrawn" ? <span className="pill a"
+        title={`charge withdrawn by the bank feed${withdrawnOn ? ` (${mmdd(withdrawnOn)})` : ""}`}>withdrawn</span>
   : h === "drifting" ? <span className="pill a" title="amount wandering — auto-corrects tonight">drifting</span>
   : h === "stale" ? <span className="pill r" title="a full cycle with no matching charge">stale</span>
   : h === "mismatch" ? <span className="pill a" title={"merchant is in the ledger but never near the configured amount"
@@ -109,7 +134,22 @@ export default function Bills({ autoDetect = false }:
   const qc = useQueryClient();
   const [sp, setSp] = useSearchParams();
   const edit = sp.get("edit") ?? "";
-  const q = useQuery({ queryKey: ["bills"], queryFn: api.bills });
+  // the month on view: absent = this month (the live key every write
+  // patches); a past month has its own key, so stepping back never
+  // overwrites the live list in the cache
+  const curYm = ymOf(new Date());
+  const month = sp.get("month") ?? "";
+  const isPast = !!month && month < curYm;
+  const q = useQuery({
+    queryKey: isPast ? ["bills", "month", month] : ["bills"],
+    queryFn: () => api.bills(isPast ? month : undefined),
+  });
+  const setMonth = (ym: string) => setSp((prev) => {
+    const n = new URLSearchParams(prev);
+    if (ym >= curYm) n.delete("month"); else n.set("month", ym);
+    n.delete("edit");
+    return n;
+  }, { replace: true });
   // the calendar section mounts once the bills are in; its own request
   // starts here, beside the bills', so the section paints with them
   useQuery({ queryKey: ["calendar"], queryFn: () => api.calendar(35) });
@@ -172,23 +212,33 @@ export default function Bills({ autoDetect = false }:
     qc.invalidateQueries({ queryKey: ["onboarding"] });
   };
 
+  const dropProposal = (pid: string) =>
+    qc.setQueryData(["bills"], (old?: BillsData) => old && {
+      ...old,
+      proposals: old.proposals.filter((p) => p.id !== pid),
+    });
+
   const act = useMutation({
     mutationFn: ({ pid, action }: { pid: string; action: "approve" | "reject" }) =>
       api.billsProposal(pid, action),
     onSuccess: (r, v) => {
-      toast(`${v.action === "approve" ? "Approved" : "Rejected"}: ${r.payee}`);
+      const gone = proposalSuperseded(r);
+      toast(gone ? `${r.payee} is already tracked — the offer was withdrawn`
+        : `${v.action === "approve" ? "Approved" : "Rejected"}: ${r.payee}`);
       // drop the decided proposal from the cached list NOW: the server has
       // already committed it, and waiting for the refetch to prove it left
       // the row sitting there through every other query this triggers.
-      qc.setQueryData(["bills"], (old?: BillsData) => old && {
-        ...old,
-        proposals: old.proposals.filter((p) => p.id !== v.pid),
-      });
-      // approving writes one bill; rejecting writes none
-      if (v.action === "approve") refetchAll();
+      dropProposal(v.pid);
+      // approving writes one bill; rejecting (or a withdrawn offer) none
+      if (v.action === "approve" && !gone) refetchAll();
       else refetchAfterReject();
     },
-    onError: (e) => toast(errText(e)),
+    onError: (e, v) => {
+      toast(errText(e));
+      // an offer for a bill already tracked is withdrawn by the server as
+      // it refuses: the card could neither be approved nor dismissed
+      if (proposalSuperseded(e)) { dropProposal(v.pid); refetchAfterReject(); }
+    },
   });
 
   const approveAll = useMutation({
@@ -229,9 +279,8 @@ export default function Bills({ autoDetect = false }:
   });
 
   const toggle = useMutation({
-    mutationFn: (v: string | { payee: string; disabled: boolean }) =>
-      typeof v === "string" ? api.billsToggle(v)
-                            : api.billsToggle(v.payee, v.disabled),
+    mutationFn: (v: { payee: string; disabled: boolean; fromQueue?: boolean }) =>
+      api.billsToggle(v.payee, v.disabled),
     onSuccess: (r, v) => {
       toast(`${r.payee}: ${r.disabled ? "disabled (excluded from budget)" : "enabled"}`);
       // the row and its editor read `disabled` from the list — flip it from
@@ -242,7 +291,7 @@ export default function Bills({ autoDetect = false }:
       // (as acceptAmount does) — armed before the write is confirmed, a
       // failed disable would show "Disabled X. [Undo]" for a bill that was never
       // disabled, with a live Undo that would fire blind later
-      if (typeof v !== "string" && v.disabled) {
+      if (v.fromQueue && v.disabled) {
         setUndo({ label: `Disabled ${r.payee}.`,
                   act: () => toggle.mutate(
                     { payee: r.payee, disabled: false }) });
@@ -257,9 +306,12 @@ export default function Bills({ autoDetect = false }:
   // Just an edit of the bill, so Undo is saving the old amount back.
   const acceptAmount = useMutation({
     mutationFn: ({ b, amt }: { b: Bill; amt: number }) =>
-      api.billsSave({ payee: b.payee, amount: amt,
-                      cadence: b.cadence_value, income: b.income,
-                      ...(b.due_on ? { next_due: b.due_on } : {}) }),
+      // no next_due: an amount change keeps the date, and this row's copy
+      // may predate the server rolling it on to the next cycle
+      // orig_payee marks this an edit of the bill the row shows, so a bill
+      // deleted since the list loaded is refused instead of recreated
+      api.billsSave({ payee: b.payee, orig_payee: b.payee, amount: amt,
+                      cadence: b.cadence_value, income: b.income }),
     onSuccess: (_r, v) => {
       setUndo({ label: `${v.b.payee} updated to ${money(v.amt)}.`,
                 act: () => acceptAmount.mutate(
@@ -387,7 +439,10 @@ export default function Bills({ autoDetect = false }:
   const rowHandlers = {
     onEdit: (p: string | null) =>
       setSp(p ? { edit: p } : {}, { replace: true }),
-    onToggle: (p: string) => toggle.mutate(p),
+    // the row sends the state its button offered, so a list that went
+    // stale under another member's change cannot flip the bill back
+    onToggle: (p: string, disabled: boolean) =>
+      toggle.mutate({ payee: p, disabled }),
     onArchive: (p: string) => del.mutate({ payee: p, mode: "archive" }),
     onPurge: (p: string) => del.mutate({ payee: p, mode: "purge" }),
     onSaved: () => {
@@ -405,9 +460,28 @@ export default function Bills({ autoDetect = false }:
                pdue: sp.get("pdue") ?? "" },
     cadences,
   };
+  const shownYm = isPast ? month : curYm;
   return (
-    <>
+    <PastMonthCtx.Provider value={isPast ? ymLabel(month) : null}>
       <h1>{autoDetect ? "Bills & Income" : "Bills"}</h1>
+      {/* step back through the months: the per-bill paid/received below
+          are the month on view, as it ended; the schedule stays live */}
+      {!autoDetect && (
+        <div className="sub" style={{ display: "flex", gap: ".5rem", alignItems: "center",
+                                      flexWrap: "wrap", margin: "-.4rem 0 .8rem" }}>
+          <button aria-label="Previous month"
+                  onClick={() => setMonth(shiftYm(shownYm, -1))}>‹</button>
+          <b style={{ color: "var(--ink)" }}>{ymLabel(shownYm)}</b>
+          <button aria-label="Next month" disabled={!isPast}
+                  onClick={() => setMonth(shiftYm(shownYm, 1))}>›</button>
+          {isPast ? (
+            <>
+              <button onClick={() => setMonth(curYm)}>This month</button>
+              <span>· how the month ended: paid and received per bill. Edits change the live schedule.</span>
+            </>
+          ) : <span>· this month so far</span>}
+        </div>
+      )}
       {/* HERO: what the schedule costs, which is otherwise a sum of a
           dozen cadence groups done by eye. Both figures are the budget's own
           evened-out monthly load, so this page and the Budget flow line
@@ -480,9 +554,7 @@ export default function Bills({ autoDetect = false }:
             {attnRows.map((b) => (
               <AttentionLine key={b.payee} b={b} mayEdit={mayEdit}
                 busy={(toggle.isPending
-                        && (typeof toggle.variables === "string"
-                              ? toggle.variables
-                              : toggle.variables?.payee) === b.payee)
+                        && toggle.variables?.payee === b.payee)
                       || (acceptAmount.isPending
                           && acceptAmount.variables?.b.payee === b.payee)
                       || (hint.isPending
@@ -495,7 +567,8 @@ export default function Bills({ autoDetect = false }:
                   if (toggle.isPending) return;
                   // Undo is armed in toggle's onSuccess, once the server
                   // has actually disabled the bill
-                  toggle.mutate({ payee: b.payee, disabled: true });
+                  toggle.mutate({ payee: b.payee, disabled: true,
+                                  fromQueue: true });
                 }}
                 onDismiss={() => hint.mutate({ payee: b.payee,
                                                action: "dismiss",
@@ -521,9 +594,9 @@ export default function Bills({ autoDetect = false }:
       )}
       {adding && (
         <AddBillForm onCancel={() => setAdding(false)}
-                     onSaved={() => {
+                     onSaved={(restored) => {
                        setAdding(false);
-                       toast("Bill added.");
+                       toast(restored ? "Bill restored." : "Bill added.");
                        refetchAll();
                      }} />
       )}
@@ -698,7 +771,7 @@ export default function Bills({ autoDetect = false }:
             can prove from your ledger.</p>
         </div>
       )}
-    </>
+    </PastMonthCtx.Provider>
   );
 }
 
@@ -711,13 +784,19 @@ const groupsOf = (ordered: [string, Row[]][], env: boolean) =>
 
 /** One table for many cadence groups: a thin separator row introduces each,
  * replacing a card-with-its-own-thead per group. */
-function BillTable({ groups, isEnv, income, edit, mayEdit, onEdit, onToggle,
+function BillTable(props: Omit<Parameters<typeof BillTableInner>[0], "past">) {
+  const past = useContext(PastMonthCtx);
+  return <BillTableInner {...props} past={!!past} />;
+}
+
+function BillTableInner({ past, groups, isEnv, income, edit, mayEdit, onEdit, onToggle,
                      onArchive, onPurge, onSaved, onHint, hintBusy,
                      togglePending, pendingDelete, prefill, cadences }: {
+  past: boolean;
   groups: [string, Row[]][]; isEnv: boolean; income?: boolean;
   edit: string; mayEdit: boolean;
   onEdit: (payee: string | null) => void;
-  onToggle: (payee: string) => void;
+  onToggle: (payee: string, disabled: boolean) => void;
   onArchive: (payee: string) => void;
   onPurge: (payee: string) => void;
   onSaved: () => void;
@@ -751,7 +830,7 @@ function BillTable({ groups, isEnv, income, edit, mayEdit, onEdit, onToggle,
         ) : (
           <tr><th>{income ? "Source" : "Bill"}</th>
             <th className="num">Amount</th>
-            <th>{income ? "Next expected" : "Next due"}</th>
+            <th>{past ? "Due" : income ? "Next expected" : "Next due"}</th>
             <th>Cycle</th>
             <th>Status</th><th></th></tr>
         )}
@@ -788,7 +867,7 @@ function BillRows({ b, isEnv, cols, editing, mayEdit, onEdit,
   b: Row; isEnv: boolean; cols: number; editing: boolean;
   mayEdit: boolean;
   onEdit: (payee: string | null) => void;
-  onToggle: (payee: string) => void;
+  onToggle: (payee: string, disabled: boolean) => void;
   onArchive: (payee: string) => void;
   onPurge: (payee: string) => void;
   onSaved: () => void;
@@ -805,10 +884,19 @@ function BillRows({ b, isEnv, cols, editing, mayEdit, onEdit,
   const isAnnualEnv = isEnv && b.period_months === 12;
   // cycle position from the row's cadence value (the label is the fallback)
   const cadVal = b.cadence_value || cadenceFromLabel(b.cadenceLabel);
-  const daysTo = !isEnv && b.due_on ? daysUntil(b.due_on) : null;
+  // a past month has no countdown: its occurrences were paid, missed, or
+  // not due, and the cycle bar has nothing to measure
+  const past = useContext(PastMonthCtx);
+  const daysTo = !past && !isEnv && b.due_on ? daysUntil(b.due_on) : null;
   const cyc = cycleDays(cadVal);
   const settled = b.occurrences > 0 && b.paid >= b.occurrences;
+  const missed = !!past && !settled && b.occurrences > 0;
   const overdue = !settled && daysTo !== null && daysTo < 0;
+  // a missed bill whose charge the bank feed withdrew: still unpaid, but a
+  // warning to check rather than a missed payment — amber, not red
+  const withdrawn = overdue && !!b.withdrawn_on;
+  const withdrawnNote = withdrawn
+    ? `charge withdrawn by the bank feed (${mmdd(b.withdrawn_on)})` : undefined;
   const soon = !settled && daysTo !== null && daysTo >= 0 && daysTo <= SOON_DAYS;
   const frac = daysTo === null || cyc <= 0 ? 0
     : Math.min(1, Math.max(0, 1 - daysTo / cyc));
@@ -844,7 +932,9 @@ function BillRows({ b, isEnv, cols, editing, mayEdit, onEdit,
           </td>
         ) : (
           <td className="mut c-due" style={{ whiteSpace: "nowrap" }}>
-            {b.due_on ? mmdd(b.due_on) : "\u00b7"}</td>
+            {past
+              ? (b.next_unpaid ? mmdd(b.next_unpaid) : "\u00b7")
+              : b.due_on ? mmdd(b.due_on) : "\u00b7"}</td>
         )}
         {!isEnv && (
           // the bar says where you are in the cycle; the words beside it say
@@ -856,11 +946,12 @@ function BillRows({ b, isEnv, cols, editing, mayEdit, onEdit,
               <span className="envbar"
                     title={daysTo === null ? undefined
                       : `${Math.round(frac * 100)}% through the cycle`}>
-                <i className={overdue ? "over" : soon ? "soon" : ""}
+                <i className={withdrawn ? "soon" : overdue ? "over" : soon ? "soon" : ""}
                    style={{ width: `${frac * 100}%` }} />
               </span>
               {daysTo !== null && !settled ? (
-                <span className={`cycle-words ${overdue ? "r" : soon ? "a" : "g"}`}>
+                <span className={`cycle-words ${withdrawn ? "a" : overdue ? "r" : soon ? "a" : "g"}`}
+                      title={withdrawnNote}>
                   {dueText(daysTo, b.income)}</span>
               ) : null}
             </span>
@@ -874,7 +965,14 @@ function BillRows({ b, isEnv, cols, editing, mayEdit, onEdit,
             edit expander. */}
         <td className="c-state" style={{ whiteSpace: "nowrap", overflow: "hidden" }}>
           {disabled ? <span className="pill m">disabled</span>
-            : isEnv ? (
+            : past && !isEnv && !settled ? (
+              // the month on view is over: paid, missed, or never due
+              missed
+                ? (b.withdrawn_on
+                    ? <span className="pill a" title={`charge withdrawn by the bank feed (${mmdd(b.withdrawn_on)})`}>withdrawn</span>
+                    : <span className="pill r">{b.income ? "not received" : "missed"}</span>)
+                : <span className="sub">not due</span>
+            ) : isEnv ? (
               (b.overflow ?? 0) > 0.005
                 ? <span className="pill r">over +{money(b.overflow!)}</span>
                 : (b.period_left ?? b.amount - (b.used ?? 0)) <= b.amount * 0.001
@@ -896,6 +994,8 @@ function BillRows({ b, isEnv, cols, editing, mayEdit, onEdit,
                         title="expected, but no date on file">awaiting</span>)
             : settled
               ? <span className="sub">paid ✓</span>
+              : withdrawn
+                ? <span className="pill a" title={withdrawnNote}>withdrawn</span>
               : overdue
                 ? <span className="pill r">overdue</span>
                 : daysTo !== null
@@ -923,6 +1023,12 @@ function BillRows({ b, isEnv, cols, editing, mayEdit, onEdit,
                       onClick={() => onHint(b.payee, "dismiss", "health")}>✕</button>
               )}
             </>
+          )}
+          {/* a cycle whose charge the bank feed withdrew: a warning, not a
+              problem to decide — no dismiss, no attention count, and not
+              repeated when the status column already says "withdrawn" */}
+          {!disabled && b.health === "withdrawn" && !withdrawn && (
+            <>{" "}{hpill(b.health, b.last_seen, b.health_withdrawn_on)}</>
           )}
           {/* what the ledger actually charged — the fact that makes
               "mismatch" actionable. A hover title does not exist on a phone
@@ -980,7 +1086,7 @@ function BillRows({ b, isEnv, cols, editing, mayEdit, onEdit,
         <EditRow d={b} cadences={cadences} cols={cols} prefill={prefill}
                  togglePending={togglePending} pendingDelete={pendingDelete}
                  onCancel={() => onEdit(null)} onSaved={onSaved}
-                 onToggle={() => onToggle(b.payee)}
+                 onToggle={() => onToggle(b.payee, !b.disabled)}
                  onArchive={() => onArchive(b.payee)}
                  onPurge={() => {
                    if (confirm("Permanently delete this bill? No archive copy is " +
@@ -996,8 +1102,19 @@ function BillRows({ b, isEnv, cols, editing, mayEdit, onEdit,
 // detector won't find, including unusual cadences. "Custom…" builds an
 // arbitrary FREQ:interval (every X months / years); the engine already
 // schedules + budgets any interval (budget._occurrences_in_month honors it).
+/** The payee an add was refused over because an archived bill holds the
+ *  name, or null for any other failure. */
+function archivedClash(e: unknown): string | null {
+  const m = /^409:\s*([\s\S]*)$/.exec(e instanceof Error ? e.message : "");
+  try {
+    const j = JSON.parse(m?.[1] ?? "");
+    return j?.archived === true ? String(j.payee || "") : null;
+  } catch { return null; }
+}
+
 function AddBillForm({ onCancel, onSaved }:
-                     { onCancel: () => void; onSaved: () => void }) {
+                     { onCancel: () => void;
+                       onSaved: (restored: boolean) => void }) {
   const [payee, setPayee] = useState("");
   const [amount, setAmount] = useState("");
   // pick from the ledger's real (canonical) merchants so the bill's match key
@@ -1013,12 +1130,15 @@ function AddBillForm({ onCancel, onSaved }:
   const [category, setCategory] = useState("");
   const cats = useQuery({ queryKey: ["categories"], queryFn: api.categories });
   const [err, setErr] = useState<string | null>(null);
+  // the add hit an archived bill of the same name: offer to bring it back
+  // with the values entered here
+  const [archived, setArchived] = useState(false);
   const cadence = mode === "CUSTOM"
     ? `${customUnit}:${Math.max(1, parseInt(customN, 10) || 1)}`
     : mode;
   const isEnv = cadence.startsWith("ENVELOPE");
   const save = useMutation({
-    mutationFn: () => api.billsSave({
+    mutationFn: (restore: boolean) => api.billsSave({
       payee: payee.trim(), amount, cadence,
       next_due: nextDue, income, merchant: payee.trim(),
       ...(income ? {} : { show_today: pinned }),
@@ -1027,9 +1147,14 @@ function AddBillForm({ onCancel, onSaved }:
       // merchant history yet
       ...(isEnv && category.trim()
         ? { category: category.trim(), match_category: true } : {}),
+      ...(restore ? { restore: true } : {}),
     }),
-    onSuccess: () => onSaved(),
-    onError: (e) => setErr(errText(e)),
+    onMutate: () => { setErr(null); setArchived(false); },
+    onSuccess: (r) => onSaved(!!r?.restored),
+    onError: (e) => {
+      setErr(errText(e));
+      setArchived(archivedClash(e) !== null);
+    },
   });
   return (
     <div className="card" style={{ marginBottom: "1rem" }}>
@@ -1037,7 +1162,7 @@ function AddBillForm({ onCancel, onSaved }:
                      flexWrap: "wrap" }}
             onSubmit={(e) => {
               e.preventDefault();
-              if (payee.trim() && amount) save.mutate();
+              if (payee.trim() && amount) save.mutate(false);
             }}>
         <input type="text" required list="known-merchants"
                placeholder="merchant — pick a known one or type a new name"
@@ -1095,7 +1220,14 @@ function AddBillForm({ onCancel, onSaved }:
         <button className="pri" disabled={save.isPending}>add bill</button>
         <button type="button" className="btn" onClick={onCancel}>cancel</button>
       </form>
-      {err && <div className="neg" style={{ fontSize: 13, marginTop: ".4rem" }}>{err}</div>}
+      {err && <div className="neg" style={{ fontSize: 13, marginTop: ".4rem" }}>
+        {err}
+        {archived && (
+          <button type="button" className="pri" style={{ marginLeft: ".5rem" }}
+                  disabled={save.isPending}
+                  onClick={() => save.mutate(true)}>Restore</button>
+        )}
+      </div>}
     </div>
   );
 }
@@ -1113,6 +1245,10 @@ function EditRow({ d, cadences, cols, prefill, togglePending, pendingDelete,
   const [amount, setAmount] = useState(prefill.pamt || d.amount.toFixed(2));
   const [cadence, setCadence] = useState(prefill.pcad || d.cadence_value);
   const [nextDue, setNextDue] = useState(prefill.pdue || d.due_on || "");
+  // the stored due date when the form opened: a save sends next_due only
+  // when the field differs from it, so a name or amount edit leaves the
+  // date to the server, which may have rolled it on since this was read
+  const [seededDue] = useState(d.due_on ?? "");
   const [cap, setCap] = useState(d.cap === null ? "" : String(d.cap));
   const [pinned, setPinned] = useState(d.show_today);
   const [matchCat, setMatchCat] = useState(d.match_category);
@@ -1145,7 +1281,8 @@ function EditRow({ d, cadences, cols, prefill, togglePending, pendingDelete,
   const [err, setErr] = useState<string | null>(null);
   const save = useMutation({
     mutationFn: () => api.billsSave({
-      payee, amount, cadence, next_due: nextDue, income: d.income,
+      payee, amount, cadence, income: d.income,
+      ...(nextDue && nextDue !== seededDue ? { next_due: nextDue } : {}),
       orig_payee: d.payee, ...(cadence !== "ENVELOPE:1" ? { cap } : {}),
       ...(d.income ? {} : { show_today: pinned }),
       // only sent when edited, so a save from elsewhere keeps the fees
@@ -1177,7 +1314,10 @@ function EditRow({ d, cadences, cols, prefill, togglePending, pendingDelete,
                  value={amount} style={{ width: "6.5rem" }}
                  onChange={(e) => setAmount(e.target.value)} /></label>
           <select value={cadence} onChange={(e) => setCadence(e.target.value)}>
-            {cadences.map(([v, label]) => (
+            {/* the bill's saved interval (and a ledger-fit prefill) stay
+                pickable even when the server's standard list lacks them */}
+            {cadenceChoices(cadences, [d.cadence_value, prefill.pcad])
+              .map(([v, label]) => (
               <option key={v} value={v}>{label}</option>
             ))}
           </select>

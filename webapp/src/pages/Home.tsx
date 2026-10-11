@@ -1,7 +1,6 @@
 // Home: one page, three timeframe lenses — Today | Month | Year —
 // with a ‹ › stepper and month/year dropdowns. There is deliberately no
-// Week lens — the weekly EMAIL digest covers that, built straight from
-// lenses.week_summary. Deep-linkable:
+// Week lens. Deep-linkable:
 //   /app/?lens=today&date=YYYY-MM-DD    (a past day; clean URL = live today)
 //   /app/?lens=month&y=2026&m=6
 //   /app/?lens=year&y=2025

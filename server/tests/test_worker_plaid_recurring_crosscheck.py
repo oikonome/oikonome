@@ -77,6 +77,53 @@ class NightlyPlaidRecurringTests(unittest.TestCase):
         self.assertEqual([{"stream_id": "s1"}], propose.call_args[0][1],
                          "the healthy item's streams must still be proposed")
 
+    def test_the_billed_cross_check_asks_the_gate_first(self):
+        """Recurring streams is a separately billed aggregator product,
+        like liabilities and investments, so an operator's gate may
+        withhold it; the household's own setting cannot turn it back on.
+        With nothing installed tier_allows says yes, so a self-host keeps
+        it."""
+        seen = []
+
+        def streams(conn, item_id):
+            seen.append(item_id)
+            return []
+        asked = []
+
+        def allows(conn, feature):
+            asked.append(feature)
+            return feature != "plaid_recurring"
+        with mock.patch.object(worker.ext.gate, "tier_allows",
+                               side_effect=allows):
+            self._run(streams)
+        self.assertIn("plaid_recurring", asked)
+        self.assertEqual(seen, [])
+
+    def test_a_failing_categorizer_does_not_end_the_tenants_night(self):
+        """The categorizer run is one step of a tenant's night like the
+        others: a model that is down must not skip the receipt pass, the
+        receipt matching or the retraining behind it."""
+        after = []
+        with mock.patch.object(worker.bills, "run",
+                               return_value={"proposed_add": 0}), \
+             mock.patch("oikonome.sync.plaid.recurring_streams",
+                        return_value=[]), \
+             mock.patch("oikonome.engine.amazon_match.run_match"), \
+             mock.patch("oikonome.engine.merchant_dedup.apply"), \
+             mock.patch("oikonome.engine.llm_categorize.run",
+                        side_effect=RuntimeError("model unreachable")), \
+             mock.patch("oikonome.engine.receipts.parse_pending",
+                        side_effect=lambda c: after.append("parse")), \
+             mock.patch("oikonome.engine.receipt_match.match_waiting",
+                        side_effect=lambda c: after.append("match")):
+            worker.nightly_tenant(self.tid)
+        self.assertEqual(after, ["parse", "match"])
+
+    def test_a_gate_that_failed_to_load_refuses_it(self):
+        from oikonome import ext
+        self.assertFalse(ext._FailClosedGate().tier_allows(
+            None, "plaid_recurring"))
+
 
 if __name__ == "__main__":
     unittest.main()

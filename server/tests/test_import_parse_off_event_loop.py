@@ -58,7 +58,8 @@ class ImportParseOffEventLoopTests(unittest.TestCase):
                           role=""):
             _assert_off_loop()
             return {"imported": 0}, None
-        with mock.patch("oikonome.web.pages.dispatch_import", fake_dispatch):
+        with mock.patch("oikonome.web.pages._dispatch_import_unlocked",
+                        fake_dispatch):
             r = self.client.post(
                 "/api/import",
                 files={"file": ("bank.csv", b"Date,Amount\n", "text/csv")},

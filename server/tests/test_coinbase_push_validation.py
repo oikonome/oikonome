@@ -74,6 +74,34 @@ class CoinbasePushMoneyValidationTests(unittest.TestCase):
             self.assertIn("amount", str(caught.exception))
             self.assertEqual(self._rows(), set(), repr(bad))
 
+    def test_a_wrong_shaped_raw_or_name_is_a_bad_payload(self):
+        """A `raw` that is not an object, or a name that is not a string,
+        used to reach the importer and the INSERT and fail as a 500."""
+        txn = _payload()["transactions"][0]
+        acct = _payload()["accounts"][0]
+        cases = [
+            ("raw", dict(txn, raw="x"), None),
+            ("raw", dict(txn, raw=[1]), None),
+            ("name", dict(txn, name={"a": 1}), None),
+            ("name", dict(txn, name=["BUY"]), None),
+            ("merchant_name", dict(txn, merchant_name=7), None),
+            ("category_primary", dict(txn, category_primary=[]), None),
+            ("raw", None, dict(acct, raw="x")),
+            ("name", None, dict(acct, name=5)),
+            ("mask", None, dict(acct, mask={"x": 1})),
+        ]
+        for field, t, a in cases:
+            p = _payload(transactions=[t] if t else [txn],
+                         accounts=[a] if a else [acct])
+            with self.assertRaises(ValueError, msg=(field, t, a)) as caught:
+                coinbase_push.import_payload(self.conn, p)
+            self.assertIn(field, str(caught.exception))
+            self.assertEqual(self._rows(), set())
+        for bad in ("x", [1]):
+            with self.assertRaises(ValueError):
+                coinbase_push.import_payload(
+                    self.conn, _payload(transactions=bad))
+
     def test_an_unusable_balance_is_refused_the_same_way(self):
         acct = dict(_payload()["accounts"][0], balance_current="lots")
         with self.assertRaises(ValueError) as caught:

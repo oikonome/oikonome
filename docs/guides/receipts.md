@@ -99,7 +99,9 @@ and shows **Enter the total and date** — type the total, pick the date on
 the receipt and, if you like, the store, then **Save**. The app looks for
 the charge straight away: it pairs by itself under the same rules as a
 receipt it read, or lists the candidates for you to pick. Or add a model
-under Settings → AI and later receipts are read for you.
+under Settings → AI and later receipts are read for you. Without one,
+a receipt on a transaction offers no **parse now** button — just a
+*no AI endpoint to read it* note pointing at Settings → AI.
 
 **The AI got it wrong, or couldn't read it?** A receipt marked *couldn't
 read* shows the same form; on one it did read, **fix total** opens it with
@@ -127,7 +129,9 @@ The vision model reads the **optimized copy** when one exists —
 cleaned-up text extracts better than a raw phone photo. If a photo
 can't be cleaned up (or is unusually large), everything falls back to
 the untouched original; an upload never fails because of this. PDFs
-keep only the original.
+keep only the original. A PDF whose first page unpacks to more than
+about 1.5 MB of content is refused before it is read — re-export it, or
+attach a photo or screenshot of the receipt instead.
 
 ## Line items and tags
 

@@ -16,9 +16,12 @@ import StaleBanner from "../components/stale-banner";
 import { Card, H, HelpLink } from "../components/ui";
 import { errText, Account, BudgetSettings, CustomBucket } from "../lib/api";
 import { saveSettings } from "../lib/cache";
-import { mergePlannerBuckets, mergeSavingsGoals, numv, type GoalDraft,
+import { goalHasWords, goalNeedsAccount, mergePlannerBuckets,
+         mergeSavingsGoals, numv, type GoalDraft,
          type PlannerRow, catLabel } from "../lib/pure";
 import { useRefetchWhenShown } from "../lib/focus";
+import { labelSavingsRow, monthSavings, plannerUnallocAuto }
+  from "../lib/planner";
 import { useSession } from "../lib/session";
 import { useViewer } from "../lib/viewer";
 import { C, money } from "../lib/theme";
@@ -85,6 +88,9 @@ export default function Budget() {
     });
   };
   const goal = (d?.savings_goals ?? []).find((g) => g.name === "Savings");
+  // the month's posted contribution when the server sends it; otherwise
+  // the goal's 90-day average, labelled as one (Today's rule)
+  const sav = goal ? monthSavings(goal) : null;
 
   const tweakBits: string[] = [];
   if (s0) {
@@ -162,7 +168,7 @@ export default function Budget() {
                      expected: (d.buckets.food?.expected ?? 0)
                        + (d.buckets.other?.expected ?? 0),
                      budget: d.variable_budget }}
-            rows={planRows(d.buckets, {
+            rows={labelSavingsRow(planRows(d.buckets, {
               // the Budget page shows the same month Today does, so its
               // rows open the same doors
               period: { y: Number(String(d.date).slice(0, 4)),
@@ -170,11 +176,9 @@ export default function Budget() {
               fixedActual: d.buckets.fixed.actual,
               fixedBudget: d.buckets.fixed.month_budget,
               fixedPending: d.fixed_unpaid_due,
-              savings: goal
-                ? { plan: goal.monthly_plan, saved: goal.rate_90d }
-                : null,
+              savings: sav,
               excess: d.plan_surplus,
-            })} />
+            }), !!sav?.averaged)} />
         </Card>
       )}
       {s0 && (
@@ -392,6 +396,8 @@ export function Planner({ s0, viewer, onSaved, onDirty }: {
   const [unallocEdited, setUnallocEdited] = useState<string | null>(null);
   const [savings, setSavings] = useState("");
   const [savingsTouched, setSavingsTouched] = useState(false);
+  // the Savings plan the planner opened with, already outside other_monthly
+  const [savingsSeed, setSavingsSeed] = useState(0);
   const [msg, setMsg] = useState<string | null>(null);
   // one-time seed. An established user's plan comes entirely from s0 —
   // it doesn't need ["budgets-suggest"] (a median-over-history
@@ -432,6 +438,7 @@ export function Planner({ s0, viewer, onSaved, onDirty }: {
       .find((g) => g.name === "Savings");
     if (userSaved && savedGoal != null) {
       setSavings(String(savedGoal.monthly_plan ?? 0));
+      setSavingsSeed(numv(String(savedGoal.monthly_plan ?? 0)));
       setSavingsTouched(true);
     }
   }, [rows, sug.isPending, sug.data, s0]);
@@ -477,10 +484,9 @@ export function Planner({ s0, viewer, onSaved, onDirty }: {
   const catsTotal = rows.filter((r) => !r.food)
     .reduce((t, r) => t + numv(r.monthly), 0);
   // a typed savings amount comes out of Everything else so the plan
-  // balances (the web planner's rule)
-  const savingsTyped = savingsTouched ? numv(savings) : 0;
-  const unallocAuto = Math.max(0, Math.round(otherBase - catsTotal
-                                              - savingsTyped));
+  // balances (the web planner's rule) — only what changed this session
+  const unallocAuto = plannerUnallocAuto({ otherBase, catsTotal,
+    savingsTouched, savingsTyped: numv(savings), savingsSeed });
   const unalloc = unallocEdited !== null
     ? numv(unallocEdited) : unallocAuto;
   const inc = numv(income);
@@ -831,7 +837,7 @@ const GoalAccountPicker = memo(function GoalAccountPicker({
       <Pressable style={[st.chip, !selected && st.chipOn]}
                  onPress={() => onPick(index, "")}>
         <Text style={{ color: !selected ? C.text : C.mut,
-                       fontSize: 11 }}>any account</Text>
+                       fontSize: 11 }}>no account (plan only)</Text>
       </Pressable>
       {/* every account — a goal bound to a hidden/archived one
           must still show its selection */}
@@ -906,7 +912,9 @@ function SavingsGoals({ s0, onSaved, onDirty }: {
       </H>
       <Text style={st.mut}>
         A goal watches transfers on its account (add match words to
-        carve several goals out of one account). The monthly plan
+        carve several goals out of one account). A goal with no account
+        is a plan only: it lowers the excess cash line but shows no
+        progress. The monthly plan
         lowers the excess cash line and rides the cash forecast — it
         never makes the daily verdict go over. A sweep goal contributes
         at month end instead, and only what the month&apos;s surplus
@@ -945,9 +953,13 @@ function SavingsGoals({ s0, onSaved, onDirty }: {
                    onChange={(v) => patch(i, { monthly_plan: v })} num />
             <Field label="Start balance $" value={r.start_balance}
                    onChange={(v) => patch(i, { start_balance: v })} num />
+            {/* words only carve a goal out of an account; with no
+                account they stay editable only so existing ones can be
+                cleared (the web editor's rule) */}
             <Field label="Match words (opt.)" value={r.tokens}
                    onChange={(v) => patch(i, { tokens: v })}
-                   placeholder="trip" wide />
+                   placeholder="trip" wide
+                   disabled={!r.account_id && !goalHasWords(r)} />
           </View>
           {/* contribution mode — the web editor's wording, verbatim */}
           <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
@@ -965,6 +977,12 @@ function SavingsGoals({ s0, onSaved, onDirty }: {
           <GoalAccountPicker accounts={accounts.data?.accounts}
                              index={i} selected={r.account_id}
                              onPick={pickAccount} />
+          {goalNeedsAccount(r) && (
+            <Text style={{ color: C.bad, fontSize: 12 }}>
+              Match words need an account — pick the account the money
+              lands in.
+            </Text>
+          )}
           {p && p.pct != null && (
             <Text style={st.mut}>
               {m$(p.saved ?? 0)} of {m$(p.target)} ({p.pct}%)
@@ -1011,17 +1029,19 @@ function SavingsGoals({ s0, onSaved, onDirty }: {
   );
 }
 
-function Field({ label, value, onChange, num, placeholder, wide }: {
+function Field({ label, value, onChange, num, placeholder, wide,
+                disabled }: {
   label: string; value: string; onChange: (v: string) => void;
-  num?: boolean; placeholder?: string; wide?: boolean;
+  num?: boolean; placeholder?: string; wide?: boolean; disabled?: boolean;
 }) {
   return (
     <View style={{ width: wide ? "100%" : "47%" }}>
       <Text style={{ color: C.mut, fontSize: 10 }}>{label}</Text>
-      <TextInput style={[st.input, { paddingVertical: 5 }]}
+      <TextInput style={[st.input, { paddingVertical: 5 },
+                         disabled && { opacity: 0.5 }]}
                  keyboardType={num ? "decimal-pad" : "default"}
                  placeholder={placeholder} placeholderTextColor={C.mut}
-                 autoCapitalize="none"
+                 autoCapitalize="none" editable={!disabled}
                  value={value} onChangeText={onChange} />
     </View>
   );

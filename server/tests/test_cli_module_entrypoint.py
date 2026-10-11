@@ -63,3 +63,12 @@ class DocumentedCommandsExistTests(unittest.TestCase):
                 self.assertIn(cmd, help_out,
                               f"docs/master-key.md documents `{cmd}` but the "
                               f"CLI does not offer it")
+
+    def test_the_rotation_never_puts_the_old_key_on_a_command_line(self):
+        """A key typed into a command lands in shell history and in the
+        engine CLI's argv, which every account on the host can read."""
+        if not _DOCS.exists():
+            self.skipTest("docs/master-key.md not present")
+        text = _DOCS.read_text()
+        self.assertNotRegex(text, r"OIKONOME_MASTER_KEY_OLD=\S")
+        self.assertIn("read -rs", text)

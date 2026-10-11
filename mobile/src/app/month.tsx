@@ -15,7 +15,8 @@ import { useRefetchWhenShown } from "../lib/focus";
 import { useSession } from "../lib/session";
 import { C, mmddyy, money } from "../lib/theme";
 import { VERDICT } from "../lib/verdict";
-import { catLabel } from "../lib/pure";
+import { catLabel, routeYm } from "../lib/pure";
+import { labelSavingsRow, monthSavings } from "../lib/planner";
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -28,10 +29,8 @@ export default function MonthLens() {
   // the year lens deep-links a specific month; default is the live one
   const p = useLocalSearchParams<{ y?: string; m?: string }>();
   const router = useRouter();
-  const [ym, setYm] = useState({
-    y: Number(p.y) || now.getFullYear(),
-    m: Number(p.m) || now.getMonth() + 1,
-  });
+  // a deep link can carry any month at all; out of range opens this one
+  const [ym, setYm] = useState(() => routeYm(p.y, p.m, now));
   const query = useQuery({
     queryKey: ["lens", "month", ym.y, ym.m],
     queryFn: () => client!.lensMonth(ym.y, ym.m),
@@ -50,6 +49,11 @@ export default function MonthLens() {
   const goal = (today.data?.savings_goals ?? [])
     .find((g) => g.name === "Savings");
   const d = query.data;
+  // the lens's own month figure only — the goal's saved_this_month is
+  // TODAY's month and would be wrong on any other
+  const monthSav = goal && d ? monthSavings(
+    { monthly_plan: goal.monthly_plan, rate_90d: goal.rate_90d },
+    d.saved_month) : null;
   // jump-anywhere picker — Jan 2019 must not be 80 taps away. Years
   // span the ledger (first_year, the web's rule), not a guessed decade.
   const [picking, setPicking] = useState(false);
@@ -268,17 +272,17 @@ export default function MonthLens() {
           </Card>
           <Card>
             <H>Monthly budget</H>
-            <MoneyMap rows={planRows(d.buckets, { period: { y: ym.y, m: ym.m },
+            <MoneyMap rows={labelSavingsRow(planRows(d.buckets, {
+              period: { y: ym.y, m: ym.m },
               fixedActual: d.bills.posted,
               fixedBudget: d.bills.planned,
               fixedPending: d.bills.awaiting,
               // the month's REAL posted contribution when the payload
-              // carries it; rate_90d only as a trailing-average fallback
-              savings: goal
-                ? { plan: goal.monthly_plan,
-                    saved: d.saved_month ?? goal.rate_90d } : null,
+              // carries it; rate_90d only as a trailing-average fallback,
+              // captioned as one
+              savings: monthSav,
               excess: d.plan_surplus,
-            })} />
+            }), !!monthSav?.averaged)} />
           </Card>
           {/* the web's empty rule: only when paid, overdue AND envelopes
               are all empty — an envelope-only month still has a story */}
@@ -297,9 +301,12 @@ export default function MonthLens() {
             {d.bills.overdue.length > 0 && (
               <Text style={s.mut}>Scheduled but not posted:</Text>
             )}
-            {d.bills.overdue.slice(0, 5).map(([payee, amt, due]) => (
-              <KV key={payee} k={`${payee} · due ${mmddyy(due)}`}
-                  v={money(amt, false)} tone="bad" />
+            {d.bills.overdue.slice(0, 5).map(([payee, amt, due, gone]) => (
+              // a charge the bank feed withdrew is a warning, not a miss
+              <KV key={payee}
+                  k={gone ? `${payee} · withdrawn by the bank feed ${mmddyy(gone)}`
+                          : `${payee} · due ${mmddyy(due)}`}
+                  v={money(amt, false)} tone={gone ? "warn" : "bad"} />
             ))}
             {(d.bills.envelopes ?? []).map((e) => (
               <KV key={e.payee}

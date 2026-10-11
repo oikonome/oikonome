@@ -156,6 +156,57 @@ class EquityTests(unittest.TestCase):
             "SELECT entity_id FROM transactions WHERE id=%s", (t,)).fetchone()
         self.assertEqual(str(row["entity_id"]), self.ent["id"])
 
+    def test_a_fronted_expense_is_explained_once(self):
+        """One expense is capitalized OR reimbursed, to ONE entity. A second
+        pick that names another entity or the other treatment must be
+        refused and leave the first booking intact: moving the row to the
+        second entity while the first keeps the contribution overstates one
+        capital account and understates the other, and recording both a
+        contribution and a reimbursement counts one cost twice. Repeating
+        the identical pick is a no-op returning the first movement."""
+        other = entities.create_entity(self.conn, name="Southport LLC",
+                                       structure="single_member_llc")
+        t = add_txn(self.conn, TODAY, 80.0, "DOMAIN RENEWAL", account="card")
+        first = equity.contribute_expense(self.conn, self.ent["id"], t)
+        again = equity.contribute_expense(self.conn, self.ent["id"], t)
+        self.assertEqual(again["id"], first["id"])
+        refusals = (
+            (equity.contribute_expense, other["id"]),
+            (equity.reimburse_expense, other["id"]),
+            (equity.reimburse_expense, self.ent["id"]),
+        )
+        for fn, ent in refusals:
+            with self.subTest(fn=fn.__name__, entity=ent):
+                with self.assertRaises(ValueError):
+                    fn(self.conn, ent, t)
+                row = self.conn.execute(
+                    "SELECT entity_id FROM transactions WHERE id=%s",
+                    (t,)).fetchone()
+                self.assertEqual(str(row["entity_id"]), self.ent["id"])
+                self.assertEqual(
+                    [m["id"] for m in equity.list_movements(
+                        self.conn, self.ent["id"])], [first["id"]])
+                self.assertEqual(
+                    equity.list_movements(self.conn, other["id"]), [])
+        # once the first movement is deleted, the expense can be re-explained
+        self.assertTrue(equity.delete_movement(self.conn, first["id"],
+                                               self.ent["id"]))
+        mv = equity.reimburse_expense(self.conn, other["id"], t)
+        self.assertEqual(mv["entity_id"], other["id"])
+
+    def test_a_movement_for_a_transaction_is_never_another_entitys(self):
+        """record_movement's double-submit re-read must not hand back a
+        movement booked to a different entity as if it were this one's."""
+        other = entities.create_entity(self.conn, name="Southport LLC",
+                                       structure="single_member_llc")
+        t = add_txn(self.conn, TODAY, 40.0, "POSTAGE", account="card")
+        equity.record_movement(self.conn, self.ent["id"], kind="contribution",
+                               amount=40, date=TODAY, txn_id=t)
+        with self.assertRaises(ValueError):
+            equity.record_movement(self.conn, other["id"],
+                                   kind="contribution", amount=40,
+                                   date=TODAY, txn_id=t)
+
     def test_list_and_delete(self):
         mv = equity.record_movement(self.conn, self.ent["id"],
                                    kind="contribution", amount=100, date=TODAY)

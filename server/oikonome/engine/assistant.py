@@ -11,7 +11,6 @@ data never leaves the box) and is unavailable when no LLM is configured.
 
 from __future__ import annotations
 
-import ipaddress
 import json
 import threading
 from urllib.parse import urlsplit
@@ -53,43 +52,29 @@ def available(conn=None) -> bool:
     return _llm.configured(conn, role="assistant")
 
 
-# Hostnames that mean "the model runs beside this server": the loopback
-# names, the compose service of the bundled Ollama, and the container-to-
-# host aliases a self-host uses to reach a model on the same machine.
-_LOCAL_HOSTS = frozenset({"localhost", "ollama", "host.docker.internal",
-                          "host.containers.internal"})
-
-
-def _host_is_local(host: str) -> bool:
-    h = (host or "").strip("[]").lower()
-    if not h:
-        return False
-    if h in _LOCAL_HOSTS:
-        return True
-    try:
-        return ipaddress.ip_address(h).is_loopback
-    except ValueError:
-        return False
-
-
 def status(conn=None) -> dict:
     """{available, local, host}: whether an assistant backend exists, and
     whether questions (and the ledger figures the tools return) stay on
-    this server. The operator's env/bundled backend counts as local — it
-    is the standard install's Ollama sidecar. A tenant-configured backend
-    is local only when its host is loopback or a same-box alias; anything
-    else is named so the UI can say where the answers go, rather than
-    making a fixed "nothing leaves the box" claim for every backend."""
+    this server or its network.
+
+    Judged from the endpoint's address for EVERY backend, the operator's
+    included: an operator can point the instance-wide backend at a cloud
+    API as easily as at the bundled Ollama, and the clients turn `local`
+    into a "nothing leaves the box" promise. Loopback, private-range and
+    same-box names are local; anything else is not. This is the same judge
+    the off-box consent gate for tax documents uses, so the two cannot
+    disagree about one endpoint. A non-local tenant backend is named so the
+    UI can say where the answers go; the operator's host never is."""
+    from .taxdocs import _endpoint_is_local
     be = _llm._backend(conn, role="assistant")
     url = be.get("url") or ""
     if not url:
         return {"available": False, "local": False, "host": ""}
-    host = urlsplit(url).hostname or ""
-    if be.get("source") == "env":
-        return {"available": True, "local": True, "host": ""}
-    local = _host_is_local(host)
-    return {"available": True, "local": local,
-            "host": "" if local else host}
+    local = _endpoint_is_local(url)
+    if be.get("source") == "env" or local:
+        return {"available": True, "local": local, "host": ""}
+    return {"available": True, "local": False,
+            "host": urlsplit(url).hostname or ""}
 
 
 # ---- read-only tools (each wraps a vetted engine function) -----------------
@@ -159,12 +144,9 @@ def _t_spend_lookup(conn, args) -> dict:
         where.append(f"{DISPLAY_MERCHANT} ILIKE %s ESCAPE '\\'")
         params.append(_like(merchant))
     if category:
-        # the row's own category, or any part of a hand split
-        where.append(
-            f"({reporting.EFF_CAT} ILIKE %s ESCAPE '\\' OR EXISTS ("
-            "SELECT 1 FROM transaction_splits sp WHERE sp.txn_id = t.id "
-            "AND REPLACE(sp.category, '_', ' ') ILIKE %s ESCAPE '\\'))")
-        params.extend([_like(category.replace("_", " "))] * 2)
+        # per part: a split row's part category, else the row's own
+        where.append(f"{reporting.PART_CAT} ILIKE %s ESCAPE '\\'")
+        params.append(_like(category.replace("_", " ")))
     try:
         year = int(year) if year not in (None, "") else None
     except (TypeError, ValueError):
@@ -174,18 +156,33 @@ def _t_spend_lookup(conn, args) -> dict:
         params.append(year)
     if not (merchant or category or year):
         return {"error": "give at least one of merchant, category, year"}
-    amt2 = reporting._R2.format(f"SUM({reporting.NET_AMOUNT})")
+    # the Accounts page "excl" toggle, as every Spending-page query applies it
+    excl, ex_p = reporting.excluded_accounts_sql(conn)
+    params.extend(ex_p)
+    if category:
+        # By category a hand-split row counts under each of its parts for
+        # that part's share, the way the Spending page's category rollup
+        # reads it; the whole row would be counted under any one part's
+        # category otherwise.
+        src = (f"transactions t {MC_JOIN} {reporting.REIMB_PARTIAL_JOIN} "
+               f"{reporting.SPLIT_JOIN}")
+        amount, count = reporting.PART_NET_JOINED, "COUNT(DISTINCT t.id)"
+    else:
+        # unsplit by anything else: the parts sum to the row
+        src = f"transactions t {MC_JOIN}"
+        amount, count = reporting.NET_AMOUNT, "COUNT(*)"
+    cond = f"{' AND '.join(where)} {excl}"
+    amt2 = reporting._R2.format(f"SUM({amount})")
     tot = conn.execute(
-        f"SELECT COALESCE({amt2}, 0) amt, COUNT(*) n, MIN(t.date) first, "
-        f"MAX(t.date) last FROM transactions t {MC_JOIN} "
-        f"WHERE {' AND '.join(where)}", params).fetchone()
+        f"SELECT COALESCE({amt2}, 0) amt, {count} n, MIN(t.date) first, "
+        f"MAX(t.date) last FROM {src} WHERE {cond}", params).fetchone()
     by_year = conn.execute(
-        f"SELECT to_char(t.date,'YYYY') yr, {amt2} amt, COUNT(*) n "
-        f"FROM transactions t {MC_JOIN} WHERE {' AND '.join(where)} "
-        f"GROUP BY yr ORDER BY yr", params).fetchall()
+        f"SELECT to_char(t.date,'YYYY') yr, {amt2} amt, {count} n "
+        f"FROM {src} WHERE {cond} GROUP BY yr ORDER BY yr",
+        params).fetchall()
     top = conn.execute(
-        f"SELECT {DISPLAY_MERCHANT} payee, {amt2} amt, COUNT(*) n "
-        f"FROM transactions t {MC_JOIN} WHERE {' AND '.join(where)} "
+        f"SELECT {DISPLAY_MERCHANT} payee, {amt2} amt, {count} n "
+        f"FROM {src} WHERE {cond} "
         f"GROUP BY payee ORDER BY amt DESC LIMIT 8", params).fetchall()
     return {
         "filter": {"merchant": merchant or None, "category": category or None,
@@ -203,9 +200,14 @@ def _t_recurring_bills(conn, _args) -> dict:
     out = []
     for payee, info in list(health.items())[:25]:
         info = info if isinstance(info, dict) else {}
+        withdrawn_on = info.get("withdrawn_on")
         out.append({"payee": payee,
                     "amount": info.get("amount") or info.get("expected"),
-                    "health": info.get("health")})
+                    "health": info.get("health"),
+                    # behind a "withdrawn" verdict: the day the bank feed
+                    # took the missed cycle's charge back
+                    "withdrawn_on": (withdrawn_on.isoformat()
+                                     if withdrawn_on else None)})
     return {"count": len(health), "bills": out}
 
 
@@ -250,7 +252,10 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "recurring_bills",
         "description": "The user's recurring bills and subscriptions with their "
-                       "amounts and health (matching / drifting / stale).",
+                       "amounts and health (ok = matching / drifting / "
+                       "stale / withdrawn = the last cycle WAS charged but "
+                       "the bank feed took the charge back, on "
+                       "withdrawn_on).",
         "parameters": {"type": "object", "properties": {}},
     }},
 ]

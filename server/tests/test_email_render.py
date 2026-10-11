@@ -787,3 +787,38 @@ class PlanFlowAddsUpTests(unittest.TestCase):
                           "missing from the flow: " + line[0])
         finally:
             conn.close()
+
+
+class GoalNeedingAnAccountTests(unittest.TestCase):
+    """A goal the user gave match words but no account is not measured, and
+    the Today page shows it anyway with the prompt to pick the account the
+    money lands in. The email mirrors the page: when the household's only
+    goal is one of those, an email that hid plan-only goals would carry no
+    goal block at all, and the one sentence that tells the owner how to make
+    the goal trackable would reach the page but never the inbox."""
+
+    PROMPT = "match words need an account — pick one on the Budget page"
+
+    def _render(self, goal):
+        conn = make_db()
+        try:
+            write_config(conn, today_view="detail", savings_goals=[goal])
+            return report.build(report.gather(conn, TODAY))
+        finally:
+            conn.close()
+
+    def test_a_goal_that_needs_an_account_gets_the_goal_block_and_the_prompt(self):
+        _, plain, html = self._render({
+            "name": "Vacation", "target": 3000, "monthly_plan": 300,
+            "tokens": ["VACATION FUND"]})
+        self.assertIn("Savings goals", html)
+        self.assertIn(self.PROMPT, html)
+        self.assertNotIn("plan only — set a destination account", html)
+        self.assertIn("Savings goals:", plain)
+        self.assertIn(f"Vacation: {self.PROMPT}", plain)
+
+    def test_a_deliberate_plan_without_match_words_still_has_no_goal_block(self):
+        _, plain, html = self._render({
+            "name": "Vacation", "target": 3000, "monthly_plan": 300})
+        self.assertNotIn("Savings goals", html)
+        self.assertNotIn("Savings goals:", plain)

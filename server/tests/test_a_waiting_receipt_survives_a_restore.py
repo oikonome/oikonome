@@ -67,5 +67,62 @@ class WaitingReceiptRoundTripTests(unittest.TestCase):
             dest.close()
 
 
+def _jpeg() -> bytes:
+    import io
+
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("L", (40, 60), 200).save(buf, format="JPEG")
+    return buf.getvalue()
+
+
+class CleanedUpCopyRoundTripTests(unittest.TestCase):
+    """The cleaned-up copy of a receipt photo travels in the data ZIP and
+    comes back with it. Only an upload ever makes one, so a restore that
+    dropped it would leave every restored receipt serving and re-reading
+    the raw, uncropped photo for good."""
+
+    def setUp(self):
+        self.src = make_db()
+        write_config(self.src)
+
+    def tearDown(self):
+        self.src.close()
+
+    def _round_trip(self, opt, opt_mime):
+        rid = receipts.add(self.src, None, PNG, "image/png")
+        self.src.execute(
+            "UPDATE receipts SET image_optimized=%s, optimized_mime=%s "
+            "WHERE id=%s::uuid", (opt, opt_mime, rid))
+        data = export.build_zip(self.src)
+        dest = make_db()
+        try:
+            restore.restore_zip(dest, data)
+            return dest.execute(
+                "SELECT image, image_optimized, optimized_mime "
+                "FROM receipts WHERE id=%s::uuid", (rid,)).fetchone()
+        finally:
+            dest.close()
+
+    def test_the_cleaned_up_copy_is_restored(self):
+        opt = _jpeg()
+        row = self._round_trip(opt, "image/jpeg")
+        self.assertEqual(bytes(row["image"]), PNG)
+        self.assertEqual(bytes(row["image_optimized"]), opt)
+        self.assertEqual(row["optimized_mime"], "image/jpeg")
+
+    def test_a_copy_that_is_not_the_jpeg_an_upload_writes_is_dropped(self):
+        # the stored type is what the image door serves the bytes back as,
+        # so only the one type the optimizer writes is ever restored; the
+        # receipt itself still comes back
+        for opt, mime in ((_jpeg(), "text/html"),
+                          (b"<html>not a jpeg</html>", "image/jpeg")):
+            with self.subTest(mime=mime):
+                row = self._round_trip(opt, mime)
+                self.assertEqual(bytes(row["image"]), PNG)
+                self.assertIsNone(row["image_optimized"])
+                self.assertIsNone(row["optimized_mime"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -818,6 +818,31 @@ class OutboxTests(Base):
         finally:
             conn.close()
 
+    def test_a_frozen_household_is_not_drained(self):
+        """A suspended or pending-delete household is locked out of every
+        door and sweep; its due deliveries must stay pending, not be sent,
+        and resume once the household is live again."""
+        from oikonome.jobs import worker
+        self._hook(("test.ping",))
+        conn = self._conn()
+        try:
+            webhooks.emit(conn, "test.ping", {})
+        finally:
+            conn.close()
+        admin = tenancy.admin_connect()
+        try:
+            for status in ("suspended", "pending_delete"):
+                admin.execute("UPDATE tenants SET status=%s WHERE id=%s",
+                              (status, self.tid))
+                self.assertNotIn(self.tid, worker._webhook_tenants(), status)
+            admin.execute("UPDATE tenants SET status='active' WHERE id=%s",
+                          (self.tid,))
+            self.assertIn(self.tid, worker._webhook_tenants())
+        finally:
+            admin.execute("UPDATE tenants SET status='active' WHERE id=%s",
+                          (self.tid,))
+            admin.close()
+
     def test_prune_keeps_the_pending_and_the_recent(self):
         h = self._hook(("test.ping",))
         conn = self._conn()
@@ -1024,6 +1049,54 @@ class OutboxTests(Base):
         self.assertEqual({r["state"] for r in self._pending(h["id"])},
                          {"failed"})
 
+    def test_the_worker_drain_holds_no_connection_while_a_receiver_answers(self):
+        """The drain sends for several households at once out of the pool
+        the sync, email and nightly sweeps share; a pooled connection held
+        across a slow receiver is one none of them can have."""
+        from oikonome.jobs import worker
+        h = self._hook(("test.ping",))
+        conn = self._conn()
+        try:
+            for i in range(2):
+                webhooks.emit(conn, "test.ping", {"n": i})
+        finally:
+            conn.close()
+        open_now = [0]
+        real_connect = tenancy.tenant_connect
+
+        def counted(tid, *a, **kw):
+            c = real_connect(tid, *a, **kw)
+            open_now[0] += 1
+            real_close = c.close
+
+            def close():
+                open_now[0] -= 1
+                real_close()
+            c.close = close
+            return c
+
+        held = []
+
+        def send(*a, **kw):
+            held.append(open_now[0])
+            return 200, None
+
+        due = (dt.datetime.now(dt.timezone.utc)
+               + dt.timedelta(seconds=1))
+        real_drain = webhooks.deliver_pending
+        with mock.patch.object(tenancy, "tenant_connect", counted), \
+                mock.patch.object(webhooks, "_send", send), \
+                mock.patch.object(
+                    webhooks, "deliver_pending",
+                    lambda *a, **kw: real_drain(*a, now=due, **kw)):
+            out = worker.webhooks_drain_tenant(self.tid)
+        self.assertEqual(out["sent"], 2)
+        self.assertEqual(held, [0, 0],
+                         "a tenant connection was held across a send")
+        self.assertEqual(open_now[0], 0)
+        self.assertEqual({r["state"] for r in self._pending(h["id"])},
+                         {"delivered"})
+
     def test_one_pass_spends_a_bounded_time_on_a_tenant(self):
         """A slow receiver with a full queue must not keep the pass on one
         household past its budget; what was not attempted stays due for
@@ -1073,6 +1146,40 @@ class OutboxTests(Base):
             self.assertEqual(out, {})
             worker.webhooks_drain()
             one.assert_called_once_with(self.tid)
+
+    def test_a_slow_household_does_not_hold_up_the_others(self):
+        from oikonome.jobs import worker
+        release = threading.Event()
+        done = []
+
+        def one(tid):
+            if tid == "slow":
+                release.wait(5)
+            done.append(tid)
+            return {"sent": 1, "failed": 0}
+        with mock.patch.object(worker, "webhooks_drain_tenant",
+                               side_effect=one), \
+                mock.patch.object(worker, "_webhook_tenants",
+                                  return_value=["slow", "a", "b"]):
+            t = threading.Thread(target=worker.webhooks_drain)
+            t.start()
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and len(done) < 2:
+                time.sleep(0.02)
+            self.assertEqual(sorted(done), ["a", "b"])
+            release.set()
+            t.join(5)
+        self.assertEqual(sorted(done), ["a", "b", "slow"])
+
+    def test_a_pass_stops_starting_households_at_its_budget(self):
+        from oikonome.jobs import worker
+        with mock.patch.object(worker, "webhooks_drain_tenant",
+                               return_value={"sent": 0, "failed": 0}) as one, \
+                mock.patch.object(worker, "_webhook_tenants",
+                                  return_value=["a", "b"]), \
+                mock.patch.object(worker, "WEBHOOK_PASS_BUDGET", 0.0):
+            self.assertEqual(worker.webhooks_drain(), {})
+        one.assert_not_called()
 
     def test_webhooks_stay_out_of_both_exports(self):
         """A receiver URL is a credential in its own right (a Home
@@ -1179,6 +1286,159 @@ class EmitterTests(Base):
         self.assertEqual(t["payee"], "NEW COFFEE")
         self.assertEqual(t["account"], "Test Card")
 
+    def test_new_rows_leave_out_hidden_and_duplicate_accounts(self):
+        from oikonome.jobs import worker
+        h = self._hook(("transactions.new",))
+        conn = self._conn()
+        try:
+            conn.execute(
+                "INSERT INTO accounts (id, item_id, name, type, subtype,"
+                " user_removed_at) VALUES ('hid','it1','Old Card','credit',"
+                "'credit card', now()) ON CONFLICT (tenant_id, id) DO NOTHING")
+            before = worker._recent_txn_ids(conn)
+            seen = add_txn(conn, dt.date.today(), 9.0, "SEEN BAKERY")
+            add_txn(conn, dt.date.today(), 11.0, "HIDDEN BAKERY",
+                    account="hid")
+            worker._webhooks_after_sync(conn, {"it1": "ok:2"}, before, self.tid)
+            p = conn.execute(
+                "SELECT payload FROM webhook_deliveries WHERE webhook_id=%s",
+                (h["id"],)).fetchone()["payload"]
+        finally:
+            conn.close()
+        self.assertEqual([t["id"] for t in p["transactions"]], [seen])
+        self.assertEqual(p["count"], 1)
+
+    def test_a_webhook_scoped_pull_announces_what_it_landed(self):
+        from oikonome.jobs import worker
+        h = self._hook(("transactions.new", "sync.completed"))
+        conn = self._conn()
+        try:
+            conn.execute(
+                "INSERT INTO items (id, aggregator, institution_name,"
+                " access_token, status) VALUES ('pl-w','plaid','Example Bank',"
+                "'enc-tok','ok') ON CONFLICT (tenant_id, id) DO NOTHING")
+        finally:
+            conn.close()
+        landed = {}
+
+        def pull(c, item_id):
+            landed["id"] = add_txn(c, dt.date.today(), 4.5, "WEBHOOK DINER")
+            return {"added": 1}
+        with mock.patch("oikonome.sync.plaid.sync", side_effect=pull), \
+             mock.patch("oikonome.engine.llm_categorize.categorize_new"):
+            worker._sync_item_body(self.tid, "pl-w")
+        conn = self._conn()
+        try:
+            by = {r["event"]: r["payload"] for r in conn.execute(
+                "SELECT event, payload FROM webhook_deliveries"
+                " WHERE webhook_id=%s", (h["id"],)).fetchall()}
+            conn.execute("DELETE FROM items WHERE id='pl-w'")
+        finally:
+            conn.close()
+        self.assertEqual(by["sync.completed"]["new_transactions"], 1)
+        self.assertEqual(by["transactions.new"]["transactions"][0]["id"],
+                         landed["id"])
+
+    def test_a_manual_bank_refresh_announces_what_it_landed(self):
+        # the per-bank refresh button pulls rows the hourly sweep would
+        # otherwise have announced; the sweep's own snapshot already holds
+        # them afterwards, so this door must name them itself
+        from oikonome.web import pages
+        h = self._hook(("transactions.new", "sync.completed"))
+        conn = self._conn()
+        try:
+            conn.execute(
+                "INSERT INTO items (id, aggregator, institution_name,"
+                " access_token, status) VALUES ('pl-m','plaid','Example Bank',"
+                "'enc-tok','ok') ON CONFLICT (tenant_id, id) DO NOTHING")
+        finally:
+            conn.close()
+        landed = {}
+
+        def pull(c, item_id):
+            landed["id"] = add_txn(c, dt.date.today(), 6.5, "BUTTON DINER")
+            return {"added": 1}
+        user = {"tenant_id": self.tid, "user_id": None, "role": "owner"}
+        try:
+            with mock.patch("oikonome.sync.plaid.sync", side_effect=pull), \
+                 mock.patch("oikonome.sync.plaid.sync_products"), \
+                 mock.patch.object(pages, "_categorize_after_pull_async"), \
+                 mock.patch.object(pages, "_tenant_sync_allowed",
+                                   return_value=True):
+                outcome, _ = pages._account_sync(user, "pl-m")
+            conn = self._conn()
+            try:
+                by = {r["event"]: r["payload"] for r in conn.execute(
+                    "SELECT event, payload FROM webhook_deliveries"
+                    " WHERE webhook_id=%s", (h["id"],)).fetchall()}
+            finally:
+                conn.close()
+        finally:
+            conn = self._conn()
+            try:
+                conn.execute("DELETE FROM items WHERE id='pl-m'")
+            finally:
+                conn.close()
+        self.assertEqual(outcome, "ok")
+        self.assertEqual(by["sync.completed"]["new_transactions"], 1)
+        self.assertEqual(by["sync.completed"]["connections"][0]["name"],
+                         "Example Bank")
+        self.assertEqual(by["transactions.new"]["transactions"][0]["id"],
+                         landed["id"])
+
+    def test_connection_changed_follows_the_announced_edge(self):
+        # a webhook pull wrote the broken status without announcing it; the
+        # next sweep reads that status as its starting point, and must
+        # still tell the receiver the connection broke — once
+        from oikonome.jobs import link_alert, worker
+        from oikonome.sync import plaid
+        h = self._hook(("connection.changed",))
+        conn = self._conn()
+        try:
+            conn.execute(
+                "INSERT INTO items (id, aggregator, institution_name,"
+                " access_token, status) VALUES ('pl-c','plaid','Example Bank',"
+                "'enc-tok','error:ITEM_LOGIN_REQUIRED')"
+                " ON CONFLICT (tenant_id, id) DO NOTHING")
+            link_alert.stamp_announced(conn, [{"id": "pl-c", "new": "ok"}])
+        finally:
+            conn.close()
+
+        def fail(c, item_id):
+            raise plaid.PlaidError(
+                {"error_code": "ITEM_LOGIN_REQUIRED",
+                 "error_type": "ITEM_ERROR", "error_message": "x"}, 400)
+
+        def sweep():
+            with mock.patch.object(worker.plaid, "sync", side_effect=fail), \
+                 mock.patch.object(worker.plaid, "sync_products",
+                                   return_value={}), \
+                 mock.patch("oikonome.web.report.send"), \
+                 mock.patch("oikonome.notify.push.send_tenant"), \
+                 mock.patch("oikonome.notify.push_native.send_tenant"):
+                worker.sync_tenant(self.tid)
+        try:
+            sweep()
+            sweep()                                   # steady: nothing new
+            conn = self._conn()
+            try:
+                rows = conn.execute(
+                    "SELECT payload FROM webhook_deliveries"
+                    " WHERE webhook_id=%s", (h["id"],)).fetchall()
+            finally:
+                conn.close()
+        finally:
+            conn = self._conn()
+            try:
+                conn.execute("DELETE FROM items WHERE id='pl-c'")
+                conn.execute("DELETE FROM job_runs WHERE job LIKE '%%pl-c'")
+            finally:
+                conn.close()
+        self.assertEqual(len(rows), 1)
+        c = rows[0]["payload"]["connections"]
+        self.assertEqual([(x["name"], x["from"], x["to"]) for x in c],
+                         [("Example Bank", "ok", "error:ITEM_LOGIN_REQUIRED")])
+
     def test_nobody_listening_costs_nothing(self):
         from oikonome.jobs import worker
         conn = self._conn()
@@ -1207,7 +1467,6 @@ class EmitterTests(Base):
         try:
             cfg = budget.load_config(conn)
             cfg["email_schedule"] = {"daily": {"on": False, "hour": 0},
-                                     "weekly": {"on": False},
                                      "monthly": {"on": False}}
             budget.save_config(conn, cfg)
             # a household created today never gets a same-day send; move
@@ -1266,7 +1525,11 @@ class EmitterTests(Base):
                                return_value=(["owner@example.dev"],
                                              ["owner@example.dev"])), \
                 mock.patch("oikonome.web.report.send_each",
-                           return_value=refused):
+                           return_value=refused), \
+                mock.patch.dict("os.environ",
+                                {"OIKONOME_SMTP_HOST": "smtp.example.com"}):
+            # a relay is configured (and refusing): with none at all the
+            # email channel is off and nothing fails
             for _ in range(2):
                 with self.assertRaises(RuntimeError):
                     worker.email_tenant(self.tid, send_it=True,
@@ -1324,6 +1587,8 @@ class EmitterTests(Base):
                                                  ["owner@example.dev"])), \
                     mock.patch("oikonome.web.report.send_each",
                                return_value=refused), \
+                    mock.patch.dict("os.environ",
+                                    {"OIKONOME_SMTP_HOST": "smtp.example.com"}), \
                     self.assertRaises(RuntimeError):
                 worker.email_tenant(self.tid, send_it=True, cadence="daily")
         finally:

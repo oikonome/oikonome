@@ -157,9 +157,12 @@ class UnscopedSavingsGoalTests(unittest.TestCase):
         self.assertEqual(p["monthly_plan"], 1500.0)
 
     def test_token_scoped_goal_still_measures(self):
+        # match words carve a goal out of its account; with no account at
+        # all the goal reads as plan-only (it needs one to be measured)
         add_txn(self.conn, dt.date(2026, 7, 5), -250.0, "TRIP FUND TRANSFER",
-                primary="TRANSFER_IN")
+                primary="TRANSFER_IN", account="chk")
         p = self._progress({"name": "Trip", "target": 1000,
+                            "account_id": "chk",
                             "tokens": ["trip fund"], "monthly_plan": 0,
                             "start_balance": 0})
         self.assertFalse(p["plan_only"])

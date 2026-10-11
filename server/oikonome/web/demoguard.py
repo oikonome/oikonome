@@ -70,6 +70,15 @@ def deny(user: dict) -> None:
         raise HTTPException(403, DENIED)
 
 
+def is_shared_login(user: dict) -> bool:
+    """True when the caller is the shared demonstration login: the one
+    login whose second factor the demonstration seed waived. The refusing
+    helpers below and the flag /api/me hands the clients both read this,
+    so a control the clients hide and a door the server refuses can never
+    disagree about who the shared login is."""
+    return bool(user.get("second_factor_waived"))
+
+
 SHARED_DENIED = ("This is a shared demonstration login — its password, "
                  "email, sign-in factors and sessions can't be changed")
 
@@ -86,8 +95,71 @@ def deny_shared_login(user: dict) -> None:
     keep plain `deny`.)
     The account-posture doors call this instead of `deny`."""
     deny(user)
-    if user.get("second_factor_waived"):
+    if is_shared_login(user):
         raise HTTPException(403, SHARED_DENIED)
+
+
+SHARED_GRANT_DENIED = ("This is a shared demonstration login — it can't add "
+                       "people, script tokens, support access or new "
+                       "outbound destinations to this household")
+
+
+def deny_shared_grant(user: dict) -> None:
+    """`deny`, plus the shared demonstration login, at every door that mints
+    a principal or a channel which outlives the login that made it: an
+    invite (a member account), a role change or removal of a member, a
+    script token, a support-access window, a webhook destination, a new
+    mail relay, AI endpoint or report recipient.
+
+    The step-up in front of those doors exists so that a password alone
+    cannot make a durable grant; for this login the second factor is waived
+    and the password is handed out, so the step-up proves nothing. And the
+    only remedy the operator has, rotating the shared password, removes
+    what the login itself holds — not a member account someone claimed
+    with it, nor a token or a hook that belongs to the household."""
+    deny(user)
+    if is_shared_login(user):
+        raise HTTPException(403, SHARED_GRANT_DENIED)
+
+
+SHARED_BUNDLE_DENIED = ("This is a shared demonstration login — it can't "
+                        "connect, disconnect or reconnect a bank or "
+                        "exchange, save aggregator keys, take the "
+                        "credential bundle or manage the household's plan, "
+                        "since those outlive the login.")
+
+
+def deny_shared_credentials(user: dict) -> None:
+    """`deny`, plus the shared demonstration login, at every door that
+    puts a live credential into the household, ends or restarts one, or
+    hands one out: linking a bank or an exchange, disconnecting or
+    reconnecting one, saving an aggregator's keys, the sealed bundle of
+    every credential the household holds, and the payment account behind
+    its plan.
+
+    Each of these outlives the login that used it. A bank someone links
+    with the handed-out password is read by every later holder of that
+    password, keeps syncing (and billing the operator) every night, and
+    stays when the password is rotated, because it is the household's and
+    not the login's; a bundle once downloaded cannot be recalled; a Stripe
+    customer opened by one visitor is a card and an address the next one
+    is shown. The step-up in front of these doors proves nothing for a
+    login whose password is handed out and whose second factor is waived.
+
+    A disconnect is in the family too: releasing a Plaid Item cannot be
+    undone, and a reconnect restarts syncing and billing — neither is the
+    shared login's to decide for the household.
+
+    The request gate calls this for every write to the bank-connection
+    door family — the prefixes in permissions.SHARED_LOGIN_CREDENTIAL_DOORS
+    and the per-connection disconnect and reconnect paths in
+    permissions.SHARED_LOGIN_CREDENTIAL_PATTERNS — so a door added there
+    later is covered without anyone remembering to. The billing doors and
+    the helpers behind the connection doors call it themselves, so a
+    caller that does not pass through that gate is refused as well."""
+    deny(user)
+    if is_shared_login(user):
+        raise HTTPException(403, SHARED_BUNDLE_DENIED)
 
 
 def roster_hidden(user: dict) -> bool:
@@ -97,3 +169,42 @@ def roster_hidden(user: dict) -> bool:
     strangers — their addresses, browsers and phones. Both roster doors
     read this one predicate so neither can drift from the other."""
     return is_demo(user["tenant_id"]) or bool(user.get("second_factor_waived"))
+
+
+# what another member's address reads as to the shared demonstration login
+SOMEONE = "a household member"
+
+
+def people_hidden(user: dict) -> bool:
+    """True when the caller must not be shown other members' addresses:
+    the shared demonstration login. Every visitor holds that one login, so
+    anything it reads about the household's people — the roster, the mail
+    recipients, who made an edit, who an invite was for — reaches each
+    stranger who signs in with it. Every door that returns a member's
+    address reads this one predicate, so none can drift from the others."""
+    return bool(user.get("second_factor_waived"))
+
+
+def own_address_only(user: dict, address) -> str:
+    """`address` as the caller may see it: unchanged when it is the
+    caller's own or people are not hidden from them, else SOMEONE."""
+    if not people_hidden(user) or not address:
+        return address
+    mine = str(user.get("email") or "").strip().lower()
+    return address if str(address).strip().lower() == mine else SOMEONE
+
+
+def own_addresses_only(user: dict, addresses) -> list:
+    """`addresses` cut to the caller's own when people are hidden from it:
+    a list of members is dropped to the one row the caller already knows,
+    rather than filled with anonymised entries that name nobody."""
+    addresses = list(addresses or [])
+    if not people_hidden(user):
+        return addresses
+    mine = str(user.get("email") or "").strip().lower()
+    return [a for a in addresses if str(a or "").strip().lower() == mine]
+
+
+SHARED_PEOPLE_DENIED = ("This is a shared demonstration login — the "
+                        "household's own notes about its people are not "
+                        "shown to it or changed by it")

@@ -74,7 +74,8 @@ def _num(v) -> float | None:
         return None
     try:
         f = float(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: a JSON integer too wide for a double
         return None
     return f if math.isfinite(f) else None
 

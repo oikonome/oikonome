@@ -97,8 +97,12 @@ tokens** and put it in your credentials file:
 
 Tokens are deliberately narrow: they can push through the import
 endpoints and update a manual account balance — nothing else. They can't
-read your ledger, can't change settings, survive password changes, and
-are revocable one-by-one (the panel shows each token's last use). Prefer
+read your ledger, can't change settings, and are revocable one-by-one
+(the panel shows each token's last use). They do **not** survive a
+credential change: changing your password or login email, turning
+two-factor on or off, or adding your first passkey revokes every token
+you minted, so mint new ones for your scripts afterwards (see
+[Account security](guides/security.md)). Prefer
 one token per script, named after it. The older email+password login
 fallback still works but puts your real login password on disk — migrate
 when convenient. Container-exec scripts don't need either (they already

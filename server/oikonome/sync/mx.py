@@ -37,6 +37,10 @@ PAGE = 250
 
 log = logging.getLogger(__name__)
 
+# how far before the disconnect a reconnected member's next pull reaches,
+# so the days either side of the gap overlap (see reconnect)
+RESYNC_OVERLAP = dt.timedelta(days=7)
+
 TYPE_MAP = {  # MX account types → engine (type, subtype)
     "CHECKING": ("depository", "checking"),
     "SAVINGS": ("depository", "savings"),
@@ -166,12 +170,20 @@ def connect_widget_url(conn, transport=None) -> str:
     c = creds(conn)
     if c is None:
         raise ValueError("MX credentials are not configured")
+    # the widget hands the bank login to the household's MX client, which
+    # a credential rotation's bank-link hold has not confirmed yet; refused
+    # before any MX user is created. Syncs are not held: they only read
+    # with the user already held and send the client nothing new.
+    from ..engine import budget
+    from ..notify import outbound_pause
+    outbound_pause.refuse_if_held(budget.load_config(conn), "mx")
     guid = ensure_user(conn, transport)
     with _client(c, transport) as h:
         r = h.post(f"/users/{guid}/widget_urls",
                    json={"widget_url": {"widget_type": "connect_widget"}})
         r.raise_for_status()
-        return r.json()["widget_url"]["url"]
+        url = r.json()["widget_url"]["url"]
+    return url
 
 
 def _accounts(h: httpx.Client, guid: str) -> list[dict]:
@@ -201,10 +213,11 @@ def _transactions(h: httpx.Client, guid: str, since: dt.date) -> list[dict]:
         page += 1
 
 
-def _members(h: httpx.Client, guid: str) -> dict[str, str]:
-    # paginate like _accounts/_transactions — page-1-only would drop the
-    # names of every member past the first page.
-    out: dict[str, str] = {}
+def _members(h: httpx.Client, guid: str) -> dict[str, dict]:
+    """member guid -> {name}. Paginated like
+    _accounts/_transactions — page-1-only would drop every member past
+    the first page."""
+    out: dict[str, dict] = {}
     page = 1
     while True:
         r = h.get(f"/users/{guid}/members",
@@ -212,11 +225,71 @@ def _members(h: httpx.Client, guid: str) -> dict[str, str]:
         r.raise_for_status()
         j = r.json()
         for m in j.get("members") or []:
-            out[m["guid"]] = (m.get("name") or m.get("institution_code")
-                              or "MX")
+            out[m["guid"]] = {
+                "name": (m.get("name") or m.get("institution_code")
+                         or "MX")}
         if page >= (j.get("pagination") or {}).get("total_pages", 1):
             return out
         page += 1
+
+
+def reconnect(conn, item_id: str) -> dict:
+    """Bring a disconnected MX member back, on the owner's word.
+
+    Disconnecting only archives a member here — it lives on at MX, which
+    keeps refreshing it — so nothing a sync sees can tell a bank the owner
+    chose to bring back from one MX merely refreshed; only the owner can
+    say. While it was archived its rows were skipped, and the usual 30-day
+    refresh would never reach back over that gap, so the next pull for it
+    starts RESYNC_OVERLAP before the disconnect (items.resync_from).
+    Raises KeyError for no such MX item, ValueError when it is not
+    disconnected."""
+    it = conn.execute(
+        "SELECT id, status, archived_at, archived_reason FROM items "
+        "WHERE id=%s AND aggregator='mx'", (item_id,)).fetchone()
+    if it is None:
+        raise KeyError(item_id)
+    if it["status"] != "archived":
+        raise ValueError("this connection is not disconnected")
+    if (it["archived_reason"] or "").startswith("reconnected"):
+        # a newer link adopted this member's accounts; its next pull would
+        # re-create each of them beside the one the new link now keeps
+        raise ValueError("a newer connection now serves this bank's "
+                         "accounts — reconnecting it would bring them in "
+                         "twice")
+    # on the same calendar the pull's own window is counted in
+    # (_default_since: the server's local today)
+    since = ((it["archived_at"] or dt.datetime.now(dt.timezone.utc))
+             .astimezone() - RESYNC_OVERLAP).date()
+    # A gap marked by an earlier reconnect that no pull has served yet is
+    # still owed: a second disconnect-and-reconnect before that pull must
+    # not move the start later, or the first gap is never fetched. LEAST
+    # skips a NULL, so a first reconnect simply takes the new date.
+    row = conn.execute(
+        "UPDATE items SET status='ok', archived_at=NULL, "
+        "archived_reason=NULL, resync_from=LEAST(resync_from, %s) "
+        "WHERE id=%s AND status='archived' RETURNING resync_from",
+        (since, item_id)).fetchone()
+    if row is not None and row["resync_from"] is not None:
+        since = row["resync_from"]
+    return {"ok": True, "resync_from": since.isoformat()}
+
+
+def _resync_from(conn) -> tuple[dt.date | None, list[str]]:
+    """The earliest day a reconnected member still needs, and which items
+    asked for it. Archived members are left out: their rows are skipped.
+
+    items.resync_from is not MX's alone, whatever the migration that added
+    it says: a new SimpleFIN setup token writes it on every bank it brings
+    back (web/setup.py, read by simplefin._resync_owed). Hence the
+    aggregator filter here, and the same one there."""
+    rows = conn.execute(
+        "SELECT id, resync_from FROM items WHERE aggregator='mx' "
+        "AND resync_from IS NOT NULL "
+        "AND COALESCE(status,'') != 'archived'").fetchall()
+    if not rows:
+        return None, []
+    return min(r["resync_from"] for r in rows), [r["id"] for r in rows]
 
 
 def _default_since(conn, raw_accounts: list[dict]) -> dt.date:
@@ -260,6 +333,11 @@ def sync(conn, since: dt.date | None = None, transport=None) -> dict:
             raw_accounts = _accounts(h, guid)
             if since is None:
                 since = _default_since(conn, raw_accounts)
+            # MX takes ONE from_date for every member, so a reconnected
+            # member's gap deepens the shared window for this pull
+            resync, resync_items = _resync_from(conn)
+            if resync is not None:
+                since = min(since, resync)
             raw_txns = _transactions(h, guid, since)
             # member names are cosmetic — a failed _members call
             # must NOT error the whole MX sync (and flip healthy members to
@@ -277,10 +355,24 @@ def sync(conn, since: dt.date | None = None, transport=None) -> dict:
                   if (isinstance(e, httpx.HTTPStatusError)
                       and e.response.status_code in (401, 403))
                   else f"error:{type(e).__name__}")
+        # a disconnected member stays disconnected
         conn.execute(
-            "UPDATE items SET status=%s WHERE aggregator='mx'", (status,))
+            "UPDATE items SET status=%s WHERE aggregator='mx' "
+            "AND COALESCE(status,'') != 'archived'", (status,))
         raise
 
+    # A disconnected member lives on at MX, so the feed keeps carrying its
+    # accounts and transactions. Skip them entirely — no accounts, no
+    # rows, no pending retirement, no sync log — as SimpleFIN skips an
+    # archived bank, or data keeps arriving under a connection the owner
+    # was told is closed.
+    archived = {r["id"] for r in conn.execute(
+        "SELECT id FROM items WHERE aggregator='mx' "
+        "AND status='archived'").fetchall()}
+    let_go = {a["guid"] for a in raw_accounts
+              if f"mx-{a.get('member_guid') or '?'}" in archived}
+    raw_accounts = [a for a in raw_accounts if a["guid"] not in let_go]
+    raw_txns = [t for t in raw_txns if t.get("account_guid") not in let_go]
     accounts_by_member: dict[str, list[Account]] = {}
     for a in raw_accounts:
         typ, sub = TYPE_MAP.get(str(a.get("type") or "").upper(),
@@ -301,9 +393,11 @@ def sync(conn, since: dt.date | None = None, transport=None) -> dict:
     for member_guid, accts in accounts_by_member.items():
         item_id = f"mx-{member_guid}"
         upsert_item(conn, item_id, "mx",
-                    members.get(member_guid, "MX"), None)
+                    (members.get(member_guid) or {}).get("name", "MX"), None,
+                    keep_archived=True)
         upsert_accounts(conn, item_id, accts)
-        conn.execute("UPDATE items SET status='ok' WHERE id=%s", (item_id,))
+        conn.execute("UPDATE items SET status='ok' WHERE id=%s "
+                     "AND COALESCE(status,'') != 'archived'", (item_id,))
 
     # what the FEED carried, keyed BEFORE any local parsing or filtering:
     # a row skipped below for a transient parse glitch, or dropped by the
@@ -338,7 +432,8 @@ def sync(conn, since: dt.date | None = None, transport=None) -> dict:
                 category_primary=(t.get("top_level_category") or "").upper()
                                  .replace(" ", "_") or None,
                 raw=t))
-        except (ValueError, TypeError, KeyError):
+        except (ValueError, TypeError, KeyError, OverflowError):
+            # OverflowError: an amount too wide for a double
             log.warning("MX row skipped (unparseable): guid=%s",
                         t.get("guid"))
     txns, skipped = filter_import_duplicates(conn, txns)
@@ -363,6 +458,12 @@ def sync(conn, since: dt.date | None = None, transport=None) -> dict:
     for member_guid in accounts_by_member:
         log_sync(conn, f"mx-{member_guid}", per_member.get(member_guid, 0),
                  removed=removed_per_member.get(member_guid, 0))
+    if resync_items:
+        # the gap is filled; later pulls go back to the usual window. The
+        # reconnect door takes the same sync lock as this pull, so no
+        # member asked for a deeper pull while this one ran.
+        conn.execute("UPDATE items SET resync_from=NULL WHERE id = ANY(%s)",
+                     (resync_items,))
     return {"members": len(accounts_by_member),
             "accounts": len(raw_accounts), "transactions": added,
             "removed": len(retired),

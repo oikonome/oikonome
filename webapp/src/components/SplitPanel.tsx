@@ -1,6 +1,6 @@
 import { type ReactNode, useMemo, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { api, catLabel, errText, type SplitPart, type Txn } from "../api/client";
+import { api, catLabel, errText, promptCategoryName, type SplitPart, type Txn } from "../api/client";
 import { patchQueries } from "../api/cache";
 
 // One charge, several categories — the editor for a row's hand split.
@@ -85,7 +85,7 @@ export default function SplitPanel({ t, catGroups, known, onDone }:
                   aria-label={`category of part ${i + 1}`}
                   onChange={(e) => {
                     if (e.target.value === "__customcat__") {
-                      const name = window.prompt("Custom category name:")?.trim();
+                      const name = promptCategoryName();
                       if (name) set(i, { category: name });
                       return;
                     }

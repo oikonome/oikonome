@@ -106,6 +106,158 @@ class EmailMutedApiCapTests(unittest.TestCase):
         self.assertEqual(r.json()["email_muted"], ["one@x.dev",
                                                    "two@x.dev"])
 
+    def test_a_mute_toggle_names_one_address_and_keeps_the_rest(self):
+        """Two members muting themselves from two phones must not un-mute
+        each other: a toggle sends only its own address, and the server
+        applies it to the stored list, whatever copy the phone had."""
+        r = self.client.post("/api/settings",
+                             json={"email_muted": ["one@x.dev"]})
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.client.post("/api/settings",
+                             json={"email_muted_add": ["Two@X.dev"]})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["email_muted"], ["one@x.dev", "two@x.dev"])
+        r = self.client.post("/api/settings",
+                             json={"email_muted_remove": ["ONE@x.dev"]})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self.client.get("/api/settings").json()["email_muted"],
+                         ["two@x.dev"])
+        r = self.client.post("/api/settings", json={"email_muted_add": 5})
+        self.assertEqual(r.status_code, 400)
+
+
+class RecipientDeltaTests(EmailMutedApiCapTests):
+    """An add or a remove names one address and is applied to the STORED
+    list. A whole list posted from a copy loaded earlier drops whatever
+    another device added since; a delta cannot."""
+
+    PW = "correct-horse-battery"
+
+    def _list(self):
+        return self.client.get("/api/settings").json()["email_recipients"]
+
+    def test_an_add_keeps_what_another_device_added(self):
+        r = self.client.post("/api/settings", json={
+            "email_recipients": ["a@x.dev"], "password": self.PW})
+        self.assertEqual(r.status_code, 200, r.text)
+        # device B adds b; device A, still holding [a], then adds c
+        for addr in ("b@x.dev", "c@x.dev"):
+            r = self.client.post("/api/settings",
+                                 json={"email_recipients_added": [addr],
+                                       "password": self.PW})
+            self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self._list(), ["a@x.dev", "b@x.dev", "c@x.dev"])
+        # adding an address already there is a no-op, not a duplicate
+        r = self.client.post("/api/settings",
+                             json={"email_recipients_added": ["B@X.dev"]})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self._list(), ["a@x.dev", "b@x.dev", "c@x.dev"])
+
+    def test_a_remove_takes_off_only_its_address(self):
+        r = self.client.post("/api/settings", json={
+            "email_recipients": ["a@x.dev", "b@x.dev"], "password": self.PW})
+        self.assertEqual(r.status_code, 200, r.text)
+        # another device adds c after this one loaded [a, b]
+        self.client.post("/api/settings", json={
+            "email_recipients_added": ["c@x.dev"], "password": self.PW})
+        r = self.client.post("/api/settings",
+                             json={"email_recipients_removed": ["A@x.dev"]})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self._list(), ["b@x.dev", "c@x.dev"])
+
+    def test_an_added_address_takes_the_whole_list_rules(self):
+        from oikonome.web import mailguard
+        self.client.post("/api/settings", json={"email_recipients": [
+            f"r{i}@x.dev" for i in range(mailguard.MAX_RECIPIENTS)],
+            "password": self.PW})
+        r = self.client.post("/api/settings", json={
+            "email_recipients_added": ["over@x.dev"], "password": self.PW})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("limit", r.json()["detail"])
+        self.client.post("/api/settings", json={"email_recipients": []})
+        r = self.client.post("/api/settings", json={
+            "email_recipients_added": ["not-an-address"], "password": self.PW})
+        self.assertEqual(r.status_code, 400)
+        r = self.client.post("/api/settings",
+                             json={"email_recipients_removed": {"a": 1}})
+        self.assertEqual(r.status_code, 400)
+
+
+class DeltaBesideAStaleListTests(unittest.TestCase):
+    """A phone sends the one-address delta and, for a server older than the
+    delta keys, the whole list from its copy. On this server the delta
+    wins: the copy may be stale, and applying it would drop or un-mute an
+    address another device changed since."""
+
+    @classmethod
+    def setUpClass(cls):
+        import os
+        import uuid
+
+        from fastapi.testclient import TestClient
+        os.environ["OIKONOME_DEV"] = "1"
+        from .util import _ensure_db
+        _ensure_db()
+        import oikonome.web.app as appmod
+        appmod.DEV_MODE = True
+        cls.client = TestClient(appmod.app)
+        cls.client.post("/api/signup", data={
+            "email": f"delta-{uuid.uuid4().hex[:8]}@example.dev",
+            "password": "correct-horse-battery"})
+
+    def test_the_mute_delta_wins_over_the_stale_copy(self):
+        self.client.post("/api/settings",
+                         json={"email_muted": ["one@x.dev", "two@x.dev"]})
+        # the phone's copy predates two@x.dev muting themselves
+        r = self.client.post("/api/settings",
+                             json={"email_muted_add": ["three@x.dev"],
+                                   "email_muted": ["one@x.dev",
+                                                   "three@x.dev"]})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["email_muted"],
+                         ["one@x.dev", "three@x.dev", "two@x.dev"])
+
+    def test_an_empty_delta_leaves_the_shortened_list_in_charge(self):
+        """Older phones and web tabs send `email_recipients_added: []`
+        beside every whole list. The shortened list is that client's
+        removal; an empty delta must not override it and keep the address
+        it removed."""
+        pw = "correct-horse-battery"
+        r = self.client.post("/api/settings", json={
+            "email_recipients": ["a@x.dev", "b@x.dev"], "password": pw})
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.client.post("/api/settings", json={
+            "email_recipients": ["b@x.dev"], "email_recipients_added": [],
+            "password": pw})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["email_recipients"], ["b@x.dev"])
+        self.assertEqual(
+            self.client.get("/api/settings").json()["email_recipients"],
+            ["b@x.dev"])
+
+    def test_a_delta_that_names_an_address_still_wins(self):
+        pw = "correct-horse-battery"
+        self.client.post("/api/settings", json={
+            "email_recipients": ["a@x.dev", "b@x.dev"], "password": pw})
+        # a stale copy [a] beside a delta that adds c: b must survive
+        r = self.client.post("/api/settings", json={
+            "email_recipients": ["a@x.dev", "c@x.dev"],
+            "email_recipients_added": ["c@x.dev"], "password": pw})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(
+            self.client.get("/api/settings").json()["email_recipients"],
+            ["a@x.dev", "b@x.dev", "c@x.dev"])
+
+    def test_an_empty_mute_delta_leaves_the_whole_mute_list_in_charge(self):
+        self.client.post("/api/settings",
+                         json={"email_muted": ["one@x.dev", "two@x.dev"]})
+        r = self.client.post("/api/settings",
+                             json={"email_muted": ["one@x.dev"],
+                                   "email_muted_add": [],
+                                   "email_muted_remove": []})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["email_muted"], ["one@x.dev"])
+
 
 class NonListMutedNeverCrashes(unittest.TestCase):
     def setUp(self):

@@ -34,9 +34,10 @@ import os
 
 log = logging.getLogger("oikonome.notify.push_native")
 
-# What a push is allowed to say. The relay enforces the same list; keep
-# the two in sync (relay/app.py EVENTS).
-EVENTS = frozenset({"daily", "weekly", "monthly", "yearly", "alert", "test"})
+# What a push is allowed to say. The relay accepts a superset of this
+# (relay/app.py EVENTS): it serves every instance version still out
+# there, so an event retired here stays accepted there.
+EVENTS = frozenset({"daily", "monthly", "yearly", "alert", "test"})
 
 _TIMEOUT = 10.0
 
@@ -75,18 +76,51 @@ def content_free() -> bool:
     return env_flag("OIKONOME_PUSH_CONTENT_FREE")
 
 
+# What a relay refusal means for the person pressing "send test push": a
+# short leg-style label (detail["unavailable"]) and the sentence.
+_REFUSALS = {
+    401: ("relay key refused",
+          "the push relay refused this server's key "
+          "(OIKONOME_PUSH_RELAY_KEY)"),
+    403: ("device held by another server",
+          "the push relay says this device is still registered to another "
+          "Oikonome server — sign out of the app there, or wait for that "
+          "registration to lapse"),
+    429: ("relay rate limit",
+          "the push relay is rate-limiting this server — try again in a "
+          "minute"),
+}
+
+
+def _why(detail: dict | None, label: str, sentence: str) -> None:
+    if detail is not None:
+        detail["unavailable"] = [label]
+        detail["reason"] = sentence
+
+
 def send_tenant(conn, tenant_id: str, event: str,
                 badge: int | None = None,
                 detail: dict | None = None,
-                text: str | None = None) -> int:
-    """Tickle every registered device of the tenant. Returns the count
+                text: str | None = None, *, user_id=None,
+                connect=None) -> int:
+    """Tickle every registered device of the tenant — or, with `user_id`,
+    only that one user's devices. Returns the count
     the relay accepted; failures log and never raise. `conn` is a
     control-plane connection. Pass `detail` to learn WHY nothing went
-    out: it gains "unavailable" (relay legs not configured),
-    "unconfigured" (no relay URL at all — the self-host default) and "targets" (registrations
-    found). `text` is the one display line the push may carry (the
+    out: it gains "unavailable" (relay legs not configured, or why the
+    relay would not deliver), "reason" (that, as one sentence for a person),
+    "refused" (how many devices the relay would not push because another
+    instance still holds them), "unconfigured" (no relay URL at all — the
+    self-host default) and "targets" (registrations found). `text` is the one display line the push may carry (the
     daily verdict); it is dropped under OIKONOME_PUSH_CONTENT_FREE and
-    cut to one line of at most MAX_TEXT_LEN characters."""
+    cut to one line of at most MAX_TEXT_LEN characters.
+
+    Pass `connect` instead of `conn` to hold a connection only for the
+    reads and writes, and none while the relay answers (see
+    push.send_tenant)."""
+    from .push import db_handle
+    if conn is None and connect is None:
+        raise TypeError("send_tenant needs a connection or `connect`")
     if text and event == "daily" and not content_free():
         text = " ".join(text.split())[:MAX_TEXT_LEN] or None
     else:
@@ -99,15 +133,17 @@ def send_tenant(conn, tenant_id: str, event: str,
         # what is a server-config problem
         if detail is not None:
             from ..auth import device_tokens
-            detail["targets"] = len(
-                device_tokens.push_targets(conn, tenant_id))
+            with db_handle(conn, connect) as c:
+                detail["targets"] = len(
+                    device_tokens.push_targets(c, tenant_id, user_id))
             detail["unconfigured"] = True
         return 0
     if event not in EVENTS:
         log.warning("push_native: refusing unknown event %r", event)
         return 0
     from ..auth import device_tokens
-    targets = device_tokens.push_targets(conn, tenant_id)
+    with db_handle(conn, connect) as c:
+        targets = device_tokens.push_targets(c, tenant_id, user_id)
     if detail is not None:
         detail["targets"] = len(targets)
     if not targets:
@@ -125,10 +161,15 @@ def send_tenant(conn, tenant_id: str, event: str,
         if r.status_code != 200:
             log.warning("push_native: relay returned %s: %s",
                         r.status_code, r.text[:200])
+            _why(detail, *_REFUSALS.get(
+                r.status_code,
+                (f"relay HTTP {r.status_code}",
+                 f"the push relay answered HTTP {r.status_code}")))
             return 0
         out = r.json()
     except Exception as e:                         # noqa: BLE001
         log.warning("push_native: relay unreachable: %s", e)
+        _why(detail, "relay unreachable", "the push relay can't be reached")
         return 0
     # The relay is an external service: its answer is input, not gospel.
     # A non-object body (or garbage field types) must degrade like any
@@ -142,11 +183,19 @@ def send_tenant(conn, tenant_id: str, event: str,
     dead = [t for t in dead_field if isinstance(t, str)] \
         if isinstance(dead_field, list) else []
     if dead:
-        device_tokens.mark_push_dead(conn, dead)
+        try:
+            with db_handle(conn, connect) as c:
+                device_tokens.mark_push_dead(c, dead)
+        except Exception as e:                     # noqa: BLE001
+            log.warning("push_native: could not mark dead tokens: %s", e)
     if detail is not None:
         unav = out.get("unavailable")
         detail["unavailable"] = [u for u in unav if isinstance(u, str)] \
             if isinstance(unav, list) else []
+        refused = out.get("refused")
+        n_refused = len(refused) if isinstance(refused, list) else 0
+        if n_refused:
+            detail["refused"] = n_refused
     try:
         return int(out.get("sent") or 0)
     except (TypeError, ValueError):

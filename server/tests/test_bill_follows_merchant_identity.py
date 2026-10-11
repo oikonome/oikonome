@@ -227,6 +227,28 @@ class BillIdentityIsTheRule(_Ledger):
         self.assertEqual(_names(self.conn), ["Northwind", "Northwind Labs"])
 
 
+class ALongMerchantNameKeepsItsMatch(_Ledger):
+    """A merchant whose imported name runs past any display cap is still a
+    merchant the bill pays: the chip is kept whole, so it resolves to that
+    merchant and the bill keeps matching its rows."""
+
+    def test_a_chip_over_two_hundred_characters_keeps_its_merchant(self):
+        long_name = "NORTHWIND " + "X" * 250
+        mid = self.conn.execute(
+            "INSERT INTO merchants (name, name_source) VALUES (%s,'plaid') "
+            "RETURNING id::text AS id", (long_name,)).fetchone()["id"]
+        self.conn.execute(
+            "UPDATE transactions SET merchant_id=%s WHERE id = ANY(%s)",
+            (mid, self.old))
+        _bill(self.conn, merchants=[long_name])
+        raw = self.conn.execute("SELECT raw FROM bills WHERE payee=%s",
+                                (PAYEE,)).fetchone()["raw"]
+        self.assertEqual(raw["merchant_refs"], [{"id": mid, "name": long_name}])
+        self.assertEqual(raw["merchant_names"], [long_name])
+        hist = bills.merchant_history(self.conn, PAYEE, today=TODAY)
+        self.assertTrue(set(self.old) & {t["txn_id"] for t in hist["txns"]})
+
+
 class IdentityFollowsTheMerchantRow(_Ledger):
     """The stored id is the key: a rename or merge of the merchant on the
     Merchants page carries the bill without an offer; the name is only

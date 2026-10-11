@@ -1,19 +1,14 @@
-"""Timeframe lenses (Week / Month / Year) over the frozen engine.
+"""Timeframe lenses (Month / Year) over the frozen engine.
 
 Every lens is a VIEW composed from `budget.month_status` outputs — the
 verdict semantics, spend definition and bucket math change ZERO here. The
 compose functions return JSON-safe dicts and are the single source for BOTH
-the /api/lens/* endpoints and the weekly/monthly email bodies: an email
+the /api/lens/* endpoints and the monthly/yearly email bodies: an email
 renderer calls the same function the SPA fetches, so the two surfaces
-cannot diverge (the todayview rule, applied to lenses).
+cannot diverge (the same single-source pattern todayview.py uses for the
+Today card and its email).
 
 Composition rules:
-
-* WEEK — Mon–Sun calendar weeks. The weekly budget is the sum of each
-  day's DAILY ALLOWANCE (that day's month_budget ÷ days-in-month), so a
-  week straddling two months mixes both months' allowances per-day.
-  Verdict = the engine's frozen formula (variance vs max($50, 5% of
-  expected)) applied at week scope; expected pro-rates to elapsed days.
 
 * MONTH — the report card. Past months are FINAL (as-of = month end, so
   frac=1 and the engine's own verdict IS the final verdict); the current
@@ -45,6 +40,9 @@ from __future__ import annotations
 
 import calendar
 import datetime as dt
+import logging
+
+log = logging.getLogger("oikonome.lenses")
 
 from ..engine import budget, reporting
 from ..engine import categories as _categories
@@ -52,10 +50,6 @@ from ..engine import categories as _categories
 # ---- shared helpers ---------------------------------------------------------
 
 _R = lambda v: round(v, 2)  # noqa: E731 — payload rounding, one name
-
-
-def monday_of(d: dt.date) -> dt.date:
-    return d - dt.timedelta(days=d.weekday())
 
 
 def _verdict(variance: float, tolerance: float) -> str:
@@ -98,6 +92,7 @@ def month_state(conn, y: int, m: int, today: dt.date, *,
     st["as_of"] = as_of
     st["budget_source"] = "snapshot" if snap is not None else "live"
     st["bills_source"] = "snapshot" if frozen is not None else "live"
+    st["bill_rows"] = frozen    # the schedule the month was judged under
     return st
 
 
@@ -110,12 +105,17 @@ def _projection(st: dict, as_of: dt.date) -> dict:
     The pace runs over ELAPSED days, the same fraction the verdict uses:
     today has not finished, so counting it as a completed $0 day would
     project an on-pace household with nothing spent yet this morning as
-    under budget while the verdict says on budget. On day 1 nothing has
-    elapsed and the projection is the plan itself."""
+    under budget while the verdict says on budget. Today's spending stays
+    out of the numerator for the same reason (spend through yesterday
+    over the days through yesterday, the forecast's horizon), or a
+    household spending its allowance every day projects over budget. On
+    day 1 nothing has elapsed and the projection is the plan itself."""
     var_budget = (st["buckets"]["food"]["month_budget"]
                   + st["buckets"]["other"]["month_budget"])
     elapsed = as_of.day - 1
-    pace_total = (st["variable_actual"] / elapsed * st["days_in_month"]
+    through_yesterday = (st["variable_actual"]
+                         - (st.get("variable_today") or 0.0))
+    pace_total = (through_yesterday / elapsed * st["days_in_month"]
                   if elapsed >= 1 else var_budget)
     variance = pace_total - var_budget
     tolerance = max(50.0, var_budget * 0.05)
@@ -128,6 +128,102 @@ def _ser_txn(r, fixed: bool) -> dict:
             "payee": r["payee"], "category": r["category"],
             "account": r.get("account"), "pending": bool(r["pending"]),
             "fixed": fixed}
+
+
+def _variable_rows(st: dict) -> list[dict]:
+    """The month's everyday rows as the engine split them: the food and
+    other buckets' rows (carve-outs sit inside their parent's list), an
+    envelope's spill as its own slice."""
+    return list(st["buckets"]["food"].get("rows") or []) + \
+        list(st["buckets"]["other"].get("rows") or [])
+
+
+def _with_items(conn, txns: list[dict]) -> list[dict]:
+    """Each serialised row gains `items`: what was bought, for the
+    merchants whose charge never says — an Amazon order's refined item
+    summary, a Costco receipt's line descriptions. Empty for every other
+    row. One query per source for the whole list; a lookup failure leaves
+    the rows without items rather than failing the lens."""
+    import json as _json
+    ids = [t["txn_id"] for t in txns if t.get("txn_id")]
+    items: dict[str, list[str]] = {}
+    if ids:
+        try:
+            for r in conn.execute(
+                    """SELECT am.transaction_id AS id, s.summary,
+                              o.items_json
+                         FROM amazon_matches am
+                         LEFT JOIN amazon_summaries s ON s.dedup_key = am.dedup_key
+                         LEFT JOIN amazon_orders o ON o.dedup_key = am.dedup_key
+                        WHERE am.transaction_id = ANY(%s)""", (ids,)).fetchall():
+                names: list[str] = []
+                if r["summary"]:
+                    names = [x.strip() for x in str(r["summary"]).split(" · ")
+                             if x.strip()]
+                elif r["items_json"]:
+                    raw = r["items_json"]
+                    if isinstance(raw, str):
+                        raw = _json.loads(raw or "[]")
+                    names = [str(i.get("title") or "")[:60].strip()
+                             for i in (raw or []) if isinstance(i, dict)]
+                if names:
+                    items.setdefault(r["id"], []).extend(names)
+            for r in conn.execute(
+                    """SELECT cm.transaction_id AS id, cr.items_json, cr.summary
+                         FROM costco_matches cm
+                         JOIN costco_receipts cr ON cr.dedup_key = cm.dedup_key
+                        WHERE cm.transaction_id = ANY(%s)""", (ids,)).fetchall():
+                raw = r["items_json"]
+                if isinstance(raw, str):
+                    raw = _json.loads(raw or "[]")
+                names = []
+                for i in raw or []:
+                    if not isinstance(i, dict):
+                        continue
+                    d = str(i.get("description") or "").strip()
+                    if d:
+                        d = d.title()
+                        if d not in names:
+                            names.append(d)
+                if not names and r["summary"]:
+                    names = [str(r["summary"])]
+                if names:
+                    items.setdefault(r["id"], []).extend(names)
+        except Exception:                                # noqa: BLE001
+            log.warning("items for the largest transactions skipped",
+                        exc_info=True)
+    out = []
+    for t in txns:
+        t = dict(t)
+        t["items"] = items.get(t.pop("txn_id", None) or "", [])
+        out.append(t)
+    return out
+
+
+def _variable_ser(r: dict) -> dict:
+    """A variable row serialised with the id the items lookup follows: a
+    spill carries the purchase it was carved from under `overflow_of`."""
+    return {**_ser_txn(r, False),
+            "txn_id": r.get("txn_id") or r.get("overflow_of")}
+
+
+HOUSING_LABEL = "Mortgage, rent and utilities"
+
+
+def ring_label(category, detailed=None) -> str:
+    """The label a category takes in the reports' spending ring. The
+    feed files the mortgage under loan payments and the rent, power and
+    water under rent and utilities; a reader asking where the money
+    went wants the roof and what keeps it lit as one answer, so both
+    read as one housing slice. Other loan payments (a car, a student
+    loan) keep their own label — the detailed category tells them
+    apart — and everything else is its category as the ledger shows it."""
+    c = str(category or "")
+    if c == "RENT AND UTILITIES":
+        return HOUSING_LABEL
+    if c == "LOAN PAYMENTS" and detailed == "LOAN_PAYMENTS_MORTGAGE_PAYMENT":
+        return HOUSING_LABEL
+    return c
 
 
 def _by_category(rows) -> tuple[list, list, float]:
@@ -187,13 +283,14 @@ def year_category_ledger(conn, key: str, year: int) -> dict:
     """The rows a year lens category label summed, and its number: the
     same spend predicate and reimbursement netting as `year_summary`'s
     category totals, matched on the display form the label groups by."""
+    excl, ex_p = reporting.excluded_accounts_sql(conn)
     rows = conn.execute(
         f"SELECT t.id, {reporting.PART_NET_JOINED} amt "
         f"FROM transactions t {reporting.REIMB_PARTIAL_JOIN} {reporting.SPLIT_JOIN} "
         f"WHERE {reporting.SPEND_WHERE} "
         f"AND t.date >= %s AND t.date < %s "
-        f"AND {reporting.PART_CAT} = REPLACE(%s, '_', ' ')",
-        (dt.date(year, 1, 1), dt.date(year + 1, 1, 1), key)).fetchall()
+        f"AND {reporting.PART_CAT} = REPLACE(%s, '_', ' ') {excl}",
+        (dt.date(year, 1, 1), dt.date(year + 1, 1, 1), key, *ex_p)).fetchall()
     # a hand-split row is listed once however many of its parts matched
     # (one per category by construction, so at most once here)
     return {"txn_ids": list(dict.fromkeys(r["id"] for r in rows)),
@@ -208,6 +305,8 @@ def year_bucket_ledger(conn, bucket: str, year: int,
     and contributes nothing there either) — each month's rows named by
     `budget.bucket_ledger` against that month's own state. None when the
     name is a bucket of none of those months, which is the caller's 400.
+    `months` names the months summed, so a per-day pace can divide by the
+    days those months cover rather than by the whole year's.
 
     `today` decides which months have elapsed, so it is the HOUSEHOLD's day
     — on the container's UTC clock a west-coast evening on the 31st has
@@ -221,17 +320,28 @@ def year_bucket_ledger(conn, bucket: str, year: int,
     seen: set[str] = set()
     amount = 0.0
     label = None
+    months: list[int] = []
     for m in range(1, 13):
         if (year, m) > (today.year, today.month):
             continue
         if (year, m) < (today.year, today.month) and m not in snap_months:
             continue
-        info = budget.bucket_ledger(
-            month_state(conn, year, m, today, memo=memo), bucket)
+        st = month_state(conn, year, m, today, memo=memo)
+        if bucket in ("food", "other"):
+            # The year map draws a parent bucket WHOLE — it sends no child
+            # rows, so its label is the raw actual, carve-outs included.
+            # Its listing counts the same money: the month tile's
+            # display-number decomposition would drop the carve-out
+            # purchases the year label still adds in.
+            whole = st["buckets"][bucket]
+            st = {"buckets": {**st["buckets"],
+                              bucket: {**whole, "children": []}}}
+        info = budget.bucket_ledger(st, bucket)
         if info is None:
             continue
         label = label or info["label"]
         amount += info["amount"]
+        months.append(m)
         for t in info["txn_ids"]:
             if t not in seen:
                 seen.add(t)
@@ -239,7 +349,76 @@ def year_bucket_ledger(conn, bucket: str, year: int,
     if label is None:
         return None
     return {"bucket": bucket, "label": label, "amount": _R(amount),
-            "txn_ids": ids}
+            "txn_ids": ids, "months": months}
+
+
+def _year_detail(conn, year: int, today: dt.date, memo: dict,
+                 snap_months: set[int]) -> dict:
+    """See year_summary(with_detail=True). Categories cover every elapsed
+    month; the bars' figures (children, envelopes, bills paid) only the
+    budgeted ones, like `buckets_annual`."""
+    cats: dict[str, float] = {}
+    cat_keys: dict[str, str | None] = {}
+    fixed_total = 0.0
+    # the paid bills by their charges' transaction category, over the
+    # same months fixed_total covers, so the report can show the bills
+    # by kind instead of as one lump
+    bill_cats: dict[str, float] = {}
+    bills_paid = 0
+    children: dict[str, dict] = {}
+    envelopes: dict[str, dict] = {}
+    walked = budgeted = 0
+    for m in range(1, 13):
+        if (year, m) > (today.year, today.month):
+            continue
+        st = month_state(conn, year, m, today, memo=memo)
+        walked += 1
+        b = st["buckets"]
+        variable_rows = _variable_rows(st)
+        for label, amt, key in _by_category(variable_rows)[0]:
+            cats[label] = cats.get(label, 0.0) + amt
+            cat_keys.setdefault(label, key)
+        fixed_total += b["fixed"]["actual"]
+        for r in b["fixed"].get("occ_rows") or []:
+            if r.get("category"):
+                lab = ring_label(r["category"], r.get("category_detailed"))
+                bill_cats[lab] = bill_cats.get(lab, 0.0) + r["amount"]
+        is_budgeted = ((year, m) == (today.year, today.month)
+                       or m in snap_months)
+        if not is_budgeted:
+            continue
+        budgeted += 1
+        bills_paid += len(b["fixed"].get("occ_rows") or [])
+        for k in ("food", "other"):
+            for c in b[k].get("children") or []:
+                e = children.setdefault(c["name"], {"actual": 0.0,
+                                                     "month_budget": 0.0,
+                                                     "parent": k})
+                e["actual"] += c["actual"]
+                e["month_budget"] += c["month_budget"]
+        for env in b["fixed"].get("envelopes") or []:
+            e = envelopes.setdefault(env["payee"], {
+                "used": 0.0, "monthly": 0.0, "overflow": 0.0,
+                "show_today": False})
+            e["used"] += env["used"]
+            e["monthly"] += env["monthly"]
+            e["overflow"] += env["overflow"]
+            e["show_today"] = e["show_today"] or bool(env.get("show_today"))
+    categories = sorted(([k, _R(v), cat_keys.get(k)] for k, v in cats.items()),
+                        key=lambda x: -x[1])
+    return {"categories_variable": categories, "fixed_total": _R(fixed_total),
+            "categories_bills": sorted(([k, _R(v)] for k, v in bill_cats.items()),
+                                       key=lambda x: -x[1]),
+            "bills_paid": bills_paid,
+            "children": {k: {"actual": _R(v["actual"]),
+                             "month_budget": _R(v["month_budget"]),
+                             "parent": v["parent"]}
+                         for k, v in children.items()},
+            "envelopes": {k: {"used": _R(v["used"]), "monthly": _R(v["monthly"]),
+                              "overflow": _R(v["overflow"]),
+                              "show_today": v["show_today"]}
+                          for k, v in envelopes.items()},
+            "months_walked": walked, "budgeted_months": budgeted}
 
 
 def _first_year(conn) -> int | None:
@@ -248,194 +427,33 @@ def _first_year(conn) -> int | None:
     return row["d"].year if row and row["d"] else None
 
 
+class _Coverage:
+    """Which months have known income. A month's income is a number only
+    once a bank account feeds the ledger: from the month of the first bank
+    row on record, in a year that has bank rows at all (the Cash Flow
+    report's year rule). Deciding it per YEAR alone would read the months
+    of a year before its checking feed starts as income $0, so each would
+    show its whole spend as a loss; those months are unknown instead.
+    Excluded, hidden and linked-backup accounts do not count, for the
+    reason _bank_coverage_years gives: their rows are invisible to the
+    income figure. The rule is reporting._income_coverage itself, not a
+    copy of it, so the lenses and the Cash Flow page cannot disagree about
+    which months are known."""
+
+    def __init__(self, conn):
+        self.years, self.start = reporting._income_coverage(conn)
+
+    def month(self, key: str) -> bool:
+        """`key` is 'YYYY-MM'."""
+        return (self.start is not None and key >= self.start
+                and key[:4] in self.years)
+
+    def whole_year(self, y: int) -> bool:
+        """Every month of `y` is covered, so a sum over the year is known."""
+        return self.month(f"{y:04d}-01")
+
+
 # ---- week lens --------------------------------------------------------------
-
-
-def week_summary(conn, start: dt.date, today: dt.date | None = None) -> dict:
-    """One Mon–Sun week. `start` snaps to its Monday. Budgets/expectations
-    sum per-day allowances (month_budget ÷ days-in-month for each day's
-    OWN month), so month-straddling weeks are exact by construction."""
-    today = today or dt.date.today()
-    start = monday_of(start)
-    days = [start + dt.timedelta(days=i) for i in range(7)]
-    end = days[-1]
-
-    states: dict[tuple[int, int], dict] = {}
-    memo: dict = {}
-    for d in {(d.year, d.month) for d in days}:
-        states[d] = month_state(conn, d[0], d[1], today, memo=memo)
-
-    def st_of(d: dt.date) -> dict:
-        return states[(d.year, d.month)]
-
-    # per-day daily allowance, per bucket + custom-bucket children (each
-    # month's own — dynamic scaling included, since month_budget is the
-    # engine's already-scaled number)
-    def allowance(d: dt.date, bucket: str, child: str | None = None) -> float:
-        st = st_of(d)
-        b = st["buckets"][bucket]
-        if child is not None:
-            c = next((c for c in b.get("children") or []
-                      if c["name"] == child), None)
-            monthly = c["month_budget"] if c else 0.0
-        else:
-            monthly = b["month_budget"]
-        return monthly / st["days_in_month"]
-
-    covered = [d for d in days if d <= today]
-    in_week = lambda r: start <= r["date"] <= end  # noqa: E731
-
-    buckets: dict[str, dict] = {}
-    child_names: dict[str, list[str]] = {}
-    for k in ("food", "other"):
-        names: list[str] = []
-        for st in states.values():
-            for c in st["buckets"][k].get("children") or []:
-                if c["name"] not in names:
-                    names.append(c["name"])
-        child_names[k] = names
-        rows = [r for st in states.values()
-                for r in st["buckets"][k]["rows"] if in_week(r)]
-        kids = []
-        carved = 0.0
-        for name in names:
-            crows = [r for st in states.values()
-                     for c in st["buckets"][k].get("children") or []
-                     if c["name"] == name for r in c["rows"] if in_week(r)]
-            cactual = sum(r["amount"] for r in crows)
-            carved += cactual
-            kids.append({
-                "name": name, "actual": _R(cactual),
-                "week_budget": _R(sum(allowance(d, k, name) for d in days)),
-                "expected": _R(sum(allowance(d, k, name) for d in covered))})
-        wk_budget = sum(allowance(d, k) for d in days)
-        buckets[k] = {
-            "actual": _R(sum(r["amount"] for r in rows)),
-            "week_budget": _R(wk_budget),
-            "expected": _R(sum(allowance(d, k) for d in covered)),
-            "children": kids,
-            "display_actual": _R(sum(r["amount"] for r in rows) - carved),
-            "remaining_budget": _R(max(
-                0.0, wk_budget - sum(c["week_budget"] for c in kids))),
-        }
-
-    fixed_rows = [r for st in states.values()
-                  for r in st["buckets"]["fixed"]["rows"] if in_week(r)]
-    var_rows = [r for st in states.values() for k in ("food", "other")
-                for r in st["buckets"][k]["rows"] if in_week(r)]
-
-    # Bills PLANNED for the week (the money map's Bills row): occurrences
-    # whose due date falls Mon–Sun, expanded and paid/unpaid-matched by the
-    # ENGINE's own machinery (month_occurrences + match_occurrences — the
-    # month_status pipeline, no new cadence rules), plus each day's share
-    # of envelope pools. `awaiting` mirrors Today's unpaid_due rule:
-    # due date arrived (≤ today) and still unmatched. A bill due this week
-    # but paid in an adjacent week shows as planned here and posted there —
-    # inherent week-boundary noise, same as an early payment on Today.
-    cfg = next(iter(states.values()))["config"]
-    bills = budget.drop_card_pay_bills(conn, budget._recurring_bills(
-        conn, caps=cfg.get("occurrence_caps"),
-        disabled=cfg.get("disabled_bills")))
-    week_bills = awaiting = 0.0
-    for (yy, mm), mst in states.items():
-        # The same candidate set month_status matches over: rows from
-        # PREPAY_MATCH_DAYS before the month, and next month's occurrences
-        # as decoys — so a bill due the 1st that autopaid on the 28th reads
-        # as settled here too, not as awaiting. Only THIS month's
-        # occurrences are counted; a next-month one paid early is counted
-        # by its own month's pass, whose lookback sees the same payment.
-        occs = budget.month_occurrences(bills, yy, mm)
-        n_this = len(occs)
-        ny, nm = (yy, mm + 1) if mm < 12 else (yy + 1, 1)
-        occs += budget.month_occurrences(bills, ny, nm)
-        mrows = budget._spend_rows(
-            conn, dt.date(yy, mm, 1) - dt.timedelta(days=budget.PREPAY_MATCH_DAYS),
-            mst["as_of"] + dt.timedelta(days=1),
-            excluded=budget.excluded_account_ids(cfg), memo=memo)
-        _, occs = budget.match_occurrences(mrows, occs)
-        for occ in occs[:n_this]:
-            if not (start <= occ["due"] <= end):
-                continue
-            if occ["floored"] and occ["txn"] is None:
-                continue        # engine rule: floored + unpaid ≠ expected
-            week_bills += occ["planned"]
-            if occ["txn"] is None and occ["due"] <= today:
-                awaiting += occ["planned"]
-    # Envelope share per day — the forecast's drip, not the plan rate:
-    # what's LEFT of each pool over the days left in its period. A flat
-    # monthly ÷ days-in-month share would keep charging an exhausted pool,
-    # planning money the engine says is already spent. Days in the
-    # current month drip max(0, pool − used) over tomorrow→EOM; other
-    # months' pools are untouched (or final) and drip the plan rate, the
-    # same rate step the forecast walks across a period roll. Annual pools
-    # drip their remaining YEAR pool over the days left in the
-    # year. month_status already did the pool accounting — reuse it.
-    days_left_month = (calendar.monthrange(today.year, today.month)[1]
-                       - today.day)
-    days_left_year = (dt.date(today.year, 12, 31) - today).days
-    for d1 in days:
-        st = st_of(d1)
-        for e in st["buckets"]["fixed"]["envelopes"]:
-            if e["period_months"] >= 12:            # annual pool
-                if d1.year == today.year:
-                    week_bills += (e["period_left"] / days_left_year
-                                   if days_left_year else 0.0)
-                else:                               # pool resets Jan 1
-                    week_bills += e["pool"] / (
-                        366 if calendar.isleap(d1.year) else 365)
-            elif (d1.year, d1.month) == (today.year, today.month):
-                week_bills += (max(0.0, e["pool"] - e["used"])
-                               / days_left_month if days_left_month else 0.0)
-            else:                                   # pool resets at the 1st
-                week_bills += e["pool"] / st["days_in_month"]
-
-    actual = buckets["food"]["actual"] + buckets["other"]["actual"]
-    expected = buckets["food"]["expected"] + buckets["other"]["expected"]
-    week_budget = buckets["food"]["week_budget"] + buckets["other"]["week_budget"]
-    variance = actual - expected
-    tolerance = max(50.0, expected * 0.05)
-
-    per_day = []
-    for d in days:
-        per_day.append({
-            "date": d.isoformat(),
-            "variable": _R(sum(r["amount"] for r in var_rows if r["date"] == d)),
-            "fixed": _R(sum(r["amount"] for r in fixed_rows if r["date"] == d)),
-        })
-
-    txns = sorted((r for r in var_rows + fixed_rows),
-                  key=lambda r: (r["date"], -r["amount"]), reverse=True)
-    fixed_ids = {id(r) for r in fixed_rows}
-    status = ("future" if start > today
-              else "in_progress" if end >= today else "final")
-    # at week scope: plan surplus is a STANDING monthly metric
-    # (config-derived — the same number Today shows); the SPA scales it
-    # to the timeframe like the savings row (planRows opts.scale)
-    plan_surplus = next(iter(states.values())).get("plan_surplus")
-    return {
-        "start": start.isoformat(), "end": end.isoformat(),
-        "status": status, "as_of": today.isoformat(),
-        "verdict": _verdict(variance, tolerance),
-        "variance": _R(variance), "tolerance": _R(tolerance),
-        "actual": _R(actual), "expected": _R(expected),
-        "week_budget": _R(week_budget),
-        "remaining": _R(week_budget - actual),
-        "days": per_day,
-        "buckets": {**buckets,
-                    "fixed": {"actual": _R(sum(r["amount"] for r in fixed_rows)),
-                              "count": len(fixed_rows),
-                              # bills planned for / awaiting in the week —
-                              # the money map's Bills row (posted green,
-                              # awaiting amber, remaining light)
-                              "week_budget": _R(week_bills),
-                              "awaiting": _R(awaiting)}},
-        "txns": [_ser_txn(r, id(r) in fixed_ids) for r in txns],
-        "plan_surplus": (_R(plan_surplus)
-                         if plan_surplus is not None else None),
-    }
-
-
-# ---- month lens -------------------------------------------------------------
 
 
 def month_summary(conn, year: int, month: int,
@@ -466,17 +484,34 @@ def month_summary(conn, year: int, month: int,
         return out
 
     mtd, amazon_subs, amazon_total = _by_category(st["rows"])
+    # the same grouping over the variable rows alone: a reader who wants
+    # "where did the everyday money go, with the bills as one line" needs
+    # the bills OUT of the category list. The variable rows are the
+    # buckets' own — not the raw rows minus the fixed ones: a purchase an
+    # envelope partly absorbed is TWO rows to the engine, the part inside
+    # the cap (fixed) and the spill (variable, carrying `overflow_of`),
+    # and the raw row would count the whole swipe as everyday spend.
+    variable_rows = _variable_rows(st)
+    mtd_variable, _, _ = _by_category(variable_rows)
     biggest = sorted(st["rows"], key=lambda r: -r["amount"])[:10]
-    income_actual = next(
-        (r["amt"] for r in reporting._income_by(conn, "month")
-         if r["p"] == f"{year:04d}-{month:02d}"), None)
+    biggest_variable = sorted(variable_rows, key=lambda r: -r["amount"])[:10]
+    # income is the bank deposits of a covered month (0 when there were
+    # none) and unknown for a month no bank account feeds: the year strip
+    # and the reports' totals read the same rule, so the hero cannot call
+    # a month unknown while its cell counts it as a loss
+    key = f"{year:04d}-{month:02d}"
+    income_actual = (next((r["amt"] for r in reporting._income_by(conn, "month")
+                           if r["p"] == key), None) or 0
+                     if status != "future" and _Coverage(conn).month(key)
+                     else None)
     paid = sorted(b["fixed"].get("occ_rows") or [],
                   key=lambda r: r["date"])
     # The month map's Savings row actual. rate_90d is a trailing 90-day
     # average, not what THIS month saved, so the figure comes from the same
     # source as the Year lens' saved_ytd: the ledger's posted contribution
-    # to the standing "Savings" goal within this month, checking-leg
-    # evidence included (posted_for_plan).
+    # to the standing "Savings" goal within this month: the plan evidence
+    # savings.month_saved reads, the checking leg standing in where the
+    # destination shows less than the plan.
     from ..engine import savings as _savings
     _cfg = budget.load_config(conn)
     saved_month = None
@@ -486,8 +521,8 @@ def month_summary(conn, year: int, month: int,
             and status != "future"):
         _first = dt.date(year, month, 1)
         _last = dt.date(year, month, calendar.monthrange(year, month)[1])
-        saved_month = _R(_savings.posted_for_plan(
-            conn, _cfg, _goal, since=_first, until=min(_last, today)))
+        saved_month = _R(_savings.month_saved(
+            conn, _cfg, _goal, _first, min(_last, today)))
     return {
         "y": year, "m": month, "status": status,
         "as_of": as_of.isoformat(), "days_in_month": st["days_in_month"],
@@ -503,19 +538,41 @@ def month_summary(conn, year: int, month: int,
             "posted": _R(b["fixed"]["actual"]),
             "planned": _R(b["fixed"]["month_budget"]),
             "awaiting": _R(b["fixed"].get("unpaid_due") or 0),
+            # category: the transaction category on the matched charge
+            # (what the bill stamps, or the feed's) and the feed's detailed
+            # one, so a reader can see the bills by kind — mortgage,
+            # utilities, subscriptions
             "paid": [{"date": r["date"].isoformat(),
-                      "amount": _R(r["amount"]), "payee": r["payee"]}
+                      "amount": _R(r["amount"]), "payee": r["payee"],
+                      "category": r.get("category"),
+                      "detailed": r.get("category_detailed")}
                      for r in paid],
-            "overdue": [[p, _R(a), due]
-                        for p, a, due in st.get("overdue_unpaid") or []],
+            # [payee, amount, due, withdrawn_on] — see month_status
+            "overdue": [[p, _R(a), due, gone]
+                        for p, a, due, gone in budget.overdue_entries(st)],
+            # the pool and the period are what "how close to the cap" means
+            # for an envelope that accumulates over several months — `used`
+            # alone is this month's swipes against a cap that is not monthly
             "envelopes": [{"payee": e["payee"], "used": _R(e["used"]),
                            "monthly": _R(e["monthly"]),
-                           "overflow": _R(e["overflow"])}
+                           "overflow": _R(e["overflow"]),
+                           "pool": _R(e.get("pool", e["monthly"])),
+                           "period_months": int(e.get("period_months") or 1),
+                           "period_used": _R(e.get("period_used", e["used"])),
+                           "period_left": _R(e.get("period_left", 0)),
+                           # "pin to Today": the household watches this cap
+                           # like a budget of its own
+                           "show_today": bool(e.get("show_today"))}
                           for e in b["fixed"].get("envelopes") or []],
         },
         "by_category": mtd, "amazon_subs": amazon_subs,
         "amazon_total": amazon_total,
+        "by_category_variable": mtd_variable,
         "biggest": [_ser_txn(r, False) for r in biggest],
+        # the same list with the bill payments and envelope swipes out —
+        # a mortgage is always the biggest row, and says nothing
+        "biggest_variable": _with_items(conn, [
+            _variable_ser(r) for r in biggest_variable]),
         "income": ({"actual": _R(income_actual)
                     if income_actual is not None else None,
                     "budgeted": _R(st["income"])
@@ -544,11 +601,19 @@ def month_summary(conn, year: int, month: int,
 # ---- year lens --------------------------------------------------------------
 
 
-def year_summary(conn, year: int, today: dt.date | None = None) -> dict:
+def year_summary(conn, year: int, today: dt.date | None = None,
+                 *, with_detail: bool = False) -> dict:
     """12 verdict cells + annual totals + category totals vs prior year.
     Verdict cells cover months with a budget (a frozen snapshot, or the
     live config for the current month); a closed month with no snapshot
-    is a "net" cell — income vs spending, no verdict."""
+    is a "net" cell — income vs spending, no verdict.
+
+    `with_detail` adds `detail` — what the yearly email needs beyond the
+    page: the variable spend by category with the bills' total apart,
+    the carve-outs' and envelopes' annual figures over the budgeted
+    months, and the net of every year back to the ledger's first. It walks every elapsed month's state (the
+    budgeted ones are already in the memo), so it is for the mail, not
+    the page."""
     today = today or dt.date.today()
     cells = []
     # annual per-bucket aggregates for the year money map —
@@ -562,12 +627,18 @@ def year_summary(conn, year: int, today: dt.date | None = None) -> dict:
     # (None when nothing has elapsed — a future year has no excess to map)
     plan_surplus = None
     snap_months = budget.snapshot_months(conn, year)
-    # bank coverage decides whether a net cell's income is a number or
-    # unknown — same rule as the annual totals below
-    covered = reporting._bank_coverage_years(conn)
+    # bank coverage decides whether a cell's income is a number or unknown,
+    # month by month (the Month lens hero's rule); the annual totals below
+    # sum those months, so they are known only when every month is
+    cov = _Coverage(conn)
     # one pass over the bank rows serves both the annual totals below and
     # the net cells' months
     income_y, income_m = reporting._income_year_month(conn)
+    # the income above drops the accounts the household excluded from the
+    # budget; every spend read below drops them too, or saved, the savings
+    # rate and the net cells would set filtered income against unfiltered
+    # spend and disagree with Cash Flow and with the month cells
+    excl, ex_p = reporting.excluded_accounts_sql(conn)
     spend_m: dict | None = None     # lazy — only no-snapshot months pay
     memo: dict = {}                 # one engine cache across the 12 months
     for m in range(1, 13):
@@ -586,12 +657,12 @@ def year_summary(conn, year: int, today: dt.date | None = None) -> dict:
                     f"SUM({reporting.NET_AMOUNT_JOINED}) amt "
                     f"FROM transactions t {reporting.REIMB_PARTIAL_JOIN} "
                     f"WHERE {reporting.SPEND_WHERE} "
-                    f"AND t.date >= %s AND t.date < %s GROUP BY p",
-                    (dt.date(year, 1, 1), dt.date(year + 1, 1, 1)))}
+                    f"AND t.date >= %s AND t.date < %s {excl} GROUP BY p",
+                    (dt.date(year, 1, 1), dt.date(year + 1, 1, 1), *ex_p))}
             key = f"{year:04d}-{m:02d}"
             spend = _R(spend_m.get(key, 0) or 0)
             inc = (_R(income_m.get(key, 0) or 0)
-                   if str(year) in covered else None)
+                   if cov.month(key) else None)
             cells.append({"m": m, "status": "net", "verdict": None,
                           "variance": None, "variable_actual": None,
                           "variable_budget": None,
@@ -609,24 +680,37 @@ def year_summary(conn, year: int, today: dt.date | None = None) -> dict:
             annual[k]["month_budget"] += b["month_budget"]
         var_budget = _R(st["buckets"]["food"]["month_budget"]
                         + st["buckets"]["other"]["month_budget"])
+        # the cash-flow fact beside the verdict, the way the Month lens
+        # hero reads it (income from the bank series, spend = the month's
+        # total out), so a reader walking the year sees what each month
+        # kept or lost, not only how it was judged
+        key = f"{year:04d}-{m:02d}"
+        inc = (_R(income_m.get(key, 0) or 0)
+               if cov.month(key) else None)
+        spend = _R(st["total_actual"])
+        flow = {"income": inc, "spend": spend,
+                "net": _R(inc - spend) if inc is not None else None}
         if (year, m) == (today.year, today.month):
             proj = _projection(st, st["as_of"])
             cells.append({"m": m, "status": "projected",
                           "verdict": proj["verdict"],
                           "variance": proj["variance"],
                           "variable_actual": _R(st["variable_actual"]),
-                          "variable_budget": var_budget})
+                          "variable_budget": var_budget, **flow})
         else:
             cells.append({"m": m, "status": "final",
                           "verdict": st["verdict"],
                           "variance": _R(st["variance"]),
                           "variable_actual": _R(st["variable_actual"]),
-                          "variable_budget": var_budget})
+                          "variable_budget": var_budget, **flow})
 
     # annual totals — the Cash Flow report's frozen definitions (income:
     # bank deposits net of own-money transfers; spend: SPEND_WHERE), scoped
-    # to the two years the lens shows. Years without bank data have unknown
-    # income, not $0 (`covered`, computed above for the net cells too).
+    # to the two years the lens shows. A year with any month no bank
+    # account feeds has unknown income, not $0: the cells call those months
+    # unknown, and a sum that counted them would set part of a year's
+    # income against all of its spend and report a loss nobody made. What
+    # went out is still known, so spend stays.
     # The year totals and the year × category rows below read the same two
     # years of spend; GROUPING SETS takes both groupings from one pass
     # (GROUPING(cat) = 1 marks the year-total rows).
@@ -645,14 +729,15 @@ def year_summary(conn, year: int, today: dt.date | None = None) -> dict:
         f"SUM({reporting.PART_NET_JOINED}) amt, GROUPING({reporting.PART_CAT}) gc "
         f"FROM transactions t {reporting.REIMB_PARTIAL_JOIN} {reporting.SPLIT_JOIN} "
         f"WHERE {reporting.SPEND_WHERE} "
-        f"AND t.date >= %s AND t.date < %s GROUP BY GROUPING SETS ((yr), (yr, cat))",
-        (dt.date(year - 1, 1, 1), dt.date(year + 1, 1, 1))).fetchall()
+        f"AND t.date >= %s AND t.date < %s {excl} "
+        f"GROUP BY GROUPING SETS ((yr), (yr, cat))",
+        (dt.date(year - 1, 1, 1), dt.date(year + 1, 1, 1), *ex_p)).fetchall()
     spend_y = {r["yr"]: r["amt"] for r in two_years if r["gc"]}
 
     def totals(y: int) -> dict:
         ys = str(y)
         spend = _R(spend_y.get(ys, 0) or 0)
-        if ys not in covered:
+        if not cov.whole_year(y):
             return {"income": None, "spend": spend, "saved": None, "rate": None}
         inc = income_y.get(ys, 0) or 0
         return {"income": _R(inc), "spend": spend, "saved": _R(inc - spend),
@@ -675,55 +760,92 @@ def year_summary(conn, year: int, today: dt.date | None = None) -> dict:
     # The money map's Savings row actual. rate_90d × elapsed months is an
     # extrapolation; the ledger knows the real figure — the net posted into
     # the standing "Savings" goal (the row's key) over the lens year's
-    # elapsed span. None when there is nothing to measure
-    # (no goal / plan-only), and the SPA falls back to its extrapolation.
+    # elapsed BUDGETED months. The row's plan is the monthly plan times
+    # those months (the final and projected cells; a month with no budget
+    # is a cash-flow cell every other row leaves out too), so the actual
+    # is measured over exactly the same months — a transfer in an
+    # unbudgeted month would otherwise count against a plan that never
+    # covered it. None when there is nothing to measure (no goal,
+    # plan-only, or no budgeted month), and the SPA falls back to its
+    # extrapolation.
     from ..engine import savings
     saved_ytd = None
     _lens_cfg = budget.load_config(conn)
     goal = next((g for g in savings.goals(_lens_cfg)
                  if str(g["name"]) == "Savings"), None)
-    if goal is not None and not savings.is_plan_only(goal):
-        span_end = min(today, dt.date(year, 12, 31))
-        span_start = dt.date(year, 1, 1)
-        if span_end >= span_start:
-            # sibling-aware dest net is ledger truth when the dest
-            # account actually has transfer rows. When dest is silent
-            # (unsynced / external), the month lens already counts
-            # checking-leg posted_for_plan — year must be the sum of
-            # those same monthly windows or the map shows $0 for a year
-            # whose months each show a figure.
-            dest = savings.matched_net(
-                conn, _lens_cfg, goal, since=span_start, until=span_end)
-            dest_rows = 0
-            if not dest and goal.get("account_id"):
-                dest_rows = conn.execute(
+    span_end = min(today, dt.date(year, 12, 31))
+    windows = []
+    for c in cells:
+        if c["status"] in ("final", "projected"):
+            first = dt.date(year, c["m"], 1)
+            last = dt.date(year, c["m"],
+                           calendar.monthrange(year, c["m"])[1])
+            if first <= span_end:
+                windows.append((first, min(last, span_end)))
+    if goal is not None and not savings.is_plan_only(goal) and windows:
+        # The goal's own measure over the budgeted months: the sibling-aware
+        # destination net is ledger truth (a withdrawal subtracts) whenever
+        # the destination has transfer rows in them. Only a silent
+        # destination (unsynced, external) is read month by month from the
+        # plan evidence the Month lens shows, or the map would read $0 for
+        # a year whose months each show a figure.
+        dest = sum(savings.matched_net(conn, _lens_cfg, goal,
+                                       since=a, until=b)
+                   for a, b in windows)
+        dest_rows = 0
+        if not dest and goal.get("account_id"):
+            # the same owner scope the goal's own figures use, so a goal
+            # on a business-entity account is not read as silent
+            scope, scope_params = savings._owner_scope(conn, goal)
+            for a, b in windows:
+                dest_rows += conn.execute(
                     f"""SELECT COUNT(*) AS n FROM transactions t
                         WHERE t.removed = 0 AND t.account_id = %s
                           AND t.date >= %s AND t.date <= %s
                           AND COALESCE(t.category_override,
                                        t.category_primary, '')
                               IN ('TRANSFER_IN','TRANSFER_OUT')
-                          {budget.PERSONAL_ONLY_SQL}""",
-                    (goal["account_id"], span_start, span_end)
+                          {scope}""",
+                    (savings._goal_account(conn, goal), a, b, *scope_params)
                 ).fetchone()["n"]
-            if dest or dest_rows:
-                saved_ytd = _R(dest)
-            else:
-                total = 0.0
-                m = span_start
-                while m <= span_end:
-                    last = dt.date(
-                        m.year, m.month,
-                        calendar.monthrange(m.year, m.month)[1])
-                    total += savings.posted_for_plan(
-                        conn, _lens_cfg, goal, since=m,
-                        until=min(last, span_end))
-                    if m.month == 12:
-                        break
-                    m = dt.date(m.year, m.month + 1, 1)
-                saved_ytd = _R(total)
+        if dest or dest_rows:
+            saved_ytd = _R(dest)
+        else:
+            saved_ytd = _R(sum(_R(savings.month_saved(
+                conn, _lens_cfg, goal, a, b)) for a, b in windows))
 
-    return {"y": year, "cells": cells,
+    detail = None
+    if with_detail:
+        detail = _year_detail(conn, year, today, memo, snap_months)
+        # net by year, back to the first year the ledger holds: the same
+        # cash-flow definitions as `totals`, one grouped pass over every
+        # year. A year with any month no bank account feeds has unknown
+        # income, no net: the months before the feed starts would otherwise
+        # add their whole spend as a loss, and the strip would disagree
+        # with the year's own headline, which sums the month cells
+        all_years = {r["yr"]: r["amt"] for r in conn.execute(
+            f"SELECT to_char(t.date,'YYYY') yr, "
+            f"SUM({reporting.NET_AMOUNT_JOINED}) amt "
+            f"FROM transactions t {reporting.REIMB_PARTIAL_JOIN} "
+            f"WHERE {reporting.SPEND_WHERE} AND t.date < %s {excl} "
+            f"GROUP BY yr", (dt.date(year + 1, 1, 1), *ex_p))}
+        first = _first_year(conn) or year
+        years = []
+        for yy in range(min(first, year), year + 1):
+            ys = str(yy)
+            spend = _R(all_years.get(ys, 0) or 0)
+            inc = (_R(income_y.get(ys, 0) or 0) if cov.whole_year(yy)
+                   else None)
+            if not years and inc is None and not spend:
+                # the ledger's first row may be an income record from
+                # decades back: the strip starts at the first year with
+                # money moving, not at the first year on file
+                continue
+            years.append({"y": yy, "income": inc, "spend": spend,
+                          "net": _R(inc - spend) if inc is not None else None})
+        detail["years"] = years
+
+    return {"y": year, "cells": cells, "detail": detail,
             "totals": totals(year), "prev_totals": totals(year - 1),
             "categories": categories, "saved_ytd": saved_ytd,
             "buckets_annual": {k: {f: _R(v) for f, v in d.items()}

@@ -33,6 +33,20 @@ export interface GlanceCache { glance: Glance; fetched_at: number;
  *  the one thing a glance must not do. */
 export const STALE_AFTER_MS = 60 * 60 * 1000;
 
+/** Whether a payload fetched at `fetchedAt` is still about the day it is
+ *  read on. The glance is one day's allowance: a fetch at 11:45 PM that
+ *  says "$0 left" is wrong at 12:30 AM, when the new day's allowance has
+ *  arrived, even though it is only 45 minutes old. The payload's own
+ *  `date` is the household's day, but the household's timezone is not in
+ *  it, so the turn is read on the phone's calendar — the same zone as the
+ *  household for nearly everyone, and erring early (grey, "as of …") for
+ *  a phone in a zone ahead of it, never late. */
+export function sameLocalDay(fetchedAt: number, now: number): boolean {
+  const a = new Date(fetchedAt), b = new Date(now);
+  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth()
+    && a.getDate() === b.getDate();
+}
+
 export type GlanceFace =
   | { kind: "signin" }
   | { kind: "noplan" }
@@ -88,7 +102,8 @@ export function glanceFace(cache: GlanceCache | null, signedIn: boolean,
     : `${dollars(spent)} of ${dollars(allow)} spent`;
   return {
     kind: "verdict",
-    stale: now - cache.fetched_at > STALE_AFTER_MS,
+    stale: now - cache.fetched_at > STALE_AFTER_MS
+      || !sameLocalDay(cache.fetched_at, now),
     number: dollars(g.left_today ?? 0),
     verdict: heroLabel(g.verdict ?? "ON BUDGET"),
     tone: g.verdict === "OVER BUDGET" ? "bad" : "good",
@@ -154,3 +169,21 @@ export function ownedCache(cache: GlanceCache | null,
 export const saveStillOwned = (startedWith: string | null | undefined,
                                now: string | null | undefined) =>
   !!startedWith && startedWith === now;
+
+/** Whether a settled Today load should refresh the home-screen widget.
+ *  The glance door runs the whole Today computation again on the server,
+ *  so it is not paid for a widget nobody placed. `placed` is how many the
+ *  launcher reports (null when the platform cannot say): none means skip;
+ *  some means refresh when Today changed or the last refresh is older than
+ *  the window. Unknown refreshes only when both hold — the widget keeps
+ *  its own half-hourly poll, so the app's push is a courtesy, not its
+ *  only source. `stamp` is anything that changes when Today's numbers do. */
+export const WIDGET_REFRESH_MIN_MS = 15 * 60 * 1000;
+export function shouldRefreshWidget(placed: number | null, stamp: string,
+                                    last: { stamp: string; at: number } | null,
+                                    now: number): boolean {
+  if (placed === 0) return false;
+  const changed = !last || last.stamp !== stamp;
+  const due = !last || now - last.at >= WIDGET_REFRESH_MIN_MS;
+  return placed === null ? changed && due : changed || due;
+}

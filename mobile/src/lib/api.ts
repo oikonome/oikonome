@@ -1,6 +1,7 @@
 import type { Glance } from "./glance-pure";
 import type { Txn } from "./ledger-row.generated";
-import { downloadsToSweep, isSharedDownload } from "./pure.ts";
+import { downloadsToSweep, isPickerScratch, isReauthReply, isSharedDownload,
+         PICKER_SCRATCH } from "./pure.ts";
 import type { MintGrant } from "./pure.ts";
 /** One multipart file part, in the shape the runtime's fetch can send.
  *  React Native's `{ uri, name, type }` descriptor is refused by Expo's
@@ -75,7 +76,10 @@ export interface TodayFull {
   }>;
   fixed_unpaid_due?: number;
   irregular_bills?: { payee: string; amount: number; label: string }[];
-  overdue_unpaid?: [string, number, string][];
+  // [payee, amount, due, withdrawn_on] — withdrawn_on is when the bank feed
+  // took the posted charge back (null: it never posted); an older server
+  // sends only the first three
+  overdue_unpaid?: [string, number, string, (string | null)?][];
   mtd: [string, number][];
   bills_remaining_month: number | null;
   forecast_rows: { date: string; amount: number; label: string;
@@ -90,7 +94,7 @@ export interface TodayFull {
   }>;
   bill_cards: { kind: string; label: string; left: number; over: boolean;
                 sub: string; frac: number; pace_frac: number;
-                status: string | null; status_tone: "neg" | "pos" | null }[];
+                status: string | null; status_tone: "neg" | "pos" | "warn" | null }[];
   days_left: number; headroom: number | null;
   runway: { checking: number; card_debt: number; due_total: number;
             balance_unreliable?: boolean } | null;
@@ -194,8 +198,9 @@ export interface TxnPage {
   bucket_amount?: number; bucket_scope?: "month" | "year";
   // month mode: the month's cash flow by the Cash Flow page's definitions
   // (spend / income / income − spend) — transfers and card payments are
-  // excluded, so these are not row sums
-  out_sum?: number; in_sum?: number; net_sum?: number;
+  // excluded, so these are not row sums. In and net are null for a month
+  // before the bank feed starts: its income is unknown, not $0
+  out_sum?: number; in_sum?: number | null; net_sum?: number | null;
   // listed/matched rows that belong to a business (not in the totals
   // unless the business scope was asked for)
   biz_count?: number;
@@ -250,6 +255,10 @@ export interface Continuity {
 export interface Me {
   email: string; tenant_id: string; role: "owner" | "viewer";
   version: string; hosted: boolean; demo: boolean;
+  // the shared demonstration login (an owner whose password is handed
+  // out): the server refuses it every posture change and every durable
+  // grant, so those controls are switched off for it (pure.sharedLock)
+  shared_login?: boolean;
   // hosted one-door bank linking: true once the PLATFORM's aggregator
   // credentials are live. False means the door is honest about not being
   // switched on yet rather than opening onto a failure.
@@ -275,13 +284,20 @@ export interface Me {
   // server-side, because the cap has a per-tenant override an operator
   // can raise and a hardcoded client number would then be a lie.
   features?: { institution_cap?: number | null;
-               institutions_used?: number; sms?: boolean };
+               institutions_used?: number; sms?: boolean;
+               // false when the plan does not include Plaid's recurring
+               // cross-check
+               plaid_recurring?: boolean };
   // merchant logos on ledger/merchants/spending (Settings; default on)
   merchant_logos?: boolean;
   needs_2fa?: boolean;
   // the household's daily-email schedule + whether THIS login is muted
   daily_email?: { on: boolean; hour: number; summary: boolean;
-                  muted: boolean };
+                  muted: boolean;
+                  // which kinds of the household's mail reach this inbox,
+                  // and which cadences the household sends at all
+                  prefs?: Partial<Record<string, boolean>>;
+                  cadences?: Partial<Record<string, boolean>> };
   email_delivery?: { state: "bouncing" | "complained";
     bounce_type: string | null; reason: string | null;
     did_you_mean: string | null } | null;
@@ -400,6 +416,9 @@ export interface Bill {
   merchants?: string[];
   payee: string; amount: number; income: boolean; cadence: string;
   disabled?: boolean;
+  // ok | stale | mismatch | drifting | misdated | off-ledger | withdrawn
+  // (the missed cycle's charge was taken back by the bank feed — amber,
+  // never in the triage queue; mirrors webapp)
   due_on: string | null; health: string | null; health_dismissed: boolean;
   // the newest ledger charge for this merchant, whatever its amount
   last_seen?: { date: string; amount: number } | null;
@@ -415,11 +434,22 @@ export interface Bill {
   hint_dismissed?: boolean;
   occurrences: number; paid: number; paid_amount: number;
   used: number | null; overflow: number | null; next_unpaid: string | null;
+  // this month's missed occurrence: the date the bank feed withdrew its
+  // charge (still unpaid, worded as a warning rather than overdue). The ONLY
+  // date that may turn the row's status amber
+  withdrawn_on?: string | null;
+  // the earlier cycle behind a "withdrawn" health verdict — for the health
+  // pill alone, never the status: a later cycle that was never charged is
+  // still overdue
+  health_withdrawn_on?: string | null;
   pool: number | null; period_months: number | null;
   period_used: number | null; period_left: number | null;
 }
 export interface BillsData {
   proposals: Proposal[]; bills: Bill[];
+  // the month the per-bill stats describe (YYYY-MM) and whether it is a
+  // closed month read back (the schedule itself is always the live one)
+  month?: string; month_final?: boolean;
   archived: { payee: string; amount: number; frequency?: string | null;
               synced_at?: string | null }[];
   totals?: { bills_monthly: number; income_monthly: number;
@@ -473,9 +503,23 @@ export interface SpendingReport {
 // kind on the left, fixed / variable / saved on the right (mirrors the web)
 export interface FlowPeriod {
   from: string; to: string; label: string;
-  in: { total: number; paychecks: number; interest: number; other: number };
+  // true when the household's ledger starts this month, so the range shows
+  // the month so far instead of complete months
+  live_month?: boolean;
+  // true when the window was cut to start at the first month with known
+  // income (the bank feed's first); `label` already names the cut range
+  income_clipped?: boolean;
+  // months inside the window left out on both sides because no bank feed
+  // covers them (their income is unknown, not $0); `label` names them
+  income_gap_months?: number;
+  // true when no bank feed covers the window (none linked, or it starts
+  // after the window): income is not known, so `in.*`, `saved` and
+  // `rate` are null rather than a misleading 0
+  income_unknown?: boolean;
+  in: { total: number | null; paychecks: number | null;
+        interest: number | null; other: number | null };
   out: { total: number; fixed: number; variable: number };
-  saved: number; rate: number | null;
+  saved: number | null; rate: number | null;
 }
 // served per range (the site-wide 3m/6m/1y/3y/5y/all vocabulary), not in
 // the report — the fixed split walks months and 'all' costs seconds
@@ -484,20 +528,32 @@ export type FlowKey = "cur" | "1m" | "3m" | "6m" | "1y" | "3y" | "5y" | "all";
 // equal window's figure (null when the range is 'all': no previous window)
 export interface SpendingWindow {
   from: string; to: string; label: string; months: number;
+  // true when the household's ledger starts this month: the range shows
+  // the month so far, and there is no previous window to compare with
+  live_month?: boolean;
   total: number; prev_total: number | null;
   by_month: [string, number][];
+  // ranked by this window; categories spent on only in the previous
+  // window follow at 0, so a drop to nothing shows as a change
   categories: [string, number, number | null][];
   // [payee, amount, visits, prev-window amount|null, logo]
   merchants: [string, number, number, number | null, string | null][];
+  // same shape, merchants paid only in the previous window (amount 0)
+  dropped_merchants?: [string, number, number, number | null, string | null][];
 }
 export interface IncomeKinds { paychecks: number; interest: number; other: number }
 export interface IncomeWindow {
   from: string; to: string; label: string; months: number;
+  // true when the household's ledger starts this month: the range shows
+  // the month so far, and there is no previous window to compare with
+  live_month?: boolean;
   total: number; prev_total: number | null;
   kinds: IncomeKinds; prev_kinds: IncomeKinds | null;
   by_month: [string, number][];
   // [payer, amount, deposits, prev-window amount|null, logo]
   sources: [string, number, number, number | null, string | null][];
+  // same shape, payers seen only in the previous window (amount 0)
+  dropped_sources?: [string, number, number, number | null, string | null][];
 }
 /** Interest and fees paid on bank and card accounts, by year — what
  *  holding money costs, net of what the bank refunded. Empty `by_year`
@@ -537,8 +593,6 @@ export interface AlertRow {
 export interface EmailSchedule {
   daily?: { on: boolean; hour: number; sms?: boolean; push?: boolean;
             summary?: boolean };
-  weekly?: { on: boolean; hour: number; weekday: number;
-             sms?: boolean; push?: boolean };
   monthly?: { on: boolean; hour: number; sms?: boolean; push?: boolean };
   yearly?: { on: boolean; hour: number; sms?: boolean; push?: boolean };
 }
@@ -578,6 +632,10 @@ export interface Receipt {
   // or a person ('manual'); null when attached from the transaction itself
   match_method?: "auto" | "manual" | null;
   matched_at?: string | null;
+  // when the current parse attempt began, or the server's own verdict that
+  // it has outlived the reclaim window — either lets a stalled read be
+  // retried (both absent from older servers)
+  parse_started_at?: string | null; parse_stale?: boolean;
   error: string | null; created_at: string; items?: ReceiptItem[];
 }
 
@@ -606,6 +664,9 @@ export interface WaitingReceipt {
   // a person had paired it by hand and that charge was later removed: it is
   // back here, and the matcher leaves it for the person to pair again
   released?: boolean;
+  // when the current read began, and whether it has outlived the reclaim
+  // window (both absent from older servers)
+  parse_started_at?: string | null; parse_stale?: boolean;
   candidates: WaitingCandidate[];
 }
 export interface RecentMatch {
@@ -659,10 +720,18 @@ export interface BillsHistoryData {
   bill: { amount: number; bill_type: string; source: string;
           cadence: string; due_on: string | null; income: boolean } | null;
   health: { health: string; last_match: string | null;
-            matched?: number; fit_diverges?: boolean } | null;
+            matched?: number; fit_diverges?: boolean;
+            // behind a "withdrawn" verdict: when the feed took the charge back
+            withdrawn_on?: string | null } | null;
   proposals: Proposal[];
   covered_by: string | null;
   hint_dismissed: boolean;
+  // an archived bill sits under this payee (`bill` is null for it): offer
+  // Restore, not a new bill. Absent from older servers.
+  bill_archived?: boolean;
+  // the payee is a name ledger rows display, so the merchant rename/merge
+  // applies to it; absent from older servers
+  merchant_in_use?: boolean;
   cadences: [string, string][];
 }
 
@@ -803,17 +872,48 @@ export interface ImportResult {
   restore_started?: boolean; job?: string;
   source?: string; confidence?: number; warnings?: string[];
   note?: string; split_accounts?: Record<string, number>;
+  // rows an earlier import stored under a reading this import corrected
+  corrected?: number;
+  // a YNAB register placed per account: rows an earlier whole-register
+  // import left on the picked account that were removed, kept because a
+  // person had added something to them, or left because nothing proves
+  // they came from this file
+  removed_earlier?: number; kept_annotated?: number; foreign_left?: number;
 }
+// A CSV whose columns could not be read: the person maps them.
+export interface ColumnMappingNeeded {
+  kind?: "columns";
+  token: string; header: string[]; filename: string;
+  sample?: string[][];
+}
+// One YNAB account a register names; `name` is the key the answer uses
+// ("" for lines with no account name), `label` what the person reads.
+export interface YnabAccountGroup {
+  name: string; label: string; rows: number;
+  first_date: string; last_date: string;
+  // rows an earlier import of the whole register left on the picked account
+  stored_on_pick: number;
+}
+// A YNAB register of several accounts: the person says where each goes.
+export interface YnabAccountsNeeded {
+  kind: "ynab_accounts";
+  token: string; filename: string; pick: string;
+  accounts: YnabAccountGroup[];
+}
+export type MappingNeeded = ColumnMappingNeeded | YnabAccountsNeeded;
+// Where one YNAB account goes: an account id, "skip", or a new account.
+export type YnabDestination = string | { new: string };
 export interface ImportOutcome {
   result: ImportResult | null;
-  mapping_needed: { token: string; header: string[]; filename: string;
-                    sample?: string[][] } | null;
+  mapping_needed: MappingNeeded | null;
 }
 export interface PlanFile {
   index: number; name: string; kind: string; size: number;
   action: "import" | "skip"; account_id: string | null;
   new_account_name: string; amount_sign: string;
   sign_certain: boolean; note: string; oversized?: boolean;
+  // an export ZIP too large to read here names the door that takes it
+  restore_door?: string;
 }
 export interface TaxdocRow {
   year: number; exists?: boolean;
@@ -838,7 +938,9 @@ export interface Entity {
   home_office_sqft?: number | null; income_tax_rate?: number | null;
   tax_reserve_account_id?: string | null;
   members?: { id: string; member_name: string;
-              ownership_pct: number | null; is_manager: boolean }[];
+              ownership_pct: number | null; is_manager: boolean 
+              /** the member this household is — at most one per business */
+              is_household?: boolean }[];
 }
 export interface EntityDeleteImpact {
   id: string; name: string;
@@ -858,10 +960,17 @@ export interface BizData {
 export interface Capital {
   contributions: number; draws: number; distributions: number;
   reimbursements: number; capital_balance: number; net_income?: number;
+  /** the household member's ownership % and their share of
+   *  capital_balance, when one member is marked "this is us" and carries
+   *  a share; null otherwise, absent on older servers */
+  household_share_pct?: number | null;
+  household_capital?: number | null;
 }
 export interface Pnl {
   year: number | null; revenue: number; operating_expenses: number;
   operating_by_line: Record<string, number>; net_operating: number;
+  /** tax the business already paid toward this year (kept off expenses) */
+  estimated_tax_paid?: number;
   organizational: number; startup_195: number;
   organizational_deduction: { total: number; immediate: number;
     amortizable: number; monthly_amortization: number };
@@ -893,7 +1002,52 @@ export interface EstimatedTax {
   startup_deduction: number;
   taxable_profit: number; se_tax: number;
   income_tax_rate: number | null; income_tax: number | null;
-  total_estimated: number; quarterly: number; deadlines: string[];
+  /** se_tax, income_tax and total_estimated are on profit so far in `year` */
+  total_estimated: number;
+  household?: { member_name: string; ownership_pct: number; share_of_profit: number;
+                se_tax: number; income_tax: number | null; total: number } | null;
+  /** the business as a whole, beside the household's share */
+  business_total?: number | null;
+  /** what total_estimated is measured against: the profit it is a rate of
+   *  and the estimates already paid toward it — the household member's
+   *  share of each when covers is "household", the business's otherwise.
+   *  Absent on older servers (use net_profit / estimated_tax_paid). */
+  covered_profit?: number;
+  covered_tax_paid?: number;
+  /** why a figure covering every member is not the household's share:
+   *  an S-corp is never split; a marked member whose shares do not total
+   *  100% cannot be; or nobody is marked. Null when it is the share. */
+  household_unavailable?: "s_corp" | "shares_incomplete" | "none_marked" | null;
+  /** a quarter of annualized_total (of total_estimated on older servers) */
+  quarterly: number; deadlines: string[];
+  /** the next 1040-ES due date, and the installment due on it: from
+   *  January 1 to 15 that is last year's fourth, not a quarter of this
+   *  year's projection. Null past the year's last deadline; absent on
+   *  older servers, which only send `quarterly`. */
+  next_deadline?: string | null;
+  next_payment?: number | null;
+  /** true for the year in progress: the so-far profit projected over the year */
+  annualized?: boolean;
+  /** actual car costs added back because the standard mileage rate,
+   *  which replaces them, was taken; absent on older servers */
+  vehicle_expenses_added_back?: number;
+  /** which car deduction the estimate took: the standard mileage rate or
+   *  the actual costs, whichever is larger; null with neither. Absent on
+   *  older servers, as is the mileage log's own figure */
+  vehicle_method?: "standard_mileage" | "actual" | null;
+  mileage_logged?: number;
+  /** what annualized_total stands on: "prior_year" early in the year, when
+   *  it is last year's tax rather than a projection of this year's */
+  basis?: "projected" | "prior_year" | "year";
+  annualized_taxable_profit?: number;
+  annualized_total?: number;
+  /** false for an S-corp: Social Security and Medicare go through payroll */
+  se_tax_applies?: boolean;
+  /** whose tax the figure is: the owner's, or every member's together */
+  covers?: "owner" | "all_members" | "household";
+  structure?: string | null;
+  members?: { member_name: string; ownership_pct: number;
+              share_of_profit: number; se_tax: number }[];
 }
 export interface Obligation {
   id?: string; title: string; due: string; fee: number | null;
@@ -904,7 +1058,7 @@ export interface MileageTrip {
   purpose: string | null;
 }
 export interface Vendor {
-  merchant: string; paid: number; reportable: boolean;
+  merchant: string; paid: number; paid_by_card: number; reportable: boolean;
   needs_1099: boolean;
 }
 
@@ -925,7 +1079,32 @@ export interface SavingsGoal {
 }
 // the slice of /api/settings the budget screens read/write
 /** GET /api/settings — and what every settings write returns. */
-export type SettingsView = BudgetSettings & Record<string, unknown>;
+export type SettingsView = BudgetSettings & Record<string, unknown> & {
+  // what a credential rotation paused until the owner confirms it
+  // (null = nothing): the Settings relay, extra recipients, the AI endpoint
+  outbound_paused?: { at: string; reason: "rotation" | "recovery";
+                      smtp: boolean; recipients: string[]; llm: boolean;
+                      /** members an owner's recovery removed (joined in the
+                       *  last days through the owner's own invites) */
+                      removed_members?: { email: string; role: string;
+                                          joined: string }[];
+                      /** what a non-owner is told instead of the names */
+                      removed_members_count?: number;
+                      /** true while new bank links are held on the
+                       *  household's own Plaid / MX keys (the bank-link
+                       *  hold): a new link, a re-auth and the MX widget are
+                       *  refused until the owner resumes or removes the
+                       *  keys. Syncs of banks already linked keep running */
+                      aggregator?: boolean;
+                      /** owner only: which clients are held (ids are not
+                       *  secrets); saved_at null = saved before the stamp */
+                      aggregator_keys?: { provider: "plaid" | "mx";
+                                          client_id: string; env: string;
+                                          saved_at: string | null }[];
+                      /** a hash of the record; the resume names it so a
+                       *  record that changed since it was read is refused */
+                      version?: string } | null;
+};
 
 export interface BudgetSettings {
   // default landing page per client (absent = Today) — mirrors web
@@ -957,17 +1136,27 @@ export interface Series {
   first_neg_amount?: number | null;
 }
 
+/** a member an owner's credential change (or recovery) removed: they
+ *  joined in the last days through the owner's own invites */
+export interface RemovedMember { email: string; role: string; joined: string }
+
 export interface SavingsGoalProgress {
   name: string; target: number; target_date: string | null;
   monthly_plan: number;
   saved: number | null; rate_90d: number | null;
   pct: number | null; eta: string | null;
   on_pace: boolean | null; plan_only: boolean;
+  // a plan-only goal that has match words: it needs an account to be
+  // measured (absent from older servers, read as false)
+  needs_account?: boolean;
   mode?: "monthly" | "sweep";
   // sweep goals only: matched-transfer evidence this month and whether
   // it already covers the plan (the month is satisfied)
   swept_this_month?: number | null;
   sweep_satisfied?: boolean | null;
+  // Today only: what was posted toward the plan this month (null for a
+  // plan-only goal; absent from older servers)
+  saved_this_month?: number | null;
 }
 
 export interface LensTxn {
@@ -991,7 +1180,7 @@ export interface MonthLensData {
   }>;
   bills: { posted: number; planned: number; awaiting: number;
            paid?: { date: string; amount: number; payee: string }[];
-           overdue: [string, number, string][];
+           overdue: [string, number, string, (string | null)?][];
            envelopes?: { payee: string; used: number; monthly: number;
                          overflow: number }[] };
   // [display label, amount, the STORED category key the ledger filters
@@ -1113,6 +1302,14 @@ export interface ElevationPrompt {
 export const ELEVATION_CANCELLED =
   "Cancelled — confirm it's you to make this change.";
 
+/** Thrown by a door that carries a single-use code once the sheet has run
+ *  in front of it. The sheet's proof can spend the same authenticator step
+ *  as the code already typed, so resending the request could only be
+ *  refused as a replay; the form asks for the next code instead. */
+export class NextCodeNeeded extends Error {
+  constructor() { super("enter the next code from your authenticator app"); }
+}
+
 /** The sheet the root layout mounts. Null until it mounts, and null again
  *  when it unmounts, so a call made with no UI to answer it fails fast
  *  instead of hanging forever. */
@@ -1214,6 +1411,18 @@ export function paywallNotice(
   if (!isWriteMethod(method)) return null;
   if (now - lastShownAt < PAYWALL_NOTICE_WINDOW_MS) return null;
   return (detail ?? "").trim() || PAYWALL_FALLBACK;
+}
+
+/** The export's restore warnings: a JSON list of sentences in a header.
+ *  Anything unreadable still counts as a warning, so a refused archive is
+ *  never reported as a clean one. */
+export function exportWarnings(raw: string | null): string[] {
+  if (!raw) return [];
+  try {
+    const v: unknown = JSON.parse(raw);
+    if (Array.isArray(v)) return v.map(String).filter((t) => t.trim());
+  } catch { /* fall through */ }
+  return [raw];
 }
 
 /** The sentence to show a person for a failed call — the web's errText.
@@ -1374,17 +1583,38 @@ export function parseOkBody<T>(status: number, contentType: string | null,
   throw new ApiError(status, UNREADABLE_REPLY, body.slice(0, 200));
 }
 
+/** The sentence a refused download carries: FastAPI's `detail`, a string
+ *  or an object with a `message`; "download failed" when the body says
+ *  nothing readable. */
+export function downloadRefusal(body: string): string {
+  try {
+    const d = (JSON.parse(body) as { detail?: unknown })?.detail;
+    if (typeof d === "string" && d.trim()) return d;
+    const m = d && typeof d === "object" ? (d as { message?: unknown }).message : null;
+    if (typeof m === "string" && m.trim()) return m;
+  } catch { /* not JSON */ }
+  return "download failed";
+}
+
 async function parseError(r: Response): Promise<ApiError> {
   let detail = r.statusText;
   let structured: unknown;
   try {
     const body = await r.json();
-    if (typeof body?.detail === "string") detail = body.detail;
-    else if (body?.detail && typeof body.detail === "object") {
+    if (typeof body?.detail === "string") {
+      detail = body.detail;
+      // a refusal can carry flags beside its sentence (an add over an
+      // archived bill says so, to offer Restore)
+      structured = body;
+    } else if (body?.detail && typeof body.detail === "object") {
       // a refusal that carries the means to act on it
       structured = body.detail;
       const m = (body.detail as { message?: unknown }).message;
       if (typeof m === "string") detail = m;
+      // the step-up marker sits at the top of the body, beside detail;
+      // keep it, or a structured refusal would read as a lost session
+      if (typeof body.error === "string" && !("error" in body.detail))
+        structured = { ...body.detail, error: body.error };
     }
   } catch { /* non-JSON error body — keep the status text */ }
   return new ApiError(r.status, detail, structured);
@@ -1405,12 +1635,12 @@ export function makeClient(baseUrl: string, token: string,
   // ...EXCEPT a step-up refusal: a wrong password or one-time code on a
   // "sign out that session" / passkey / export door is a 401 too, and it
   // means "try again", not "your session is gone" — the web client draws
-  // the same line (main.tsx). Same wording list, kept in step.
-  const REAUTH = /totp_required|recovery_required|password_required|wrong password|one-time code|bad credentials|passkey/i;
+  // the same line (main.tsx); both read the wording list from a pure
+  // helper (isReauthReply) the logic suite runs against each copy.
   const checkAuth = async (r: Response, method?: string): Promise<void> => {
     if (r.status === 401) {
       const err = await parseError(r);
-      if (!REAUTH.test(err.detail)) onAuthLost();
+      if (!isReauthReply(err.detail, err.body)) onAuthLost();
       throw err;
     }
     // An installed add-on may make the account read-only: every WRITE is
@@ -1432,12 +1662,16 @@ export function makeClient(baseUrl: string, token: string,
   const send = async <T>(path: string, init?: RequestInit): Promise<T> => {
     // every request binds to the CURRENT cache epoch: a sign-out or the
     // biometric lock aborts the epoch, so a response issued under the
-    // previous account/session can never land in the cache (see query.ts)
+    // previous account/session can never land in the cache (see query.ts).
+    // no-store keeps the reply out of the platform's own HTTP disk cache
+    // (OkHttp's on Android, URLCache on iOS), which nothing here can
+    // encrypt or wipe at sign-out; expo/fetch takes no `cache` option.
     const r = await fetch(baseUrl + path, {
       ...init,
       signal: init?.signal ?? epochSignal(),
       headers: { Authorization: `Bearer ${token}`,
                  Accept: "application/json",
+                 "Cache-Control": "no-store",
                  ...(init?.headers || {}) },
     });
     await checkAuth(r, init?.method ?? "GET");
@@ -1486,6 +1720,24 @@ export function makeClient(baseUrl: string, token: string,
           (e as ApiError).body);
       }
       return run();
+    }
+  };
+  // withElevation without the retry, for a body holding a one-time code:
+  // the sheet is raised, then NextCodeNeeded hands the form back.
+  const sendOneTimeCode = async <T>(path: string,
+                                    init: RequestInit): Promise<T> => {
+    try {
+      return await send<T>(path, init);
+    } catch (e) {
+      if (!isElevationRequired(e)) throw e;
+      try {
+        await elevate(refusalWantsFresh(e));
+      } catch (cancel) {
+        throw new ApiError(403, cancel instanceof Error && cancel.message
+          ? cancel.message : ELEVATION_CANCELLED,
+          (e as ApiError).body);
+      }
+      throw new NextCodeNeeded();
     }
   };
   const req = <T>(path: string, init?: RequestInit): Promise<T> =>
@@ -1544,9 +1796,24 @@ export function makeClient(baseUrl: string, token: string,
       const dest = dir + filename;
       const r = await FileSystem.downloadAsync(baseUrl + path, dest,
         { headers: { Authorization: `Bearer ${token}` } });
-      if (r.status !== 200)
-        throw new Error(`${r.status}: download failed`);
+      if (r.status !== 200) {
+        // downloadAsync writes the refusal's body to dest like any other
+        // body; read the server's sentence from it (a multi-tenant
+        // instance, a missing pg_dump) so the owner is not left retrying
+        // a refusal that reads like a network blip, then drop the file
+        let text = "";
+        try {
+          text = await FileSystem.readAsStringAsync(r.uri);
+        } catch { /* nothing readable: the generic sentence stands */ }
+        await FileSystem.deleteAsync(r.uri, { idempotent: true }).catch(() => {});
+        throw new ApiError(r.status, downloadRefusal(text));
+      }
+      // the full export names what a restore of it would refuse in a
+      // header; header-name case differs between platforms
+      const h = Object.entries(r.headers ?? {}).find(
+        ([k]) => k.toLowerCase() === "x-oikonome-export-warnings");
       await Sharing.shareAsync(r.uri);
+      return { warnings: exportWarnings(h ? String(h[1]) : null) };
     },
     me: () => req<Me>("/api/me"),
     // who changed which category, bill, note… and when — newest first;
@@ -1631,7 +1898,9 @@ export function makeClient(baseUrl: string, token: string,
       return null;
     },
     accounts: () => req<{ accounts: Account[] }>("/api/accounts"),
-    bills: () => req<BillsData>("/api/bills"),
+    // `month` (YYYY-MM) reads a past month's paid/received per bill
+    bills: (month?: string) =>
+      req<BillsData>(month ? `/api/bills?month=${month}` : "/api/bills"),
     reportNetworth: () => req<NetWorthReport>("/api/reports/networth"),
     reportFees: () => req<FeesReport>("/api/reports/fees"),
     reportSpending: () => req<SpendingReport>("/api/reports/spending"),
@@ -1667,7 +1936,9 @@ export function makeClient(baseUrl: string, token: string,
       // passkey that stops working right after is explained, not a mystery
       req<{ ok: boolean; passkeys_removed?: number; passkeys_kept?: number;
             devices_revoked?: number;
-            tokens_revoked?: number; invites_removed?: number }>(
+            tokens_revoked?: number; invites_removed?: number;
+            sms_number_needs_verify?: boolean;
+            members_removed?: RemovedMember[] }>(
         "/api/password/change", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1676,7 +1947,9 @@ export function makeClient(baseUrl: string, token: string,
     emailChange: (new_email: string) =>
       req<{ ok: boolean; email: string; verify_sent?: boolean;
             hint?: string | null; passkeys_removed?: number;
-            passkeys_kept?: number }>(
+            passkeys_kept?: number; mail_list_entry_dropped?: boolean;
+            sms_number_needs_verify?: boolean;
+            members_removed?: RemovedMember[] }>(
         "/api/email/change", {
         method: "POST",
         headers: { "Content-Type":
@@ -1691,7 +1964,9 @@ export function makeClient(baseUrl: string, token: string,
         body: "",
       }),
     totpConfirm: (secret: string, code: string) =>
-      req<{ ok: boolean; recovery_codes: string[] | null }>(
+      req<{ ok: boolean; recovery_codes: string[] | null;
+            sms_number_needs_verify?: boolean;
+            members_removed?: RemovedMember[] }>(
         "/api/totp/confirm", {
           method: "POST",
           headers: { "Content-Type":
@@ -1699,9 +1974,12 @@ export function makeClient(baseUrl: string, token: string,
           body: new URLSearchParams({ secret, code }).toString(),
         }),
     // the live code is the route's own input (it proves the authenticator
-    // being switched off is still in hand), kept beside elevation
+    // being switched off is still in hand), kept beside elevation; being
+    // single-use, it is never resent after the sheet
     totpDisable: (code: string) =>
-      req<{ ok: boolean }>("/api/totp/disable", {
+      sendOneTimeCode<{ ok: boolean; sms_number_needs_verify?: boolean;
+                        members_removed?: RemovedMember[] }>(
+        "/api/totp/disable", {
         method: "POST",
         headers: { "Content-Type":
                      "application/x-www-form-urlencoded" },
@@ -1753,6 +2031,11 @@ export function makeClient(baseUrl: string, token: string,
       req<{ ok: boolean; muted: boolean }>("/api/me/email", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ muted }) }),
+    // one kind of the household's mail on or off for my own inbox
+    meEmailPref: (kind: string, on: boolean) =>
+      req<{ ok: boolean; prefs: Record<string, boolean> }>("/api/me/email", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kind, on }) }),
     // wants FRESH elevation: the sheet shows even inside a live window
     accountDelete: () =>
       req<{ ok: boolean }>("/api/account/delete", {
@@ -1876,8 +2159,15 @@ export function makeClient(baseUrl: string, token: string,
           r.status, r.headers.get("content-type"), await r.text());
       });
     },
+    // `sent: false` (with `reason`) when the server held the mail back;
+    // an older server leaves `sent` out and always sent
+    // the owner confirms the paused relay / recipients / AI endpoint are theirs
+    outboundResume: (version?: string) =>
+      req<{ ok: boolean; resumed: boolean }>("/api/settings/outbound/resume",
+        { method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ version }) }),
     recipientInviteResend: (email: string) =>
-      req<{ ok: boolean }>("/api/settings/recipients/resend", {
+      req<{ ok: boolean; sent?: boolean; reason?: string }>("/api/settings/recipients/resend", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email }),
@@ -1995,7 +2285,7 @@ export function makeClient(baseUrl: string, token: string,
             failed: { pid: string; error: string }[] }>(
         "/api/bills/proposals/approve-all", { method: "POST" }),
     billsProposal: (pid: string, action: "approve" | "reject") =>
-      req<{ ok: boolean; payee: string }>("/api/bills/proposal", {
+      req<{ ok: boolean; payee: string; superseded?: boolean }>("/api/bills/proposal", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ pid, action }),
@@ -2072,9 +2362,17 @@ export function makeClient(baseUrl: string, token: string,
     // `order` is the screen's sort toggle, honored server-side so the
     // 200-row window is the top of the order asked for, not a re-sorted
     // slice of some other one
-    merchantCatalog: (q = "", order: "count" | "alpha" = "count") =>
+    // `sort` and `filter` carry the screen's full choice so a server that
+    // applies them before its cap answers over every merchant; one that
+    // ignores them still gets `order`, and the screen filters what came back.
+    merchantCatalog: (q = "", order: "count" | "alpha" = "count",
+                      opts: { sort?: string; filter?: string; limit?: number } = {}) =>
       req<MerchantCatalog>("/api/merchants/catalog?q=" + encodeURIComponent(q)
-                           + "&order=" + order),
+                           + "&order=" + order
+                           + (opts.sort ? "&sort=" + encodeURIComponent(opts.sort) : "")
+                           + (opts.filter && opts.filter !== "all"
+                              ? "&filter=" + encodeURIComponent(opts.filter) : "")
+                           + (opts.limit ? "&limit=" + opts.limit : "")),
     merchantDetail: (display: string) =>
       req<MerchantDetail>("/api/merchants/detail?display="
                           + encodeURIComponent(display)),
@@ -2170,13 +2468,31 @@ export function makeClient(baseUrl: string, token: string,
         }),
     // the reply is the member row itself, so a screen can append it
     entityAddMember: (id: string, body: { member_name: string;
-                       ownership_pct?: number }) =>
+                       ownership_pct?: number; is_manager?: boolean;
+                       is_household?: boolean }) =>
       req<NonNullable<Entity["members"]>[number]>(
         `/api/business/entities/${encodeURIComponent(id)}/members`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         }),
+    // ownership_pct null clears the share
+    entityUpdateMember: (id: string, memberId: string,
+                         body: { member_name?: string;
+                                 ownership_pct?: number | null;
+                                 is_manager?: boolean;
+                                 is_household?: boolean }) =>
+      req<NonNullable<Entity["members"]>[number]>(
+        `/api/business/entities/${encodeURIComponent(id)}/members/`
+          + encodeURIComponent(memberId), {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+    entityRemoveMember: (id: string, memberId: string) =>
+      req<{ ok: boolean }>(
+        `/api/business/entities/${encodeURIComponent(id)}/members/`
+          + encodeURIComponent(memberId), { method: "DELETE" }),
     entityGet: (id: string) =>
       req<Entity>(`/api/business/entities/${encodeURIComponent(id)}`),
     entityPnl: (id: string, year?: number) =>
@@ -2186,11 +2502,21 @@ export function makeClient(baseUrl: string, token: string,
       req<{ transactions: BizTxn[] }>(
         `/api/business/entities/${encodeURIComponent(id)}/transactions`
         + (year ? `?year=${year}` : "")),
+    /** One page of the worksheet, newest first. `total` is every row in
+     *  scope; a server that predates paging omits it and sends them all. */
+    bizTxnsPage: (id: string, offset: number, limit: number, year?: number) =>
+      req<{ transactions: BizTxn[]; total?: number; limit?: number;
+            offset?: number }>(
+        `/api/business/entities/${encodeURIComponent(id)}/transactions`
+        + `?limit=${limit}&offset=${offset}` + (year ? `&year=${year}` : "")),
     balanceSheet: (id: string) =>
       req<{ assets: { name: string; amount: number }[];
             liabilities: { name: string; amount: number }[];
             total_assets: number; total_liabilities: number; net: number;
-            capital_account: number }>(
+            capital_account: number;
+            /** the household member's share of capital_account */
+            household_share_pct?: number | null;
+            household_capital?: number | null }>(
         `/api/business/entities/${encodeURIComponent(id)}/balance-sheet`),
     entityEquity: (id: string) =>
       req<{ movements: { id: string; kind: string; amount: number;
@@ -2227,9 +2553,10 @@ export function makeClient(baseUrl: string, token: string,
       req<{ ok: boolean }>(
         `/api/business/entities/${encodeURIComponent(id)}/mileage/${
           encodeURIComponent(tripId)}`, { method: "DELETE" }),
-    vendorList: (id: string) =>
+    vendorList: (id: string, year?: number) =>
       req<{ vendors: Vendor[]; threshold?: number }>(
-        `/api/business/entities/${encodeURIComponent(id)}/vendors`),
+        `/api/business/entities/${encodeURIComponent(id)}/vendors` +
+        (year ? `?year=${year}` : "")),
     vendorMark: (id: string, body: { merchant: string;
                    reportable: boolean }) =>
       req<{ ok: boolean }>(
@@ -2279,12 +2606,17 @@ export function makeClient(baseUrl: string, token: string,
           body: JSON.stringify(body),
         }),
     importBatches: () => req<{ batches: Batch[] }>("/api/import/batches"),
-    importRollback: (batch_id: string) =>
-      req<{ ok: boolean; deleted: number; warning: string | null }>(
+    // `forceKept`: the owner's "undo anyway" after the server asked about
+    // rows only a note naming no feed account would keep
+    importRollback: (batch_id: string, forceKept = false) =>
+      req<{ ok: boolean; deleted: number; warning: string | null;
+            // rows the bank feed relies on stay, and the note says so
+            kept?: number; note?: string | null }>(
         "/api/import/rollback", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ batch_id }),
+          body: JSON.stringify(forceKept ? { batch_id, force_kept: true }
+                                         : { batch_id }),
         }),
     bulkAnalyze: async (files: PickedFile[]) => {
       const fd = new FormData();
@@ -2294,21 +2626,54 @@ export function makeClient(baseUrl: string, token: string,
         { method: "POST", body: fd, signal: epochSignal(),
           headers: { Authorization: `Bearer ${token}` } });
       await checkAuth(r, "POST");
+      if (r.status === 413) {
+        // the app words its own refusal; a proxy's is an HTML page that
+        // says nothing — and one archive is not a folder to split, it
+        // belongs on the restore door
+        const own = await parseError(r);
+        const oneZip = files.length === 1 && /\.zip$/i.test(files[0].name);
+        // the app's refusal names the restore door; kept on the error's
+        // body so the screen can send the archive there
+        if (oneZip && (own.body as { restore_door?: string } | undefined)
+              ?.restore_door)
+          throw new ApiError(413, "this export is too large to read here — "
+            + "restore it on its own (the account owner's)", own.body);
+        if (own.detail && own.detail !== r.statusText) throw own;
+        throw new ApiError(413, oneZip
+          ? "this export is too large to read here — restore it on its own "
+            + "(the account owner's)"
+          : "these files are too large to send at once — import them in "
+            + "smaller batches");
+      }
       if (!r.ok) throw await parseError(r);
-      return parseOkBody<{ token: string; files: PlanFile[] }>(
+      // `restore_door` at the top: the batch is one export ZIP and nothing
+      // else, and that door restores it whatever its size
+      return parseOkBody<{ token: string; files: PlanFile[];
+                           restore_door?: string }>(
         r.status, r.headers.get("content-type"), await r.text());
     },
     restoreProgress: () => req<RestoreProgress>("/api/restore/progress"),
+    // submits the plan; the files import in the background, and the
+    // screen follows the job with bulkJob until it settles
     bulkRun: (planToken: string, files: PlanFile[]) =>
-      req<{ results: { index: number; name: string; ok: boolean;
-                       imported?: number; error?: string;
-                       // an export ZIP restores in the background
-                       restore_started?: boolean }[] }>(
+      req<import("./pure.ts").BulkJob>(
         "/api/import/bulk/run", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ token: planToken, files }),
+          body: JSON.stringify({ token: planToken, files,
+                                 background: true }),
         }),
+    // one job by id, or — with none — the household's job in progress
+    // (or the one that finished within the hour), else {state: "idle"}
+    bulkJob: (jobId?: string) =>
+      req<import("./pure.ts").BulkJobStatus>(jobId
+        ? `/api/import/bulk/jobs/${encodeURIComponent(jobId)}`
+        : "/api/import/bulk/jobs/current"),
+    // the file in hand finishes; the rest are skipped
+    bulkCancel: (jobId: string) =>
+      req<import("./pure.ts").BulkJob>(
+        `/api/import/bulk/jobs/${encodeURIComponent(jobId)}/cancel`,
+        { method: "POST" }),
     importFile: async (f: PickedFile, accountId: string,
                        amountSign: string, newAccountName?: string) => {
       const fd = new FormData();
@@ -2316,6 +2681,9 @@ export function makeClient(baseUrl: string, token: string,
       fd.append("account_id", accountId);
       fd.append("amount_sign", amountSign);
       if (newAccountName) fd.append("new_account_name", newAccountName);
+      // this app can ask where each account of a multi-account YNAB
+      // register goes, so the server parks such a file and asks
+      fd.append("ynab_choice", "1");
       const r = await fetch(baseUrl + "/api/import",
         { method: "POST", body: fd, signal: epochSignal(),
           headers: { Authorization: `Bearer ${token}` } });
@@ -2324,11 +2692,44 @@ export function makeClient(baseUrl: string, token: string,
       return parseOkBody<ImportOutcome>(
         r.status, r.headers.get("content-type"), await r.text());
     },
+    // A whole-ledger restore: POST /api/import streams a .zip to disk under
+    // the restore cap. The door is step-up gated, so the window is opened
+    // before the archive is sent rather than after a refused upload.
+    restoreArchive: async (f: PickedFile) => {
+      const st = await elevationStatus().catch(() => null);
+      if (st && !st.elevated) await elevate(false);
+      return withElevation(async () => {
+        const fd = new FormData();
+        fd.append("file", await filePart(f.uri, f.name, f.mime || "application/zip"));
+        fd.append("account_id", "");
+        fd.append("amount_sign", "bank");
+        const r = await fetch(baseUrl + "/api/import",
+          { method: "POST", body: fd, signal: epochSignal(),
+            headers: { Authorization: `Bearer ${token}` } });
+        await checkAuth(r, "POST");
+        if (r.status === 413)
+          throw new ApiError(413, "This export is larger than the instance "
+            + "accepts — restores take up to 500 MB, and a proxy in front "
+            + "of the instance may cap uploads lower.");
+        if (!r.ok) throw await parseError(r);
+        return parseOkBody<ImportOutcome>(
+          r.status, r.headers.get("content-type"), await r.text());
+      });
+    },
     importMapped: (mapToken: string, cols: Record<string, string>) =>
       req<{ result: ImportResult }>("/api/import/mapped", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: mapToken, ...cols }),
+      }),
+    importYnabAccounts: (mapToken: string,
+                         accounts: Record<string, YnabDestination>,
+                         removeEarlier: Record<string, boolean>) =>
+      req<{ result: ImportResult }>("/api/import/ynab-accounts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: mapToken, accounts,
+                               remove_earlier: removeEarlier }),
       }),
     taxdocAnalyze: async (f: PickedFile) => {
       const fd = new FormData();
@@ -2363,17 +2764,33 @@ export function makeClient(baseUrl: string, token: string,
                              phase?: string | null } | null }>(
         "/api/connections"),
     holdings: () => req<{ holdings: Holding[] }>("/api/holdings"),
-    accountRemove: (accountId: string, mode: AccountRemoveMode) =>
+    // `forceKept`: the owner's "delete anyway" after the server asked
+    // about rows only a note naming no feed account keeps
+    accountRemove: (accountId: string, mode: AccountRemoveMode,
+                    forceKept = false) =>
       req<{ ok: boolean; mode: string; plaid_released: boolean;
-            note: string; affected_accounts: string[] }>(
+            note: string; affected_accounts: string[];
+            // a purge's counts; rows the bank feed relies on are kept,
+            // and its note says so
+            purged?: { kept_transactions?: number; note?: string } | null }>(
         `/api/accounts/${encodeURIComponent(accountId)}/remove`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ mode }),
+          body: JSON.stringify(forceKept ? { mode, force_kept: true }
+                                         : { mode }),
         }),
     connectionDisconnect: (id: string) =>
       req<{ ok: boolean; plaid_released: boolean; note: string }>(
         `/api/connections/${encodeURIComponent(id)}/disconnect`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+        }),
+    // bring a disconnected MX or SimpleFIN bank back; MX fetches the gap on
+    // its next sync, SimpleFIN pulls it at once (refused if the bridge lost it)
+    connectionReconnect: (id: string) =>
+      req<{ ok: boolean; resync_from: string }>(
+        `/api/connections/${encodeURIComponent(id)}/reconnect`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: "{}",
@@ -2507,12 +2924,14 @@ export function makeClient(baseUrl: string, token: string,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ account_id, name }),
       }),
+    // primary_checking left out = the household's anchor stays put
     accountClassify: (account_id: string, kind: string,
-                      primary_checking: boolean) =>
+                      primary_checking?: boolean) =>
       req<unknown>("/api/accounts/classify", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ account_id, kind, primary_checking }),
+        body: JSON.stringify({ account_id, kind,
+          ...(primary_checking === undefined ? {} : { primary_checking }) }),
       }),
     accountExclude: (account_id: string, excluded: boolean) =>
       req<{ ok: boolean }>("/api/accounts/exclude", {
@@ -2556,20 +2975,22 @@ export function makeClient(baseUrl: string, token: string,
       cap?: string | number | null; category?: string | null;
       show_today?: boolean; match_category?: boolean;
       txn_category?: string; companions?: Companion[];
-      merchants?: string[] }) =>
-      req<{ ok: boolean; payee: string }>("/api/bills/save", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      }),
-    // `disabled` names the target state; omitted = flip. The queue's
-    // Disable/Undo send it so a duplicated request is idempotent (web too)
-    billsToggle: (payee: string, disabled?: boolean) =>
+      merchants?: string[]; restore?: boolean }) =>
+      req<{ ok: boolean; payee: string; restored?: boolean }>(
+        "/api/bills/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+    // `disabled` names the target state and is required: a bare flip is
+    // decided against whatever the server holds, so a stale screen or a
+    // retried request would toggle the bill the opposite way to the button
+    // the person pressed (web too)
+    billsToggle: (payee: string, disabled: boolean) =>
       req<{ ok: boolean; disabled: boolean }>("/api/bills/toggle", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(disabled === undefined ? { payee }
-                                                    : { payee, disabled }),
+        body: JSON.stringify({ payee, disabled }),
       }),
     billsDelete: (payee: string, mode: "archive" | "purge" = "archive") =>
       req<{ ok: boolean; mode: string }>("/api/bills/delete", {
@@ -2897,10 +3318,16 @@ export function makeClient(baseUrl: string, token: string,
       req<{ sms_available: boolean; sms_entitled?: boolean;
             phone: string | null; phone_verified: boolean;
             phone_pending: string | null;
+            // when a credential change paused the stored number; absent on
+            // servers that predate it
+            phone_paused_at?: string | null;
             // push_available is BROWSER push (VAPID); native_push_available
             // is the relay this app's own pushes ride
             push_available: boolean; native_push_available?: boolean;
-            native_push_devices?: number }>(
+            native_push_devices?: number;
+            // no public address, so no recipient invitation can be
+            // mailed; absent on servers that predate it
+            invites_need_base_url?: boolean }>(
         "/api/notify"),
     notifyPhone: (number: string, consent: string[] = []) =>
       req<{ ok: boolean }>("/api/notify/phone", {
@@ -2948,11 +3375,14 @@ export function makeClient(baseUrl: string, token: string,
         .then((s0) => s0.email_schedule ?? null),
     // the household's zone ("" = follow the instance); the server refuses a
     // name it cannot load, so a typo never silently moves the clock
-    settingsSaveTimezone: (timezone: string) =>
+    settingsSaveTimezone: (timezone: string, adopted = false) =>
       req<SettingsView>("/api/settings", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ timezone }),
+        // an automatic adopt says so: the server refuses it once the
+        // household chose a zone by hand
+        body: JSON.stringify(adopted ? { timezone, timezone_adopted: true }
+                                     : { timezone }),
       }),
     settingsSaveSchedule: (email_schedule: EmailSchedule) =>
       req<SettingsView>("/api/settings", {
@@ -3111,14 +3541,29 @@ export async function mintDeviceWithGrant(
 }
 
 /** Walk away from an unspent grant (the person cancelled the device
- *  picker): close the login session, which also burns its mint ticket.
- *  Best-effort — where no cookie reaches this code the ticket simply
- *  expires in minutes. */
+ *  picker, the mint was refused for good, or a fall-back sign-in is about
+ *  to replace it): spend the mint ticket without minting, which closes
+ *  the session that login opened. The ticket is the only handle on that
+ *  session where no cookie reached this code (iOS). The logout after it
+ *  covers servers older than the abandon door (they answer it 404) and
+ *  grants that carry only a cookie. Best-effort: otherwise the ticket
+ *  expires in minutes and the session idles out. */
 export async function abandonMintGrant(baseUrl: string, grant: MintGrant):
     Promise<void> {
-  if (!grant.cookie) return;
+  let closed = false;
+  if (grant.ticket)
+    closed = await fetch(baseUrl + "/api/devices/abandon", {
+      method: "POST",
+      headers: { "Content-Type": "application/json",
+                 Accept: "application/json" },
+      body: JSON.stringify({ mint_ticket: grant.ticket }),
+    }).then((r) => r.ok, () => false);
+  // Without a cookie of its own the logout would ride whatever session
+  // the platform jar holds — a fresh sign-in's, mid-mint — so it is sent
+  // bare only when the ticket did not already close the session.
+  if (closed && !grant.cookie) return;
   await fetch(baseUrl + "/api/logout", {
-    method: "POST", headers: { Cookie: grant.cookie },
+    method: "POST", headers: grant.cookie ? { Cookie: grant.cookie } : {},
   }).catch(() => { /* the session expires on its own */ });
 }
 
@@ -3148,6 +3593,34 @@ export async function sweepDownloads(maxAgeS: number): Promise<void> {
     }
     for (const name of downloadsToSweep(files, Date.now() / 1000, maxAgeS))
       await FileSystem.deleteAsync(dir + name, { idempotent: true });
+    // what the pickers copied in and an upload did not clear (the app
+    // was closed mid-upload, or the file was picked and never sent). An
+    // hour at least, short of a sign-out: the import screen holds its
+    // picked files across analyze and run.
+    const pickAge = maxAgeS <= 0 ? 0 : Math.max(maxAgeS, 3600);
+    for (const sub of PICKER_SCRATCH) {
+      const info = await FileSystem.getInfoAsync(dir + sub);
+      if (!info.exists || !info.isDirectory) continue;
+      for (const name of await FileSystem.readDirectoryAsync(dir + sub)) {
+        const f = await FileSystem.getInfoAsync(dir + sub + name);
+        if (pickAge <= 0 || (f.exists && (f.modificationTime ?? 0)
+                               < Date.now() / 1000 - pickAge))
+          await FileSystem.deleteAsync(dir + sub + name, { idempotent: true });
+      }
+    }
+  } catch { /* best-effort */ }
+}
+
+/** Delete a picked file's copy in the picker's cache folder once its
+ *  upload has settled. Anything outside those folders (a file the app
+ *  does not own) is left alone. Never throws. */
+export async function discardPicked(uri: string | null | undefined):
+    Promise<void> {
+  if (!uri) return;
+  try {
+    const FileSystem = await import("expo-file-system/legacy");
+    if (isPickerScratch(uri, FileSystem.cacheDirectory))
+      await FileSystem.deleteAsync(uri, { idempotent: true });
   } catch { /* best-effort */ }
 }
 
@@ -3164,7 +3637,9 @@ export async function revokeDeviceToken(baseUrl: string, token: string):
     const r = await fetch(baseUrl + "/api/logout", {
       method: "POST", signal: ctl.signal,
       headers: { Authorization: `Bearer ${token}` } });
-    return r.ok;
+    // a 401 means the server no longer knows the token: already revoked
+    // or expired, so there is nothing left to retry
+    return r.ok || r.status === 401;
   } catch {
     return false;
   } finally {

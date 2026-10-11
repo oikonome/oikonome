@@ -16,7 +16,9 @@ heading; `/spending` redirects to the Spending tab.
 The page opens with a **flow picture** for the timeframe you pick —
 the same This month / 1m / 3m / 6m / 1y / 3y / 5y / All toggle every over-time chart on
 the site uses (a year is the default; wide windows take a moment to
-compute the fixed split, then stay cached). On the left, where
+compute the fixed split, then stay cached). On this page **This month**
+is the one window that runs to today; every other range holds complete
+months only, ending with last month (see Spending below). On the left, where
 the money came from: paychecks, interest and dividends, and other
 income. On the right, where it went: **fixed bills** (the charges a
 recurring bill matched), **variable spend** (everything else), and what
@@ -26,6 +28,13 @@ it earned, an "overspent by" source appears on the left so the two sides
 still balance, and the sentence under the picture says so in plain
 words: came in, went out, stayed (or overspent), and the share of income
 you kept.
+
+A month no bank feed covers has unknown income, not $0, so it is left
+out of the picture on both sides, and the window's label under the
+picture says so. When no bank feed covers the window at all, the picture is
+not drawn and the sentence says *income unknown for this range* and
+gives only what went out. A household whose ledger starts this month
+sees the month so far, labelled as such, instead of an empty page.
 
 Below it, **saved by month** — one bar per month with the amount
 written on it, green when the month kept money and red when it did not.
@@ -44,8 +53,10 @@ open a year for the same labelled bars over its months.
 This tab answers one question: **where has the money actually gone** —
 over the timeframe you pick with the same toggle, and **what changed**
 against the previous equal window. **This month** is the month so far;
-**1m** is the last complete month, the one window that closes before
-today, so mid-month you can read last month whole.
+every other range holds **complete months only** — **1m** is the last
+complete month, **3m** the last three that have closed, and so on — so
+the month in progress never sits beside whole ones, and a per-month pace
+is measured over months that are actually finished.
 
 ### What counts as spend
 
@@ -83,10 +94,11 @@ totals are unchanged, since the parts add up to the charge.
 - **The story line** — total spent over the window, the monthly pace,
   the biggest category, and the change against the previous equal
   window (a 1y view compares to the year before it; All has no
-  previous window, so no comparison). A window that runs to today is
-  compared like for like: the previous window stops the same number of
-  days into its own last month, so on the 3rd, this month's three days
-  are set against the first three days of last month, not all of it. A small pace line shows the
+  previous window, so no comparison). **This month**, the one window
+  that runs to today, is compared like for like: the previous window
+  stops the same number of days into its own month, so on the 3rd, this
+  month's three days are set against the first three days of last month,
+  not all of it. Every other range is whole months against whole months. A small pace line shows the
   window's months once it holds at least four of them.
 - **What changed** — up to four categories that moved most against the
   previous window, biggest absolute change first, rises in red and
@@ -103,8 +115,11 @@ totals are unchanged, since the parts add up to the charge.
 
 This tab computes fresh from the ledger on every load — nothing here
 is cached. (The Overview's fixed-bills split for closed months is the
-one cached figure on the page, kept for ten minutes and keyed to your
-bills and budget settings, so an edit refreshes it.)
+one cached figure on the page. It is keyed to everything the split is
+computed from — your bills, your budget settings, the transactions and
+how they are filed, split or reimbursed, which accounts count, and which
+copy of a linked account is current — so any change to those refreshes
+it on the next load. Otherwise a cached month is kept for up to a day.)
 
 ### Canonical merchant names
 

@@ -28,6 +28,16 @@ def main() -> None:
                              "for the person who has lost all three (verify "
                              "who is asking first)")
     c2.add_argument("email")
+    c2.add_argument("--preview", action="store_true",
+                    help="change nothing; list the household members the "
+                         "clear would also remove (an owner's recovery "
+                         "removes members who joined through that owner's "
+                         "recent invites)")
+    c2.add_argument("--expect-members", metavar="EMAILS", default=None,
+                    help="comma-separated addresses the confirmation "
+                         "listed (from --preview); the clear refuses and "
+                         "changes nothing if it would remove any other "
+                         "set")
     sub.add_parser("keycheck",
                    help="verify stored secrets decrypt under the current "
                         "OIKONOME_MASTER_KEY (run after a restore)")
@@ -113,6 +123,11 @@ def main() -> None:
     ms.add_argument("--apply", action="store_true")
     ms.add_argument("--limit", type=int, default=None,
                     help="merges per tenant (default: the nightly's cap)")
+    ms.add_argument("--rekey-rules", action="store_true",
+                    help="instead of merging, carry the category rules of "
+                         "renames and merges already made onto the merchant "
+                         "their rows went to; prints what it would change, "
+                         "--apply to change it (recorded for undo)")
     rs = sub.add_parser("reanchor-stranded",
                         help="move notes, receipts, categories and pairings "
                              "left on retired transactions onto the live "
@@ -145,7 +160,8 @@ def main() -> None:
         raise SystemExit(merchants_resolve(args.tenant, reclean=args.reclean))
     if args.cmd == "merchants-repair-splits":
         raise SystemExit(merchants_repair_splits(
-            args.tenant, apply=args.apply, limit=args.limit))
+            args.tenant, apply=args.apply, limit=args.limit,
+            rekey_rules=args.rekey_rules))
     if args.cmd == "migrate":
         from .db import migrate
         names = migrate.run()
@@ -157,7 +173,12 @@ def main() -> None:
     elif args.cmd == "reset-password":
         reset_password(args.email)
     elif args.cmd == "clear-2fa":
-        clear_2fa(args.email)
+        if args.preview:
+            clear_2fa_preview(args.email)
+        else:
+            clear_2fa(args.email, expect_members=(
+                None if args.expect_members is None
+                else args.expect_members.split(",")))
     elif args.cmd == "reencrypt-secrets":
         from .db import migrate
         n = migrate.reencrypt_tenant_secrets()
@@ -221,7 +242,9 @@ def reanchor_stranded_cmd(tenant: str | None = None, *, dry_run: bool = False) -
                     st["stranded"] += 1
                     st[reanchor.find_twin(conn, row)[1]] += 1
             else:
-                st = reanchor.reanchor_stranded(conn)
+                from .sync import adopt
+                st = reanchor.reanchor_stranded(
+                    conn, release_after_days=adopt.RECONCILE_DAYS)
             print(json.dumps({"tenant": str(r["id"]), **st}))
         finally:
             conn.close()
@@ -261,7 +284,8 @@ def merchants_resolve(tenant: str | None = None, *, reclean: bool = False) -> in
 
 
 def merchants_repair_splits(tenant: str | None = None, *, apply: bool = False,
-                            limit: int | None = None) -> int:
+                            limit: int | None = None,
+                            rekey_rules: bool = False) -> int:
     """Operator door onto the split-merchant repair — dry run unless --apply.
 
     One line per merge (or per proposal) and one per refusal, so the reason
@@ -283,6 +307,16 @@ def merchants_repair_splits(tenant: str | None = None, *, apply: bool = False,
         tid = str(r["id"])
         conn = tenancy.tenant_connect(tid)
         try:
+            if rekey_rules:
+                # renames made before a rename carried its merchant's rules
+                from .engine import merchant_dedup
+                got = merchant_dedup.rekey_orphaned_rules(conn, apply=apply)
+                for rec in got:
+                    print(json.dumps({"tenant": tid, "apply": apply, **rec},
+                                     default=str))
+                print(json.dumps({"tenant": tid, "applied": apply,
+                                  "rekeyed": len(got)}))
+                continue
             kw = {"limit": limit} if limit is not None else {}
             got = merchant_split_repair.repair(conn, apply=apply, **kw)
             for rec in got["merges"]:
@@ -443,10 +477,9 @@ def admin_keys(remove: str | None = None, reset: bool = False) -> int:
 # re-wraps each; a CP secret missing from this list survives a rotation
 # unreadable, and keycheck would still say the old key can be dropped.
 # (table, primary-key column, ciphertext column)
-CP_CIPHERTEXT_COLUMNS = (
-    ("users", "id", "totp_secret"),            # per-user TOTP seed
-    ("push_vapid", "id", "private_key"),       # the instance web-push key
-)
+# The list lives beside the startup sweep that encrypts these columns, so
+# sweep, probe and rotation cannot drift apart.
+from .db.migrate import CP_SECRET_COLUMNS as CP_CIPHERTEXT_COLUMNS  # noqa: E402
 
 
 def _cp_ciphertexts(admin, lock: bool = False) -> list[tuple]:
@@ -460,6 +493,18 @@ def _cp_ciphertexts(admin, lock: bool = False) -> list[tuple]:
                 (crypto.CP_PREFIX + "%",)).fetchall():
             rows.append((table, pk, col, r["pk"], r["ct"]))
     return rows
+
+
+def _cp_plaintext(admin) -> int:
+    """How many control-plane secrets are stored in the clear — written
+    before the instance had a master key, and not yet through the startup
+    sweep. Counted, never read."""
+    from .db import crypto
+    return sum(admin.execute(
+        f"SELECT count(*) AS n FROM {table} WHERE {col} IS NOT NULL "
+        f"AND {col} <> '' AND {col} NOT LIKE %s",
+        (crypto.CP_PREFIX + "%",)).fetchone()["n"]
+        for table, _pk, col in CP_CIPHERTEXT_COLUMNS)
 
 
 def keycheck() -> bool:
@@ -480,8 +525,15 @@ def keycheck() -> bool:
         wrapped = [r["wrapped_key"] for r in admin.execute(
             "SELECT wrapped_key FROM tenant_keys").fetchall()]
         totp = [row[4] for row in _cp_ciphertexts(admin)]
+        plain = _cp_plaintext(admin)
     finally:
         admin.close()
+    if plain:
+        # not a continuity failure — nothing here is unreadable — but not
+        # something to call "encrypted" either
+        print(f"warning: {plain} control-plane secret(s) are stored "
+              "unencrypted; with OIKONOME_MASTER_KEY set, the next start "
+              "encrypts them", file=sys.stderr)
     if not wrapped and not totp:
         print("ok: no encrypted secrets stored")
         return True
@@ -629,13 +681,15 @@ def reset_password(email: str) -> None:
           file=sys.stderr)
 
 
-def clear_2fa(email: str) -> None:
-    """The operator door for a user who has lost password, authenticator
-    and recovery codes together: void TOTP, passkeys and recovery codes,
-    evict every session and device (exactly what a reset does), leave the
-    password alone, and tell the account by mail. Print the reset link
-    next so the operator can hand it over in the same breath."""
-    from .auth import factor_reset
+def clear_2fa_preview(email: str) -> None:
+    """Print, one per line, the logins clearing this account's factors
+    would also delete — the members who joined through the owner's own
+    recent invites, which an owner's recovery removes — and change
+    nothing. The operator's confirmation shows this list and hands it back
+    as `--expect-members`, so nobody is removed by a step whose prompt
+    never named them. The address leads each line. The query is the one
+    the clear itself runs under the household's member lock."""
+    from .auth import reset as reset_mod
     from .db import tenancy
 
     admin = tenancy.admin_connect()
@@ -645,8 +699,48 @@ def clear_2fa(email: str) -> None:
         if u is None:
             print(f"no user with email {email!r}", file=sys.stderr)
             raise SystemExit(1)
-        removed = factor_reset.clear_second_factor(admin, u["id"])
+        for m in reset_mod._recent_invitees(admin, u["id"]):
+            print(f"{m['email']} ({m['role']}, joined {m['joined'][:10]})")
+        admin.rollback()
+    finally:
+        admin.close()
+
+
+def clear_2fa(email: str, expect_members=None) -> None:
+    """The operator door for a user who has lost password, authenticator
+    and recovery codes together: void TOTP, passkeys and recovery codes,
+    evict every session and device (exactly what a reset does), leave the
+    password alone, and tell the account by mail. Print the reset link
+    next so the operator can hand it over in the same breath."""
+    from .auth import factor_reset
+    from .auth import reset as reset_mod
+    from .db import tenancy
+
+    admin = tenancy.admin_connect()
+    try:
+        u = admin.execute("SELECT id FROM users WHERE email=%s",
+                          (email.strip().lower(),)).fetchone()
+        if u is None:
+            print(f"no user with email {email!r}", file=sys.stderr)
+            raise SystemExit(1)
+        # An owner's clear also deletes the members who joined through that
+        # owner's recent invites (the same eviction an emailed reset makes).
+        # The output and the audit row name the rows the eviction deleted,
+        # and with --expect-members the clear refuses outright when that is
+        # not the set the operator's confirmation listed.
+        try:
+            removed = factor_reset.clear_second_factor(
+                admin, u["id"], expect_members=expect_members)
+        except reset_mod.MembersChanged as e:
+            admin.rollback()
+            now = ", ".join(sorted(m["email"] for m in e.members)) or "none"
+            print("nothing changed: the household logins this clear would "
+                  "remove are no longer the ones you confirmed (now: "
+                  f"{now}). Run it again to see the current list.",
+                  file=sys.stderr)
+            raise SystemExit(1)
         admin.commit()
+        gone = removed["members"]
         admin.execute(
             "INSERT INTO admin_audit (action, target, detail, ip, actor) "
             "VALUES ('clear_second_factor', %s, to_jsonb(%s::text), NULL, "
@@ -654,7 +748,9 @@ def clear_2fa(email: str) -> None:
             (email.strip().lower(),
              f"totp={'yes' if removed['totp'] else 'no'} "
              f"passkeys={removed['passkeys']} "
-             f"sessions_evicted={removed['sessions']}"))
+             f"sessions_evicted={removed['sessions']} "
+             f"members_removed={len(gone)}"
+             + (f" ({', '.join(gone)})" if gone else "")))
         admin.commit()
     finally:
         admin.close()
@@ -665,6 +761,11 @@ def clear_2fa(email: str) -> None:
           f"{removed['passkeys']} passkey(s) and all recovery codes removed, "
           f"{removed['sessions']} session(s) signed out; the account was "
           f"emailed.", file=sys.stderr)
+    if gone:
+        print(f"{len(gone)} household member login(s) who joined through "
+              f"this owner's recent invites were removed: "
+              f"{', '.join(gone)}. Invite them again if they are genuine.",
+              file=sys.stderr)
     print("Set a new password with:  oikonome reset-password "
           f"{email}", file=sys.stderr)
 

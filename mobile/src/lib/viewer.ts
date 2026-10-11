@@ -2,6 +2,7 @@
 // cached /api/me query, so asking for one costs nothing extra.
 import { useQuery } from "@tanstack/react-query";
 
+import { sharedLock } from "./pure";
 import { useSession } from "./session";
 
 export function useMe() {
@@ -58,4 +59,11 @@ export function useDemo(): boolean {
 export function useOwner(): boolean {
   const me = useMe();
   return me.data ? me.data.role === "owner" : false;
+}
+
+// Why a control is off for the shared demonstration login, or null when
+// it is live — pure.sharedLock over the same cached /api/me.
+export function useSharedLock(kind: "login" | "grant" | "credential"): string | null {
+  const me = useMe();
+  return sharedLock(me.data, kind);
 }

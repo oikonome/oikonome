@@ -202,6 +202,67 @@ class VerificationTests(WebhookBase):
         self.assertEqual(r.status_code, 413)
 
 
+class MalformedTokenShapesTests(WebhookBase):
+    """The webhook is unauthenticated, so every shape a token can take is
+    attacker-chosen. Each one that is not a well-formed Plaid JWT is a
+    clean 401 through the refusal path (which is what records it), never
+    an unhandled error: JSON that decodes to an array or a number where an
+    object belongs, a key id that is not a string, claims that are not an
+    object. A verified body that is not an event object is a 400."""
+
+    BODY = VerificationTests.BODY
+
+    def _signed(self, header, claims) -> str:
+        h = _b64url(json.dumps(header).encode())
+        c = _b64url(json.dumps(claims).encode())
+        der = self.signer.key.sign(f"{h}.{c}".encode(),
+                                   ec.ECDSA(hashes.SHA256()))
+        r, s = decode_dss_signature(der)
+        return f"{h}.{c}.{_b64url(r.to_bytes(32, 'big') + s.to_bytes(32, 'big'))}"
+
+    def _claims(self, body=None):
+        return {"iat": int(time.time()),
+                "request_body_sha256": hashlib.sha256(
+                    self.BODY if body is None else body).hexdigest()}
+
+    def test_a_header_that_is_not_an_object_is_refused(self):
+        for hdr in ([], [1, 2], 7, "ES256", None, True):
+            with self.subTest(hdr=hdr), \
+                    mock.patch.object(plaid_webhook, "_refuse",
+                                      wraps=plaid_webhook._refuse) as refuse:
+                r = self.post(self.BODY, self._signed(hdr, self._claims()))
+                self.assertEqual(r.status_code, 401)
+                refuse.assert_called_once()
+
+    def test_a_kid_that_is_not_a_string_is_refused(self):
+        for kid in ([1], {"a": 1}, 5, True, "k" * 1000):
+            with self.subTest(kid=kid):
+                r = self.post(self.BODY, self._signed(
+                    {"alg": "ES256", "kid": kid}, self._claims()))
+                self.assertEqual(r.status_code, 401)
+
+    def test_claims_that_are_not_an_object_are_refused(self):
+        for claims in ([], [1], 3, "x", None):
+            with self.subTest(claims=claims):
+                r = self.post(self.BODY, self._signed(
+                    {"alg": "ES256", "kid": KID}, claims))
+                self.assertEqual(r.status_code, 401)
+
+    def test_a_verified_body_that_is_not_an_event_is_a_bad_request(self):
+        for body in (b"[]", b"7", b'"x"', b"null"):
+            with self.subTest(body=body):
+                r = self.post(body, self._signed(
+                    {"alg": "ES256", "kid": KID}, self._claims(body)))
+                self.assertEqual(r.status_code, 400)
+
+    def test_an_event_with_odd_field_shapes_is_acknowledged(self):
+        body = json.dumps({"webhook_type": "ITEM", "webhook_code": "ERROR",
+                           "item_id": ["x"], "error": ["no"]}).encode()
+        r = self.post(body, self._signed({"alg": "ES256", "kid": KID},
+                                         self._claims(body)))
+        self.assertEqual(r.status_code, 200)
+
+
 class EventTests(WebhookBase):
     def setUp(self):
         super().setUp()
@@ -421,10 +482,9 @@ class EventTests(WebhookBase):
         r = worker_mod._sync_item_body(self.tenant_id, self.item_id)
         self.assertEqual(r, {"skipped": "archived"})
 
-    def test_clean_sync_clears_webhook_status(self):
-        self._post_event({"webhook_type": "ITEM",
-                          "webhook_code": "PENDING_EXPIRATION",
-                          "item_id": self.item_id})
+    def _clean_sync(self, during=None):
+        """One successful plaid.sync; `during` runs while it paginates, the
+        way a webhook can land between the sync's start and its end."""
         write_config(self.conn, plaid_client_id="cid", plaid_secret="sec",
                      plaid_env="sandbox")
         page = {"added": [], "modified": [], "removed": [],
@@ -433,12 +493,114 @@ class EventTests(WebhookBase):
         def handler(request):
             if request.url.path == "/accounts/get":
                 return httpx.Response(200, text=json.dumps({"accounts": []}))
+            if request.url.path == "/transactions/sync" and during:
+                during()
             return httpx.Response(200, text=json.dumps(page))
         plaid.sync(self.conn, self.item_id,
                    transport=httpx.MockTransport(handler))
+
+    def test_clean_sync_clears_an_error_flag(self):
+        # a working pull disproves an ITEM ERROR: the connection works
+        self._post_event({"webhook_type": "ITEM", "webhook_code": "ERROR",
+                          "item_id": self.item_id,
+                          "error": {"error_code": "ITEM_LOGIN_REQUIRED"}})
+        self.conn.execute("UPDATE items SET webhook_status_at = "
+                          "now() - interval '1 minute' WHERE id=%s",
+                          (self.item_id,))
+        self._clean_sync()
         row = self._webhook_status()
         self.assertIsNone(row["webhook_status"])
         self.assertIsNone(row["webhook_status_at"])
+
+    def test_clean_sync_keeps_warnings_it_cannot_disprove(self):
+        # Plaid sends these once. An expiring consent, a pending disconnect
+        # and an unshared new account all still sync cleanly, so a clean
+        # sync is no evidence any of them resolved — clearing them would
+        # hide the re-auth door until the connection actually breaks.
+        for code, word in (("PENDING_EXPIRATION", "pending_expiration"),
+                           ("PENDING_DISCONNECT", "pending_disconnect"),
+                           ("NEW_ACCOUNTS_AVAILABLE", "new_accounts")):
+            with self.subTest(code=code):
+                self._post_event({"webhook_type": "ITEM",
+                                  "webhook_code": code,
+                                  "item_id": self.item_id})
+                self._clean_sync()
+                row = self._webhook_status()
+                self.assertEqual(row["webhook_status"], word)
+                self.assertIsNotNone(row["webhook_status_at"])
+
+    def test_error_flag_landing_mid_sync_survives_it(self):
+        # the sync's success predates the event, so it proves nothing about it
+        def webhook():
+            self._post_event({"webhook_type": "ITEM", "webhook_code": "ERROR",
+                              "item_id": self.item_id,
+                              "error": {"error_code": "ITEM_LOGIN_REQUIRED"}})
+        self._clean_sync(during=webhook)
+        self.assertEqual(self._webhook_status()["webhook_status"],
+                         "error:ITEM_LOGIN_REQUIRED")
+
+    # NEW_ACCOUNTS_AVAILABLE is sent once and shares the webhook slot with
+    # every other ITEM status, so no later, unrelated webhook may erase it.
+    def _new_accounts(self):
+        self._post_event({"webhook_type": "ITEM",
+                          "webhook_code": "NEW_ACCOUNTS_AVAILABLE",
+                          "item_id": self.item_id})
+
+    def _error(self):
+        self._post_event({"webhook_type": "ITEM", "webhook_code": "ERROR",
+                          "item_id": self.item_id,
+                          "error": {"error_code": "ITEM_LOGIN_REQUIRED"}})
+
+    def _row(self):
+        return self.conn.execute(
+            "SELECT status, webhook_status FROM items WHERE id=%s",
+            (self.item_id,)).fetchone()
+
+    def test_an_error_after_new_accounts_keeps_the_offer(self):
+        self._new_accounts()
+        self._error()
+        row = self._row()
+        self.assertEqual(row["webhook_status"], "new_accounts")
+        # the sign-in problem still shows first, on the status
+        self.assertEqual(row["status"], "error:ITEM_LOGIN_REQUIRED")
+
+    def test_new_accounts_after_an_error_keeps_the_error(self):
+        self._error()
+        self._new_accounts()
+        row = self._row()
+        self.assertEqual(row["webhook_status"], "new_accounts")
+        self.assertEqual(row["status"], "error:ITEM_LOGIN_REQUIRED")
+
+    def test_an_expiry_warning_or_a_heal_keeps_the_offer(self):
+        self._new_accounts()
+        for code in ("PENDING_EXPIRATION", "PENDING_DISCONNECT",
+                     "LOGIN_REPAIRED"):
+            self._post_event({"webhook_type": "ITEM", "webhook_code": code,
+                              "item_id": self.item_id})
+            self.assertEqual(self._row()["webhook_status"], "new_accounts",
+                             code)
+        self.assertEqual(self._row()["status"], "ok")
+
+    def test_a_clean_sync_clears_the_error_and_keeps_the_offer(self):
+        self._new_accounts()
+        self._error()
+        self.conn.execute("UPDATE items SET webhook_status_at = "
+                          "now() - interval '1 minute' WHERE id=%s",
+                          (self.item_id,))
+        self._clean_sync()
+        row = self._row()
+        self.assertEqual((row["status"], row["webhook_status"]),
+                         ("ok", "new_accounts"))
+
+    def test_an_error_beside_the_offer_landing_mid_sync_survives_it(self):
+        self._new_accounts()
+        self.conn.execute("UPDATE items SET webhook_status_at = "
+                          "now() - interval '1 minute' WHERE id=%s",
+                          (self.item_id,))
+        self._clean_sync(during=self._error)
+        row = self._row()
+        self.assertEqual((row["status"], row["webhook_status"]),
+                         ("error:ITEM_LOGIN_REQUIRED", "new_accounts"))
 
     def test_unhandled_codes_acknowledged(self):
         """A code we deliberately do not act on is still a 200 — Plaid

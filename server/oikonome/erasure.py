@@ -48,14 +48,60 @@ log = logging.getLogger(__name__)
 # Every per-tenant advisory lock a background WRITER holds while it works:
 # the sync (hourly sweep, webhook, the manual doors, restore, reaper), the
 # categorize pass that runs after a pull or an import, and the nightly
-# sweep. The domain tables have no FK to tenants, so a writer already in
-# flight when the rows go writes them straight back for a tenant that no
-# longer exists. An erasure blocks on ALL of them — waiting on the sync
-# lock alone lets the nightly sweep or a categorize pass carry on writing
-# through the wipe. Each writer only TRY-locks its own, so a writer that
-# arrives while the erasure holds them skips.
+# sweep — and the three hourly/nightly runs that write on their own: the
+# email send (it records the run and its verdict line after sending), the
+# net-worth snapshot, and the stale-collector alert. The domain tables have
+# no FK to tenants, so a writer already in flight when the rows go writes
+# them straight back for a tenant that no longer exists. An erasure blocks
+# on ALL of them — waiting on the sync lock alone lets any of the others
+# carry on writing through the wipe. Each writer only TRY-locks its own,
+# so a writer that arrives while the erasure holds them skips, and none
+# waits on another's while holding its own, so the fixed order here cannot
+# deadlock against them.
+# The collector push doors (crypto, plan activity, store orders and
+# receipts) write on their own too, from a request authenticated before the
+# erasure flipped the tenant's status; `push_may_write` is how they join.
+#
+# Those try-locks never wait. The locks a writer DOES wait on, inside its
+# transaction, are always taken in one order, because two writers taking
+# any pair of them the other way round can each hold what the other wants,
+# and Postgres then kills one of them:
+#   1. the reimbursement-pairing lock (sync.reanchor.hold_pairing_lock);
+#   2. the household merchant-identity lock
+#      (engine.merchant_identity._lock_identity) — AFTER the pairing lock
+#      when a writer needs both, as a ledger import or a crypto push does
+#      (the importer pairs receipts and names merchants), and never asked
+#      for the first time once a transaction row is held: a rename holds
+#      identity while it moves rows, so a writer that restated a row and
+#      then asked for identity would wait on a rename waiting on that row;
+#   3. the settings row before any accounts row (engine.budget.config_txn),
+#      and before the household-member lock (oikonome:tenant-members), which
+#      comes before the inviter's invite rows and then users rows: an
+#      owner's rotation or recovery pauses the outbound settings
+#      (notify.outbound_pause) and only then waits out the invite claims
+#      (auth.reset._cancel_invites_and_read_invitees). A user's own
+#      per-user factor lock comes first of all, in that user's own door;
+#      a REMOVED member's factor lock comes after the household-member
+#      lock, taken under it just before that member's rows
+#      (auth.reset._remove_members). So only an owner's rotation or
+#      recovery ever takes the household-member lock: a member's own door
+#      already holds its factor lock and removes nobody, and asking for
+#      the member lock there would close a cycle with an owner removing
+#      that member;
+#   4. bill offers, then bills, then transaction rows
+#      (engine.bills._rename_locks);
+#   5. a merchant-wide category write and a rename both touch category
+#      rules and the rows those rules file, in opposite orders (the write:
+#      rule, then rows; the rename: rows, then rules), so each holds the
+#      identity lock first and they take turns on it
+#      (web.data.set_merchant_category, engine.merchant_dedup.rename).
+# A writer that needs a later lock takes the earlier ones it will need
+# first, even when it only reaches them near the end of its work.
+PUSH_LOCK = "oikonome:push:{}"
 WRITER_LOCKS = ("oikonome:sync:{}", "oikonome:sync-categorize:{}",
-                "oikonome:nightly:{}")
+                "oikonome:nightly:{}", "oikonome:email:{}",
+                "oikonome:snapshot:{}", "oikonome:script-alert:{}",
+                PUSH_LOCK)
 
 
 def writer_lock_keys(tenant_id) -> list[str]:
@@ -70,6 +116,53 @@ def hold_writers(conn, tenant_id, *, xact: bool = False) -> None:
     fn = "pg_advisory_xact_lock" if xact else "pg_advisory_lock"
     for key in writer_lock_keys(tenant_id):
         conn.execute(f"SELECT {fn}(hashtext(%s))", (key,))
+
+
+def being_deleted(tenant_id, conn=None) -> bool:
+    """True once an erasure of this household has begun: its status was
+    flipped to pending_delete, or its row is already gone — or, given a
+    connection, the push writer lock is held exclusively, which only an
+    erasure does. Read from the control plane, so it is current even
+    inside another transaction."""
+    if conn is not None:
+        got = conn.execute(
+            "SELECT pg_try_advisory_lock_shared(hashtext(%s)) AS ok",
+            (PUSH_LOCK.format(tenant_id),)).fetchone()
+        if not (got["ok"] if isinstance(got, dict) else got[0]):
+            return True
+        conn.execute("SELECT pg_advisory_unlock_shared(hashtext(%s))",
+                     (PUSH_LOCK.format(tenant_id),))
+    from .db import tenancy
+    cc = tenancy.control_connect()
+    try:
+        row = cc.execute("SELECT status FROM tenants WHERE id=%s",
+                         (str(tenant_id),)).fetchone()
+    finally:
+        cc.close()
+    return not row or row["status"] == "pending_delete"
+
+
+def push_may_write(conn, tenant_id) -> bool:
+    """Call inside a push door's write transaction, before its first write.
+    Takes the push writer lock SHARED for the rest of that transaction —
+    pushes for one household coexist (a slow store import must not turn
+    the next collector's push into a false "being deleted"), while an
+    erasure, which takes it exclusive, waits for every push to commit and
+    then deletes what it wrote — and answers False (the door replies 409 and writes
+    nothing) when an erasure holds the lock or has already begun: the
+    tenant's status was flipped to pending_delete, or its row is gone. The
+    status is read after the lock is held, because the request was
+    authenticated earlier and an erasure flips the status before it takes
+    the writer locks; without the re-read, a push authenticated while the
+    tenant was active writes the household's rows back under a tenant id
+    nothing will ever sweep again (the domain tables have no FK to
+    tenants)."""
+    got = conn.execute(
+        "SELECT pg_try_advisory_xact_lock_shared(hashtext(%s)) AS ok",
+        (PUSH_LOCK.format(tenant_id),)).fetchone()
+    if not (got["ok"] if isinstance(got, dict) else got[0]):
+        return False
+    return not being_deleted(tenant_id)
 
 
 def release_writers(conn, tenant_id) -> None:

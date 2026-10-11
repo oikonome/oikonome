@@ -108,3 +108,25 @@ const s = StyleSheet.create({
   pill: { borderWidth: 1, borderRadius: 999, paddingHorizontal: 8,
           paddingVertical: 2, alignSelf: "flex-start" },
 });
+
+// A control the server refuses this login, shown untouchable in place
+// with the refusal's own sentence above it — the native twin of the web's
+// DemoLock. Shown rather than hidden, because discoverable beats missing;
+// switched off, because a button that can only answer 403 reads as broken.
+// `note` null renders the children untouched.
+export function SharedLock({ note, children }: {
+  note: string | null; children: React.ReactNode;
+}) {
+  if (!note) return <>{children}</>;
+  return (
+    <View>
+      <Text style={{ color: C.warn, fontSize: 12, textAlign: "center",
+                     paddingHorizontal: 8, paddingTop: 8 }}>
+        {note}
+      </Text>
+      <View pointerEvents="none" style={{ opacity: 0.55 }}>
+        {children}
+      </View>
+    </View>
+  );
+}

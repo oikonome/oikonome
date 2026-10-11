@@ -3,7 +3,7 @@
 // investment fees, and the property table with the manual-assets
 // editor (the page's only mutation).
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View,
          useWindowDimensions } from "react-native";
 import PullRefresh from "../components/pull-refresh";
@@ -18,7 +18,8 @@ import { RANGE_LABEL, rangeCaption, TREND_RANGES, trendWindow,
 import { useSession } from "../lib/session";
 import { useViewer } from "../lib/viewer";
 import { C, money } from "../lib/theme";
-import { catLabel, parseMoneyDraft } from "../lib/pure";
+import { catLabel, nameKeys, parseMoneyDraft, rebaseNamedSave }
+  from "../lib/pure";
 
 const m$ = (n: number) => money(n, false);
 const plTxt = (v: number) => `${v >= 0 ? "+" : "−"}${m$(Math.abs(v))}`;
@@ -328,16 +329,38 @@ function ManualAssets() {
     queryFn: () => client!.settingsFull(),
     enabled: !!client && !viewer });
   // `draft` is the value TEXT while it is typed; it is parsed only at
-  // save, so "-", "-0." and "1200." can be typed on the way to a number
-  const [rows, setRows] = useState<(ManualAsset & { draft?: string })[]
-                                   | null>(null);
+  // save, so "-", "-0." and "1200." can be typed on the way to a number.
+  // `orig` is the row's key in `opened`, the list as it was when Edit was
+  // pressed (absent: added here). `sent` is the row's place in the list
+  // the last Save wrote, and `lastSent` that list: when its reply is lost
+  // the next Save checks whether it landed, so nothing goes in twice.
+  type Row = ManualAsset & { draft?: string; orig?: string; sent?: number };
+  type Edited = ManualAsset & { orig?: string; sent?: number };
+  const [rows, setRows] = useState<Row[] | null>(null);
+  const [opened, setOpened] = useState<ManualAsset[]>([]);
+  const lastSent = useRef<ManualAsset[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const save = useMutation({
-    // the reply seeds ["settings"], so "Edit assets" right after Save
-    // opens on the list just written — re-seeding from the stale copy
-    // would let the next save overwrite this one
-    mutationFn: (assets: ManualAsset[]) =>
-      saveSettings(qc, client!, { manual_assets: assets }),
+    // The server replaces the whole list, and this one is a copy from
+    // when Edit was pressed: the nightly valuation or another device may
+    // have saved since. Read the stored list now and lay only this
+    // editor's changes over it.
+    // The reply seeds ["settings"], so "Edit assets" right after Save
+    // opens on the list just written.
+    mutationFn: async ({ edited, at }: { edited: Edited[]; at: number[] }) => {
+      const live = ((await client!.settingsFull()).manual_assets as
+        ManualAsset[] | null) ?? [];
+      const r = rebaseNamedSave(edited, opened, live, lastSent.current);
+      lastSent.current = r.list;
+      setOpened(r.baseline);
+      setRows((cur) => cur && cur.flatMap((row, j) => {
+        const n = at.indexOf(j);
+        if (n < 0) return [row];
+        const k = r.rows[n];
+        return k ? [{ ...row, ...k }] : [];
+      }));
+      return saveSettings(qc, client!, { manual_assets: r.list });
+    },
     onSuccess: () => {
       setErr(null); setRows(null);
       // the report itself is rebuilt server-side from the new assets
@@ -351,7 +374,12 @@ function ManualAssets() {
   if (rows === null) {
     return (
       <Pressable style={[s.btn, { alignSelf: "flex-start", marginTop: 8 }]}
-                 onPress={() => setRows(saved.map((a) => ({ ...a })))}>
+                 onPress={() => {
+                   const keys = nameKeys(saved);
+                   setOpened(saved);
+                   lastSent.current = null;
+                   setRows(saved.map((a, i) => ({ ...a, orig: keys[i] })));
+                 }}>
         <Text style={s.btnText}>
           {saved.length ? "Edit assets"
             : "Add property, vehicle or mortgage"}
@@ -359,13 +387,16 @@ function ManualAssets() {
       </Pressable>
     );
   }
-  const upd = (i: number, patch: Partial<ManualAsset & { draft: string }>) =>
+  const upd = (i: number, patch: Partial<Row>) =>
     setRows(rows.map((r, j) => (j === i ? { ...r, ...patch } : r)));
   // settle every typed value; one that is not a number stops the save
   // and says which row, rather than going out as NaN (sent as null → $0)
   const submit = () => {
-    const out: ManualAsset[] = [];
-    for (const { draft, ...r } of rows.filter((x) => x.name.trim())) {
+    const out: Edited[] = [];
+    const at: number[] = [];
+    for (const [j, { draft, ...r }] of rows.entries()) {
+      if (!r.name.trim()) continue;
+      at.push(j);
       if (draft === undefined) { out.push(r); continue; }
       const v = draft.trim() === "" ? 0 : parseMoneyDraft(draft);
       if (v === null) {
@@ -374,7 +405,7 @@ function ManualAssets() {
       }
       out.push({ ...r, value: v });
     }
-    save.mutate(out);
+    save.mutate({ edited: out, at });
   };
   const KINDS = ["property", "vehicle", "mortgage", "other"];
   return (

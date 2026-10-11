@@ -1,11 +1,13 @@
 // The account-kind vocabulary and the remove-an-account panel, shared by
 // the Accounts page and the Manage-accounts card in Settings. A module of
 // its own so the card does not import the whole Accounts page for them.
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { api, errText, type Account, type AccountRemoveMode,
-         type Connection, type Me } from "../api/client";
-import { patchList, patchQuery, removeFromList } from "../api/cache";
+         type AccountRemoveResult, type Connection }
+  from "../api/client";
+import { patchList, removeFromList } from "../api/cache";
+import { sharedLock } from "../sharedlogin";
 
 export const KINDS: [string, string][] = [
   ["depository/checking", "checking"],
@@ -37,6 +39,18 @@ type AccountsData = { accounts: Account[] };
  *  counts. Mobile's twin is `accountRemoveMoved` in mobile/src/lib/pure.ts
  *  — the same rule, over the key names that client uses (its ledger is
  *  ["transactions"], this one's is ["txns"] and is not mounted here). */
+/** What to say after a removal. A purge that kept rows (the bank feed
+ *  already relies on them) explains so in the purge's own note, beside
+ *  the removal's note; the same sentence is never said twice. */
+export function accountRemoveNote(r: AccountRemoveResult): string {
+  const parts: string[] = [];
+  if (r.note) parts.push(r.note);
+  const kept = r.purged?.note;
+  if (kept && !(r.note ?? "").includes(kept)) parts.push(kept);
+  return (parts.join(" ") || "Removed.")
+    + (r.plaid_released ? " Plaid connection released." : "");
+}
+
 export function accountRemoveMoved(mode: AccountRemoveMode): Moved[] {
   const keys: Moved[] = ["accounts", "today"];
   if (mode !== "hide") keys.push("connections", "me");
@@ -47,6 +61,37 @@ export function accountRemoveMoved(mode: AccountRemoveMode): Moved[] {
   return keys;
 }
 
+/** The question a delete refused with "kept_rows_unconfirmed" asks, or
+ *  null for any other error. The server keeps imported rows a bank feed
+ *  may have set its own copy aside for; when every kept row is held only
+ *  by a note that names no feed account, nothing would ever release them,
+ *  so it asks the owner instead and "delete anyway" re-sends with
+ *  `force_kept`. Mobile's twin is `keptRowsQuestion` in
+ *  mobile/src/lib/pure.ts. */
+export function keptRowsQuestion(e: unknown): string | null {
+  const m = /^409:\s*([\s\S]*)$/.exec(e instanceof Error ? e.message : "");
+  if (!m) return null;
+  try {
+    const b = JSON.parse(m[1]);
+    return b?.error === "kept_rows_unconfirmed" && typeof b.detail === "string"
+      ? b.detail : null;
+  } catch { return null; }
+}
+
+/** The note an undo refused with "kept_rows" carries: a member's undo
+ *  that would leave such rows is told why and offered nothing, because
+ *  deleting them anyway is the owner's call. Null for any other error.
+ *  Mobile's twin is `keptRowsNote` in mobile/src/lib/pure.ts. */
+export function keptRowsNote(e: unknown): string | null {
+  const m = /^409:\s*([\s\S]*)$/.exec(e instanceof Error ? e.message : "");
+  if (!m) return null;
+  try {
+    const b = JSON.parse(m[1]);
+    return b?.error === "kept_rows" && typeof b.detail === "string" && b.detail
+      ? b.detail : null;
+  } catch { return null; }
+}
+
 export function RemoveAccountPanel({ a, liveConn, onDone, onCancel }: {
   a: Account; liveConn: boolean;
   onDone: DoneFn; onCancel: () => void;
@@ -54,23 +99,52 @@ export function RemoveAccountPanel({ a, liveConn, onDone, onCancel }: {
   const qc = useQueryClient();
   const isPlaid = a.aggregator === "plaid";
   const inst = a.institution_name || "this institution";
+  // Disconnecting ends a bank connection that outlives the shared
+  // demonstration login (a Plaid release cannot be undone), so the server
+  // refuses both disconnect modes to it; they are shown switched off with
+  // the reason, and hiding the one account stays open.
+  const meQ = useQuery({ queryKey: ["me"], queryFn: api.me });
+  const credLock = liveConn ? sharedLock(meQ.data, "credential") : null;
+  // at the allowance, the likely reason to disconnect is to make room —
+  // and a released bank keeps its place for 30 days, so say that first
+  const cap = meQ.data?.features?.institution_cap;
+  const used = meQ.data?.features?.institutions_used;
+  const atCap = liveConn && isPlaid && typeof cap === "number"
+    && typeof used === "number" && used >= cap;
   // default: live → disconnect keep history; dead/manual → purge
   const [mode, setMode] = useState<AccountRemoveMode>(
     liveConn ? "disconnect" : "purge");
+  const lockedMode = (m: AccountRemoveMode) =>
+    !!credLock && m.startsWith("disconnect");
+  // the lock can arrive after the first render (me loads late), so the
+  // chosen mode follows it rather than the initial default
+  const effMode: AccountRemoveMode = lockedMode(mode) ? "hide" : mode;
 
   const remove = useMutation({
-    mutationFn: () => api.accountRemove(a.id, mode),
+    mutationFn: async () => {
+      try {
+        return await api.accountRemove(a.id, effMode);
+      } catch (e) {
+        // rows only a note naming no feed account keeps: the server asks
+        // before deleting them, and the answer re-sends the same removal
+        const q = keptRowsQuestion(e);
+        if (q && window.confirm(`${q}\n\nDelete anyway?`))
+          return await api.accountRemove(a.id, effMode, true);
+        throw e;
+      }
+    },
     onSuccess: (r) => {
-      const extra = r.plaid_released ? " Plaid connection released." : "";
       // The server names every account it touched. Purged rows leave the
       // list now; a hidden one moves to its section; a disconnected
       // institution shows archived on every row — all before the refetch,
       // which only confirms.
       const hit = new Set(r.affected_accounts);
-      if (r.mode === "purge" || r.mode === "disconnect_purge")
+      // a purge that kept rows keeps their account too; the refetch says which
+      const kept = (r.purged?.kept_transactions ?? 0) > 0;
+      if ((r.mode === "purge" || r.mode === "disconnect_purge") && !kept)
         removeFromList<AccountsData, Account>(qc, ["accounts"], "accounts",
           (x) => hit.has(x.id));
-      else
+      else if (!kept)
         patchList<AccountsData, Account>(qc, ["accounts"], "accounts",
           (x) => hit.has(x.id),
           r.mode === "hide"
@@ -81,18 +155,11 @@ export function RemoveAccountPanel({ a, liveConn, onDone, onCancel }: {
       if (r.mode.startsWith("disconnect") && r.item_id) {
         removeFromList<{ connections: Connection[] }, Connection>(
           qc, ["connections"], "connections", (c) => c.id === r.item_id);
-        // …and the freed slot shows on the allowance NOW. The server
-        // archives exactly one item per disconnect (sync/base counts the
-        // unarchived ones), so the new figure is known here — the
-        // refetch below only confirms it.
-        const me = qc.getQueryData<Me>(["me"]);
-        const used = me?.features?.institutions_used;
-        if (me && typeof used === "number")
-          patchQuery<Me>(qc, ["me"],
-            { features: { ...me.features, institutions_used:
-                            Math.max(0, used - 1) } });
+        // The allowance is NOT patched down here: a released Item keeps
+        // holding its place for a while, so the count may not move at
+        // all. The "me" refetch below brings the server's own figure.
       }
-      onDone((r.note || "Removed.") + extra, accountRemoveMoved(r.mode));
+      onDone(accountRemoveNote(r), accountRemoveMoved(r.mode));
     },
     onError: (e) => onDone(errText(e)),
   });
@@ -151,12 +218,22 @@ export function RemoveAccountPanel({ a, liveConn, onDone, onCancel }: {
             + "whole login (Plaid Item), not a single sub-account."
           : "This account is not actively syncing."}
       </div>
+      {atCap && (
+        <div style={{ color: "var(--amber)", marginBottom: ".5rem" }}>
+          Disconnecting does not free a slot for 30 days.</div>
+      )}
+      {credLock && (
+        <div style={{ marginBottom: ".5rem", color: "var(--amber)" }}>
+          {credLock}</div>
+      )}
       {opts.map((o) => (
         <label key={o.mode}
                style={{ display: "block", marginBottom: ".45rem",
-                        cursor: "pointer" }}>
+                        cursor: lockedMode(o.mode) ? "not-allowed" : "pointer",
+                        opacity: lockedMode(o.mode) ? .55 : 1 }}>
           <input type="radio" name={`rm-${a.id}`} value={o.mode}
-                 checked={mode === o.mode}
+                 checked={effMode === o.mode}
+                 disabled={lockedMode(o.mode)}
                  onChange={() => setMode(o.mode)}
                  style={{ marginRight: ".4rem" }} />
           <b>{o.label}</b>
@@ -169,12 +246,12 @@ export function RemoveAccountPanel({ a, liveConn, onDone, onCancel }: {
                 style={{ background: "var(--red, #c44)", borderColor: "transparent" }}
                 disabled={remove.isPending}
                 onClick={() => {
-                  const need = mode === "disconnect_purge" || mode === "purge";
-                  const msg = mode === "disconnect_purge"
+                  const need = effMode === "disconnect_purge" || effMode === "purge";
+                  const msg = effMode === "disconnect_purge"
                     ? `Disconnect ${inst} and DELETE all its local data? This cannot be undone.`
-                    : mode === "purge"
+                    : effMode === "purge"
                       ? `Permanently delete ${a.name} and its transactions?`
-                      : mode === "disconnect"
+                      : effMode === "disconnect"
                         ? `Disconnect ${inst}? Syncing stops; history is kept.`
                         : `Hide ${a.name} from active accounts?`;
                   if (need ? window.confirm(msg) : window.confirm(msg))

@@ -5,7 +5,9 @@ The Bills page manages the bills the plan spends against. Bills are
 them; you approve. Nothing invents a bill you didn't have.
 
 The headline sums the schedule as evened-out monthly figures — what
-bills cost per month, what income brings in, and the difference: what's
+bills cost per month (a weekly or every-2-weeks bill at its exact rate
+over an average year, so a year with a 27th payday or a 53rd week does
+not inflate it), what income brings in, and the difference: what's
 left for variable spending and savings. The two loads use the same math
 as the Budget page's flow line, so the pages can't disagree about the
 same schedule.
@@ -35,7 +37,8 @@ When a bill's real charge settles at a new amount (at least $1
 different), the bill's amount **updates automatically** and leaves an
 audit entry — subscription price hikes shouldn't need paperwork. If you
 hand-edit an amount, it's immune to drift for 60 days, so detection
-won't fight you.
+won't fight you. A detection run that is already under way when you
+save an edit never writes over it either — your edit wins.
 
 ## How matching works
 
@@ -57,6 +60,25 @@ won't fight you.
 - An occurrence is recognized **at payment** — paying early is never
   "over budget"; an unpaid occurrence starts counting on its due date
   and shows in the overdue list until it posts.
+- **"Withdrawn by the bank feed"** means the bill *was* charged, but
+  your bank's feed later took that posted charge back out of the ledger
+  (banks sometimes withdraw and re-send a batch of transactions). Instead
+  of calling the bill overdue, the Bills page, Today and the daily email
+  show it in amber as "charge withdrawn by the bank feed" with the
+  charge's date. It still counts as unpaid in your budget and forecast
+  until the charge is back. It clears itself the moment the bank re-posts
+  the charge; if it never does, the bill goes back to reading overdue
+  once the withdrawn charge is older than the bill's matching window
+  (about half its billing cycle, at most 35 days). The same goes for a
+  bill's health: when the cycle it missed was charged and then withdrawn,
+  its pill reads an amber "withdrawn" (hover for the charge's date)
+  instead of a red "stale", and it is not counted as needing attention —
+  a second missed cycle in a row still reads stale, and a later payment
+  that is missed outright still reads overdue. Only a charge your bank's
+  feed itself took back counts: a transaction merged into another
+  source's copy, replaced by a file import or by an exchange's full
+  re-sync, or on an account you excluded on the Accounts page never
+  reads as withdrawn.
 
 ## Envelopes
 
@@ -134,8 +156,12 @@ due date, red once it is late; the mobile app colours the same words under
 each bill the same way.
 
 Each bill row edits inline: rename, amount, cadence (the standard cycles,
-or **Custom interval…** for every N months or years), next due date, an
-occurrence cap (at most N per month), disable, archive, or delete.
+or **Custom interval…** for every N months or years — a bill already on
+a custom interval keeps it listed in the picker, so editing something
+else never loses it), next due date, an occurrence cap (at most N per
+month), disable, archive, or delete. The enable/disable button sets the
+state it shows, so if someone else in the household changed the bill a
+moment earlier, clicking it does not flip it back.
 Health pills flag problems — a bill that stopped appearing ("stale"), one
 whose due-date anchor sits more than a couple of days off the real charge
 phase ("misdated"), and "mismatch": the merchant is charging you, but
@@ -178,6 +204,19 @@ page: any row already matched to a bill shows an indicator, and
 unmatched merchants offer "add as bill / envelope" with a suggested
 cadence prefilled from that merchant's history (you confirm; nothing
 auto-saves).
+
+## Past months
+
+The page opens on this month. The ‹ › control under the heading steps
+back a month at a time: the paid / received column then shows how that
+month ended — paid ✓, **missed** (or **withdrawn**, when the bank feed
+took the charge back), **not received**, or **not due** for a bill that
+had no occurrence that month — and an envelope shows what it used. The
+reading is the Month lens's own, so the two agree. The schedule itself
+(the bills, their next dates, the health flags) is always the live one:
+a bill added since shows with nothing due in a month it did not exist
+for, and an edit made while looking at a past month changes the live
+bill. **This month** brings you back.
 
 ## Upcoming calendar
 

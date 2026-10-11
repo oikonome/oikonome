@@ -29,6 +29,9 @@ const money = (v: number | null | undefined) => money$(v, false);
 // the server caps the catalog at its 200 most frequent merchants;
 // the long tail is reachable only through search
 const CATALOG_LIMIT = 200;
+// a filter or a spend/recency sort is cut from whatever came back, so ask
+// for the widest window the server allows before cutting it
+const CATALOG_WIDE = 500;
 
 // the server caps the `variants` array it returns, so the array's length
 // is NOT the number of source names — a merchant with 3,000 spellings
@@ -83,9 +86,12 @@ export default function Merchants({ embedded = false }:
   const mayEdit = canEdit(me);
   // the demo instance 403s every write; disabled-in-place beats a 403
   const demo = !!me.data?.demo;
-  const key = ["merchants", q, serverOrder(order)];
+  const narrowed = flt !== "all" || order === "spend" || order === "recent";
+  const limit = narrowed ? CATALOG_WIDE : CATALOG_LIMIT;
+  const key = ["merchants", q, serverOrder(order), order, flt];
   const list = useQuery({ queryKey: key,
-                          queryFn: () => api.merchantCatalog(q, serverOrder(order)),
+                          queryFn: () => api.merchantCatalog(q, serverOrder(order),
+                                                             { sort: order, filter: flt, limit }),
                           // keep the last page on screen while refetching —
                           // a debounce fire shouldn't flash "loading…"
                           placeholderData: (prev) => prev });
@@ -313,9 +319,12 @@ export default function Merchants({ embedded = false }:
             <span className="mut" aria-hidden="true">›</span>
           </div>
         ))}
-        {rows.length >= CATALOG_LIMIT && !q && flt === "all" && (
+        {/* capped is judged on what the server sent, before the filter:
+            a filter over a capped window can come back short or empty
+            while the merchants it wants sit past the cap */}
+        {(list.data?.merchants.length ?? 0) >= limit && !q && (
           <p className="sub" style={{ marginTop: ".6rem" }}>
-            Showing the {CATALOG_LIMIT} most frequent — search to find any merchant.
+            Showing the {limit} most frequent — search to find any merchant.
           </p>
         )}
       </div>
@@ -477,7 +486,8 @@ function OfferMerged({ p }: { p: MergeProposal }) {
         <>
           <div className="sb">
             {f.rows + i.rows} rows <span className="delta">+{f.rows}</span> ·{" "}
-            {money(f.total + i.total)} <span className="delta">+{money(f.total)}</span>
+            {money(f.total + i.total)} <span className="delta">
+              {f.total >= 0 ? "+" : ""}{money(f.total)}</span>
           </div>
           <div className="sb">
             {mmdd(dates[0])} – {mmdd(dates[dates.length - 1])}

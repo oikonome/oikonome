@@ -143,6 +143,54 @@ class AlertTests(unittest.TestCase):
                       " | ".join(a["message"] for a in out))
 
 
+class StaleSyncFollowsThePollInterval(unittest.TestCase):
+    """The stale-sync alert tolerates the poll interval the operator chose.
+    Raising OIKONOME_SYNC_BUCKETS lengthens every tenant's poll (buckets ×
+    five minutes), so a fixed six-hour threshold would call a healthy
+    eight-hourly poll stale for part of every cycle — a false alarm that
+    returns after each dismissal. The default cadence keeps six hours."""
+
+    def setUp(self):
+        self.conn = make_db()
+        write_config(self.conn)
+        self.conn.execute(
+            "UPDATE items SET aggregator='simplefin' WHERE id='it1'")
+        self.conn.execute(
+            "INSERT INTO sync_log (item_id, added, modified, removed) "
+            "VALUES ('it1', 1, 0, 0)")
+        self.now = dt.datetime.now(dt.timezone.utc)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _stale_after(self, hours, buckets):
+        from unittest import mock
+        env = {} if buckets is None else {"OIKONOME_SYNC_BUCKETS": buckets}
+        with mock.patch.dict("os.environ", env, clear=False):
+            if buckets is None:
+                import os
+                os.environ.pop("OIKONOME_SYNC_BUCKETS", None)
+            out = alerts.freshness(
+                self.conn, now_utc=self.now + dt.timedelta(hours=hours))
+        return any(a["kind"] == "stale-pull" for a in out)
+
+    def test_the_default_cadence_keeps_the_six_hour_threshold(self):
+        self.assertFalse(self._stale_after(5, None))
+        self.assertTrue(self._stale_after(7, None))
+        self.assertTrue(self._stale_after(7, "12"))
+
+    def test_a_longer_poll_is_not_stale_between_polls(self):
+        # 96 buckets = an eight-hourly poll: one poll late is not stale
+        self.assertFalse(self._stale_after(9, "96"))
+        self.assertFalse(self._stale_after(15, "96"))
+        # several polls missed still is
+        self.assertTrue(self._stale_after(30, "96"))
+
+    def test_an_unreadable_setting_falls_back_to_the_floor(self):
+        self.assertTrue(self._stale_after(7, "lots"))
+        self.assertTrue(self._stale_after(7, "0"))
+
+
 class AnomalyTests(unittest.TestCase):
     """Anomaly detection: what counts as news, and what does not."""
 

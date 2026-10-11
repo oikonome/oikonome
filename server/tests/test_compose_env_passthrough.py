@@ -114,7 +114,10 @@ class ComposePassthroughTests(unittest.TestCase):
         fwd = _forwarded()
         one_sided = sorted(n for n in (
             "OIKONOME_POOL_MAX", "OIKONOME_CONTROL_POOL_MAX",
-            "OIKONOME_TENANT_POOL_TIMEOUT", "OIKONOME_CONTROL_POOL_TIMEOUT")
+            "OIKONOME_TENANT_POOL_TIMEOUT", "OIKONOME_CONTROL_POOL_TIMEOUT",
+            "OIKONOME_CONTROL_LOCK_TIMEOUT_MS",
+            "OIKONOME_CONTROL_IDLE_TXN_TIMEOUT_MS",
+            "OIKONOME_CONTROL_STATEMENT_TIMEOUT_MS")
             if fwd.get(n, 0) < 2)
         self.assertEqual(one_sided, [],
                          "pool knob not forwarded to app AND worker: "
@@ -163,6 +166,39 @@ class ComposePassthroughTests(unittest.TestCase):
             "the worker imports code that reads these documented knobs, but "
             "compose never forwards them to the worker container — every "
             "branch behind them silently takes its default path: "
+            + ", ".join(missing))
+
+    def test_every_knob_the_web_process_can_reach_is_forwarded_to_the_app(self):
+        """The same question from the other side. A knob forwarded to the
+        worker alone is read with its default by everything the web process
+        computes — the Today page's stale-sync threshold derives from the
+        poll interval, and read the default one, it called healthy
+        connections stale for part of every poll cycle. Derived from the
+        web entrypoint's import graph, in a fresh interpreter for the reason
+        given above."""
+        probe = subprocess.run(
+            [sys.executable, "-c",
+             "import sys, importlib;"
+             "importlib.import_module('oikonome.web.app');"
+             "print('\\n'.join(m.__file__ for n, m in sys.modules.items()"
+             " if n.startswith('oikonome.') and getattr(m, '__file__', None)))"],
+            capture_output=True, text=True, cwd=str(REPO / "server"))
+        self.assertEqual(probe.returncode, 0,
+                         f"could not import the web app: {probe.stderr}")
+        names: set[str] = set()
+        for path in probe.stdout.split():
+            try:
+                names |= set(re.findall(r"OIKONOME_[A-Z0-9_]+",
+                                        Path(path).read_text()))
+            except OSError:
+                continue
+        app_env = _service_env("app")
+        need = (names & _documented()) - HOST_SIDE
+        missing = sorted(n for n in need if n not in app_env)
+        self.assertEqual(
+            missing, [],
+            "the web process imports code that reads these documented "
+            "knobs, but compose never forwards them to the app container: "
             + ", ".join(missing))
 
     def test_the_installed_version_reaches_the_worker(self):

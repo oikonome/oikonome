@@ -747,12 +747,15 @@ class NightlyRebootTests(unittest.TestCase):
     """Graceful automated maintenance reboot: only with the env flag AND
     a pending host reboot; sets the countdown broadcast + drops the flag."""
 
-    def _run(self, td, reboot_required, env_on=True):
+    def _run(self, td, reboot_required, env_on=True,
+             watchers=("command", "reboot")):
         import json
         from pathlib import Path
 
         from oikonome.jobs.worker import _nightly_reboot_check
-        (Path(td) / "ops").mkdir(exist_ok=True)
+        (Path(td) / "ops" / "watchers").mkdir(parents=True, exist_ok=True)
+        for kind in watchers:
+            (Path(td) / "ops" / "watchers" / kind).write_text("")
         (Path(td) / "cmd").mkdir(exist_ok=True)
         (Path(td) / "ops" / "host-health.json").write_text(json.dumps(
             {"reboot_required": reboot_required}))
@@ -776,6 +779,18 @@ class NightlyRebootTests(unittest.TestCase):
         _ensure_db()
         with tempfile.TemporaryDirectory() as td:
             self.assertEqual(self._run(td, False), "not-needed")
+
+    def test_the_command_watcher_alone_is_not_a_reboot_watcher(self):
+        """The drop-box is writable once either watcher is installed; with
+        only the command watcher nothing reads a reboot flag, so the night
+        must not broadcast a countdown to a restart that never happens."""
+        import tempfile
+        from pathlib import Path
+        _ensure_db()
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(self._run(td, True, watchers=("command",)),
+                             "no-cmd-dir")
+            self.assertFalse((Path(td) / "cmd" / "reboot-requested").exists())
 
     def test_fires_with_broadcast_and_flag(self):
         import tempfile

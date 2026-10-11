@@ -46,7 +46,18 @@ spin() {
 # installer and the control script can never disagree about the version
 . "$(dirname "$0")/scripts/version-stamp.sh"
 
+# shared docker/.env readers (dotenv_get, data_dir_resolve, pg_data_version)
+# — also sourced by oikonome.sh, uninstall.sh and pg-major-migrate.sh, so
+# every script resolves the database folder the way compose does
+. "$(dirname "$0")/scripts/env-file.sh"
+
 cd "$(dirname "$0")/docker"
+
+# env_read KEY — KEY from docker/.env exactly as compose will hand it to the
+# stack (last assignment, `export`, quotes and comments handled). A literal
+# `grep ^KEY=` misses `export KEY=…`, and reading the master key as absent
+# is how an upgrade would mint a second one that compose then prefers.
+env_read() { dotenv_get .env "$1"; }
 
 echo
 echo "  Oikonome — self-hosted installer"
@@ -59,17 +70,30 @@ echo "  ────────────────────────
 # Sets COMPOSE + ENGINE (docker | podman).
 step 1 "Container engine"
 require_prereqs
+# the compose client answers `version` with no daemon behind it, so check
+# the engine itself: otherwise the first container probe below fails with
+# its output thrown away and the installer stops without a word
+if ! $ENGINE info >/dev/null 2>&1; then
+  die "Can't reach the $ENGINE engine — is it running (Docker Desktop started, docker.service up), and may this user use it (the docker group)? Nothing was changed."
+fi
 ok "Using $COMPOSE"
 
 # port_busy comes from scripts/check-prereqs.sh (shared with oikonome.sh)
 
 # rewrite KEY=VALUE in .env without sed — values may contain any characters.
-# chmod every time: mv replaces .env with a umask-mode temp file, and the
-# file holds the database passwords + master key — keep it owner-only
+# Every spelling of KEY goes (`export KEY=`, `KEY = …`), not just `KEY=`:
+# a left-over line that compose reads after ours would win.
+# The temp copy holds every secret in .env (database passwords, master key),
+# and this installer runs at the folder's 022 umask, so it is made by mktemp
+# (owner-only from its first byte) in the same directory, and the rename
+# over .env is atomic. chmod after: belt and braces on filesystems that
+# ignore the mode mktemp asks for.
 set_env() {
-  grep -v "^$1=" .env > .env.tmp 2>/dev/null || true
-  printf '%s=%s\n' "$1" "$2" >> .env.tmp
-  mv .env.tmp .env
+  local tmp
+  tmp=$(mktemp .env.XXXXXX) || die "Can't write a temporary file in docker/ — is the disk full or the folder read-only?"
+  grep -Ev "^[[:space:]]*(export[[:space:]]+)?$1[[:space:]]*=" .env > "$tmp" 2>/dev/null || true
+  printf '%s=%s\n' "$1" "$2" >> "$tmp"
+  mv "$tmp" .env
   chmod 600 .env
 }
 
@@ -83,10 +107,9 @@ if [ -f .env ]; then
   # cannot match the live database (auth failures) or decrypt stored data
   # (wrong master key). A stale/partial .env next to a running stack is not
   # a config to "repair" here — it must be recovered from the containers.
-  # `|| true`: under `set -euo pipefail` a no-match grep exits 1 and pipefail
-  # would abort the whole installer — an .env without COMPOSE_PROJECT_NAME
-  # (older/self-host installs) is normal, not an error.
-  proj=$(grep "^COMPOSE_PROJECT_NAME=" .env 2>/dev/null | cut -d= -f2- || true)
+  # An .env without COMPOSE_PROJECT_NAME (older/self-host installs) is
+  # normal, not an error.
+  proj=$(env_read COMPOSE_PROJECT_NAME)
   proj=${proj:-oikonome}
   # Detect a RUNNING instance by compose LABEL, never by container name: the
   # name template differs per engine (`proj-app-1` on docker compose v2 vs
@@ -95,17 +118,23 @@ if [ -f .env ]; then
   # containers via svc_container / label filters (oikonome.sh). The
   # working_dir label also catches a stub .env that lost COMPOSE_PROJECT_NAME
   # (compose then falls back to compose.yaml's `name:`, not our ${proj}).
+  # a probe that fails must stop the install out loud: treating it as
+  # "nothing running" would let the backfill below mint secrets the live
+  # stack does not have
+  ps_fail="Can't list this instance's containers ($ENGINE ps failed) — is the $ENGINE engine running, and may this user use it? Nothing was changed."
   running=$($ENGINE ps --filter "label=com.docker.compose.project=$proj" \
-            --format '{{.Names}}' 2>/dev/null)
-  [ -n "$running" ] || running=$($ENGINE ps \
-            --filter "label=com.docker.compose.project.working_dir=$PWD" \
-            --format '{{.Names}}' 2>/dev/null)
+            --format '{{.Names}}' 2>/dev/null) || die "$ps_fail"
+  if [ -z "$running" ]; then
+    running=$($ENGINE ps \
+              --filter "label=com.docker.compose.project.working_dir=$PWD" \
+              --format '{{.Names}}' 2>/dev/null) || die "$ps_fail"
+  fi
   if [ -n "$running" ]; then
     appc=$(printf '%s\n' "$running" | grep -m1 -- '-\?app-\?' || \
            printf '%s\n' "$running" | head -n1)
     for _k in OIKONOME_MASTER_KEY OIKONOME_APP_PASSWORD POSTGRES_PASSWORD \
               OIKONOME_ADMIN_PASSWORD; do
-      grep -q "^${_k}=." .env 2>/dev/null && continue
+      [ -n "$(env_read "$_k")" ] && continue
       die "docker/.env is missing ${_k}, but this instance (${proj}) is running.
    The live containers hold the real secret — generating a new one here would
    break access to the existing database. Don't run install to fix a running
@@ -118,7 +147,7 @@ if [ -f .env ]; then
   # a .env from before that, or a hand-rolled one, may lack it — backfill
   # so the stack still comes up. Any secrets stored plaintext meanwhile
   # re-encrypt as each connection is next saved (TOTP seeds sweep on boot).
-  MK=$(grep "^OIKONOME_MASTER_KEY=" .env 2>/dev/null | cut -d= -f2- || true)
+  MK=$(env_read OIKONOME_MASTER_KEY)
   if [ -z "$MK" ]; then
     set_env OIKONOME_MASTER_KEY "$(openssl rand -base64 32 | tr '+/' '-_')"
     warn "No OIKONOME_MASTER_KEY in .env — generated one (bank tokens encrypt at rest)."
@@ -126,7 +155,7 @@ if [ -f .env ]; then
   # Redis AUTH — older .envs predate REDIS_PASSWORD; backfill so
   # the queue stops being open on the compose network. Takes effect when
   # compose recreates the redis container below.
-  RP=$(grep "^REDIS_PASSWORD=" .env 2>/dev/null | cut -d= -f2- || true)
+  RP=$(env_read REDIS_PASSWORD)
   if [ -z "$RP" ]; then
     set_env REDIS_PASSWORD "$(openssl rand -hex 16)"
     warn "No REDIS_PASSWORD in .env — generated one (job-queue AUTH)."
@@ -134,7 +163,7 @@ if [ -f .env ]; then
   # least-privilege runtime-admin role — older .envs predate it;
   # backfill so app/worker stop carrying the postgres superuser DSN. The
   # migrate one-shot creates/aligns the role before app/worker start.
-  AP=$(grep "^OIKONOME_ADMIN_PASSWORD=" .env 2>/dev/null | cut -d= -f2- || true)
+  AP=$(env_read OIKONOME_ADMIN_PASSWORD)
   if [ -z "$AP" ]; then
     set_env OIKONOME_ADMIN_PASSWORD "$(openssl rand -hex 16)"
     warn "No OIKONOME_ADMIN_PASSWORD in .env — generated one (runtime-admin role)."
@@ -143,7 +172,7 @@ if [ -f .env ]; then
   # can sort instances in creation order portably — the first
   # install writes it and it never changes; existing instances that predate it
   # fall back to folder birth time. Backfilled here for older .envs too.
-  CR=$(grep "^OIKONOME_CREATED=" .env 2>/dev/null | cut -d= -f2- || true)
+  CR=$(env_read OIKONOME_CREATED)
   if [ -z "$CR" ]; then
     set_env OIKONOME_CREATED "$(date +%s)"
   fi
@@ -151,7 +180,7 @@ if [ -f .env ]; then
   # exported OIKONOME_PORT would silently publish on a different port than
   # .env (and the health check) believes — keep the two in agreement
   if [ -n "${OIKONOME_PORT:-}" ]; then
-    CUR_PORT=$(grep "^OIKONOME_PORT=" .env 2>/dev/null | cut -d= -f2- || true)
+    CUR_PORT=$(env_read OIKONOME_PORT)
     if [ "$OIKONOME_PORT" != "${CUR_PORT:-8042}" ]; then
       # the target must be free — otherwise the stack silently loses the
       # port race and another instance answers the health check
@@ -167,8 +196,19 @@ else
   # ../data). Freshly generated secrets would not match it and the app would
   # never come up. (Deleting the whole install folder can't hit this —
   # config and data go together.)
-  if [ -f ../data/postgres/PG_VERSION ]; then
-    warn "Found an existing Oikonome database in ./data, but no docker/.env (which held its passwords)."
+  # The folder is probed, not merely tested from the host: rootful Docker
+  # leaves it owned by the database container at mode 0700, where a plain
+  # `-f PG_VERSION` from this user is false and fresh passwords would be
+  # minted against a cluster that already has its own.
+  ORPHAN_DIR=$(data_dir_resolve "$PWD" ../data/postgres)
+  PG_IMAGE=$(grep -oE 'image: docker.io/library/postgres:[0-9]+-alpine' compose.yaml 2>/dev/null | head -1 | sed 's/^image: //' || true)
+  ORPHAN_RC=0
+  ORPHAN_VER=$(pg_data_version "$ORPHAN_DIR" "$ENGINE" "${PG_IMAGE:-docker.io/library/postgres:18-alpine}") || ORPHAN_RC=$?
+  if [ "$ORPHAN_RC" -ne 0 ]; then
+    die "There is a database folder at $ORPHAN_DIR that this user cannot read, and no docker/.env (which held its passwords). Nothing was changed: restore the old docker/.env and re-run, or remove that folder (sudo rm -rf '$ORPHAN_DIR') to start fresh."
+  fi
+  if [ -n "$ORPHAN_VER" ]; then
+    warn "Found an existing Oikonome database at $ORPHAN_DIR, but no docker/.env (which held its passwords)."
     echo "  • To KEEP that data: restore your old docker/.env and re-run."
     echo "  • To START FRESH:    type 'fresh' to delete the old database."
     printf "  Keep data (Enter) or type 'fresh': "
@@ -184,24 +224,71 @@ else
         $COMPOSE down >/dev/null 2>&1 || true
       # rootless podman: postgres's files can be subuid-owned, so plain rm
       # gets EPERM — retry inside the user namespace (same as uninstall.sh)
-      if ! rm -rf ../data/postgres 2>/dev/null; then
+      if ! rm -rf "$ORPHAN_DIR" 2>/dev/null; then
         if command -v podman >/dev/null 2>&1; then
-          podman unshare rm -rf ../data/postgres 2>/dev/null || true
+          podman unshare rm -rf "$ORPHAN_DIR" 2>/dev/null || true
+        fi
+        # rootful docker: the files belong to the container uid; a
+        # throwaway container removes them without host sudo
+        if [ -e "$ORPHAN_DIR" ] && [ "$ENGINE" = docker ]; then
+          docker run --rm --network none --security-opt label=disable \
+            --entrypoint find -v "$ORPHAN_DIR":/d \
+            "${PG_IMAGE:-docker.io/library/postgres:18-alpine}" /d -mindepth 1 -delete >/dev/null 2>&1 || true
+          rmdir "$ORPHAN_DIR" 2>/dev/null || true
         fi
       fi
-      if [ -e ../data/postgres ]; then
-        die "Couldn't delete the old database (rootful Docker owns it as uid 999?). Run: sudo rm -rf '$(cd .. && pwd)/data/postgres'  then re-run ./install.sh"
+      if [ -e "$ORPHAN_DIR" ]; then
+        die "Couldn't delete the old database (rootful Docker owns it as the container's uid?). Run: sudo rm -rf '$ORPHAN_DIR'  then re-run ./install.sh"
       fi
       ok "Old database removed — starting fresh."
     else
       die "Stopping so your data is untouched. Restore docker/.env, then re-run ./install.sh"
     fi
   fi
+  # Fernet key: 32 random bytes, urlsafe base64 (encrypts bank tokens at rest).
+  # `oikonome.sh reset` hands the previous key back in OIKONOME_KEEP_MASTER_KEY:
+  # the backups it keeps were encrypted under that key, and a fresh one would
+  # leave their two-factor seeds, webhook secrets and API keys undecryptable.
+  # Checked before .env is written, with the same test oikonome.sh applies
+  # (43 urlsafe-base64 characters and one '=').
+  if [ -n "${OIKONOME_KEEP_MASTER_KEY:-}" ]; then
+    case $OIKONOME_KEEP_MASTER_KEY in
+      *[!A-Za-z0-9_=-]*) die "OIKONOME_KEEP_MASTER_KEY is not a master key (urlsafe base64)." ;;
+    esac
+    case ${OIKONOME_KEEP_MASTER_KEY%=} in
+      *=*) die "OIKONOME_KEEP_MASTER_KEY is not a master key (urlsafe base64)." ;;
+    esac
+    [ "${#OIKONOME_KEEP_MASTER_KEY}" -eq 44 ] \
+      && [ "${OIKONOME_KEEP_MASTER_KEY%=}" != "$OIKONOME_KEEP_MASTER_KEY" ] \
+      || die "OIKONOME_KEEP_MASTER_KEY is not a master key (32 bytes, urlsafe base64)."
+    MASTER_KEY=$OIKONOME_KEEP_MASTER_KEY
+  else
+    MASTER_KEY=$(openssl rand -base64 32 | tr '+/' '-_')
+  fi
+  unset OIKONOME_KEEP_MASTER_KEY
   cp .env.example .env
   chmod 600 .env    # secrets land in here next — owner-only from the start
   rand() { openssl rand -hex 16; }
-  # Fernet key: 32 random bytes, urlsafe base64 (encrypts bank tokens at rest)
-  MASTER_KEY=$(openssl rand -base64 32 | tr '+/' '-_')
+  # `oikonome.sh reset` hands over the operator's own settings (HTTPS,
+  # bind address, external database, console, SMTP, LLM, data folder,
+  # provider keys …) in OIKONOME_RESET_SETTINGS, one KEY=VALUE per line,
+  # minus the secrets minted below. They are written first, so a reset
+  # instance comes back configured the way it was; read from the
+  # environment, never a file, so no extra copy of them lands on disk.
+  CARRIED=""
+  if [ -n "${OIKONOME_RESET_SETTINGS:-}" ]; then
+    while IFS= read -r _line; do
+      _line=${_line#export }
+      _k=${_line%%=*}
+      case $_line in *=*) : ;; *) continue ;; esac
+      case $_k in ""|[0-9]*|*[!A-Za-z0-9_]*) continue ;; esac
+      set_env "$_k" "${_line#*=}"
+      CARRIED="$CARRIED $_k "
+    done < <(printf '%s\n' "$OIKONOME_RESET_SETTINGS")
+    ok "Settings carried over from before the reset"
+  fi
+  unset OIKONOME_RESET_SETTINGS
+  carried() { case $CARRIED in *" $1 "*) return 0;; esac; return 1; }
   # host port: an exported OIKONOME_PORT wins (compose gives the
   # environment precedence over .env, so honoring it here keeps port,
   # project name, and health check in agreement); otherwise default 8042,
@@ -217,11 +304,14 @@ else
   fi
   set_env OIKONOME_PORT "$PORT"
   # unique compose project per instance so containers/networks never clash
-  set_env COMPOSE_PROJECT_NAME "oikonome-${PORT}"
-  set_env POSTGRES_PASSWORD "$(rand)"
-  set_env OIKONOME_APP_PASSWORD "$(rand)"
-  set_env OIKONOME_ADMIN_PASSWORD "$(rand)"
-  set_env REDIS_PASSWORD "$(rand)"
+  # (a reset keeps the name it had, so its volumes are found again)
+  carried COMPOSE_PROJECT_NAME || set_env COMPOSE_PROJECT_NAME "oikonome-${PORT}"
+  # a password the reset carried is not ours to mint: on an external
+  # database POSTGRES_PASSWORD is the provider's admin password
+  carried POSTGRES_PASSWORD || set_env POSTGRES_PASSWORD "$(rand)"
+  carried OIKONOME_APP_PASSWORD || set_env OIKONOME_APP_PASSWORD "$(rand)"
+  carried OIKONOME_ADMIN_PASSWORD || set_env OIKONOME_ADMIN_PASSWORD "$(rand)"
+  carried REDIS_PASSWORD || set_env REDIS_PASSWORD "$(rand)"
   set_env OIKONOME_MASTER_KEY "$MASTER_KEY"
   # one-time setup-wizard gate: only the link printed at the end (which
   # carries this token) can create the first account
@@ -235,8 +325,9 @@ else
   # model. ON by default for interactive installs (just press Enter) — it's
   # the recommended experience. Downloads ~1GB and wants real RAM/CPU, so we
   # still ask, and non-interactive installs stay off (can't pull silently);
-  # toggle any time with ./oikonome.sh llm on|off.
-  if [ -t 0 ]; then
+  # toggle any time with ./oikonome.sh llm on|off. A reset already
+  # carried the instance's answer (and COMPOSE_PROFILES may hold tls too).
+  if [ -t 0 ] && [ -z "$CARRIED" ]; then
     # model tier by host RAM: >=12GB comfortably fits the 7b,
     # which is markedly better at categorization; both are Apache-2.0
     LLM_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null)
@@ -299,7 +390,9 @@ set_env OIKONOME_VERSION_NOTE_FOR "$VER"
 
 # 2b. timezone — dates like "today" and the daily-email window follow the
 # household's clock, not UTC. Detect once from the host; editable in .env.
-if ! grep -q "^OIKONOME_TZ=" .env 2>/dev/null; then
+# A presence test, not a value test: `OIKONOME_TZ=` left empty on purpose
+# (UTC) is the operator's choice and is kept.
+if ! grep -Eq "^[[:space:]]*(export[[:space:]]+)?OIKONOME_TZ[[:space:]]*=" .env 2>/dev/null; then
   HOST_TZ=$(timedatectl show -p Timezone --value 2>/dev/null ||
             cat /etc/timezone 2>/dev/null ||
             readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||' || true)
@@ -314,12 +407,17 @@ fi
 # database at ./data/postgres. Delete the folder (after `compose down`) and
 # the install is gone. OIKONOME_DATA_DIR in .env overrides the location.
 step 3 "Data folder"
-DATA_DIR=$(grep "^OIKONOME_DATA_DIR=" .env 2>/dev/null | cut -d= -f2- || true)
-DATA_DIR=${DATA_DIR:-../data/postgres}
+# read the way compose reads it (quotes, comments, `export`), as an
+# absolute path, so this creates the folder postgres will mount
+DATA_DIR=$(data_dir_resolve "$PWD" ../data/postgres)
+DEFAULT_DATA_DIR=$(canon_path ../data/postgres)
 mkdir -p "$DATA_DIR" || die "Can't create $DATA_DIR"
 # the admin console's backup/host-health cards read these via
-# read-only binds — pre-create so compose never auto-creates them as root
-mkdir -p ../backups ../ops-state ../ops-cmd 2>/dev/null || true
+# read-only binds — pre-create so compose never auto-creates them as root.
+# ../models is the local categorizer's folder (bound read-only at /models):
+# left to Docker it is created root-owned, and the documented "drop the
+# model file into ./models" step then fails for the person installing.
+mkdir -p ../backups ../ops-state ../ops-cmd ../models 2>/dev/null || true
 # ops-cmd is the console→host command drop-box. Default it CLOSED (0700)
 # so the reboot lever is inert until the root-run
 # scripts/install-host-reboot-watcher.sh enables it — that installer
@@ -327,7 +425,11 @@ mkdir -p ../backups ../ops-state ../ops-cmd 2>/dev/null || true
 # container (not arbitrary local users or neighbour containers) can drop a
 # reboot flag; a world-writable 1777 here would let anyone reboot the host.
 chmod 0700 ../ops-cmd 2>/dev/null || true
-ok "Database lives at ${DATA_DIR#../} (inside the install folder)"
+if [ "$DATA_DIR" = "$DEFAULT_DATA_DIR" ]; then
+  ok "Database lives at data/postgres (inside the install folder)"
+else
+  ok "Database lives at $DATA_DIR"
+fi
 
 # Rootless Podman: map the host user to the container's postgres user so the
 # files in ./data stay owned by YOU (plain rm -rf works). Without this they
@@ -371,11 +473,20 @@ step 5 "Health check"
 TRIES=60
 for i in $(seq 1 $TRIES); do
   # effective port = environment first, then .env — same order compose uses
-  PORT=$(grep "^OIKONOME_PORT=" .env 2>/dev/null | cut -d= -f2 || true)
+  PORT=$(env_read OIKONOME_PORT)
   PORT=${OIKONOME_PORT:-${PORT:-8042}}
   if curl -sf "http://localhost:${PORT}/readyz" >/dev/null 2>&1; then
     [ -t 1 ] && printf '\r\033[K'
     ok "App is up — database migrated, all services healthy ($((i * 5))s)"
+    # The commit that has now migrated this database. The next
+    # `oikonome.sh install` compares it with the code it is about to
+    # install and snapshots the database whenever they differ — however
+    # the new code arrived (its own pull, a `git pull` by hand, main
+    # checked out again after a rollback). Written only here, once the
+    # stack is healthy: a failed install leaves the old record, so the
+    # retry snapshots too. Empty outside a git checkout, where every
+    # upgrade snapshots anyway.
+    set_env OIKONOME_INSTALLED_COMMIT "$(git -C .. rev-parse -q --verify HEAD 2>/dev/null || true)"
     # opt-in local LLM: the ollama container is already up (COMPOSE_PROFILES
     # includes llm), but the model still has to be pulled once into its
     # volume. Do it now so smart categorization works on first sync.
@@ -383,7 +494,7 @@ for i in $(seq 1 $TRIES); do
       # scope to THIS install's project — the service label alone matches
       # every oikonome instance on the host, and the model then lands in
       # some OTHER instance's ollama container (leaving this one empty)
-      PROJ=$(grep "^COMPOSE_PROJECT_NAME=" .env 2>/dev/null | cut -d= -f2 || true)
+      PROJ=$(env_read COMPOSE_PROJECT_NAME)
       OLLAMA_CT=$($ENGINE ps \
                     --filter "label=com.docker.compose.project=${PROJ:-oikonome}" \
                     --filter "label=com.docker.compose.service=ollama" \
@@ -393,7 +504,7 @@ for i in $(seq 1 $TRIES); do
         for _ in $(seq 1 30); do
           $ENGINE exec "$OLLAMA_CT" ollama list >/dev/null 2>&1 && break; sleep 2
         done
-        LLM_PULL=$(grep '^OIKONOME_LLM_MODEL=' .env 2>/dev/null | cut -d= -f2 || true)
+        LLM_PULL=$(env_read OIKONOME_LLM_MODEL)
         if $ENGINE exec "$OLLAMA_CT" ollama pull "${LLM_PULL:-qwen2.5:1.5b}" >/dev/null 2>&1; then
           ok "Smart-categorization model ready (${LLM_PULL:-qwen2.5:1.5b})"
         else
@@ -404,12 +515,12 @@ for i in $(seq 1 $TRIES); do
       fi
     fi
     ROOT_DIR=$(cd .. && pwd)
-    if [ "$DATA_DIR" = "../data/postgres" ]; then
+    if [ "$DATA_DIR" = "$DEFAULT_DATA_DIR" ]; then
       echo "  Everything lives in: $ROOT_DIR  (code, config, and data)"
     else
       echo "  Install folder: $ROOT_DIR   Database: $DATA_DIR"
     fi
-    SETUP_TOKEN=$(grep "^OIKONOME_SETUP_TOKEN=" .env 2>/dev/null | cut -d= -f2- || true)
+    SETUP_TOKEN=$(env_read OIKONOME_SETUP_TOKEN)
     # first LAN address of this machine — the localhost link is useless
     # when the browser is on another machine
     HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
@@ -453,6 +564,12 @@ for i in $(seq 1 $TRIES); do
     B "1. The setup wizard creates your account."
     B "2. Help (?) has guides; Feedback reaches the instance operator."
     B ""
+    # Podman has no daemon to apply `restart:` at boot — say so where the
+    # operator is looking, rather than let the first reboot find out
+    if [ "$ENGINE" = podman ]; then
+      B "Reboots:     Podman won't restart the stack by itself — run"
+      B "             ./oikonome.sh start-at-boot   once to add a systemd unit"
+    fi
     B "Stop:        $COMPOSE down   (data kept)"
     B "Upgrade:     ./oikonome.sh install"
     B "Start over:  ./oikonome.sh uninstall   (removes everything)"
@@ -473,7 +590,12 @@ done
 echo
 warn "Still not responding after 5 minutes. Last app logs:"
 echo
-$COMPOSE logs app 2>&1 | tail -25
+# Never the raw log: its access-log lines carry every one-time link
+# (password reset, invite, email verification) members opened meanwhile,
+# and when the admin console runs this the output lands in a file other
+# accounts on the host can read. `oikonome.sh logs` run non-interactively
+# is the one scrubbed snapshot, so the tail comes from there.
+OIKONOME_ASSUME_YES=1 "$(cd .. && pwd)/oikonome.sh" logs 2>&1 | tail -25 || true
 echo
-echo "  Full logs:  $COMPOSE logs app"
+echo "  Full logs:  ./oikonome.sh logs"
 exit 1

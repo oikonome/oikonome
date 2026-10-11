@@ -155,6 +155,42 @@ export async function clearCredentials() {
   ]);
 }
 
+/** Device tokens whose sign-out never reached their server (offline,
+ *  the request timed out). The server keeps such a token live, and with
+ *  it the household's daily push to this phone, so the revoke is retried
+ *  until it lands. Kept apart from the credentials on purpose: signing
+ *  out clears those, never this list. */
+const KEY_UNREVOKED = "oikonome.unrevokedTokens";
+export type Unrevoked = { url: string; token: string; at: number };
+export async function loadUnrevoked(): Promise<Unrevoked[]> {
+  try {
+    const v = JSON.parse(
+      (await SecureStore.getItemAsync(KEY_UNREVOKED)) ?? "[]");
+    return Array.isArray(v) ? v : [];
+  } catch { return []; }
+}
+
+async function saveUnrevoked(list: readonly Unrevoked[]) {
+  if (list.length)
+    await SecureStore.setItemAsync(KEY_UNREVOKED, JSON.stringify(list),
+                                   DEVICE_ONLY);
+  else await SecureStore.deleteItemAsync(KEY_UNREVOKED);
+}
+
+// Sign-out appends while a foreground retry removes, and either can be
+// waiting on the network in between: every change is a read-modify-write
+// queued behind the last one, so neither writes back a stale copy over
+// the other's entry.
+let unrevokedChain: Promise<unknown> = Promise.resolve();
+export function updateUnrevoked(
+    change: (list: Unrevoked[]) => Unrevoked[]): Promise<void> {
+  const run = unrevokedChain.then(async () => {
+    await saveUnrevoked(change(await loadUnrevoked()));
+  });
+  unrevokedChain = run.catch(() => {});
+  return run;
+}
+
 /** The user's biometric-gate choice: "1" = gate disabled by choice.
  *  Their call (Settings) — the credential still sits in the enclave. */
 export async function loadGateOff(): Promise<boolean> {

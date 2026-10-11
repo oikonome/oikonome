@@ -47,6 +47,7 @@ def connect_simplefin(conn, setup_token: str, *, days: int = 90,
     from ..sync.base import upsert_item
     access = simplefin.claim_setup_token(setup_token, transport=transport)
     upsert_item(conn, SIMPLEFIN_ITEM, "simplefin", "SimpleFIN bridge", access)
+    revived = _revive_disconnected_banks(conn)
     try:
         return simplefin.sync(
             conn, SIMPLEFIN_ITEM, access,
@@ -54,6 +55,165 @@ def connect_simplefin(conn, setup_token: str, *, days: int = 90,
             transport=transport)
     except Exception as e:                                # noqa: BLE001
         raise SimplefinFirstPullFailed(type(e).__name__) from e
+    finally:
+        # A pull that failed carried no bank, so every revived one goes
+        # back to disconnected — the state it was in before this token,
+        # still owing its gap. Left live, a bank no longer on the bridge
+        # would read as a connection that never syncs, and the routine
+        # sync that retries the bridge never re-archives anything.
+        _rearchive_banks_not_returned(conn, revived)
+
+
+def _revive_disconnected_banks(conn) -> dict:
+    """A new setup token is the owner connecting the bridge again, and the
+    banks that went down with the bridge come back with it. Only those: a
+    bank the owner disconnected or purged on its own, or one a new link
+    took over, was cut for a reason of its own (a duplicate of another
+    feed, history deleted on purpose), and the bridge still carrying it is
+    no word from the owner that they want it back. A bank with no accounts
+    left has nothing to come back to. Each is marked to reach back
+    RESYNC_OVERLAP before its disconnect on the next pull, which the
+    routine window never would. Returns {child id: when it was
+    disconnected}."""
+    from ..sync.base import BRIDGE_DISCONNECT
+    rows = conn.execute(
+        "SELECT id, archived_at FROM items WHERE aggregator='simplefin-org' "
+        "AND id LIKE %s AND status='archived' AND archived_reason=%s "
+        "AND EXISTS (SELECT 1 FROM accounts a WHERE a.item_id=items.id)",
+        (SIMPLEFIN_ITEM + ":%", BRIDGE_DISCONNECT)).fetchall()
+    for r in rows:
+        _mark_returning(conn, r["id"], r["archived_at"])
+    return {r["id"]: r["archived_at"] for r in rows}
+
+
+def _mark_returning(conn, child: str, archived_at) -> dt.date | None:
+    """Make one disconnected bank live again, owing the days it was away.
+    Returns the first day its next pull reaches back to."""
+    # on the calendar the pull's own window is counted in (the server's
+    # local today)
+    since = ((archived_at or dt.datetime.now(dt.timezone.utc)).astimezone()
+             - simplefin.RESYNC_OVERLAP).date()
+    # a gap an earlier revival marked and no pull has served yet is still
+    # owed, so the start never moves later
+    row = conn.execute(
+        "UPDATE items SET status='ok', archived_at=NULL, "
+        "archived_reason=NULL, resync_from=LEAST(resync_from, %s) "
+        "WHERE id=%s AND status='archived' RETURNING resync_from",
+        (since, child)).fetchone()
+    return row["resync_from"] if row else None
+
+
+# archived_reason on a SimpleFIN bank one of whose accounts the owner
+# deleted by itself while the bank was disconnected. The bridge still
+# carries that account, so any pull of the bank would bring it back with
+# its history: the bank stays out, and the reconnect door says why.
+ACCOUNT_PURGED = "account-purged"
+
+# how far the pull a reconnect makes at once reaches on its own; the bank
+# coming back reaches further, over the time it was away
+RECONNECT_PULL_DAYS = 30
+
+
+def reconnect_bank(conn, child: str, *, transport=None) -> dict:
+    """Bring back one SimpleFIN bank the owner disconnected on its own, on
+    their word. A new setup token no longer does that (it brings back only
+    what went down with the bridge), so this is the way back for a bank
+    cut by itself.
+
+    The bridge is pulled at once, reaching back over the time the bank was
+    away. Only that pull can tell whether the bridge still carries the
+    bank: one it no longer returns, left live, would read as a connection
+    that never syncs, so it goes back to disconnected as it was, and the
+    owner is told. Raises KeyError for no such bank, ValueError when it is
+    not disconnected, its bridge is not live, nothing of it is left, a new
+    link now serves its accounts, one of its accounts was deleted, or the
+    bridge does not (or could not) return it."""
+    from ..sync.base import get_access_token
+    it = conn.execute(
+        "SELECT id, status, archived_at, archived_reason FROM items "
+        "WHERE id=%s AND aggregator='simplefin-org'", (child,)).fetchone()
+    if it is None:
+        raise KeyError(child)
+    if it["status"] != "archived":
+        raise ValueError("this connection is not disconnected")
+    bridge_id = child.split(":", 1)[0]
+    bridge = conn.execute(
+        "SELECT status, access_token FROM items WHERE id=%s",
+        (bridge_id,)).fetchone()
+    if (bridge is None or not bridge["access_token"]
+            or bridge["status"] == "archived"):
+        raise ValueError("the SimpleFIN bridge is disconnected — connect a "
+                         "new SimpleFIN setup token first")
+    if conn.execute("SELECT 1 FROM accounts WHERE item_id=%s LIMIT 1",
+                    (child,)).fetchone() is None:
+        # its history was deleted on purpose; bringing it back would pull
+        # that history in again unasked
+        raise ValueError("this bank's data was deleted — add it again at "
+                         "bridge.simplefin.org to start it fresh")
+    reason = it["archived_reason"] or ""
+    if reason.startswith("reconnected"):
+        # a new link adopted its accounts; its next pull would re-create
+        # each of them beside the one the new link now keeps
+        raise ValueError("a newer connection now serves this bank's "
+                         "accounts — reconnecting it would bring them in "
+                         "twice")
+    if reason == ACCOUNT_PURGED:
+        # the bridge still carries the deleted account, and the pull
+        # would recreate it with its history
+        raise ValueError("can't reconnect — an account deleted from this "
+                         "bank is still on the bridge, and sync would "
+                         "recreate it. Disconnect and delete the bank, then "
+                         "add it again at bridge.simplefin.org")
+    since = _mark_returning(conn, child, it["archived_at"])
+    prior = {child: it["archived_at"]}
+    try:
+        simplefin.sync(
+            conn, bridge_id, get_access_token(conn, bridge_id),
+            since=dt.date.today() - dt.timedelta(days=RECONNECT_PULL_DAYS),
+            transport=transport)
+    except Exception as e:                                # noqa: BLE001
+        # nothing showed the bank is still there; it stays as it was,
+        # still owing its gap
+        _rearchive_banks_not_returned(conn, prior,
+                                      reason=it["archived_reason"])
+        raise ValueError("SimpleFIN did not answer — try again in a moment"
+                         ) from e
+    if _rearchive_banks_not_returned(conn, prior,
+                                     reason=it["archived_reason"]):
+        raise ValueError("SimpleFIN no longer returns this bank — add it "
+                         "again at bridge.simplefin.org, then reconnect it")
+    return {"ok": True,
+            "resync_from": since.isoformat() if since else None}
+
+
+_BRIDGE_MARK = object()
+
+
+def _rearchive_banks_not_returned(conn, revived: dict, *,
+                                  reason=_BRIDGE_MARK) -> list:
+    """A revived bank the pull did not carry is no longer on the bridge;
+    left live it would read as a connection that never syncs. It goes back
+    to disconnected as it was — under the mark it had (a bank a new token
+    brought back is marked as gone with the bridge, so a later token can
+    bring it back; one the owner brought back keeps its own) — and still
+    owing its gap should it be added at the bridge and come back again.
+    The pull clears the gap on every bank it carried, so the ones still
+    owing are these. A pull that failed carried nothing, and a bank it
+    stamped with the error is put back too. Returns the banks re-archived."""
+    from ..sync.base import BRIDGE_DISCONNECT
+    if reason is _BRIDGE_MARK:
+        reason = BRIDGE_DISCONNECT
+    back = []
+    for child, archived_at in revived.items():
+        row = conn.execute(
+            "UPDATE items SET status='archived', archived_reason=%s, "
+            "archived_at=COALESCE(%s, now()) WHERE id=%s "
+            "AND resync_from IS NOT NULL "
+            "AND COALESCE(status,'') != 'archived' RETURNING id",
+            (reason, archived_at, child)).fetchone()
+        if row is not None:
+            back.append(child)
+    return back
 
 
 SIMPLEFIN_PULL_RETRYING = ("Bank connected, but the first download from "
@@ -64,6 +224,37 @@ SIMPLEFIN_PULL_RETRYING = ("Bank connected, but the first download from "
 def instance_has_users(conn) -> bool:
     return conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None
 
+
+
+# How long the wizard waits for the household's sync lock before its first
+# SimpleFIN pull. The household is seconds old, so whatever holds the lock
+# is a scheduled pass over an empty household and lets go almost at once.
+SETUP_SYNC_LOCK_WAIT_S = 30.0
+
+
+def _connect_simplefin_locked(conn, tid, token, transport, sleep=None,
+                              wait_s=None):
+    """The wizard's SimpleFIN connect, under the household's sync lock like
+    every other connect door. The bridge item is visible to the worker the
+    moment it is written, so without the lock a scheduled sync can start a
+    second deep pull of the same item alongside this one, both writing the
+    same accounts and transactions from different snapshots. A wizard has no
+    "try again later" to answer with, so it waits for the lock instead of
+    giving up at once; if it never frees, the connect is reported failed and
+    the Accounts page retries it (the token is not claimed until then)."""
+    import time
+
+    from ..sync.base import tenant_sync_lock
+    sleep = sleep or time.sleep
+    deadline = time.monotonic() + (SETUP_SYNC_LOCK_WAIT_S if wait_s is None
+                                   else wait_s)
+    while True:
+        with tenant_sync_lock(conn, str(tid)) as held:
+            if held:
+                return connect_simplefin(conn, token, transport=transport)
+        if time.monotonic() >= deadline:
+            raise RuntimeError("the household's sync lock stayed held")
+        sleep(0.5)
 
 def bootstrap(email: str, password: str, simplefin_token: str = "",
               plaid_client_id: str = "", plaid_secret: str = "",
@@ -106,6 +297,9 @@ def bootstrap(email: str, password: str, simplefin_token: str = "",
             check_url(llm_url, what="the LLM endpoint")
         except BlockedURL as e:
             raise ValueError(str(e))
+    # hashed before the claim lock below: argon2 is slow by design, and
+    # nothing slow runs while a lock other requests queue on is held
+    pw_hash = passwords.hash_password(password)
     admin = tenancy.admin_connect()
     try:
         # The route's instance_has_users() check and this insert are a
@@ -127,7 +321,7 @@ def bootstrap(email: str, password: str, simplefin_token: str = "",
             row = admin.execute(
                 """INSERT INTO users (tenant_id, email, password_hash, verified_at)
                    VALUES (%s,%s,%s,now()) RETURNING id""",
-                (tid, email, passwords.hash_password(password))).fetchone()
+                (tid, email, pw_hash)).fetchone()
     finally:
         admin.close()
     sync_result = None
@@ -139,8 +333,9 @@ def bootstrap(email: str, password: str, simplefin_token: str = "",
         # offers a retry form.
         conn = tenancy.tenant_connect(tid)
         try:
-            sync_result = connect_simplefin(conn, simplefin_token,
-                                            transport=transport)
+            sync_result = _connect_simplefin_locked(conn, tid,
+                                                    simplefin_token,
+                                                    transport)
         except SimplefinFirstPullFailed:
             import logging
             logging.getLogger("oikonome.simplefin").exception(
@@ -169,6 +364,10 @@ def bootstrap(email: str, password: str, simplefin_token: str = "",
                 cfg["plaid_secret"] = crypto.encrypt(conn, plaid_secret)
                 cfg["plaid_env"] = (plaid_env if plaid_env in PLAID_ENVS
                                     else "production")
+                # when the keys were saved, for the bank-link hold's banner
+                # (written by the server only)
+                cfg["plaid_keys_saved_at"] = dt.datetime.now(
+                    dt.timezone.utc).isoformat()
         finally:
             conn.close()
         plaid_saved = True

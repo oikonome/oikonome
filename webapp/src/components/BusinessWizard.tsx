@@ -22,6 +22,8 @@ import { patchQuery, saveSettings } from "../api/cache";
 import { bizWizardEntryStep } from "../bizmath";
 import { isOwner } from "../role";
 import { openPlaidHostedLink, plaidLinkOutcome } from "./ConnectHub";
+import DemoLock from "./DemoLock";
+import { sharedLock } from "../sharedlogin";
 
 const STRUCTURES = [
   ["sole_prop", "Sole proprietorship"],
@@ -172,13 +174,26 @@ export default function BusinessWizard({ resume, onDone, onCancel }: {
   });
 
   // create + assign in one go: an unassigned manual account would sit in the
-  // personal budget, which is the opposite of why it was made
+  // personal budget, which is the opposite of why it was made. The two
+  // writes are separate, so an Add retried after the assignment failed
+  // reuses the account the first try made instead of making one more.
+  const madeAcct = useRef<{ name: string; kind: string; id: string } | null>(
+    null);
   const addAcct = useMutation({
     mutationFn: async () => {
       const eid = needEntity();
-      const r = await api.accountAdd(newName.trim(), newKind);
-      await api.accountAssignEntity(r.account_id, eid);
-      return r;
+      const name = newName.trim();
+      const prior = madeAcct.current;
+      let id: string;
+      if (prior && prior.name === name && prior.kind === newKind) {
+        id = prior.id;
+      } else {
+        id = (await api.accountAdd(name, newKind)).account_id;
+        madeAcct.current = { name, kind: newKind, id };
+      }
+      await api.accountAssignEntity(id, eid);
+      madeAcct.current = null;
+      return { account_id: id };
     },
     onSuccess: () => {
       setNewName("");
@@ -354,7 +369,10 @@ export default function BusinessWizard({ resume, onDone, onCancel }: {
               Business bank not connected yet?
             </div>
             {owner ? (
-              <>
+              // the shared demonstration login is refused the bank link
+              // (it plants a credential that outlives the login), so the
+              // button is shown switched off with that refusal's sentence
+              <DemoLock on={false} shared={sharedLock(me.data, "credential")}>
                 <button className="pri" disabled={busy}
                         onClick={() => connect.mutate()}>
                   {connect.isPending ? "waiting for your bank…"
@@ -373,7 +391,7 @@ export default function BusinessWizard({ resume, onDone, onCancel }: {
                       refresh the list
                     </button>.</>}
                 </div>
-              </>
+              </DemoLock>
             ) : (
               <div className="sub">Linking a bank over this household is the
                 account owner's — ask them, and the business account shows up

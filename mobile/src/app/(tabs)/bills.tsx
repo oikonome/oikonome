@@ -10,7 +10,7 @@ import Sheet from "../../components/sheet";
 import CalendarSection from "../../components/calendar-section";
 import StaleBanner from "../../components/stale-banner";
 import { Card, H, HelpLink, KV, Meter, Pill } from "../../components/ui";
-import { errText, Bill, BillsData, Proposal } from "../../lib/api";
+import { ApiError, errText, Bill, BillsData, Proposal } from "../../lib/api";
 import { patchDismissedHint, patchList, removeFromList } from "../../lib/cache";
 import { useRouter, useScrollToTop } from "expo-router";
 import { useMemo, useRef, useState } from "react";
@@ -19,9 +19,21 @@ import { useRefetchWhenShown } from "../../lib/focus";
 import { useSession } from "../../lib/session";
 
 const BILLS_KEY = ["bills"];
+
+// ---- stepping back through the months (mirrors the web page) ----
+const ymOf = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+export const shiftYm = (ym: string, by: number) => {
+  const [y, m] = ym.split("-").map(Number);
+  return ymOf(new Date(y, m - 1 + by, 1));
+};
+export const ymLabel = (ym: string) => {
+  const [y, m] = ym.split("-").map(Number);
+  return new Date(y, m - 1, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" });
+};
 import { useViewer } from "../../lib/viewer";
 import { C, mmddyy, money } from "../../lib/theme";
-import { catLabel, filterCategories } from "../../lib/pure";
+import { catLabel, filterCategories, missedBillPill,
+         proposalSuperseded } from "../../lib/pure";
 
 // the web row's status column, ported whole: a quiet row IS the ✓ —
 // only a bill wanting a decision says anything
@@ -56,16 +68,19 @@ const HEALTH_PILL: Record<string, "warn" | "bad"> = {
   drifting: "warn", stale: "bad", mismatch: "warn", misdated: "warn",
 };
 
-function BillRow({ b, onPress, onHint }: {
+function BillRow({ b, onPress, onHint, past }: {
   b: Bill; onPress?: () => void;
+  // a past month on view: no countdown — paid, missed, or not due
+  past?: boolean;
   // dismiss/restore a flag from the row (web's ✕ / ↺) — absent = viewer
   onHint?: (payee: string, action: "dismiss" | "restore",
             target: "fit" | "health") => void;
 }) {
   const envelope = b.used !== null;
   const isAnnualEnv = envelope && b.period_months === 12;
-  const daysTo = !envelope && b.due_on ? daysUntil(b.due_on) : null;
+  const daysTo = !past && !envelope && b.due_on ? daysUntil(b.due_on) : null;
   const settled = b.occurrences > 0 && b.paid >= b.occurrences;
+  const missed = !!past && !settled && b.occurrences > 0;
   const overdue = !settled && daysTo !== null && daysTo < 0;
   const soon = !settled && daysTo !== null && daysTo >= 0 && daysTo <= SOON_DAYS;
   const cyc = cycleDays(b.cadence);
@@ -82,6 +97,13 @@ function BillRow({ b, onPress, onHint }: {
         : <Text style={s.mut}>
             {money(left, false)} left{isAnnualEnv ? " this year" : ""}
           </Text>;
+  } else if (past && !settled) {
+    // the month on view is over: paid, missed, or never due
+    status = missed
+      ? (b.withdrawn_on
+          ? <Pill text="withdrawn" tone="warn" />
+          : <Pill text={b.income ? "not received" : "missed"} tone="bad" />)
+      : <Text style={s.mut}>not due</Text>;
   } else if (b.income) {
     status = settled
       ? <Text style={{ color: C.good, fontSize: 12 }}>
@@ -94,7 +116,9 @@ function BillRow({ b, onPress, onHint }: {
     status = settled
       ? <Text style={s.mut}>paid ✓</Text>
       : overdue
-        ? <Pill text="overdue" tone="bad" />
+        // a charge the bank feed withdrew is a warning, not a missed payment
+        ? <Pill text={missedBillPill(b.withdrawn_on).text}
+                tone={missedBillPill(b.withdrawn_on).tone} />
         : daysTo !== null
           ? <Text style={[s.mut, { color: soon ? C.warn : C.good }]}>{dueText(daysTo)}</Text>
           : <Pill text="awaiting" />;
@@ -136,6 +160,16 @@ function BillRow({ b, onPress, onHint }: {
                 </Text>
               )}
             </>
+          ) : null}
+          {/* the missed cycle's charge was withdrawn by the bank feed: a
+              warning, not a problem to decide — no dismiss, not in the
+              triage queue, and not repeated when the status already says
+              it. Gated on this month's own reading (withdrawn_on), never
+              the health verdict's earlier cycle. The bill screen spells
+              out the date (missedBillPill). */}
+          {!b.disabled && b.health === "withdrawn"
+            && !(overdue && b.withdrawn_on) ? (
+            <Pill text="withdrawn" tone="warn" />
           ) : null}
           {/* the way back from a dismissed health flag */}
           {!b.disabled && b.health && b.health_dismissed
@@ -203,12 +237,20 @@ export default function Bills() {
   const router = useRouter();
   const viewer = useViewer();
   const qc = useQueryClient();
+  // the month on view: null = this month (the live key every write
+  // patches); a past month has its own key, so stepping back never
+  // overwrites the live list in the cache
+  const curYm = ymOf(new Date());
+  const [ym, setYm] = useState<string | null>(null);
+  const isPast = ym !== null && ym < curYm;
+  const queryKey = isPast ? ["bills", "month", ym] : BILLS_KEY;
   const query = useQuery({
-    queryKey: BILLS_KEY,
-    queryFn: () => client!.bills(),
+    queryKey,
+    queryFn: () => client!.bills(isPast ? ym! : undefined),
     enabled: !!client,
   });
-  useRefetchWhenShown(query, BILLS_KEY);
+  useRefetchWhenShown(query, queryKey);
+  const shownYm = isPast ? ym! : curYm;
   // every write says what it did — silent success reads as a dead tap
   const [notice, setNotice] = useState<string | null>(null);
   // one reversible triage action at a time (the web banner's Undo)
@@ -236,10 +278,12 @@ export default function Bills() {
         { pid: string; action: "approve" | "reject" }) =>
       client!.billsProposal(pid, action),
     onSuccess: (r, v) => {
-      setNotice(v.action === "approve"
+      const gone = proposalSuperseded(r);
+      setNotice(gone ? `${r.payee} is already tracked — the offer was withdrawn.`
+        : v.action === "approve"
         ? "Approved — the bill is live." : "Proposal rejected.");
       dropProposal(v.pid);
-      if (v.action === "approve") {
+      if (v.action === "approve" && !gone) {
         refetchSchedule();
         qc.invalidateQueries({ queryKey: ["payee-history", r.payee] });
       } else {
@@ -248,6 +292,15 @@ export default function Bills() {
         qc.invalidateQueries({ queryKey: ["onboarding"] });
       }
       qc.invalidateQueries({ queryKey: ["budgets-suggest"] });
+    },
+    onError: (e, v) => {
+      setNotice(errText(e));
+      // an offer for a bill already tracked is withdrawn by the server as
+      // it refuses: the card could neither be approved nor dismissed
+      if (proposalSuperseded(e)) {
+        dropProposal(v.pid);
+        qc.invalidateQueries({ queryKey: ["bills"] });
+      }
     },
   });
   const approveAll = useMutation({
@@ -349,11 +402,17 @@ export default function Bills() {
   const accept = useMutation({
     mutationFn: ({ b, amt }: { b: Bill; amt: number }) =>
       client!.billsSave({ payee: b.payee, amount: amt,
+                          // marks this an edit of the bill the row shows,
+                          // so a bill deleted since the list loaded is
+                          // refused instead of recreated
+                          orig_payee: b.payee,
                           // omitted when unknown: the server keeps the
                           // bill's own cadence rather than defaulting
                           ...(b.cadence_value ? { cadence: b.cadence_value }
                                               : {}),
-                          next_due: b.due_on ?? undefined,
+                          // no next_due: an amount edit keeps the date,
+                          // and this row's copy may predate the server
+                          // rolling it to the next cycle
                           income: b.income }),
     onSuccess: (_r, v) => {
       setUndoAct({
@@ -390,9 +449,11 @@ export default function Bills() {
       // the pool — the natural read of picking one on a fresh pool
       ...(f.isEnv && f.category.trim()
         ? { category: f.category.trim(), match_category: true } : {}),
+      ...(f.restore ? { restore: true } : {}),
     }),
-    onSuccess: (_r, f) => {
-      setNotice(`Added ${f.payee.trim()}.`);
+    onSuccess: (r, f) => {
+      setNotice(r?.restored ? `Restored ${f.payee.trim()}.`
+        : `Added ${f.payee.trim()}.`);
       setAdding(false);
       refetchSchedule();
     },
@@ -430,6 +491,30 @@ export default function Bills() {
                                             { queryKey: ["calendar"] })]);
                                       }} />}>
       <StaleBanner query={query} />
+      {/* step back through the months: the per-bill paid/received are
+          the month on view, as it ended; the schedule stays live */}
+      <View style={[s.toolRow, { alignItems: "center" }]}>
+        <Pressable style={s.tool} accessibilityLabel="Previous month"
+                   onPress={() => setYm(shiftYm(shownYm, -1))}>
+          <Text style={s.toolText}>‹</Text>
+        </Pressable>
+        <Text style={{ color: C.text, fontWeight: "700" }}>{ymLabel(shownYm)}</Text>
+        <Pressable style={[s.tool, !isPast && { opacity: 0.4 }]} disabled={!isPast}
+                   accessibilityLabel="Next month"
+                   onPress={() => { const n = shiftYm(shownYm, 1); setYm(n >= curYm ? null : n); }}>
+          <Text style={s.toolText}>›</Text>
+        </Pressable>
+        {isPast ? (
+          <Pressable style={s.tool} onPress={() => setYm(null)}>
+            <Text style={s.toolText}>This month</Text>
+          </Pressable>
+        ) : null}
+      </View>
+      {isPast ? (
+        <Text style={[s.mut, { marginHorizontal: 12, marginBottom: 6 }]}>
+          How the month ended: paid and received per bill. Edits change the live schedule.
+        </Text>
+      ) : null}
       {!viewer && (
       <View style={s.toolRow}>
         <Pressable style={s.tool} onPress={() => setAdding(true)}>
@@ -554,8 +639,10 @@ export default function Bills() {
             {d.proposals.length === 1 ? "" : "s"} awaiting review.
           </Text>
           {d.proposals.map((p) => {
-            // this row's own decision in flight — never the whole list
-            const busy = act.isPending && act.variables?.pid === p.id;
+            // this row's own decision in flight — never the whole list —
+            // or Approve all, which is deciding this row too
+            const busy = approveAll.isPending
+              || (act.isPending && act.variables?.pid === p.id);
             return (
             <View key={p.id} style={s.proposal}>
               <View style={{ flex: 1 }}>
@@ -613,7 +700,7 @@ export default function Bills() {
           })}
           {act.isError ? (
             <Text style={{ color: C.bad, fontSize: 12 }}>
-              {String(act.error)}
+              {errText(act.error)}
             </Text>
           ) : null}
         </Card>
@@ -625,7 +712,7 @@ export default function Bills() {
         <Card>
           <H>Income</H>
           {income.map((b) => (
-            <BillRow key={b.payee} b={b} onHint={onHint}
+            <BillRow key={b.payee} b={b} onHint={onHint} past={isPast}
               onPress={() => router.push({ pathname: "/bill-history",
                 params: { payee: b.payee } } as never)} />
           ))}
@@ -638,7 +725,7 @@ export default function Bills() {
           <Card key={g}>
             <H>{g}</H>
             {list.map((b) => (
-              <BillRow key={b.payee} b={b} onHint={onHint}
+              <BillRow key={b.payee} b={b} onHint={onHint} past={isPast}
                 onPress={() => router.push({ pathname: "/bill-history",
                     params: { payee: b.payee } } as never)} />
             ))}
@@ -665,7 +752,7 @@ export default function Bills() {
               </Text>
             )}
             {monthly.map((b) => (
-              <BillRow key={b.payee} b={b} onHint={onHint}
+              <BillRow key={b.payee} b={b} onHint={onHint} past={isPast}
                 onPress={() => router.push({ pathname: "/bill-history",
                     params: { payee: b.payee } } as never)} />
             ))}
@@ -677,7 +764,7 @@ export default function Bills() {
               </Text>
             )}
             {annual.map((b) => (
-              <BillRow key={b.payee} b={b} onHint={onHint}
+              <BillRow key={b.payee} b={b} onHint={onHint} past={isPast}
                 onPress={() => router.push({ pathname: "/bill-history",
                     params: { payee: b.payee } } as never)} />
             ))}
@@ -726,18 +813,21 @@ export default function Bills() {
                   && restore.variables === b.payee;
                 const deleting = delForever.isPending
                   && delForever.variables === b.payee;
+                // either write in flight holds both: a restore racing a
+                // purge leaves the row in whichever state lands last
+                const rowBusy = restoring || deleting;
                 return (<>
                 <Pressable style={[s.pBtn, s.pBtnQuiet,
-                             restoring && { opacity: 0.5 }]}
-                           disabled={restoring}
+                             rowBusy && { opacity: 0.5 }]}
+                           disabled={rowBusy}
                            onPress={() => restore.mutate(b.payee)}>
                   <Text style={[s.pBtnText, { color: C.mut }]}>
                     {restoring ? "restoring…" : "Restore"}
                   </Text>
                 </Pressable>
                 <Text style={[{ color: C.bad, fontSize: 12, padding: 4 },
-                               deleting && { opacity: 0.5 }]}
-                      onPress={() => deleting || Alert.alert(
+                               rowBusy && { opacity: 0.5 }]}
+                      onPress={() => rowBusy || Alert.alert(
                         "Delete forever",
                         "Permanently delete this archived bill? The "
                         + "ledger transactions stay; only this bill "
@@ -765,7 +855,8 @@ export default function Bills() {
                 keystroke used to re-render the whole tab behind the sheet */}
             {adding && (
               <AddBillFields pending={add.isPending}
-                             error={add.isError ? String(add.error) : null}
+                             error={add.isError ? errText(add.error) : null}
+                             archived={add.isError && archivedClash(add.error)}
                              onAdd={(f) => add.mutate(f)}
                              onCancel={() => setAdding(false)} />
             )}
@@ -777,10 +868,16 @@ export default function Bills() {
 
 type AddBillForm = { payee: string; amount: string; cadence: string;
                      due: string; income: boolean; pinned: boolean;
-                     category: string; isEnv: boolean };
+                     category: string; isEnv: boolean; restore?: boolean };
 
-function AddBillFields({ pending, error, onAdd, onCancel }: {
-  pending: boolean; error: string | null;
+/** The add was refused because an archived bill holds the name. */
+function archivedClash(e: unknown): boolean {
+  return e instanceof ApiError && e.status === 409
+    && (e.body as { archived?: unknown } | undefined)?.archived === true;
+}
+
+function AddBillFields({ pending, error, archived, onAdd, onCancel }: {
+  pending: boolean; error: string | null; archived: boolean;
   onAdd: (f: AddBillForm) => void; onCancel: () => void;
 }) {
   const { client } = useSession();
@@ -802,6 +899,9 @@ function AddBillFields({ pending, error, onAdd, onCancel }: {
     ? `${nCustomUnit}:${Math.max(1, parseInt(nCustomN, 10) || 1)}`
     : nCadence;
   const nIsEnv = effCadence.startsWith("ENVELOPE");
+  const form = (): AddBillForm => ({ payee: nPayee, amount: nAmount,
+    cadence: effCadence, due: nDue, income: nIncome, pinned: nPinned,
+    category: nCategory, isEnv: nIsEnv });
   // known categories feed the envelope-category field (the web
   // datalist) — free text stays possible, typos stop being the default
   const catsQ = useQuery({ queryKey: ["categories"],
@@ -931,14 +1031,20 @@ function AddBillFields({ pending, error, onAdd, onCancel }: {
       ) : null}
       <View style={{ flexDirection: "row", gap: 8,
                      justifyContent: "center" }}>
+        {/* an archived bill holds this name: bring it back with the
+            values entered here */}
+        {archived && (
+          <Pressable style={[s.pBtn, pending && { opacity: 0.5 }]}
+                     disabled={pending}
+                     onPress={() => onAdd({ ...form(), restore: true })}>
+            <Text style={s.pBtnText}>Restore</Text>
+          </Pressable>
+        )}
         <Pressable style={[s.pBtn,
                      (!nPayee.trim() || !nAmount || pending)
                        && { opacity: 0.5 }]}
                    disabled={!nPayee.trim() || !nAmount || pending}
-                   onPress={() => onAdd({ payee: nPayee, amount: nAmount,
-                     cadence: effCadence, due: nDue, income: nIncome,
-                     pinned: nPinned, category: nCategory,
-                     isEnv: nIsEnv })}>
+                   onPress={() => onAdd(form())}>
           <Text style={s.pBtnText}>Add</Text>
         </Pressable>
         <Pressable style={[s.pBtn, s.pBtnQuiet]} onPress={onCancel}>

@@ -227,3 +227,47 @@ class MultipartAtANonUploadDoorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FolderImportBudgetIsReachableTests(unittest.TestCase):
+    """A folder analyze sends the whole folder in one multipart body, so the
+    edge ceiling on that body IS the batch limit. The handler's own batch
+    budget must sit below it, or the batch message the handler words for a
+    person ('import in smaller batches') can never be reached and every
+    oversized folder gets the bare edge refusal instead. Either refusal
+    tells the person what to do."""
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ["OIKONOME_DEV"] = "1"
+        _ensure_db()
+        import oikonome.web.app as appmod
+        appmod.DEV_MODE = True
+        cls.client = TestClient(appmod.app)
+
+    def test_the_batch_budget_fits_inside_the_body_ceiling(self):
+        from oikonome.web import bulk_import
+        from oikonome.web.pages import MAX_UPLOAD
+        self.assertLess(bulk_import.MAX_BATCH_BYTES,
+                        security.UPLOAD_BODY_LIMIT)
+        # and one file at the per-file cap still fits in a batch
+        self.assertGreaterEqual(bulk_import.MAX_BATCH_BYTES, MAX_UPLOAD)
+
+    def test_a_folder_over_the_ceiling_is_told_to_split(self):
+        r = self.client.post(
+            "/api/import/bulk/analyze", content=b"",
+            headers={"content-type": MULTIPART,
+                     "content-length": str(security.UPLOAD_BODY_LIMIT + 1)})
+        self.assertEqual(r.status_code, 413)
+        self.assertIn("smaller batches", r.json()["detail"])
+        # the edge cannot see whether the body is one export ZIP, so it
+        # names the door that restores one alone
+        self.assertEqual(r.json()["restore_door"], "/api/import")
+
+    def test_other_doors_keep_the_plain_refusal(self):
+        r = self.client.post(
+            "/api/receipts", content=b"",
+            headers={"content-type": MULTIPART,
+                     "content-length": str(security.UPLOAD_BODY_LIMIT + 1)})
+        self.assertEqual(r.status_code, 413)
+        self.assertEqual(r.json()["detail"], "request body too large")

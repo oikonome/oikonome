@@ -47,13 +47,42 @@ or owner from the household — or their leaving it — ends the script tokens
 they made. Webhooks are treated as standing credentials too: a password or
 email change, a mailed reset, a first second factor, and removing or
 leaving all pause the webhooks that person created, until someone switches
-them back on in Settings, which is itself a step-up action. A **webhook signing secret** (`oikwh_`) is the other direction: it is
+them back on in Settings, which is itself a step-up action. An owner's
+password or email change, a second factor turned on or off, a mailed reset
+and an operator clear also pause the household's own outbound settings —
+the mail relay saved in Settings, extra email recipients and the AI
+endpoint — until the owner confirms them in Settings ("These are mine —
+resume"); until then mail goes through the instance's own relay, the paused
+recipients get nothing, and the AI runs on the instance's own backend. The
+owner's password, email or second-factor change also pauses the household's
+text-message number until it is verified again, and ends browser
+notifications in every browser but the one making the change; a browser's
+notifications end with its sign-in. Every owner rotation and recovery
+also cancels the owner's unspent reset links and pending invitations, and
+removes every member who joined through the owner's invitations in the
+last seven days (`OIKONOME_RECOVERY_MEMBER_WINDOW_DAYS`, `0` turns it
+off), since a stolen session could have invited a login of its own; the
+owner is shown who was removed. Where the household saved its own Plaid
+or MX keys, the same changes hold new bank links on them — a new link, a
+bank re-auth and the MX widget are refused until the owner confirms the
+keys or removes them — because those keys decide who receives the bank
+login typed into a new link. Banks already linked keep syncing. Disconnecting a bank, exchange or
+bridge discards its stored credential (a Plaid connection keeps its token
+only until its removal at Plaid goes through), so no backup carries a live
+secret for a connection nobody uses. A **webhook signing secret** (`oikwh_`) is the other direction: it is
 shown once, stored encrypted under the household's key, left out of the
 data export, and signs every delivery (HMAC-SHA256 over timestamp and
 body) so the receiver can refuse a forgery or a replay. Minting a script
 token, adding a webhook, changing its URL or switching it on, restoring a
 data archive, and pointing the mail relay, the AI endpoint or the
-daily-email list somewhere new are step-up actions. The one-tap buttons in the daily
+daily-email list somewhere new are step-up actions. A folder import runs
+in the background on a plan frozen when it is submitted: any step-up, and
+any export archive in the folder being restored, happen in that
+submitting request, never later in the job, and the job stops for good
+when the session that started it is signed out or loses permission to
+import. A data restore whose starter is already signed out stops before
+writing, and one whose starter is signed out while it runs pauses the
+mail relay, recipients and AI endpoint the archive brings in. The one-tap buttons in the daily
 email are signed links for one action on one object, addressed to the
 recipient, and expire after seven days. Pressing one is a write like any
 other: the address must still hold an owner or member account in good
@@ -78,10 +107,14 @@ it happened; neither changes the password.
 
 Wrong second-factor guesses are counted in two places. At sign-in and on a
 mailed reset they count toward a per-account lock on those doors. Inside a
-signed-in session — step-up, elevation, re-binding an authenticator — they
-count toward a lock on that session alone, keyed by the credential that
+signed-in session — step-up, elevation, re-binding an authenticator, and
+every door that asks for the password again — wrong passwords and codes
+alike count toward a lock on that session alone, keyed by the credential that
 authenticated the request, so a stolen session can neither guess without
-limit nor lock the owner out of signing in. On hosted, a passkey-only
+limit nor lock the owner out of signing in. Every guess takes its slot in
+the budget *before* it is checked and a right answer hands it back, so a
+burst of concurrent wrong guesses cannot all be verified ahead of the
+count catching up. On hosted, a passkey-only
 account that elevates with a recovery code must give its password with it:
 the code stands in for the passkey, never for the whole proof.
 
@@ -89,8 +122,10 @@ Full account, routing and loan numbers are not kept in the raw copy of a
 row stored beside each account, loan and transaction — that copy leaves the
 instance verbatim in the export. Identifier columns in file imports are cut
 to their last four digits, and so is any run of eight or more digits in the
-line a statement import keeps and in the description of every
-file-imported transaction. Upgrading applies the same cuts to rows
+line a statement import keeps, in the description of every
+file-imported transaction, and in a file row's free-text cells (memo,
+note, payee, description, details and the like, and any cells past the
+header row). Upgrading applies the same cuts to rows
 stored earlier, and a restore applies them to older archives. An AI
 endpoint URL keeps its host and path in the export, with any password or
 key inside it masked.
@@ -103,7 +138,13 @@ arriving at once, and a stall timeout — a client that stops sending loses
 its slot and gets a `408` rather than holding a door shut. That last one
 matters on a public instance: without it a handful of deliberately slow
 connections from one host could refuse every upload on the box. These are
-fixed limits, not `.env` settings. Set `OIKONOME_TRUSTED_PROXIES` if
+fixed limits, not `.env` settings. What an accepted upload may *expand*
+to is bounded too: a PDF is measured before it is read or rendered — at
+most about 1.5 MB of drawing content and 40 megapixels of embedded images
+per page, 500 pages, about 2 MB of extracted text — with every decoder
+capped, so a small compressed file cannot inflate into a large one inside
+the server; a plain-text tax upload carries the same text ceiling, and
+an image is refused for decoding past 40 megapixels. Set `OIKONOME_TRUSTED_PROXIES` if
 anything fronts the app, or all of them see the proxy as the only client
 (see [docs/reverse-proxy.md](docs/reverse-proxy.md)). Under rootless
 Podman the app cannot see real client addresses at all, so auto-ban, the

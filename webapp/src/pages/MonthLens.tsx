@@ -9,6 +9,7 @@ import MoneyMap, { Track } from "../components/MoneyMap";
 import { planRows } from "../components/PlanBars";
 import { api, mmdd, money, type MonthLensData, catLabel } from "../api/client";
 import { VERDICT } from "./Today";
+import { monthSavings } from "../moneymath";
 
 export default function MonthLens({ y, m }: { y: number; m: number }) {
   const q = useQuery({ queryKey: ["lens-month", y, m],
@@ -108,8 +109,7 @@ export default function MonthLens({ y, m }: { y: number; m: number }) {
             // saved prefers the month's REAL posted contribution when
             // the payload carries it; rate_90d only as fallback (it's a
             // trailing average, not this month's actual)
-            savings: goal ? { plan: goal.monthly_plan,
-                              saved: d.saved_month ?? goal.rate_90d } : null,
+            savings: goal ? monthSavings(goal, d.saved_month) : null,
             // the plan's residual, monthly — same row as Today
             excess: d.plan_surplus,
           })} />
@@ -133,8 +133,11 @@ export default function MonthLens({ y, m }: { y: number; m: number }) {
           {d.bills.overdue.length > 0 && (
             <div className="sub" style={{ marginTop: ".4rem" }}>
               Scheduled but not posted:{" "}
-              {d.bills.overdue.slice(0, 5).map(([pp, a, due], i) => (
-                <span key={i}>{pp} {money(a)} (due {mmdd(due)})
+              {d.bills.overdue.slice(0, 5).map(([pp, a, due, gone], i) => (
+                // a charge the bank feed withdrew, rather than one never made
+                <span key={i}>{pp} {money(a)} {gone
+                    ? <span style={{ color: "var(--amber)" }}>(withdrawn by the bank feed {mmdd(gone)})</span>
+                    : <>(due {mmdd(due)})</>}
                   {i < Math.min(d.bills.overdue.length, 5) - 1 ? ", " : ""}</span>
               ))}
             </div>

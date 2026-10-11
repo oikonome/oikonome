@@ -47,14 +47,14 @@ class RetirementSettingsTests(unittest.TestCase):
 
     def test_roundtrip_new_fields(self):
         r = self.client.post("/api/settings", json={
-            "birthdate": "1975-03-04",
+            "birthdate": "1970-01-01",
             "ss_estimates": {"67": 3000, "70": "4,100"},
             "retirement_saving": True,
             "income_biweekly_saving": 5200,
             "income_biweekly_not_saving": "$6,000.50"})
         self.assertEqual(r.status_code, 200)
         got = self.client.get("/api/settings").json()
-        self.assertEqual(got["birthdate"], "1975-03-04")
+        self.assertEqual(got["birthdate"], "1970-01-01")
         self.assertEqual(got["ss_estimates"], {"67": 3000.0, "70": 4100.0})
         self.assertTrue(got["retirement_saving"])
         self.assertEqual(got["income_biweekly_saving"], 5200.0)
@@ -133,7 +133,7 @@ class RetirementApiTests(unittest.TestCase):
 
     def test_projection_shape_and_birthdate_default(self):
         r = self.client.post("/api/settings", json={
-            "birthdate": "1975-03-04", "ss_estimates": {"67": 3000}})
+            "birthdate": "1970-01-01", "ss_estimates": {"67": 3000}})
         self.assertEqual(r.status_code, 200)
         r = self.client.get("/api/retirement")
         self.assertEqual(r.status_code, 200)
@@ -151,7 +151,7 @@ class RetirementApiTests(unittest.TestCase):
             self.assertGreater(c["extra_monthly"], 0)
         inp = body["inputs"]
         self.assertEqual(inp["age"],
-                         retirement.age_from_birthdate("1975-03-04"))
+                         retirement.age_from_birthdate("1970-01-01"))
         self.assertEqual(inp["your_ss"], 3000)
         self.assertTrue(inp["has_sched"])
         self.assertEqual(inp["spend"], 250000)          # the default
@@ -201,6 +201,39 @@ class RetirementApiTests(unittest.TestCase):
         inp = r.json()["inputs"]
         self.assertEqual(inp["ssage"], 65)
         self.assertEqual(inp["your_ss"], 0)
+
+    def test_a_restored_schedule_with_bad_amounts_never_500s(self):
+        """Only the Settings save coerces the schedule's amounts; a restored
+        or hand-edited config can carry text, null or a list where a monthly
+        figure belongs. The page drops such an entry (as it drops a bad
+        age) rather than failing on every load."""
+        def put(sched):
+            conn = tenancy.tenant_connect(self.tid)
+            try:
+                cfg = budget.load_config(conn)
+                cfg["ss_estimates"] = sched
+                budget.save_config(conn, cfg)
+            finally:
+                conn.close()
+        put({"67": "1800"})     # a number written as text still counts
+        r = self.client.get("/api/retirement?age=60&end=75&ssage=67")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["inputs"]["your_ss"], 1800)
+        for bad in ("lots", None, [1, 2], "nan", -5, "1e999", True):
+            with self.subTest(bad=bad):
+                put({"67": bad, "70": 4000})
+                r = self.client.get("/api/retirement?age=60&end=75&ssage=67")
+                self.assertEqual(r.status_code, 200, r.text)
+                self.assertEqual(r.json()["inputs"]["your_ss"], 0)
+                r = self.client.get("/api/retirement?age=60&end=75&ssage=70")
+                self.assertEqual(r.json()["inputs"]["your_ss"], 4000)
+        for bad in (["not", "a", "dict"], "text"):
+            with self.subTest(bad=bad):
+                put(bad)
+                r = self.client.get("/api/retirement?age=60&end=75&ssage=67")
+                self.assertEqual(r.status_code, 200, r.text)
+                self.assertEqual(r.json()["inputs"]["your_ss"], 0)
+        put({})
 
 
 if __name__ == "__main__":

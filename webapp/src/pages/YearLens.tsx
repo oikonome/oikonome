@@ -111,13 +111,18 @@ export default function YearLens({ y, onMonth }: {
                   // Savings — standing monthly plan × the same
                   // elapsed months every other row here covers.
                   // actual prefers the lens's ledger-verified YTD
-                  // (saved_ytd, matched transfers); rate_90d × elapsed is
-                  // the fallback against servers that don't send it yet.
+                  // (saved_ytd, matched transfers over the budgeted
+                  // months). Without it (an older server, or no budgeted
+                  // month to measure) the only figure is rate_90d ×
+                  // elapsed, and the row says it is an estimate.
                   savings: goal && elapsed > 0
-                    ? { plan: goal.monthly_plan * elapsed,
-                        saved: d.saved_ytd
-                          ?? (goal.rate_90d === null ? null
-                              : goal.rate_90d * elapsed) } : null,
+                    ? (typeof d.saved_ytd === "number"
+                      ? { plan: goal.monthly_plan * elapsed,
+                          saved: d.saved_ytd }
+                      : { plan: goal.monthly_plan * elapsed,
+                          saved: goal.rate_90d === null ? null
+                            : goal.rate_90d * elapsed,
+                          estimated: goal.rate_90d !== null }) : null,
                   excess: d.plan_surplus !== null && elapsed > 0
                     ? d.plan_surplus * elapsed : null })} />
           </div>
@@ -137,7 +142,8 @@ export default function YearLens({ y, onMonth }: {
         </div>
         {t.income === null && (
           <div className="sub" style={{ marginTop: ".4rem" }}>
-            No bank income data for {d.y} — income and savings are unknown, not $0.
+            Income isn't known for every month of {d.y} (no bank account
+            feeds part of it) — income and savings are unknown, not $0.
           </div>
         )}
       </div>

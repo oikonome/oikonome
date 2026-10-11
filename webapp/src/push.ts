@@ -77,6 +77,21 @@ export async function enableBrowserPush(vapidPublicKey: string): Promise<PushEna
   return { ok: true };
 }
 
+/** A subscription lives only as long as the session that registered it,
+ *  so one made a month ago dies with that session while the browser still
+ *  holds it and still looks enabled. At each load the browser's own
+ *  subscription is re-sent so it rides the current session; the server
+ *  takes that without step-up while its row still exists. "lapsed" means
+ *  the row is gone and turning push back on needs the user. */
+export async function rebindBrowserPush(): Promise<"none" | "ok" | "lapsed"> {
+  if (browserPushBlocked() || typeof Notification === "undefined"
+      || Notification.permission !== "granted") return "none";
+  const sub = await ownPushSubscription();
+  if (!sub) return "none";
+  const r = await api.pushRebind(sub.toJSON(), navigator.userAgent.slice(0, 180));
+  return r === "ok" ? "ok" : r === "step-up" ? "lapsed" : "none";
+}
+
 export async function disableBrowserPush(): Promise<void> {
   const reg = await navigator.serviceWorker.ready;
   const sub = await reg.pushManager.getSubscription();

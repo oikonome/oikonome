@@ -85,6 +85,8 @@ function elevateError(e: unknown): string {
   if (m.includes("wrong password") || m.includes("password_required"))
     return "That password didn't match.";
   if (m.includes("totp_required")) return "Enter the 6-digit code from your authenticator app.";
+  // a code from a step already spent is not a clock problem
+  if (/code_used|already (been )?used/i.test(m)) return "That code was already used — enter the next one from your app.";
   if (m.includes("one-time code")) return "That code didn't match — check your app's clock.";
   if (m.includes("recovery")) return "That recovery code didn't match.";
   if (m.includes("too many")) return "Too many attempts — try again in a few minutes.";

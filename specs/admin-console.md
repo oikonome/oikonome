@@ -149,8 +149,17 @@ Self-host postures:
 1. **Token only** — the default, and the only thing a LAN self-host can do.
 2. **Token as break-glass** — `OIKONOME_ADMIN_REQUIRE_PASSKEY=1` for a
    self-host that does have TLS. The flag is ignored while zero keys are
-   enrolled: bootstrapping is token → enrol → flip, and enrolment needs a
-   session, so honouring it on an empty table would brick a fresh box.
+   enrolled, because enrolment needs a session and honouring it on an
+   empty table would brick a fresh box. Bootstrapping is: sign in with the
+   token, enrol the first key — which asks for the operator token again
+   (`_first_key_proof_ok`), since a session cookie alone is not proof
+   enough for a credential that outlives every session — and only then
+   set the flag. Once a key exists under the flag, the token stops signing
+   in, and a session the token opened earlier ends at its next request
+   (`_token_may_sign_in`, checked in `_session`), so a leaked token loses
+   its reach the moment the door is shut. The same holds for every
+   token-opened session on a hosted instance, where the token never signs
+   in.
 3. **No token at all** — `OIKONOME_ADMIN_ENABLED=1` with no
    `OIKONOME_ADMIN_TOKEN`.
 

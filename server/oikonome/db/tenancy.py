@@ -196,6 +196,34 @@ CONTROL_POOL_TIMEOUT = float(os.environ.get("OIKONOME_CONTROL_POOL_TIMEOUT")
                              or "5")
 
 
+# Every control connection waits a bounded time, because the pool is four
+# connections shared by every request on the instance. A request that
+# queues on a lock (the per-user factor lock, a users row) holds its
+# connection the whole time it waits, so a few waiters on one account
+# would otherwise take the session lookup away from every other household
+# for as long as the holder runs. With a lock wait capped, the waiter gives
+# up (LockNotAvailable, answered 409 "busy" by the web layer) and its
+# connection goes back to the pool. The idle-in-transaction cap ends a
+# transaction whose Python side wandered off into slow work while holding
+# locks, and the statement cap stops one runaway query; neither is reached
+# by anything the control plane does on purpose — its statements are
+# single-row reads and writes. Values in milliseconds.
+_CONTROL_LIMITS_MS = (
+    ("lock_timeout", "OIKONOME_CONTROL_LOCK_TIMEOUT_MS", 5 * 1000),
+    ("idle_in_transaction_session_timeout",
+     "OIKONOME_CONTROL_IDLE_TXN_TIMEOUT_MS", 30 * 1000),
+    ("statement_timeout", "OIKONOME_CONTROL_STATEMENT_TIMEOUT_MS", 30 * 1000),
+)
+
+
+def _control_options() -> str:
+    out = []
+    for setting, env, default in _CONTROL_LIMITS_MS:
+        raw = (os.environ.get(env) or "").strip()
+        out.append(f"-c {setting}={int(raw) if raw.isdigit() else default}")
+    return " ".join(out)
+
+
 def _control_pool(dsn: str) -> ConnectionPool:
     with _pools_lock:
         p = _control_pools.get(dsn)
@@ -204,7 +232,10 @@ def _control_pool(dsn: str) -> ConnectionPool:
                 dsn, min_size=0,
                 max_size=int(os.environ.get("OIKONOME_CONTROL_POOL_MAX")
                              or "4"),
-                kwargs={"row_factory": dict_row, "autocommit": True},
+                # set at connect, so they hold for every checkout and a
+                # RESET on the way back to the pool cannot drop them
+                kwargs={"row_factory": dict_row, "autocommit": True,
+                        "options": _control_options()},
                 check=ConnectionPool.check_connection,  # see _pool
                 open=True)
             _control_pools[dsn] = p
@@ -571,27 +602,94 @@ def delete_tenant_rows(admin: psycopg.Connection, tenant_id) -> None:
     # the live config is only the CURRENT list. An address the household
     # mailed and then removed — the usual remedy for one that bounces —
     # is still in recipient_invites, the durable record of everyone ever
-    # invited, and its bounce row is still this tenant's to erase.
+    # invited, and its bounce row is still this tenant's to erase. Only an
+    # invitation this household actually sent or had answered, though: a
+    # decline read out of a restore archive was never mailed from here, and
+    # naming an address is not a claim on its record.
     for r in admin.execute(
-            "SELECT email FROM recipient_invites WHERE tenant_id = %s",
+            "SELECT email FROM recipient_invites WHERE tenant_id = %s"
+            " AND (token_hash IS NOT NULL OR send_count > 0"
+            "      OR last_sent_at IS NOT NULL OR accepted_at IS NOT NULL)",
             (tenant_id,)).fetchall():
         if isinstance(r["email"], str):
             emails.add(r["email"].strip().lower())
     emails.discard("")
+    # The record is shared by every household that mails the address. One
+    # another household still has as a user, or has actually invited (the
+    # same test as above: sent or answered), is evidence for that household
+    # too, and stays. An invitation that household only read out of a
+    # restore archive and never sent is not: it was never mailed from
+    # there, and naming an address is no claim on its record.
+    if emails:
+        emails -= {(r["email"] or "").strip().lower() for r in admin.execute(
+            """SELECT email FROM users
+                WHERE tenant_id <> %s AND lower(email) = ANY(%s)
+               UNION
+               SELECT email FROM recipient_invites
+                WHERE tenant_id <> %s AND lower(email) = ANY(%s)
+                  AND (token_hash IS NOT NULL OR send_count > 0
+                       OR last_sent_at IS NOT NULL
+                       OR accepted_at IS NOT NULL)""",
+            (tenant_id, sorted(emails), tenant_id, sorted(emails))).fetchall()}
+    # A spam complaint is the recipient's word, and only they can take it
+    # back (notify/delivery.clear keeps one the same way). The household's
+    # own users' complaints go with the household; a complaint on any other
+    # address it named stands.
+    own = {(r["email"] or "").strip().lower() for r in admin.execute(
+        "SELECT email FROM users WHERE tenant_id = %s",
+        (tenant_id,)).fetchall()}
     # whatever the installed add-on must keep about the account beyond its
     # life is archived out of its own tables by it here, before the sweep
-    # below takes the rows; best-effort — an erasure never fails over it
+    # below takes the rows. Best-effort against the add-on's own failures —
+    # an erasure never fails over one of those — but NOT when the add-on is
+    # not loaded at all: then nothing can archive its billing record, and
+    # sweeping its tables anyway would erase the only copy of it. That
+    # stops the erasure with nothing deleted; the caller reports it and the
+    # next run finishes once the add-on loads.
+    from .. import ext
     try:
-        from .. import ext
         ext.gate.on_tenant_purge(admin, tenant_id)
+    except ext.GateUnavailable:
+        logging.getLogger(__name__).error(
+            "erasure of %s stopped before any row was deleted: the billing "
+            "add-on is not loaded to archive its record", tenant_id)
+        raise
     except Exception:                                    # noqa: BLE001
         logging.getLogger(__name__).warning(
             "add-on purge hook failed for %s", tenant_id, exc_info=True)
+    # signup_invites is control-plane and email-keyed too: the operator's
+    # invitation carries the person's address, a free-text note about them
+    # and the id of the household it minted, and the discovery above cannot
+    # see it. The household's own invitation goes, and so does any spent
+    # or lapsed invite to one of its users' addresses — unless another
+    # household still has that address as a user, whose invitation it may
+    # be, or another household spent it: an address moves between
+    # households when a login email changes, and the invitation another
+    # household was born from is that household's record, not this one's.
+    # A live, unused invite stays: it is the operator's standing offer
+    # to that person for a household that does not exist yet — the one a
+    # signup reclaim is about to create once this wipe clears the address,
+    # or one the operator issued during the erasure's grace period — and
+    # deleting it here would quietly drop its terms and note.
+    invitees = set(own)
+    if invitees:
+        invitees -= {(r["email"] or "").strip().lower() for r in admin.execute(
+            "SELECT email FROM users WHERE tenant_id <> %s"
+            " AND lower(email) = ANY(%s)",
+            (tenant_id, sorted(invitees))).fetchall()}
+    invitees.discard("")
     with admin.transaction():
+        admin.execute(
+            "DELETE FROM signup_invites WHERE used_by_tenant = %s"
+            " OR (lower(email) = ANY(%s)"
+            "     AND (used_by_tenant IS NULL OR used_by_tenant = %s)"
+            "     AND (used_at IS NOT NULL OR expires_at <= now()))",
+            (tenant_id, sorted(invitees), tenant_id))
         if emails:
             admin.execute(
-                "DELETE FROM email_delivery_state WHERE lower(email) = ANY(%s)",
-                (sorted(emails),))
+                "DELETE FROM email_delivery_state WHERE lower(email) = ANY(%s)"
+                " AND (state <> 'complained' OR lower(email) = ANY(%s))",
+                (sorted(emails), sorted(emails & own)))
         for t in ordered:
             admin.execute(sql.SQL("DELETE FROM {} WHERE tenant_id = %s")
                           .format(sql.Identifier(t)), (tenant_id,))

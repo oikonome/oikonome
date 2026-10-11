@@ -37,10 +37,12 @@ string its layer1 canonical.
 """
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import re
 
 from . import budget, merchant_sql
+from .compat import jsonb
 
 log = logging.getLogger("oikonome.merchant_dedup")
 
@@ -460,7 +462,11 @@ MERCHANT_ID = merchant_sql.MERCHANT_ID
 
 def load_llm_map(conn, mapping: dict[str, str]) -> int:
     """Upsert reviewed llm merges (raw -> canonical); these win over layer1."""
+    from . import merchant_identity
     with conn.transaction():
+        # identity before the alias rows, written one at a time in the
+        # map's order: see apply()
+        merchant_identity._lock_identity(conn)
         for raw, canon in mapping.items():
             if not raw or not canon:
                 continue
@@ -472,7 +478,6 @@ def load_llm_map(conn, mapping: dict[str, str]) -> int:
                 (raw, canon))
     # the merchant ROW follows the reviewed name (a raw string that got its
     # own layer1 merchant re-points at the one the merge names)
-    from . import merchant_identity
     merchant_identity.reconcile_raws(conn, [r for r in mapping if r and mapping[r]])
     return len(mapping)
 
@@ -512,7 +517,14 @@ def apply(conn) -> int:
     held = {r["raw_merchant"]: r["merchant_id"] for r in conn.execute(
         "SELECT raw_merchant, merchant_id FROM merchant_canonical "
         " WHERE method = 'layer1'").fetchall()}
+    from . import merchant_identity
     with conn.transaction():
+        # The identity lock before the first alias row, as every other
+        # writer of alias rows takes it. This loop locks the rows one at a
+        # time in its query's order; a rename locks the same rows in one
+        # statement in its scan's order, and two writers taking one set of
+        # rows in two orders can each hold a row the other is waiting for.
+        merchant_identity._lock_identity(conn)
         for r in rows:
             m = r["m"]
             here = manual
@@ -535,7 +547,6 @@ def apply(conn) -> int:
             if cur.rowcount:
                 recomputed.append(m)
             touched += cur.rowcount
-    from . import merchant_identity
     # A layer1 canonical that CHANGED — the string cleaning improved, or a
     # newly-harvested city took effect — has to move its rows to the
     # merchant it now names, or the household keeps reading the old name
@@ -725,11 +736,12 @@ def rename(conn, display: str, to: str) -> dict:
         if not joined:
             break
         raws = raws + joined
+    # the journal rows' ids, so the rule note below lands on exactly these
+    journal_ids = [r["id"] for r in conn.execute(
+        "INSERT INTO merchant_renames (raw_merchant, from_canonical, to_canonical) "
+        "SELECT r, p, %s FROM unnest(%s::text[], %s::text[]) AS j(r, p) "
+        "RETURNING id", (to, raws, [prior.get(raw) for raw in raws])).fetchall()]
     with conn.cursor() as cur:
-        cur.executemany(
-            "INSERT INTO merchant_renames (raw_merchant, from_canonical, "
-            "                              to_canonical) VALUES (%s,%s,%s)",
-            [(raw, prior.get(raw), to) for raw in raws])
         cur.executemany(
             "INSERT INTO merchant_canonical (raw_merchant, canonical, method, "
             "                                as_of) VALUES (%s,%s,'manual',now()) "
@@ -747,9 +759,396 @@ def rename(conn, display: str, to: str) -> dict:
         (raws,)).fetchone()["n"]
     # the merchant ROW follows: whole-merchant rename keeps the merchant
     # (and its logo); a rename onto an existing name is a merge
+    # the merchants that displayed the name, read before the rows move:
+    # what a bill holding them pays
+    old_ids = [r["mid"] for r in conn.execute(
+        f"SELECT DISTINCT t.merchant_id::text AS mid FROM transactions t "
+        f" WHERE t.removed = 0 AND t.merchant_id IS NOT NULL "
+        f"   AND {merchant_sql.RAW_KEY} = ANY(%s)", (raws,)).fetchall()]
+    # the offers and bills the rename rewrites are locked before any row
+    # moves: an approval holds the same pair while it stamps those rows,
+    # and reaching for them after the rows would close a cycle with it
+    from . import bills
+    bills.lock_merchant_rename(conn, display, old_ids)
     from . import merchant_identity
     merchant_identity.reconcile_raws(conn, raws)
+    # a bill paying the old name pays the new one from this transaction on,
+    # not from whenever the nightly next reads its refs
+    bills.follow_merchant_rename(conn, display, old_ids, raws)
+    # and a 1099 vendor mark: the year-end list must not drop a contractor
+    # because their payee was renamed or merged
+    from . import selfemploy
+    selfemploy.follow_merchant_rename(conn, display, old_ids, raws)
+    # and so does the category the household taught the old name
+    note = follow_rules(conn, display, to, raws, old_ids)
+    if note is not None:
+        _journal_note(conn, note, journal_ids)
     return {"raws": len(raws), "rows": rows}
+
+
+def _journal_note(conn, note: dict, ids: list, *,
+                  only_unnoted: bool = False) -> None:
+    """Write a rename's rule note onto its journal rows.
+
+    Every row carries the note, so undoing any one string can put the rules
+    back, but not the rename's list of strings: a merchant shown for
+    thousands of bank lines would copy that whole list onto each of its
+    thousands of rows. The rows share a group token instead, and the list
+    is read back from the rows that carry it (`_note_raws`). The token is
+    random, not a row id, so groups brought in by a restore can never be
+    mistaken for one made here."""
+    import uuid
+    slim = {k: v for k, v in note.items() if k != "raws"}
+    slim["group"] = uuid.uuid4().hex
+    conn.execute(
+        "UPDATE merchant_renames SET rules = %s WHERE id = ANY(%s)"
+        + (" AND rules IS NULL" if only_unnoted else ""),
+        (jsonb(slim), list(ids)))
+
+
+def _note_raws(conn, note: dict) -> list[str]:
+    """The raw strings of the rename a note belongs to: the list itself on
+    a note written before the group token, else the journal rows still
+    carrying its token (an undone string has left the journal, and with it
+    the list)."""
+    if note.get("raws") is not None:
+        return list(note.get("raws") or [])
+    group = note.get("group")
+    if not group:
+        return []
+    return [r["raw_merchant"] for r in conn.execute(
+        "SELECT raw_merchant FROM merchant_renames "
+        "WHERE rules->>'group' = %s", (str(group),)).fetchall()]
+
+
+# ---- the category rules a rename carries -----------------------------------
+# A rule is stored under a STRING and reaches its rows through that string's
+# alias row, or else through a live merchant of that exact name (see the
+# rules CTE in llm_categorize.apply). A rename moves every alias of a name
+# to the merchant it now names, so a rule under the old DISPLAY name is left
+# reaching nothing: the household's correction still shows on the Rules
+# page, files no charge, and a machine guess fills the gap. A rule under one
+# of the moved raw strings has the opposite problem: it follows its alias to
+# the survivor and, beside a survivor rule of another category, the two
+# cancel out (the CTE applies a merchant's rules only when they agree).
+#
+# So the rename settles it once, in its own transaction: of the old name's
+# rules and the survivor's, a person's outranks a machine's and otherwise
+# the survivor's stays — it is the rule the survivor's own rows have been
+# living under, and a rename must never overwrite what the person told the
+# survivor. Everything set aside is written into the rename's journal rows,
+# so undo puts it back.
+
+def _rule_dict(r) -> dict:
+    return {"merchant": r["merchant"], "category_primary": r["category_primary"],
+            "source": r["source"], "disabled": bool(r["disabled"]),
+            "classified_at": r["classified_at"].isoformat()
+            if r["classified_at"] is not None else None}
+
+
+_RULE_COLS = "m.merchant, m.category_primary, m.source, m.disabled, m.classified_at"
+# a person's live rule first, then the newest
+_RULE_ORDER = "ORDER BY m.disabled, (m.source <> 'user'), m.classified_at DESC"
+
+
+def rules_reaching(conn, name: str, mid, *, exclude=(), lock: bool = False) -> list:
+    """The category rules that reach one merchant: those under its name
+    (any case) and those under a raw string whose alias names it. Best
+    first. `exclude` leaves out rules under these strings."""
+    return conn.execute(
+        f"""SELECT {_RULE_COLS} FROM merchant_categories m
+             WHERE NOT (m.merchant = ANY(%s))
+               AND (lower(m.merchant) = lower(%s)
+                    OR EXISTS (SELECT 1 FROM merchant_canonical a
+                                WHERE a.raw_merchant = m.merchant
+                                  AND a.merchant_id = %s))
+             {_RULE_ORDER}{" FOR UPDATE OF m" if lock else ""}""",
+        (list(exclude), name, mid)).fetchall()
+
+
+def _put_rule(conn, rule: dict, key: str | None = None) -> bool:
+    """Write a journalled rule back under `key` (its own string by default)
+    unless something already lives there: a rule written since is the
+    household's newer word and is never overwritten."""
+    cur = conn.execute(
+        "INSERT INTO merchant_categories (merchant, category_primary, source, "
+        "    disabled, classified_at) VALUES (%s,%s,%s,%s,COALESCE(%s::timestamptz, now())) "
+        "ON CONFLICT (tenant_id, merchant) DO NOTHING",
+        (key or rule["merchant"], rule["category_primary"], rule["source"],
+         rule.get("disabled", False), rule.get("classified_at")))
+    return cur.rowcount > 0
+
+
+def _outranks(rule: dict, held: dict | None) -> bool:
+    """Whether `rule` may take a key `held` already occupies. A person's
+    live rule beats a machine's (or a disabled one); nothing else ever
+    displaces what is there — a machine rule never overwrites a rule of
+    any source, and of two people's rules the one already there stays."""
+    if held is None:
+        return True
+    return (not rule["disabled"] and rule["source"] == "user"
+            and (held["disabled"] or held["source"] != "user"))
+
+
+def _rule_rank(d: dict) -> tuple:
+    """_RULE_ORDER, for rules held in memory: live first, a person's first,
+    then the newest."""
+    at = d.get("classified_at") or ""
+    return (d["disabled"], d["source"] != "user",
+            -dt.datetime.fromisoformat(at).timestamp() if at else 0.0)
+
+
+def _plan_follow(conn, display: str, into: str, raws: list[str], old_ids=(), *,
+                 lock: bool = False, gone=frozenset(), placed=()) -> dict | None:
+    """Decide what follow_rules would do, reading only. `gone` and `placed`
+    let a dry run over several renames see what the earlier ones in the same
+    run would have removed and carried, without writing either."""
+    if not display or not into or display.lower() == into.lower() or not raws:
+        return None
+    from . import merchant_identity
+    row = conn.execute(
+        "SELECT merchant_id FROM merchant_canonical WHERE raw_merchant=%s",
+        (raws[0],)).fetchone()
+    mid = merchant_identity._survivor(conn, row["merchant_id"]) \
+        if row and row["merchant_id"] else None
+    if mid is None:
+        return None
+    old_ids = [str(i) for i in old_ids if i]
+    # the old name's rules: under the name itself, unless another live
+    # merchant still carries that name and so still answers to them, and
+    # under the strings that moved. A rule under the survivor's own name is
+    # the survivor's even when that string moved too: it is the key the old
+    # name's rule would be written to, so it competes rather than travels.
+    mine = [_rule_dict(r) for r in conn.execute(
+        f"""SELECT {_RULE_COLS} FROM merchant_categories m
+             WHERE lower(m.merchant) <> lower(%s)
+               AND (m.merchant = ANY(%s)
+                OR (lower(m.merchant) = lower(%s)
+                    AND NOT EXISTS (SELECT 1 FROM merchant_canonical a
+                                     WHERE a.raw_merchant = m.merchant)
+                    AND NOT EXISTS (SELECT 1 FROM merchants l
+                                     WHERE l.merged_into IS NULL
+                                       AND lower(l.name) = lower(m.merchant)
+                                       AND l.id <> %s
+                                       AND NOT (l.id::text = ANY(%s)))))
+             {_RULE_ORDER}{" FOR UPDATE OF m" if lock else ""}""",
+        (into, raws, display, mid, old_ids)).fetchall()]
+    mine = [d for d in mine if d["merchant"] not in gone]
+    if not mine:
+        return None
+    there = [_rule_dict(r) for r in rules_reaching(
+        conn, into, mid, exclude=[d["merchant"] for d in mine], lock=lock)]
+    there = sorted([d for d in there if d["merchant"] not in gone]
+                   + [d for d in placed if d["merchant"] not in gone],
+                   key=_rule_rank)
+    best = mine[0]
+    wins = _outranks(best, there[0] if there else None)
+    rules, displaced = [], [dict(d) for d in there] if wins else []
+    for i, d in enumerate(mine):
+        d = dict(d)
+        if i == 0 and wins and d["merchant"] in raws:
+            d["fate"] = "kept"           # its alias already carries it over
+        elif i == 0 and wins:
+            d["fate"] = "moved"
+        else:
+            d["fate"] = "dropped"
+        rules.append(d)
+    if all(d["fate"] == "kept" for d in rules) and not displaced:
+        return None
+    return {"from": display, "into": into, "raws": sorted(raws),
+            "rules": rules, "displaced": displaced}
+
+
+def _write_follow(conn, note: dict) -> dict:
+    """Carry out a planned follow. The losers go first, so the key the
+    winner moves to is free; the move itself is still an upsert that only
+    lands where the winner outranks what it finds, so a rule that appeared
+    under the key since the plan was read is kept and the move is recorded
+    as dropped instead of failing the whole rename."""
+    into = note["into"]
+    for d in note["displaced"]:
+        conn.execute("DELETE FROM merchant_categories WHERE merchant = %s",
+                     (d["merchant"],))
+    for d in note["rules"]:
+        if d["fate"] == "dropped":
+            conn.execute("DELETE FROM merchant_categories WHERE merchant = %s",
+                         (d["merchant"],))
+    for d in note["rules"]:
+        if d["fate"] != "moved":
+            continue
+        landed = conn.execute(
+            """INSERT INTO merchant_categories (merchant, category_primary,
+                   source, disabled, classified_at)
+               VALUES (%s,%s,%s,%s,COALESCE(%s::timestamptz, now()))
+               ON CONFLICT (tenant_id, merchant) DO UPDATE SET
+                   category_primary = EXCLUDED.category_primary,
+                   source = EXCLUDED.source, disabled = EXCLUDED.disabled,
+                   classified_at = EXCLUDED.classified_at
+               WHERE EXCLUDED.source = 'user' AND NOT EXCLUDED.disabled
+                 AND (merchant_categories.source <> 'user'
+                      OR merchant_categories.disabled)""",
+            (into, d["category_primary"], d["source"], d["disabled"],
+             d["classified_at"])).rowcount
+        conn.execute("DELETE FROM merchant_categories WHERE merchant = %s",
+                     (d["merchant"],))
+        if not landed:
+            d["fate"] = "dropped"
+    return note
+
+
+def follow_rules(conn, display: str, into: str, raws: list[str], old_ids=()) -> dict | None:
+    """Carry the category rules of the name `display` to the merchant its
+    raw strings `raws` were just filed under as `into`. Called by rename
+    after the rows moved, inside its transaction; also by the repair of
+    renames made before this existed. `old_ids` are the merchants that
+    displayed the name before the move (a twin the caller retires after
+    the rename is still live under the old name at this point).
+
+    Returns the journal note for undo, or None when no rule moved."""
+    note = _plan_follow(conn, display, into, raws, old_ids, lock=True)
+    return _write_follow(conn, note) if note is not None else None
+
+
+def unfollow_rules(conn, note: dict | None, raw_key: str) -> None:
+    """The undo of follow_rules for one raw string whose rename was just
+    reversed. The old name's rules come back under their own strings at
+    once, so the undone string's rows are filed as before; the survivor
+    gives back what it was handed, and gets back what was set aside, only
+    when the last string of that rename has gone back. Nothing written
+    since — a rule the person edited or added — is overwritten."""
+    if not isinstance(note, dict):
+        return
+    for d in note.get("rules") or []:
+        if d.get("fate") in ("moved", "dropped"):
+            _put_rule(conn, d)
+    into = str(note.get("into") or "")
+    left = conn.execute(
+        "SELECT 1 FROM merchant_canonical WHERE raw_merchant = ANY(%s) "
+        "AND raw_merchant <> %s AND lower(canonical) = lower(%s) LIMIT 1",
+        (_note_raws(conn, note), raw_key, into)).fetchone()
+    if left:
+        return
+    for d in note.get("rules") or []:
+        if d.get("fate") == "moved":
+            conn.execute(
+                "DELETE FROM merchant_categories WHERE merchant = %s "
+                "AND category_primary = %s AND source = %s",
+                (into, d["category_primary"], d["source"]))
+    for d in note.get("displaced") or []:
+        _put_rule(conn, d)
+
+
+def _regroup_locked(conn, ids: list, old: str, mid: str):
+    """One repair group as it stands now, read under the identity lock:
+    (survivor's live name, journal ids, raw strings) of the rows that still
+    carry no note and still leave `old` for merchant `mid`, or None when
+    nothing of the group is left to settle."""
+    from . import merchant_identity
+    keep_ids, raws = [], []
+    for r in conn.execute(
+            """SELECT j.id, j.raw_merchant, j.from_canonical, a.merchant_id
+                 FROM merchant_renames j
+                 JOIN merchant_canonical a ON a.raw_merchant = j.raw_merchant
+                WHERE j.id = ANY(%s) AND j.rules IS NULL
+                ORDER BY j.id FOR UPDATE OF j""", (list(ids),)).fetchall():
+        sid = merchant_identity._survivor(conn, r["merchant_id"]) \
+            if r["merchant_id"] else None
+        if (r["from_canonical"] or r["raw_merchant"]) != old \
+                or sid is None or str(sid) != mid:
+            continue
+        keep_ids.append(r["id"])
+        if r["raw_merchant"] not in raws:
+            raws.append(r["raw_merchant"])
+    if not keep_ids:
+        return None
+    live = conn.execute("SELECT name FROM merchants WHERE id = %s",
+                        (mid,)).fetchone()
+    if live is None or live["name"].lower() == old.lower():
+        return None
+    return live["name"], keep_ids, raws
+
+
+def rekey_orphaned_rules(conn, *, apply: bool = False) -> list[dict]:
+    """Carry the rules of renames made before rename() carried them.
+
+    Walks the journal for renames that recorded no rule note, groups each
+    one's strings by the name they left and the merchant they now belong
+    to, and settles each group as the rename would have.
+
+    A dry run (apply=False) only reads: it plans every group against what
+    the groups before it in the same run would have removed and carried, so
+    it reports what applying would do without writing anything — not even
+    inside a transaction it means to roll back, where one bad group would
+    end the whole report. With apply=True each group is its own
+    transaction, its note written to its journal rows alongside the rule
+    changes, so undoing such a rename puts the rules back too and a group
+    that fails leaves every other one whole. Idempotent, and safe to re-run
+    after a partial failure: a group already carried has a note on its
+    rows and is not walked again, and one with nothing left to carry plans
+    to nothing."""
+    from . import merchant_identity
+    groups: dict = {}
+    for r in conn.execute(
+            """SELECT j.id, j.raw_merchant, j.from_canonical, a.merchant_id
+                 FROM merchant_renames j
+                 JOIN merchant_canonical a ON a.raw_merchant = j.raw_merchant
+                WHERE j.rules IS NULL
+                ORDER BY j.id""").fetchall():
+        old = r["from_canonical"] or r["raw_merchant"]
+        mid = merchant_identity._survivor(conn, r["merchant_id"]) \
+            if r["merchant_id"] else None
+        if mid is None:
+            continue
+        g = groups.setdefault((old, str(mid)), {"ids": [], "raws": []})
+        g["ids"].append(r["id"])
+        if r["raw_merchant"] not in g["raws"]:
+            g["raws"].append(r["raw_merchant"])
+    out = []
+    gone: set[str] = set()        # dry run: keys an earlier group cleared
+    placed: dict[str, list] = {}  # dry run: rules an earlier group carried
+    for (old, mid), g in groups.items():
+        live = conn.execute("SELECT name FROM merchants WHERE id = %s",
+                            (mid,)).fetchone()
+        if live is None or live["name"].lower() == old.lower():
+            continue
+        into = live["name"]
+        if apply:
+            with conn.transaction():
+                merchant_identity._lock_identity(conn)
+                # The groups were read before the lock: an undo or a rename
+                # since may have taken a string back, retired the journal
+                # row or renamed the survivor. Re-read the group under the
+                # lock and settle only what still stands, or a stale plan
+                # moves a restored merchant's rule onto another with no
+                # note for undo to put it back.
+                cur = _regroup_locked(conn, g["ids"], old, mid)
+                if cur is None:
+                    continue
+                into, ids, raws = cur
+                note = follow_rules(conn, old, into, raws)
+                if note is not None:
+                    _journal_note(conn, note, ids, only_unnoted=True)
+        else:
+            note = _plan_follow(conn, old, into, g["raws"], gone=frozenset(gone),
+                                placed=placed.get(into.lower(), ()))
+            if note is not None:
+                gone.update(d["merchant"] for d in note["displaced"])
+                gone.update(d["merchant"] for d in note["rules"]
+                            if d["fate"] != "kept")
+                carried = placed.setdefault(into.lower(), [])
+                carried[:] = [d for d in carried if d["merchant"] not in gone]
+                carried.extend({**d, "merchant": into} for d in note["rules"]
+                               if d["fate"] == "moved")
+                gone.discard(into)
+        if note is not None:
+            out.append({"from": old, "into": into, "raws": len(g["raws"]),
+                        "rules": [{k: d[k] for k in ("merchant", "category_primary",
+                                                     "source", "fate")}
+                                  for d in note["rules"]],
+                        "displaced": [{k: d[k] for k in ("merchant",
+                                                         "category_primary", "source")}
+                                      for d in note["displaced"]]})
+    return out
 
 
 def undo(conn, change_id: int) -> dict:
@@ -762,7 +1161,7 @@ def undo(conn, change_id: int) -> dict:
     from . import merchant_identity
     merchant_identity._lock_identity(conn)
     row = conn.execute(
-        "SELECT raw_merchant, from_canonical, to_canonical "
+        "SELECT raw_merchant, from_canonical, to_canonical, rules "
         "FROM merchant_renames WHERE id=%s", (change_id,)).fetchone()
     if not row:
         raise LookupError("no such change")
@@ -794,8 +1193,27 @@ def undo(conn, change_id: int) -> dict:
             "SET canonical=EXCLUDED.canonical, method='manual', as_of=now()",
             (row["raw_merchant"], row["from_canonical"]))
     conn.execute("DELETE FROM merchant_renames WHERE id=%s", (change_id,))
+    # The bills the rename re-pointed are locked before any row moves
+    # back, in id order, as rename() locks them: an approval holds its bill
+    # while it stamps that bill's charges, and an undo that moved a charge
+    # first and reached for the bill after would close a cycle with it.
+    # These are the bills unfollow_merchant_rename below rewrites; taking
+    # them again there costs nothing.
+    conn.execute("SELECT 1 FROM bills WHERE raw ? 'merchant_merges' "
+                 "ORDER BY id FOR UPDATE")
     from . import merchant_identity
     merchant_identity.reconcile_raws(conn, [row["raw_merchant"]])
+    # and the bills the rename re-pointed go back with the string
+    from . import bills
+    bills.unfollow_merchant_rename(conn, row["raw_merchant"],
+                                   row["to_canonical"])
+    from . import selfemploy
+    selfemploy.unfollow_merchant_rename(conn, row["raw_merchant"],
+                                        row["to_canonical"])
+    # and the category rules it carried or set aside
+    from .compat import as_dict
+    unfollow_rules(conn, as_dict(row["rules"]) if row["rules"] else None,
+                   row["raw_merchant"])
     return {"raw_merchant": row["raw_merchant"],
             "restored": row["from_canonical"]}
 
@@ -912,8 +1330,33 @@ def detail(conn, display: str) -> dict | None:
     return out
 
 
+# The catalog's sorts and filters. A filter or sort cut on the client from
+# a capped page would silently lose every match past the cap, so both run
+# here, before the LIMIT.
+LISTING_SORTS = ("count", "alpha", "spend", "recent")
+LISTING_FILTERS = ("all", "oneoff", "unnamed", "month")
+# a name the aggregator never resolved: a run of three digits, a terminal's
+# * or #, or an all-caps string of four letters or more that no one would
+# write as a name — the same test the merchant screens apply
+_UNNAMED_SQL = (f"({DISPLAY_MERCHANT} ~ '[0-9]{{3,}}|[*#]' OR "
+                f"({DISPLAY_MERCHANT} ~ '[A-Z]{{4,}}' AND "
+                f"{DISPLAY_MERCHANT} = upper({DISPLAY_MERCHANT})))")
+_LISTING_ORDER = {
+    # ordinals: 1 = display, 2 = the personal row count, 3 = the personal
+    # total, 6 = last seen; the name breaks every tie so paging with an
+    # offset never repeats or skips a merchant
+    "count": "2 DESC, 1 ASC",
+    "alpha": "1 ASC",
+    "spend": "3 DESC, 1 ASC",
+    "recent": "6 DESC NULLS LAST, 1 ASC",
+}
+_MAX_OFFSET = 10_000_000
+
+
 def listing(conn, q: str = "", limit: int = 200,
-            order: str = "count") -> list[dict]:
+            order: str = "count", *, sort: str | None = None,
+            filter: str = "all", offset: int = 0,
+            today: dt.date | None = None) -> list[dict]:
     """Merchants as the ledger shows them: name, how many rows, how much,
     and the raw strings feeding each — the variants are the whole point,
     since a merchant looking wrong is usually several strings underneath.
@@ -930,10 +1373,19 @@ def listing(conn, q: str = "", limit: int = 200,
     `order`: "count" (busiest first, the default) or "alpha" — the catalog
     is capped, and under count-order the cap cuts exactly the long-tail
     merchants most likely to need correction, so the screen needs a way to
-    walk the tail. A search (`q`) filters BEFORE the limit, so matches are
-    never starved by the cap."""
-    if order not in ("count", "alpha"):
-        raise ValueError("order must be 'count' or 'alpha'")
+    walk the tail. `sort` supersedes it when given and also takes "spend"
+    (personal total, largest first) and "recent" (last seen, newest
+    first). `filter`: "all", "oneoff" (one personal row), "unnamed" (a
+    bank string for a name, see _UNNAMED_SQL) or "month" (seen on or after
+    the first of the household's current month; `today` overrides the
+    household's day). `offset` pages past the cap. The search (`q`), the
+    filter and the sort all apply BEFORE the limit, so matches are never
+    starved by the cap."""
+    key = sort if sort is not None else order
+    if key not in LISTING_SORTS:
+        raise ValueError("sort must be one of " + ", ".join(LISTING_SORTS))
+    if filter not in LISTING_FILTERS:
+        raise ValueError("filter must be one of " + ", ".join(LISTING_FILTERS))
     args: list = []
     # Every merchant is LISTED, business-only ones included: the catalog must
     # never hide a name that `rename` can still reach, or the screen offers no
@@ -946,7 +1398,8 @@ def listing(conn, q: str = "", limit: int = 200,
     # NULL when the session vars are unset, and a WHERE drops NULL rows, so
     # COALESCE(..., false) is what makes it mean the same thing inside FILTER.
     personal = f"COALESCE(true {budget.PERSONAL_ONLY_SQL}, false)"
-    where = ""
+    conds: list[str] = []
+    having = ""
     if q.strip():
         # The search text is literal text, not a pattern: escape LIKE's
         # wildcards so searching "%" finds merchants containing a percent
@@ -954,13 +1407,25 @@ def listing(conn, q: str = "", limit: int = 200,
         # default LIKE escape character.
         esc = (q.strip().replace("\\", "\\\\")
                .replace("%", "\\%").replace("_", "\\_"))
-        where = f"WHERE {DISPLAY_MERCHANT} ILIKE %s"
+        conds.append(f"{DISPLAY_MERCHANT} ILIKE %s")
         args.append(f"%{esc}%")
+    if filter == "unnamed":
+        conds.append(_UNNAMED_SQL)
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
+    # the aggregate filters read the grouped figures, after the WHERE
+    if filter == "oneoff":
+        having = "HAVING sum(t.n_personal) = 1"
+    elif filter == "month":
+        if today is None:
+            from .. import localtime
+            today = localtime.now_local(budget.load_config(conn)).date()
+        having = "HAVING max(t.last_seen) >= %s"
+        args.append(today.replace(day=1))
     args.append(max(1, min(int(limit), 500)))
+    args.append(max(0, min(int(offset), _MAX_OFFSET)))
     # Ordinals, because the sort keys are the aliased aggregates and `rows`
-    # is a keyword in Postgres: 1 = display, 2 = the personal row count. The
-    # name breaks count ties so paging the cap is deterministic.
-    order_sql = "1 ASC" if order == "alpha" else "2 DESC, 1 ASC"
+    # is a keyword in Postgres (see _LISTING_ORDER).
+    order_sql = _LISTING_ORDER[key]
     # Variants are capped at 50 per merchant: a payee with thousands of raw
     # strings (Mint amount-embedding descriptors) would otherwise bloat the
     # payload, and past 50 the list stops informing anyone. `variant_count`
@@ -1014,4 +1479,5 @@ def listing(conn, q: str = "", limit: int = 200,
               FROM t {MC_JOIN}
               LEFT JOIN merchants pm ON pm.id = mm.parent_id
              {where}
-             GROUP BY 1 ORDER BY {order_sql} LIMIT %s""", args).fetchall()
+             GROUP BY 1 {having}
+             ORDER BY {order_sql} LIMIT %s OFFSET %s""", args).fetchall()

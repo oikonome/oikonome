@@ -13,7 +13,8 @@ import { patchList, patchQuery } from "../lib/cache";
 import { useSession } from "../lib/session";
 import { useViewer } from "../lib/viewer";
 import { C } from "../lib/theme";
-import { catLabel } from "../lib/pure";
+import { billToggleNote, cadenceChoices, catLabel, missedBillPill }
+  from "../lib/pure";
 import { errText, takeBillPrefill } from "../lib/api";
 
 export default function BillEdit() {
@@ -31,6 +32,15 @@ export default function BillEdit() {
     enabled: !!client && !!payee,
   });
   const d = query.data;
+  // this month's state rides on the Bills list row the screen was opened
+  // from; a missed bill whose charge the bank feed withdrew says so here —
+  // this month's occurrence first, else the earlier cycle behind a
+  // "withdrawn" health verdict (the row's amber pill)
+  const listRow = qc.getQueryData<BillsData>(["bills"])?.bills
+    .find((b) => b.payee === String(payee));
+  const withdrawnNote = missedBillPill(
+    listRow?.withdrawn_on
+    || (listRow?.health === "withdrawn" ? listRow.health_withdrawn_on : null)).note;
   const [name, setName] = useState("");
   const [amount, setAmount] = useState("");
   const [cadence, setCadence] = useState("");
@@ -84,10 +94,16 @@ export default function BillEdit() {
       .filter((c) => !flow.has(c));
   }, [cats.data]);
   const [err, setErr] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
   // seed once per payee, and never again — `d` re-renders on every
   // refetch (focusManager refetches on app-foreground), and reseeding
   // from it would silently revert whatever the user had typed since
   const seededPayee = useRef<string | null>(null);
+  // the due date the stored bill had when the form was seeded: a save
+  // sends next_due only when the field differs from it, so an amount or
+  // name edit leaves the date to the server, which may have rolled it on
+  // since this copy was read
+  const seededDue = useRef("");
   useEffect(() => {
     if (!d || seededPayee.current === payee) return;
     seededPayee.current = String(payee);
@@ -95,6 +111,7 @@ export default function BillEdit() {
     setName(d.payee);
     setAmount(fit?.amount || String(d.amount));
     setCadence(fit?.cadence || d.cadence);
+    seededDue.current = d.next_due ?? "";
     setNextDue(fit?.next_due || (d.next_due ?? ""));
     setCap(d.cap !== null ? String(d.cap) : "");
     setCategory(d.category ?? "");
@@ -114,7 +131,7 @@ export default function BillEdit() {
   // (it shows the amount and health just changed) and this form's own
   // source, which a reopen within the stale window would re-seed from
   // the pre-save copy. A rename or a delete drops that copy outright.
-  const done = (o: { gone?: boolean; renamedTo?: string } = {}) => {
+  const refreshAround = (o: { gone?: boolean; renamedTo?: string } = {}) => {
     qc.invalidateQueries({ queryKey: ["bills"], refetchType: "none" });
     qc.invalidateQueries({ queryKey: ["calendar"], refetchType: "none" });
     qc.invalidateQueries({ queryKey: ["today"], refetchType: "none" });
@@ -124,6 +141,9 @@ export default function BillEdit() {
     else qc.invalidateQueries({ queryKey: ["bill", payee] });
     if (o.renamedTo && o.renamedTo !== payee)
       qc.invalidateQueries({ queryKey: ["payee-history", o.renamedTo] });
+  };
+  const done = (o: { gone?: boolean; renamedTo?: string } = {}) => {
+    refreshAround(o);
     router.back();
   };
   const save = useMutation({
@@ -131,7 +151,9 @@ export default function BillEdit() {
     // occurrence edit can never strip detection's category from the row
     mutationFn: () => client!.billsSave({
       payee: name.trim() || d!.payee, orig_payee: d!.payee,
-      amount, cadence, next_due: nextDue || undefined,
+      amount, cadence,
+      ...(nextDue && nextDue !== seededDue.current
+        ? { next_due: nextDue } : {}),
       income: d!.income,
       ...(cadence !== "ENVELOPE:1"
         ? { cap: cap === "" ? null : cap } : {}),
@@ -154,7 +176,9 @@ export default function BillEdit() {
         const amt = Number(amount);
         patchQuery<BillDetail>(qc, ["bill", payee], {
           amount: Number.isFinite(amt) ? amt : d!.amount, cadence,
-          next_due: nextDue, show_today: showToday, txn_category: txnCat,
+          ...(nextDue && nextDue !== seededDue.current
+            ? { next_due: nextDue } : {}),
+          show_today: showToday, txn_category: txnCat,
           ...(isEnv ? { category: category.trim() || null,
                         match_category: matchCat && !!category.trim() }
                     : { cap: cap === "" ? null : Number(cap) }) });
@@ -162,19 +186,27 @@ export default function BillEdit() {
         qc.setQueriesData<BillsHistoryData>({ queryKey: ["payee-history", payee] },
           (old) => old && old.bill ? { ...old, bill: { ...old.bill,
             amount: Number.isFinite(amt) ? amt : old.bill.amount,
-            cadence, due_on: nextDue || null } } : old);
+            cadence,
+            ...(nextDue && nextDue !== seededDue.current
+              ? { due_on: nextDue } : {}) } } : old);
       }
       done({ renamedTo: r.payee });
     },
     onError: (e) => setErr(errText(e)),
   });
+  // The button sends the state it offered, so a screen gone stale under
+  // another member's change cannot flip the bill back. The person stays
+  // here and sees the state the server settled on — returning to the list
+  // in silence hid the outcome.
   const toggle = useMutation({
-    mutationFn: () => client!.billsToggle(d!.payee),
+    mutationFn: (disabled: boolean) => client!.billsToggle(d!.payee, disabled),
+    onMutate: () => { setErr(null); setNote(null); },
     onSuccess: (r) => {
       patchQuery<BillDetail>(qc, ["bill", payee], { disabled: r.disabled });
       patchList<BillsData, Bill>(qc, ["bills"], "bills",
         (b) => b.payee === d!.payee, { disabled: r.disabled });
-      done();
+      setNote(billToggleNote(r.disabled));
+      refreshAround();
     },
     onError: (e) => setErr(errText(e)),
   });
@@ -191,8 +223,9 @@ export default function BillEdit() {
        onPress: () => del.mutate("purge") },
      { text: "Cancel", style: "cancel" }]);
   // one destructive write at a time — a slow request invites a second
-  // click (double purge; double toggle silently nets to no change)
-  const busy = toggle.isPending || del.isPending;
+  // click (double purge; double toggle silently nets to no change), and a
+  // save racing an archive could bring the bill straight back
+  const busy = save.isPending || toggle.isPending || del.isPending;
 
   return (
     <ScrollView style={s.wrap} contentContainerStyle={{ paddingBottom: 24 }}>
@@ -207,6 +240,11 @@ export default function BillEdit() {
         <>
           <Card>
             <H>{d.payee}</H>
+            {withdrawnNote ? (
+              <Text style={{ color: C.warn, fontSize: 12, marginBottom: 6 }}>
+                {withdrawnNote}
+              </Text>
+            ) : null}
             <Text style={s.lbl}>
               Payee (renaming changes ledger matching)
             </Text>
@@ -216,13 +254,11 @@ export default function BillEdit() {
                        keyboardType="decimal-pad" />
             <Text style={s.lbl}>Cadence</Text>
             <View style={s.cadRow}>
-              {/* a ledger-fit prefill may carry a cadence outside the
-                  standard list — keep it visible and selected */}
-              {[...d.cadences,
-                ...(cadence && !d.cadences.some(([k]) => k === cadence)
-                  ? [[cadence, cadence.toLowerCase().replace(":", " × ")] as
-                      [string, string]]
-                  : [])].map(([key, label]) => (
+              {/* the bill's saved interval and a ledger-fit prefill may
+                  sit outside the standard list — keep both pickable, so
+                  trying another chip never loses the bill's own cadence */}
+              {cadenceChoices(d.cadences, [d.cadence, cadence])
+                .map(([key, label]) => (
                 <Pressable key={key}
                            style={[s.cad, cadence === key && s.cadOn]}
                            onPress={() => setCadence(key)}>
@@ -381,18 +417,22 @@ export default function BillEdit() {
               <Text style={{ color: C.bad, fontSize: 12 }}
                     onPress={() => setErr(null)}>{err}</Text>
             ) : null}
+            {note ? (
+              <Text style={{ color: C.mut, fontSize: 12 }}
+                    onPress={() => setNote(null)}>{note}</Text>
+            ) : null}
             {!viewer && (<>
             <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8,
                            marginTop: 12 }}>
-              <Pressable style={[s.btn, save.isPending && { opacity: 0.5 }]}
-                         disabled={save.isPending}
+              <Pressable style={[s.btn, busy && { opacity: 0.5 }]}
+                         disabled={busy}
                          onPress={() => save.mutate()}>
                 <Text style={s.btnText}>Save</Text>
               </Pressable>
               <Pressable style={[s.btn, s.btnQuiet,
                            busy && { opacity: 0.5 }]}
                          disabled={busy}
-                         onPress={() => toggle.mutate()}>
+                         onPress={() => toggle.mutate(!d.disabled)}>
                 <Text style={[s.btnText, { color: d.disabled
                                 ? C.good : C.warn }]}>
                   {d.disabled ? "Enable" : "Disable"}

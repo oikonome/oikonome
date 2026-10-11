@@ -106,6 +106,32 @@ class PushRegistrationTests(unittest.TestCase):
             r = bare.post("/api/devices/push", headers=hdr, json=bad)
             self.assertEqual(r.status_code, 400, bad)
 
+    def test_the_phone_count_the_clients_read_matches_who_push_reaches(self):
+        """Both apps offer the push setting when the notify status counts a
+        registered phone. A phone the delivery fan-out skips — the shared
+        demonstration login's — must not be counted, or the setting is
+        shown live and saves, and nothing is ever delivered."""
+        from oikonome.auth import device_tokens as dt_mod
+        before = self.client.get("/api/notify").json()["native_push_devices"]
+        admin = tenancy.admin_connect()
+        try:
+            shared_uid = admin.execute(
+                """INSERT INTO users (tenant_id, email, password_hash, role,
+                                      second_factor_waived)
+                   VALUES (%s, %s, 'x', 'member', TRUE) RETURNING id""",
+                (self.tid, f"shared-{uuid.uuid4().hex[:8]}@example.dev"),
+                ).fetchone()["id"]
+            _, row = dt_mod.mint(admin, shared_uid, self.tid, "visitor")
+            dt_mod.set_push(admin, shared_uid, row["id"],
+                            f"fcm-visitor-{uuid.uuid4().hex}", "fcm")
+            admin.commit()
+            reached = len(dt_mod.push_targets(admin, self.tid))
+        finally:
+            admin.close()
+        after = self.client.get("/api/notify").json()["native_push_devices"]
+        self.assertEqual(after, before)
+        self.assertEqual(after, reached)
+
     def test_push_state_is_visible_to_the_web_settings_surfaces(self):
         """The web app can only offer a native test-push (and explain a
         broken one) if the devices list and the notify status expose the
@@ -150,6 +176,29 @@ class PushRegistrationTests(unittest.TestCase):
         self.assertNotIn("sign in", r.json()["detail"])
         # cleanup: clear the push registration for other tests
         bare.post("/api/devices/push", headers=hdr, json={"token": None})
+
+    def test_a_relay_refusal_is_what_the_test_push_says(self):
+        """When the relay refuses a registered phone (held by another
+        server, rate-limited) the test-push answer carries that reason —
+        never advice to enable push on a phone that already has."""
+        minted, bare, hdr = self._device("held-elsewhere")
+        r = bare.post("/api/devices/push", headers=hdr,
+                      json={"token": "held-token-" + "h" * 20,
+                            "platform": "fcm"})
+        self.assertEqual(r.status_code, 200, r.text)
+        try:
+            for status, words in ((403, "another"), (429, "rate")):
+                relay = _RelayCapture({"detail": "no"}, status=status)
+                with mock.patch.dict(os.environ, {
+                        "OIKONOME_PUSH_RELAY_URL": "https://relay.example"}), \
+                     mock.patch("httpx.post", relay):
+                    r = self.client.post("/api/notify/test",
+                                         json={"channel": "push"})
+                self.assertEqual(r.status_code, 400, r.text)
+                self.assertIn(words, r.json()["detail"], status)
+                self.assertNotIn("enable push", r.json()["detail"], status)
+        finally:
+            bare.post("/api/devices/push", headers=hdr, json={"token": None})
 
     def test_revoking_the_device_silences_its_push(self):
         minted, bare, hdr = self._device("doomed")
@@ -233,6 +282,33 @@ class PushNativeChannelTests(unittest.TestCase):
                 0)
             self.assertEqual([t["push_token"] for t in
                               dt_mod.push_targets(admin, other_tid)], [token])
+        finally:
+            admin.close()
+
+    def test_the_shared_demonstration_logins_phone_gets_no_push(self):
+        """A token the shared demonstration login registered before the
+        register door refused it still sits on its device row. Every
+        visitor holds that login, so its phone is whoever's last planted
+        it — never a destination for the household's notices — while an
+        owner's registered phone in the same household still is."""
+        from oikonome.auth import device_tokens as dt_mod
+        admin = tenancy.admin_connect()
+        try:
+            shared_uid = admin.execute(
+                """INSERT INTO users (tenant_id, email, password_hash, role,
+                                      second_factor_waived)
+                   VALUES (%s, %s, 'x', 'member', TRUE) RETURNING id""",
+                (self.tid, f"shared-{uuid.uuid4().hex[:8]}@example.dev"),
+                ).fetchone()["id"]
+            _, row = dt_mod.mint(admin, shared_uid, self.tid, "visitor")
+            shared_token = f"fcm-visitor-{uuid.uuid4().hex}"
+            dt_mod.set_push(admin, shared_uid, row["id"], shared_token, "fcm")
+            owner_token = f"fcm-owner-{uuid.uuid4().hex}"
+            self._add_device_with_push(admin, owner_token)
+            targets = [t["push_token"]
+                       for t in dt_mod.push_targets(admin, self.tid)]
+            self.assertNotIn(shared_token, targets)
+            self.assertIn(owner_token, targets)
         finally:
             admin.close()
 
@@ -325,7 +401,7 @@ class PushNativeChannelTests(unittest.TestCase):
                     push_native.send_tenant(conn, self.tid, event, text=text)
                 return capture.calls[0]["json"]["notifications"][0]
 
-            self.assertNotIn("text", sent("weekly", "UNDER budget"))
+            self.assertNotIn("text", sent("monthly", "UNDER budget"))
             self.assertNotIn("text", sent("alert", "Rent is late"))
             self.assertNotIn("text", sent("daily", "OVER budget by $9",
                                           OIKONOME_PUSH_CONTENT_FREE="1"))
@@ -406,6 +482,41 @@ class PushNativeChannelTests(unittest.TestCase):
                  mock.patch("httpx.post", boom):
                 self.assertEqual(
                     push_native.send_tenant(conn, self.tid, "daily"), 0)
+        finally:
+            conn.close()
+
+    def test_a_relay_refusal_reaches_the_test_door_as_its_reason(self):
+        """A non-200 from the relay used to read as 'no live push
+        subscription', so the owner was told to sign in from the phone
+        they were holding. The detail names what the relay said, and a
+        partly refused batch says how many devices were held back."""
+        from oikonome.notify import push_native
+        conn = tenancy.control_connect()
+        try:
+            self._add_device_with_push(conn, f"held-{uuid.uuid4().hex}")
+            for status, words in ((403, "another"), (429, "rate"),
+                                  (401, "key"), (502, "502")):
+                detail: dict = {}
+                capture = _RelayCapture({"detail": "no"}, status=status)
+                with mock.patch.dict(os.environ, {
+                        "OIKONOME_PUSH_RELAY_URL": "https://relay.example"}), \
+                     mock.patch("httpx.post", capture):
+                    n = push_native.send_tenant(conn, self.tid, "test",
+                                                detail=detail)
+                self.assertEqual(n, 0)
+                self.assertTrue(detail.get("unavailable"), status)
+                self.assertIn(words, detail.get("reason", ""), status)
+            # a batch the relay delivered in part says how many it held back
+            detail = {}
+            capture = _RelayCapture({"sent": 1, "dead": [], "unavailable": [],
+                                     "refused": ["held-token-xyz"]})
+            with mock.patch.dict(os.environ, {
+                    "OIKONOME_PUSH_RELAY_URL": "https://relay.example"}), \
+                 mock.patch("httpx.post", capture):
+                n = push_native.send_tenant(conn, self.tid, "test",
+                                            detail=detail)
+            self.assertEqual(n, 1)
+            self.assertEqual(detail.get("refused"), 1)
         finally:
             conn.close()
 

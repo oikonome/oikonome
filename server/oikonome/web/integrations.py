@@ -28,6 +28,7 @@ by the same function, from the same gather the daily email renders.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import logging
 import math
@@ -41,7 +42,7 @@ from ..db import tenancy
 from ..engine import budget, links, reporting
 from ..engine.compat import as_date
 from ..notify import webhooks
-from . import data, demoguard
+from . import data, demoguard, security
 from .security import limit
 
 router = APIRouter()
@@ -565,7 +566,12 @@ def webhooks_list_api(user: dict = Depends(_user())):
     _owner_session(user)
     conn = _conn(user)
     try:
-        return {"webhooks": webhooks.list_hooks(conn),
+        hooks = webhooks.list_hooks(conn)
+        # created_by is the address of the member who added the hook
+        for h in hooks:
+            h["created_by"] = demoguard.own_address_only(
+                user, h.get("created_by"))
+        return {"webhooks": hooks,
                 "events": [{"name": k, "description": v}
                            for k, v in webhooks.EVENTS.items()]}
     finally:
@@ -578,29 +584,58 @@ def webhooks_create_api(user: dict = Depends(_user()), body: dict = Body(...)):
     A webhook sends the household's balances and rows to a URL, so it is
     a step-up act like minting a token: a hijacked cookie alone must not
     be able to point the ledger at a stranger's server."""
-    demoguard.deny(user)
+    demoguard.deny_shared_grant(user)
     _owner_session(user)
-    from .app import _require_elevation
+    _destination_budget(user)
+    from .app import _require_elevation, _still_signed_in_under_factor_lock
     _require_elevation(user, password=str(body.get("password") or ""),
                        totp_code=str(body.get("totp_code") or ""),
                        recovery_code=str(body.get("recovery_code") or ""))
+    url = str(body.get("url") or "")
+    events = body.get("events") or []
+    # Validated here, with nothing held: checking the URL resolves a
+    # hostname the caller chose, which can take the whole lookup deadline,
+    # and the block below holds the account's factor lock on a pooled
+    # control connection. The write repeats the check there from the
+    # answer this one cached.
+    try:
+        url = webhooks._check_url(url)
+        webhooks.normalize_events(events)
+    except webhooks.WebhookError as e:
+        raise HTTPException(400, str(e))
     conn = _conn(user)
     try:
-        try:
-            row, secret = webhooks.create(
-                conn, url=str(body.get("url") or ""),
-                events=body.get("events") or [],
-                name=str(body.get("name") or ""),
-                created_by=str(user.get("email") or ""),
-                created_by_user=user["user_id"])
-        except webhooks.WebhookError as e:
-            raise HTTPException(400, str(e))
+        # a reset landing during the step-up pauses every hook the account
+        # made; one created after it would post the ledger with no session
+        # behind it, so the row is written under the reset's own lock
+        with _still_signed_in_under_factor_lock(user):
+            try:
+                row, secret = webhooks.create(
+                    conn, url=url, events=events,
+                    name=str(body.get("name") or ""),
+                    created_by=str(user.get("email") or ""),
+                    created_by_user=user["user_id"])
+            except webhooks.WebhookError as e:
+                raise HTTPException(400, str(e))
         return {**row, "secret": secret}
     finally:
         conn.close()
 
 
-@router.post("/api/webhooks/{hook_id}")
+def _destination_budget(user: dict) -> None:
+    """Pointing the ledger somewhere new — a new hook, a new URL, a hook
+    switched back on — is budgeted per account as well as per address:
+    each one resolves a hostname the caller picked and then takes the
+    account's factor lock, and an owner rotating client addresses must
+    not be able to keep those coming without end."""
+    if not security._account_limit(("webhook_destination",
+                                    str(user["user_id"])), 20, 3600):
+        raise HTTPException(429, "too many webhook changes — try again "
+                                 "later")
+
+
+@router.post("/api/webhooks/{hook_id}",
+             dependencies=[Depends(limit("webhooks_update", 60, 3600))])
 def webhooks_update_api(hook_id: str, user: dict = Depends(_user()),
                         body: dict = Body(...)):
     """Edit: url, events, name, enabled. A new URL is a new destination
@@ -617,21 +652,37 @@ def webhooks_update_api(hook_id: str, user: dict = Depends(_user()),
     hid = _hook_id(hook_id)
     url = body.get("url")
     enabled = _enabled_flag(body)
+    guard = contextlib.nullcontext()
     if url is not None or enabled is True:
-        from .app import _require_elevation
+        # a new or resumed destination is a durable channel, which the
+        # shared demonstration login may not open (demoguard)
+        demoguard.deny_shared_grant(user)
+        _destination_budget(user)
+        from .app import _require_elevation, _still_signed_in_under_factor_lock
         _require_elevation(user, password=str(body.get("password") or ""),
                            totp_code=str(body.get("totp_code") or ""),
                            recovery_code=str(body.get("recovery_code") or ""))
+        if url is not None:
+            # resolved now, with nothing held — see webhooks_create_api
+            try:
+                url = webhooks._check_url(str(url))
+            except webhooks.WebhookError as e:
+                raise HTTPException(400, str(e))
+        # the same race as creation: a reset during the step-up pauses the
+        # hook, and a resume or a new URL written after it must not stand
+        guard = _still_signed_in_under_factor_lock(user)
     conn = _conn(user)
     try:
-        try:
-            row = webhooks.update(
-                conn, hid, url=(str(url) if url is not None else None),
-                events=body.get("events"),
-                name=(str(body["name"]) if "name" in body else None),
-                enabled=enabled)
-        except webhooks.WebhookError as e:
-            raise HTTPException(404 if "no such" in str(e) else 400, str(e))
+        with guard:
+            try:
+                row = webhooks.update(
+                    conn, hid, url=(str(url) if url is not None else None),
+                    events=body.get("events"),
+                    name=(str(body["name"]) if "name" in body else None),
+                    enabled=enabled)
+            except webhooks.WebhookError as e:
+                raise HTTPException(404 if "no such" in str(e) else 400,
+                                    str(e))
         return row
     finally:
         conn.close()
@@ -651,7 +702,7 @@ def _enabled_flag(body: dict) -> bool | None:
 
 @router.post("/api/webhooks/{hook_id}/delete")
 def webhooks_delete_api(hook_id: str, user: dict = Depends(_user())):
-    demoguard.deny(user)
+    demoguard.deny_shared_grant(user)
     _owner_session(user)
     hid = _hook_id(hook_id)
     conn = _conn(user)
@@ -667,7 +718,7 @@ def webhooks_delete_api(hook_id: str, user: dict = Depends(_user())):
 def webhooks_rotate_api(hook_id: str, user: dict = Depends(_user()),
                         body: dict = Body(default={})):
     """A fresh signing secret, shown once. Step-up, like creation."""
-    demoguard.deny(user)
+    demoguard.deny_shared_grant(user)
     _owner_session(user)
     hid = _hook_id(hook_id)
     from .app import _require_elevation
@@ -689,7 +740,7 @@ def webhooks_rotate_api(hook_id: str, user: dict = Depends(_user()),
              dependencies=[Depends(limit("webhooks_test", 30, 3600))])
 def webhooks_test_api(hook_id: str, user: dict = Depends(_user())):
     """Send a test.ping now and report what the receiver said."""
-    demoguard.deny(user)
+    demoguard.deny_shared_grant(user)
     _owner_session(user)
     hid = _hook_id(hook_id)
     # The attempt waits on a stranger's server for up to the send deadline;

@@ -95,7 +95,9 @@ class MissingVersusBrokenTests(unittest.TestCase):
                         _lock_timeout):
             r = self.owner.post(f"/api/receipts/{rid}/match",
                                 json={"txn_id": self.txn})
-        self.assertGreaterEqual(r.status_code, 500, r.text)
+        # a held lock is reported as busy (409) or as a failure, never as
+        # a receipt that does not exist
+        self.assertIn(r.status_code, (409, 500, 503), r.text)
 
     def test_a_lock_timeout_while_unpairing_is_not_a_missing_receipt(self):
         rid = self._snap()
@@ -105,7 +107,9 @@ class MissingVersusBrokenTests(unittest.TestCase):
         with mock.patch("oikonome.engine.receipt_match.unmatch",
                         _lock_timeout):
             r = self.owner.post(f"/api/receipts/{rid}/unmatch")
-        self.assertGreaterEqual(r.status_code, 500, r.text)
+        # a held lock is reported as busy (409) or as a failure, never as
+        # a receipt that does not exist
+        self.assertIn(r.status_code, (409, 500, 503), r.text)
         # nothing moved: the receipt is still on its charge
         on = self.owner.get(f"/api/transactions/{self.txn}/receipts").json()
         self.assertIn(rid, [x["id"] for x in on["receipts"]])

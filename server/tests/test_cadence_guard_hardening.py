@@ -43,16 +43,16 @@ class CadenceGuardTests(unittest.TestCase):
     def test_a_malformed_hour_skips_that_cadence_only(self):
         self._cfg(email_schedule={
             "daily": {"on": True, "hour": "x"},
-            "weekly": {"on": True, "hour": 7, "weekday": 2}})
+            "monthly": {"on": True, "hour": 7}})
         with mock.patch.dict("os.environ", {"OIKONOME_TZ": "UTC"}):
-            # 2026-07-15 is a Wednesday (weekday 2): weekly is due, the
-            # broken daily is skipped, and nothing raises
+            # 2026-07-01 is the 1st: monthly is due, the broken daily is
+            # skipped, and nothing raises
             self.assertEqual(
-                worker.emails_due(self.conn, _utc(2026, 7, 15, 9)), ["weekly"])
+                worker.emails_due(self.conn, _utc(2026, 7, 1, 9)), ["monthly"])
 
-    def test_an_out_of_range_weekday_never_fires(self):
+    def test_a_retired_weekly_entry_never_fires(self):
         self._cfg(email_schedule={"weekly": {"on": True, "hour": 7,
-                                             "weekday": 9}})
+                                             "weekday": 2}})
         with mock.patch.dict("os.environ", {"OIKONOME_TZ": "UTC"}):
             self.assertEqual(
                 worker.emails_due(self.conn, _utc(2026, 7, 15, 9)), [])

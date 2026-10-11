@@ -239,17 +239,54 @@ class DemoGeneratorTests(unittest.TestCase):
         back as personal bill or income proposals: the personal-only filter
         has to see the assignment made moments earlier, not the empty
         entity set stamped when the connection was checked out."""
-        biz = {r["n"].lower() for r in self.conn.execute(
-            "SELECT DISTINCT COALESCE(merchant_name, name) AS n "
-            "FROM transactions WHERE account_id = 'demo-biz'").fetchall()
-            if r["n"]}
+        # The household also buys from some of the business's vendors on
+        # its personal cards, and those personal purchases may well recur
+        # (which ones do depends on the calendar the household is generated
+        # against). So the invariant is read off the evidence: no proposal
+        # for a payee only the business pays, and no proposal whose evidence
+        # stands on a business-account charge.
+        def payees(where):
+            return {r["n"].lower() for r in self.conn.execute(
+                "SELECT DISTINCT COALESCE(merchant_name, name) AS n "
+                f"FROM transactions WHERE removed = 0 AND {where}").fetchall()
+                if r["n"]}
+        biz = payees("account_id = 'demo-biz'")
         self.assertTrue(biz)
-        proposed = [r["payee"] for r in self.conn.execute(
-            "SELECT payee FROM bill_proposals WHERE status = 'pending'")
-            .fetchall()]
-        leaked = [p for p in proposed
-                  if p and any(p.lower() in b or b in p.lower()
-                               for b in biz)]
+        biz_only = biz - payees("account_id <> 'demo-biz'")
+        self.assertTrue(biz_only)
+
+        def personal(payee):
+            by_day: dict = {}
+            by_month: dict = {}
+            for r in self.conn.execute(
+                    "SELECT date, amount FROM transactions"
+                    " WHERE removed = 0 AND account_id <> 'demo-biz'"
+                    " AND lower(COALESCE(merchant_name, name)) = %s",
+                    (payee.lower(),)).fetchall():
+                by_day[r["date"].isoformat()] = True
+                m = r["date"].strftime("%Y-%m")
+                by_month[m] = by_month.get(m, 0.0) + float(r["amount"])
+            return by_day, by_month
+
+        leaked = []
+        for r in self.conn.execute(
+                "SELECT payee, evidence FROM bill_proposals"
+                " WHERE status = 'pending'").fetchall():
+            p = (r["payee"] or "").lower()
+            if not p:
+                continue
+            if any(p in b or b in p for b in biz_only):
+                leaked.append(r["payee"])
+                continue
+            if p not in biz:
+                continue
+            ev = r["evidence"] or {}
+            days, months = personal(p)
+            if any(d not in days for d in ev.get("dates") or []):
+                leaked.append(r["payee"])
+            if any(float(v) > months.get(m, 0.0) + 0.01
+                   for m, v in (ev.get("monthly_totals") or {}).items()):
+                leaked.append(r["payee"])
         self.assertEqual(leaked, [])
 
     def test_business_equity_matches_the_ledger(self):

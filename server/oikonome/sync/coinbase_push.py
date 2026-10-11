@@ -30,7 +30,7 @@ from __future__ import annotations
 import datetime as dt
 import math
 
-from ..engine.compat import as_date
+from ..engine.compat import MAX_AMOUNT, as_date, strip_nul
 from . import base
 
 MAX_ROWS = 20_000
@@ -70,6 +70,10 @@ def _money(value, what: str) -> float:
     # they would poison every sum the account appears in
     if not math.isfinite(num):
         raise ValueError(f"{what}: {value!r} is not a finite number")
+    # finite but past any real sum (1e308): every cents conversion of it
+    # downstream overflows
+    if abs(num) > MAX_AMOUNT:
+        raise ValueError(f"{what}: {value!r} is out of range")
     return num
 
 
@@ -80,10 +84,45 @@ def _money_or_none(value, what: str) -> float | None:
     return None if value is None else _money(value, what)
 
 
+def _text(value, what: str, *, required: bool = False) -> str | None:
+    """A name, type or category: a string, or null where it is optional.
+    Anything else reaches the INSERT as an object psycopg cannot store and
+    the push fails as a bare server error naming nothing; refused here it
+    is the 400 every other bad value in the payload gets."""
+    if value is None and not required:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{what}: must be a string")
+    return value
+
+
+def _obj(value, what: str) -> dict:
+    """`raw` is an object the importer reads keys from; absent is empty."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{what}: must be an object")
+    return value
+
+
+def _list_of_objects(value, what: str) -> list:
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(
+            isinstance(x, dict) for x in value):
+        raise ValueError(f"{what}: must be a list of objects")
+    return value
+
+
 def import_payload(conn, payload: dict) -> dict:
-    items = payload.get("items") or []
-    accounts = payload.get("accounts") or []
-    txns_in = payload.get("transactions") or []
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be an object")
+    # U+0000 cannot be stored in text or jsonb and means nothing in a
+    # collector's names; dropped once here for every id, name and raw
+    payload = strip_nul(payload)
+    items = _list_of_objects(payload.get("items"), "items")
+    accounts = _list_of_objects(payload.get("accounts"), "accounts")
+    txns_in = _list_of_objects(payload.get("transactions"), "transactions")
     if not accounts:
         raise ValueError("payload needs accounts")
     if len(txns_in) > MAX_ROWS:
@@ -93,9 +132,11 @@ def import_payload(conn, payload: dict) -> dict:
     # The prefix is DERIVED here, never read from the request.
     prefix = TXN_PREFIX
     acct_ids = [str(a["id"]) for a in accounts]
-    for iid in (str(it["id"]) for it in items):
+    for it in items:
+        iid = str(it["id"])
         if not iid.startswith(ITEM_PREFIX):
             raise ValueError(f"item id {iid!r} outside the coinbase namespace")
+        _text(it.get("institution_name"), f"item {iid} institution_name")
     for a in accounts:
         aid, a_item = str(a["id"]), str(a["item_id"])
         if not aid.startswith(ITEM_PREFIX):
@@ -149,25 +190,35 @@ def import_payload(conn, payload: dict) -> dict:
     # ValueError with nothing written, rather than a database error
     # somewhere in the middle of the batch.
     acct_rows = [(str(a["item_id"]), base.Account(
-        id=a["id"], name=a["name"], type=a["type"],
-        subtype=a.get("subtype"), mask=a.get("mask"),
+        id=str(a["id"]),
+        name=_text(a["name"], f"account {a['id']} name", required=True),
+        type=_text(a["type"], f"account {a['id']} type", required=True),
+        subtype=_text(a.get("subtype"), f"account {a['id']} subtype"),
+        mask=_text(a.get("mask"), f"account {a['id']} mask"),
         balance_current=_money_or_none(
             a.get("balance_current"), f"account {a['id']} balance_current"),
         balance_available=_money_or_none(
             a.get("balance_available"),
             f"account {a['id']} balance_available"),
-        currency=a.get("currency"), raw=a.get("raw") or {})) for a in accounts]
+        currency=_text(a.get("currency"), f"account {a['id']} currency"),
+        raw=_obj(a.get("raw"), f"account {a['id']} raw")))
+        for a in accounts]
     txns = [base.Transaction(
-        id=t["id"], account_id=t["account_id"],
+        id=str(t["id"]), account_id=str(t["account_id"]),
         # as_date refuses a year the app cannot read, as a ValueError the
         # route reports as a bad payload
         date=as_date(str(t["date"])[:10]),
         amount=_money(t.get("amount"), f"transaction {t['id']} amount"),
-        name=t["name"], merchant_name=t.get("merchant_name"),
+        name=_text(t["name"], f"transaction {t['id']} name", required=True),
+        merchant_name=_text(t.get("merchant_name"),
+                            f"transaction {t['id']} merchant_name"),
         pending=bool(t.get("pending")),
-        category_primary=t.get("category_primary"),
-        category_detailed=t.get("category_detailed"),
-        raw=t.get("raw") or {}) for t in txns_in]
+        category_primary=_text(t.get("category_primary"),
+                               f"transaction {t['id']} category_primary"),
+        category_detailed=_text(t.get("category_detailed"),
+                                f"transaction {t['id']} category_detailed"),
+        raw=_obj(t.get("raw"), f"transaction {t['id']} raw"))
+        for t in txns_in]
 
     before = counts()
     # One transaction for the whole push. The connection is autocommit,
@@ -181,6 +232,13 @@ def import_payload(conn, payload: dict) -> dict:
         # any row is written (see reanchor.hold_pairing_lock)
         from .reanchor import hold_pairing_lock
         hold_pairing_lock(conn)
+        # and then the merchant-identity lock the resolver inside
+        # upsert_transactions takes: pairing, then identity, then rows, the
+        # order every ledger writer keeps. Asked for after the rows, it would
+        # wait on a rename or the nightly split repair that holds identity
+        # and is itself waiting on a row this push has just restated.
+        from ..engine import merchant_identity
+        merchant_identity._lock_identity(conn)
         for it in items:
             # Stamp the honest source. aggregator='coinbase' (not
             # 'csv') so the item's origin is visible everywhere the value is
@@ -193,7 +251,7 @@ def import_payload(conn, payload: dict) -> dict:
                 "INSERT INTO items (id, aggregator, institution_name, status,"
                 " raw) VALUES (%s,'coinbase',%s,'archived','{}'::jsonb)"
                 " ON CONFLICT (tenant_id, id) DO NOTHING",
-                (it["id"], it.get("institution_name") or "Coinbase"))
+                (str(it["id"]), it.get("institution_name") or "Coinbase"))
         for item_id, account in acct_rows:
             base.upsert_accounts(conn, item_id, [account])
 

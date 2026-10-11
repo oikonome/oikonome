@@ -26,6 +26,7 @@ Two layers:
 
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 from ..envnum import env_flag
 import socket
@@ -54,6 +55,31 @@ _DNS_LOCKS: dict[str, threading.Lock] = {}
 _DNS_LOCKS_GUARD = threading.Lock()
 _DNS_POOL = ThreadPoolExecutor(max_workers=4,
                                thread_name_prefix="netguard-dns")
+_NO_LOOKUPS = threading.local()
+
+
+@contextlib.contextmanager
+def no_lookups():
+    """Inside this block a hostname is judged on what was already resolved
+    for it, and never sent to a nameserver.
+
+    It is for a check that has to be repeated while a lock is held. The
+    door validates the URL first, with nothing held, which resolves the
+    name and caches the answer; the write it then makes under the lock
+    validates again on its way to the database. That second look must not
+    be a network call: a nameserver the caller controls can take the full
+    lookup deadline, and a lock or a pooled connection held across it is
+    held for every request queued behind it. So the second look takes the
+    cached answer as it stands, even one whose short TTL lapsed while the
+    door queued for the lock, because it is the very answer the door
+    already checked; a name with no cached answer at all reads as
+    unresolvable, which every caller treats as a refusal on hosted."""
+    prev = getattr(_NO_LOOKUPS, "on", False)
+    _NO_LOOKUPS.on = True
+    try:
+        yield
+    finally:
+        _NO_LOOKUPS.on = prev
 
 
 class BlockedURL(ValueError):
@@ -70,6 +96,9 @@ def _resolved_ips(host: str) -> list[str]:
     refuses; the locality classifiers judge non-local, so the off-box SSN
     consent gate still fires). A timeout is the same as unresolvable: a
     non-answering nameserver must not be able to hold a request thread."""
+    if getattr(_NO_LOOKUPS, "on", False):
+        hit = _DNS_CACHE.get(host)
+        return hit[1] if hit is not None else []
     now = time.monotonic()
     hit = _DNS_CACHE.get(host)
     if hit is not None and hit[0] > now:

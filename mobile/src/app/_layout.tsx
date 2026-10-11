@@ -3,18 +3,20 @@ import { PersistQueryClientProvider } from "@tanstack/react-query-persist-client
 import { Stack, usePathname, useRouter } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import { useEffect, useState } from "react";
-import { AppState, Platform, View } from "react-native";
+import { AppState, Modal, Platform, View } from "react-native";
 import * as ScreenCapture from "expo-screen-capture";
 
 import ElevationModal from "../components/elevation-modal";
 import { LogosProvider } from "../components/merchant-avatar";
 import { ext } from "../ext";
-import { PINNED_SERVER_URL } from "../lib/api";
+import { PINNED_SERVER_URL, type Me } from "../lib/api";
 import { markLaunchConsumed, settleLaunch } from "../lib/launch";
 import { pushSupported } from "../lib/push";
+import { pushRoute, pushSentAt } from "../lib/pure";
 import { persistOptions, queryClient } from "../lib/query";
 import { SessionProvider, useSession } from "../lib/session";
 import { C, isDarkTheme } from "../lib/theme";
+import Unlock from "./unlock";
 
 /** Warm the tabs someone taps next while they read Today — a first tap
  *  on Bills/Accounts then paints from cache instead of a spinner. */
@@ -82,15 +84,24 @@ function Gate({ children }: { children: React.ReactNode }) {
     // a build pinned to one server skips the URL screen entirely
     if (phase === "setup" && !inSetup)
       router.replace(PINNED_SERVER_URL ? "/login" : "/connect");
-    else if (phase === "locked" && path !== "/unlock") router.replace("/unlock");
     else if (phase === "ready" && (inSetup || path === "/unlock"))
       router.replace("/");
   }, [phase, path, router]);
 
+  // The lock is drawn OVER the open screen rather than navigated to:
+  // replacing the route would unmount whatever the person was in the
+  // middle of, and the steps that send them to another app (copying a
+  // two-factor secret into an authenticator, a bank's sign-in tab) take
+  // longer than the lock's grace period, so they would come back to a
+  // fresh screen with that state gone. The token is still dropped and the
+  // cache frozen while locked (session.tsx), so nothing underneath can
+  // call out. A Modal, not a View, so it also sits above any sheet the
+  // screen had open; its close request is swallowed so Android Back
+  // cannot pop the stack hidden behind it.
+  const locked = phase === "locked";
   // the cover hides screens until the gate has steered — the navigator
   // stays mounted underneath it
-  const covered = phase === "loading" ||
-    (phase === "locked" && path !== "/unlock") ||
+  const covered = phase === "loading" || locked ||
     (phase === "ready" && !inFront);
   return (
     <View style={{ flex: 1 }}>
@@ -99,6 +110,10 @@ function Gate({ children }: { children: React.ReactNode }) {
         <View style={{ position: "absolute", top: 0, left: 0, right: 0,
                        bottom: 0, backgroundColor: C.bg }} />
       ) : null}
+      <Modal visible={locked} animationType="none" statusBarTranslucent
+             onRequestClose={() => {}}>
+        <Unlock />
+      </Modal>
     </View>
   );
 }
@@ -148,19 +163,23 @@ export default function RootLayout() {
       subs.push(N.addNotificationReceivedListener((n) => {
         refreshFor(String(n.request.content.data?.event ?? ""));
       }));
-      const onTap = (resp: { notification: { request: {
+      const onTap = (resp: { notification: { date?: number; request: {
         identifier: string; content: { data?: Record<string, unknown> } } } }) => {
         const id = resp.notification.request.identifier;
         if (handled.has(id)) return;
         handled.add(id);
-        const event = String(
-          resp.notification.request.content.data?.event ?? "");
+        const data = resp.notification.request.content.data;
+        const event = String(data?.event ?? "");
         markLaunchConsumed();   // the tap decides where the app opens
         refreshFor(event);
-        if (event === "alert") router.push("/alerts");
-        else if (event === "monthly") router.push("/month");
-        else if (event === "yearly") router.push("/year");
-        else router.navigate("/");
+        // a report push opens the period it reports on, dated from when it
+        // was sent rather than when it was tapped
+        // and on the household's clock, which the cached profile knows
+        const route = pushRoute(event, data,
+          pushSentAt(resp.notification.date),
+          queryClient.getQueryData<Me>(["me"])?.timezone);
+        if (route === "/") router.navigate("/");
+        else router.push(route as never);
       };
       subs.push(N.addNotificationResponseReceivedListener(onTap));
       // A tap that COLD-STARTED the process was delivered before any

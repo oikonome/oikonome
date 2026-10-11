@@ -33,6 +33,8 @@ def _run_https_off(env_text: str) -> dict[str, str]:
         shutil.copy(ROOT / "oikonome.sh", inst / "oikonome.sh")
         shutil.copy(ROOT / "scripts" / "version-stamp.sh",
                     inst / "scripts" / "version-stamp.sh")
+        shutil.copy(ROOT / "scripts" / "env-file.sh",
+                    inst / "scripts" / "env-file.sh")
         (inst / "scripts" / "check-prereqs.sh").write_text(
             "require_prereqs() { COMPOSE=true; ENGINE=true; }\n")
         envf = inst / "docker" / ".env"

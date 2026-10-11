@@ -41,10 +41,14 @@
   </form>
   {% endif %}
   {# export is a data-touching action — audited; the console
-     shows the tenant's support-consent state next to it #}
+     shows the tenant's support-consent state next to it. A copy that has
+     left the instance cannot be called back, so with an operator key
+     enrolled it takes a fresh passkey assertion like a purge does. #}
   <form method="post" action="/admin/console/tenant-export" style="display:inline;margin:0"
+        {% if passkeys_enrolled %}data-admin-stepup{% endif %}
         data-confirm="Export this tenant's data to a downloadable archive? This is a data-access action and is audited.">
     <input type="hidden" name="tenant_id" value="{{ tenant.id }}">
+    <input type="hidden" name="stepup" value="">
     <button style="font-size:12px">export data ⭳</button>
   </form>
   {% if tenant.status in (frozen_statuses or []) %}
@@ -54,12 +58,16 @@
     <button style="font-size:12px">{{ 'restore (cancel deletion)' if tenant.status == 'pending_delete' else 'reactivate' }}</button>
   </form>
   {% else %}
-  {# grace delete (default) — freezes now, purges after the window #}
+  {# grace delete (default) — freezes now, purges after the window. With
+     no window configured the server purges at once, and then asks for the
+     same assertion an immediate delete does. #}
   <form method="post" action="/admin/console/tenant-delete" id="danger"
         style="display:inline-flex;gap:.4rem;margin:0 0 0 1.2rem;align-items:center"
+        {% if passkeys_enrolled and grace_days == 0 %}data-admin-stepup{% endif %}
         data-confirm="Schedule this tenant for deletion? It freezes now and the worker wipes it after the grace window — restorable until then.">
     <input type="hidden" name="tenant_id" value="{{ tenant.id }}">
     <input type="hidden" name="mode" value="grace">
+    <input type="hidden" name="stepup" value="">
     <input name="confirm" placeholder="type owner email to confirm"
            style="font-size:12px;width:14rem">
     <button style="font-size:12px;color:var(--red)">schedule delete</button>
@@ -67,10 +75,12 @@
   {# data-admin-stepup — pages.js collects a fresh single-use
      passkey assertion into the hidden field before submitting, the same
      browser half restore/reset/uninstall already use. The server refuses
-     an immediate purge without it whenever a key is enrolled. #}
+     an immediate purge without it whenever a key is enrolled — and only
+     then, so the form asks only then: with no key there is nothing to
+     sign with and the ceremony would block a purge the server accepts. #}
   <form method="post" action="/admin/console/tenant-delete"
         style="display:inline-flex;gap:.4rem;margin:0;align-items:center"
-        data-admin-stepup
+        {% if passkeys_enrolled %}data-admin-stepup{% endif %}
         data-confirm="Delete this tenant IMMEDIATELY and PERMANENTLY? No grace window — only backups can bring it back.">
     <input type="hidden" name="tenant_id" value="{{ tenant.id }}">
     <input type="hidden" name="mode" value="immediate">
@@ -101,9 +111,10 @@
              first — the typed address is the operator asserting they did.
              data-admin-stepup: a fresh operator passkey assertion rides
              the hidden field, as for an immediate purge; the server
-             refuses the clear without one whenever a key is enrolled. #}
+             refuses the clear without one whenever a key is enrolled, and
+             the form asks for one exactly then. #}
           <form method="post" action="/admin/console/clear-2fa" style="display:inline;margin:0"
-                data-admin-stepup
+                {% if passkeys_enrolled %}data-admin-stepup{% endif %}
                 data-confirm="Clear the second factor for {{ u.email }}? TOTP, passkeys and recovery codes go, every session and device is signed out, and they are emailed. Only after verifying who is asking.">
             <input type="hidden" name="user_id" value="{{ u.id }}">
             <input type="hidden" name="stepup" value="">

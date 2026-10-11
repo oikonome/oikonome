@@ -199,6 +199,34 @@ class TheEnrichCeilingHoldsAtSpendTimeNotOnlyAtWriteTime(unittest.TestCase):
             self.assertEqual(self._cap_seen(), 250)
 
 
+    def _reserve(self, want):
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            with budget.config_txn(conn) as cfg:
+                cfg.pop("plaid_enrich_used", None)
+            return plaid._enrich_reserve(conn, "2026-01", want)
+        finally:
+            conn.close()
+
+    def test_a_household_that_never_saved_a_cap_is_held_to_the_ceiling(self):
+        # The default is a preference, not an authorisation: a household
+        # that never touched the setting must not spend past the operator's
+        # ceiling (0 = OFF) just because it has no stored number to clamp.
+        from oikonome import ext
+        self._store(None)
+        for ceiling in (0, 100):
+            with self.subTest(ceiling=ceiling), self._as_hosted(), \
+                    mock.patch.object(ext.gate, "enrich_rows_cap",
+                                      return_value=ceiling):
+                self.assertEqual(self._cap_seen(), ceiling)
+                self.assertEqual(self._reserve(500), ceiling)
+
+    def test_a_negative_stored_cap_spends_nothing(self):
+        self._store(-50)
+        self.assertEqual(self._cap_seen(), 0)
+        self.assertEqual(self._reserve(10), 0)
+
+
 class CsvCellsCannotHideAFormulaBehindAnInvisibleCharacter(unittest.TestCase):
     """An invisible first character does not stop a spreadsheet reaching the
     `=` behind it, so a leading tab, CR, line feed or byte-order mark is

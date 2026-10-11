@@ -29,8 +29,8 @@ not elapsed yet; a closed month expects the full variable budget.
 budget categories are carved out of those two for display, so their
 spending counts inside them). Fixed bills never make a period "over";
 they appear in each lens's Bills row instead. A bill you track by hand
-as a card payment drops out of the month verdict and the week summary
-while a linked card carries a balance — the card's own payoff covers
+as a card payment drops out of the month verdict while a linked card
+carries a balance — the card's own payoff covers
 it. As everywhere, spending shows as positive numbers (see the concepts
 guide).
 
@@ -85,6 +85,11 @@ under one parent), the ten **biggest transactions**, and **income vs
 spend** with the net. In a heavy-bill month the header notes that
 variable budgets were auto-scaled (see the Budget guide).
 
+Every row of the Monthly budget map — Food, Everything else, a carve-out,
+and Bills — opens the transactions it counted for that month; on the
+Year lens the same rows open the year's. Each category in the spending
+table opens that month's rows in the category.
+
 ## Year: the twelve-cell grid
 
 The Year lens is twelve month cells: each finished month's **final
@@ -102,22 +107,48 @@ labels opens that bucket's rows for the year, the same months summed —
 annual totals
 — income, spend, saved, savings rate — and the top twelve spending
 categories next to the prior year's figures, with a Total spend row. Annual income and spend use the Cash Flow
-report's definitions (see the cash-flow guide). A year with no bank
-income data shows income and savings as **unknown, not $0**.
+report's definitions (see the cash-flow guide), summed over the same
+months as the grid: a year whose income is not known for every month
+(no bank account feeds part of it) shows income and savings as
+**unknown, not $0**, and only what went out. A hidden account, or the
+backup copy of a linked pair, does not count as a feed: its deposits
+are not in the income total, so its months are not known by it either.
 
 ## Which summary mirrors which lens
 
 - The **daily email** mirrors the Today page — same content, same math
   (see the Today guide).
-- The **weekly email** summarizes the **last completed Mon–Sun week**
-  (per-day budget built from each day's own month allowance), sent on
-  your chosen weekday. An envelope purchase sits on the day it
-  happened — the part inside the cap as a bill, any overflow as
-  variable spending — so the week counts the swipe once.
-- The **monthly email** renders the **previous month's** report card,
-  sent on the 1st.
-- The **year in review** renders the previous year's Year lens, sent on
-  January 1st.
+- The **monthly email** is the **previous month's** report card, sent on
+  the 1st: the year it sits in month by month (each cell is the month's
+  net, green when it made money, red when it lost) and the year-to-date
+  net; the month's own net and verdict; the budget as bars — the bills in
+  one bar, then the variable budget as you split it (Food, Everything
+  else, any carve-outs) and any envelope bill you pinned to Today as a
+  bar of its own, each green or red by whether it ran over;
+  spending by category as a ring, the bills under their own categories
+  (the mortgage, rent, power and water as one "Mortgage, rent and
+  utilities" slice, and whatever you set as a bill's transaction
+  category — tag the streaming and software bills "Subscriptions" and
+  they show as one slice); a paid bill no category accounts for stays in
+  a plain Bills slice. The ring holds up to eight slices; the rest fold
+  into Other.
+- The **year in review**, sent on January 1st, is the monthly report
+  card at year scale: the year's net beside last year's, the twelve
+  months coloured by what each kept or lost, how many finished on or
+  under budget; the budget as annual bars over the budgeted months (the
+  bills in one bar, then the variable budget as you split it, then any
+  bill pinned to Today — a year with no budget on record has no bars);
+  the year's spending by category as a ring, the bills under their own
+  categories, with up to twelve slices before the rest fold into Other;
+  and, under the twelve months, every year the ledger holds with its net,
+  back to the first (a year whose income is not known for every month
+  shows what went out instead).
+
+Neither email lists individual transactions; the Month page still
+shows the month's biggest. If the instance could not send the card on
+the 1st (the server was down, or mail was failing), it is still due at
+the send hour on each of the next three days until it goes out, and its
+text or push goes out once.
 
 Every summary is built from the exact same computation the lens fetches,
 so the email and the page cannot disagree. Each cadence is switched on
@@ -132,9 +163,6 @@ they can't disagree with the email either.
 
 ## Gotchas
 
-- A bill due one week but paid in an adjacent one is week-boundary
-  timing noise in the weekly email — the same way an early payment
-  reads on Today.
 - The current month's projection is pace, not fate — one early splurge
   reads hot and usually cools.
 - Past report cards are judged against the budget, and decompose bills

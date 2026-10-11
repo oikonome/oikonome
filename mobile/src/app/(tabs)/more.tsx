@@ -48,7 +48,7 @@ const PAGES: [string, string, string, IconName][] = [
    "notifications-outline"],
   ["Doctor", "/doctor", "instance health checks", "medkit-outline"],
   ["Email & Push", "/notifications",
-   "daily/weekly summaries: email, push + SMS", "mail-outline"],
+   "daily, monthly and yearly summaries: email, push + SMS", "mail-outline"],
   ["Settings", "/settings", "account, devices, sign out",
    "settings-outline"],
   ["Security & household", "/security",

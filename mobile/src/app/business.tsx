@@ -5,8 +5,10 @@
 // (mileage log + itemized expenses), and Settings (entity lifecycle,
 // account assignment, tax reserve, members). CSV/zip/ics exports ride
 // the bearer-authenticated download door into the OS share sheet.
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import type { QueryClient, QueryKey } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient }
+  from "@tanstack/react-query";
+import type { InfiniteData, QueryClient, QueryKey }
+  from "@tanstack/react-query";
 import { useRouter } from "expo-router";
 import { memo, useCallback, useEffect, useState } from "react";
 import { Alert, Linking, Pressable, ScrollView, StyleSheet, Switch, Text,
@@ -15,12 +17,16 @@ import PullRefresh from "../components/pull-refresh";
 
 import StaleBanner from "../components/stale-banner";
 import { Card, H, HelpLink, KV, Pill } from "../components/ui";
-import { errText, Account, BizData, BizTxn, countsInTotals, Entity,
+import { ApiError, errText, Account, BizData, BizTxn, countsInTotals, Entity,
+         EstimatedTax,
          Obligation, setHandedOffTxn, Txn,
          Vendor } from "../lib/api";
 import { patchList, patchQueries, patchQuery, removeFromList, bizKeys, personalKeys, invalidateAll } from "../lib/cache";
 import { ymd } from "../lib/dates";
-import { bizPeriodProfit, isValidYmd, catLabel } from "../lib/pure";
+import { bizDefaultTaxYear, bizPeriodProfit, bizTaxStillDue, bizTaxYears,
+  isValidYmd, catLabel, numberDraft, parseMoneyDraft, bizShownBucket,
+  bizNeedsLine,
+  numberFieldsPatch, bizMemberDoorMissing } from "../lib/pure";
 import { DownloadButton } from "../components/download-button";
 import { useSession } from "../lib/session";
 import { useOwner, useViewer } from "../lib/viewer";
@@ -421,7 +427,8 @@ function DeleteForeverConfirm({ entity, onDone, onCancel }: {
 // ---- overview: four tiles ----
 // guided setup is FINISHED when the entity has at least one assigned
 // account (the web's rule) — until then the prompt offers the resume
-// point, and it never shows once the wizard recorded completion
+// point. The wizard's step marks are household-wide and outlive the
+// business they were written for, so they never decide this per entity.
 function ContinueSetupPrompt({ entity, viewer }: {
   entity: Entity; viewer: boolean;
 }) {
@@ -429,16 +436,10 @@ function ContinueSetupPrompt({ entity, viewer }: {
   const router = useRouter();
   const accounts = useQuery({ queryKey: ["accounts"],
     queryFn: () => client!.accounts(), enabled: !!client && !viewer });
-  const settings = useQuery({ queryKey: ["settings"],
-    queryFn: () => client!.settingsFull(), enabled: !!client && !viewer });
   if (viewer) return null;
-  const marks = ((settings.data as
-    { biz_wizard_steps?: Record<string, string> } | undefined)
-    ?.biz_wizard_steps) || {};
   const assigned = (accounts.data?.accounts ?? [])
     .some((a) => a.entity_id === entity.id);
-  if (assigned || marks.finish === "done"
-      || !accounts.data || !settings.data) return null;
+  if (assigned || !accounts.data) return null;
   return (
     <Text style={{ color: C.accent, fontSize: 13, marginHorizontal: 12,
                    marginTop: 10 }}
@@ -497,7 +498,7 @@ function Overview({ entity }: { entity: Entity }) {
       <KV k="Next deadline"
           v={next ? mmddyy(next.due) : "none"} />
       <Text style={s.mut}>
-        {m$(est.data?.quarterly)} est. quarterly
+        {m$(est.data?.next_payment ?? est.data?.quarterly)} est. quarterly
       </Text>
       {(() => {
         const n = sugg.isPending ? null
@@ -805,6 +806,8 @@ const FlaggedRow = memo(function FlaggedRow({ t, viewer, pending, onOpen,
 });
 
 // ---- books: P&L + balance sheet + equity ----
+const BOOKS_PAGE = 100;
+
 function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
   const { client } = useSession();
   const qc = useQueryClient();
@@ -820,35 +823,68 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
       q?.queryKey[1] === entity.id ? prev : undefined });
   const txns = useQuery({ queryKey: ["biztxns", entity.id, year ?? "all"],
     queryFn: () => client!.bizTxns(entity.id, year),
-    enabled: !!client,
+    enabled: !!client && year !== undefined,
     placeholderData: (prev, q) =>
       q?.queryKey[1] === entity.id ? prev : undefined });
+  // 'all' is fetched a page at a time: the whole history in one reply is
+  // the slow part. Still under the "biztxns" prefix so every invalidation
+  // reaches it.
+  const allTxns = useInfiniteQuery({
+    queryKey: ["biztxns", entity.id, "all", "pages"],
+    queryFn: ({ pageParam }) =>
+      client!.bizTxnsPage(entity.id, pageParam, BOOKS_PAGE),
+    initialPageParam: 0,
+    getNextPageParam: (last, pages) => {
+      const got = pages.reduce((n, pg) => n + pg.transactions.length, 0);
+      return typeof last.total === "number" && last.transactions.length > 0
+        && got < last.total ? got : undefined;
+    },
+    enabled: !!client && year === undefined,
+  });
+  const [shown, setShown] = useState(BOOKS_PAGE);
+  useEffect(() => { setShown(BOOKS_PAGE); }, [year]);
   const bs = useQuery({ queryKey: ["balancesheet", entity.id],
     queryFn: () => client!.balanceSheet(entity.id), enabled: !!client });
   const equity = useQuery({ queryKey: ["equity", entity.id],
     queryFn: () => client!.entityEquity(entity.id), enabled: !!client });
   const [bucketFor, setBucketFor] = useState<string | null>(null);
+  // a row bucketed here with no line stays in Schedule C review; the
+  // line is offered on the row too, from the closed list the review
+  // queue reads (the same cache entry)
+  const [lineFor, setLineFor] = useState<string | null>(null);
+  const lineList = useQuery({ queryKey: ["biz-suggestions", entity.id],
+    queryFn: () => client!.bizSuggestions(entity.id), enabled: !!client });
   type TxnList = { transactions: BizTxn[] };
   // the bucket label is a pure field on the row: flip it in every cached
   // year view up front, put it back if the server refuses, and refetch
   // only the figures that derive from it (P&L, estimated tax)
+  // a line goes with the bucket only when one is picked on the row: a
+  // bucket change alone leaves any line the server holds as it is
   const classify = useMutation({
-    mutationFn: ({ txnId, bucket }: { txnId: string; bucket: string }) =>
-      client!.bizClassify(entity.id, txnId, { bucket }),
-    onMutate: async ({ txnId, bucket }) => {
+    mutationFn: ({ txnId, bucket, line }:
+        { txnId: string; bucket: string; line?: string }) =>
+      client!.bizClassify(entity.id, txnId,
+        line ? { bucket, sched_c_line: line } : { bucket }),
+    onMutate: async ({ txnId, bucket, line }) => {
       await qc.cancelQueries({ queryKey: ["biztxns", entity.id] });
       const prev = qc.getQueriesData<TxnList>(
         { queryKey: ["biztxns", entity.id] });
-      patchQueries<TxnList>(qc, ["biztxns", entity.id], (o) => ({
-        ...o,
-        transactions: o.transactions.map((x) =>
-          x.id === txnId ? { ...x, bucket, effective_bucket: bucket } : x),
-      }));
+      const flip = (rows: BizTxn[]) => rows.map((x) =>
+        x.id === txnId ? { ...x, bucket, effective_bucket: bucket,
+                           ...(line ? { sched_c_line: line } : {}) } : x);
+      // the prefix holds both a year's list and the paged 'all' view
+      patchQueries<TxnList | InfiniteData<TxnList>>(
+        qc, ["biztxns", entity.id], (o) => "pages" in o
+          ? { ...o, pages: o.pages.map((pg) => ({
+              ...pg, transactions: flip(pg.transactions) })) }
+          : { ...o, transactions: flip(o.transactions) });
       return { prev };
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["pnl", entity.id] });
       qc.invalidateQueries({ queryKey: ["esttax", entity.id] });
+      // a bucket or line set here moves the row in or out of review
+      qc.invalidateQueries({ queryKey: ["biz-suggestions", entity.id] });
     },
     onError: (e, _v, ctx) => {
       for (const [k, v] of ctx?.prev ?? []) qc.setQueryData(k, v);
@@ -862,7 +898,7 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
   const [eqErr, setEqErr] = useState<string | null>(null);
   const record = useMutation({
     mutationFn: () => client!.equityRecord(entity.id,
-      { kind: eqKind, amount: Number(eqAmt.replace(/[$,]/g, "")),
+      { kind: eqKind, amount: parseMoneyDraft(eqAmt) as number,
         date: eqDate, form: eqForm || undefined }),
     onSuccess: () => {
       setEqAmt(""); setEqForm("");
@@ -886,8 +922,32 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
     onError: (e) => Alert.alert("Couldn't delete", errText(e)),
   });
   const p = pnl.data;
-  const expenses = (txns.data?.transactions ?? [])
-    .filter((x) => x.amount > 0);
+  // offset paging over a list that changed between pages can skip a row;
+  // a page whose total disagrees with the first page's says it did, so the
+  // list starts over from the first page
+  const pageTotals = (allTxns.data?.pages ?? []).map((pg) => pg.total);
+  useEffect(() => {
+    if (pageTotals.some((t) => t !== pageTotals[0]))
+      qc.resetQueries({ queryKey: ["biztxns", entity.id, "all", "pages"] });
+  }, [pageTotals.join(","), entity.id, qc]);
+  // rows that arrive while paging can shift a later page by one; a row is
+  // listed once
+  const loaded: BizTxn[] = year !== undefined
+    ? (txns.data?.transactions ?? [])
+    : (() => {
+        const seen = new Set<string>();
+        return (allTxns.data?.pages ?? []).flatMap((pg) => pg.transactions)
+          .filter((x) => !seen.has(x.id) && !!seen.add(x.id));
+      })();
+  const total = year === undefined
+    ? allTxns.data?.pages[0]?.total : undefined;
+  const serverPaged = typeof total === "number";
+  const expenses = loaded.filter((x) => x.amount > 0);
+  // a server-paged list shows every expense it has loaded; otherwise (one
+  // year, or a server that sent everything) the render is capped instead
+  const visible = serverPaged ? expenses : expenses.slice(0, shown);
+  // the year list is disabled under 'all', where its placeholder is stale
+  const dimmed = year !== undefined && txns.isPlaceholderData;
   const cap = equity.data?.capital;
   return (
     <>
@@ -951,9 +1011,9 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
         )}
         {/* placeholder rows belong to another year: shown dimmed, not
             tappable, until the chosen year's land */}
-        <View pointerEvents={txns.isPlaceholderData ? "none" : "auto"}
-              style={txns.isPlaceholderData ? { opacity: 0.5 } : null}>
-        {expenses.slice(0, 30).map((x) => (
+        <View pointerEvents={dimmed ? "none" : "auto"}
+              style={dimmed ? { opacity: 0.5 } : null}>
+        {visible.map((x) => (
           <View key={x.id} style={s.row}>
             <View style={{ flex: 1 }}>
               <Text style={{ color: C.text, fontSize: 13 }}
@@ -970,8 +1030,7 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
                   {BUCKETS.map(([v, l]) => (
                     <Pressable key={v}
                                style={[s.chip,
-                                 (x.bucket ?? "operating") === v
-                                   && s.chipOn]}
+                                 bizShownBucket(x) === v && s.chipOn]}
                                disabled={classify.isPending
                                  && classify.variables?.txnId === x.id}
                                onPress={() => { setBucketFor(null);
@@ -984,21 +1043,59 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
                   ))}
                 </View>
               )}
+              {lineFor === x.id && !ro && bizNeedsLine(x) && (
+                <View style={{ flexDirection: "row", flexWrap: "wrap",
+                               gap: 4, marginTop: 4 }}>
+                  {(lineList.data?.lines ?? []).map((ln) => (
+                    <Pressable key={ln} style={s.chip}
+                               disabled={classify.isPending
+                                 && classify.variables?.txnId === x.id}
+                               onPress={() => { setLineFor(null);
+                                 classify.mutate({ txnId: x.id,
+                                   bucket: x.bucket ?? "operating",
+                                   line: ln }); }}>
+                      <Text style={{ color: C.mut, fontSize: 11 }}>
+                        {ln}
+                      </Text>
+                    </Pressable>
+                  ))}
+                </View>
+              )}
             </View>
+            {!ro && bizNeedsLine(x) && (
+              <Text style={{ color: C.accent, fontSize: 12, padding: 4 }}
+                    onPress={() => setLineFor(
+                      lineFor === x.id ? null : x.id)}>
+                line ▾
+              </Text>
+            )}
             <Text style={{ color: ro ? C.mut : C.accent, fontSize: 12 }}
                   onPress={ro ? undefined
                     : () => setBucketFor(
                         bucketFor === x.id ? null : x.id)}>
-              {(BUCKETS.find(([v]) => v === (x.bucket ?? "operating"))
-                ?.[1] ?? x.bucket)}{ro ? "" : " ▾"}
+              {(BUCKETS.find(([v]) => v === bizShownBucket(x))
+                ?.[1] ?? bizShownBucket(x))}{ro ? "" : " ▾"}
             </Text>
           </View>
         ))}
         </View>
-        {expenses.length > 30 && (
-          <Text style={s.mut}>
-            showing 30 of {expenses.length} expense rows — the P&amp;L
-            CSV carries them all.
+        {!serverPaged && expenses.length > shown && (
+          <Text style={[s.mut, { marginTop: 6 }]}>
+            Showing {shown} of {expenses.length}{"  "}
+            <Text style={{ color: C.accent }}
+                  onPress={() => setShown(shown + BOOKS_PAGE)}>
+              show more</Text>
+          </Text>
+        )}
+        {/* the count is transactions, revenue included — the list shows
+            the expenses among them */}
+        {serverPaged && allTxns.hasNextPage && (
+          <Text style={[s.mut, { marginTop: 6 }]}>
+            Showing the newest {loaded.length} of {total} transactions{"  "}
+            <Text style={{ color: C.accent }}
+                  onPress={allTxns.isFetchingNextPage ? undefined
+                    : () => { allTxns.fetchNextPage(); }}>
+              show more</Text>
           </Text>
         )}
       </Card>
@@ -1019,6 +1116,11 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
                 <B>{m$(bs.data.total_liabilities)}</B> = Net{" "}
                 <B>{m$(bs.data.net)}</B> · Capital account{" "}
                 <B>{m$(bs.data.capital_account)}</B>
+                {bs.data.household_capital != null
+                  && bs.data.household_share_pct != null
+                  ? <> · your share ({bs.data.household_share_pct}%){" "}
+                      <B>{m$(bs.data.household_capital)}</B></>
+                  : null}
               </Text>
               <Text style={s.mut}>
                 Snapshot from business account balances — not
@@ -1045,6 +1147,10 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
               {m$(cap.draws + cap.distributions)})
               {cap.reimbursements > 0
                 ? ` · reimbursements ${m$(cap.reimbursements)}` : ""}
+              {cap.household_capital != null
+                && cap.household_share_pct != null
+                ? ` · your share (${cap.household_share_pct}%): ${
+                    m$(cap.household_capital)}` : ""}
             </Text>
           </Text>
         )}
@@ -1113,6 +1219,10 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
                              setEqErr(DATE_ERR);
                              return;
                            }
+                           if (parseMoneyDraft(eqAmt) === null) {
+                             setEqErr("The amount is not a number");
+                             return;
+                           }
                            setEqErr(null);
                            record.mutate();
                          }}>
@@ -1136,6 +1246,26 @@ function B({ children }: { children: React.ReactNode }) {
 }
 
 // ---- tax: set-aside + estimated + 1099 + compliance ----
+/** What would make a figure covering every member the household's share:
+ *  the server's own rule, so the screen never asks for a mark that changes
+ *  nothing (an S-corp is never split; a marked member needs every share
+ *  given, together 100%). Older servers send no reason; they get the
+ *  plain request to mark a member. */
+function bizHouseholdHint(why: EstimatedTax["household_unavailable"]): string {
+  if (why === "s_corp") return "";
+  if (why === "shares_incomplete")
+    return " — your member is marked \"this is us\", but every member needs an ownership share and together they must make 100% before yours can be split out";
+  return " — mark your member as \"this is us\" in Settings (with every member's share given, together 100%) to see yours";
+}
+
+/** A member's share or household mark moves the estimate and the
+ *  household's share of the capital account, which the Books tab's
+ *  equity and balance-sheet cards both show. */
+function bizMembersChanged(qc: QueryClient, entityId: string) {
+  for (const k of ["entity", "esttax", "equity", "balancesheet"])
+    qc.invalidateQueries({ queryKey: [k, entityId] });
+}
+
 function Tax({ entity, ro, onChanged }: {
   entity: Entity; ro: boolean; onChanged: () => void;
 }) {
@@ -1144,10 +1274,20 @@ function Tax({ entity, ro, onChanged }: {
   const year = new Date().getFullYear();
   const est = useQuery({ queryKey: ["esttax", entity.id, year],
     queryFn: () => client!.estTax(entity.id, year), enabled: !!client });
+  // the P&L reports the estimates already paid out of the business
+  const pnl = useQuery({ queryKey: ["pnl", entity.id, year],
+    queryFn: () => client!.entityPnl(entity.id, year), enabled: !!client });
   const accounts = useQuery({ queryKey: ["accounts"],
     queryFn: () => client!.accounts(), enabled: !!client });
-  const vendors = useQuery({ queryKey: ["vendors", entity.id],
-    queryFn: () => client!.vendorList(entity.id), enabled: !!client });
+  // the filing year the package and the 1099 list read together, so last
+  // year's return can be put together in March
+  const taxYears = bizTaxYears(new Date(), entity.formation_date,
+                               entity.business_start_date);
+  const [taxYear, setTaxYear] = useState(
+    () => bizDefaultTaxYear(new Date(), taxYears));
+  const vendors = useQuery({ queryKey: ["vendors", entity.id, taxYear],
+    queryFn: () => client!.vendorList(entity.id, taxYear),
+    enabled: !!client });
   const compliance = useQuery({ queryKey: ["compliance", entity.id],
     queryFn: () => client!.entityCompliance(entity.id),
     enabled: !!client });
@@ -1157,11 +1297,24 @@ function Tax({ entity, ro, onChanged }: {
   const [sqft, setSqft] =
     useState(entity.home_office_sqft != null
       ? String(entity.home_office_sqft) : "");
+  // what the fields held when loaded: only a field typed into since is
+  // sent, so saving the rate never puts back a size changed elsewhere
+  const [taxLoaded, setTaxLoaded] = useState({ rate, sqft });
+  // a value that is not a number is refused here: sent, it would go out
+  // as null, which the server reads as "clear" and wipes the stored one
   const saveTax = useMutation({
-    mutationFn: () => client!.entityUpdate(entity.id,
-      { income_tax_rate: rate.trim() ? Number(rate) : null,
-        home_office_sqft: sqft.trim() ? Number(sqft) : null }),
+    mutationFn: async () => {
+      const patch = numberFieldsPatch({
+        income_tax_rate: { draft: rate, loaded: taxLoaded.rate,
+                           label: "tax rate" },
+        home_office_sqft: { draft: sqft, loaded: taxLoaded.sqft,
+                            label: "home office size" } });
+      if (!Object.keys(patch).length) return null;
+      return client!.entityUpdate(entity.id, patch);
+    },
     onSuccess: (r) => {
+      if (!r) return;
+      setTaxLoaded({ rate, sqft });
       putEntity(qc, r);
       qc.invalidateQueries({ queryKey: ["esttax", entity.id] });
       onChanged();
@@ -1177,13 +1330,14 @@ function Tax({ entity, ro, onChanged }: {
       client!.vendorMark(entity.id, { merchant, reportable }),
     onMutate: async ({ merchant, reportable }) => {
       await qc.cancelQueries({ queryKey: ["vendors", entity.id] });
-      const prev = qc.getQueryData<VendorList>(["vendors", entity.id]);
-      patchList<VendorList, Vendor>(qc, ["vendors", entity.id], "vendors",
+      const key = ["vendors", entity.id, taxYear];
+      const prev = qc.getQueryData<VendorList>(key);
+      patchList<VendorList, Vendor>(qc, key, "vendors",
         (v) => v.merchant === merchant, { reportable });
-      return { prev };
+      return { prev, key };
     },
     onError: (e, _v, ctx) => {
-      if (ctx?.prev) qc.setQueryData(["vendors", entity.id], ctx.prev);
+      if (ctx?.prev) qc.setQueryData(ctx.key, ctx.prev);
       Alert.alert("Couldn't change", errText(e));
     },
     onSettled: () =>
@@ -1227,9 +1381,26 @@ function Tax({ entity, ro, onChanged }: {
     (a) => a.id === entity.tax_reserve_account_id);
   const ringFenced = !!reserve;
   const stale = !!entity.tax_reserve_account_id && !reserve;
-  const cash = ringFenced ? (reserve!.balance_current ?? 0)
+  // Everything set against the estimate stands on its footing: when it is
+  // the household member's share, so are the profit it is a rate of, the
+  // payments already made toward it and the cash held for it. The
+  // business's own figures would halve the rate shown and take every
+  // partner's payments off one partner's bill.
+  const share = e0?.covers === "household" && e0.household
+    ? e0.household.ownership_pct : null;
+  const held = ringFenced ? (reserve!.balance_current ?? 0)
     : mine.reduce((t, a) => t + (a.balance_current ?? 0), 0);
-  const gap = e0 ? cash - e0.total_estimated : 0;
+  // the business's accounts hold every partner's money, so the household's
+  // claim on them is its ownership share
+  const cash = share != null ? held * share / 100 : held;
+  // measured against what is still to pay: a reserve that paid this
+  // year's earlier estimates is not short by them
+  const paid = e0?.covered_tax_paid
+    ?? (share != null ? null : pnl.data?.estimated_tax_paid) ?? 0;
+  const profit = e0?.covered_profit
+    ?? (share != null ? null : e0?.net_profit) ?? 0;
+  const due = e0 ? bizTaxStillDue(e0.total_estimated, paid) : 0;
+  const gap = e0 ? cash - due : 0;
   return (
     <>
       {e0 && (
@@ -1237,13 +1408,22 @@ function Tax({ entity, ro, onChanged }: {
           <H>Set aside for tax</H>
           <KV k={`Estimated for ${e0.year}`}
               v={m$(e0.total_estimated)} />
-          {e0.net_profit > 0 && (
+          {profit > 0 && (
             <Text style={s.mut}>
-              {Math.round((100 * e0.total_estimated)
-                / e0.net_profit)}% of profit
+              {Math.round((100 * e0.total_estimated) / profit)}% of
+              {share != null ? " your share of" : ""} profit
             </Text>
           )}
-          <KV k={ringFenced ? "In the tax account" : "Business cash"}
+          {paid > 0 && (
+            <Text style={s.mut}>
+              {m$(paid)} paid, {m$(due)} still to pay (a prior-year
+              balance paid in April counts as paid here)
+            </Text>
+          )}
+          <KV k={share != null
+                   ? `Your ${share}% of ${ringFenced ? "the tax account"
+                                                     : "business cash"}`
+                   : ringFenced ? "In the tax account" : "Business cash"}
               v={m$(cash)} />
           {ringFenced && (
             <Text style={s.mut}>
@@ -1280,6 +1460,11 @@ function Tax({ entity, ro, onChanged }: {
         {e0 && (
           <Text style={{ color: C.text, fontSize: 13, lineHeight: 19 }}>
             On <B>{m$(e0.net_profit)}</B> net
+            {/* the standard mileage rate replaces the actual car costs
+                the books already deducted, so those come back in first */}
+            {(e0.vehicle_expenses_added_back ?? 0) > 0
+              ? <> + <B>{m$(e0.vehicle_expenses_added_back)}</B> car
+                  costs</> : null}
             {e0.mileage_deduction > 0
               ? <> − <B>{m$(e0.mileage_deduction)}</B> mileage</> : null}
             {e0.home_office_deduction > 0
@@ -1287,16 +1472,48 @@ function Tax({ entity, ro, onChanged }: {
                   office</> : null}
             {e0.startup_deduction > 0
               ? <> − <B>{m$(e0.startup_deduction)}</B> start-up</> : null}
-            {" = "}<B>{m$(e0.taxable_profit)}</B> taxable · SE tax{" "}
-            <B>{m$(e0.se_tax)}</B>
+            {" = "}<B>{m$(e0.taxable_profit)}</B> taxable ·{" "}
+            {/* an S-corp owes no SE tax: a bare $0 line would read as a
+                bug */}
+            {e0.se_tax_applies === false
+              ? <>no self-employment tax</>
+              : <>SE tax <B>{m$(e0.se_tax)}</B></>}
             {e0.income_tax != null
               ? <> + income tax <B>{m$(e0.income_tax)}</B></> : null}
-            {" → "}<B>{m$(e0.total_estimated)}</B>/yr,{" "}
-            <B>{m$(e0.quarterly)}</B> per quarter.
+            {/* the year in progress: the total is on profit so far and the
+                quarterly figure is a quarter of the projected year, so
+                each is labelled for what it is, as on the web */}
+            {e0.annualized && e0.annualized_total != null
+              ? <>{" → "}<B>{m$(e0.total_estimated)}</B> so far this
+                  year; {e0.basis === "prior_year"
+                    ? "on last year's tax of " : "projected "}
+                  <B>{m$(e0.annualized_total)}</B>
+                  {e0.basis === "prior_year" ? "" : " for the year"},{" "}
+                  <B>{m$(e0.quarterly)}</B> per quarter.</>
+              : <>{" → "}<B>{m$(e0.total_estimated)}</B>/yr,{" "}
+                  <B>{m$(e0.quarterly)}</B> per quarter.</>}
           </Text>
         )}
         <Text style={s.mut}>
           Estimate — set aside quarterly; confirm with your CPA.
+          {/* the two car methods exclude each other; naming the one
+              taken explains why the other figure is missing */}
+          {e0?.vehicle_method === "standard_mileage"
+            ? " Car costs: standard mileage." : ""}
+          {e0?.vehicle_method === "actual"
+            ? ((e0.mileage_logged ?? 0) > 0
+                ? ` Car costs: actual costs, larger than ${m$(e0.mileage_logged ?? 0)} of logged mileage.`
+                : " Car costs: actual costs.") : ""}
+          {e0?.se_tax_applies === false
+            ? " An S-corp's Social Security and Medicare go through payroll."
+            : ""}
+          {e0?.covers === "all_members"
+            ? ` Covers every member of the business, not one member's share${
+                bizHouseholdHint(e0.household_unavailable)}.`
+            : ""}
+          {e0?.covers === "household" && e0.household
+            ? ` Your ${e0.household.ownership_pct}% share as ${e0.household.member_name}; the business as a whole owes ${m$(e0.business_total ?? 0)}.`
+            : ""}
           {e0?.income_tax == null
             ? " Set an income-tax rate below to include income tax." : ""}
         </Text>
@@ -1324,7 +1541,23 @@ function Tax({ entity, ro, onChanged }: {
         )}
       </Card>
       <Card>
-        <H>Year-end package</H>
+        <View style={{ flexDirection: "row", alignItems: "center",
+                       gap: 6, flexWrap: "wrap" }}>
+          <H>Year-end package</H>
+          <View style={{ flexDirection: "row", gap: 4,
+                         marginLeft: "auto" }}>
+            {taxYears.map((y) => (
+              <Pressable key={y}
+                         style={[s.chip, taxYear === y && s.chipOn]}
+                         onPress={() => setTaxYear(y)}>
+                <Text style={{ color: taxYear === y ? C.text : C.mut,
+                               fontSize: 11 }}>
+                  {y}
+                </Text>
+              </Pressable>
+            ))}
+          </View>
+        </View>
         <Text style={s.mut}>
           P&amp;L, ledger with Schedule C lines, balance sheet, 1099
           vendor totals and the mileage log — one zip for your
@@ -1332,17 +1565,17 @@ function Tax({ entity, ro, onChanged }: {
         </Text>
         <DownloadButton
           path={`/api/business/entities/${entity.id}/package.zip?year=${
-            year}`}
-          filename={`year-end-${year}.zip`}
-          label={`Download ${year} package`} />
+            taxYear}`}
+          filename={`year-end-${taxYear}.zip`}
+          label={`Download ${taxYear} package`} />
       </Card>
       <Card>
-        <H>1099 contractors</H>
+        <H>1099 contractors · {taxYear}</H>
         <Text style={s.mut}>
           Mark who&apos;s a contractor — those paid{" "}
           {vendors.data?.threshold != null
             ? `${m$(vendors.data.threshold)}+` : "over the threshold"}{" "}
-          this year need a 1099-NEC.
+          in {taxYear} need a 1099-NEC.
           {(vendors.data?.vendors ?? []).length === 0
             ? " No business payees yet — assign an account or "
               + "transactions to this entity first." : ""}
@@ -1353,6 +1586,7 @@ function Tax({ entity, ro, onChanged }: {
                   numberOfLines={1}>{v.merchant}</Text>
             <Text style={{ color: C.mut, fontSize: 12 }}>
               {m$(v.paid)}
+              {v.paid_by_card > 0 ? ` +${m$(v.paid_by_card)} by card` : ""}
             </Text>
             {v.needs_1099 && <Pill text="1099" tone="warn" />}
             <Switch value={v.reportable}
@@ -1487,7 +1721,7 @@ function ReceiptsTab({ entity, ro }: { entity: Entity; ro: boolean }) {
   const [mErr, setMErr] = useState<string | null>(null);
   const addTrip = useMutation({
     mutationFn: () => client!.mileageAdd(entity.id,
-      { date: mDate, miles: Number(mMiles),
+      { date: mDate, miles: numberDraft(mMiles) as number,
         purpose: mPurpose || undefined }),
     onSuccess: () => {
       setMMiles(""); setMPurpose("");
@@ -1595,6 +1829,10 @@ function ReceiptsTab({ entity, ro }: { entity: Entity; ro: boolean }) {
                          onPress={() => {
                            if (!isValidYmd(mDate)) {
                              setMErr(DATE_ERR);
+                             return;
+                           }
+                           if (numberDraft(mMiles) == null) {
+                             setMErr("The miles are not a number");
                              return;
                            }
                            setMErr(null);
@@ -1718,24 +1956,33 @@ function SettingsTab({ entity, ro, onChanged, onSelect }: {
     onSuccess: (r) => { putEntity(qc, r); onChanged(); },
     onError: (e, action) => Alert.alert(
       action === "archive" ? "Couldn't archive" : "Couldn't restore",
-      String(e)),
+      errText(e)),
   });
   const [memberName, setMemberName] = useState("");
   const [memberPct, setMemberPct] = useState("");
-  type Member = NonNullable<Entity["members"]>[number];
+  const [memberManager, setMemberManager] = useState(false);
+  const [memberHousehold, setMemberHousehold] = useState(false);
   const addMember = useMutation({
-    mutationFn: () => client!.entityAddMember(entity.id,
-      { member_name: memberName.trim(),
-        ...(memberPct.trim()
-          ? { ownership_pct: Number(memberPct) } : {}) }),
+    mutationFn: () => {
+      const pct = numberDraft(memberPct);
+      if (pct === undefined)
+        throw new Error("The ownership share is not a number");
+      return client!.entityAddMember(entity.id,
+        { member_name: memberName.trim(), is_manager: memberManager,
+          is_household: memberHousehold,
+          ...(pct !== null ? { ownership_pct: pct } : {}) });
+    },
     onSuccess: (r) => {
-      setMemberName(""); setMemberPct("");
+      // every field resets, the household mark too: left on, the next
+      // member added would quietly take it from this one
+      setMemberName(""); setMemberPct(""); setMemberManager(false);
+      setMemberHousehold(false);
       // the reply is the member row — it joins the list now
       const m0 = r as unknown as Member;
       if (m0 && typeof m0.id === "string")
         qc.setQueryData<Entity>(["entity", entity.id], (o) => o && {
           ...o, members: [...(o.members ?? []), m0] });
-      qc.invalidateQueries({ queryKey: ["entity", entity.id] });
+      bizMembersChanged(qc, entity.id);
     },
     onError: (e) => Alert.alert("Couldn't add", errText(e)),
   });
@@ -1984,15 +2231,14 @@ function SettingsTab({ entity, ro, onChanged, onSelect }: {
 
       <Card>
         <H>Members</H>
-        {(full.data?.members ?? []).map((m0) => (
-          <Text key={m0.id} style={[s.mut, { paddingVertical: 2 }]}>
-            {m0.member_name}
-            {m0.ownership_pct != null ? ` — ${m0.ownership_pct}%` : ""}
-            {m0.is_manager ? " · manager" : ""}
-          </Text>
-        ))}
-        {!ro && (
-          <View style={{ flexDirection: "row", gap: 6, marginTop: 6 }}>
+        <MemberList entityId={entity.id}
+                    members={full.data?.members ?? []}
+                    editable={!ro && owner} />
+        {/* ownership shares split the tax estimate, so adding a member is
+            the owner's call, like editing or removing one */}
+        {!ro && owner && (<>
+          <View style={{ flexDirection: "row", gap: 6, marginTop: 6,
+                         alignItems: "center" }}>
             <TextInput style={[s.input, { flex: 1 }]}
                        placeholder="member name"
                        placeholderTextColor={C.mut} value={memberName}
@@ -2001,6 +2247,13 @@ function SettingsTab({ entity, ro, onChanged, onSelect }: {
                        placeholder="%" placeholderTextColor={C.mut}
                        keyboardType="decimal-pad" value={memberPct}
                        onChangeText={setMemberPct} />
+            <Text style={s.mut}>manager</Text>
+            <Switch value={memberManager} onValueChange={setMemberManager} />
+          </View>
+          <View style={{ flexDirection: "row", alignItems: "center",
+                         justifyContent: "space-between", marginTop: 6 }}>
+            <Text style={s.mut}>this is us</Text>
+            <Switch value={memberHousehold} onValueChange={setMemberHousehold} />
             <Pressable style={[s.btn,
                          (!memberName.trim() || addMember.isPending)
                            && { opacity: 0.5 }]}
@@ -2010,8 +2263,139 @@ function SettingsTab({ entity, ro, onChanged, onSelect }: {
               <Text style={s.btnText}>add</Text>
             </Pressable>
           </View>
-        )}
+        </>)}
       </Card>
+    </>
+  );
+}
+
+type Member = NonNullable<Entity["members"]>[number];
+
+// The ownership shares drive the multi-member estimate, so a typo or a
+// partner who left has to be correctable without deleting the business.
+// An older server has no edit or remove door; the first refusal that says
+// so hides the controls instead of failing every tap. As on the web.
+function MemberList({ entityId, members, editable }: {
+  entityId: string; members: Member[]; editable: boolean;
+}) {
+  const { client } = useSession();
+  const qc = useQueryClient();
+  const key = ["entity", entityId];
+  const [missing, setMissing] = useState(false);
+  const [editing, setEditing] = useState<string | null>(null);
+  const [name, setName] = useState("");
+  const [pct, setPct] = useState("");
+  const [manager, setManager] = useState(false);
+  const [household, setHousehold] = useState(false);
+  const refused = (title: string, e: unknown) => {
+    const st = e instanceof ApiError ? e.status : undefined;
+    if (bizMemberDoorMissing(st, e instanceof ApiError ? e.detail : null)) {
+      setMissing(true); setEditing(null);
+      Alert.alert(title, "This server can't edit members yet.");
+      return;
+    }
+    // already gone elsewhere: the list catches up
+    if (st === 404) qc.invalidateQueries({ queryKey: key });
+    Alert.alert(title, errText(e));
+  };
+  const afterChange = () => bizMembersChanged(qc, entityId);
+  const save = useMutation({
+    mutationFn: (id: string) => {
+      const share = numberDraft(pct);
+      if (share === undefined)
+        throw new Error("The ownership share is not a number");
+      if (!name.trim()) throw new Error("A member needs a name");
+      return client!.entityUpdateMember(entityId, id,
+        { member_name: name.trim(), ownership_pct: share,
+          is_manager: manager, is_household: household });
+    },
+    onSuccess: (saved, id) => {
+      qc.setQueryData<Entity>(key, (o) => o && { ...o,
+        members: (o.members ?? []).map((x) =>
+          x.id === id ? { ...x, ...saved } : x) });
+      setEditing(null);
+      afterChange();
+    },
+    onError: (e) => refused("Couldn't save", e),
+  });
+  const remove = useMutation({
+    mutationFn: (id: string) => client!.entityRemoveMember(entityId, id),
+    onSuccess: (_r, id) => {
+      qc.setQueryData<Entity>(key, (o) => o && { ...o,
+        members: (o.members ?? []).filter((x) => x.id !== id) });
+      afterChange();
+    },
+    onError: (e) => refused("Couldn't remove", e),
+  });
+  const busy = save.isPending || remove.isPending;
+  const controls = editable && !missing;
+  return (
+    <>
+      {members.map((m0) => editing === m0.id ? (
+        <View key={m0.id} style={{ gap: 6, marginVertical: 4 }}>
+          <View style={{ flexDirection: "row", gap: 6,
+                         alignItems: "center" }}>
+            <TextInput style={[s.input, { flex: 1 }]} value={name}
+                       placeholder="member name"
+                       placeholderTextColor={C.mut} onChangeText={setName} />
+            <TextInput style={[s.input, { width: 60 }]} value={pct}
+                       placeholder="%" placeholderTextColor={C.mut}
+                       keyboardType="decimal-pad" onChangeText={setPct} />
+          </View>
+          <View style={{ flexDirection: "row", gap: 6,
+                         alignItems: "center" }}>
+            <Text style={s.mut}>manager</Text>
+            <Switch value={manager} onValueChange={setManager} />
+          </View>
+          <View style={{ flexDirection: "row", alignItems: "center",
+                         justifyContent: "space-between", marginTop: 6 }}>
+            <Text style={s.mut}>this is us</Text>
+            <Switch value={household} onValueChange={setHousehold} />
+            <Pressable style={[s.btn, { marginLeft: "auto" },
+                               busy && { opacity: 0.5 }]}
+                       disabled={busy} onPress={() => save.mutate(m0.id)}>
+              <Text style={s.btnText}>save</Text>
+            </Pressable>
+            <Text style={{ color: C.mut, fontSize: 12, padding: 4 }}
+                  onPress={() => setEditing(null)}>cancel</Text>
+          </View>
+        </View>
+      ) : (
+        <View key={m0.id} style={{ flexDirection: "row",
+                                   alignItems: "center",
+                                   paddingVertical: 2 }}>
+          <Text style={[s.mut, { flex: 1 }]}>
+            {m0.member_name}
+            {m0.ownership_pct != null ? ` — ${m0.ownership_pct}%` : ""}
+            {m0.is_manager ? " · manager" : ""}
+            {m0.is_household ? " · us" : ""}
+          </Text>
+          {controls && (
+            <>
+              <Text style={{ color: C.accent, fontSize: 12, padding: 4 }}
+                    onPress={busy ? undefined : () => {
+                      setEditing(m0.id); setName(m0.member_name);
+                      setPct(m0.ownership_pct != null
+                        ? String(m0.ownership_pct) : "");
+                      setManager(!!m0.is_manager);
+                      setHousehold(!!m0.is_household); }}>
+                edit
+              </Text>
+              <Text style={{ color: C.mut, fontSize: 14, padding: 4,
+                             opacity: busy ? 0.5 : 1 }}
+                    onPress={busy ? undefined : () => Alert.alert(
+                      "Remove member",
+                      `Remove ${m0.member_name} from this business? Their `
+                      + "ownership share comes out of the tax estimate.",
+                      [{ text: "Remove", style: "destructive",
+                         onPress: () => remove.mutate(m0.id) },
+                       { text: "Cancel", style: "cancel" }])}>
+                ✕
+              </Text>
+            </>
+          )}
+        </View>
+      ))}
     </>
   );
 }

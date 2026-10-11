@@ -84,7 +84,7 @@ class TokenTests(unittest.TestCase):
         self.assertTrue(html.endswith("</p></div></div>"), html)
         self.assertIn(url, html)
         self.assertIn(url, plain)
-        self.assertIn("daily, weekly, monthly and yearly", plain)
+        self.assertIn("daily, monthly and yearly", plain)
 
 
 class MuteTests(unittest.TestCase):

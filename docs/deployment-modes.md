@@ -25,7 +25,10 @@ not described to tenants.
 
 An **installed add-on** (`server/oikonome/ext.py`) may add gating, intake
 and console panes of its own on top of either mode; with nothing installed
-the product gates nothing and caps nothing. See `DEVELOPMENT.md` →
+the product gates nothing and caps nothing. A **hosted** instance with no
+add-on must say so — `OIKONOME_HOSTED_BILLING=none` — or it refuses to
+start: a hosted image built without the add-on would otherwise be
+indistinguishable from that mode and bill nobody. See `DEVELOPMENT.md` →
 *Extension points*.
 
 **Rule: every new mode-dependent behavior adds its row to the table below
@@ -47,7 +50,7 @@ modes must behave identically.
 | Report email recipients | Free-form addresses (the operator owns the SMTP account) | Every recipient must hold an account on the tenant — the settings door refuses outsiders, restore drops them, the worker filters at send time. `OIKONOME_HOSTED_FREEFORM_RECIPIENTS=1` lifts it for a test instance | `web/mailguard.py`, `jobs/worker.py` |
 | Signups that never confirm | Nothing to do — accounts are born verified | Day 7: one reminder per unconfirmed person with a fresh link. Day `OIKONOME_UNVERIFIED_REAP_DAYS` (30): the household is frozen (`status='unverified_expired'`, the resend door stays open), the owner is mailed the deletion date and a fresh link, and the nightly purge erases it a week later. A click confirms the address and the page it lands on carries the button that reopens the household (a POST, so a mail scanner's prefetch cannot lift a freeze); a household with money attached or where anyone ever confirmed is never touched. `0` turns it off | `jobs/unverified.py`, run from the worker's nightly sweep before the purge |
 | Which owner receives household mail | Always the owner, verified or not | Only a verified owner; an all-unverified tenant receives nothing | `OIKONOME_HOSTED` check in the worker's recipient resolution |
-| Mail delivery configuration | Tenant SMTP settings win, `OIKONOME_SMTP_*` is the fallback, and the setup wizard offers an SMTP step | Same resolution order, but mail is normally the operator's env SMTP: the wizard omits the step and a tenant host that fails the address guard falls back to env | `report.resolve_smtp()`; the SPA's step list keyed on `me.hosted` |
+| Mail delivery configuration | Tenant SMTP settings win, `OIKONOME_SMTP_*` is the fallback — except account-recovery mail (reset, unlock, factor-cleared), which always uses `OIKONOME_SMTP_*` when it is set — and the setup wizard offers an SMTP step | Same resolution order, but mail is normally the operator's env SMTP: the wizard omits the step and a tenant host that fails the address guard falls back to env | `report.resolve_smtp()`; the SPA's step list keyed on `me.hosted` |
 | Bounce webhook | Off unless `OIKONOME_EMAIL_WEBHOOK_TOKEN` is set — a local relay has none to send, and the send path still detects a refused address on its own | Set, so a hard bounce is known when the relay reports it rather than one send later | unset ⇒ the route 404s |
 | Unsent one-time links | A link the instance could not email is logged in full, so the operator can hand it over | Only a fingerprint and a "not emailed" note; the link never lands in a log line | `OIKONOME_HOSTED` check in `_log_link()` |
 | Bring-your-own aggregator keys | Plaid / MX / SimpleFIN keys are saved per tenant | Refused on every keys door — connections run under the operator's credentials, and a restored connections bundle has its keys and items stripped | `_no_byo_on_hosted()`; `OIKONOME_HOSTED` check in `sync/connections_bundle.py` |
@@ -58,6 +61,7 @@ modes must behave identically.
 | Feedback package contents | Includes the recent process log ring only while the instance demonstrably holds at most one tenant | Never includes it — the ring is process-wide and would carry other households' lines; the tenant-scoped doctor bundle stays | `feedback._single_tenant_instance()` |
 | Operator notice on a new household | None | One email per new household (the address and the household id), sent off the request so a slow relay never fails a signup | `OIKONOME_OPERATOR_EMAIL` + SMTP; `_notify_operator_signup` |
 | `/api/me` `hosted` flag | `false` | `true` — the one switch the SPA keys every client-side divergence on | `OIKONOME_HOSTED` read in the `/api/me` handler |
+| Billing at startup | Nothing required | The gate add-on must be installed, or `OIKONOME_HOSTED_BILLING=none` set; otherwise the process refuses to start | `ext.require_hosted_billing()` at app import |
 
 Note: **demo mode is not a deployment mode.** A demo instance is a
 per-tenant flag (synthetic data, disabled data and security doors) and

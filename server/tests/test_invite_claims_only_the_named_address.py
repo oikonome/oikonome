@@ -130,11 +130,16 @@ class HostedInvitesAreAddressedAndDeliveredOnly(_Household):
     def setUp(self):
         super().setUp()
         # the hosted write gate wants a second factor; this suite is about
-        # the invite door, not enrollment
+        # the invite door, not enrollment, so the owner gets one directly.
+        # (Not the waiver: a waived login is the shared demonstration one,
+        # which may mint no invite at all.)
+        from oikonome.auth import totp as totp_mod
+        from oikonome.db import crypto
+        self.totp_secret = totp_mod.new_secret()
         admin = tenancy.admin_connect()
         try:
-            admin.execute("UPDATE users SET second_factor_waived=TRUE "
-                          "WHERE id=%s", (self.uid,))
+            admin.execute("UPDATE users SET totp_secret=%s WHERE id=%s",
+                          (crypto.encrypt_cp(self.totp_secret), self.uid))
         finally:
             admin.close()
         os.environ["OIKONOME_HOSTED"] = "1"
@@ -152,10 +157,17 @@ class HostedInvitesAreAddressedAndDeliveredOnly(_Household):
     def _pending(self):
         return self.owner.get("/api/invites").json()["invites"]
 
+    def _proof(self) -> dict:
+        from oikonome.auth import totp as totp_mod
+        from .util import clear_totp_burn
+        clear_totp_burn(self.owner_email)
+        return {"password": PW,
+                "totp_code": totp_mod.code_now(self.totp_secret)}
+
     def test_an_invite_naming_nobody_is_refused(self):
         before = len(self._pending())
         r = self.owner.post("/api/invites",
-                            json={"label": "spouse", "password": PW})
+                            json={"label": "spouse", **self._proof()})
         self.assertEqual(r.status_code, 400, r.text)
         self.assertIn("email address this invite is for", r.text)
         self.assertEqual(len(self._pending()), before,
@@ -164,7 +176,7 @@ class HostedInvitesAreAddressedAndDeliveredOnly(_Household):
     def test_the_link_reaches_the_mailbox_and_not_the_minter(self):
         alice = f"alice4-{uuid.uuid4().hex[:8]}@example.dev"
         r = self.owner.post("/api/invites",
-                            json={"label": alice, "password": PW})
+                            json={"label": alice, **self._proof()})
         self.assertEqual(r.status_code, 200, r.text)
         body = r.json()
         self.assertTrue(body["emailed"])
@@ -189,7 +201,7 @@ class HostedInvitesAreAddressedAndDeliveredOnly(_Household):
         r = self.owner.post(
             "/api/invites",
             json={"label": f"alice5-{uuid.uuid4().hex[:8]}@example.dev",
-                  "password": PW})
+                  **self._proof()})
         self.assertEqual(r.status_code, 502, r.text)
         self.assertEqual(len(self._pending()), before)
 

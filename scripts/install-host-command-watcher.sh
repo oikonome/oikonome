@@ -157,6 +157,39 @@ rm -f "\$lock"
 SCRIPT
 chmod 755 /usr/local/bin/oikonome-command-run
 
+# A command the host restarted under (a power cut, a reboot from the shell)
+# never wrote its final status: its result stays "running", and the console
+# and the nightly reboot check both read that as a command still in flight.
+# At boot nothing can be running yet, so every result still "running" that
+# was written before this boot is marked failed. Results written since the
+# boot are left alone — a request waiting in the drop-box starts its run
+# as soon as the path unit comes up.
+cat > /usr/local/bin/oikonome-command-boot-sweep <<'SCRIPT'
+#!/bin/sh
+set -u
+res="$1/ops-state/cmd-results"
+[ -d "$res" ] || exit 0
+python3 - "$res" <<'PY'
+import glob, json, os, sys, time
+booted = time.time() - float(open("/proc/uptime").read().split()[0])
+for p in glob.glob(os.path.join(sys.argv[1], "*.json")):
+    try:
+        if os.path.getmtime(p) >= booted:
+            continue
+        with open(p) as fh:
+            d = json.load(fh)
+        if not isinstance(d, dict) or d.get("state") != "running":
+            continue
+        d.update(state="failed", rc=4, finished=int(time.time()),
+                 error="the host restarted while this command ran")
+        with open(p, "w") as fh:   # rewritten in place: the owner is kept
+            fh.write(json.dumps(d) + "\n")
+    except (OSError, ValueError):
+        continue
+PY
+SCRIPT
+chmod 755 /usr/local/bin/oikonome-command-boot-sweep
+
 # One HOST can run several instances, each in
 # its own install dir. The units MUST be namespaced per install or the
 # second install silently clobbers the first — one unit watching one dir, so
@@ -169,6 +202,16 @@ Description=Oikonome console-requested host command ($TAG)
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/oikonome-command-run $ROOT
+UNIT
+cat > "/etc/systemd/system/$SVC-boot.service" <<UNIT
+[Unit]
+Description=Mark Oikonome console commands cut off by a restart as failed ($TAG)
+Before=$SVC.path
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/oikonome-command-boot-sweep $ROOT
+[Install]
+WantedBy=multi-user.target
 UNIT
 cat > "/etc/systemd/system/$SVC.path" <<UNIT
 [Unit]
@@ -186,4 +229,9 @@ rm -f /etc/systemd/system/oikonome-command-watcher.path \
 systemctl daemon-reload
 systemctl reset-failed "$SVC.service" "$SVC.path" 2>/dev/null || true
 systemctl enable --now "$SVC.path"
+systemctl enable "$SVC-boot.service"
+# the container cannot see host units, so tell it THIS watcher is installed
+# (scripts/watcher-marker.sh has the whole rule)
+. "$(dirname "$0")/watcher-marker.sh"
+watcher_mark "$ROOT" command "$TAG"
 echo "command watcher installed for $ROOT (unit $SVC, drop-box uid $UID_C, runs as $OWNER)"

@@ -93,6 +93,22 @@ class FailoverAlertMailTests(unittest.TestCase):
             "SELECT count(*) AS n FROM alerts_log "
             "WHERE kind='source-failover'").fetchone()["n"], 1)
 
+    def test_no_mail_relay_still_pushes_once(self):
+        """With no relay at all the email channel is off on this instance,
+        which is a decision rather than a failure to retry: the push goes
+        out and the edge is stamped, or a household that only uses push
+        would never hear of the failover (and a push without the stamp
+        would repeat every sweep)."""
+        off = {"configured": False, "host": "localhost", "port": 587,
+               "user": None, "password": None, "sender": "x@localhost"}
+        with mock.patch.object(report, "resolve_smtp", return_value=off), \
+             mock.patch.object(report, "send_each") as each, \
+             mock.patch.object(worker, "_push_alert") as push:
+            worker._alert_failovers(self.conn, self.tid)
+        each.assert_not_called()
+        push.assert_called_once()
+        self.assertEqual(links.failover_pending(self.conn), [])
+
     def test_alert_is_dated_on_the_households_day(self):
         cfg = budget.load_config(self.conn)
         cfg["timezone"] = "Pacific/Kiritimati"       # UTC+14

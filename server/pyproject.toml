@@ -22,7 +22,9 @@ dependencies = [
     "h2>=4.1",
     "cryptography>=42",
     "ofxtools>=0.9",
-    "pypdf>=4",
+    # 6.11 is the first release with LimitReachedError and every decoder
+    # output limit the PDF importer lowers (sync/pdfimport.py)
+    "pypdf>=6.19",
     "pypdfium2>=4",
     # the continuity packet (Settings → Data) is a PDF a survivor reads
     # cold; reportlab is pure Python, so the image grows by no system libs

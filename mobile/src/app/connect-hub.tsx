@@ -14,15 +14,16 @@ import { Alert, Linking, Pressable, RefreshControl, ScrollView, StyleSheet,
 import PullRefresh from "../components/pull-refresh";
 
 import StaleBanner from "../components/stale-banner";
-import { Card, H, Pill } from "../components/ui";
+import { Card, H, Pill, SharedLock } from "../components/ui";
 import { patchQuery } from "../lib/cache";
 import { ago } from "../lib/dates";
 import { plaidHostedLink } from "../lib/plaid";
-import { institutionAllowance, showsProviderDoor } from "../lib/pure";
+import { bankLinkHoldNote, institutionAllowance, showsProviderDoor,
+         type BankLinkHoldView } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { ext } from "../ext";
 import { C } from "../lib/theme";
-import { useOwner } from "../lib/viewer";
+import { useOwner, useSharedLock } from "../lib/viewer";
 import { errText } from "../lib/api";
 
 const ROWS: { key: string; name: string; cost: string; effort: string;
@@ -53,6 +54,9 @@ export default function ConnectHub() {
   const d = settings.data as (Record<string, unknown> | undefined);
   const hosted = !!me.data?.hosted;
   const owner = useOwner();
+  // the key and token flows below plant credentials too; refused the
+  // shared demonstration login wherever it meets them
+  const credentialLock = useSharedLock("credential");
   const [open, setOpen] = useState<string | null>(null);
 
   // every door on this screen links a bank or saves a provider key —
@@ -126,9 +130,12 @@ export default function ConnectHub() {
             </Text>
           </Pressable>
           {open === r.key && (
-            r.key === "plaid" ? <PlaidFlow d={d} />
-            : r.key === "mx" ? <MxFlow d={d} />
-            : r.key === "simplefin" ? <SimplefinFlow />
+            r.key === "plaid"
+              ? <SharedLock note={credentialLock}><PlaidFlow d={d} /></SharedLock>
+            : r.key === "mx"
+              ? <SharedLock note={credentialLock}><MxFlow d={d} /></SharedLock>
+            : r.key === "simplefin"
+              ? <SharedLock note={credentialLock}><SimplefinFlow /></SharedLock>
             : r.key === "scripts" ? (
               <Text style={s.mut}>
                 Host-side collector scripts push data in over the API
@@ -171,6 +178,9 @@ function HostedHub({ bankLink, cap, used }: {
   // the pull-to-refresh spinner tracks the PULL, not the query: sharing
   // isRefetching with the 5s poll above would flash it every tick
   const [pulling, setPulling] = useState(false);
+  // a bank link plants a credential that outlives the shared demonstration
+  // login, so the server refuses it that door; the button says so in place
+  const credentialLock = useSharedLock("credential");
   const link = useMutation({
     mutationFn: () => plaidHostedLink(client!, ""),
     onSuccess: (r) => {
@@ -239,9 +249,10 @@ function HostedHub({ bankLink, cap, used }: {
                 {ext.allowanceNote(used, cap, full)}
               </Text>
             )}
+            <SharedLock note={credentialLock}>
             <Pressable style={[s.btn, (link.isPending || full)
                                       && { opacity: 0.5 }]}
-                       disabled={link.isPending || full}
+                       disabled={link.isPending || full || !!credentialLock}
                        onPress={() => { setMsg(null); link.mutate(); }}>
               {/* "account", not "bank" — a card, a brokerage and a bank
                   are all accounts; once one is in, the button invites
@@ -252,6 +263,7 @@ function HostedHub({ bankLink, cap, used }: {
                                   : "+ Connect an account ↗"}
               </Text>
             </Pressable>
+            </SharedLock>
             <Text style={s.mut}>
               Opens your bank&apos;s sign-in (Plaid). When you finish, the
               connection appears below so you can link another or carry
@@ -306,8 +318,13 @@ function HostedHub({ bankLink, cap, used }: {
                         ? ` · bank sent data ${ago(c.bank_updated_at)}` : ""}
                     </Text>
                   </View>
-                  <Text style={{ color: C.bad, fontSize: 12 }}
-                        onPress={() => !disc.isPending && Alert.alert(
+                  {/* refused to the shared demonstration login, whose
+                      reason already stands at the connect button above */}
+                  <Text style={{ color: C.bad, fontSize: 12,
+                                 opacity: credentialLock ? 0.55 : 1 }}
+                        disabled={!!credentialLock}
+                        onPress={() => !disc.isPending && !credentialLock
+                          && Alert.alert(
                           `Disconnect ${name}?`,
                           "It stops syncing (history is kept).",
                           [{ text: "Cancel", style: "cancel" },
@@ -428,6 +445,10 @@ function PlaidFlow({ d }: { d?: Record<string, unknown> }) {
     onError: (e) => setMsg(errText(e)),
   });
   const keysReady = !!d?.plaid_secret_set;
+  // the bank-link hold: the server refuses a new link on keys a
+  // credential rotation has not confirmed yet; closed here with its
+  // sentence (mirrors the web's ConnectHub)
+  const held = bankLinkHoldNote(d as BankLinkHoldView, "plaid");
   return (
     <>
       <Text style={s.mut}>
@@ -473,14 +494,17 @@ function PlaidFlow({ d }: { d?: Record<string, unknown> }) {
                                  marginTop: 8 }]}>
             Keys saved ✓ — now link your bank(s):
           </Text>
-          <Pressable style={[s.btn, link.isPending && { opacity: 0.5 }]}
-                     disabled={link.isPending}
+          <Pressable style={[s.btn, (link.isPending || !!held)
+                       && { opacity: 0.5 }]}
+                     disabled={link.isPending || !!held}
                      onPress={() => link.mutate()}>
             <Text style={s.btnText}>
               {link.isPending ? "waiting for your bank…"
                               : "+ Link a bank via Plaid ↗"}
             </Text>
           </Pressable>
+          {held ? <Text style={{ color: C.warn, fontSize: 12 }}>{held}</Text>
+                : null}
           {msg && <Text style={s.mut}>{msg}</Text>}
           <Text style={{ color: C.bad, fontSize: 12, marginTop: 6 }}
                 onPress={() => !clear.isPending && clear.mutate()}>
@@ -524,6 +548,8 @@ function MxFlow({ d }: { d?: Record<string, unknown> }) {
         qc.invalidateQueries({ queryKey: [k] }); },
     onError: (e) => setErr(errText(e)),
   });
+  // the widget is held like a Plaid link (mirrors the web's MxFlow)
+  const held = bankLinkHoldNote(d as BankLinkHoldView, "mx");
   const clear = useMutation({
     mutationFn: () => client!.mxKeysClear(),
     onSuccess: () => { setErr(null); setSaved(false);
@@ -556,9 +582,9 @@ function MxFlow({ d }: { d?: Record<string, unknown> }) {
               : saved ? "Keys saved ✓" : "Validate & save keys"}
           </Text>
         </Pressable>
-        <Pressable style={[s.btn, (!saved || connect.isPending)
+        <Pressable style={[s.btn, (!saved || connect.isPending || !!held)
                      && { opacity: 0.5 }]}
-                   disabled={!saved || connect.isPending}
+                   disabled={!saved || connect.isPending || !!held}
                    onPress={() => connect.mutate()}>
           <Text style={s.btnText}>
             {connect.isPending ? "…" : "Open MX Connect (link a bank)"}
@@ -573,6 +599,8 @@ function MxFlow({ d }: { d?: Record<string, unknown> }) {
           </Text>
         </Pressable>
       </View>
+      {held ? <Text style={{ color: C.warn, fontSize: 12 }}>{held}</Text>
+            : null}
       {msg && <Text style={s.mut}>{msg}</Text>}
       <Text style={s.mut}>
         Link banks in the MX window, then hit Sync now — accounts and

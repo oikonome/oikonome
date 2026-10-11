@@ -5,7 +5,9 @@
 // A separate file (not inline) because the SPA CSP is script-src 'self'
 // — an inline script would be blocked.
 (function () {
-  var t = localStorage.getItem("oiko-theme");
+  // storage can be blocked (it then throws); that reads as no choice
+  var t = null;
+  try { t = localStorage.getItem("oiko-theme"); } catch (e) { /* blocked */ }
   // no stored choice → dark default; "auto" → let the OS blocks decide
   if (t === "light" || t === "dark")
     document.documentElement.dataset.theme = t;

@@ -38,7 +38,7 @@ class ShortWindows(unittest.TestCase):
 
     def test_this_month_is_one_month_open_to_today(self):
         bank = reporting._bank_account_ids(self.conn)
-        start, end, prev, label = reporting._range_window(self.conn, TODAY, "cur", bank)
+        start, end, prev, label, _live = reporting._range_window(self.conn, TODAY, "cur", bank)
         self.assertEqual(start, TODAY.replace(day=1))
         self.assertEqual(end, TODAY + dt.timedelta(days=1))
         self.assertEqual(prev, (TODAY.replace(day=1) - dt.timedelta(days=1)).replace(day=1))
@@ -46,7 +46,7 @@ class ShortWindows(unittest.TestCase):
 
     def test_last_month_closes_before_today(self):
         bank = reporting._bank_account_ids(self.conn)
-        start, end, prev, label = reporting._range_window(self.conn, TODAY, "1m", bank)
+        start, end, prev, label, _live = reporting._range_window(self.conn, TODAY, "1m", bank)
         month_start = TODAY.replace(day=1)
         self.assertEqual(end, month_start)
         self.assertEqual(start, (month_start - dt.timedelta(days=1)).replace(day=1))
@@ -106,14 +106,23 @@ class ShortWindows(unittest.TestCase):
                   reporting.income_window(self.conn, TODAY, "cur")):
             self.assertEqual(w["to"], TODAY.isoformat())
 
-    def test_ranges_that_run_to_today_still_count_the_live_month(self):
-        """The other direction of the same rule: a range whose window is
-        open to now ends today and counts the in-progress month whole, as
-        its label promises ("May–Jul" is three months, not two-and-a-half)."""
-        for w in (reporting.spending_window(self.conn, TODAY, "3m"),
-                  reporting.income_window(self.conn, TODAY, "3m")):
-            self.assertEqual(w["months"], 3)
-            self.assertEqual(w["to"], TODAY.isoformat())
+    def test_a_range_of_months_holds_complete_months_only(self):
+        """Every key but "cur" ends with the last complete month: "3m" on
+        the 6th is the three months that have closed, not two and six
+        days, so a per-month pace over it is honest and its label names
+        whole months. Only "This month" runs to today."""
+        month_start = TODAY.replace(day=1)
+        last = month_start - dt.timedelta(days=1)
+        for key in ("3m", "6m", "1y", "3y", "5y", "all"):
+            for w in (reporting.spending_window(self.conn, TODAY, key),
+                      reporting.income_window(self.conn, TODAY, key)):
+                self.assertEqual(w["to"], last.isoformat(), key)
+        w = reporting.spending_window(self.conn, TODAY, "3m")
+        self.assertEqual(w["from"], reporting._months_back(month_start, 3).isoformat())
+        # the ledger here opens two months back, so the pace divides by
+        # the two months it has (a young ledger), not the window's three
+        self.assertEqual(w["months"], 2)
+        self.assertEqual(w["total"], 70.0 + 90.0)   # this month's row is out
 
     def test_the_routes_accept_both_keys(self):
         from fastapi import FastAPI

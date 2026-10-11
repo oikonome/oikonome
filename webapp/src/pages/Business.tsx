@@ -1,5 +1,6 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { type InfiniteData, useInfiniteQuery, useQuery, useQueryClient }
+  from "@tanstack/react-query";
+import { useEffect, useState } from "react";
 
 // double-submit guard: wrap an async action, expose a pending flag to disable
 // its trigger while in flight
@@ -13,15 +14,19 @@ function useBusy() {
 }
 import { Link, useSearchParams } from "react-router";
 import BusinessWizard from "../components/BusinessWizard";
-import { bizPeriodProfit, countsInTotals } from "../bizmath";
+import { bizDefaultTaxYear, bizPeriodProfit, bizTaxStillDue, bizTaxYears,
+  countsInTotals, bizShownBucket, bizNeedsLine, numberFieldsPatch,
+  numberDraft, bizMemberDoorMissing } from "../bizmath";
 import { localYmd } from "../moneymath";
 import ReceiptPanel from "../components/ReceiptPanel";
 import { NoteEditor } from "../components/TxnTable";
 import { api, errText, kindIs, mmdd, money, toast, type Account, type BizData,
          type BizTxn, type BusinessSummary, type Entity, type EquityMovement,
+         type EstimatedTax,
          type MileageTrip, type Obligation, type Vendor,
          catLabel } from "../api/client";
-import { patchList, patchQuery, removeFromList } from "../api/cache";
+import { patchList, patchQueries, patchQuery, removeFromList }
+  from "../api/cache";
 import { canEdit, isOwner, isViewer } from "../role";
 
 // Assigning an account moves its money between the personal and business
@@ -216,15 +221,41 @@ function EditEntityForm({ entity, onDone, onCancel }:
  *  card says which of the two it is showing rather than letting the number
  *  imply the stronger one.
  */
+/** What would make a figure covering every member the household's share:
+ *  the server's own rule, so the screen never asks for a mark that changes
+ *  nothing (an S-corp is never split; a marked member needs every share
+ *  given, together 100%). Older servers send no reason; they get the
+ *  plain request to mark a member. */
+function bizHouseholdHint(why: EstimatedTax["household_unavailable"]): string {
+  if (why === "s_corp") return "";
+  if (why === "shares_incomplete")
+    return " — your member is marked \"this is us\", but every member needs an ownership share and together they must make 100% before yours can be split out";
+  return " — mark your member as \"this is us\" under Settings (with every member's share given, together 100%) to see yours";
+}
+
 function TaxSetAside({ entity }: { entity: Entity }) {
   const year = new Date().getFullYear();
   const tax = useQuery({ queryKey: ["esttax", entity.id, year],
     queryFn: () => api.estTax(entity.id, year) });
+  // the P&L reports the estimates already paid out of the business
+  const pnl = useQuery({ queryKey: ["pnl", entity.id, year],
+    queryFn: () => api.entityPnl(entity.id, year) });
   const accts = useQuery({ queryKey: ["accounts"], queryFn: api.accounts });
 
   if (tax.isPending) return null;
   const owed = tax.data?.total_estimated ?? 0;
-  const profit = tax.data?.net_profit ?? 0;
+  // Everything set against the estimate stands on its footing: when it is
+  // the household member's share, so are the profit it is a rate of, the
+  // payments already made toward it and the cash held for it. The
+  // business's own figures would halve the rate shown and take every
+  // partner's payments off one partner's bill.
+  const share = tax.data?.covers === "household" && tax.data.household
+    ? tax.data.household.ownership_pct : null;
+  const paid = tax.data?.covered_tax_paid
+    ?? (share != null ? null : pnl.data?.estimated_tax_paid) ?? 0;
+  const due = bizTaxStillDue(owed, paid);
+  const profit = tax.data?.covered_profit
+    ?? (share != null ? null : tax.data?.net_profit) ?? 0;
   // Shadow exclusion, the same rule the server applies to every money sum:
   // an account linked through two aggregators leaves two rows sharing one
   // group, and both can carry entity_id, so the fallback "all business
@@ -240,11 +271,16 @@ function TaxSetAside({ entity }: { entity: Entity }) {
   const reserve = entity.tax_reserve_account_id
     ? mine.find(a => a.id === entity.tax_reserve_account_id) : undefined;
   const ringFenced = !!reserve;
-  const cash = ringFenced
+  const held = ringFenced
     ? (reserve!.balance_current ?? 0)
     : mine.reduce((s, a) => s + (a.balance_current ?? 0), 0);
+  // the business's accounts hold every partner's money, so the household's
+  // claim on them is its ownership share
+  const cash = share != null ? held * share / 100 : held;
   const stale = !!entity.tax_reserve_account_id && !reserve;
-  const gap = cash - owed;
+  // measured against what is still to pay: a reserve that paid this
+  // year's earlier estimates is not short by them
+  const gap = cash - due;
   const pct = profit > 0 ? Math.round((owed / profit) * 100) : null;
 
   return (
@@ -254,11 +290,18 @@ function TaxSetAside({ entity }: { entity: Entity }) {
         <div>
           <div className="sub">Estimated for {year}</div>
           <div className="kpi sm">{money(owed)}</div>
-          {pct !== null && <div className="sub">{pct}% of profit</div>}
+          {pct !== null && <div className="sub">{pct}% of{" "}
+            {share != null ? "your share of " : ""}profit</div>}
+          {paid > 0 && <div className="sub">{money(paid)} paid,{" "}
+            {money(due)} still to pay (a prior-year balance paid in April
+            counts as paid here)</div>}
         </div>
         <div>
-          <div className="sub">{ringFenced ? "In the tax account"
-                                           : "Business cash"}</div>
+          <div className="sub">{share != null ? `Your ${share}% of ` : ""}
+            {ringFenced ? (share != null ? "the tax account"
+                                         : "In the tax account")
+                        : (share != null ? "business cash" : "Business cash")}
+          </div>
           <div className="kpi sm">{money(cash)}</div>
           {ringFenced && <div className="sub">{reserve!.name}
             {reserve!.mask ? ` ····${reserve!.mask}` : ""}</div>}
@@ -400,23 +443,39 @@ function ReviewQueue({ entity, ro }: { entity: Entity; ro?: boolean }) {
 
   const rows = q.data?.suggestions || [];
   const lines = q.data?.lines || [];
-  const commit = (txnId: string, bucket: string, line: string) => {
+  const commit = (txnId: string, line: string) => {
     setPending(txnId);
-    api.bizClassify(entity.id, txnId, { bucket, sched_c_line: line })
-      .then(() => {
-        // the decided row leaves the queue now — the server has committed
-        // it, and waiting for the refetch to prove that left it sitting
-        // there; the count on the Overview tile follows the same payload
-        qc.setQueryData<Sugg>(["biz-suggestions", entity.id], (old) =>
-          old && { ...old,
-                   suggestions: old.suggestions.filter((x) => x.txn_id !== txnId),
-                   unclassified: Math.max(0, old.unclassified - 1) });
-        qc.invalidateQueries({ queryKey: ["biz-suggestions", entity.id] });
-        qc.invalidateQueries({ queryKey: ["pnl", entity.id] });
-        qc.invalidateQueries({ queryKey: ["biz-txns", entity.id] });
+    // The bucket sent with the line is the queue's date-derived default,
+    // and the save replaces whatever bucket the row has. Read the queue
+    // fresh first: a row given a bucket since (on the Books tab, or on
+    // another device) has left it, and saving the cached default would
+    // undo that choice.
+    api.bizSuggestions(entity.id)
+      .then((fresh) => {
+        const row = fresh.suggestions.find((x) => x.txn_id === txnId);
+        if (!row) {
+          qc.setQueryData(["biz-suggestions", entity.id], fresh);
+          toast("Already classified elsewhere — the list is up to date.");
+          return;
+        }
+        return api.bizClassify(entity.id, txnId,
+          { bucket: row.suggested_bucket, sched_c_line: line })
+          .then(() => afterCommit(txnId));
       })
       .catch(toastErr)
       .finally(() => setPending((p) => (p === txnId ? null : p)));
+  };
+  const afterCommit = (txnId: string) => {
+    // the decided row leaves the queue now — the server has committed
+    // it, and waiting for the refetch to prove that left it sitting
+    // there; the count on the Overview tile follows the same payload
+    qc.setQueryData<Sugg>(["biz-suggestions", entity.id], (old) =>
+      old && { ...old,
+               suggestions: old.suggestions.filter((x) => x.txn_id !== txnId),
+               unclassified: Math.max(0, old.unclassified - 1) });
+    qc.invalidateQueries({ queryKey: ["biz-suggestions", entity.id] });
+    qc.invalidateQueries({ queryKey: ["pnl", entity.id] });
+    qc.invalidateQueries({ queryKey: ["biz-txns", entity.id] });
   };
 
   if (q.isPending) return <p className="mut">loading…</p>;
@@ -468,8 +527,7 @@ function ReviewQueue({ entity, ro }: { entity: Entity; ro?: boolean }) {
               <td style={{ width: "1%" }}>
                 <button className="pri"
                         disabled={pending === s.txn_id || !chosen || ro}
-                        onClick={() => commit(s.txn_id, s.suggested_bucket,
-                                              chosen)}>
+                        onClick={() => commit(s.txn_id, chosen)}>
                   {s.suggested_line && chosen === s.suggested_line
                     ? "Accept" : "Save"}</button>
               </td>
@@ -553,7 +611,9 @@ function OverviewSection({ entity }: { entity: Entity }) {
             sub={`${counted.length} account(s)`} />
       <Tile label="Next deadline"
             value={next ? mmdd(next.due) : "none"}
-            sub={tax.data ? `${money(tax.data.quarterly)} est. quarterly` : undefined} />
+            sub={tax.data ? `${money(tax.data.next_payment
+                                     ?? tax.data.quarterly)} est. quarterly`
+                          : undefined} />
       <Tile label="Needs attention"
             value={sugg.isPending ? "…" : String(attention)}
             sub={attention ? "unclassified transactions" : "nothing outstanding"} />
@@ -569,6 +629,12 @@ function EntityDetail({ entity, flaggedUnassigned, onChange, tab,
     onAdd?: () => void }) {
   const qc = useQueryClient();
   const [editing, setEditing] = useState(false);
+  // the Tax tab's filing year: the package and the 1099 list read the
+  // same one, so last year's return can be put together in March
+  const taxYears = bizTaxYears(new Date(), entity.formation_date,
+                               entity.business_start_date);
+  const [taxYear, setTaxYear] = useState(
+    () => bizDefaultTaxYear(new Date(), taxYears));
   // delete-forever confirm open (typed-name gate lives in the card)
   const [nuke, setNuke] = useState(false);
   const accts = useQuery({ queryKey: ["accounts"], queryFn: api.accounts });
@@ -810,14 +876,12 @@ function EntityDetail({ entity, flaggedUnassigned, onChange, tab,
       <TaxReservePicker entity={entity} accounts={assigned} ro={ro} />
 
       <h4 style={{ marginBottom: ".3rem" }}>Members</h4>
-      {(full.data?.members || []).map(m => (
-        <div key={m.id} className="mut" style={{ fontSize: ".9rem" }}>
-          {m.member_name}{m.ownership_pct != null
-            ? ` — ${m.ownership_pct}%` : ""}{m.is_manager ? " · manager" : ""}
-        </div>
-      ))}
-      {!ro && <AddMember entityId={entity.id} onDone={() =>
-        qc.invalidateQueries({ queryKey: ["entity", entity.id] })} />}
+      <MemberList entityId={entity.id} members={full.data?.members || []}
+                  editable={!ro && isOwner(meQ)} />
+      {/* ownership shares split the tax estimate, so adding a member is
+          the owner's call, like editing or removing one */}
+      {!ro && isOwner(meQ) && <AddMember entityId={entity.id} onDone={() =>
+        bizMembersChanged(qc, entity.id)} />}
       </>}
 
       {/* one task per tab. Books is the money picture, Tax is what the
@@ -834,18 +898,25 @@ function EntityDetail({ entity, flaggedUnassigned, onChange, tab,
         {/* the whole point is ONE action — the failure mode is exporting
             four reports in March and forgetting the fifth */}
         <div className="card">
-          <h4 style={{ marginTop: 0 }}>Year-end package</h4>
-          <p className="sub" style={{ marginTop: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: ".5rem",
+            flexWrap: "wrap" }}>
+            <h4 style={{ margin: 0 }}>Year-end package</h4>
+            <select value={taxYear} aria-label="tax year"
+              onChange={(e) => setTaxYear(Number(e.target.value))}>
+              {taxYears.map(y => <option key={y} value={y}>{y}</option>)}
+            </select>
+          </div>
+          <p className="sub">
             P&amp;L, ledger with Schedule C lines, balance sheet, 1099 vendor
             totals and the mileage log — one zip for your accountant.
           </p>
           <a className="btn pri"
              href={`/api/business/entities/${entity.id}/package.zip` +
-                   `?year=${new Date().getFullYear()}`}>
-            Download {new Date().getFullYear()} package</a>
+                   `?year=${taxYear}`}>
+            Download {taxYear} package</a>
         </div>
         <TaxSection entity={entity} readOnly={ro} />
-        <VendorSection entityId={entity.id} readOnly={ro} />
+        <VendorSection entityId={entity.id} year={taxYear} readOnly={ro} />
         <ComplianceSection entityId={entity.id} readOnly={ro} />
       </>}
       {tab === "transactions" && <ReviewQueue entity={entity} ro={ro} />}
@@ -906,6 +977,10 @@ function EquitySection({ entityId, readOnly }:
           {money(cap.draws + cap.distributions)})
           {cap.reimbursements > 0 &&
             <> · reimbursements {money(cap.reimbursements)}</>}
+          {cap.household_capital != null && cap.household_share_pct != null &&
+            <> · your share ({cap.household_share_pct}%):{" "}
+              <b className={cap.household_capital < 0 ? "neg" : "pos"}>
+                {money(cap.household_capital)}</b></>}
         </p>
       )}
       {(q.data?.movements || []).length > 0 && (
@@ -955,35 +1030,119 @@ const BUCKETS: [string, string][] = [
   ["startup_195", "Start-up (§195)"],
 ];
 
+const BOOKS_PAGE = 100;
+
 function BooksSection({ entityId, readOnly }:
   { entityId: string; readOnly: boolean }) {
   const qc = useQueryClient();
   const now = new Date();
   const [year, setYear] = useState<number | undefined>(now.getFullYear());
+  // 'all years' can be a whole account history: a dropdown per row for
+  // every one of them would freeze the tab, so the list renders a page at
+  // a time and the CSV carries the rest
+  const [shown, setShown] = useState(BOOKS_PAGE);
   const pnl = useQuery({ queryKey: ["pnl", entityId, year ?? "all"],
     queryFn: () => api.entityPnl(entityId, year) });
   // the same key the Overview and the review queue use, so a decision made
   // on either tab refreshes this list too — spelled differently it never
   // would
   const txns = useQuery({ queryKey: ["biz-txns", entityId, year ?? "all"],
-    queryFn: () => api.bizTxns(entityId, year) });
+    queryFn: () => api.bizTxns(entityId, year), enabled: year !== undefined });
+  // 'all years' is fetched a page at a time: the whole history in one reply
+  // is the slow part, not just rendering it. Still under the "biz-txns"
+  // prefix so every invalidation above reaches it.
+  const allTxns = useInfiniteQuery({
+    queryKey: ["biz-txns", entityId, "all", "pages"],
+    queryFn: ({ pageParam }) =>
+      api.bizTxnsPage(entityId, pageParam, BOOKS_PAGE),
+    initialPageParam: 0,
+    getNextPageParam: (last, pages) => {
+      const got = pages.reduce((n, pg) => n + pg.transactions.length, 0);
+      return typeof last.total === "number" && last.transactions.length > 0
+        && got < last.total ? got : undefined;
+    },
+    enabled: year === undefined,
+  });
+  type BizPage = { transactions: BizTxn[]; total?: number };
+  // offset paging over a list that changed between pages can skip a row;
+  // a page whose total disagrees with the first page's says it did, so the
+  // list starts over from the first page
+  const pageTotals = (allTxns.data?.pages ?? []).map((pg) => pg.total);
+  useEffect(() => {
+    if (pageTotals.some((t) => t !== pageTotals[0]))
+      qc.resetQueries({ queryKey: ["biz-txns", entityId, "all", "pages"] });
+  }, [pageTotals.join(","), entityId, qc]);
+  // rows that arrive while paging can shift a later page by one; a row is
+  // listed once
+  const loaded: BizTxn[] = year !== undefined
+    ? (txns.data?.transactions || [])
+    : (() => {
+        const seen = new Set<string>();
+        return (allTxns.data?.pages ?? []).flatMap((pg) => pg.transactions)
+          .filter((t) => !seen.has(t.id) && !!seen.add(t.id));
+      })();
+  const total = year === undefined
+    ? allTxns.data?.pages[0]?.total : undefined;
+  const serverPaged = typeof total === "number";
+  // a bucket set here takes the row out of the Schedule C review queue.
+  // The row is already patched: refetching every loaded page of the 'all
+  // years' list would cost a full-history read per page, so that list is
+  // left as patched and only what derives from the bucket refreshes.
   const refresh = () => {
     qc.invalidateQueries({ queryKey: ["pnl", entityId] });
-    qc.invalidateQueries({ queryKey: ["biz-txns", entityId] });
+    qc.invalidateQueries({ queryKey: ["biz-txns", entityId],
+      predicate: (q) => q.queryKey[3] !== "pages" });
+    qc.invalidateQueries({ queryKey: ["biz-suggestions", entityId] });
   };
   // the select is bound to the cached row, so it snaps back to the old
   // bucket until the list refetches — write the choice into the row first;
   // a failure refetches the truth back
   const setBucket = (txnId: string, bucket: string) => {
-    patchList<{ transactions: BizTxn[] }, BizTxn>(
-      qc, ["biz-txns", entityId, year ?? "all"], "transactions",
-      (t) => t.id === txnId, { bucket, effective_bucket: bucket });
+    if (year === undefined)
+      patchQueries<InfiniteData<BizPage>>(
+        qc, ["biz-txns", entityId, "all", "pages"], (old) => ({
+          ...old, pages: old.pages.map((pg) => ({
+            ...pg, transactions: pg.transactions.map((t) => t.id === txnId
+              ? { ...t, bucket, effective_bucket: bucket } : t) })) }));
+    else
+      patchList<{ transactions: BizTxn[] }, BizTxn>(
+        qc, ["biz-txns", entityId, year], "transactions",
+        (t) => t.id === txnId, { bucket, effective_bucket: bucket });
     api.bizClassify(entityId, txnId, { bucket }).then(refresh).catch((e) => {
       qc.invalidateQueries({ queryKey: ["biz-txns", entityId] });
       toastErr(e);
     });
   };
+  // a row bucketed here with no line stays in Schedule C review; the
+  // line is offered on the row too, from the same closed list (and the
+  // same cache entry) the review queue reads
+  const wantsLine = !readOnly && loaded.some(bizNeedsLine);
+  const lineList = useQuery({ queryKey: ["biz-suggestions", entityId],
+    queryFn: () => api.bizSuggestions(entityId), enabled: wantsLine });
+  const setLine = (t: BizTxn, line: string) => {
+    if (!line || !t.bucket) return;
+    const bucket = t.bucket;
+    if (year === undefined)
+      patchQueries<InfiniteData<BizPage>>(
+        qc, ["biz-txns", entityId, "all", "pages"], (old) => ({
+          ...old, pages: old.pages.map((pg) => ({
+            ...pg, transactions: pg.transactions.map((x) => x.id === t.id
+              ? { ...x, sched_c_line: line } : x) })) }));
+    else
+      patchList<{ transactions: BizTxn[] }, BizTxn>(
+        qc, ["biz-txns", entityId, year], "transactions",
+        (x) => x.id === t.id, { sched_c_line: line });
+    api.bizClassify(entityId, t.id, { bucket, sched_c_line: line })
+      .then(refresh).catch((e) => {
+        qc.invalidateQueries({ queryKey: ["biz-txns", entityId] });
+        toastErr(e);
+      });
+  };
   const p = pnl.data;
+  const expenses = loaded.filter(t => t.amount > 0);
+  // a server-paged list shows every expense it has loaded; otherwise (one
+  // year, or a server that sent everything) the render is capped instead
+  const visible = serverPaged ? expenses : expenses.slice(0, shown);
   const years = [now.getFullYear(), now.getFullYear() - 1,
                  now.getFullYear() - 2];
   const csv = `/api/business/entities/${entityId}/pnl.csv` +
@@ -993,8 +1152,9 @@ function BooksSection({ entityId, readOnly }:
       <div style={{ display: "flex", alignItems: "center", gap: ".5rem",
         marginTop: ".6rem", flexWrap: "wrap" }}>
         <h4 style={{ margin: 0 }}>Books &amp; P&amp;L</h4>
-        <select value={year ?? ""} onChange={(e) =>
-          setYear(e.target.value ? Number(e.target.value) : undefined)}>
+        <select value={year ?? ""} onChange={(e) => {
+          setYear(e.target.value ? Number(e.target.value) : undefined);
+          setShown(BOOKS_PAGE); }}>
           <option value="">all years</option>
           {years.map(y => <option key={y} value={y}>{y}</option>)}
         </select>
@@ -1023,7 +1183,7 @@ function BooksSection({ entityId, readOnly }:
           )}
         </div>
       )}
-      {(txns.data?.transactions || []).some(t => t.amount > 0) && (
+      {expenses.length > 0 && (
         <>
         <p className="mut" style={{ fontSize: ".82rem", margin: ".2rem 0" }}>
           Expenses only — classify each into a bucket. Revenue is summed into
@@ -1033,23 +1193,45 @@ function BooksSection({ entityId, readOnly }:
             <th className="num" style={{ width: "1%" }}>Amount</th>
             <th style={{ width: "1%" }}>Bucket</th></tr>
         </thead><tbody>
-          {(txns.data?.transactions || []).filter(t => t.amount > 0).map(t => (
+          {visible.map(t => (
             <tr key={t.id}>
               <td className="mut" style={{ whiteSpace: "nowrap" }}>
                 {t.date ? mmdd(t.date) : ""}</td>
               <td>{t.payee}{t.note && <div className="mut" style={{ fontSize: 11,
                 fontStyle: "italic" }}>📝 {t.note}</div>}</td>
               <td className="num">{money(t.amount)}</td>
-              <td>{readOnly ? (t.bucket || "operating") : (
-                <select value={t.bucket || "operating"}
+              <td>{readOnly ? bizShownBucket(t) : (
+                <select value={bizShownBucket(t)}
                   onChange={(e) => setBucket(t.id, e.target.value)}>
                   {BUCKETS.map(([v, l]) =>
                     <option key={v} value={v}>{l}</option>)}
-                </select>)}</td>
+                </select>)}
+                {!readOnly && bizNeedsLine(t) && (
+                  <select value="" style={{ display: "block", marginTop: 2 }}
+                          onChange={(e) => setLine(t, e.target.value)}>
+                    <option value="">choose a line…</option>
+                    {(lineList.data?.lines || []).map((l) =>
+                      <option key={l} value={l}>{l}</option>)}
+                  </select>)}</td>
             </tr>
           ))}
         </tbody></table>
+        {!serverPaged && expenses.length > shown && (
+          <p className="sub">Showing {shown} of {expenses.length}{" "}
+            <button className="btn" onClick={() => setShown(shown + BOOKS_PAGE)}>
+              show more</button></p>
+        )}
         </>
+      )}
+      {/* outside the table: a page of revenue alone lists no expense, and
+          the next page must still be reachable. The count is transactions,
+          revenue included — the table lists the expenses among them. */}
+      {serverPaged && allTxns.hasNextPage && (
+        <p className="sub">Showing the newest {loaded.length} of {total}{" "}
+          transactions{" "}
+          <button className="btn" disabled={allTxns.isFetchingNextPage}
+                  onClick={() => allTxns.fetchNextPage()}>
+            show more</button></p>
       )}
     </>
   );
@@ -1064,12 +1246,24 @@ function TaxSection({ entity, readOnly }:
     entity.income_tax_rate != null ? String(entity.income_tax_rate) : "");
   const [sqft, setSqft] = useState(
     entity.home_office_sqft != null ? String(entity.home_office_sqft) : "");
+  // what the fields held when loaded: only a field typed into since is
+  // sent, so saving the rate never puts back a size changed elsewhere
+  const [loaded, setLoaded] = useState({ rate, sqft });
   const [busy, run] = useBusy();
   // the rate lives on the entity, which the summary serves — write the
   // saved entity into both caches so nothing reads the old rate back
-  const save = () => run(api.entityUpdate(entity.id, {
-    income_tax_rate: rate ? Number(rate) : null,
-    home_office_sqft: sqft ? Number(sqft) : null }).then((saved) => {
+  const save = () => {
+    let patch: Record<string, number | null>;
+    try {
+      patch = numberFieldsPatch({
+        income_tax_rate: { draft: rate, loaded: loaded.rate,
+                           label: "tax rate" },
+        home_office_sqft: { draft: sqft, loaded: loaded.sqft,
+                            label: "home office size" } });
+    } catch (e) { toastErr(e); return; }
+    if (!Object.keys(patch).length) return;
+    run(api.entityUpdate(entity.id, patch).then((saved) => {
+      setLoaded({ rate, sqft });
       patchList<BusinessSummary, Entity>(qc, ["biz-summary"], "entities",
         (x) => x.id === entity.id,
         { income_tax_rate: saved.income_tax_rate,
@@ -1079,25 +1273,59 @@ function TaxSection({ entity, readOnly }:
       qc.invalidateQueries({ queryKey: ["esttax", entity.id] });
       qc.invalidateQueries({ queryKey: ["biz-summary"] });
     }).catch(toastErr));
+  };
   const e = est.data;
   return (
     <>
       <h4 style={{ marginBottom: ".3rem" }}>Estimated taxes</h4>
       {e && (
         <p className="mut" style={{ marginTop: 0, fontSize: ".9rem" }}>
-          On {money(e.net_profit)} net{e.mileage_deduction > 0 &&
+          On {money(e.net_profit)} net
+          {/* the standard mileage rate replaces the actual car costs the
+              books already deducted, so those come back in first */}
+          {(e.vehicle_expenses_added_back ?? 0) > 0 &&
+            <> + {money(e.vehicle_expenses_added_back)} car costs</>}
+          {e.mileage_deduction > 0 &&
             <> − {money(e.mileage_deduction)} mileage</>}
           {e.home_office_deduction > 0 &&
             <> − {money(e.home_office_deduction)} home office</>}
           {e.startup_deduction > 0 &&
             <> − {money(e.startup_deduction)} start-up</>}
           {" = "}{money(e.taxable_profit)} taxable ·{" "}
-          SE tax <b>{money(e.se_tax)}</b>
+          {/* an S-corp owes no SE tax: a bare $0 line would read as a bug */}
+          {e.se_tax_applies === false
+            ? <>no self-employment tax</>
+            : <>SE tax <b>{money(e.se_tax)}</b></>}
           {e.income_tax != null && <> + income tax <b>{money(e.income_tax)}</b></>}
-          {" → "}<b className="pos">{money(e.total_estimated)}</b>/yr,{" "}
-          <b>{money(e.quarterly)}</b> per quarter.
+          {/* the year in progress: the total is on profit so far, and the
+              quarterly figure is a quarter of the projected year, so each
+              is labelled for what it is or the sentence will not add up */}
+          {e.annualized && e.annualized_total != null
+            ? <>{" → "}<b className="pos">{money(e.total_estimated)}</b> so far
+                this year; {e.basis === "prior_year"
+                  ? <>on last year's tax of </> : <>projected </>}
+                <b>{money(e.annualized_total)}</b>{e.basis === "prior_year"
+                  ? "" : " for the year"}, <b>{money(e.quarterly)}</b> per
+                quarter.</>
+            : <>{" → "}<b className="pos">{money(e.total_estimated)}</b>/yr,{" "}
+                <b>{money(e.quarterly)}</b> per quarter.</>}
           <span style={{ display: "block", fontSize: ".82rem" }}>
             Estimate — set aside quarterly; confirm with your CPA.
+            {/* the two car methods exclude each other; naming the one
+                taken explains why the other figure is missing */}
+            {e.vehicle_method === "standard_mileage" &&
+              " Car costs: standard mileage."}
+            {e.vehicle_method === "actual" &&
+              ((e.mileage_logged ?? 0) > 0
+                ? ` Car costs: actual costs, larger than ${money(e.mileage_logged ?? 0)} of logged mileage.`
+                : " Car costs: actual costs.")}
+            {e.se_tax_applies === false &&
+              " An S-corp's Social Security and Medicare go through payroll."}
+            {e.covers === "all_members" &&
+              ` Covers every member of the business, not one member's share${
+                bizHouseholdHint(e.household_unavailable)}.`}
+            {e.covers === "household" && e.household &&
+              ` Your ${e.household.ownership_pct}% share as ${e.household.member_name}; the business as a whole owes ${money(e.business_total ?? 0)}.`}
             {e.income_tax == null && " Set an income-tax rate below to include income tax."}
           </span>
         </p>
@@ -1217,6 +1445,9 @@ function BalanceSheetSection({ entityId }: { entityId: string }) {
         <b>{money(b.total_liabilities)}</b> = Net{" "}
         <b className={b.net >= 0 ? "pos" : "bad"}>{money(b.net)}</b>
         {"  ·  "}Capital account {money(b.capital_account)}
+        {b.household_capital != null && b.household_share_pct != null &&
+          <>{"  ·  "}your share ({b.household_share_pct}%){" "}
+            {money(b.household_capital)}</>}
         <span style={{ display: "block", fontSize: ".82rem" }}>
           Snapshot from business account balances — not double-entry books.</span>
       </p>
@@ -1225,16 +1456,16 @@ function BalanceSheetSection({ entityId }: { entityId: string }) {
   );
 }
 
-function VendorSection({ entityId, readOnly }:
-  { entityId: string; readOnly: boolean }) {
+function VendorSection({ entityId, year, readOnly }:
+  { entityId: string; year: number; readOnly: boolean }) {
   const qc = useQueryClient();
-  const q = useQuery({ queryKey: ["vendors", entityId],
-    queryFn: () => api.vendorList(entityId) });
+  const q = useQuery({ queryKey: ["vendors", entityId, year],
+    queryFn: () => api.vendorList(entityId, year) });
   // the checkbox is bound to the cached row, so it snaps back until the
   // list refetches — flip it first; the refetch settles needs_1099, and a
   // failure refetches the truth back
   const mark = (merchant: string, reportable: boolean) => {
-    patchList<{ vendors: Vendor[] }, Vendor>(qc, ["vendors", entityId],
+    patchList<{ vendors: Vendor[] }, Vendor>(qc, ["vendors", entityId, year],
       "vendors", (v) => v.merchant === merchant, { reportable });
     api.vendorMark(entityId, { merchant, reportable }).then(() =>
       qc.invalidateQueries({ queryKey: ["vendors", entityId] })).catch((e) => {
@@ -1246,18 +1477,23 @@ function VendorSection({ entityId, readOnly }:
   const vendors = all.slice(0, 12);
   return (
     <>
-      <h4 style={{ marginBottom: ".3rem" }}>1099 contractors</h4>
+      <h4 style={{ marginBottom: ".3rem" }}>1099 contractors · {year}</h4>
       <p className="mut" style={{ marginTop: 0, fontSize: ".85rem" }}>
         Mark who's a contractor — those paid{" "}
         {q.data?.threshold != null ? `${money(q.data.threshold)}+` : "over the threshold"}{" "}
-        this year need a 1099-NEC.
+        in {year} need a 1099-NEC.
         {all.length === 0 && " No business payees yet — assign an account or "
           + "transactions to this entity first."}</p>
       <table style={{ fontSize: ".9rem" }}><tbody>
         {vendors.map(v => (
           <tr key={v.merchant}>
             <td>{v.merchant}</td>
-            <td className="num">{money(v.paid)}</td>
+            <td className="num">{money(v.paid)}
+              {v.paid_by_card > 0 && (
+                // card payments are reported by the processor on a 1099-K,
+                // so they sit outside the 1099-NEC figure but are still money paid
+                <span className="mut" style={{ fontSize: ".8rem" }}>
+                  {" "}+{money(v.paid_by_card)} by card</span>)}</td>
             <td style={{ width: "1%", whiteSpace: "nowrap" }}>
               {v.needs_1099 && <span className="pill b">1099</span>}</td>
             <td style={{ width: "1%" }}>
@@ -1358,24 +1594,148 @@ function ComplianceSection({ entityId, readOnly }:
   );
 }
 
+/** A member's share or household mark moves the estimate and the
+ *  household's share of the capital account, which the equity section and
+ *  the balance sheet both show. */
+function bizMembersChanged(qc: ReturnType<typeof useQueryClient>,
+                           entityId: string) {
+  for (const k of ["entity", "esttax", "equity", "balancesheet"])
+    qc.invalidateQueries({ queryKey: [k, entityId] });
+}
+
 function AddMember({ entityId, onDone }:
   { entityId: string; onDone: () => void }) {
   const [name, setName] = useState("");
   const [pct, setPct] = useState("");
+  const [manager, setManager] = useState(false);
+  const [household, setHousehold] = useState(false);
   const [busy, run] = useBusy();
-  const add = () => run(api.entityAddMember(entityId, { member_name: name.trim(),
-    ownership_pct: pct ? Number(pct) : undefined }).then(() => {
-      setName(""); setPct(""); onDone();
-    }).catch(toastErr));
+  const add = () => {
+    // a share that is not a number would go out as no share at all
+    const share = numberDraft(pct);
+    if (share === undefined) { toast("The ownership share is not a number");
+                               return; }
+    run(api.entityAddMember(entityId, { member_name: name.trim(),
+      ownership_pct: share ?? undefined, is_manager: manager,
+      is_household: household }).then(() => {
+        setName(""); setPct(""); setManager(false); setHousehold(false);
+        onDone();
+      }).catch(toastErr));
+  };
   return (
     <div style={{ display: "flex", gap: ".4rem", marginTop: ".4rem",
-      flexWrap: "wrap" }}>
+      flexWrap: "wrap", alignItems: "center" }}>
       <input value={name} onChange={(e) => setName(e.target.value)}
         placeholder="member name" style={{ maxWidth: "12rem" }} />
       <input value={pct} onChange={(e) => setPct(e.target.value)}
-        placeholder="%" type="number" style={{ maxWidth: "5rem" }} />
+        placeholder="%" inputMode="decimal" style={{ maxWidth: "5rem" }} />
+      <label className="mut" style={{ fontSize: ".9rem" }}>
+        <input type="checkbox" checked={manager}
+          onChange={(e) => setManager(e.target.checked)} /> manager</label>
+      <label className="mut" title="the member this household is">
+        <input type="checkbox" checked={household}
+          onChange={(e) => setHousehold(e.target.checked)} /> this is us</label>
       <button disabled={busy || !name.trim()} onClick={add}>add member</button>
     </div>
+  );
+}
+
+type Member = NonNullable<Entity["members"]>[number];
+
+// the status a refused request carried ("404: {…}")
+const errStatus = (e: unknown) => {
+  const m = /^(\d{3}):/.exec(e instanceof Error ? e.message : "");
+  return m ? Number(m[1]) : undefined;
+};
+
+// The ownership shares drive the multi-member estimate, so a typo or a
+// partner who left has to be correctable without deleting the business.
+// An older server has no edit or remove door; the first refusal that says
+// so hides the controls instead of failing every click.
+function MemberList({ entityId, members, editable }:
+  { entityId: string; members: Member[]; editable: boolean }) {
+  const qc = useQueryClient();
+  const [missing, setMissing] = useState(false);
+  const [editing, setEditing] = useState<string | null>(null);
+  const [f, setF] = useState({ name: "", pct: "", manager: false,
+                               household: false });
+  const [busy, run] = useBusy();
+  const key = ["entity", entityId];
+  const refused = (e: unknown) => {
+    if (bizMemberDoorMissing(errStatus(e), errText(e))) {
+      setMissing(true); setEditing(null);
+      toast("This server can't edit members yet.");
+      return;
+    }
+    // already gone elsewhere: the list catches up
+    if (errStatus(e) === 404) qc.invalidateQueries({ queryKey: key });
+    toastErr(e);
+  };
+  const start = (m: Member) => {
+    setEditing(m.id);
+    setF({ name: m.member_name,
+           pct: m.ownership_pct != null ? String(m.ownership_pct) : "",
+           manager: !!m.is_manager, household: !!m.is_household });
+  };
+  const save = (m: Member) => {
+    const share = numberDraft(f.pct);
+    if (share === undefined) { toast("The ownership share is not a number");
+                               return; }
+    if (!f.name.trim()) { toast("A member needs a name"); return; }
+    run(api.entityUpdateMember(entityId, m.id, { member_name: f.name.trim(),
+      ownership_pct: share, is_manager: f.manager,
+      is_household: f.household }).then((saved) => {
+        qc.setQueryData<Entity>(key, (old) => old && { ...old,
+          members: (old.members ?? []).map((x) =>
+            x.id === m.id ? { ...x, ...saved } : x) });
+        setEditing(null);
+        bizMembersChanged(qc, entityId);
+      }).catch(refused));
+  };
+  const remove = (m: Member) => confirmThen(
+    `Remove ${m.member_name} from this business? Their ownership share `
+    + "comes out of the tax estimate.",
+    () => run(api.entityRemoveMember(entityId, m.id).then(() => {
+      qc.setQueryData<Entity>(key, (old) => old && { ...old,
+        members: (old.members ?? []).filter((x) => x.id !== m.id) });
+      bizMembersChanged(qc, entityId);
+    }).catch(refused)));
+  const controls = editable && !missing;
+  return (
+    <>
+      {members.map((m) => editing === m.id ? (
+        <div key={m.id} style={{ display: "flex", gap: ".4rem",
+          flexWrap: "wrap", alignItems: "center", fontSize: ".9rem" }}>
+          <input value={f.name} onChange={(e) => setF({ ...f,
+            name: e.target.value })} style={{ maxWidth: "12rem" }} />
+          <input value={f.pct} onChange={(e) => setF({ ...f,
+            pct: e.target.value })} placeholder="%" inputMode="decimal"
+            style={{ maxWidth: "5rem" }} />
+          <label className="mut">
+            <input type="checkbox" checked={f.manager}
+              onChange={(e) => setF({ ...f, manager: e.target.checked })} />{" "}
+            manager</label>
+          <label className="mut" title="the member this household is — the estimate and the capital account then also show this member's share">
+            <input type="checkbox" checked={f.household}
+              onChange={(e) => setF({ ...f, household: e.target.checked })} />{" "}
+            this is us</label>
+          <button disabled={busy} onClick={() => save(m)}>save</button>
+          <button className="btn" disabled={busy}
+            onClick={() => setEditing(null)}>cancel</button>
+        </div>
+      ) : (
+        <div key={m.id} className="mut" style={{ fontSize: ".9rem" }}>
+          {m.member_name}{m.ownership_pct != null
+            ? ` — ${m.ownership_pct}%` : ""}{m.is_manager ? " · manager" : ""}
+          {m.is_household ? " · us" : ""}
+          {controls && <>{" "}
+            <button className="btn" disabled={busy}
+              onClick={() => start(m)}>edit</button>{" "}
+            <button className="btn" disabled={busy}
+              onClick={() => remove(m)}>remove</button></>}
+        </div>
+      ))}
+    </>
   );
 }
 

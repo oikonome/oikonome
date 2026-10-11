@@ -93,7 +93,7 @@ around a single daily email, so the tool does the checking, not you.
 | Envelope budgets — monthly **and** lumpy annual pools |
 | Retirement projection via historical market replay |
 | Bank sync — Plaid · MX · SimpleFIN, on your own keys |
-| File imports — CSV · OFX/QFX · Quicken QIF · Mint · YNAB · PDF |
+| File imports — CSV · OFX/QFX · Quicken QIF · Mint · YNAB · PDF, one file or a whole folder at once (run in the background); re-importing a file corrects rows an earlier version read differently |
 | Multi-source accounts with automatic failover |
 | Receipt & check image parsing (vision line-items); snap a receipt before the charge posts and it matches itself when the charge arrives |
 | Local-LLM categorization — data never leaves the box |
@@ -109,7 +109,7 @@ around a single daily email, so the tool does the checking, not you.
 | Passkeys / TOTP 2FA, per-tenant encryption at rest |
 | Email, SMS (your own Twilio credentials) and push delivery of the summaries |
 | Webhooks, a Prometheus `/metrics` exporter, Home Assistant sensors and a local MCP server — on read-only tokens |
-| One-command manager (install / backup / restore / upgrade) |
+| One-command manager (install / backup / restore / upgrade), with a database snapshot before every upgrade and a documented rollback |
 | Native iOS and Android app with a home-screen widget — source in `mobile/`, built pinned to your own server |
 
 <sub>Nothing here is gated: a self-hosted instance has every feature, with

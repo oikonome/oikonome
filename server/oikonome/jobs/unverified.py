@@ -167,7 +167,23 @@ def reopen(admin, user_id) -> str | None:
     first of two mails. The household is the user's own, so a link for
     one household can never reopen another. The caller tells the
     installed gate about the restore OUTSIDE this transaction — a round
-    trip to a billing service is not held across a row lock."""
+    trip to a billing service is not held across a row lock.
+
+    Also None when the billing add-on is unavailable to say where a
+    household coming back to 'active' should land: nothing is written,
+    the household stays frozen, and the page offers the button again —
+    the person retries rather than meeting an error page."""
+    try:
+        return _reopen_locked(admin, user_id)
+    except ext.GateUnavailable as e:
+        log.warning("reopen of the household of user %s not done: %s",
+                    user_id, e)
+        return None
+
+
+def _reopen_locked(admin, user_id) -> str | None:
+    # the transaction is left by the exception, so the status flip above
+    # the gate's call rolls back with it
     with admin.transaction():
         t = admin.execute(
             "SELECT t.id, t.status, t.status_before_delete FROM tenants t "
@@ -176,13 +192,21 @@ def reopen(admin, user_id) -> str | None:
             "FOR UPDATE OF t", (user_id,)).fetchone()
         if t is None or t["status"] != STATUS:
             return None
+        prior = t["status_before_delete"] or "active"
         admin.execute(
             "UPDATE tenants SET status=%s, delete_after=NULL, "
-            "status_before_delete=NULL WHERE id=%s",
-            (t["status_before_delete"] or "active", t["id"]))
+            "status_before_delete=NULL WHERE id=%s", (prior, t["id"]))
+        landed = prior
+        if prior == "active":
+            # Coming back to 'active' is the installed gate's call, as it
+            # is for the console's reactivation: a trial that ran out while
+            # the household sat frozen lands in its lockout, not in free
+            # access. Inside this transaction, with the row locked, which
+            # is how the gate's reactivate expects to be called.
+            landed = ext.gate.reactivate(admin, t["id"])
         from ..web.adminconsole import _audit
         _audit(admin, "tenant_delete_restored", target=str(t["id"]),
-               detail="restored_to=active reason=email_confirmed",
+               detail=f"restored_to={landed} reason=email_confirmed",
                ip="verify-email")
         return str(t["id"])
 
@@ -256,7 +280,7 @@ def _sweep_locked(admin, now: dt.datetime, out: dict) -> dict:
                 if word:
                     out[word].append(tid)
             else:
-                out["reminded"] += _remind(admin, tid, now)
+                out["reminded"] += _remind(admin, tid, now, r["since"])
         except Exception as e:                        # noqa: BLE001
             log.error("unverified sweep failed for %s: %s", tid, e)
     return out
@@ -272,10 +296,18 @@ def _skip(admin, tid: str) -> bool:
     return bool(ext.gate.money_attached(admin, tid))
 
 
-def _remind(admin, tid: str, now: dt.datetime) -> list[str]:
+def _remind(admin, tid: str, now: dt.datetime,
+            since: dt.datetime) -> list[str]:
     """One reminder per unconfirmed person, once. A send that fails is
     retried tomorrow (nothing stamped); an address nothing can reach is
-    stamped without a send, so it is not retried forever."""
+    stamped without a send, so it is not retried forever.
+
+    `since` is the HOUSEHOLD's first signup: the freeze is decided on it
+    and the app's nudge (`deadline`) shows it, so the date in every
+    person's mail is read from it too — a member who joined later is told
+    the day the household actually freezes, not one counted from their
+    own signup."""
+    frozen_on = since + dt.timedelta(days=reap_days())
     done: list[str] = []
     people = admin.execute(
         "SELECT id, email, created_at FROM users WHERE tenant_id=%s "
@@ -287,8 +319,7 @@ def _remind(admin, tid: str, now: dt.datetime) -> list[str]:
         if _reachable(p["email"]):
             token = email_verify.create(admin, uid)
             plain, html = _reminder_body(_link(token), p["created_at"],
-                                         p["created_at"]
-                                         + dt.timedelta(days=reap_days()))
+                                         frozen_on)
             word = "sent" if account_mail.send(
                 p["email"], "Confirm your email to keep your Oikonome "
                 "account", plain, html, kind="verify-reminder") else "failed"

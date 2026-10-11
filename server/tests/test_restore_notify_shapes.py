@@ -34,13 +34,28 @@ def _zip(config: dict) -> bytes:
 
 
 class NormalizeTests(unittest.TestCase):
+    def test_an_infinite_hour_is_dropped_not_raised(self):
+        cfg = {"email_schedule": {"daily": {"on": True,
+                                            "hour": float("inf")},
+                                  "monthly": {"on": True,
+                                              "hour": float("inf")}},
+               "email_send_hour_utc": float("inf")}
+        notes = restore.normalize_notify_shapes(cfg)
+        self.assertNotIn("email_schedule", cfg)
+        self.assertNotIn("email_send_hour_utc", cfg)
+        self.assertGreaterEqual(len(notes), 2)
+        self.assertTrue(any("daily" in n for n in notes))
+        self.assertTrue(any("monthly" in n for n in notes))
+
     def test_malformed_cadence_is_dropped_and_noted(self):
         cfg = {"email_schedule": {"daily": {"on": True, "hour": "x"},
-                                  "weekly": {"on": True, "hour": 8,
-                                             "weekday": 3, "sms": 1}}}
+                                  "monthly": {"on": True, "hour": 8,
+                                              "weekday": 3, "sms": 1},
+                                  # from before the weekly report was retired
+                                  "weekly": {"on": True, "hour": 8}}}
         notes = restore.normalize_notify_shapes(cfg)
         self.assertEqual(cfg["email_schedule"], {
-            "weekly": {"on": True, "hour": 8, "weekday": 3, "sms": True}})
+            "monthly": {"on": True, "hour": 8, "sms": True}})
         self.assertTrue(any("daily" in n for n in notes))
 
     def test_a_stray_weekday_on_a_daily_entry_is_ignored(self):
@@ -93,8 +108,7 @@ class RestoreThenSweepTests(unittest.TestCase):
     def test_a_restored_bad_schedule_never_silences_the_sweep(self):
         report = restore.restore_zip(self.conn, _zip({
             "email_schedule": {"daily": {"on": True, "hour": "x"},
-                               "weekly": {"on": True, "hour": 7,
-                                          "weekday": 2}},
+                               "monthly": {"on": True, "hour": 7}},
             "email_recipients": "p@example.dev",
             "notify_phone": "not-an-object"}))
         self.assertEqual(report.get("settings"), 1, report)
@@ -103,8 +117,8 @@ class RestoreThenSweepTests(unittest.TestCase):
         self.assertNotIn("notify_phone", cfg)
         with mock.patch.dict("os.environ", {"OIKONOME_TZ": "UTC"}):
             due = worker.emails_due(
-                self.conn, dt.datetime(2026, 7, 15, 9, tzinfo=dt.timezone.utc))
-        self.assertEqual(due, ["weekly"])
+                self.conn, dt.datetime(2026, 7, 1, 9, tzinfo=dt.timezone.utc))
+        self.assertEqual(due, ["monthly"])
 
 
 if __name__ == "__main__":

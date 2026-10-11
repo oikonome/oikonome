@@ -12,10 +12,9 @@ interface Turn { q: string; a?: string; err?: string; tools?: string[]; }
 
 const EXAMPLES = [
   "What's my net worth?",
-  "Where did my money go last month?",
-  "What bills are coming up?",
-  // the question people actually have
-  "Can I afford $2,000 this month?",
+  "Where does my money go?",
+  "How much did I spend on groceries this year?",
+  "What are my recurring bills?",
 ];
 
 export default function Assistant() {
@@ -85,7 +84,8 @@ export default function Assistant() {
               and nothing leaves the box.</span>
           </>) : (
             <span>read-only tools only — your questions and the figures they
-              return go to {status.data.host || "the configured model host"}.</span>
+              return go to {status.data.host
+                || "the model host this instance is configured with"}.</span>
           )}
         </div>
       </div>

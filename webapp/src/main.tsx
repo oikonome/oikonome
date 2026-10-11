@@ -9,6 +9,7 @@ import { HOME_KEY } from "./launchhome";
 import { warmRoute } from "./pageChunks";
 import { api, AuthError } from "./api/client";
 import { ElevationProvider } from "./elevation";
+import { isReauthReply } from "./reauth";
 import "./index.css";
 
 // last time the read-only (402) toast fired — module-level so repeated
@@ -52,16 +53,14 @@ const qc = new QueryClient({
       // in-app form (wrong password, totp_required, recovery_required,
       // password_required, passkey step-up) are NOT a lost session —
       // treating them as one reads as a random logout.
-      if (err instanceof AuthError || /\b401\b/.test(String(err))) {
-        const m = String(err instanceof Error ? err.message : err);
-        // "one-time code" rather than "bad one-time": the server also says
-        // "current one-time code required" (change email, delete account),
-        // which a narrower pattern misses — and a missed re-auth reply
-        // blanks the whole app to the login screen, swallowing the message
-        // the person needed to read.
-        const reauth = /totp_required|recovery_required|password_required|wrong password|one-time code|bad credentials|passkey/i
-          .test(m);
-        if (!reauth)
+      // Only our own server's 401 status counts, which the client carries
+      // as AuthError. A 401 quoted inside some other reply's text (an AI
+      // backend refusing its key, a bucket named "401(k)") is that
+      // page's error to show, not a reason to sign out.
+      if (err instanceof AuthError) {
+        // The marker and wording list live in reauth.ts, shared case for
+        // case with the phone's copy.
+        if (!isReauthReply(err.message))
           window.dispatchEvent(new Event("oiko-auth-lost"));
         return;
       }
@@ -112,7 +111,7 @@ const HOME_PREFETCH: Record<string, () => void> = {
     qc.prefetchQuery({ queryKey: ["txns", params],
                        queryFn: () => api.transactions(params) });
   },
-  "/bills": () => qc.prefetchQuery({ queryKey: ["bills"], queryFn: api.bills }),
+  "/bills": () => qc.prefetchQuery({ queryKey: ["bills"], queryFn: () => api.bills() }),
   "/accounts": () => qc.prefetchQuery({ queryKey: ["accounts"], queryFn: api.accounts }),
   "/networth": () => qc.prefetchQuery({ queryKey: ["report", "networth"],
                                         queryFn: api.reportNetworth }),

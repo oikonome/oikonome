@@ -9,9 +9,10 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import * as DocumentPicker from "expo-document-picker";
+import { Image as ExpoImage } from "expo-image";
 import * as ImagePicker from "expo-image-picker";
 import { useRouter } from "expo-router";
-import { Alert, Image, Pressable, StyleSheet, Text, TextInput, View }
+import { Alert, Pressable, StyleSheet, Text, TextInput, View }
   from "react-native";
 
 import { errText, type WaitingReceipt, type WaitingReceipts as Waiting }
@@ -24,7 +25,8 @@ import { C, mmddyy, money } from "../lib/theme";
 import { useDemo, useViewer } from "../lib/viewer";
 import { WAITING_KEY, moreWaiting, receiptDateBounds, useMatchReceipt,
          useMoreWaiting, useReceiptDetails, useSnapReceipt,
-         useUnmatchReceipt, useWaitingReceipts } from "../lib/waiting";
+         useUnmatchReceipt, useWaitingReceipts, parseStalled,
+         forgetParseStart } from "../lib/waiting";
 import DatePicker, { DateField } from "./date-picker";
 import { Card, H } from "./ui";
 
@@ -123,15 +125,17 @@ function Thumb({ id, mime, optimized }:
   }
   const path = `/api/receipts/${encodeURIComponent(id)}/image`
     + (optimized ? "?variant=optimized" : "");
-  return <Image style={s.thumb} resizeMode="cover"
-                accessibilityLabel="receipt"
-                source={{ uri: client.baseUrl + path,
-                          headers: client.authHeader }} />;
+  // memory only: a receipt image must not sit in an image disk cache
+  // that a sign-out leaves behind
+  return <ExpoImage style={s.thumb} contentFit="cover"
+                    accessibilityLabel="receipt" cachePolicy="memory"
+                    source={{ uri: client.baseUrl + path,
+                              headers: client.authHeader }} />;
 }
 
 // the web card's status pill words, one for one
 function statusWords(r: WaitingReceipt): string {
-  if (r.status === "parsing") return "reading…";
+  if (r.status === "parsing") return parseStalled(r) ? "stalled" : "reading…";
   if (r.status === "failed") return "couldn't read";
   if (r.needs_details) return "needs its total";
   if (r.status === "uploaded") return "not read yet";
@@ -229,10 +233,16 @@ export default function WaitingReceiptsCard() {
   });
   const parse = useMutation({
     mutationFn: (id: string) => client!.receiptParse(id),
-    // flip to reading at once — the poll keys off the cache
-    onSuccess: (_r, id) => patchList<Waiting, WaitingReceipt>(
-      qc, WAITING_KEY, "waiting", (x) => x.id === id,
-      { status: "parsing", error: null }),
+    // flip to reading at once — the poll keys off the cache, and a row
+    // still marked stale would count as stalled and keep it stopped, so the
+    // stale mark goes too and a refetch restarts the poll
+    onSuccess: (_r, id) => {
+      patchList<Waiting, WaitingReceipt>(
+        qc, WAITING_KEY, "waiting", (x) => x.id === id,
+        { status: "parsing", error: null, parse_stale: false,
+          parse_started_at: new Date().toISOString() });
+      qc.invalidateQueries({ queryKey: WAITING_KEY });
+    },
   });
   const take = async (source: "camera" | "library" | "pdf") => {
     const f = await pickReceipt(source);
@@ -340,10 +350,14 @@ export default function WaitingReceiptsCard() {
             {!viewer && (
               <View style={{ flexDirection: "row", gap: 14, marginTop: 2 }}>
                 {d?.ai_available && r.status !== "parsed"
-                  && r.status !== "parsing" && (
+                  && (r.status !== "parsing" || parseStalled(r)) && (
                   <Text style={s.link}
-                        onPress={() => !parse.isPending && parse.mutate(r.id)}>
-                    {r.status === "failed" ? "retry" : "read now"}</Text>)}
+                        onPress={() => {
+                          if (parse.isPending) return;
+                          forgetParseStart(r.id); parse.mutate(r.id);
+                        }}>
+                    {r.status === "failed" || r.status === "parsing"
+                      ? "retry" : "read now"}</Text>)}
                 {!demo && r.status === "parsed" && !r.needs_details
                   && fixing !== r.id && (
                   <Text style={s.link} onPress={() => setFixing(r.id)}>

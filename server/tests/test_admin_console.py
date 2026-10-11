@@ -192,6 +192,62 @@ class ActionTests(_Base):
             "action='resend_verification' AND target=%s", (email,)))
 
 
+class CreateInstanceRaceTests(_Base):
+    """Provisioning an instance is a check ("no account for this address")
+    followed by three inserts. Two submits for one address — a double
+    click, or the person signing up at the same moment — must not both
+    pass the check: the loser used to hit the users.email unique index
+    with a 500 after its tenant had already been committed, leaving an
+    ownerless household that every sweep then visits for good."""
+
+    def test_a_double_submit_makes_one_household_and_no_error(self):
+        import threading
+
+        from oikonome.db import tenancy as tenancy_mod
+        self._login()
+        email = f"race-{uuid.uuid4().hex[:8]}@x.dev"
+        cookie = self.client.cookies.get("oikonome_admin")
+        real_create = tenancy_mod.create_tenant
+        meet = threading.Barrier(2, timeout=1.5)
+
+        def _both_past_the_check(admin, name=""):
+            # hold the first submit here until the second has also passed
+            # its check — or give up once it is plainly being kept out
+            try:
+                meet.wait()
+            except threading.BrokenBarrierError:
+                pass
+            return real_create(admin, name)
+
+        out = []
+
+        def _submit():
+            c = TestClient(self.appmod.app, raise_server_exceptions=False)
+            c.cookies.set("oikonome_admin", cookie, path="/admin")
+            out.append(c.post("/admin/console/create-instance",
+                              data={"email": email}))
+
+        with unittest.mock.patch.object(tenancy_mod, "create_tenant",
+                                        side_effect=_both_past_the_check), \
+             unittest.mock.patch("oikonome.web.app._deliver_welcome"):
+            threads = [threading.Thread(target=_submit) for _ in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=20)
+        self.assertEqual(sorted(r.status_code for r in out), [200, 200],
+                         [r.text[:300] for r in out])
+        self.assertEqual(sum("already has an account" in r.text for r in out),
+                         1)
+        self.assertEqual(
+            len(_admin_rows("SELECT 1 FROM tenants WHERE name=%s", (email,))),
+            1, "a second, ownerless tenant was left behind")
+        self.assertEqual(
+            _admin_rows("SELECT 1 FROM tenants t WHERE t.name=%s AND NOT "
+                        "EXISTS (SELECT 1 FROM users u "
+                        "WHERE u.tenant_id = t.id)", (email,)), [])
+
+
 class PrivilegeTests(_Base):
     def test_app_role_has_no_grants_on_console_tables(self):
         # migration 026 + the migrate.py re-grant block: SQLi through the

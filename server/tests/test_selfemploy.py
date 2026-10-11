@@ -130,7 +130,9 @@ class SelfEmployTests(unittest.TestCase):
         # Medicare 2.9%); allow a cent of split-vs-flat rounding
         self.assertAlmostEqual(est["se_tax"], 10000 * 0.9235 * 0.153, delta=0.02)
         self.assertIsNone(est["income_tax"])
-        self.assertEqual(est["quarterly"], round(est["total_estimated"] / 4, 2))
+        # an installment is a quarter of the whole year's tax, which for the
+        # year in progress is projected from the year so far
+        self.assertEqual(est["quarterly"], round(est["annualized_total"] / 4, 2))
 
     def test_estimated_tax_honors_the_400_dollar_floor(self):
         """IRC §1402(b)(2): no SE tax when net earnings from
@@ -205,6 +207,73 @@ class SelfEmployTests(unittest.TestCase):
         self.assertEqual(needs, {2025: True, 2026: False})
 
 
+    def test_1099_counts_only_what_was_not_paid_by_credit_card(self):
+        """Card payments are reported by the card network, not on the
+        business's 1099-NEC: a contractor paid partly by check and partly on
+        the business card is judged against the threshold on the check part
+        alone, and the form amount leaves the card part out."""
+        line = selfemploy.reportable_1099_threshold(TODAY.year)
+        by_check = line - 500.0
+        add_txn(self.conn, TODAY, by_check, "MIXED CONTRACTOR",
+                account="biz", txn_id="mx1")
+        add_txn(self.conn, TODAY, 800.0, "MIXED CONTRACTOR",
+                account="bizcard", txn_id="mx2")
+        selfemploy.mark_vendor(self.conn, self.ent["id"], "MIXED CONTRACTOR")
+        v = {v["merchant"]: v for v in selfemploy.vendor_totals(
+            self.conn, self.ent["id"], TODAY.year)}["MIXED CONTRACTOR"]
+        self.assertEqual(v["paid"], by_check)
+        self.assertFalse(v["needs_1099"])
+        self.assertEqual(v["paid_by_card"], 800.0)
+
+    def test_1099_leaves_out_in_store_debit_card_payments_from_checking(self):
+        """A debit-card payment made at the counter is a payment-card
+        transaction like a credit card one, reported on a 1099-K, so it is
+        not counted toward the 1099-NEC. A check from the same account
+        still is."""
+        line = selfemploy.reportable_1099_threshold(TODAY.year)
+        add_txn(self.conn, TODAY, line - 100.0, "DEBIT CONTRACTOR",
+                account="biz", txn_id="dc1")
+        add_txn(self.conn, TODAY, 300.0, "DEBIT CONTRACTOR",
+                account="biz", txn_id="dc2")
+        self.conn.execute("UPDATE transactions SET payment_channel="
+                          "'in store' WHERE id='dc2'")
+        selfemploy.mark_vendor(self.conn, self.ent["id"], "DEBIT CONTRACTOR")
+        v = {v["merchant"]: v for v in selfemploy.vendor_totals(
+            self.conn, self.ent["id"], TODAY.year)}["DEBIT CONTRACTOR"]
+        self.assertEqual(v["paid"], line - 100.0)
+        self.assertEqual(v["paid_by_card"], 300.0)
+        self.assertFalse(v["needs_1099"])
+
+    def test_a_tax_payment_is_not_a_1099_payee(self):
+        """An estimated-tax payment to the IRS is the owner's money, not a
+        fee paid to a contractor: it stays off the payee list the way the
+        books keep it off the P&L, however large it is."""
+        line = selfemploy.reportable_1099_threshold(TODAY.year)
+        add_txn(self.conn, TODAY, line + 1000.0, "IRS USATAXPYMT",
+                account="biz", primary="GOVERNMENT_AND_NON_PROFIT",
+                detailed="GOVERNMENT_AND_NON_PROFIT_TAX_PAYMENT")
+        payees = {v["merchant"] for v in selfemploy.vendor_totals(
+            self.conn, self.ent["id"], TODAY.year)}
+        self.assertNotIn("IRS USATAXPYMT", payees)
+
+    def test_1099_counts_an_online_ach_payment_from_checking(self):
+        """The aggregator marks ACH debits and bill pay 'online' too. With
+        no card signal such a payment is what the 1099-NEC reports, so a
+        contractor paid that way still reaches the threshold."""
+        line = selfemploy.reportable_1099_threshold(TODAY.year)
+        add_txn(self.conn, TODAY, line - 500.0, "ACH CONTRACTOR",
+                account="biz", txn_id="ach1")
+        add_txn(self.conn, TODAY, 1000.0, "ACH CONTRACTOR",
+                account="biz", txn_id="ach2")
+        self.conn.execute("UPDATE transactions SET payment_channel="
+                          "'online' WHERE id='ach2'")
+        selfemploy.mark_vendor(self.conn, self.ent["id"], "ACH CONTRACTOR")
+        v = {v["merchant"]: v for v in selfemploy.vendor_totals(
+            self.conn, self.ent["id"], TODAY.year)}["ACH CONTRACTOR"]
+        self.assertEqual(v["paid"], line + 500.0)
+        self.assertEqual(v["paid_by_card"], 0.0)
+        self.assertTrue(v["needs_1099"])
+
     def _paid_with_partial_link(self, deposit_payee, tag):
         """A vendor charge just over the year's 1099 line, $300 of it paid
         back by a deposit from `deposit_payee`."""
@@ -266,6 +335,54 @@ class SelfEmployTests(unittest.TestCase):
         them nothing on it."""
         _, vt = self._paid_with_full_link("JANE CONTRACTOR", 6)
         self.assertNotIn("JANE CONTRACTOR", vt)
+
+    def test_a_first_week_invoice_is_not_projected_over_the_year(self):
+        """One $1,500 payment on January 3 is not a $180k year: until the
+        first three months have passed, a projection from the year so far
+        spreads it over at least that long."""
+        add_txn(self.conn, dt.date(2027, 1, 2), -1500.0, "CLIENT",
+                account="biz", primary="INCOME", txn_id="early")
+        est = selfemploy.estimated_tax(self.conn, self.ent["id"], 2027,
+                                       today=dt.date(2027, 1, 3))
+        self.assertEqual(est["basis"], "projected")
+        factor = 365 / selfemploy.MIN_PROJECTION_DAYS
+        self.assertAlmostEqual(est["annualized_taxable_profit"],
+                               1500 * factor, delta=0.01)
+
+    def test_early_in_the_year_last_years_tax_is_the_basis(self):
+        add_txn(self.conn, dt.date(2026, 6, 1), -40000.0, "CLIENT",
+                account="biz", primary="INCOME", txn_id="last-year")
+        add_txn(self.conn, dt.date(2027, 1, 2), -1500.0, "CLIENT",
+                account="biz", primary="INCOME", txn_id="early")
+        prior = selfemploy.estimated_tax(self.conn, self.ent["id"], 2026,
+                                         today=dt.date(2027, 1, 3))
+        est = selfemploy.estimated_tax(self.conn, self.ent["id"], 2027,
+                                       today=dt.date(2027, 1, 3))
+        self.assertEqual(est["basis"], "prior_year")
+        self.assertEqual(est["quarterly"], prior["quarterly"])
+        # past the first three months the year's own figures take over
+        later = selfemploy.estimated_tax(self.conn, self.ent["id"], 2027,
+                                         today=dt.date(2027, 4, 30))
+        self.assertEqual(later["basis"], "projected")
+
+    def test_the_january_deadline_quotes_last_years_installment(self):
+        """From January 1 to 15 the next 1040-ES date is last year's fourth
+        installment, so the amount beside it is a quarter of last year's
+        tax, not of the new year's projection."""
+        add_txn(self.conn, dt.date(2026, 6, 1), -40000.0, "CLIENT",
+                account="biz", primary="INCOME", txn_id="last-year")
+        add_txn(self.conn, dt.date(2027, 1, 2), -9000.0, "CLIENT",
+                account="biz", primary="INCOME", txn_id="early")
+        prior = selfemploy.estimated_tax(self.conn, self.ent["id"], 2026,
+                                         today=dt.date(2027, 1, 10))
+        est = selfemploy.estimated_tax(self.conn, self.ent["id"], 2027,
+                                       today=dt.date(2027, 1, 10))
+        self.assertEqual(est["next_deadline"], "2027-01-15")
+        self.assertEqual(est["next_payment"], prior["quarterly"])
+        after = selfemploy.estimated_tax(self.conn, self.ent["id"], 2027,
+                                         today=dt.date(2027, 1, 16))
+        self.assertEqual(after["next_deadline"], "2027-04-15")
+        self.assertEqual(after["next_payment"], after["quarterly"])
 
 
 

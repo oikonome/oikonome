@@ -19,18 +19,18 @@
 // creates a second business next to one that exists.
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import PullRefresh from "../components/pull-refresh";
 
-import { Card } from "../components/ui";
+import { Card, SharedLock } from "../components/ui";
 import type { Account, Entity } from "../lib/api";
 import { patchList, patchQuery, saveSettings, bizKeys, personalKeys, invalidateAll } from "../lib/cache";
 import { plaidHostedLink } from "../lib/plaid";
 import { bizSetupEntity, bizWizardEntryStep } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { C } from "../lib/theme";
-import { useMe, useOwner } from "../lib/viewer";
+import { useMe, useOwner, useSharedLock } from "../lib/viewer";
 import { errText } from "../lib/api";
 
 const kindIs = (a: { kind: string }, ...types: string[]) =>
@@ -213,19 +213,36 @@ function BusinessWizard({ resume, owner, flagged }: {
   });
   // create + assign in one go: an unassigned manual account would sit
   // in the personal budget, the opposite of why it was made
+  // The two writes are separate, so an Add retried after the assignment
+  // failed reuses the account the first try made instead of making one
+  // more (each would sit unassigned in the personal budget).
+  const madeAcct = useRef<{ name: string; kind: string; id: string } | null>(
+    null);
   const addAcct = useMutation({
     mutationFn: async () => {
       const eid = needEntity();
-      const r = await client!.accountAdd(newName.trim(), newKind);
-      await client!.accountAssignEntity(
-        (r as { account_id: string }).account_id, eid);
-      return r;
+      const name = newName.trim();
+      const prior = madeAcct.current;
+      let id: string;
+      if (prior && prior.name === name && prior.kind === newKind) {
+        id = prior.id;
+      } else {
+        const r = await client!.accountAdd(name, newKind);
+        id = (r as { account_id: string }).account_id;
+        madeAcct.current = { name, kind: newKind, id };
+      }
+      await client!.accountAssignEntity(id, eid);
+      madeAcct.current = null;
+      return { account_id: id };
     },
     onSuccess: () => { setNewName(""); setErr(null);
                        // the list is mounted, so invalidating refetches it
                        qc.invalidateQueries({ queryKey: ["accounts"] }); },
     onError: fail,
   });
+  // the shared demonstration login is refused the bank link (it plants a
+  // credential that outlives the login), so the button says so in place
+  const credentialLock = useSharedLock("credential");
   // the real bank first — a manual account is a container with no feed
   const connect = useMutation({
     mutationFn: () => plaidHostedLink(client!, ""),
@@ -390,14 +407,16 @@ function BusinessWizard({ resume, owner, flagged }: {
             </Text>
             {owner ? (
               <>
+                <SharedLock note={credentialLock}>
                 <Pressable style={[s.btn, busy && { opacity: 0.5 }]}
-                           disabled={busy}
+                           disabled={busy || !!credentialLock}
                            onPress={() => connect.mutate()}>
                   <Text style={s.btnText}>
                     {connect.isPending ? "waiting for your bank…"
                                        : "Connect an account"}
                   </Text>
                 </Pressable>
+                </SharedLock>
                 <Text style={s.mut}>
                   Opens your bank&apos;s sign-in. When it finishes, the
                   account appears in the list above — tick it and assign.

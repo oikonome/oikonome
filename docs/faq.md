@@ -29,8 +29,8 @@ the provider on every sync.
 
 **Can I get the summaries as a text message or a notification instead
 of email?** Yes — the **Scheduled summaries** matrix in Settings →
-Email → Daily email card is per-cadence: each of daily / weekly /
-monthly / yearly can go out by email,
+Email & Push → Daily email card is per-cadence: each of daily / monthly /
+yearly can go out by email,
 SMS (a short form; verify your phone number first), push notification
 (enable it per browser), or any combination. If you use the mobile app
 and your server opts in to mobile push (`OIKONOME_PUSH_RELAY_URL`),
@@ -62,7 +62,7 @@ opt in, plus the `OIKONOME_PUSH_RELAY_KEY` the relay's operator gives you
 without one; a relay run with no keys stays open). What your server
 sends the relay per push is the device's opaque push routing token,
 which platform it belongs to (Apple or Google), an event kind from a
-fixed list (`daily`, `weekly`, …), an optional badge number and — for
+fixed list (`daily`, `monthly`, …), an optional badge number and — for
 the daily push only — the one line the lock screen shows: the verdict
 ("OVER budget by $120"), the top driver and today's allowance, exactly
 what the SMS says. Never a merchant, a name, a balance or an email, and
@@ -104,10 +104,13 @@ Every timeframe toggle on the site offers the same eight windows (This
 month, 1m, 3m, 6m, 1y, 3y, 5y, All). **This month** is the current month
 so far, and **1m** is the last complete month, closed before today, so on
 the 13th you can read August whole instead of thirteen days of September.
-The longer ones count back from the current month to today. On Cash Flow
-the window applies to every section of the page: the flow picture,
-spending and income, and the comparison line reads against the month
-before.
+On Cash Flow every range but This month holds complete months only — in
+September, **3m** is June through August — so a part-month never sits
+beside whole ones; the window applies to every section of the page (the
+flow picture, spending and income), and the comparison reads against the
+equal window before it. The ledger's range buttons and the Net Worth
+trend keep the month in progress instead (**3m** in September runs from
+July 1 to today), because they show what is there now.
 
 **Why am I asked whether two merchants are the same?**
 Card terminals and banks spell a business several ways: cut at 13 or 20
@@ -284,7 +287,10 @@ guide.
 `./oikonome.sh backup` writes a compressed `pg_dump` into `./backups`
 inside the install folder; that one file is the whole state. Restore any
 dump with `./oikonome.sh restore` — it lists what's available, confirms,
-snapshots the current database first, and swaps the database in place.
+snapshots the current database first, swaps the database in place, and
+loads the snapshot back if the app will not start on the restored one.
+An upgrade snapshots the database the same way before it installs new
+code (see the quick start's *Upgrades*).
 Uninstalling offers to move `./backups` out to your home directory
 before it removes the folder, so backups outlive the install.
 
@@ -304,6 +310,10 @@ going if you close the page. Two things you may see when it finishes:
 * *"N already present"*. Restoring the same archive twice is safe: rows
   the account already has are skipped, not duplicated, and the summary
   counts them separately from what actually landed.
+* *"N orphaned"*. A note, category, receipt or business row whose
+  transaction, account or business is not in the archive is left out and
+  counted here — an archive written by an older release can carry a few.
+  Nothing that was in the archive with its parent is affected.
 
 **I'm locked out and never set up email.**
 Run `./oikonome.sh reset-password` on the host — it prints a one-time
@@ -392,14 +402,24 @@ checkbox on each row (yours included) turns that person's copy on or
 off, so the schedule can keep mailing the household while skipping you.
 
 **How do I stop the emails without asking the owner?**
-Every household email — the daily verdict, the weekly report, the
-monthly report card, the year in review and the alerts — ends with an
+Every household email — the daily verdict, the monthly report card,
+the year in review and the alerts — ends with an
 **Unsubscribe** link for the address it was sent to. Opening it and
 pressing the button is the same as the owner unticking your row: every
 one of those emails stops for that address, immediately. Sign-in and
 security emails are not affected, and the owner can turn you back on
 under Settings → Email & Push. Most mail apps also show their own Unsubscribe
 button for these messages; it does the same thing.
+
+**Can my partner get the monthly report but not the daily email?**
+Yes. Under the recipient list in **Settings → Email & Push**, *Who gets
+which email* has a row for each person and a box for each kind: Daily,
+Monthly, Yearly and Alerts (bank connections, savings goals and
+collector alerts). Untick a box and that person stops getting that kind
+only. The owner sets anyone's row; everyone else sets their own under
+**Daily email**. A column is dimmed while the household doesn't send that
+kind at all, and an address that has unsubscribed gets nothing whatever
+its boxes say. Sign-in and security emails always go to the account.
 
 **Why does the daily email have no merchant logos in it?**
 On purpose: nothing in the email is fetched from the web. An image loaded
@@ -428,7 +448,9 @@ toward the 30 days, and any successful sync resets the clock. Your
 accounts and history are untouched; the old credentials are gone, so
 the fix is the **reconnect** button on the Accounts page — a fresh
 link, not a repair. Self-host: the window is
-`OIKONOME_PLAID_REAP_DAYS` (0 disables the reaper).
+`OIKONOME_PLAID_REAP_DAYS` (0 disables the reaper; a disconnect you
+asked for whose removal at Plaid failed is still retried, since the
+connection bills until that removal goes through).
 
 **Adding a bank says I've reached a limit.**
 An instance may cap how many institutions can be connected; the cap, and
@@ -475,7 +497,14 @@ inbox the operator named in `OIKONOME_FEEDBACK_TO` (unset, the tab hands
 you the .zip instead), with
 `[bug]` or `[feedback]` in the subject so the inbox sorts itself; without
 SMTP you get a downloadable .zip to email manually. Either way you get a
-report number to quote.
+report number to quote. The package carries the diagnostic bundle — check
+results and versions, with no tokens, transaction contents, hostnames,
+bank names or collector labels. On an instance with a single household it
+also carries the app's recent log lines (`app-logs.txt`). Tokens,
+passwords, sign-in links and email addresses are stripped from those, but
+host names (your instance's address, the mail relay, an AI endpoint) and
+bank names can appear in them, so read that file, or delete it from the
+.zip, before attaching the package to a public issue.
 
 **What's "the one number to hit"?**
 What you can spend per day for the rest of the month and still land on

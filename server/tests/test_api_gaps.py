@@ -89,10 +89,11 @@ class TodayFullGapTests(unittest.TestCase):
         self.assertIn("annual",
                       [i["label"] for i in r["irregular_bills"]
                        if i["payee"] == "Annual Insurance"])
-        # both bills due today, nothing posted → [payee, amount, due] rows
-        self.assertIn(["Water Utility", 120.0, self.today.isoformat()],
+        # both bills due today, nothing posted → [payee, amount, due,
+        # withdrawn_on] rows (nothing was withdrawn)
+        self.assertIn(["Water Utility", 120.0, self.today.isoformat(), None],
                       r["overdue_unpaid"])
-        self.assertIn(["Annual Insurance", 600.0, self.today.isoformat()],
+        self.assertIn(["Annual Insurance", 600.0, self.today.isoformat(), None],
                       r["overdue_unpaid"])
         self.assertAlmostEqual(r["fixed_unpaid_due"], 720.0, places=2)
 

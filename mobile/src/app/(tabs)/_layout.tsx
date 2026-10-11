@@ -11,10 +11,9 @@ import { ext } from "../../ext";
 import { seedSettings } from "../../lib/cache";
 import { useSession } from "../../lib/session";
 import { deviceZone } from "../../lib/zone";
-import { adoptsDeviceZone } from "../../lib/pure";
-import { C, getThemeMode, mmddyy, setThemeMode,
-         type ThemeMode } from "../../lib/theme";
-import { errText } from "../../lib/api";
+import { accountTheme, retriesZoneAdopt, zoneToAdopt } from "../../lib/pure";
+import { C, getThemeMode, mmddyy, setThemeMode } from "../../lib/theme";
+import { ApiError, errText, type Me } from "../../lib/api";
 
 // the brand row the web header carries — mark + wordmark
 function Brand() {
@@ -145,9 +144,17 @@ export default function TabsLayout() {
   // sessionStorage entry the same way) — a NEW broadcast must reappear
   // after an old one was waved away
   const [bcDismissed, setBcDismissed] = useState<string | null>(null);
+  // the last /api/me the NETWORK answered for this client — me.data may be
+  // the snapshot restored from disk, which the zone adoption must not trust
+  const freshMe = useRef<{ client: unknown; me: Me } | null>(null);
   const me = useQuery({
     queryKey: ["me"],
-    queryFn: () => client!.me(),
+    queryFn: async () => {
+      const c = client!;
+      const r = await c.me();
+      freshMe.current = { client: c, me: r };
+      return r;
+    },
     enabled: !!client,
     staleTime: 5 * 60_000,
   });
@@ -159,18 +166,27 @@ export default function TabsLayout() {
   // phone's zone, once; More → Notifications names it and can change it.
   // adoptsDeviceZone holds the rest of the rule (self-hosted instances
   // keep following their configured zone). (web: App.tsx, same rule)
+  // It runs on a network answer only (zoneToAdopt says why); a failed
+  // attempt is retried on a later fresh answer unless the server refused.
   const zoneOffered = useRef(false);
+  const zoneTries = useRef(0);
   useEffect(() => {
-    const m = me.data;
-    if (!m || !client || zoneOffered.current) return;
-    const device = deviceZone();
-    if (!adoptsDeviceZone(m, device)) return;
+    if (!client || zoneOffered.current) return;
+    const fresh = freshMe.current?.client === client
+      ? freshMe.current.me : null;
+    const zone = zoneToAdopt(fresh, deviceZone());
+    if (!zone) return;
     zoneOffered.current = true;
-    client.settingsSaveTimezone(device)
+    client.settingsSaveTimezone(zone, true)
       .then((v) => { seedSettings(qc, v);
                      qc.invalidateQueries({ queryKey: ["me"] }); })
-      .catch(() => {});
-  }, [me.data, client, qc]);
+      .catch((e) => {
+        zoneTries.current += 1;
+        if (retriesZoneAdopt(e instanceof ApiError ? e.status : 0,
+                             zoneTries.current))
+          zoneOffered.current = false;
+      });
+  }, [me.dataUpdatedAt, client, qc]);
   // the verify banner's resend: one mail per tap, not one per tap while
   // the first is still in flight
   const [resending, setResending] = useState(false);
@@ -204,9 +220,8 @@ export default function TabsLayout() {
   useEffect(() => {
     if (me.data?.role !== "owner" || me.data.demo || !themePeek.data)
       return;
-    const server = (themePeek.data.theme ?? "dark") as ThemeMode;
-    if ((server === "auto" || server === "light" || server === "dark")
-        && server !== getThemeMode())
+    const server = accountTheme(themePeek.data.theme);
+    if (server && server !== getThemeMode())
       setThemeMode(server);
   }, [themePeek.data, me.data]);
   // the alerts bell count the web header carries — a badge on More

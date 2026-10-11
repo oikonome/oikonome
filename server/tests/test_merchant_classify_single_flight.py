@@ -8,6 +8,8 @@ merchants and each POST the same batch to the tenant's LLM backend: the
 same answer, paid for twice. The sync-side door must skip while a
 classification is in flight (idempotent, pending-gated — the next pass
 catches up); the nightly mop-up must wait its turn, never run beside it.
+Its wait is bounded: the holder may be a pass stuck on the household's own
+slow backend, and an endless wait would hold up every later household.
 """
 
 import os
@@ -115,6 +117,40 @@ class MerchantClassifySingleFlightTests(unittest.TestCase):
         t.join(10)
         self.assertTrue(classified.is_set(),
                         "run() must classify once the lock frees")
+
+    def test_the_nightly_door_gives_up_after_a_bounded_wait(self):
+        calls = []
+        self._hold()
+        try:
+            with mock.patch.object(llm_categorize, "LOCK_WAIT_SECONDS", 0.3), \
+                    self._classifying(lambda conn, **kw: calls.append("hit")):
+                t0 = time.monotonic()
+                stats = llm_categorize.run(self.conn)
+                waited = time.monotonic() - t0
+        finally:
+            self._release()
+        self.assertEqual(calls, [])
+        self.assertEqual(stats.get("merchant_classify_skipped"), "busy")
+        self.assertLess(waited, 5)
+
+    def test_a_waiting_amazon_chain_refuses_rather_than_runs_unlocked(self):
+        """The nightly enters the Amazon chain with a bare `with`; a lock it
+        could not get must stop the block, never let it run unguarded."""
+        self.other.execute(
+            f"SELECT pg_advisory_lock({llm_categorize._AMAZON_LOCK})")
+        ran = []
+        try:
+            with mock.patch.object(llm_categorize, "LOCK_WAIT_SECONDS", 0.3):
+                with self.assertRaises(llm_categorize.LockBusy):
+                    with llm_categorize.amazon_chain_lock(self.conn,
+                                                          wait=True):
+                        ran.append(True)
+        finally:
+            self.other.execute(
+                f"SELECT pg_advisory_unlock({llm_categorize._AMAZON_LOCK})")
+        self.assertEqual(ran, [])
+        with llm_categorize.amazon_chain_lock(self.conn, wait=True) as got:
+            self.assertTrue(got)
 
 
 if __name__ == "__main__":

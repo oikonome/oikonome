@@ -42,9 +42,19 @@ BUCKETS = ("organizational", "startup_195", "operating")
 from . import reporting  # noqa: E402
 from . import merchant_dedup as _md
 
+#
+# LOAN-ACCOUNT EXCLUSION, the rule the personal spend and income readers
+# apply (budget.SPEND_ONLY_SQL): a loan account's rows are the servicer's
+# side of payments the checking account already recorded. A business that
+# assigns its vehicle or SBA loan to the entity (the balance sheet lists it
+# as a liability) would otherwise book each payment's received leg as
+# gross receipts and the servicer's interest postings as a second expense
+# beside the checking payment that paid them.
 _BIZ_TXN = ("(t.entity_id = %(eid)s OR (t.entity_id IS NULL "
             "AND t.account_id IN "
             "(SELECT id FROM accounts WHERE entity_id = %(eid)s)))"
+            " AND t.account_id NOT IN "
+            "(SELECT id FROM accounts WHERE type = 'loan')"
             + reporting._NOT_SHADOW.format(col="t.account_id"))
 
 # Money that MOVED but was never spent. `pnl()` skips these per-row (same
@@ -52,7 +62,9 @@ _BIZ_TXN = ("(t.entity_id = %(eid)s OR (t.entity_id IS NULL "
 # must skip them too — otherwise `unclassified_count` lights the "Needs
 # attention" tile for card payments and inter-account transfers that
 # classifying cannot resolve: pick any line and the P&L is unchanged, leave
-# it and the tile stays lit.
+# it and the tile stays lit. An owner's tax payment (_TAX_PAYMENT below)
+# is left out of the queue for the same reason: the books already keep it
+# off the P&L, and the worksheet is where a deductible one gets its line.
 #
 # Expenses only (both callers filter `t.amount > 0`), so the exact-match
 # form from `_pnl_core`'s expense branch is the right one.
@@ -60,7 +72,60 @@ _NOT_FLOW = """
                AND COALESCE(t.category_override, t.category_primary, '')
                    NOT IN ('TRANSFER_OUT', 'TRANSFER_IN')
                AND COALESCE(t.category_detailed, '')
-                   != 'LOAN_PAYMENTS_CREDIT_CARD_PAYMENT'"""
+                   NOT IN ('LOAN_PAYMENTS_CREDIT_CARD_PAYMENT',
+                           'GOVERNMENT_AND_NON_PROFIT_TAX_PAYMENT')"""
+
+
+# An owner's tax paid out of the business account is not a business cost.
+# A sole proprietor or single-member LLC pays federal and state income tax
+# and self-employment tax on the OWNER's return; Schedule C line 23 and
+# §275 exclude both, so booking a 1040-ES payment as "Taxes and licenses"
+# lowers the very profit the tax is figured on, and each quarter's payment
+# shrinks the next quarter's estimate. The books treat such a payment like
+# an owner draw (skipped, the way a transfer is), and a tax refund paid
+# into the business like capital coming back.
+#
+# A tax the BUSINESS owes and deducts (the employer's payroll share, a
+# property or excise tax) carries the same aggregator label, so the rule
+# yields to the user: a row given a Schedule C line on the worksheet is a
+# business cost again. The review queue leaves these rows out (_NOT_FLOW)
+# so the default does not light "Needs attention" every quarter.
+_TAX_PAYMENT = "GOVERNMENT_AND_NON_PROFIT_TAX_PAYMENT"
+_TAX_REFUND = "INCOME_TAX_REFUND"
+
+
+def _is_owner_tax(t: dict) -> bool:
+    """A tax payment or tax refund the books keep out of the P&L (see
+    _TAX_PAYMENT): the aggregator's detailed label, and no Schedule C line
+    the user chose for it."""
+    return ((t.get("cat_detailed") or "") in (_TAX_PAYMENT, _TAX_REFUND)
+            and not t.get("sched_c_line"))
+
+
+def _tax_year_window(year: int) -> tuple[dt.date, dt.date]:
+    """The dates whose tax payments count toward `year`'s estimates. The
+    fourth estimate falls due on January 15 of the next year, so a payment
+    made in January belongs to the year before it; one made from February
+    on is the current year's."""
+    return dt.date(year, 2, 1), dt.date(year + 1, 1, 31)
+
+
+def estimated_tax_paid(rows, year: int | None) -> float:
+    """Tax already paid out of the business toward `year` (the owner tax
+    payments _is_owner_tax keeps off the P&L, net of a refund of one).
+    `rows` must reach into January of the next year, so the caller passes
+    the entity's whole history. All history when `year` is None."""
+    lo, hi = (_tax_year_window(year) if year is not None
+              else (dt.date.min, dt.date.max))
+    paid = 0.0
+    for t in rows:
+        if (t.get("cat_detailed") or "") != _TAX_PAYMENT \
+                or not _is_owner_tax(t):
+            continue
+        d = _row_date(t)
+        if d is not None and lo <= d <= hi:
+            paid += _net(t)
+    return round(paid, 2)
 
 
 def default_bucket(business_start_date, txn_date) -> str:
@@ -127,6 +192,40 @@ _CATEGORY_TO_LINE = {
 }
 
 
+# The car costs the IRS standard mileage rate stands in for: the "Car and
+# truck expenses" line, and a TRANSPORTATION row nobody has given a line
+# yet (it lands on that line by default). The rate covers only the costs of
+# running the owner's OWN vehicle, so among the transportation codes only
+# fuel and the catch-all count. Parking and tolls are allowed on top of the
+# standard rate, and a fare for a vehicle someone else drives (a ride
+# share, transit, a hired bike or scooter) is a cost the miles never
+# covered — those stay deducted even on the car line. Repairs, tires,
+# servicing and washes are coded as automotive services, not transportation,
+# and default to another line, but the rate stands in for them just the
+# same, so they count whatever line they sit on.
+_VEHICLE_LINE = "Car and truck expenses"
+_OWN_VEHICLE_CODES = frozenset({"TRANSPORTATION_GAS",
+                                "TRANSPORTATION_OTHER_TRANSPORTATION"})
+_VEHICLE_SERVICE_CODES = frozenset({"GENERAL_SERVICES_AUTOMOTIVE"})
+
+
+def _is_vehicle_cost(t: dict, line: str | None) -> bool:
+    """Whether a row booked on `line` is an actual vehicle operating cost —
+    what an estimate that takes the standard mileage rate must not also
+    deduct."""
+    detailed = (t.get("cat_detailed") or "").upper()
+    if detailed in _VEHICLE_SERVICE_CODES:
+        return True
+    if detailed.startswith("TRANSPORTATION_") \
+            and detailed not in _OWN_VEHICLE_CODES:
+        return False
+    if line == _VEHICLE_LINE:
+        return True
+    return (not t.get("sched_c_line")
+            and (t.get("category") or "").upper() == "TRANSPORTATION"
+            and line == t.get("category"))
+
+
 # Money IN that is a merchant giving money BACK, not a customer paying. An
 # inflow still carrying a spending category is the return of a purchase
 # (a refunded chair keeps the store's GENERAL_MERCHANDISE), so the P&L nets
@@ -146,8 +245,8 @@ _REFUND_CATEGORIES = frozenset({
 
 def _inflow_role(t: dict) -> str:
     """How a row of money IN counts in the books: "revenue", "refund" (it
-    reverses a cost in its own bucket) or "skip" (capital, a transfer or a
-    card payment — neither revenue nor a cost).
+    reverses a cost in its own bucket) or "skip" (capital, a transfer, a
+    card payment or an owner's tax refund — neither revenue nor a cost).
 
     The one rule for every place that reads inflows — the year-scoped P&L
     and the lifetime start-up scan both call it. A row whose ORIGINAL
@@ -171,7 +270,7 @@ def _inflow_role(t: dict) -> str:
     was_transfer = "TRANSFER" in (t.get("cat_original") or "").upper()
     is_cc_payment = (t.get("cat_detailed") or "") == \
         "LOAN_PAYMENTS_CREDIT_CARD_PAYMENT"
-    if "TRANSFER" in cat or is_cc_payment or (
+    if "TRANSFER" in cat or is_cc_payment or _is_owner_tax(t) or (
             was_transfer and cat != "INCOME"):
         return "skip"
     if cat in _REFUND_CATEGORIES:
@@ -187,11 +286,14 @@ _REFUND_LOOKBACK = dt.timedelta(days=365)
 
 
 def _is_cost(t: dict) -> bool:
-    """A row the books count as a cost (money out that is not a transfer
-    or a card payment) — the expense branch's own test."""
+    """A row the books count as a cost (money out that is not a transfer,
+    a card payment or an owner's tax payment) — the expense branch's own
+    test."""
     if (t["amount"] or 0) <= 0:
         return False
     if (t["category"] or "").upper() in ("TRANSFER_OUT", "TRANSFER_IN"):
+        return False
+    if _is_owner_tax(t):
         return False
     return (t.get("cat_detailed") or "") != "LOAN_PAYMENTS_CREDIT_CARD_PAYMENT"
 
@@ -298,6 +400,18 @@ def _entity_start(conn, entity_id: str):
     return ent["business_start_date"] if ent else None
 
 
+# Which business rows still need a Schedule C decision (alias `c` is the
+# row's business_txn_class). No class at all, OR an operating class with no
+# line: the Books tab writes a bucket alone, and a row given only a bucket
+# is no nearer a line than one given nothing — if leaving the queue took
+# only a class row, a bucket change would remove the row from the one
+# control that sets a line, and the P&L would file it under its raw ledger
+# category for good. A row bucketed as organizational or start-up leaves
+# the queue: those costs are capitalized, not filed on a Part II line.
+_NEEDS_LINE = ("(c.txn_id IS NULL OR (c.sched_c_line IS NULL "
+               "AND c.bucket = 'operating'))")
+
+
 def unclassified_count(conn, entity_id: str) -> int:
     """How many business transactions still need a Schedule C decision.
 
@@ -311,12 +425,13 @@ def unclassified_count(conn, entity_id: str) -> int:
               FROM transactions t
               LEFT JOIN business_txn_class c ON c.txn_id = t.id
              WHERE {_BIZ_TXN} AND t.removed = 0 AND t.amount > 0
-               AND c.txn_id IS NULL{_NOT_FLOW}""",
+               AND {_NEEDS_LINE}{_NOT_FLOW}""",
         {"eid": entity_id}).fetchone()["n"]
 
 
 def suggest_lines(conn, entity_id: str, *, limit: int = 200) -> list[dict]:
-    """Propose a Schedule C line for each UNCLASSIFIED business transaction.
+    """Propose a Schedule C line for each business transaction that still
+    needs one (_NEEDS_LINE).
 
     SUGGEST, never apply. The personal side auto-applies a learned merchant
     category because a wrong one is cosmetic; a wrong Schedule C line is a
@@ -339,12 +454,13 @@ def suggest_lines(conn, entity_id: str, *, limit: int = 200) -> list[dict]:
     rows = conn.execute(
         f"""SELECT t.id, t.date, t.amount,
                    {_md.DISPLAY_MERCHANT} AS payee,
-                   COALESCE(t.category_override, t.category_primary, '') AS cat
+                   COALESCE(t.category_override, t.category_primary, '') AS cat,
+                   c.bucket AS bucket
               FROM transactions t
               {_md.MC_JOIN}
               LEFT JOIN business_txn_class c ON c.txn_id = t.id
              WHERE {_BIZ_TXN} AND t.removed = 0 AND t.amount > 0
-               AND c.txn_id IS NULL{_NOT_FLOW}
+               AND {_NEEDS_LINE}{_NOT_FLOW}
              ORDER BY t.date DESC LIMIT {int(limit)}""",
         {"eid": entity_id}).fetchall()
     if not rows:
@@ -379,7 +495,10 @@ def suggest_lines(conn, entity_id: str, *, limit: int = 200) -> list[dict]:
             # date (costs before it are pre-operating). Returned so a confirm
             # is one action: classify() requires a bucket, and asking the user
             # to restate a date-derived fact would be busywork.
-            "suggested_bucket": default_bucket(start, r["date"]),
+            # A row whose bucket was already set on the Books tab keeps it:
+            # confirming its line must not reset that decision.
+            "suggested_bucket": (r["bucket"]
+                                 or default_bucket(start, r["date"])),
         })
     return out
 
@@ -394,8 +513,11 @@ def txn_belongs_to_entity(conn, entity_id: str, txn_id: str) -> bool:
     Same scoping idea as equity.delete_movement ("scope by entity too, not
     just tenant via RLS"), and ownership is _BIZ_TXN's own notion: the
     per-row override first, else the account's assignment."""
+    # only a row still on the ledger: a class written on a retired row
+    # (a pending hold that has posted) lands where no P&L reads it
     return conn.execute(
-        f"SELECT 1 FROM transactions t WHERE t.id = %(tid)s AND {_BIZ_TXN}",
+        f"SELECT 1 FROM transactions t WHERE t.id = %(tid)s "
+        f"AND t.removed = 0 AND {_BIZ_TXN}",
         {"eid": entity_id, "tid": txn_id}).fetchone() is not None
 
 
@@ -455,7 +577,8 @@ def entity_transactions(conn, entity_id: str, year: int | None = None) -> list[d
     else the start-date default for a cost, else (a refund) the bucket of
     the cost it reverses — "operating" for a refund of an organizational
     or start-up cost that arrives after the year the deduction is taken,
-    a recovery in its own year; None for money in that is not a refund. A client
+    a recovery in its own year; None for money in that is not a refund
+    and for an owner's tax payment (_is_owner_tax). A client
     that totals a period from these rows reads `effective_bucket` rather
     than re-deriving it, so it cannot re-bucket a refund by its date."""
     rows = _select_rows(conn, entity_id, year)
@@ -474,7 +597,7 @@ def entity_transactions(conn, entity_id: str, year: int | None = None) -> list[d
     for r in rows:
         if r["id"] in refund_ids:
             r["effective_bucket"] = _refund_bucket(r, start, index, cutoff)
-        elif r["amount"] > 0:
+        elif r["amount"] > 0 and not _is_owner_tax(r):
             r["effective_bucket"] = r["bucket"] or default_bucket(
                 start, _row_date(r))
         else:
@@ -501,7 +624,7 @@ def _select_rows(conn, entity_id: str, year: int | None) -> list[dict]:
                  LEFT JOIN business_txn_class c ON c.txn_id = t.id
                  LEFT JOIN transaction_notes tn ON tn.txn_id = t.id
             WHERE {_BIZ_TXN} AND t.removed = 0{yr}
-            ORDER BY t.date DESC, t.amount DESC""", params).fetchall()
+            ORDER BY t.date DESC, t.amount DESC, t.id""", params).fetchall()
     return [{"id": r["id"], "date": r["date"].isoformat() if r["date"] else None,
              "amount": float(r["amount"] or 0),
              "net_amount": float(r["net_amount"] or 0), "payee": r["payee"],
@@ -547,13 +670,8 @@ def _lifetime_scan(conn, entity_id: str, rows=None) -> dict:
             # cost — by the same rule the year-scoped P&L applies
             if _inflow_role(t) != "refund":
                 continue
-        else:
-            cat = (t["category"] or "").upper()
-            if cat in ("TRANSFER_OUT", "TRANSFER_IN"):
-                continue
-            if (t.get("cat_detailed") or "") == \
-                    "LOAN_PAYMENTS_CREDIT_CARD_PAYMENT":
-                continue
+        elif not _is_cost(t):
+            continue
         d = dt.date.fromisoformat(t["date"]) if t["date"] else None
         # SAME bucket rule the year-scoped loop uses — explicit class first,
         # else the default from the business start date; a refund takes
@@ -674,6 +792,7 @@ def _pnl_core(conn, entity_id: str, year: int | None = None,
     org_total = 0.0
     startup_total = 0.0
     by_line: dict[str, float] = {}
+    vehicle = 0.0          # the operating part that is actual car costs
     # A refund with no Schedule C line of its own lands on the line its
     # merchant's charges were filed under, so a returned purchase takes the
     # line back to zero instead of opening a negative line beside it.
@@ -713,10 +832,13 @@ def _pnl_core(conn, entity_id: str, year: int | None = None,
                             or merchant_line.get(t.get("payee"))
                             or (t["category"] or "Uncategorized"))
                     by_line[line] = round(by_line.get(line, 0.0) + net, 2)
+                    if _is_vehicle_cost(t, line):
+                        vehicle += net
             continue
         # expense: bucket = explicit class, else default from start date
         bucket = t["bucket"] or default_bucket(start, d)
-        if cat in ("TRANSFER_OUT", "TRANSFER_IN") or is_cc_payment:
+        if cat in ("TRANSFER_OUT", "TRANSFER_IN") or is_cc_payment \
+                or _is_owner_tax(t):
             continue
         net = _net(t)
         if bucket == "organizational":
@@ -728,6 +850,8 @@ def _pnl_core(conn, entity_id: str, year: int | None = None,
             operating += net
             line = t["sched_c_line"] or (t["category"] or "Uncategorized")
             by_line[line] = round(by_line.get(line, 0.0) + net, 2)
+            if _is_vehicle_cost(t, line):
+                vehicle += net
 
     # A refund and the charge it reverses net a line to zero whichever the
     # rows arrive in (newest first, so the refund usually comes first):
@@ -752,6 +876,14 @@ def _pnl_core(conn, entity_id: str, year: int | None = None,
             "operating_expenses": operating,
             "operating_by_line": by_line,
             "net_operating": round(revenue - operating, 2),
+            # the actual vehicle operating costs inside operating_expenses
+            # (_is_vehicle_cost): the estimate deducts these OR the
+            # standard mileage rate, never both
+            "vehicle_expenses": round(max(0.0, vehicle), 2),
+            # the owner's tax paid toward this year so far, kept off the
+            # expenses above: what a tax set-aside still has to cover is
+            # the year's estimate less this
+            "estimated_tax_paid": estimated_tax_paid(lifetime, year),
             "organizational": round(org_total, 2),
             "startup_195": round(startup_total, 2),
             # LIFETIME totals, not this year's slice. §195/§248 is a

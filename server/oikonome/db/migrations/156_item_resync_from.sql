@@ -1,0 +1,12 @@
+-- A disconnected MX bank stays alive at MX, so bringing it back is an
+-- explicit owner action (the reconnect door) rather than something a sync
+-- guesses. While it was disconnected nothing it carried was written here,
+-- and the regular 30-day refresh would never reach back far enough to fill
+-- that gap. So the reconnect door records how far back the next pull must
+-- go for that connection:
+--
+--   resync_from   the first day the next sync fetches for this item — a
+--                 week before it was disconnected, so the days either side
+--                 of the gap overlap. Cleared by the first pull that
+--                 succeeds after it; NULL means the usual window.
+ALTER TABLE items ADD COLUMN IF NOT EXISTS resync_from DATE;

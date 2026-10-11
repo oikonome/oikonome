@@ -14,6 +14,12 @@ a batch removes that batch's claim and deletes **only rows no other
 batch still owns** — undoing a re-import can't destroy rows an earlier
 import legitimately created.
 
+When a newer version reads a line differently from an earlier import —
+its sign, or the year a December→January statement's January lines fall
+in — importing the same file again corrects the rows that import made,
+in place, with your notes, receipts and categories kept on them, rather
+than adding a corrected twin beside each.
+
 ## Deduplication against live sources
 
 A file that overlaps a connected account's window must not
@@ -29,8 +35,9 @@ description-aware) and keeps the connected source's copy.
   default.
 - **Wrong account**: roll back, re-import into the right one.
 - **Bulk imports**: the whole-folder flow (analyze → editable plan →
-  run) tags each file as its own batch, so one bad file rolls back
-  alone.
+  import) runs in the background — the page follows it file by file and
+  you can leave it — and tags each file as its own batch, so one bad file
+  rolls back alone.
 
 ## Describing imported rows with Plaid
 
@@ -48,6 +55,12 @@ the rows' amounts, dates or accounts changes.
 ## Gotchas
 
 - Rollback removes transactions, not the account they landed in.
+- Rows a bank feed relies on stay. If a feed found one of this import's
+  charges already here, it set its own copy aside and will not send it
+  again, so undo keeps that row (the reply says how many). When the feed
+  did not note which of its accounts did so (older imports), undo stops
+  and asks first; only the owner can choose **Undo anyway** to remove
+  those rows too. Until then the import stays listed with them.
 - Category overrides you made on imported rows are lost with the rows
   if you roll their batch back — and so are receipts, notes and
   reimbursement pairings added to those rows since the import. The

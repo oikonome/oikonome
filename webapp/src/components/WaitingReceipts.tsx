@@ -14,7 +14,8 @@ import { patchList, removeFromList } from "../api/cache";
 import { WAITING_KEY, moreWaiting, receiptDateBounds, seedWaiting,
          useMatchReceipt,
          useMoreWaiting, useReceiptDetails, useUnmatchReceipt,
-         useWaitingReceipts } from "../api/waiting";
+         useWaitingReceipts, parseStalled, forgetParseStart }
+  from "../api/waiting";
 import { localYmd, receiptDetailsDraft } from "../moneymath";
 import { canEdit } from "../role";
 
@@ -87,7 +88,9 @@ function Thumb({ r }: { r: { id: string; mime: string; has_optimized: boolean } 
 }
 
 function statusWords(r: WaitingReceipt): { cls: string; text: string } {
-  if (r.status === "parsing") return { cls: "m", text: "reading…" };
+  if (r.status === "parsing")
+    return parseStalled(r) ? { cls: "r", text: "stalled" }
+      : { cls: "m", text: "reading…" };
   if (r.status === "failed") return { cls: "r", text: "couldn't read" };
   if (r.needs_details) return { cls: "a", text: "needs its total" };
   if (r.status === "uploaded") return { cls: "m", text: "not read yet" };
@@ -168,10 +171,16 @@ export default function WaitingReceipts() {
   });
   const parse = useMutation({
     mutationFn: (id: string) => api.receiptParse(id),
-    // flip to reading at once — the poll above keys off the cache
-    onSuccess: (_r, id) => patchList<Waiting, WaitingReceipt>(
-      qc, WAITING_KEY, "waiting", (x) => x.id === id,
-      { status: "parsing", error: null }),
+    // flip to reading at once — the poll keys off the cache, and a row
+    // still marked stale would count as stalled and keep it stopped, so the
+    // stale mark goes too and a refetch restarts the poll
+    onSuccess: (_r, id) => {
+      patchList<Waiting, WaitingReceipt>(
+        qc, WAITING_KEY, "waiting", (x) => x.id === id,
+        { status: "parsing", error: null, parse_stale: false,
+          parse_started_at: new Date().toISOString() });
+      qc.invalidateQueries({ queryKey: WAITING_KEY });
+    },
   });
   // a receipt whose read total is wrong: its details form, opened by hand
   const [fixing, setFixing] = useState<string | null>(null);
@@ -198,6 +207,7 @@ export default function WaitingReceipts() {
           <Link to="/settings/ai">Settings → AI</Link>.</p>)}
       {match.isError && <p style={{ color: "var(--red)" }}>{errText(match.error)}</p>}
       {unmatch.isError && <p style={{ color: "var(--red)" }}>{errText(unmatch.error)}</p>}
+      {parse.isError && <p style={{ color: "var(--red)" }}>{errText(parse.error)}</p>}
       {q.isPending && <p className="mut">loading…</p>}
       {d && d.waiting.length === 0 && (
         <p className="mut" style={{ margin: ".5rem 0 0" }}>
@@ -216,7 +226,7 @@ export default function WaitingReceipts() {
                 {r.date && <span className="mut"> · {mmdd(r.date)}</span>}{" "}
                 <span className={"pill " + st.cls}>{st.text}</span>
               </div>
-              {r.status === "parsing" && (
+              {r.status === "parsing" && !parseStalled(r) && (
                 <div style={{ marginTop: ".35rem" }}>
                   <div className="rcpt-progress"><span /></div></div>)}
               {r.status === "failed" && r.error && (
@@ -269,11 +279,12 @@ export default function WaitingReceipts() {
             {mayEdit && (
               <div style={{ display: "flex", flexDirection: "column", gap: ".25rem" }}>
                 {d?.ai_available && r.status !== "parsed"
-                  && r.status !== "parsing" && (
+                  && (r.status !== "parsing" || parseStalled(r)) && (
                   <button style={{ fontSize: 12 }}
                     disabled={busy(parse, r.id)}
-                    onClick={() => parse.mutate(r.id)}>
-                    {r.status === "failed" ? "retry" : "read now"}</button>)}
+                    onClick={() => { forgetParseStart(r.id); parse.mutate(r.id); }}>
+                    {r.status === "failed" || r.status === "parsing"
+                      ? "retry" : "read now"}</button>)}
                 {!demo && r.status === "parsed" && !r.needs_details
                   && fixing !== r.id && (
                   <button style={{ fontSize: 12 }}

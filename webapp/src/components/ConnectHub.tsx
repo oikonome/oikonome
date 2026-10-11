@@ -1,8 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { lazy, Suspense, useRef, useState } from "react";
-import { ago, api, errText, type Connection, type Settings } from "../api/client";
+import { ago, api, AuthError, errText, type Connection, type Settings } from "../api/client";
 import { ext } from "../ext";
 import { patchQuery, removeFromList } from "../api/cache";
+import { sharedLock } from "../sharedlogin";
 // The file importer is a page of its own and opens only behind the
 // "Import files" button, so its code arrives on that click rather than
 // riding in with every screen that shows this hub.
@@ -21,6 +22,29 @@ function FileImport() {
  *  operator's own credentials — no developer-account steps. */
 
 type ProviderKey = "plaid" | "mx" | "simplefin" | "scripts" | "files";
+
+/** The sentence a held bank-link door shows, or null when links through
+ *  `provider` are open. After a credential rotation the household's own
+ *  Plaid / MX client may be one a hijacker saved, so the server refuses a
+ *  new link, a re-auth and the MX widget on it until the owner resumes in
+ *  the Settings banner or removes the keys; the button is closed here with
+ *  the server's own sentence (a stale tab still gets the server's 400).
+ *  Only the owner is told which clients are held, so only the owner's
+ *  buttons close ahead of the server. Mobile: bankLinksHeld in
+ *  mobile/src/lib/pure.ts. */
+export function bankLinkHoldNote(s: Settings | undefined,
+                                 provider: "plaid" | "mx"): string | null {
+  const p = s?.outbound_paused;
+  if (!p?.aggregator
+      || !(p.aggregator_keys ?? []).some((k) => k.provider === provider))
+    return null;
+  const why = p.reason === "recovery" ? "your account was recovered"
+    : "your password, login email or second factor changed";
+  return `New bank links are on hold since ${why}: confirm the `
+    + `${provider === "mx" ? "MX" : "Plaid"} keys saved in Settings are `
+    + "yours (Settings, top banner), or disconnect their banks and remove "
+    + "the keys.";
+}
 
 /** What a finished Plaid session reports. `kind` is the server's word for
  *  how it ended: add / update on success; exited when the user left Link
@@ -111,14 +135,39 @@ export async function openPlaidHostedLink(itemId = "", opts?: {
   // The server resolves kind:"exited" when Plaid stamps the session
   // finished with nothing added (the in-Link exit button); the cancelled
   // callback covers the case Plaid never hears about — a closed tab.
+  //
+  // This poll is what makes the server exchange the bank's token, so one
+  // failed request must not end it: a dropped connection, a restart or an
+  // edge timeout while the first sync runs would otherwise lose a link the
+  // person just finished in the bank tab. Transient failures back off and
+  // keep polling until the deadline; only a definite refusal (a 4xx such
+  // as an unknown session) or a sign-out ends the wait early.
   const deadline = Date.now() + 15 * 60 * 1000;
+  let wait = 2500;
   while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 2500));
+    await new Promise((r) => setTimeout(r, wait));
     if (opts?.cancelled?.()) return { kind: "cancelled" };
-    const s = await api.plaidLinkStatus(started.link_token);
-    if (s.done) return s;
+    try {
+      const s = await api.plaidLinkStatus(started.link_token);
+      wait = 2500;
+      if (s.done) return s;
+    } catch (e) {
+      if (!pollMayRetry(e)) throw e;
+      wait = Math.min(wait * 2, 30_000);
+    }
   }
   throw new Error("Timed out waiting for the bank connection");
+}
+
+/** A status poll failure worth trying again: no answer at all (offline,
+ *  connection dropped), a server or gateway error, a request timeout or a
+ *  rate limit. A sign-out and any other 4xx are final. */
+function pollMayRetry(e: unknown): boolean {
+  if (e instanceof AuthError) return false;
+  const m = /^(\d{3}):/.exec(e instanceof Error ? e.message : String(e));
+  if (!m) return true;
+  const code = Number(m[1]);
+  return code >= 500 || code === 408 || code === 429;
 }
 
 const ROWS: { key: ProviderKey; name: string; cost: string; effort: string;
@@ -267,6 +316,8 @@ function PlaidConnectButton({ label, hint, itemId = "", full = false }: {
   label: string; hint: string; itemId?: string; full?: boolean;
 }) {
   const qc = useQueryClient();
+  const st = useQuery({ queryKey: ["settings"], queryFn: api.settings });
+  const held = bankLinkHoldNote(st.data, "plaid");
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   // backing out of the bank tab is normal, not an error — it gets its own
@@ -312,11 +363,13 @@ function PlaidConnectButton({ label, hint, itemId = "", full = false }: {
   };
   return (
     <div>
-      <button className="pri" style={{ fontSize: 15 }} disabled={busy || full}
+      <button className="pri" style={{ fontSize: 15 }}
+        disabled={busy || full || !!held}
         title={full ? "you are at this account's institution limit" : undefined}
         onClick={() => void run()}>
         {busy ? "Connecting…" : label}
       </button>
+      {held && <p style={{ fontSize: 13, color: "var(--amber)" }}>{held}</p>}
       {/* the escape hatch: the server only learns about an exit Plaid
           reports, and a closed TAB reports nothing — without this the
           button sat on "Connecting…" for 15 minutes after a back-out */}
@@ -344,6 +397,9 @@ function PlaidConnectButton({ label, hint, itemId = "", full = false }: {
  *  the same call). */
 function HubFixButton({ c }: { c: Connection }) {
   const qc = useQueryClient();
+  const st = useQuery({ queryKey: ["settings"], queryFn: api.settings });
+  // a re-auth hands the bank login to the same client a new link does
+  const held = bankLinkHoldNote(st.data, "plaid");
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
   if (c.aggregator !== "plaid") return null;
@@ -354,7 +410,10 @@ function HubFixButton({ c }: { c: Connection }) {
   if (!gone && kind !== "reauth" && kind !== "attention") return null;
   const run = () => {
     setBusy(true); setNote(null);
-    void openPlaidHostedLink(gone ? "" : c.id)
+    // new accounts at the bank are offered only with Link's account
+    // checklist switched on
+    void openPlaidHostedLink(gone ? "" : c.id,
+      { manageAccounts: !gone && c.status === "new_accounts" })
       .then((s) => {
         const out = plaidLinkOutcome(s, gone ? "add" : "fix");
         setNote(out.text);
@@ -367,11 +426,12 @@ function HubFixButton({ c }: { c: Connection }) {
   };
   return (
     <>
-      <button className="linked-x" disabled={busy}
-        title={gone ? "link this bank again" : "sign in to the bank again"}
+      <button className="linked-x" disabled={busy || !!held}
+        title={held ?? (gone ? "link this bank again"
+                              : "sign in to the bank again")}
         onClick={run}>
         {busy ? "waiting…" : gone ? "reconnect ↗" : "fix ↗"}</button>
-      {note && <small className="sub">{note}</small>}
+      {(note ?? held) && <small className="sub">{note ?? held}</small>}
     </>
   );
 }
@@ -399,6 +459,7 @@ export function MxFlow({ onDone }: { onDone: () => void }) {
   // session state alone, an owner returning to link another bank would find
   // both actions dead with no way to revive them.
   const keysReady = !!s.data?.mx_api_key_set;
+  const held = bankLinkHoldNote(s.data, "mx");
   const connect = useMutation({
     // the widget URL comes from the server response; openTabAt opens the
     // tab inside the click (a tab opened after the round-trip is blocked),
@@ -438,7 +499,7 @@ export function MxFlow({ onDone }: { onDone: () => void }) {
           onClick={() => save.mutate()}>
           {save.isPending ? "checking with MX…" : keysReady ? "Keys saved ✓" : "Validate & save keys"}
         </button>
-        <button disabled={!keysReady || connect.isPending}
+        <button disabled={!keysReady || connect.isPending || !!held}
           onClick={() => connect.mutate()}>
           {connect.isPending ? "…" : "Open MX Connect (link a bank)"}
         </button>
@@ -447,6 +508,7 @@ export function MxFlow({ onDone }: { onDone: () => void }) {
           {sync.isPending ? "syncing…" : "Sync now"}
         </button>
       </div>
+      {held && <p style={{ color: "var(--amber)" }}>{held}</p>}
       <p className="mut" style={{ marginTop: ".6rem" }}>Link banks in the MX
         window, then hit <b>Sync now</b> — accounts and transactions land on
         the Accounts page; the background sync keeps them fresh after that.</p>
@@ -543,6 +605,17 @@ export default function ConnectHub({ onDone }: { onDone?: () => void }) {
           External data connections are disabled on the demo instance —
           everything here is synthetic. Install your own instance to
           connect real accounts.</p>
+      </div>
+    );
+  // the shared demonstration login is refused every door in here (each
+  // one plants a credential that outlives the login), so the hub says so
+  // once instead of offering buttons that can only answer 403
+  const credentialLock = sharedLock(me.data, "credential");
+  if (credentialLock)
+    return (
+      <div className="card" style={{ marginBottom: "1rem" }}>
+        <h2>Where should your data come from?</h2>
+        <p className="sub" style={{ color: "var(--amber)" }}>{credentialLock}</p>
       </div>
     );
   // hosted never shows the raw provider grid — the platform runs
@@ -703,8 +776,12 @@ export default function ConnectHub({ onDone }: { onDone?: () => void }) {
                             onClick={() => window.confirm(
                               `Disconnect ${c.institution_name || c.id}? `
                               + "It stops syncing (history is kept)"
+                              // a released Item keeps its place under the
+                              // allowance for 30 days, so only say so where
+                              // there is an allowance to hold it
                               + (r.key === "plaid"
-                                 ? " and the Plaid slot is freed." : "."))
+                                   && typeof me.data?.features?.institution_cap === "number"
+                                 ? ". It keeps its slot for 30 days." : "."))
                               && disc.mutate(c.id)}>✕</button>
                         </span>
                       ))}

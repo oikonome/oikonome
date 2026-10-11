@@ -195,7 +195,8 @@ export default function Doctor({ embedded = false }:
         </div>
         <p className="mut" style={{ marginBottom: 0 }}>The bundle is what bug
           reports ask for — check output and versions only, no tokens and no
-          transaction contents.</p>
+          transaction contents. Hostnames, bank names and collector labels
+          are not included.</p>
       </div>
 
     </>

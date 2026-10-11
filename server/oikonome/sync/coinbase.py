@@ -239,11 +239,31 @@ def sync(conn, item_id_: str, *, transport=None, tries: int = 6) -> dict:
         txns = [t for w in wallets for t in client.paginate(
             f"/v2/accounts/{w['id']}/transactions?limit=100")]
         # attach raw wallet objects for the holdings rows (kept out of the
-        # priced tuple above so the guard math stays readable)
-        raw_by_code = {w["balance"]["currency"]: w for w in wallets}
+        # priced tuple above so the guard math stays readable). Every
+        # non-empty wallet of a currency is kept, not the last one seen.
+        raw_by_code: dict[str, list] = {}
+        for w in wallets:
+            if float(w["balance"]["amount"]) != 0:
+                raw_by_code.setdefault(w["balance"]["currency"], []).append(w)
+        # Holdings are one row per (account, currency), but one currency can
+        # sit in several wallets (a wallet and a vault). Written one by one,
+        # the second would overwrite the first under that key, leaving the
+        # holdings short of the balance just summed from both, and P/L and
+        # the net-worth history short with them. So a currency's wallets
+        # are added together first.
+        by_code: dict[str, list] = {}
+        for haid, code, qty, usd in priced_rows:
+            agg = by_code.setdefault(code, [haid, code, 0.0, 0.0])
+            agg[2] += qty
+            agg[3] += usd
+        priced_rows = [(haid, code, qty, round(usd, 2))
+                       for haid, code, qty, usd in by_code.values()]
     except Exception as e:                       # noqa: BLE001
         log_sync(conn, item_id_, 0, error=f"{type(e).__name__}: {e}")
-        conn.execute("UPDATE items SET status=%s WHERE id=%s",
+        # never over a disconnect that landed mid-pull, nor a restored
+        # shell (see the worker's error write)
+        conn.execute("UPDATE items SET status=%s WHERE id=%s "
+                     "AND COALESCE(status,'') NOT IN ('archived', 'restored')",
                      (f"error:{type(e).__name__}", item_id_))
         raise
 
@@ -263,7 +283,8 @@ def sync(conn, item_id_: str, *, transport=None, tries: int = 6) -> dict:
                        quantity=EXCLUDED.quantity,
                        native_usd=EXCLUDED.native_usd,
                        as_of=EXCLUDED.as_of, raw=EXCLUDED.raw""",
-                (haid, code, qty, usd, now, jsonb(raw_by_code.get(code) or {})))
+                (haid, code, qty, usd, now, jsonb(_holding_raw(
+                    raw_by_code.get(code) or []))))
         conn.execute(
             "UPDATE accounts SET balance_current=%s, updated_at=%s WHERE id=%s",
             (round(total_usd, 2), now, aid))
@@ -290,10 +311,21 @@ def sync(conn, item_id_: str, *, transport=None, tries: int = 6) -> dict:
                 (stale,))
 
     log_sync(conn, item_id_, n_txn)
-    conn.execute("UPDATE items SET status='ok' WHERE id=%s", (item_id_,))
+    # the owner may have disconnected this key while the pull ran; 'ok'
+    # here would put it back into every hourly sweep
+    conn.execute("UPDATE items SET status='ok' WHERE id=%s "
+                 "AND COALESCE(status,'') != 'archived'", (item_id_,))
     return {"label": label, "wallets": len(wallets),
             "holdings_usd": round(total_usd, 2), "transactions": n_txn,
             "stale_removed": len(stale)}
+
+
+def _holding_raw(wallets: list) -> dict:
+    """The source record of one currency's holding: the wallet itself, or
+    every wallet when the currency sits in more than one."""
+    if len(wallets) == 1:
+        return wallets[0]
+    return {"wallets": wallets} if wallets else {}
 
 
 def _upsert_txn(conn, aid: str, t: dict) -> None:
@@ -319,7 +351,12 @@ def _upsert_txn(conn, aid: str, t: dict) -> None:
                category_primary=EXCLUDED.category_primary,
                category_source=EXCLUDED.category_source,
                category_detailed=EXCLUDED.category_detailed,
-               pending=EXCLUDED.pending, removed=0, raw=EXCLUDED.raw""",
+               pending=EXCLUDED.pending,
+               -- a re-pulled row comes back unless it was retired by a
+               -- decision (see upsert_transactions in sync/base.py)
+               removed=CASE WHEN transactions.retired_at IS NOT NULL
+                            THEN 1 ELSE 0 END,
+               raw=EXCLUDED.raw""",
         (f"coinbase:{t['id']}", aid, date, amount, name, "Coinbase",
          cat, f"COINBASE_{ttype.upper()}", pending, jsonb(t)))
     # category_override deliberately untouched — sacred, never synced

@@ -147,6 +147,92 @@ class StatusLeverTests(unittest.TestCase):
         self.assertIsNone(row["delete_after"])
         self.assertIsNone(row["status_before_delete"])
 
+    def test_the_restore_door_refuses_a_household_the_purge_has_claimed(self):
+        """Once the nightly purge has claimed a household it releases its
+        bank links and billing without holding the row; a restore then
+        would hand back an account whose connections are already gone."""
+        _freeze(self.tid, "pending_delete")
+        admin = tenancy.admin_connect()
+        try:
+            admin.execute("UPDATE tenants SET purge_claimed_at = now() "
+                          "WHERE id=%s", (self.tid,))
+        finally:
+            admin.close()
+        r = self.client.post("/admin/console/tenant-restore",
+                             data={"tenant_id": self.tid})
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertIn("Deletion in progress", r.text)
+        self.assertEqual(_tenant_row(self.tid)["status"], "pending_delete")
+        # the claim given up, the same door works again
+        admin = tenancy.admin_connect()
+        try:
+            admin.execute("UPDATE tenants SET purge_claimed_at = NULL "
+                          "WHERE id=%s", (self.tid,))
+        finally:
+            admin.close()
+        r = self.client.post("/admin/console/tenant-restore",
+                             data={"tenant_id": self.tid})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(_tenant_row(self.tid)["status"], "active")
+
+    def test_a_claim_left_by_a_killed_purge_does_not_lock_the_door(self):
+        """A worker killed mid-purge leaves its claim behind, and nothing
+        else clears it. One far older than any purge takes is given up:
+        the restore goes through, and the Items that purge had already
+        removed at Plaid come back archived rather than looking live."""
+        _freeze(self.tid, "pending_delete")
+        gone, live = (f"it-{uuid.uuid4().hex[:8]}" for _ in range(2))
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            for iid in (gone, live):
+                conn.execute(
+                    "INSERT INTO items (id, aggregator, institution_name, "
+                    "access_token) VALUES (%s,'plaid','Test Bank','tok')",
+                    (iid,))
+        finally:
+            conn.close()
+        admin = tenancy.admin_connect()
+        try:
+            admin.execute("UPDATE tenants SET purge_claimed_at = "
+                          "now() - interval '7 hours' WHERE id=%s",
+                          (self.tid,))
+            for iid in (gone, live):
+                admin.execute("INSERT INTO plaid_item_ledger (item_id) "
+                              "VALUES (%s)", (iid,))
+            admin.execute("UPDATE plaid_item_ledger SET removed_at=now() "
+                          "WHERE item_id=%s", (gone,))
+        finally:
+            admin.close()
+        r = self.client.post("/admin/console/tenant-restore",
+                             data={"tenant_id": self.tid})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(_tenant_row(self.tid)["status"], "active")
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            rows = {r["id"]: r for r in conn.execute(
+                "SELECT id, status, archived_reason, access_token "
+                "FROM items").fetchall()}
+        finally:
+            conn.close()
+        self.assertEqual(rows[gone]["status"], "archived")
+        self.assertEqual(rows[gone]["archived_reason"], "plaid-gone")
+        self.assertIsNone(rows[gone]["access_token"])
+        self.assertNotEqual(rows[live]["status"], "archived")
+        self.assertIsNotNone(rows[live]["access_token"])
+
+    def test_a_fresh_claim_still_refuses(self):
+        _freeze(self.tid, "pending_delete")
+        admin = tenancy.admin_connect()
+        try:
+            admin.execute("UPDATE tenants SET purge_claimed_at = "
+                          "now() - interval '1 hour' WHERE id=%s",
+                          (self.tid,))
+        finally:
+            admin.close()
+        r = self.client.post("/admin/console/tenant-restore",
+                             data={"tenant_id": self.tid})
+        self.assertEqual(r.status_code, 409, r.text)
+
 
 if __name__ == "__main__":
     unittest.main()

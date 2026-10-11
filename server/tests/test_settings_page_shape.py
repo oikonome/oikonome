@@ -106,15 +106,22 @@ class RecipientDraftTests(unittest.TestCase):
         except FileNotFoundError:
             self.skipTest("webapp/ not present")
 
-    def test_every_change_saves_itself_with_the_full_next_form(self):
+    def test_every_change_saves_itself_as_the_one_thing_it_changed(self):
+        """Each edit saves at once, and sends only what it changed: a
+        recipient or mute edit names its addresses, so a page that opened
+        before another member muted themselves cannot un-mute them."""
         self.assertIn(
             "onChange={(recipients) => applyEmail({ ...form, recipients })}",
             self.src)
         self.assertIn(
             "onChange={(sched) => applyEmail({ ...form, sched })}", self.src)
-        # the whole next form goes to the server, plus the addresses this
-        # edit added (so a stale page cannot re-add a removed member)
-        self.assertIn("saveEmail.mutate({ ...next, added })", self.src)
+        body = self.src[self.src.index("const applyEmail = ("):
+                        self.src.index("saveEmail.mutate(body)")]
+        for key in ("email_recipients_added", "email_recipients_removed",
+                    "email_muted_add", "email_muted_remove"):
+            self.assertIn(key, body)
+        self.assertNotIn("body.email_recipients =", body)
+        self.assertNotIn("body.email_muted =", body)
         # the flush-on-save machinery must not linger half-wired
         self.assertNotIn("flushRecipient", self.src)
 

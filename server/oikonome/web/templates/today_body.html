@@ -322,9 +322,10 @@
    pass `summary`. #}
 {% if not summary and view == 'detail' %}
 {# ---- savings goals — ledger-verified progress + pace:
-      only when a TRACKABLE goal exists (mirrors Today.tsx) ---- #}
+      only when a TRACKABLE goal exists, or one that needs an account to
+      become trackable (mirrors Today.tsx) ---- #}
 {% set goals = st.savings_goals or [] %}
-{% if goals | rejectattr('plan_only') | list %}
+{% if goals | rejectattr('plan_only') | list or goals | selectattr('needs_account') | list %}
 <div class="card" style="margin-top:1rem;">
   <div class="sub" style="text-transform:uppercase;letter-spacing:.03em;">Savings goals</div>
   {% for g in goals %}
@@ -334,7 +335,7 @@
       <b>{{ g.name }}</b>
       {% if g.plan_only %}
       <span class="mut" style="font-size:13px;">plan {{ money(g.monthly_plan) }}/mo</span>
-      <span class="mut" style="font-size:13px;margin-left:auto;">plan only — set a destination account on the Budget page to track progress</span>
+      <span class="mut" style="font-size:13px;margin-left:auto;">{% if g.needs_account %}match words need an account — pick one on the Budget page{% else %}plan only — set a destination account on the Budget page to track progress{% endif %}</span>
       {% else %}
       {# open-ended goal (no target): "$X saved" + the measured rate —
          never "of $0" (mirrors Today.tsx) #}
@@ -390,13 +391,19 @@
     {%- if map.has_overflow and map.has_pending %} · {% endif %}
     {%- if map.has_pending %}amber is awaiting{% endif %}</div>
   {% endif %}
+  {#- a charge the bank feed withdrew is not a bill that never posted: it
+      gets its own line, in the same words as the Today page #}
+  {% set late = (st.overdue_unpaid or []) | rejectattr(3) | list %}
+  {% set gone = (st.overdue_unpaid or []) | selectattr(3) | list %}
   {% if map.folded or st.irregular_bills or st.overdue_unpaid %}
   <div class="sub" style="font-size:12px;margin-top:.5rem;">
     {%- if map.folded %}Also this month: {{ map.folded | join(' · ') }}{% endif %}
     {%- if map.folded and st.irregular_bills %} · {% endif %}
     {%- if st.irregular_bills %}non-monthly bills: {% for i in st.irregular_bills[:4] %}{{ i.payee }} <b>{{ money(i.amount) }}</b> ({{ i.label }}){{ ' · ' if not loop.last }}{% endfor %}{% endif %}
-    {%- if (map.folded or st.irregular_bills) and st.overdue_unpaid %}<br>{% endif %}
-    {%- if st.overdue_unpaid %}Scheduled but not yet posted: {% for p, a, due in st.overdue_unpaid[:4] %}{{ p }} {{ money(a) }} (due {{ due|d }}){{ ', ' if not loop.last }}{% endfor %}{% endif %}
+    {%- if (map.folded or st.irregular_bills) and late %}<br>{% endif %}
+    {%- if late %}Scheduled but not yet posted: {% for o in late[:4] %}{{ o[0] }} {{ money(o[1]) }} (due {{ o[2]|d }}){{ ', ' if not loop.last }}{% endfor %}{% endif %}
+    {%- if (map.folded or st.irregular_bills or late) and gone %}<br>{% endif %}
+    {%- if gone %}<span style="color:var(--amber);">withdrawn by the bank feed: {% for o in gone[:4] %}{{ o[0] }} {{ money(o[1]) }} ({{ o[3]|d }}){{ ', ' if not loop.last }}{% endfor %}</span>{% endif %}
   </div>
   {% endif %}
 </div>

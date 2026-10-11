@@ -16,7 +16,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { api, errText, toast, type RuleRow, type RulesPage, catLabel } from "../api/client";
-import { patchList, removeFromList } from "../api/cache";
+import { invalidateRollups, patchList, removeFromList } from "../api/cache";
 import { canEdit } from "../role";
 import { spendPickerGroups } from "../moneymath";
 
@@ -153,6 +153,7 @@ function RenameCategoryCard() {
       // the carve-outs it rewrote feed the verdict and the month snapshots
       qc.invalidateQueries({ queryKey: ["today"] });
       qc.invalidateQueries({ queryKey: ["budget-snapshots"] });
+      invalidateRollups(qc);
       if (n === 0) setMsg(`Nothing used “${r.old}” — name unchanged elsewhere.`);
     },
     onError: (e) => {
@@ -249,6 +250,7 @@ function RuleGroup({ source, title, mayEdit, q, count, note,
         qc.invalidateQueries({ queryKey: ["txns"] });
         qc.invalidateQueries({ queryKey: ["today"] });
         qc.invalidateQueries({ queryKey: ["merchant-detail"] });
+        invalidateRollups(qc);
       }
     },
     // a refused write only re-enabled the button, which reads as a no-op
@@ -266,10 +268,14 @@ function RuleGroup({ source, title, mayEdit, q, count, note,
   });
   // A delete cannot be undone, so it asks first — like every other
   // destructive action on the web, and like the mobile rules screen.
+  // Only a rule of your own stays deleted: the next sync puts a built-in
+  // or learned rule back, so for those the prompt points at Disable.
   const confirmDelete = (m: string) => {
-    if (window.confirm(`Delete the rule for "${m}"? It stops `
-        + "auto-categorizing this merchant; existing transactions keep "
-        + "their category."))
+    if (window.confirm(source === "user"
+        ? `Delete the rule for "${m}"? It stops auto-categorizing this `
+          + "merchant; existing transactions keep their category."
+        : `Delete the rule for "${m}"? The next sync adds it back — `
+          + "Disable stops it for good."))
       del.mutate(m);
   };
   // the chip's write: the new category (and its promotion) on the row now;
@@ -285,6 +291,7 @@ function RuleGroup({ source, title, mayEdit, q, count, note,
     qc.invalidateQueries({ queryKey: ["txns"] });
     qc.invalidateQueries({ queryKey: ["today"] });
     qc.invalidateQueries({ queryKey: ["merchant-detail"] });
+    invalidateRollups(qc);
   };
   const d: RulesPage | undefined = rq.data;
   const pages = d ? Math.max(1, Math.ceil(d.total / d.per_page)) : 1;

@@ -9,6 +9,33 @@ import { patchQueries } from "./cache";
 
 export const WAITING_KEY = ["receipts-waiting"] as const;
 
+// A parse whose worker died (a restart mid-read) stays 'parsing' until the
+// server's reclaim window has passed; after that a fresh parse may claim
+// the receipt again. Past that age a read is treated as stalled: polling
+// for it stops and the retry is offered. The server says that it is stale
+// (parse_stale, by its own clock) and when the attempt began
+// (parse_started_at); an older server sends neither, and then the age
+// counts from when this client first saw the row parsing.
+export const STALE_PARSE_MS = 10 * 60_000;
+const firstSeenParsing = new Map<string, number>();
+export function parseStalled(r: { id: string; status: string;
+                                  parse_started_at?: string | null;
+                                  parse_stale?: boolean },
+                             now = Date.now()): boolean {
+  if (r.status !== "parsing") { firstSeenParsing.delete(r.id); return false; }
+  if (r.parse_stale !== undefined) return r.parse_stale;
+  let began = r.parse_started_at ? Date.parse(r.parse_started_at) : NaN;
+  if (Number.isNaN(began)) {
+    began = firstSeenParsing.get(r.id) ?? now;
+    firstSeenParsing.set(r.id, began);
+  }
+  return now - began > STALE_PARSE_MS;
+}
+/** A retry starts a new attempt: its age counts from now. */
+export function forgetParseStart(id: string): void {
+  firstSeenParsing.delete(id);
+}
+
 /** The waiting list, polled while a snapped receipt is still being read —
  *  its parse finishing is also the moment the server tries to match it. */
 export function useWaitingReceipts() {
@@ -18,7 +45,8 @@ export function useWaitingReceipts() {
     queryFn: () => loadWaiting(api.receiptsWaiting,
       qc.getQueryData<WaitingReceipts>(WAITING_KEY)?.waiting.length ?? 0),
     refetchInterval: (query) =>
-      query.state.data?.waiting.some((r) => r.status === "parsing")
+      query.state.data?.waiting.some((r) => r.status === "parsing"
+                                            && !parseStalled(r))
         ? 1500 : false,
   });
 }

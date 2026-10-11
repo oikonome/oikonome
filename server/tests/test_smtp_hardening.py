@@ -82,7 +82,8 @@ class SmtpSettingsGuardTests(unittest.TestCase):
 
     def _save(self, host):
         return self.client.post("/api/settings",
-                                json={"smtp_host": host, "smtp_port": 587})
+                                json={"smtp_host": host, "smtp_port": 587,
+                                      "smtp_from": "money@example.com"})
 
     def test_metadata_smtp_host_rejected_even_self_hosted(self):
         r = self._save(METADATA_IP)

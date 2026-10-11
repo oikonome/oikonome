@@ -34,6 +34,13 @@ export default function SavingsGoalsCard({ data, onSaved, onDirtyChange }: {
   const baseline = useRef<SavingsGoal[]>(data.savings_goals ?? []);
   const touch = () => onDirtyChange?.(true);
   const num = (v: string) => Number(v.replace(/[$,\s]/g, "") || 0);
+  // Match words with no account can never be measured: they match both
+  // legs of a transfer and nothing says which side is the fund, so the
+  // server refuses the shape. Mobile shares this predicate
+  // (goalNeedsAccount in mobile/src/lib/pure.ts).
+  const hasWords = (r: Row) =>
+    r.tokens.split(",").some((t) => t.trim() !== "");
+  const needsAccount = (r: Row) => r.account_id === "" && hasWords(r);
   const save = useMutation({
     mutationFn: async () => {
       // the goals list is replaced wholesale, but these rows were
@@ -86,7 +93,9 @@ export default function SavingsGoalsCard({ data, onSaved, onDirtyChange }: {
         <span className="mut" style={{ fontSize: 13, fontWeight: 400 }}>
           — trip fund, emergency fund; progress comes from real transfers</span></h2>
       <p className="mut">A goal watches transfers on its account (add
-        match words to carve several goals out of one account). The
+        match words to carve several goals out of one account). A goal
+        with no account is a plan only: it lowers the excess cash line
+        but shows no progress. The
         monthly plan lowers the excess cash line and rides the cash forecast —
         it never makes the daily verdict go over. A sweep goal contributes
         at month end instead, and only what the month&apos;s surplus covers.</p>
@@ -118,18 +127,27 @@ export default function SavingsGoalsCard({ data, onSaved, onDirtyChange }: {
               <label>Account
                 <select value={r.account_id}
                         onChange={(e) => upd(i, { account_id: e.target.value })}>
-                  <option value="">any account</option>
+                  <option value="">no account (plan only)</option>
                   {(accts.data?.accounts ?? []).map((a) => (
                     <option key={a.id} value={a.id}>{a.name}</option>
                   ))}
                 </select></label>
               <label>Match words <span className="mut">(optional, comma-sep)</span>
+                {/* words only carve a goal out of an account; with no
+                    account they stay editable only so existing ones can
+                    be cleared */}
                 <input value={r.tokens} placeholder="trip"
+                       disabled={r.account_id === "" && !hasWords(r)}
                        onChange={(e) => upd(i, { tokens: e.target.value })} /></label>
               <label>Starting balance $ <span className="mut">(before tracking)</span>
                 <input inputMode="decimal" value={r.start_balance}
                        onChange={(e) => upd(i, { start_balance: e.target.value })} /></label>
             </div>
+            {needsAccount(r) && (
+              <div className="note bad" style={{ marginTop: ".4rem" }}>
+                Match words need an account — pick the account the money
+                lands in.</div>
+            )}
             {p && p.pct != null && (
               <div className="mut" style={{ fontSize: 13, marginTop: ".4rem" }}>
                 {money(p.saved)} of {money(p.target)} ({p.pct}%)

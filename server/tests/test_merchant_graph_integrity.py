@@ -59,8 +59,8 @@ class DanglingPointers(unittest.TestCase):
     def test_transaction_pointing_at_a_missing_merchant_is_re_resolved(self):
         conn = make_db()
         self.addCleanup(conn.close)
-        tid = add_txn(conn, "2026-07-02", 11.0, "TRADER JOES #55",
-                      merchant="Trader Joes")
+        tid = add_txn(conn, "2026-07-02", 11.0, "NORTHWIND MARKET #00",
+                      merchant="Northwind Market")
         conn.execute("UPDATE transactions SET merchant_id=%s",
                      (str(uuid.uuid4()),))
 
@@ -78,17 +78,17 @@ class ScopedResolve(unittest.TestCase):
     def test_a_scoped_resolve_still_honours_the_persons_own_name(self):
         conn = make_db()
         self.addCleanup(conn.close)
-        tid = add_txn(conn, "2026-07-05", 15.0, "SQ *BLUE BOTTLE",
-                      merchant="SQ *BLUE BOTTLE")
-        other = add_txn(conn, "2026-07-05", 25.0, "PEETS #12",
-                        merchant="PEETS #12")
+        tid = add_txn(conn, "2026-07-05", 15.0, "SQ *FABRIKAM ROASTERS",
+                      merchant="SQ *FABRIKAM ROASTERS")
+        other = add_txn(conn, "2026-07-05", 25.0, "CONTOSO COFFEE #00",
+                        merchant="CONTOSO COFFEE #00")
         conn.execute(
             "INSERT INTO merchant_canonical (raw_merchant, canonical, method) "
-            "VALUES ('SQ *BLUE BOTTLE','Blue Bottle Coffee','manual')")
+            "VALUES ('SQ *FABRIKAM ROASTERS','Fabrikam Roasters','manual')")
 
         merchant_identity.resolve(conn, txn_ids=[tid])
 
-        self.assertEqual(_merchant_of(conn, tid), "Blue Bottle Coffee")
+        self.assertEqual(_merchant_of(conn, tid), "Fabrikam Roasters")
         # the row outside the scope was not touched
         self.assertIsNone(_merchant_of(conn, other))
 

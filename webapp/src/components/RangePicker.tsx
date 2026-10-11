@@ -65,8 +65,8 @@ export function monthsBackFrom(anchor: string, months: number): string {
 // timezone is in a different month for hours at each month boundary: a
 // household in Los Angeles at 6pm on Aug 31 is still in August while the
 // browser's UTC month is already September. Cutting the chart on the
-// browser would drop June from a "3m" window whose server figures cover
-// Jun+Jul+Aug — the best/worst caption would be computed over a window one
+// browser would drop May from a "3m" window whose server figures cover
+// May+Jun+Jul — the best/worst caption would be computed over a window one
 // month shorter than the one being read.
 //
 // The report itself names the household's month: the cash graph's history
@@ -82,18 +82,34 @@ export function graphCurrentMonth(
   return graph.points[graph.forecast_from]?.[0] ?? null;
 }
 
+// How many COMPLETE months each cash-flow range holds — the server's
+// reporting.FLOW_RANGES, read through `_range_window`: every key but "cur"
+// is N complete months ending with LAST month, and "cur" is the month in
+// progress alone (no closed month at all). Kept apart from RANGE_MONTHS on
+// purpose: that table counts back from the current month INCLUSIVE, which
+// is right for the ledger filter and the net-worth trend (both keep the
+// month in progress) and one month short for a complete-months window.
+const CASHFLOW_COMPLETE_MONTHS: Record<Range, number | null> =
+  { cur: 0, "1m": 1, "3m": 3, "6m": 6, "1y": 12, "3y": 36, "5y": 60, all: null };
+
 /** The first month a cash-flow range covers, anchored on the household's
- *  month rather than the browser's. `today` is only the fallback for a
+ *  month rather than the clock here. `today` is only the fallback for a
  *  report with no forecast tail to read the household's month from.
- *  Mobile's twin is `cashflowCutoffMonth` in mobile/src/lib/pure.ts. */
+ *  In October, "3m" opens in July (Jul+Aug+Sep, the server's window), "1m"
+ *  in September and "cur" in October — whose history is empty, because the
+ *  cash graph's history stops before the current month.
+ *  The twin is `cashflowCutoffMonth` in mobile/src/lib/pure.ts — keep them identical. */
 export function cashflowCutoffMonth(
   graph: { points: [string, number][]; forecast_from: number },
   range: Range, today: Date = new Date(),
 ): string | null {
-  const months = RANGE_MONTHS[range];
-  if (months === null) return null;
-  const cur = graphCurrentMonth(graph);
-  return cur ? monthsBackFrom(cur, months) : rangeCutoffMonth(range, today);
+  const complete = CASHFLOW_COMPLETE_MONTHS[range];
+  if (complete === null) return null;
+  const cur = graphCurrentMonth(graph)
+    ?? new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), 1))
+      .toISOString().slice(0, 7);
+  // a window of `complete` months whose last month is the one before `cur`
+  return monthsBackFrom(cur, complete + 1);
 }
 
 /** `iso` moved `months` months earlier, in the shape it came in: a
@@ -115,8 +131,9 @@ export function shiftMonthsUtc(iso: string, months: number): string {
 
 /** The ledger's quick date filter for a range, as LOCAL "YYYY-MM-DD"
  *  dates: the first day of the window's opening month with an open end
- *  ("3m" in September is Jul 1 onward — the same three calendar months
- *  Cash Flow's 3m covers), "This month" from the 1st, and "1m" the last
+ *  ("3m" in September is Jul 1 onward — the ledger shows what is there to
+ *  edit, so it keeps the month in progress that Cash Flow's complete-month
+ *  windows leave out), "This month" from the 1st, and "1m" the last
  *  complete month CLOSED on its last day (in September: Aug 1 – Aug 31).
  *  "all" is no date filter at all. A calendar date the reader types into a
  *  date box is local, so this one is cut on the browser's calendar, not

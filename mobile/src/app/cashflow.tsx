@@ -19,7 +19,7 @@ import { Card, H, HelpLink, KV } from "../components/ui";
 import type { CashCostsReport, CashflowReport, FlowKey, IncomeWindow }
   from "../lib/api";
 import { TREND_RANGES, cashflowCutoffMonth, RANGE_LABEL, RANGE_MONTHS,
-         type TrendRange }
+         savedFigure, type TrendRange, windowLabel }
   from "../lib/pure";
 import { useSession } from "../lib/session";
 import { C, money } from "../lib/theme";
@@ -102,6 +102,7 @@ export default function CashFlow() {
   const hist = series ? series.points.slice(0, series.estimatedFrom) : [];
   const best = hist.length ? hist.reduce((a, b) => (b[1] > a[1] ? b : a)) : null;
   const worst = hist.length ? hist.reduce((a, b) => (b[1] < a[1] ? b : a)) : null;
+  const bestFig = best ? savedFigure(best[1]) : null;
   const savings = [...(d?.savings_by_year ?? [])].reverse();
   const chartW = width - 24 - 28;
 
@@ -163,9 +164,17 @@ export default function CashFlow() {
                       computing {period === "all" ? "all history" : period}…
                     </Text>
                   )}
-                  {(flow.in.total > 0 || flow.out.total > 0) && (
+                  {/* income unknown (no bank feed covers the window):
+                      say so, and claim no saved figure or rate */}
+                  {(flow.income_unknown || flow.in.total === null
+                    || flow.saved === null) ? (flow.out.total > 0 && (
                     <Text style={[s.mut, { marginTop: 6 }]}>
-                      {flow.label}:{" "}
+                      {windowLabel(flow)}: income unknown for this range ·{" "}
+                      <Text style={s.big}>{m$(flow.out.total)}</Text> out
+                    </Text>
+                  )) : (flow.in.total > 0 || flow.out.total > 0) && (
+                    <Text style={[s.mut, { marginTop: 6 }]}>
+                      {windowLabel(flow)}:{" "}
                       <Text style={s.big}>{m$(flow.in.total)}</Text> in →{" "}
                       <Text style={s.big}>{m$(flow.out.total)}</Text> out →{" "}
                       <Text style={[s.big, { color: flow.saved >= 0 ? C.good : C.bad }]}>
@@ -200,9 +209,11 @@ export default function CashFlow() {
               <NetBars width={chartW} points={series.points}
                        estimatedFrom={series.estimatedFrom} />
               <Text style={s.mut}>
-                {best ? <>best {best[0]}{" "}
-                  <Text style={{ color: C.good, fontWeight: "700" }}>
-                    +{m$(best[1])}</Text></> : null}
+                {bestFig ? <>best {best![0]}{" "}
+                  <Text style={{ color: bestFig.tone === "good" ? C.good
+                                   : bestFig.tone === "bad" ? C.bad : C.text,
+                                 fontWeight: "700" }}>
+                    {bestFig.text}</Text></> : null}
                 {best && worst ? " · " : ""}
                 {worst ? <>worst {worst[0]}{" "}
                   <Text style={{ color: worst[1] < 0 ? C.bad : C.text,
@@ -340,9 +351,10 @@ function IncomeTab({ chartW, range, setRange, iq }: {
           </View>
         </View>
         <Text style={[s.mut, { marginTop: 8 }]}>
-          {w.label}: <Text style={s.big}>{m$(w.total)}</Text> came in ·{" "}
-          <Text style={{ color: C.text, fontWeight: "600" }}>
-            {m$(perMonth)}</Text>/mo ·{" "}
+          {windowLabel(w)}: <Text style={s.big}>{m$(w.total)}</Text> came in ·{" "}
+          {!w.live_month ? <>
+            <Text style={{ color: C.text, fontWeight: "600" }}>
+              {m$(perMonth)}</Text>/mo ·{" "}</> : null}
           <Text style={{ color: C.text, fontWeight: "600" }}>
             {payShare}%</Text> paychecks
         </Text>

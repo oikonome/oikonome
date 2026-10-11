@@ -1,5 +1,8 @@
 # Run against an EXTERNAL / managed Postgres (a cloud provider's managed
 # database, your own server) instead of the bundled postgres container.
+# The server must run PostgreSQL 16 or newer: the migrations use functions
+# added in 16, and the migrate step refuses an older server before it
+# changes anything.
 #
 # Activate by listing this file after the base one in docker/.env:
 #   COMPOSE_FILE=compose.yaml:compose.external-db.yaml

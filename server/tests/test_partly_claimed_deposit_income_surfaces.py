@@ -9,11 +9,16 @@ lose the part that really was income. The Income tab, the Cash Flow
 picture and the interest-earned figure each run their own query; each
 must land on the same net.
 """
+import datetime as dt
 import unittest
 
 from oikonome.engine import reporting
 
 from .util import TODAY, add_txn, make_db, write_config
+
+# the rows sit in the last complete month: a range of months holds
+# complete months only, and today's own month is not one yet
+DAY = TODAY.replace(day=1) - dt.timedelta(days=1)
 
 
 class PartlyClaimedDepositIncomeTests(unittest.TestCase):
@@ -21,14 +26,14 @@ class PartlyClaimedDepositIncomeTests(unittest.TestCase):
         self.conn = make_db()
         write_config(self.conn)
         c = self.conn
-        self.pay = add_txn(c, TODAY, -1000.0, "EMPLOYER DIRECT DEP",
+        self.pay = add_txn(c, DAY, -1000.0, "EMPLOYER DIRECT DEP",
                            account="chk", primary="INCOME",
                            txn_id="dep-pay")
-        self.interest = add_txn(c, TODAY, -100.0, "SAVINGS INTEREST PAID",
+        self.interest = add_txn(c, DAY, -100.0, "SAVINGS INTEREST PAID",
                                 account="chk", primary="INCOME",
                                 txn_id="dep-interest")
-        add_txn(c, TODAY, 300.0, "CONFERENCE FEE", txn_id="exp-fee")
-        add_txn(c, TODAY, 40.0, "BANK SUPPLIES", txn_id="exp-supplies")
+        add_txn(c, DAY, 300.0, "CONFERENCE FEE", txn_id="exp-fee")
+        add_txn(c, DAY, 40.0, "BANK SUPPLIES", txn_id="exp-supplies")
         c.execute("INSERT INTO reimbursements (expense_id, reimburse_id, "
                   "partial, amount) VALUES ('exp-fee','dep-pay',1,300), "
                   "('exp-supplies','dep-interest',1,40)")

@@ -164,16 +164,44 @@ GENERIC = {           # single words far too common in merchant strings
     "MOBILE", "PHONE", "DENTAL", "CLINIC", "OPTICAL", "TIRE", "TIRES",
     "STORAGE", "CLEANERS", "NAILS", "FITNESS", "CINEMA", "TRAVEL", "TOURS",
 }
-# Brand names whose bare form is too greedy: the word alone also starts
-# unrelated local business names, which would then be filed under the
-# national brand's category. Longer forms in EXTRA still catch the brand.
-# These belong here, not in the generated file — a hand edit to generated
-# output is silently reverted by the next refresh.
-DROP = {
-    "ROGERS",           # a common surname: the bare word is not the brand
-}
+# A brand whose whole name is one common surname is too greedy in its bare
+# form: seed names match as whole words anywhere in a merchant string, and
+# the surname alone also starts thousands of unrelated local businesses
+# named for a family (a plumber, a dentist, a law office, a county
+# treasurer), which would then be filed under the national brand's
+# category. So a single-word name that is one of these is skipped; the
+# brand's longer names ("<NAME> COMMUNICATIONS", "<NAME> MOTOR COMPANY")
+# still come through and still catch it. The list is every surname held by
+# at least 1 in 2,000 people in the US Census Bureau's 2010 surname table
+# (prop100k >= 50), so the exclusion is a rule over a public population
+# statistic, not a list of names someone happened to trip over. It lives
+# here, not in the generated file: a hand edit to generated output is
+# silently reverted by the next refresh.
+COMMON_SURNAMES = frozenset("""
+    ADAMS AGUILAR ALEXANDER ALLEN ALVAREZ ANDERSON BAILEY BAKER BARNES
+    BELL BENNETT BLACK BOYD BROOKS BROWN BRYANT BURNS BUTLER CAMPBELL
+    CARTER CASTILLO CASTRO CHAVEZ CHEN CLARK COLE COLEMAN COLLINS COOK
+    COOPER COX CRAWFORD CRUZ DAVIS DIAZ DIXON EDWARDS ELLIS EVANS
+    FERNANDEZ FISHER FLORES FORD FOSTER FOX FREEMAN GARCIA GIBSON GOMEZ
+    GONZALES GONZALEZ GORDON GRAHAM GRAY GREEN GRIFFIN GUTIERREZ GUZMAN
+    HALL HAMILTON HARRIS HARRISON HAYES HENDERSON HENRY HERNANDEZ
+    HERRERA HICKS HILL HOLMES HOWARD HUGHES HUNT HUNTER JACKSON JAMES
+    JENKINS JIMENEZ JOHNSON JONES JORDAN KELLY KENNEDY KIM KING LEE
+    LEWIS LONG LOPEZ MARSHALL MARTIN MARTINEZ MASON MCDONALD MEDINA
+    MENDEZ MENDOZA MEYER MILLER MILLS MITCHELL MOORE MORALES MORENO
+    MORGAN MORRIS MUNOZ MURPHY MURRAY MYERS NELSON NGUYEN OLSON ORTIZ
+    OWENS PALMER PARKER PATEL PATTERSON PEREZ PERRY PETERSON PHILLIPS
+    PORTER POWELL PRICE RAMIREZ RAMOS REED REYES REYNOLDS RICE
+    RICHARDSON RIVERA ROBERTS ROBERTSON ROBINSON RODRIGUEZ ROGERS ROMERO
+    ROSE ROSS RUIZ RUSSELL SALAZAR SANCHEZ SANDERS SCOTT SHAW SILVA
+    SIMMONS SIMPSON SMITH SNYDER STEVENS STEWART STONE SULLIVAN TAYLOR
+    THOMAS THOMPSON TORRES TRAN TUCKER TURNER VARGAS VASQUEZ WAGNER
+    WALKER WALLACE WARD WARREN WASHINGTON WATSON WEBB WELLS WEST WHITE
+    WILLIAMS WILSON WOOD WOODS WRIGHT YOUNG
+""".split())
 # Statement spellings the dataset does not carry. Applied after the tag
-# families, so a name dropped above can be restored in an unambiguous form.
+# families, so a brand whose bare name a rule above skips can still be
+# caught in an unambiguous form.
 EXTRA: dict[str, str] = {
     "ROGERS WIRELESS": "RENT_AND_UTILITIES",
 }
@@ -209,7 +237,7 @@ def names_of(item: dict) -> set[str]:
         if not n:
             continue
         up = n.upper().strip()
-        if (len(up) < MIN_LEN or up in GENERIC or up in DROP
+        if (len(up) < MIN_LEN or up in GENERIC or up in COMMON_SURNAMES
                 or not re.search(r"[A-Z].*[A-Z]", up)):
             continue
         out.add(up)

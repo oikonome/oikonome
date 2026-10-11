@@ -29,6 +29,15 @@ def real_return(nominal: float, inflation: float) -> float:
     return (1 + nominal) / (1 + inflation) - 1
 
 
+# Card debt carried into the projection grows at a card's rate, whatever
+# the market does: a crash shrinks the portfolio, never what is owed on it.
+# 20% is a typical revolving APR and errs on the side of a debt that costs
+# more, not less. Made real with the plan's inflation; the default below
+# assumes 3% for a caller that names none.
+CARD_DEBT_NOMINAL = 0.20
+CARD_DEBT_REAL = real_return(CARD_DEBT_NOMINAL, 0.03)
+
+
 def current_buckets(conn) -> dict:
     """Group live balances into the four tax treatments the sim needs.
 
@@ -156,7 +165,8 @@ RMD_DIVISOR = {72: 27.4, 73: 26.5, 74: 25.5,
 def simulate(buckets, age, retire_age, end_age, spend, rr, ss_annual, ss_age,
              rental_annual, td_annual, taxable_annual, resume_age,
              eff_ord, eff_cg, gain_frac, shock=(), rr_path=None,
-             cash_rr=0.0, rmd_start=RMD_START, extra_annual=0.0):
+             cash_rr=0.0, rmd_start=RMD_START, extra_annual=0.0,
+             debt_rr=CARD_DEBT_REAL):
     """Run age→end_age. Returns dict(survived, fail_age, end_balance,
     at_retire).
 
@@ -172,7 +182,8 @@ def simulate(buckets, age, retire_age, end_age, spend, rr, ss_annual, ss_age,
     cash bucket's real return. rmd_start: first RMD age. extra_annual:
     saving on top of the plan, into taxable, every working year from now —
     not held back to resume_age, because it is the answer to "what would
-    I have to start doing"."""
+    I have to start doing". debt_rr: the real rate card debt grows at —
+    its own, never the market's (shock and rr_path do not touch it)."""
     # The four buckets live in locals for the whole walk. A projection runs
     # this loop thousands of times (every bisection step of every retire
     # age, every historical path), so a dict rebuilt per simulated year is
@@ -181,6 +192,13 @@ def simulate(buckets, age, retire_age, end_age, spend, rr, ss_annual, ss_age,
     # operation, so the numbers are bit-identical to the dict form.
     cash, taxable, td, roth = (buckets["cash"], buckets["taxable"],
                                buckets["td"], buckets["roth"])
+    # Card debt beyond every bucket (current_buckets' debt_residual) is a
+    # starting liability, not nothing: it grows at the card's own rate,
+    # savings pay it before they build anything, and a retiree still owing
+    # it pays it before spending. Zero leaves every figure bit-identical
+    # (x - 0.0 is x).
+    debt = buckets.get("debt_residual") or 0.0
+    gd = 1 + debt_rr
     ntx = 1 - eff_cg * gain_frac            # spendable per $ from taxable
     nod = 1 - eff_ord                       # spendable per $ from tax-deferred
     ss_net = ss_annual * (1 - 0.85 * eff_ord)
@@ -191,7 +209,7 @@ def simulate(buckets, age, retire_age, end_age, spend, rr, ss_annual, ss_age,
     gc = 1 + cash_rr
     for a in range(age, end_age + 1):
         if a >= retire_age and at_retire is None:
-            at_retire = cash + taxable + td + roth
+            at_retire = cash + taxable + td + roth - debt
         if rr_path is not None:
             yr_rr = rr_path[a - age]
         else:
@@ -203,6 +221,8 @@ def simulate(buckets, age, retire_age, end_age, spend, rr, ss_annual, ss_age,
         taxable = taxable * g
         td = td * g
         roth = roth * g
+        if debt:
+            debt = debt * gd
         # A required minimum distribution is forced by age alone — working
         # does not defer it. Taxed as ordinary income; what spending does
         # not need is reinvested in taxable.
@@ -218,9 +238,16 @@ def simulate(buckets, age, retire_age, end_age, spend, rr, ss_annual, ss_age,
             taxable += rmd_net
             if extra_annual:
                 taxable += extra_annual
+            if debt and taxable > 0:
+                pay = min(taxable, debt)
+                taxable -= pay
+                debt -= pay
         else:
             income = (ss_net if a >= ss_age else 0.0) + rent_net + rmd_net
             need = spend - income
+            if debt:
+                need += debt                                # settle it first
+                debt = 0.0
             if need < 0:
                 taxable += -need                            # excess reinvested
                 need = 0.0
@@ -246,16 +273,16 @@ def simulate(buckets, age, retire_age, end_age, spend, rr, ss_annual, ss_age,
                 return {"survived": False, "fail_age": a, "end_balance": 0.0,
                         "at_retire": at_retire or 0.0}
     if at_retire is None:                                    # retire_age > end_age
-        at_retire = cash + taxable + td + roth
+        at_retire = cash + taxable + td + roth - debt
     return {"survived": True, "fail_age": None,
-            "end_balance": cash + taxable + td + roth,
+            "end_balance": cash + taxable + td + roth - debt,
             "at_retire": at_retire}
 
 
 def _max_spend(buckets, age, retire_age, end_age, rr, ss_annual, ss_age,
                rental_annual, td_annual, taxable_annual, resume_age,
                eff_ord, eff_cg, gain_frac, shock=(), cash_rr=0.0,
-               rmd_start=RMD_START):
+               rmd_start=RMD_START, debt_rr=CARD_DEBT_REAL):
     """Largest constant real annual spend that still lasts to end_age.
 
     30 halvings of the $2M bracket resolve the answer to about $0.002 — the
@@ -267,7 +294,7 @@ def _max_spend(buckets, age, retire_age, end_age, rr, ss_annual, ss_age,
         ok = simulate(buckets, age, retire_age, end_age, mid, rr, ss_annual, ss_age,
                       rental_annual, td_annual, taxable_annual, resume_age,
                       eff_ord, eff_cg, gain_frac, shock=shock, cash_rr=cash_rr,
-                      rmd_start=rmd_start)["survived"]
+                      rmd_start=rmd_start, debt_rr=debt_rr)["survived"]
         if ok:
             lo = mid
         else:
@@ -370,7 +397,8 @@ SCENARIOS = [
 
 
 def _growth_path(b, age, horizon, rr, td_annual, taxable_annual, resume_age,
-                 cash_rr=0.0, rmd_start=RMD_START, eff_ord=0.0):
+                 cash_rr=0.0, rmd_start=RMD_START, eff_ord=0.0,
+                 debt_rr=CARD_DEBT_REAL):
     """Portfolio value (today's $) year by year if you KEEP working & saving.
 
     Point k is the balance after k years, i.e. at age `age + k` — the same
@@ -379,9 +407,14 @@ def _growth_path(b, age, horizon, rr, td_annual, taxable_annual, resume_age,
     Same year model as `simulate`: grow, force any RMD, contribute."""
     yr0 = dt.date.today().year
     bb = {k: b[k] for k in ("cash", "taxable", "td", "roth")}
-    path = [[f"{yr0}-06", round(bb["cash"] + bb["taxable"] + bb["td"] + bb["roth"], 2)]]
+    # card debt beyond every bucket, carried and paid as `simulate` does
+    debt = b.get("debt_residual") or 0.0
+    path = [[f"{yr0}-06", round(bb["cash"] + bb["taxable"] + bb["td"] + bb["roth"]
+                                - debt, 2)]]
     for a in range(age, horizon):
         bb = _grow(bb, rr, cash_rr)
+        if debt:
+            debt *= 1 + debt_rr
         if a >= rmd_start and bb["td"] > 0:
             gross = bb["td"] / RMD_DIVISOR.get(min(a, 100), 6.4)
             bb["td"] -= gross
@@ -389,8 +422,13 @@ def _growth_path(b, age, horizon, rr, td_annual, taxable_annual, resume_age,
         if a >= resume_age:
             bb["td"] += td_annual
             bb["taxable"] += taxable_annual
+        if debt and bb["taxable"] > 0:
+            pay = min(bb["taxable"], debt)
+            bb["taxable"] -= pay
+            debt -= pay
         path.append([f"{yr0 + (a - age) + 1}-06",
-                     round(bb["cash"] + bb["taxable"] + bb["td"] + bb["roth"], 2)])
+                     round(bb["cash"] + bb["taxable"] + bb["td"] + bb["roth"]
+                           - debt, 2)])
     return path
 
 
@@ -407,13 +445,18 @@ def default_spend(conn, floor: float = 24_000, fallback: int = 250_000) -> int:
     default is wrong for any household whose real spend differs from it,
     and reads as broken; the ledger is the right source. Falls back only
     when the ledger is too thin to mean anything."""
-    from .reporting import NET_AMOUNT_JOINED, REIMB_PARTIAL_JOIN, SPEND_WHERE
+    from .reporting import (NET_AMOUNT_JOINED, REIMB_PARTIAL_JOIN,
+                            SPEND_WHERE, excluded_accounts_sql)
     # net of partial reimbursements, like every other spend aggregate — an
-    # expensed-and-repaid card charge is not money the household lives on
+    # expensed-and-repaid card charge is not money the household lives on —
+    # and without the accounts the household excluded, as every spend
+    # report drops them
+    excl, ex_p = excluded_accounts_sql(conn)
     row = conn.execute(
         f"SELECT COALESCE(SUM({NET_AMOUNT_JOINED}),0) AS s "
         f"FROM transactions t {REIMB_PARTIAL_JOIN} "
-        f"WHERE {SPEND_WHERE} AND t.date >= CURRENT_DATE - 365").fetchone()
+        f"WHERE {SPEND_WHERE} AND t.date >= CURRENT_DATE - 365 {excl}",
+        ex_p).fetchone()
     s = float(row["s"] or 0)
     return int(round(s, -3)) if s >= floor else fallback
 
@@ -456,7 +499,8 @@ def _project_cached(key: tuple) -> dict:
     kw = dict(rr=rr, ss_annual=ss_annual, ss_age=ss_age, rental_annual=rental_annual,
               td_annual=td_annual, taxable_annual=taxable_annual, resume_age=resume_age,
               eff_ord=eff_ord, eff_cg=eff_cg, gain_frac=gain_frac,
-              cash_rr=cash_rr, rmd_start=rmd_start)
+              cash_rr=cash_rr, rmd_start=rmd_start,
+              debt_rr=real_return(CARD_DEBT_NOMINAL, inflation))
     retire_max = max(retire_max, age)     # age>72 must still yield ≥1 row
     rows, earliest = [], None
     for ra in range(age, retire_max + 1):
@@ -502,7 +546,8 @@ def _project_cached(key: tuple) -> dict:
 
     horizon = min(end_age, 80)
     path = _growth_path(b, age, horizon, rr, td_annual, taxable_annual, resume_age,
-                        cash_rr=cash_rr, rmd_start=rmd_start, eff_ord=eff_ord)
+                        cash_rr=cash_rr, rmd_start=rmd_start, eff_ord=eff_ord,
+                        debt_rr=kw["debt_rr"])
     at67 = next((v for y, v in path
                  if y == f"{dt.date.today().year + (67 - age)}-06"), None)
     if at67 is None:

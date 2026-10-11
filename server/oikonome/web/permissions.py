@@ -143,6 +143,31 @@ OWNER_ONLY = (
     "/api/settings/recipients", "/api/settings/smtp-test", "/api/jobs/email",
 )
 
+# Doors that put a live credential into the household: linking a bank or
+# an exchange, and saving or clearing an aggregator's keys. The shared
+# demonstration login is an owner, so the role gate above lets it through
+# every one; the request gate refuses it here for the whole family
+# (demoguard.deny_shared_credentials says why), so a door added under one
+# of these prefixes later is refused to it without anyone remembering to.
+SHARED_LOGIN_CREDENTIAL_DOORS = (
+    "/api/accounts/plaid", "/api/accounts/mx", "/api/accounts/simplefin",
+    "/api/accounts/coinbase",
+    "/accounts/plaid", "/accounts/simplefin",
+    # Plaid Enrich is billed per row to whoever holds the Plaid keys, so a
+    # run started with the handed-out password spends someone else's money
+    "/api/import/enrich",
+)
+
+# The same family where the path carries a connection id. Reconnecting an
+# MX member restarts its syncing and its billing; disconnecting a Plaid
+# bank releases the Item at Plaid, which cannot be undone — neither is the
+# shared login's to decide for the household. (The account-removal door's
+# disconnect modes are told apart by the body, so that door refuses them
+# itself.)
+SHARED_LOGIN_CREDENTIAL_PATTERNS = (
+    re.compile(r"^/api/connections/[^/]+/(?:disconnect|reconnect)$"),
+)
+
 # Owner-only doors whose path carries an id, so a prefix cannot name them.
 OWNER_ONLY_PATTERNS = (
     # removing an account: 'hide' keeps history, but the same door
@@ -160,8 +185,12 @@ OWNER_ONLY_SETTINGS = frozenset({
     "smtp_host", "smtp_port", "smtp_user", "smtp_password", "smtp_from",
     "smtp_starttls", "smtp_no_verify",
     # who receives the household's daily mail (an outside mailbox here is
-    # an export that arrives every morning)
-    "email_recipients",
+    # an export that arrives every morning), and the household-wide mute
+    # list — otherwise a member could silence every recipient, the owner
+    # included, or un-mute someone who opted out; a member's own mute goes
+    # through /api/me/email. The one-address delta keys count the same.
+    "email_recipients", "email_recipients_added", "email_recipients_removed",
+    "email_muted_add", "email_muted_remove",
     # where transaction text is sent to be read — including which backend
     # serves each role, the vision model, and the consent that lets a
     # W-2's SSN or a check's account number leave the box for a remote
@@ -210,6 +239,13 @@ def owner_only(path: str) -> bool:
     """Is this door the account rather than the money?"""
     return (path_within(path, OWNER_ONLY)
             or any(p.match(path) for p in OWNER_ONLY_PATTERNS))
+
+
+def credential_door(path: str) -> bool:
+    """Does a write here put a live credential into the household, or end
+    or restart one (a connection's disconnect or reconnect)?"""
+    return (path_within(path, SHARED_LOGIN_CREDENTIAL_DOORS)
+            or any(p.match(path) for p in SHARED_LOGIN_CREDENTIAL_PATTERNS))
 
 
 def read_only_route(path: str) -> bool:
@@ -280,4 +316,8 @@ def settings_for(role: str, body: dict) -> dict:
     """
     if role == "owner" or not isinstance(body, dict):
         return body
-    return {k: v for k, v in body.items() if k not in OWNER_ONLY_SETTINGS}
+    # a delta spelled <owner-only key>_<verb> edits the same stored value,
+    # so it is dropped with its key rather than slipping past by name
+    return {k: v for k, v in body.items()
+            if k not in OWNER_ONLY_SETTINGS
+            and not any(k.startswith(o + "_") for o in OWNER_ONLY_SETTINGS)}

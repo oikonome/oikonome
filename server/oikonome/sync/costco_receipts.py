@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import math
 
-from ..engine.compat import as_date, jsonb
+from ..engine.compat import MAX_AMOUNT, as_date, jsonb, strip_nul
 
 MAX_RECEIPTS = 10_000
 RECEIPT_TYPES = ("warehouse", "gas", "online")
@@ -29,6 +29,8 @@ def import_receipts(conn, receipts: list[dict]) -> dict:
         raise ValueError("payload needs a non-empty receipts list")
     if len(receipts) > MAX_RECEIPTS:
         raise ValueError(f"too many receipts (max {MAX_RECEIPTS})")
+    # a collector relays the portal's text; U+0000 cannot be stored
+    receipts = strip_nul(receipts)
 
     def count():
         return conn.execute(
@@ -55,9 +57,12 @@ def import_receipts(conn, receipts: list[dict]) -> dict:
                 if isinstance(r.get("amount"), bool):
                     raise TypeError
                 amount = float(r["amount"])
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError, OverflowError):
+                # OverflowError: a JSON integer too wide for a double
                 continue
-            if not math.isfinite(amount):
+            # finite is not enough: the matchers work in cents, and an
+            # amount past any real charge overflows on the way there
+            if not math.isfinite(amount) or abs(amount) > MAX_AMOUNT:
                 continue
             rtype = str(r.get("receipt_type") or "warehouse")
             if rtype not in RECEIPT_TYPES:

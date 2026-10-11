@@ -23,11 +23,18 @@ provider's tools.
 "never ran" or stale: the worker container isn't running or can't reach
 Redis. `docker compose logs worker`. All three heartbeats are written
 only on SUCCESS — a "running" worker that errors still shows stale here,
-by design.
+by design. Bank sync counts as a success when at least one connection
+synced; its row then names how many failed ("3 ok, 1 failed"), and each
+failing connection has its own row below. The daily email row stays green
+on a day the worker deliberately sent nothing, and says why: no budget is
+set yet, or there is no confirmed, unmuted address to mail.
 
 ### <bank name> (<aggregator>)
 `error:*` status: the aggregator connection needs re-auth. SimpleFIN:
 check your bridge subscription. Plaid: re-link.
+A bank you **disconnected** yourself stays that way until you bring it
+back — MX and SimpleFIN from the account's ✎ row (**reconnect**), a whole
+SimpleFIN bridge by connecting a new setup token; see the Accounts guide.
 
 ### token encryption
 `OIKONOME_MASTER_KEY` unset — tokens and TOTP seeds stored plaintext.
@@ -56,7 +63,8 @@ Check whether a budget is set (**Budget** → Food and Everything-else). The
 scheduled daily verdict is skipped while there is no plan to judge, since
 the only thing it could report is "on budget, $0 of $0". **Send today's
 email now** (in the Daily email card under Settings → Email & Push) still sends
-on demand if you want to see the message.
+on demand if you want to see the message. Doctor's daily email row says
+*not sent: no budget is set yet* when this is the cause.
 
 ### someone you added isn't receiving it
 Adding an address invites it; it does not enrol it. The person is emailed
@@ -119,7 +127,7 @@ a small container.
 ### an upload is refused or times out
 Uploads are the one request shape that costs an instance real memory
 before anything has decided whether to accept it, so they are bounded at
-the door. Three refusals you may meet, none of them a fault:
+the door. Four refusals you may meet, none of them a fault:
 
 - **"too many uploads — try again later"** (429) — more than 60 uploads
   from your address in a minute. A person importing a folder never
@@ -132,6 +140,15 @@ the door. Three refusals you may meet, none of them a fault:
   connection went quiet mid-upload. A genuinely slow link is fine (the
   clock measures progress, not total time), but a dropped Wi-Fi
   connection loses the slot. Re-send the file.
+- **"these files total more than 60 MB — import the folder in smaller
+  batches"** (413) — a folder analyze is sent as one request, so the
+  whole folder counts against one limit. Select part of the folder,
+  analyze and run it, then do the rest.
+- **An HTML "413 Request Entity Too Large" or "504 Gateway Timeout"
+  page** instead of one of the messages above — that answer came from a
+  reverse proxy in front of the app, not the app. Raise the proxy's body
+  limit and read timeout as shown in [the reverse-proxy
+  guide](reverse-proxy.md#upload-size-and-time-limits).
 
 Beyond the uploads themselves, **analyzing a folder or a tax document is
 limited to 20 attempts an hour** and a single-file import to 60. These
@@ -140,6 +157,38 @@ are fixed, not `.env` settings.
 Everything that is *not* a file upload — signing in, saving settings,
 ordinary API calls — is capped at a **1 MB** request body, which is far
 more than any of them legitimately send.
+
+### running a folder import says "another folder import is still running"
+A household runs one folder import at a time, and the import runs in the
+background after you press Import, so this (a 409) means an earlier batch —
+started here, in another tab or by another member — has not finished.
+Nothing is lost: the refused batch stays analyzed, so wait for the other
+import to finish and press Import again. If the batch has expired by then,
+the message says to re-analyze the files instead.
+
+### a PDF is refused as too large
+Separate from the upload limits above, a PDF is measured by what it
+unpacks to before anything reads it: at most about **1.5 MB** of drawing
+content per page, **40 megapixels** of embedded images per page, 500
+pages, and about 2 MB of extracted text. These are fixed, not `.env`
+settings. The messages:
+
+- **"this PDF expands past the size limit for a statement"** (or the
+  *text-size* limit) on the Import page — usually a scanned or
+  image-heavy statement. Download the same period as **CSV or OFX/QFX**
+  instead; if the bank offers only PDFs, a statement re-exported or
+  printed to PDF from the bank's site often comes out much smaller.
+- **"this PDF's first page expands past the size limit — try
+  re-exporting it, or upload an image"** on a receipt — save or
+  screenshot the receipt as a JPEG/PNG and attach that.
+- **"this file is far larger than any tax document"** on the tax-document
+  card — a plain-text upload is capped like a PDF's extracted text;
+  upload the transcript, W-2 or return itself rather than a bundle.
+
+Running the server outside the provided container image? These checks
+need **pypdf 6.11 or newer** (`server/pyproject.toml` pins it); with an
+older pypdf, PDF imports fail with an import error naming
+`LimitReachedError` — upgrade it, or reinstall the server package.
 
 ### the daily email's "Needs you" section has no buttons
 The buttons link back to your instance, and recurring mail only carries
@@ -176,7 +225,8 @@ the webhook back on. A LAN address is fine on a self-hosted instance; the
 cloud metadata address never is.
 
 ### the home-screen widget is grey or says "Sign in"
-Grey with a time means the phone has not refreshed it for over an hour —
+Grey with a time means the phone has not refreshed it for over an hour,
+or not since the day turned —
 the OS schedules widget refreshes, and opening the app forces one; check
 that the phone can reach the instance. **Sign in** means its credential
 is gone: it dies with the device's sign-in, so a device revoked in
@@ -240,7 +290,12 @@ band — the command only records that you did:
 
 (menu item **f**; it asks for the address twice.) It removes the
 authenticator, every passkey and every recovery code, signs out every
-session and device, and emails the account that it happened. The password
+session and device, and emails the account that it happened. On an
+owner's account it also deletes the logins of members who joined through
+that owner's invites in the last 7 days (a thief holding the session may
+have planted them): the confirmation lists them first, and if the
+household changed while you were confirming, nothing is cleared — run it
+again. Re-invite any that are genuine. The password
 is untouched, so follow it with `./oikonome.sh reset-password` and hand
 over the link. The account holder enrols a new authenticator once in.
 
@@ -273,7 +328,18 @@ docker compose exec -T app oikonome admin-keys --reset
 
 It removes every enrolled key. The require-flag is ignored once none are
 enrolled, so **the token signs in again immediately — no `.env` edit, no
-restart.** Sign in with it and enrol a new key.
+restart.** Sign in with it and enrol a new key; enrolling the first key
+asks for the operator token once more, because a signed-in browser alone
+is not enough to add a credential that outlasts the session.
+
+Setting up a passkey for the first time works the same way: sign in with
+the token, enrol (re-entering the token when asked), and only then set
+`OIKONOME_ADMIN_REQUIRE_PASSKEY=1` in `docker/.env` and apply it
+(`docker compose up -d`). From that moment the token no longer
+signs in, and a console tab you opened with it is signed out at its next
+click — sign in again with the passkey. On a hosted instance the token
+never signs in at all; there, `oikonome admin-enrol` (above) is the way to
+the first key.
 
 Neither is a way around the console's security: both need a shell inside
 the container, which means you already control the host. The console's own
@@ -284,7 +350,9 @@ still sign in, the last key may go.
 
 ## Still stuck?
 Open a GitHub issue with the **diagnostic bundle** from /doctor attached
-(it contains check results and versions — never tokens or transactions).
+(it contains check results and versions — never tokens or transactions,
+and no hostnames, bank names or collector labels, so it is safe to attach to
+a public issue; the signed-in /doctor page still shows them).
 Issues without the bundle get auto-asked for it.
 
 ## Signing up says "this address already has an account"

@@ -57,6 +57,12 @@ HARD_TYPES = frozenset({
     "ManuallyDeactivated",  # an operator killed it at the provider
     "Blocked",
 })
+# Of those, the verdicts that are a decision rather than an observation: an
+# operator deactivated the address at the provider, or the provider blocked
+# it. The app recorded the bounce but did not make the call, so nothing a
+# household can press may lift it upstream; only the operator can, at the
+# provider.
+PROVIDER_DECISIONS = frozenset({"ManuallyDeactivated", "Blocked"})
 # Deliberately NOT here: Unsubscribe / SubscriptionChange. Oikonome sends no
 # broadcast or marketing mail, so those cannot arrive on this stream — and if
 # that ever changes they need a state of their own, because telling someone
@@ -123,7 +129,8 @@ def record_failure(email: str, *, state: str = "bouncing",
     """Remember that mail to this address failed. Idempotent per address:
     a repeat bumps the count and the timestamp rather than piling up rows,
     and a later report that carries a provider_id or a suppression flag
-    fills those in without losing the first sighting."""
+    fills those in without losing the first sighting. A complaint stands
+    whatever is reported after it: only the recipient can take it back."""
     e = _norm(email)
     if not e:
         return
@@ -136,7 +143,9 @@ def record_failure(email: str, *, state: str = "bouncing",
                         suppressed)
                    VALUES (%s,%s,%s,%s,%s,%s)
                    ON CONFLICT (email) DO UPDATE SET
-                       state       = EXCLUDED.state,
+                       state       = CASE
+                           WHEN email_delivery_state.state = 'complained'
+                           THEN 'complained' ELSE EXCLUDED.state END,
                        bounce_type = COALESCE(EXCLUDED.bounce_type,
                                               email_delivery_state.bounce_type),
                        reason      = COALESCE(EXCLUDED.reason,
@@ -157,32 +166,78 @@ def record_failure(email: str, *, state: str = "bouncing",
         log.exception("delivery: could not record failure for %s", e)
 
 
-def clear(email: str, *, reactivate: bool = True) -> None:
-    """This address works again — forget the failure.
+def clear(email: str, *, reactivate: bool = True,
+          keep_complaint: bool = False) -> dict | None:
+    """This address works again — forget the failure. Returns the row that
+    was removed (None when there was none), so a caller that cleared on
+    speculation can put it back with `restore`.
 
     Called on a successful send and on a fresh verification. `reactivate`
     also asks the provider to lift its own suppression: without that a
     corrected address stays dead upstream however clean our table is.
+    `keep_complaint` leaves a spam complaint in place; deciding that in the
+    DELETE itself means one landing a moment earlier is not lost.
     """
     e = _norm(email)
     if not e:
-        return
+        return None
     row = None
     try:
         conn = _write_conn()
         try:
             row = conn.execute(
-                "DELETE FROM email_delivery_state WHERE email=%s "
-                "RETURNING provider_id, suppressed", (e,)).fetchone()
+                "DELETE FROM email_delivery_state WHERE email=%s"
+                + (" AND state <> 'complained'" if keep_complaint else "")
+                + " RETURNING *", (e,)).fetchone()
         finally:
             conn.close()
     except Exception:                              # noqa: BLE001
         log.exception("delivery: could not clear state for %s", e)
-        return
+        return None
     if row:
         log.info("delivery: %s cleared", e)
     if reactivate and row and row["suppressed"] and row["provider_id"]:
         _reactivate(e, row["provider_id"])
+    return dict(row) if row else None
+
+
+def mark_reactivated(email: str) -> None:
+    """The provider lifted its suppression of this address at our request;
+    the hold itself stays until a send proves the mailbox works."""
+    e = _norm(email)
+    if not e:
+        return
+    try:
+        conn = _write_conn()
+        try:
+            conn.execute("UPDATE email_delivery_state SET suppressed = FALSE "
+                         "WHERE email=%s", (e,))
+        finally:
+            conn.close()
+    except Exception:                              # noqa: BLE001
+        log.exception("delivery: could not note the reactivation of %s", e)
+
+
+def restore(row: dict) -> None:
+    """Put back a row `clear` returned. A row written since (a fresh
+    refusal, a complaint) is newer evidence and wins."""
+    try:
+        conn = _write_conn()
+        try:
+            conn.execute(
+                """INSERT INTO email_delivery_state
+                       (email, state, bounce_type, reason, provider_id,
+                        suppressed, fail_count, first_seen, last_seen)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (email) DO NOTHING""",
+                (row["email"], row["state"], row["bounce_type"],
+                 row["reason"], row["provider_id"], row["suppressed"],
+                 row["fail_count"], row["first_seen"], row["last_seen"]))
+        finally:
+            conn.close()
+    except Exception:                              # noqa: BLE001
+        log.exception("delivery: could not restore state for %s",
+                      row.get("email"))
 
 
 def record_send_failure(email: str, error: str) -> None:
@@ -216,7 +271,7 @@ def state_for(email: str) -> dict | None:
         try:
             return conn.execute(
                 """SELECT email, state, bounce_type, reason, suppressed,
-                          fail_count, first_seen, last_seen
+                          provider_id, fail_count, first_seen, last_seen
                    FROM email_delivery_state WHERE email=%s""",
                 (e,)).fetchone()
         finally:

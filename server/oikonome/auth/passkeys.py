@@ -250,12 +250,17 @@ def register_verify(conn, user_id, challenge_id: str, credential: dict,
         require_user_verification=True)
     transports = ",".join(credential.get("response", {})
                           .get("transports", []) or [])
-    row = conn.execute(
-        """INSERT INTO passkeys (user_id, credential_id, public_key,
-                                 sign_count, transports, label)
-           VALUES (%s,%s,%s,%s,%s,%s) RETURNING id""",
-        (user_id, _b64u(v.credential_id), _b64u(v.credential_public_key),
-         v.sign_count, transports, label.strip()[:60])).fetchone()
+    # a savepoint under the caller's transaction: a key registered twice
+    # fails this insert, and the refusal must leave the transaction usable
+    # so the challenge burn above still commits — a refused registration
+    # never hands its challenge back
+    with conn.transaction():
+        row = conn.execute(
+            """INSERT INTO passkeys (user_id, credential_id, public_key,
+                                     sign_count, transports, label)
+               VALUES (%s,%s,%s,%s,%s,%s) RETURNING id""",
+            (user_id, _b64u(v.credential_id), _b64u(v.credential_public_key),
+             v.sign_count, transports, label.strip()[:60])).fetchone()
     return {"id": str(row["id"])}
 
 
@@ -488,8 +493,8 @@ def _norm_cred_id(s: str) -> str:
 
 def login_verify(conn, challenge_id: str, credential: dict,
                  rp_id: str, origin: str) -> dict:
-    """Returns {user_id, tenant_id} on success; raises ValueError on any
-    user-facing failure."""
+    """Returns {user_id, tenant_id, passkey_id} on success; raises
+    ValueError on any user-facing failure."""
     challenge = _take_challenge(conn, challenge_id, "login")
     if challenge is None:
         raise ValueError("challenge expired — try again")
@@ -524,4 +529,7 @@ def login_verify(conn, challenge_id: str, credential: dict,
         credential_current_sign_count=row["sign_count"],
         require_user_verification=True)
     _advance_sign_count(conn, row["id"], row["sign_count"], v.new_sign_count)
-    return {"user_id": row["user_id"], "tenant_id": row["tenant_id"]}
+    # the key's id rides along so the sign-in can re-check, under the
+    # factor lock, that a rotation has not evicted it in the meantime
+    return {"user_id": row["user_id"], "tenant_id": row["tenant_id"],
+            "passkey_id": row["id"]}

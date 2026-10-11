@@ -9,7 +9,7 @@ import { Alert, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput,
          View } from "react-native";
 import PullRefresh from "../components/pull-refresh";
 
-import { Card, H, HelpLink, KV } from "../components/ui";
+import { Card, H, HelpLink, KV, SharedLock } from "../components/ui";
 import { ext } from "../ext";
 
 // the add-on's account card, fixed for the life of the bundle
@@ -17,13 +17,18 @@ const AccountCard = ext.account?.Card;
 import * as DocumentPicker from "expo-document-picker";
 import { router, useRouter } from "expo-router";
 
-import { Continuity, errText, Me, PickedFile, SettingsView, TokenScope, Webhook,
+import { ApiError, Continuity, errText, Me, PickedFile, SettingsView, TokenScope, Webhook,
          WebhookEvent, EmailSchedule } from "../lib/api";
-import { patchQuery, removeFromList, saveSettings } from "../lib/cache";
-import { signOutAction } from "../lib/pure";
+import { patchQuery, removeFromList, saveSettings, SETTINGS_SAVES }
+  from "../lib/cache";
+import { EMAIL_KIND_LABEL, EMAIL_KINDS, kindOffNote, localDayOf, myDailyLine,
+         prefOn, signOutAction }
+  from "../lib/pure";
+import { llmBackendsSeed, storedEnrichCap } from "../lib/settings-pure";
+import { cadenceOf } from "../lib/schedule";
 import { registerNativePush } from "../lib/push";
 import { useSession } from "../lib/session";
-import { useOwner, useViewer } from "../lib/viewer";
+import { useOwner, useSharedLock, useViewer } from "../lib/viewer";
 import { C, ThemeMode, getThemeMode, mmddyy, setThemeMode,
          themeRestartPending } from "../lib/theme";
 
@@ -89,9 +94,12 @@ function ExportDownloads({ dump }: { dump: boolean }) {
     setBusy(kind); setMsg(null);
     try {
       const t = await client!.exportTicket(kind);
-      await client!.download(t.url, kind === "zip"
+      const { warnings } = await client!.download(t.url, kind === "zip"
         ? "oikonome-export.zip" : "oikonome-dump.sql.gz");
-      setMsg({ text: "Downloaded." });
+      setMsg(warnings.length
+        ? { text: "Downloaded, but a restore would refuse this file: "
+                  + warnings.join(" "), bad: true }
+        : { text: "Downloaded." });
     } catch (e) {
       setMsg({ text: stepUpMsg(e), bad: true });
     }
@@ -319,6 +327,10 @@ export default function Settings() {
   const [filter, setFilter] = useState("");
   // reads are demo-safe — the sections render (untouchable) on demo too
   const owner = me.data?.role === "owner";
+  // the shared demonstration login may not mint a token, a hook or a
+  // support window, nor point mail, the AI endpoint or a restored bundle
+  // anywhere new; those cards stay visible, switched off, saying why
+  const lockGrant = useSharedLock("grant");
   const connsQ = useQuery({ queryKey: ["connections"],
     queryFn: () => client!.connections(), enabled: !!client && owner });
   const schedQ = useQuery({ queryKey: ["settings"],
@@ -342,7 +354,7 @@ export default function Settings() {
     continuity: hit("continuity packet if i die spouse partner survivor "
       + "estate emergency pdf where things are will print"),
     smtp: hit("email delivery smtp host port password sender test"),
-    daily: hit("daily email verdict recipients schedule cadence weekly "
+    daily: hit("daily email verdict recipients schedule cadence monthly "
       + "monthly report send email now sms push"),
     family: hit("users family household members invite viewer role"),
     billing: !!ext.account && hit(ext.account.keywords),
@@ -379,9 +391,10 @@ export default function Settings() {
     : null;
   const connWarn = nBad > 0;
   const schedSub = (() => {
-    const d0 = schedQ.data?.daily as
-      { on?: boolean; hour?: number } | undefined;
-    if (!d0?.on) return null;
+    // an unset daily email is on (the schedule's own default)
+    if (schedQ.data === undefined) return null;
+    const d0 = cadenceOf(schedQ.data, "daily");
+    if (!d0.on) return null;
     const h = d0.hour ?? 7;
     return `daily ${h % 12 === 0 ? 12 : h % 12}${h < 12 ? "am" : "pm"}`;
   })();
@@ -417,6 +430,7 @@ export default function Settings() {
                                       progressBackgroundColor={C.card}
                                       onRefresh={() => Promise.all([
                                         me.refetch(), devices.refetch()])} />}>
+      <OutboundPausedBanner />
       <Card>
         <H>Account</H>
         <KV k="Signed in as" v={me.data?.email ?? "…"} />
@@ -473,13 +487,18 @@ export default function Settings() {
           Cadences and channels live under More → Email &amp; Push;
           this phone receives push once signed in.
         </Text>
-        <Pressable style={[s.testBtn, testPush.isPending && { opacity: 0.5 }]}
-                   disabled={testPush.isPending}
-                   onPress={() => { setTestMsg(null); testPush.mutate(); }}>
-          <Text style={{ color: C.text, fontWeight: "600" }}>
-            Send test push to my devices
-          </Text>
-        </Pressable>
+        {/* the test is the owner's, as on the web, and it reaches every
+            phone and browser registered in the household, not this
+            phone alone */}
+        {owner && !me.data?.demo && (
+          <Pressable style={[s.testBtn, testPush.isPending && { opacity: 0.5 }]}
+                     disabled={testPush.isPending}
+                     onPress={() => { setTestMsg(null); testPush.mutate(); }}>
+            <Text style={{ color: C.text, fontWeight: "600" }}>
+              Send test push to every household device
+            </Text>
+          </Pressable>
+        )}
         {testMsg && (
           <Text style={[s.hint, { color: C.good }]}
                 onPress={() => setTestMsg(null)}>{testMsg}</Text>
@@ -528,15 +547,23 @@ export default function Settings() {
           <NavRow label="Where should your data come from?"
                   sub="providers compared · Plaid/MX keys · SimpleFIN"
                   href="/connect-hub" />
-          <PlaidRecurringCard />
+          {/* the plan may not include the cross-check; the server
+              refuses the setting then, so the switch is not offered */}
+          {me.data.features?.plaid_recurring !== false
+            && <PlaidRecurringCard />}
           {!me.data.demo && <EnrichCard />}
         </>)}
         {/* hosted included — the web renders script tokens everywhere */}
-        {owner && hits.tokens && <ScriptTokensCard />}
-        {owner && hits.move && !me.data.hosted && <ConnectionsBackupCard />}
+        {owner && hits.tokens && (
+          <SharedLock note={lockGrant}><ScriptTokensCard /></SharedLock>)}
+        {owner && hits.move && !me.data.hosted && (
+          <SharedLock note={lockGrant}>
+            <ConnectionsBackupCard />
+          </SharedLock>)}
         {owner && (hits.smtp || hits.daily)
           && <SectionHead>Email &amp; Push</SectionHead>}
-        {owner && hits.smtp && !me.data.hosted && <SmtpCard />}
+        {owner && hits.smtp && !me.data.hosted && (
+          <SharedLock note={lockGrant}><SmtpCard /></SharedLock>)}
         {owner && hits.daily && (
           <NavRow label="Email & Push"
                   sub={schedSub
@@ -547,9 +574,12 @@ export default function Settings() {
             other programs — webhooks out, the read doors in */}
         {owner && (hits.webhooks || hits.readtokens)
           && <SectionHead>Integrations</SectionHead>}
-        {owner && hits.webhooks && !me.data.demo && <WebhooksCard />}
-        {owner && hits.readtokens && !me.data.demo
-          && <ScriptTokensCard scope="read" />}
+        {owner && hits.webhooks && !me.data.demo && (
+          <SharedLock note={lockGrant}><WebhooksCard /></SharedLock>)}
+        {owner && hits.readtokens && !me.data.demo && (
+          <SharedLock note={lockGrant}>
+            <ScriptTokensCard scope="read" />
+          </SharedLock>)}
         {owner && hits.readtokens && <EndpointsCard />}
         {hits.family && (<>
           <SectionHead>Users</SectionHead>
@@ -589,7 +619,9 @@ export default function Settings() {
         </>)}
         {owner && hits.llm && (<>
           <SectionHead>AI</SectionHead>
-          <LlmCard hosted={!!me.data.hosted} />
+          <SharedLock note={lockGrant}>
+            <LlmCard hosted={!!me.data.hosted} />
+          </SharedLock>
         </>)}
         {owner && hits.setup && (<>
           <SectionHead>Wizards</SectionHead>
@@ -602,7 +634,9 @@ export default function Settings() {
         </>)}
         {owner && me.data.hosted && hits.support && (<>
           <SectionHead>Support</SectionHead>
-          <SupportAccessCard owner />
+          <SharedLock note={lockGrant}>
+            <SupportAccessCard owner />
+          </SharedLock>
         </>)}
         {hits.security && (<>
           <SectionHead>Security</SectionHead>
@@ -805,14 +839,8 @@ function LlmCard({ hosted }: { hosted: boolean }) {
   const [editing, setEditing] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
   if (d && !seeded) {
-    const rows = (d.llm_backends as Backend[] | null) ?? [];
     // a legacy single-endpoint config shows as one synthetic row
-    setBackends(rows.length ? rows
-      : d.llm_url
-        ? [{ id: "legacy", name: "Custom endpoint",
-             url: String(d.llm_url), model: String(d.llm_model ?? ""),
-             api_key_set: !!d.llm_api_key_set }]
-        : []);
+    setBackends(llmBackendsSeed(d));
     setRoles((d.llm_roles as Record<string, string> | null) ?? {});
     setTaxOk(!!d.taxdocs_allow_remote_llm);
     setBundledVision(String(d.llm_vision_model ?? ""));
@@ -1311,11 +1339,15 @@ function EnrichCard() {
     && !!d && capNum !== d.cap;
   const saveCap = useMutation({
     mutationFn: () => saveSettings(qc, client!, { plaid_enrich_cap: capNum }),
-    onSuccess: () => {
+    onSuccess: (v) => {
       // the draft falls back to the cached cap the moment it clears, so
-      // the cache must already hold the new one or the box snaps back
+      // the cache must already hold the new one or the box snaps back —
+      // the cap the server STORED, which it clamps to the instance's
+      // ceiling; the refetch then brings the rest of the card along
+      const cap = storedEnrichCap(v, capNum);
       qc.setQueryData<typeof d>(["enrich-status"], (o) => o && {
-        ...o, cap: capNum, remaining: Math.max(0, capNum - o.used) });
+        ...o, cap, remaining: Math.max(0, cap - o.used) });
+      qc.invalidateQueries({ queryKey: ["enrich-status"] });
       setCapDraft(null); setLast("Monthly cap saved.");
     },
     onError: (e) => setLast(errText(e)),
@@ -1379,28 +1411,53 @@ function EnrichCard() {
 }
 
 
-// A Switch bound to cached settings has to move the moment it is
-// tapped: flip the cache first, let the reply (the full settings view)
-// settle it, and put the old value back only if the server refused.
-function useSettingToggle(key: string, alsoMe?: string) {
+// A Switch bound to cached settings has to move the moment it is tapped,
+// and each save writes the whole stored view back. Two quick taps (or two
+// switches) could answer out of order, and the older reply would put back
+// a value already changed — on screen, or on the server when the second
+// POST overtook the first. So the saves go out one at a time in the same
+// queue as the email switches and schedule, and every tap not yet answered
+// is drawn over whatever the cache holds, as the email grid does. Once the
+// key has nothing left in flight, `settled` hears the stored value. Covers:
+// Plaid's recurring cross-check, merchant logos, feedback enabled.
+function useSettingToggle(key: string,
+                          settled?: (on: boolean) => void) {
   const { client } = useSession();
   const qc = useQueryClient();
-  return useMutation({
+  const pending = useRef<{ id: number; on: boolean }[]>([]);
+  const [, redraw] = useState(0);
+  const nextId = useRef(0);
+  const save = useMutation({
     mutationFn: (v: boolean) => saveSettings(qc, client!, { [key]: v }),
-    onMutate: async (v) => {
-      await qc.cancelQueries({ queryKey: ["settings"] });
-      const prev = qc.getQueryData<SettingsView>(["settings"]);
-      const prevMe = alsoMe ? qc.getQueryData<Me>(["me"]) : undefined;
-      patchQuery<SettingsView>(qc, ["settings"], { [key]: v });
-      if (alsoMe) patchQuery<Me>(qc, ["me"], { [alsoMe]: v });
-      return { prev, prevMe };
+    scope: SETTINGS_SAVES,
+    onMutate: (v) => {
+      const id = ++nextId.current;
+      pending.current = [...pending.current, { id, on: v }];
+      redraw((n) => n + 1);
+      return { id };
     },
-    onError: (e, _v, ctx) => {
-      if (ctx?.prev) qc.setQueryData(["settings"], ctx.prev);
-      if (alsoMe && ctx?.prevMe) qc.setQueryData(["me"], ctx.prevMe);
+    onError: (e) => {
+      qc.invalidateQueries({ queryKey: ["settings"] });
       Alert.alert("Couldn't save", errText(e));
     },
+    onSettled: (_r, _e, _v, ctx) => {
+      pending.current = pending.current.filter((x) => x.id !== ctx?.id);
+      redraw((n) => n + 1);
+      if (settled && !pending.current.length) {
+        const stored = (qc.getQueryData<SettingsView>(["settings"]) as
+          Record<string, unknown> | undefined)?.[key];
+        settled(stored !== false);
+      }
+    },
   });
+  return {
+    /** what the switch shows: the newest unanswered tap, else the cache */
+    on: (cached: unknown): boolean => {
+      const mine = pending.current[pending.current.length - 1];
+      return mine ? mine.on : cached !== false;
+    },
+    set: (v: boolean) => save.mutate(v),
+  };
 }
 
 function PlaidRecurringCard() {
@@ -1408,9 +1465,9 @@ function PlaidRecurringCard() {
   const { client } = useSession();
   const settings = useQuery({ queryKey: ["settings"],
     queryFn: () => client!.settingsFull(), enabled: !!client });
-  const on = (settings.data as Record<string, unknown> | undefined)
-    ?.plaid_recurring !== false;
   const toggle = useSettingToggle("plaid_recurring");
+  const on = toggle.on((settings.data as Record<string, unknown> | undefined)
+    ?.plaid_recurring);
   return (
     <Card>
       <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
@@ -1423,7 +1480,7 @@ function PlaidRecurringCard() {
             proposals beside ours — never applied without you
           </Text>
         </View>
-        <Switch value={on} onValueChange={(v) => toggle.mutate(v)}
+        <Switch value={on} onValueChange={(v) => toggle.set(v)}
                 trackColor={{ true: C.accent, false: C.hover }}
                 thumbColor={C.text} />
       </View>
@@ -1437,10 +1494,13 @@ function LogosToggleCard() {
   const { client } = useSession();
   const settings = useQuery({ queryKey: ["settings"],
     queryFn: () => client!.settingsFull(), enabled: !!client });
-  const on = (settings.data as Record<string, unknown> | undefined)
-    ?.merchant_logos !== false;
-  // every avatar reads the flag from ["me"], so that copy flips too
-  const toggle = useSettingToggle("merchant_logos", "merchant_logos");
+  const qc = useQueryClient();
+  // every avatar reads the flag from ["me"], so that copy flips too: on
+  // the tap, and to the stored value once the saves are answered
+  const toggle = useSettingToggle("merchant_logos", (stored) =>
+    patchQuery<Me>(qc, ["me"], { merchant_logos: stored }));
+  const on = toggle.on((settings.data as Record<string, unknown> | undefined)
+    ?.merchant_logos);
   return (
     <Card>
       <View style={{ flexDirection: "row", alignItems: "center",
@@ -1454,7 +1514,10 @@ function LogosToggleCard() {
             plainer look (the daily email never carries images)
           </Text>
         </View>
-        <Switch value={on} onValueChange={(v) => toggle.mutate(v)}
+        <Switch value={on} onValueChange={(v) => {
+                  patchQuery<Me>(qc, ["me"], { merchant_logos: v });
+                  toggle.set(v);
+                }}
                 trackColor={{ true: C.accent, false: C.hover }}
                 thumbColor={C.text} />
       </View>
@@ -1468,9 +1531,11 @@ function FeedbackToggleCard() {
   const qc = useQueryClient();
   const settings = useQuery({ queryKey: ["settings"],
     queryFn: () => client!.settingsFull(), enabled: !!client });
-  const on = (settings.data as Record<string, unknown> | undefined)
-    ?.feedback_enabled !== false;
-  const toggle = useSettingToggle("feedback_enabled");
+  // the Feedback screen asks /api/testing, not settings
+  const toggle = useSettingToggle("feedback_enabled", () =>
+    qc.invalidateQueries({ queryKey: ["testing"] }));
+  const on = toggle.on((settings.data as Record<string, unknown> | undefined)
+    ?.feedback_enabled);
   return (
     <Card>
       <View style={{ flexDirection: "row", alignItems: "center",
@@ -1478,11 +1543,7 @@ function FeedbackToggleCard() {
         <Text style={{ color: C.text, fontSize: 14, flex: 1 }}>
           Feedback &amp; bug reports enabled on this instance
         </Text>
-        <Switch value={on}
-                onValueChange={(v) => toggle.mutate(v, {
-                  // the Feedback screen asks /api/testing, not settings
-                  onSuccess: () =>
-                    qc.invalidateQueries({ queryKey: ["testing"] }) })}
+        <Switch value={on} onValueChange={(v) => toggle.set(v)}
                 trackColor={{ true: C.accent, false: C.hover }}
                 thumbColor={C.text} />
       </View>
@@ -1501,6 +1562,12 @@ function MyEmailCard() {
   const qc = useQueryClient();
   const me = useQuery({ queryKey: ["me"], queryFn: () => client!.me(),
                         enabled: !!client });
+  // who the worker actually mails: the saved list and each address's
+  // invitation, and whether this server can send invitations at all
+  const settings = useQuery({ queryKey: ["settings"],
+    queryFn: () => client!.settingsFull(), enabled: !!client });
+  const notify = useQuery({ queryKey: ["notify"],
+    queryFn: () => client!.notifyStatus(), enabled: !!client });
   const d = me.data?.daily_email;
   const [err, setErr] = useState<string | null>(null);
   const set = useMutation({
@@ -1514,10 +1581,35 @@ function MyEmailCard() {
     },
     onError: (e) => setErr(errText(e)),
   });
+  // one kind on or off for my own inbox (the web's row of boxes); the
+  // switch moves on the tap and the reply (my whole row) settles it
+  const pref = useMutation({
+    mutationFn: (v: { kind: string; on: boolean }) =>
+      client!.meEmailPref(v.kind, v.on),
+    onMutate: (v) => qc.setQueryData<Me>(["me"], (o) => o?.daily_email && {
+      ...o, daily_email: { ...o.daily_email,
+        prefs: { ...o.daily_email.prefs, [v.kind]: v.on } } }),
+    onSuccess: (r) => {
+      setErr(null);
+      qc.setQueryData<Me>(["me"], (o) => o?.daily_email && {
+        ...o, daily_email: { ...o.daily_email, prefs: r.prefs } });
+    },
+    onError: (e) => {
+      setErr(errText(e));
+      qc.invalidateQueries({ queryKey: ["me"] });
+    },
+  });
   if (!d) return null;
   const hourLabel = (h: number) =>
     h === 0 ? "12am" : h < 12 ? `${h}am` : h === 12 ? "12pm" : `${h - 12}pm`;
-  const receiving = d.on && !d.muted;
+  const sv = settings.data as Record<string, unknown> | undefined;
+  const line = myDailyLine({
+    me: me.data?.email ?? "", on: d.on, muted: d.muted, prefs: d.prefs,
+    verified: me.data?.verified, hosted: me.data?.hosted,
+    recipients: sv?.email_recipients as string[] | null | undefined,
+    status: sv?.email_recipient_status as
+      Parameters<typeof myDailyLine>[0]["status"],
+    needBaseUrl: notify.data?.invites_need_base_url });
   return (
     <Card>
       <H>Daily email</H>
@@ -1531,17 +1623,45 @@ function MyEmailCard() {
           the household right now.</Text>
       )}
       <Text style={[s.hintL, { color: C.text, marginTop: 6 }]}>
-        {receiving ? "You receive it."
-          : d.on ? "You've turned it off for yourself." : "Off."}
+        {line.text}
       </Text>
-      {d.on && (
+      {/* a mute stops every kind of household mail, not just the daily
+          one, so lifting it must stay reachable while the daily is off */}
+      {(d.on || d.muted) && (
         <Pressable style={[s.testBtn, set.isPending && { opacity: 0.5 }]}
                    disabled={set.isPending}
                    onPress={() => set.mutate(!d.muted)}>
           <Text style={{ color: C.text, fontWeight: "600" }}>
-            {d.muted ? "Turn on for me" : "Turn off for me"}
+            {d.muted ? "Unmute me" : "Turn off for me"}
           </Text>
         </Pressable>
+      )}
+      {d.muted && (
+        <Text style={s.hintL}>Unmute to choose which emails you get.</Text>
+      )}
+      <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6,
+                     marginTop: 8, opacity: d.muted ? 0.6 : 1 }}>
+        {EMAIL_KINDS.map((k) => {
+          const on = !d.muted && prefOn(d.prefs, k);
+          const off = kindOffNote(k, d.cadences);
+          return (
+            <Pressable key={k} disabled={d.muted || pref.isPending}
+              accessibilityLabel={`${EMAIL_KIND_LABEL[k]} email`}
+              accessibilityState={{ checked: on, disabled: d.muted }}
+              style={[s.chip, on && s.chipOn, off ? { opacity: 0.5 } : null]}
+              onPress={() => pref.mutate({ kind: k, on: !on })}>
+              <Text style={{ color: on ? C.text : C.mut, fontSize: 12 }}>
+                {on ? "☑" : "☐"} {EMAIL_KIND_LABEL[k]}
+              </Text>
+            </Pressable>
+          );
+        })}
+      </View>
+      {EMAIL_KINDS.some((k) => kindOffNote(k, d.cadences)) && (
+        <Text style={s.hintL}>
+          {EMAIL_KINDS.map((k) => kindOffNote(k, d.cadences)).filter(Boolean)
+            .join(" · ")}
+        </Text>
       )}
       {err && <Text style={[s.hint, { color: C.warn }]}>{err}</Text>}
     </Card>
@@ -1550,6 +1670,7 @@ function MyEmailCard() {
 
 function ThemeCard() {
   const { client } = useSession();
+  const qc = useQueryClient();
   const me = useQuery({ queryKey: ["me"], queryFn: () => client!.me(),
     enabled: !!client, staleTime: 5 * 60_000 });
   const [mode, setMode] = useState<ThemeMode>(getThemeMode());
@@ -1566,9 +1687,18 @@ function ThemeCard() {
           <Pressable key={m0} style={[s.chip, mode === m0 && s.chipOn]}
                      onPress={() => { setThemeMode(m0); setMode(m0);
                                       setPending(themeRestartPending());
-                                      if (persist)
-                                        client!.settingsSave(
-                                          { theme: m0 }).catch(() => {});
+                                      if (persist) {
+                                        // the launch-time reconcile reads the
+                                        // cached settings: they must carry the
+                                        // new theme from the tap, or the next
+                                        // launch writes the old one back
+                                        patchQuery<SettingsView>(qc,
+                                          ["settings"], { theme: m0 });
+                                        saveSettings(qc, client!,
+                                          { theme: m0 }).catch(() =>
+                                          qc.invalidateQueries(
+                                            { queryKey: ["settings"] }));
+                                      }
                                     }}>
             <Text style={{ color: mode === m0 ? C.text : C.mut,
                            fontSize: 13 }}>
@@ -2168,6 +2298,129 @@ function HomePageCard() {
            "home_web")}
       <Text style={s.hintL}>Applied once per launch — the Today tab is
         always a tap away.</Text>
+    </Card>
+  );
+}
+
+
+/** A credential rotation paused the household's own outbound settings —
+ *  the relay, extra recipients, the AI endpoint — until the owner says
+ *  they are theirs (mirrors the web banner). */
+function OutboundPausedBanner() {
+  const { client } = useSession();
+  const qc = useQueryClient();
+  // only the owner may resume, and not on the shared demonstration login;
+  // anyone else is told why the mail and the AI changed, with no button
+  // that could only be refused
+  const owner = useOwner();
+  const lock = useSharedLock("grant");
+  const canResume = owner && !lock;
+  const q = useQuery({ queryKey: ["settings"], queryFn: () => client!.settingsFull(),
+                       enabled: !!client });
+  const [err, setErr] = useState<string | null>(null);
+  // resuming re-opens destinations, so the server wants an elevated
+  // session; the client's elevation sheet collects the proof when it is not
+  const resume = useMutation({
+    // the resume names the record it was shown, so a pause that changed
+    // since this screen read it is refused rather than confirmed unseen
+    mutationFn: () => client!.outboundResume(q.data?.outbound_paused?.version),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["settings"] }),
+    onError: (e) => {
+      if (e instanceof ApiError && e.status === 409) {
+        qc.invalidateQueries({ queryKey: ["settings"] });
+        setErr("The paused record changed since this screen loaded — reload "
+               + "and check it again before resuming.");
+        return;
+      }
+      setErr(errText(e));
+    },
+  });
+  const p = q.data?.outbound_paused;
+  if (!p) return null;
+  const what: string[] = [];
+  if (p.smtp) what.push("the mail relay saved in Settings");
+  if (p.recipients.length)
+    what.push(`${p.recipients.length === 1 ? "the extra recipient" : "the extra recipients"} ${p.recipients.join(", ")}`);
+  if (p.llm) what.push("the AI endpoint");
+  // the household's own Plaid / MX keys are not in the paused list —
+  // they keep serving every sync of the banks already linked — but new
+  // links on them are HELD (a new link, a re-auth, the MX widget) until
+  // the owner confirms the keys or removes them; the owner is shown which
+  // client, anyone else only that links are held (mirrors the web)
+  const heldKeys = (p.aggregator_keys ?? []).map((k) =>
+    `${k.provider === "mx" ? "MX" : "Plaid"} client ${k.client_id} (${k.env}, `
+    + (k.saved_at ? `saved ${mmddyy(localDayOf(k.saved_at))}`
+                  : "saved before this record") + ")");
+  const byoKeys = !p.aggregator ? ""
+    : heldKeys.length
+    ? `New bank links are held: ${heldKeys.join("; ")}.`
+    : "New bank links are held until the owner confirms the bank-connection keys saved in Settings (Plaid / MX).";
+  // an owner's recovery also removes members its recent invites created;
+  // a non-owner is told how many, not who
+  const removed = p.removed_members ?? [];
+  const removedCount = removed.length || (p.removed_members_count ?? 0);
+  const names = removed.length
+    ? removed.map((m) => `${m.email} (${m.role}, joined ${mmddyy(localDayOf(m.joined))})`).join(", ")
+    : `${removedCount} ${removedCount === 1 ? "member" : "members"}`;
+  if (!canResume)
+    return (
+      <Card>
+        {what.length > 0 ? <>
+          <Text style={{ color: C.warn, fontWeight: "700" }}>
+            Paused since {mmddyy(localDayOf(p.at))} after
+            {p.reason === "recovery" ? " the owner's account was recovered" : " the owner's password, login email or second factor changed"}
+          </Text>
+          <Text style={{ color: C.warn, marginTop: 4 }}>
+            {what.join("; ")}. Mail goes through the instance's own relay and
+            the AI runs on the instance's own backend until the owner confirms
+            these are theirs.{owner && lock ? ` ${lock}` : ""}
+          </Text></> : null}
+        {byoKeys ? (
+          <Text style={{ color: C.warn, marginTop: 4 }}>{byoKeys}</Text>) : null}
+        {removedCount > 0 ? (
+          <Text style={{ color: C.warn, marginTop: 4 }}>
+            Removed {p.reason === "recovery" ? "with the recovery"
+              : "with the password, login-email or second-factor change"}, because they
+            joined in the last days through the owner's invites: {names}.
+          </Text>) : null}
+      </Card>
+    );
+  return (
+    <Card>
+      {what.length > 0 ? <>
+        <Text style={{ color: C.warn, fontWeight: "700" }}>
+          Paused since {mmddyy(localDayOf(p.at))} after
+          {p.reason === "recovery" ? " your account was recovered" : " your password, login email or second factor changed"}
+        </Text>
+        <Text style={{ color: C.warn, marginTop: 4 }}>
+          {what.join("; ")}. Mail goes through the instance's own relay and the AI
+          runs on the instance's own backend until you confirm these are yours.
+          If you don't recognise one, change it below first.
+        </Text></> : null}
+      {byoKeys ? (
+        <Text style={{ color: C.warn, marginTop: 4 }}>
+          {byoKeys} If these are yours, resume; if not, disconnect those
+          banks and remove the keys in Connections.
+        </Text>) : null}
+      {removedCount > 0 ? (
+        <Text style={{ color: C.warn, marginTop: 4 }}>
+          Removed when {p.reason === "recovery" ? "your account was recovered"
+            : "your password, login email or second factor changed"}, because they joined
+          in the last days through your invites: {names}. Invite again the
+          ones that are yours.
+        </Text>) : null}
+      {err ? <Text style={{ color: C.bad, marginTop: 4 }}>{err}</Text> : null}
+      <Pressable onPress={() => resume.mutate()} disabled={resume.isPending}
+                 style={{ marginTop: 8, alignSelf: "flex-start",
+                          backgroundColor: C.hover, borderColor: C.border,
+                          borderWidth: 1, borderRadius: 8,
+                          paddingHorizontal: 12, paddingVertical: 6 }}>
+        <Text style={{ color: C.accent, fontWeight: "600" }}>
+          {resume.isPending ? "resuming…"
+            : what.length || p.aggregator ? "These are mine — resume"
+            : "Got it"}
+        </Text>
+      </Pressable>
     </Card>
   );
 }

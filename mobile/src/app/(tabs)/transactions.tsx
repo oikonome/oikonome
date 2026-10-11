@@ -20,7 +20,10 @@ import { errText, setHandedOffTxn, Txn, TxnPage, TxnQuery }
   from "../../lib/api";
 import { patchQueries } from "../../lib/cache";
 import { DayHead, RANGE_LABEL, TREND_RANGES, withDayHeads, catLabel,
-         filterCategories, ledgerRange } from "../../lib/pure";
+         filterCategories, ledgerRange, routeYm,
+         BULK_CHUNK, BULK_MAX, flattenPile, goneTxnIds, mergePilePages,
+         runChunked }
+  from "../../lib/pure";
 import { useRefetchWhenShown } from "../../lib/focus";
 
 const TXNS_KEY = ["transactions"];
@@ -56,8 +59,8 @@ export default function Transactions() {
                                    date_to?: string; as_of?: string;
                                    counted?: string }>();
   const str = (v: string | string[] | undefined) => v ? String(v) : "";
-  const [ym, setYm] = useState({ y: Number(sp.y) || now.getFullYear(),
-                                 m: Number(sp.m) || now.getMonth() + 1 });
+  // read through routeYm: a deep link can carry any month at all
+  const [ym, setYm] = useState(() => routeYm(sp.y, sp.m, now));
   const [q, setQ] = useState("");
   const [showFilters, setShowFilters] = useState(false);
   const [acct, setAcct] = useState(str(sp.acct));
@@ -97,8 +100,7 @@ export default function Transactions() {
     setCounted(str(sp.counted) === "1");
     setDateFrom(str(sp.date_from));
     setDateTo(str(sp.date_to));
-    setYm({ y: Number(sp.y) || now.getFullYear(),
-            m: Number(sp.m) || now.getMonth() + 1 });
+    setYm(routeYm(sp.y, sp.m, now));
     setMonthScope(!!((sp.bucket && sp.m) || (sp.cat && sp.y && sp.m)));
     setYearScope(!!(sp.bucket && sp.y && !sp.m));
     setPage(1);
@@ -188,26 +190,56 @@ export default function Transactions() {
       return prevSearching === searching ? prev : undefined;
     },
   });
-  useRefetchWhenShown(query, TXNS_KEY);
   // pages ACCUMULATE in search mode ("Load more" must never replace
   // what's shown); the pile resets when the question changes
   const PAGE_SIZE = 100;
-  const [pile, setPile] = useState<Txn[]>([]);
+  const [pilePages, setPilePages] = useState<Txn[][]>([]);
+  const pile = useMemo(() => flattenPile(pilePages), [pilePages]);
   const filterKey =
     `${search}|${acct}|${cat}|${bucket}|${monthScope ? `${ym.y}-${ym.m}` : ""
      }|${reimbF}|${dateFrom}|${dateTo}|${owner}|${scope}|${channel}|${checksF}`;
   const pileKey = useRef(filterKey);
+  const qcPile = useQueryClient();
+  // bumped once a whole-pile refresh has settled, so the merge below runs
+  // again even when the current page came back unchanged
+  const [pileTick, setPileTick] = useState(0);
+  // A refresh (the pull, or the tab shown again after a write elsewhere)
+  // must reach every page the pile shows, not only the current one: the
+  // earlier pages are only ever re-read from the cache, so a row the server
+  // added or changed there would never appear, while the total and Load
+  // more already counted it. Each loaded page is fetched again (a page the
+  // cache has dropped is fetched afresh), then the pile is merged once.
+  const refreshAll = async () => {
+    const earlier = searching && client
+      ? Array.from({ length: page - 1 }, (_, i) => {
+          const pp = { ...params, page: String(i + 1) };
+          const key = ["transactions", pp];
+          return qcPile.getQueryCache().find({ queryKey: key, exact: true })
+            ? qcPile.refetchQueries({ queryKey: key, exact: true,
+                                      type: "all" })
+            : qcPile.prefetchQuery({ queryKey: key,
+                                     queryFn: () => client.transactions(pp) });
+        })
+      : [];
+    await Promise.allSettled([...earlier, query.refetch()]);
+    setPileTick((t) => t + 1);
+  };
+  useRefetchWhenShown({ isStale: query.isStale, isFetching: query.isFetching,
+                        refetch: refreshAll }, TXNS_KEY);
   useEffect(() => {
     if (!query.data || !searching) return;
-    setPile((prev) => {
-      if (pileKey.current !== filterKey || page === 1) {
-        pileKey.current = filterKey;
-        return query.data!.rows;
-      }
-      const seen = new Set(prev.map((r) => r.id));
-      return [...prev, ...query.data!.rows.filter((r) => !seen.has(r.id))];
-    });
-  }, [query.data, searching, filterKey, page]);
+    const reset = pileKey.current !== filterKey || page === 1;
+    pileKey.current = filterKey;
+    // every earlier page is re-read from the cache: a row edited or
+    // removed on the detail screen is patched there, never in this state
+    const cached = (p: number) => qcPile.getQueryData<TxnPage>(
+      ["transactions", { ...params, page: String(p) }])?.rows;
+    setPilePages((prev) =>
+      mergePilePages(prev, page, query.data!.rows, cached, reset,
+                     goneTxnIds));
+    // params is rebuilt every render; filterKey + page name it
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query.data, searching, filterKey, page, qcPile, pileTick]);
   const accts = useQuery({ queryKey: ["accounts"],
     queryFn: () => client!.accounts(),
     // also needed while a search names an account (the context line)
@@ -229,10 +261,15 @@ export default function Transactions() {
     enabled: !!client && bulkPicking });
   const [bulkFilter, setBulkFilter] = useState("");
   const qc2 = useQueryClient();
+  // pieces written so far of a selection larger than one request
+  const [bulkProg, setBulkProg] = useState<{ done: number; total: number } | null>(null);
+  const tooMany = sel.size > BULK_MAX;
   const bulk = useMutation({
     mutationFn: ({ action, category }:
         { action: string; category?: string }) =>
-      client!.txnBulk([...sel], action, category),
+      runChunked([...sel], (piece) => client!.txnBulk(piece, action, category),
+                 (done, total) => setBulkProg(total > BULK_CHUNK ? { done, total } : null)),
+    onSettled: () => setBulkProg(null),
     // the picker closes on the tap; the result arrives behind it. The
     // selection is remembered here because the user can change it while
     // the write is in flight.
@@ -252,7 +289,7 @@ export default function Transactions() {
         rs.map((x) => ids.has(x.id) ? { ...x, ...patch } : x);
       patchQueries<TxnPage>(qc2, ["transactions"],
         (o) => ({ ...o, rows: flip(o.rows) }));
-      setPile(flip);
+      setPilePages((ps) => ps.map(flip));
       setSel(new Set());
       // every bulk action moves money (totals, verdict), and the flag
       // actions feed the Reimburse / business ledgers' own lists
@@ -273,7 +310,11 @@ export default function Transactions() {
         bits.push(`${r.missing} no longer exist`);
       Alert.alert("Bulk result", bits.join("\n"));
     },
-    onError: (e) => Alert.alert("Bulk update failed", errText(e)),
+    onError: (e) => {
+      // pieces before a failed one stay written, so the lists refetch
+      qc2.invalidateQueries({ queryKey: ["transactions"] });
+      Alert.alert("Bulk update failed", errText(e));
+    },
   });
   const toggleSel = useCallback((id: string) => setSel((prev) => {
     const next = new Set(prev);
@@ -328,7 +369,7 @@ export default function Transactions() {
   // the household wrote it), a month-scoped category by its label — each
   // with its month, because a link's scope is the part that otherwise
   // goes unsaid. No sheet control shows either one.
-  const monthShort = `${MONTHS[ym.m - 1].slice(0, 3)} ${ym.y}`;
+  const monthShort = `${(MONTHS[ym.m - 1] ?? "").slice(0, 3)} ${ym.y}`;
   // the previous result stays on screen while the next loads, so the
   // server's label counts only when it answers THIS bucket; until then
   // the link's own word stands in (web reads the same way)
@@ -493,14 +534,24 @@ export default function Transactions() {
                          fontVariant: ["tabular-nums"] }}>
             {!searching ? (
               <>
-                <Text style={{ color: C.good }}>{money(d0.in_sum ?? 0)}</Text>
+                {/* in and net are null for a month before the bank feed
+                    starts: income unknown reads "—" and no net is shown,
+                    never a false loss */}
+                {d0.in_sum == null
+                  ? <Text style={s.heroMut}>—</Text>
+                  : <Text style={{ color: C.good }}>{money(d0.in_sum)}</Text>}
                 <Text style={s.heroMut}> in · </Text>
                 {money(d0.out_sum ?? 0)}
                 <Text style={s.heroMut}> out · </Text>
-                <Text style={{ color: (d0.net_sum ?? 0) < 0 ? C.bad : C.good }}>
-                  {(d0.net_sum ?? 0) < 0 ? "" : "+"}{money(d0.net_sum ?? 0)}
-                </Text>
-                <Text style={s.heroMut}> net · {rows.length} txn
+                {d0.net_sum != null && (
+                  <>
+                    <Text style={{ color: d0.net_sum < 0 ? C.bad : C.good }}>
+                      {d0.net_sum < 0 ? "" : "+"}{money(d0.net_sum)}
+                    </Text>
+                    <Text style={s.heroMut}> net · </Text>
+                  </>
+                )}
+                <Text style={s.heroMut}>{rows.length} txn
                   {rows.length === 1 ? "" : "s"}
                   {(d0.biz_count ?? 0) > 0
                     ? ` · ${d0.biz_count} business (not in the totals)` : ""}</Text>
@@ -647,7 +698,7 @@ export default function Transactions() {
         contentContainerStyle={s.list}
         refreshControl={<PullRefresh tintColor={C.accent} colors={[C.accent]}
                                       progressBackgroundColor={C.card}
-                                        onRefresh={() => query.refetch()} />}
+                                        onRefresh={refreshAll} />}
         ListEmptyComponent={
           <Text style={s.mut}>
             {query.isPending ? "Loading…"
@@ -677,35 +728,42 @@ export default function Transactions() {
                          gap: 14, flexWrap: "wrap" }}>
             <Text style={{ color: C.text, fontSize: 13,
                            fontWeight: "600" }}>
-              {sel.size} selected
+              {bulkProg
+                ? `Updating ${bulkProg.done} of ${bulkProg.total}…`
+                : `${sel.size} selected`}
             </Text>
+            {tooMany && (
+              <Text style={{ color: C.mut, fontSize: 13 }}>
+                select fewer than {BULK_MAX.toLocaleString("en-US")}
+              </Text>
+            )}
             <Text style={s.bulkAct}
                   onPress={() =>
                     setSel(new Set(rows.map((r) => r.id)))}>
               All
             </Text>
-            <Text style={[s.bulkAct, bulk.isPending && { opacity: 0.4 }]}
-                  onPress={() => !bulk.isPending && setBulkPicking(true)}>
+            <Text style={[s.bulkAct, (bulk.isPending || tooMany) && { opacity: 0.4 }]}
+                  onPress={() => !bulk.isPending && !tooMany && setBulkPicking(true)}>
               Category
             </Text>
             {/* the web TxnTable's action names, verbatim */}
-            <Text style={[s.bulkAct, bulk.isPending && { opacity: 0.4 }]}
-                  onPress={() => !bulk.isPending
+            <Text style={[s.bulkAct, (bulk.isPending || tooMany) && { opacity: 0.4 }]}
+                  onPress={() => !bulk.isPending && !tooMany
                     && bulk.mutate({ action: "reimb_flag" })}>
               ⚑ expect reimbursement
             </Text>
-            <Text style={[s.bulkAct, bulk.isPending && { opacity: 0.4 }]}
-                  onPress={() => !bulk.isPending
+            <Text style={[s.bulkAct, (bulk.isPending || tooMany) && { opacity: 0.4 }]}
+                  onPress={() => !bulk.isPending && !tooMany
                     && bulk.mutate({ action: "reimb_unflag" })}>
               unflag
             </Text>
-            <Text style={[s.bulkAct, bulk.isPending && { opacity: 0.4 }]}
-                  onPress={() => !bulk.isPending
+            <Text style={[s.bulkAct, (bulk.isPending || tooMany) && { opacity: 0.4 }]}
+                  onPress={() => !bulk.isPending && !tooMany
                     && bulk.mutate({ action: "biz_on" })}>
               mark business
             </Text>
-            <Text style={[s.bulkAct, bulk.isPending && { opacity: 0.4 }]}
-                  onPress={() => !bulk.isPending
+            <Text style={[s.bulkAct, (bulk.isPending || tooMany) && { opacity: 0.4 }]}
+                  onPress={() => !bulk.isPending && !tooMany
                     && bulk.mutate({ action: "biz_off" })}>
               unmark business
             </Text>

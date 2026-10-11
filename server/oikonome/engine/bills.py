@@ -24,7 +24,12 @@ from .compat import as_date, as_dict, jsonb
 
 log = logging.getLogger(__name__)
 
-PER_YEAR = {"DAILY": 365.0, "WEEKLY": 52.0, "MONTHLY": 12.0, "YEARLY": 1.0}
+# A mean Gregorian year, so a weekly or daily cycle's monthly figure is the
+# same rate the schedule's evened load uses: 52 weeks a year understates a
+# biweekly bill by one payment every eleven years and makes the per-bill
+# "/mo" disagree with the headline that sums them.
+PER_YEAR = {"DAILY": 365.2425, "WEEKLY": 365.2425 / 7, "MONTHLY": 12.0,
+            "YEARLY": 1.0}
 
 # supported detection cycles: (days, frequency, interval)
 CYCLES = [(7, "WEEKLY", 1), (14, "WEEKLY", 2), (30, "MONTHLY", 1),
@@ -79,6 +84,38 @@ def _monthly(amount: float, frequency: str | None, interval: int) -> float:
     if not frequency or frequency.upper() == "ENVELOPE":
         return amount
     return amount * PER_YEAR[frequency.upper()] / (interval or 1) / 12.0
+
+
+# The figure a 52-week / 365-day year gave before PER_YEAR moved to the mean
+# year — what every bill saved before that change still stores.
+_OLD_PER_YEAR = {"DAILY": 365.0, "WEEKLY": 52.0}
+
+
+def restated_monthly(amount, monthly, raw: dict | None):
+    """A stored monthly figure, restated to the mean-year rate when it is
+    exactly what the old 52-week / 365-day year gave for this bill's cycle.
+    Anything else — a monthly bill, a hand-set figure, a figure already at
+    the new rate — comes back unchanged. A restore applies this to the
+    bills an archive carries, as migration 183 applied it once to stored
+    rows: the budget's expected income sums the stored column while the
+    Bills headline recomputes it, so an old-rate figure makes the two
+    disagree for every weekly or daily bill."""
+    try:
+        rec = raw.get("recurrence") if isinstance(raw, dict) else None
+        rec = rec if isinstance(rec, dict) else {}
+        freq = str(rec.get("frequency") or "").upper()
+        if freq not in _OLD_PER_YEAR or amount is None or monthly is None:
+            return monthly
+        iv = rec.get("interval")
+        iv = 1 if iv in (None, "") else int(iv)
+        if not 1 <= iv <= 99999:
+            return monthly
+        old_rate = float(amount) * _OLD_PER_YEAR[freq] / iv / 12.0
+        if round(float(monthly), 2) != round(old_rate, 2):
+            return monthly
+        return round(_monthly(float(amount), freq, iv), 2)
+    except (TypeError, ValueError, AttributeError):
+        return monthly
 
 
 # ---- canonical merchant ---------------------------------------------------
@@ -239,7 +276,8 @@ def save_bill(conn, *, payee: str, amount: float, bill_type: str = "occurrence",
               match_category: bool | None = None,
               txn_category: str | None = None,
               companions: list[dict] | None = None,
-              merchants: list[str] | None = None) -> str:
+              merchants: list[str] | None = None,
+              revive: bool = False) -> str:
     """Insert or replace one bill. `amount` in positive dollars (sign applied
     here: bills negative, income positive).
 
@@ -264,7 +302,13 @@ def save_bill(conn, *, payee: str, amount: float, bill_type: str = "occurrence",
     `companions` are the fees that ride with this bill's payment (see
     companions_of): a list replaces the set, None keeps it, [] clears it.
     The bill's `amount` stays the main charge; cap, health, Today and the
-    email add the fees on top ("$91.60 incl. $1 fee")."""
+    email add the fees on top ("incl. $1 fee").
+
+    An edit keeps an archived bill archived. Archiving takes a bill out of
+    the plan, Today and the email, and an edit that lands after it (a Save
+    still in flight, another member's stale form, a machine proposal
+    approved from a stale list) must not quietly put it back. `revive` is
+    the explicit ask to restore it with the save."""
     if not float(amount) > 0:
         raise ValueError("bill amount must be positive dollars")
     with conn.transaction():
@@ -402,11 +446,14 @@ def save_bill(conn, *, payee: str, amount: float, bill_type: str = "occurrence",
                    type=EXCLUDED.type, payee=EXCLUDED.payee,
                    amount=EXCLUDED.amount, frequency=EXCLUDED.frequency,
                    monthly_amount=EXCLUDED.monthly_amount, due_on=EXCLUDED.due_on,
-                   category=EXCLUDED.category, is_completed=0, active=1,
+                   category=EXCLUDED.category,
+                   is_completed=CASE WHEN %s THEN 0 ELSE bills.is_completed END,
+                   active=CASE WHEN %s THEN 1 ELSE bills.active END,
                    synced_at=now(), raw=EXCLUDED.raw, merchant=EXCLUDED.merchant""",
             (_slug(payee), "INCOME" if income else "BILL", payee, amount,
              _alias(frequency, interval) if bill_type != "envelope" else "ENVELOPE",
-             monthly, next_due_d, category, jsonb(raw), prev_merchant))
+             monthly, next_due_d, category, jsonb(raw), prev_merchant,
+             bool(revive), bool(revive)))
         return _slug(payee)
 
 
@@ -678,13 +725,16 @@ def delete_bill(conn, payee: str) -> int:
 
 def _merchant_names(names) -> list[str]:
     """A bill's attached merchant names, normalised: strings only, trimmed,
-    deduplicated, bounded, sorted — the same list whichever door wrote it."""
+    deduplicated, bounded in COUNT, sorted — the same list whichever door
+    wrote it. A name is never cut short: it is the key the bill matches its
+    merchant by, and a shortened one names no merchant, so the bill would
+    quietly stop matching its own charges."""
     out: list[str] = []
     seen: set[str] = set()
     for n in names or []:
         if not isinstance(n, str):
             continue
-        n = n.strip()[:200]
+        n = n.strip()
         if n and n not in seen:
             seen.add(n)
             out.append(n)
@@ -701,9 +751,11 @@ def _identity(conn, items, *, backed_only: bool = False) -> dict:
     for it in items or []:
         if isinstance(it, dict) and isinstance(it.get("name"), str):
             refs.append({"id": (str(it["id"]) if it.get("id") else None),
-                         "name": it["name"].strip()[:200]})
+                         "name": it["name"].strip()})
         elif isinstance(it, str) and it.strip():
-            refs.append({"id": None, "name": it.strip()[:200]})
+            # the full name: resolve_refs matches it exactly, and an
+            # imported descriptor can run past any display cap
+            refs.append({"id": None, "name": it.strip()})
     refs = [r for r in refs if r["name"]][:20]
     refs = budget.resolve_refs(conn, refs)
     if backed_only:
@@ -910,6 +962,186 @@ def reconcile_bill_merchants(conn, today: dt.date | None = None) -> dict:
                     evidence={"bill_payee": payee, "merchant_name": name}):
                 stats["proposed_merchant"] += 1
     return stats
+
+
+# ---- a merchant renamed or merged on the Merchants page ------------------
+# A bill names its merchants twice over (merchant_refs: id + name). The id
+# already follows a merge (resolve_refs walks merged_into), but the name is
+# what a ref falls back on when its id is not known here (a bill mirrored or
+# restored from another instance), what the clients list, and what the
+# person reads on the bill — and after a merge no live merchant answers to
+# the old name. So the moment a display name is folded into another, every
+# bill that pays it is re-pointed at the survivor in the same transaction,
+# and leaves a note of what it held so the rename's undo can put it back.
+# The bill's `payee` is the person's label and is never touched: matching
+# reads the identity, not the label.
+
+_MERGE_NOTES = 20
+
+
+def _merchant_of_raw(conn, raw_key: str):
+    """The live merchant (id, name) a raw string's rows now belong to."""
+    from . import merchant_identity
+    row = conn.execute(
+        "SELECT merchant_id FROM merchant_canonical WHERE raw_merchant=%s",
+        (raw_key,)).fetchone()
+    mid = merchant_identity._survivor(conn, row["merchant_id"]) \
+        if row and row["merchant_id"] else None
+    if mid is None:
+        return None
+    m = conn.execute("SELECT id::text AS id, name FROM merchants WHERE id=%s",
+                     (mid,)).fetchone()
+    return (m["id"], m["name"]) if m else None
+
+
+def _write_identity(conn, bill_id: str, refs: list, notes: list) -> None:
+    ident = _identity(conn, refs)
+    conn.execute(
+        "UPDATE bills SET raw = (COALESCE(raw, '{}'::jsonb) - 'merchant_merges') "
+        "|| %s::jsonb, synced_at = now() WHERE id = %s",
+        (jsonb({**ident, **({"merchant_merges": notes[-_MERGE_NOTES:]}
+                            if notes else {})}), bill_id))
+
+
+def _rename_hits(conn, raw: dict, old_ids: set, low: str):
+    """A bill's refs, and those of them a rename of `low` re-points."""
+    refs = budget.bill_refs(raw)
+    ids = [r["id"] for r in refs if r["id"]]
+    known = {r["id"] for r in conn.execute(
+        "SELECT id::text AS id FROM merchants WHERE id::text = ANY(%s)",
+        (ids,)).fetchall()} if ids else set()
+    return refs, [r for r in refs if r["id"] in old_ids
+                  or (r["name"].lower() == low and r["id"] not in known)]
+
+
+def _rename_locks(conn, display: str, old_ids) -> tuple[list, list]:
+    """Lock what a rename of `display` rewrites: the pending merchant offers
+    naming it, then the bills that pay it. Returns (offers, bills).
+
+    Lock order matches apply_proposal and rename_bill: the pending
+    proposals first, then the bills, and both before any transaction row
+    (an approval stamps its bill's category onto the rows the bill now
+    matches while it holds both). Taking them in another order would wait
+    on a lock an approval already holds while that approval waits on ours,
+    a cycle Postgres breaks by killing one side, which for the nightly
+    repair rolls back every merge of the night.
+
+    Only the bills this rename re-points are locked, read once unlocked
+    to find them and again under the lock (in id order, so two renames
+    never take the same bills in opposite orders): a household's every
+    bill held for the rest of a long repair transaction would stall every
+    bill edit behind it. Taking these locks twice in one transaction is
+    free, so a caller may take them early (`lock_merchant_rename`) and
+    `follow_merchant_rename` takes them again to read what is there now."""
+    old_ids = {str(i) for i in old_ids if i}
+    low = display.lower()
+    offers = conn.execute(
+        "SELECT id, payee, evidence FROM bill_proposals "
+        "WHERE status='pending' AND kind='merchant' "
+        "AND lower(COALESCE(evidence->>'merchant_name', payee)) = %s "
+        "ORDER BY id FOR UPDATE", (low,)).fetchall()
+    hit_ids = [b["id"] for b in conn.execute(
+        "SELECT id, raw FROM bills WHERE raw ? 'merchant_refs' "
+        "OR raw ? 'merchant_names'").fetchall()
+        if _rename_hits(conn, as_dict(b["raw"]), old_ids, low)[1]]
+    locked = (conn.execute(
+        "SELECT id, raw FROM bills WHERE id = ANY(%s) ORDER BY id "
+        "FOR UPDATE", (hit_ids,)).fetchall() if hit_ids else [])
+    return offers, locked
+
+
+def lock_merchant_rename(conn, display: str, old_ids) -> None:
+    """Take the offer and bill locks a rename of `display` will need, before
+    the rename moves any transaction row (see `_rename_locks`)."""
+    _rename_locks(conn, display, old_ids)
+
+
+def follow_merchant_rename(conn, display: str, old_ids, raws: list[str]) -> int:
+    """Re-point every bill that pays `display` at the merchant its rows were
+    just filed under. Called by merchant_dedup.rename after the rows moved,
+    inside its transaction. `old_ids` are the merchants that displayed the
+    name before the move. Returns how many bills changed.
+
+    A ref is the old merchant's when it carries one of those ids, or when
+    it carries only the old name (no id, or an id nothing here answers
+    to). The survivor joins the list once, never as a second chip beside
+    one the bill already had."""
+    survivor = _merchant_of_raw(conn, raws[0]) if raws else None
+    if survivor is None:
+        return 0
+    old_ids = {str(i) for i in old_ids if i}
+    low = display.lower()
+    changed = 0
+    offers, locked = _rename_locks(conn, display, old_ids)
+    for b in locked:
+        raw = as_dict(b["raw"])
+        refs, hit = _rename_hits(conn, raw, old_ids, low)
+        if not hit:
+            continue
+        rest = [r for r in refs if r not in hit]
+        had_into = any(r["id"] == survivor[0] for r in budget.resolve_refs(conn, rest))
+        notes = [n for n in (raw.get("merchant_merges") or []) if isinstance(n, dict)]
+        notes.append({"from": display, "into": survivor[1],
+                      "had_into": had_into, "raws": sorted(raws)})
+        _write_identity(conn, b["id"],
+                        rest + [{"id": survivor[0], "name": survivor[1]}], notes)
+        changed += 1
+    # a pending offer to add the old name to a bill now offers the survivor,
+    # or is moot when the bill already pays it
+    for p in offers:
+        ev = as_dict(p["evidence"])
+        bill = conn.execute("SELECT raw FROM bills WHERE payee=%s",
+                            (ev.get("bill_payee") or "",)).fetchone()
+        have = budget.resolve_refs(conn, budget.bill_refs(bill["raw"])) if bill else []
+        if any(r["id"] == survivor[0] for r in have):
+            conn.execute("UPDATE bill_proposals SET status='superseded', "
+                         "decided_at=now() WHERE id=%s", (p["id"],))
+        else:
+            conn.execute(
+                "UPDATE bill_proposals SET payee=%s, "
+                "evidence = evidence || %s::jsonb WHERE id=%s",
+                (survivor[1], jsonb({"merchant_name": survivor[1]}), p["id"]))
+    return changed
+
+
+def unfollow_merchant_rename(conn, raw_key: str, into: str) -> int:
+    """The undo of follow_merchant_rename for one raw string whose rename
+    to `into` was just reversed: every bill that rename re-pointed pays the
+    name the string displays under again. The survivor's chip leaves only
+    when the bill did not pay it before the merge and no other string of
+    that merge still files there (an undo runs one string at a time). A
+    bill whose list was edited since carries no note and is left as the
+    person set it. Returns how many bills changed."""
+    back = _merchant_of_raw(conn, raw_key)
+    if back is None:
+        return 0
+    into_low = into.lower()
+    changed = 0
+    for b in conn.execute(
+            "SELECT id, raw FROM bills WHERE raw ? 'merchant_merges' "
+            "FOR UPDATE").fetchall():
+        raw = as_dict(b["raw"])
+        notes = [n for n in (raw.get("merchant_merges") or []) if isinstance(n, dict)]
+        mine = [n for n in notes
+                if str(n.get("into") or "").lower() == into_low
+                and raw_key in (n.get("raws") or [])]
+        if not mine:
+            continue
+        refs = budget.bill_refs(raw) + [{"id": back[0], "name": back[1]}]
+        keep = []
+        for n in notes:
+            if n not in mine:
+                keep.append(n)
+                continue
+            left = [r for r in (n.get("raws") or []) if r != raw_key
+                    and (_merchant_of_raw(conn, r) or ("", ""))[1].lower() == into_low]
+            if left:
+                keep.append({**n, "raws": left})
+            elif not n.get("had_into"):
+                refs = [r for r in refs if r["name"].lower() != into_low]
+        _write_identity(conn, b["id"], refs, keep)
+        changed += 1
+    return changed
 
 
 def get_bill(conn, payee: str):
@@ -1151,13 +1383,30 @@ def settle_proposals_alert(conn) -> bool:
 
 def _apply_approved(conn, p, ev) -> dict:
     if p["kind"] == "add":
+        # An offer made before the person added the bill themselves (the
+        # detection pass and a hand save can cross) must not create a
+        # second bill for the same charge, nor overwrite the hand-entered
+        # one with the detected amount and cadence. The nightly would
+        # retire the offer as superseded; approving it early does the same.
+        cover = _cover_keys(conn.execute(
+            "SELECT payee, merchant FROM bills WHERE active = 1").fetchall())
+        key = budget._key_token(p["payee"] or "")
+        by = cover.get(key) if key else None
+        if by is not None:
+            conn.execute("UPDATE bill_proposals SET status='superseded', "
+                         "decided_at=now() WHERE id=%s", (p["id"],))
+            return {"error": f"'{by}' is already tracked — this offer "
+                             "was withdrawn"}
         save_bill(conn, payee=p["payee"], amount=p["amount"],
                   bill_type=p["bill_type"], frequency=p["frequency"],
                   interval=p["interval"] or 1, next_due=p["next_due"],
                   category=ev.get("category"), source="detected",
                   last_seen=ev.get("last_seen"),
                   by_month_day=ev.get("by_month_day"),
-                  income=bool(ev.get("income")), manual_touch=False)
+                  income=bool(ev.get("income")), manual_touch=False,
+                  # approving an offer to add the bill is the explicit ask
+                  # for it, even when an archived bill of that name exists
+                  revive=True)
     elif p["kind"] == "remove":
         n = conn.execute("UPDATE bills SET active=0, synced_at=now() "
                          "WHERE payee=%s", (p["payee"],)).rowcount
@@ -1211,7 +1460,10 @@ def _apply_approved(conn, p, ev) -> dict:
         apply_txn_categories(conn, bill_id=host["id"])
     elif p["kind"] in ("frequency_change", "type_change"):
         bill = get_bill(conn, p["payee"])
-        if bill is None:
+        # an archived bill is out of the schedule, as for the remove,
+        # attach and merchant kinds: a cadence change approved from a stale
+        # list must not edit, or bring back, a bill the person archived
+        if bill is None or not bill["active"]:
             return {"error": f"bill '{p['payee']}' no longer exists"}
         old = as_dict(bill["raw"])
         # manual_touch=False: approving a machine proposal is not a hand-edit
@@ -1303,6 +1555,41 @@ def _events(rows: list[dict]) -> list[dict]:
                                           "is_food": r["is_food"]})
         e["amount"] += r["amount"]
     return sorted(by_day.values(), key=lambda e: e["date"])
+
+
+def _withdrawn_rows(conn, today: dt.date) -> list[dict]:
+    """Posted charges the bank feed later took back, shaped like
+    _ledger_rows' rows so a bill's matcher reads them unchanged.
+
+    They are loaded by the budget's own reader (budget.withdrawn_rows) —
+    the evidence the overdue line uses to say "withdrawn by the bank feed",
+    with the same excluded accounts and account types — so the Bills page
+    and Today cannot disagree about which charges were withdrawn. They are
+    never spend and never a match: only proof that a bill WAS charged."""
+    since = today - dt.timedelta(days=LOOKBACK_MONTHS * 31)
+    out = []
+    for r in budget.withdrawn_rows(conn, since, today + dt.timedelta(days=1),
+                                   budget.load_config(conn)):
+        text = budget.match_text(r["payee"], r["name"])
+        out.append({"date": as_date(r["date"]), "amount": float(r["amount"]),
+                    "payee": r["payee"] or "?", "category": r["category"],
+                    "is_food": bool(r["is_food"]),
+                    "merchant_id": r["merchant_id"], "text": text,
+                    "tokens": budget._tokens(text)})
+    return out
+
+
+def _withdrawn_after(gone: list[dict], match, after: dt.date,
+                     bill_amt: float) -> list[dt.date]:
+    """Dates of the withdrawn charges that would have paid this bill after
+    its last live charge, oldest first. A withdrawn twin of a charge that
+    is still live sits on or before that charge and says nothing."""
+    tol = budget.bill_tolerance(bill_amt)
+    return [e["date"] for e in _events(
+                [r for r in gone
+                 if r["date"] > after
+                 and match(r["text"], r["tokens"], r["merchant_id"])])
+            if abs(e["amount"] - bill_amt) <= tol]
 
 
 def _run_from_end(dates: list[dt.date], cycle: int) -> list[dt.date]:
@@ -1428,23 +1715,16 @@ def run(conn, today: dt.date | None = None) -> dict:
     # snapshot: read separately, a rename committing between the two reads
     # hands the pass a row under its old name and a config under the new
     # one, and the bill is watched for a night as though it were enabled.
-    bills = conn.execute(
-        """SELECT b.*,
-                  COALESCE((SELECT jsonb_exists(s.config->'disabled_bills',
-                                                b.payee)
-                              FROM tenant_settings s
-                             WHERE jsonb_typeof(s.config->'disabled_bills')
-                                   = 'array'), false) AS budget_disabled
-             FROM bills b WHERE b.active = 1""").fetchall()
-    active_keys = set()
-    for b in bills:
-        k = budget._key_token(b["payee"] or "")
-        if k:
-            active_keys.add(k)
-        # a bill's merchant tokens mark its ledger groups as covered
-        active_keys |= budget._tokens(b["merchant"] or "")
-
     with conn.transaction():
+        bills = conn.execute(
+            """SELECT b.*,
+                      COALESCE((SELECT jsonb_exists(s.config->'disabled_bills',
+                                                    b.payee)
+                                  FROM tenant_settings s
+                                 WHERE jsonb_typeof(s.config->'disabled_bills')
+                                       = 'array'), false) AS budget_disabled
+                 FROM bills b WHERE b.active = 1""").fetchall()
+        active_keys = set(_cover_keys(bills))
         # supersede pending adds that an active bill now covers
         for p in conn.execute("SELECT id, payee FROM bill_proposals "
                               "WHERE status='pending' AND kind='add'").fetchall():
@@ -1456,6 +1736,14 @@ def run(conn, today: dt.date | None = None) -> dict:
         stats["income_rolled"] = advance_received_income(conn, today)
         _advance_due_dates(conn, today, stats)
         _maintain_bills(conn, bills, rows, today, stats)
+        # Coverage is read again right before proposing: the maintenance
+        # pass above can take seconds on a long fresh history, and a bill
+        # the person typed in meanwhile (the setup wizard runs detection as
+        # its bills step opens) must count, or the step offers to add the
+        # very bill they just added. A save landing after this read is
+        # caught when the offer is approved (_apply_approved).
+        active_keys = set(_cover_keys(conn.execute(
+            "SELECT payee, merchant FROM bills WHERE active = 1").fetchall()))
         _propose_new(conn, groups, active_keys, today, stats)
         _propose_income(conn, today, stats)
     # bills that carry a transaction category stamp the rows they match
@@ -1465,6 +1753,20 @@ def run(conn, today: dt.date | None = None) -> dict:
     stats["txn_category_applied"] = tc["applied"]
     stats["txn_category_reverted"] = tc["reverted"]
     return stats
+
+
+def _cover_keys(bills) -> dict[str, str]:
+    """The ledger-group keys the given active bills already cover, each
+    mapped to the bill that covers it: a bill's own key token, and its
+    merchant's tokens (the bill matcher claims those rows)."""
+    out: dict[str, str] = {}
+    for b in bills:
+        k = budget._key_token(b["payee"] or "")
+        if k:
+            out.setdefault(k, b["payee"])
+        for t in budget._tokens(b["merchant"] or ""):
+            out.setdefault(t, b["payee"])
+    return out
 
 
 def _scan_months(rec: dict) -> int:
@@ -1509,10 +1811,27 @@ def _advance_due_dates(conn, today, stats):
         # merge only the keys this pass owns — a whole-raw overwrite from
         # the loop's snapshot read would race a user's concurrent save and
         # lose whatever they had just written (lock_amount, companions, …)
-        conn.execute("UPDATE bills SET due_on=%s, raw = COALESCE(raw, '{}'::jsonb) || %s::jsonb, "
-                     "synced_at=now() WHERE id=%s",
-                     (nxt, jsonb(delta), b["id"]))
-        stats["due_advanced"] += 1
+        if _roll_due(conn, b, nxt, delta):
+            stats["due_advanced"] += 1
+
+
+def _roll_due(conn, snap, nxt: dt.date, delta: dict) -> bool:
+    """Write a computed due-date roll only if the schedule it was computed
+    from is still the bill's schedule. The roll is derived from a snapshot
+    read without a lock; a hand edit to the due date or recurrence that
+    commits in between must win, not be replaced by a date projected from
+    the old anchor — and a slow pass must not write a due date back over a
+    roll a later pass already made. Returns whether the row was written."""
+    raw = as_dict(snap["raw"])
+    cur = conn.execute(
+        "UPDATE bills SET due_on=%s, raw = COALESCE(raw, '{}'::jsonb) || %s::jsonb, "
+        "synced_at=now() WHERE id=%s AND active = 1 "
+        "AND due_on IS NOT DISTINCT FROM %s "
+        "AND COALESCE(raw->'recurrence', '{}'::jsonb) = %s::jsonb "
+        "AND COALESCE(raw->>'bill_type', '') = %s",
+        (nxt, jsonb(delta), snap["id"], as_date(snap["due_on"]),
+         jsonb(raw.get("recurrence") or {}), raw.get("bill_type") or ""))
+    return cur.rowcount > 0
 
 
 def advance_received_income(conn, today: dt.date | None = None) -> int:
@@ -1580,13 +1899,11 @@ def advance_received_income(conn, today: dt.date | None = None) -> int:
             y, m = (y, m + 1) if m < 12 else (y + 1, 1)
         if not nxt:
             continue
-        # merge only this pass's keys — see _advance_due_dates: a whole-raw
-        # overwrite from the loop's snapshot would race a concurrent save
-        conn.execute("UPDATE bills SET due_on=%s, raw = COALESCE(raw, '{}'::jsonb) || %s::jsonb, "
-                     "synced_at=now() WHERE id=%s",
-                     (nxt, jsonb({"lastDueOn": due.isoformat(),
-                                  "dueOn": nxt.isoformat()}), b["id"]))
-        n += 1
+        # merge only this pass's keys, and only onto the schedule the roll
+        # was computed from — see _roll_due
+        if _roll_due(conn, b, nxt, {"lastDueOn": due.isoformat(),
+                                    "dueOn": nxt.isoformat()}):
+            n += 1
     return n
 
 
@@ -1940,6 +2257,14 @@ def _maintain_bills(conn, bills, rows, today, stats):
     # The flag rides on the row (run reads it in the row's own statement),
     # not on a config re-read that a rename can have moved out from under.
     ids = budget.bill_merchant_ids(conn, bills)
+    withdrawn: list[list[dict]] = []
+
+    def gone() -> list[dict]:
+        # loaded once, and only when a bill is about to be called dead
+        if not withdrawn:
+            withdrawn.append(_withdrawn_rows(conn, today))
+        return withdrawn[0]
+
     for b in bills:
         payee = b["payee"] or ""
         if b["budget_disabled"]:
@@ -1975,8 +2300,8 @@ def _maintain_bills(conn, bills, rows, today, stats):
                 if events and all(c == 0 for c in counts12) and not this_month:
                     pid = _sig("remove", key, "env12",
                                _month_key(events[-1]["date"]))
-                    if _insert_proposal(
-                            conn, pid=pid, kind="remove", payee=payee,
+                    if _propose_for(
+                            conn, b, pid=pid, kind="remove", payee=payee,
                             amount=bill_amt, bill_type="envelope",
                             evidence={"last_seen": events[-1]["date"].isoformat(),
                                       "pool_months": 12}):
@@ -2006,7 +2331,7 @@ def _maintain_bills(conn, bills, rows, today, stats):
             if events and all(c == 0 for c in c2) and not this_month:
                 pid = _sig("remove", key, "env",
                            _month_key(events[-1]["date"]))
-                if _insert_proposal(conn, pid=pid, kind="remove", payee=payee,
+                if _propose_for(conn, b, pid=pid, kind="remove", payee=payee,
                                     amount=bill_amt, bill_type="envelope",
                                     evidence={"last_seen": events[-1]["date"].isoformat()}):
                     stats["proposed_remove"] += 1
@@ -2036,7 +2361,7 @@ def _maintain_bills(conn, bills, rows, today, stats):
             due = as_date(raw.get("dueOn"))
             if due and (today - due).days > 60:
                 pid = _sig("remove", key, "onetime", due.isoformat())
-                if _insert_proposal(conn, pid=pid, kind="remove", payee=payee,
+                if _propose_for(conn, b, pid=pid, kind="remove", payee=payee,
                                     amount=bill_amt,
                                     evidence={"due_on": due.isoformat()}):
                     stats["proposed_remove"] += 1
@@ -2045,10 +2370,17 @@ def _maintain_bills(conn, bills, rows, today, stats):
         # removal: 2 fully missed cycles (only for bills the ledger has seen),
         # AND the merchant itself must be gone — a merchant still charging at
         # a different price is an amount problem, not a dead bill
+        # A charge the bank feed withdrew is proof the merchant DID charge:
+        # silence is measured from it, so a withdrawn cycle can never be
+        # what makes a bill look dead.
         if (amt_matched and (today - amt_matched[-1]["date"]).days > 2 * cycle
-                and (not events or (today - events[-1]["date"]).days > 2 * cycle)):
+                and (not events or (today - events[-1]["date"]).days > 2 * cycle)
+                and not any((today - d).days <= 2 * cycle
+                            for d in _withdrawn_after(
+                                gone(), match, amt_matched[-1]["date"],
+                                bill_amt))):
             pid = _sig("remove", key, cycle, _month_key(amt_matched[-1]["date"]))
-            if _insert_proposal(conn, pid=pid, kind="remove", payee=payee,
+            if _propose_for(conn, b, pid=pid, kind="remove", payee=payee,
                                 amount=bill_amt,
                                 evidence={"last_seen": amt_matched[-1]["date"].isoformat(),
                                           "cycle_days": cycle}):
@@ -2095,7 +2427,7 @@ def _maintain_bills(conn, bills, rows, today, stats):
                     ev = _cycle_to_proposal(cyc, run_dates, med, amt_matched)
                     ev["old_cycle_days"] = cycle
                     pid = _sig("freq", key, cyc[0], cycle)
-                    if _insert_proposal(conn, pid=pid, kind="frequency_change",
+                    if _propose_for(conn, b, pid=pid, kind="frequency_change",
                                         payee=payee, amount=round(med, 2),
                                         frequency=cyc[1], interval=cyc[2],
                                         next_due=ev["next_due"], evidence=ev):
@@ -2111,7 +2443,7 @@ def _maintain_bills(conn, bills, rows, today, stats):
                   "charges_per_month": dict(zip(months3, counts)),
                   "last_seen": events[-1]["date"].isoformat()}
             pid = _sig("type", key, "env", round(monthly, -1))
-            if _insert_proposal(conn, pid=pid, kind="type_change", payee=payee,
+            if _propose_for(conn, b, pid=pid, kind="type_change", payee=payee,
                                 amount=monthly, bill_type="envelope", evidence=ev):
                 stats["proposed_change"] += 1
 
@@ -2298,10 +2630,19 @@ def _suggest(health: str, fit: dict | None, cycle: int | None,
     return None
 
 
-def _bill_health(b, raw: dict, events: list[dict], today: dt.date) -> dict:
+def _bill_health(b, raw: dict, events: list[dict], today: dt.date,
+                 withdrawn: list[dt.date] = ()) -> dict:
     """Health verdict for one active bill vs the ledger. Stale = 1 missed
     cycle (+ posting grace) — a full cycle of warning before the 2-cycle
-    removal proposal fires."""
+    removal proposal fires.
+
+    `withdrawn`: dates of charges that would have paid the bill after its
+    last live one but that the bank feed took back (_withdrawn_after).
+    When one of them covers the cycle that made the bill stale, the bill
+    WAS charged and the verdict is "withdrawn" — a warning, with no
+    suggestion to review or remove it. It covers ONE cycle: if the cycle
+    after it is missed as well (never charged, or withdrawn again), the
+    bill reads stale as before."""
     bill_amt = abs(b["amount"] or 0)
     bill_type = raw.get("bill_type", "occurrence")
     rec = raw.get("recurrence") or {}
@@ -2349,6 +2690,7 @@ def _bill_health(b, raw: dict, events: list[dict], today: dt.date) -> dict:
                                  and _fit_suggests_change(raw, fit, bill_amt))}
 
     cycle = budget._cycle_days(rec)
+    withdrawn_on = None
     if not amt_matched:
         # merchant IS in the ledger but never near the configured amount —
         # the case the 'ledger says' prefill exists for. With too few
@@ -2361,7 +2703,11 @@ def _bill_health(b, raw: dict, events: list[dict], today: dt.date) -> dict:
         # latest charge is off-amount; that's drift, not stale.
         last_seen = events[-1]["date"] if events else last
         if (today - last_seen).days > cycle + 5:
-            health = "stale"
+            took = [d for d in withdrawn if d > last_seen]
+            if took and (today - took[0]).days <= cycle + 5:
+                health, withdrawn_on = "withdrawn", took[0]
+            else:
+                health = "stale"
         elif not is_income and (today - last).days > 2 * cycle + 5:
             # merchant still charging but nothing near the configured amount
             # for 2+ cycles — a permanent price jump beyond the tolerance
@@ -2378,6 +2724,9 @@ def _bill_health(b, raw: dict, events: list[dict], today: dt.date) -> dict:
             health = "ok"
     return {"health": health, "last_match": last, "fit": fit,
             "matched": len(amt_matched),
+            # the date of the withdrawn charge behind a "withdrawn" verdict;
+            # last_match stays the last LIVE charge
+            "withdrawn_on": withdrawn_on,
             # the newest charge the ledger has for this merchant, whatever
             # its amount — so a "mismatch" can say what it saw
             "last_seen": ({"date": events[-1]["date"],
@@ -2405,7 +2754,7 @@ def analyze_bills(conn, today: dt.date | None = None, *,
     # bill's tolerance is evidence the bill is right, not a mismatch to
     # nag about until it posts. Detection (bills.run) stays posted-only —
     # a pending row can still vanish or change amount.
-    spend = income = None
+    spend = income = gone = None
     out = {}
     # each bill's merchant identity (the names its rows display under), so
     # a payee the bank renamed keeps matching its own charges
@@ -2469,7 +2818,21 @@ def analyze_bills(conn, today: dt.date | None = None, *,
                     r["tokens"] = budget._tokens(r["text"])
                 if match(r["text"], r["tokens"], r["merchant_id"]):
                     matched.append(r)
-        out[payee_] = _bill_health(b, raw, _events(matched), today)
+        verdict = _bill_health(b, raw, _events(matched), today)
+        if verdict["health"] == "stale" and verdict.get("cycle_days") \
+                and (b["amount"] or 0) <= 0 and verdict["last_match"]:
+            # a stale bill only: was the cycle it missed charged and then
+            # withdrawn by the feed? The withdrawn rows load once, the
+            # first time any bill needs them
+            if gone is None:
+                gone = _withdrawn_rows(conn, today)
+            took = _withdrawn_after(
+                gone, match, _events(matched)[-1]["date"],
+                abs(b["amount"] or 0))
+            if took:
+                verdict = _bill_health(b, raw, _events(matched), today,
+                                       withdrawn=took)
+        out[payee_] = verdict
     return out
 
 
@@ -2681,6 +3044,7 @@ def merchant_history(conn, payee: str, today: dt.date | None = None,
     txns = []
     for r in conn.execute(
             f"""SELECT t.id AS txn_id, t.date, t.amount, t.pending,
+                      t.account_id,
                       t.merchant_id::text AS merchant_id,
                       {merchant_dedup.DISPLAY_MERCHANT} AS payee,
                       -- what the bank literally sent, kept beside the display
@@ -2721,10 +3085,18 @@ def merchant_history(conn, payee: str, today: dt.date | None = None,
                               for m, env, amt, tol in others))
         if ok:
             txns.append(r)
+    # The list shows every matching row, the twin a linked or hidden account
+    # holds included, so it agrees with what a bulk edit from this page
+    # would touch. The figures below are money and count each charge once:
+    # a linked account's non-primary sources and a hidden account
+    # contribute to nothing (links.shadow_ids), as on every other total.
+    from . import links
+    shadows = links.shadow_ids(conn)
+    counted = [r for r in txns if r["account_id"] not in shadows]
     events = _events([{"date": as_date(r["date"]),
                        "amount": r["amount"], "payee": r["payee"] or "?",
                        "category": r["category"], "is_food": False}
-                      for r in txns if r["amount"] > 0 and not r["pending"]])
+                      for r in counted if r["amount"] > 0 and not r["pending"]])
 
     # direction: an income series (or an inflow-dominant merchant) aggregates
     # its INFLOWS — but transfers/CC-credits are the user's own money and
@@ -2736,12 +3108,13 @@ def merchant_history(conn, payee: str, today: dt.date | None = None,
 
     inflow = ((is_bill and (row["amount"] or 0) > 0)
               or (not is_bill
-                  and sum(1 for r in txns if _real_inflow(r))
-                  > sum(1 for r in txns if r["amount"] > 0 and not r["pending"])))
+                  and sum(1 for r in counted if _real_inflow(r))
+                  > sum(1 for r in counted
+                        if r["amount"] > 0 and not r["pending"])))
     disp_events = (_events([{"date": as_date(r["date"]),
                              "amount": -r["amount"], "payee": r["payee"] or "?",
                              "category": r["category"], "is_food": False}
-                            for r in txns if _real_inflow(r)])
+                            for r in counted if _real_inflow(r)])
                    if inflow else events)
     # The CURRENT month belongs in the table too — otherwise a bill already
     # paid this month is invisible in the monthly totals while the txn list
@@ -2778,10 +3151,11 @@ def merchant_history(conn, payee: str, today: dt.date | None = None,
                  AND COALESCE(t.category_detailed,'') != 'LOAN_PAYMENTS_CREDIT_CARD_PAYMENT'
                  AND COALESCE(t.category_override, t.category_primary, '')
                      NOT IN ('TRANSFER_IN','TRANSFER_OUT')
+                 AND NOT (t.account_id = ANY(%s))
                  -- the lifetime aggregate is lifetime BY DEFINITION, so it
                  -- cannot take a date bound; the merchant predicate is what
                  -- keeps it off the rest of the ledger
-                 AND {match_frag}""", match_params or None).fetchall():
+                 AND {match_frag}""", (shadows, *match_params)).fetchall():
         text = budget.match_text(r["raw_payee"], r["name"])
         # same display-first rule as the txn list above: the lifetime
         # aggregate sits beside it, so a different matcher here would print
@@ -2817,11 +3191,65 @@ def merchant_history(conn, payee: str, today: dt.date | None = None,
             "logo": logo}
 
 
+# The bill row now, with its paused flag tested the way the pass's
+# snapshot query tests it (by the row's CURRENT payee, so a rename that
+# committed mid-pass is followed too).
+_FRESH_BILL_SQL = """
+    SELECT b.amount, b.monthly_amount, b.raw, b.active,
+           COALESCE((SELECT jsonb_exists(s.config->'disabled_bills', b.payee)
+                       FROM tenant_settings s
+                      WHERE jsonb_typeof(s.config->'disabled_bills')
+                            = 'array'), false) AS budget_disabled
+      FROM bills b WHERE b.id=%s"""
+
+
+def _still_watched(conn, bill_row) -> bool:
+    """False once the bill was paused or retired after the pass read it.
+    The pass decides from a snapshot taken before any lock, and a Disable
+    commits to tenant_settings without touching the bill row — so a
+    proposal decided from that snapshot is re-checked here, or a bill the
+    person just paused is offered for removal anyway. No row lock: the
+    proposal writes nothing to the bill, and a lock held to the end of the
+    pass would stall the person's own save behind it."""
+    fresh = conn.execute(_FRESH_BILL_SQL, (bill_row["id"],)).fetchone()
+    return bool(fresh and fresh["active"] and not fresh["budget_disabled"])
+
+
+def _propose_for(conn, bill_row, **kw) -> bool:
+    """`_insert_proposal` for a proposal about an existing bill, filed only
+    while that bill is still watched."""
+    if not _still_watched(conn, bill_row):
+        return False
+    return _insert_proposal(conn, **kw)
+
+
 def _apply_drift(conn, bill_row, new_amt: float, evidence: dict, stats,
                  today: dt.date | None = None):
     """Auto-update a bill's amount (no approval needed) and
     leave an `auto` audit row for the email digest."""
     today = today or localtime.household_day(conn)
+    # The drift was decided from a snapshot read before the pass took any
+    # lock. A hand edit (a new amount, a pin, a fresh grace stamp) that
+    # committed since must win: re-read the row under its lock and skip the
+    # automatic write unless the amount and the protection flags are still
+    # what the decision saw. Skipping also keeps the drift notice honest —
+    # it is suppressed for bills edited on or after the drift's day, on the
+    # premise that no drift lands on a bill edited that day.
+    # A Disable tapped mid-pass writes tenant_settings, not the bill row,
+    # so the row lock alone would not see it: the paused flag is read in
+    # the same statement, as the pass's snapshot read it.
+    fresh = conn.execute(_FRESH_BILL_SQL + " FOR UPDATE",
+                         (bill_row["id"],)).fetchone()
+    if fresh is None or not fresh["active"] or fresh["budget_disabled"]:
+        return
+    snap_raw, fresh_raw = as_dict(bill_row["raw"]), as_dict(fresh["raw"])
+    if (abs(float(fresh["amount"] or 0) - float(bill_row["amount"] or 0)) > 0.005
+            or fresh_raw.get("lock_amount")
+            or in_manual_grace(fresh_raw, today)
+            or fresh_raw.get("manual_edited_at") != snap_raw.get("manual_edited_at")):
+        return
+    bill_row = dict(bill_row, monthly_amount=fresh["monthly_amount"],
+                    raw=fresh["raw"])
     old = abs(bill_row["amount"] or 0)
     # a $0 row must not flip to +amount (the income convention), which
     # would make it invisible everywhere; bills are negative unless the row

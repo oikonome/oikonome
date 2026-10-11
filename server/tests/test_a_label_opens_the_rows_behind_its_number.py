@@ -117,7 +117,7 @@ class BucketLedgerEngineTests(unittest.TestCase):
 
     def test_a_name_that_is_not_a_bucket_has_no_rows(self):
         self.assertIsNone(budget.bucket_ledger(self.st, "Nope"))
-        self.assertIsNone(budget.bucket_ledger(self.st, "fixed"))
+        self.assertIsNone(budget.bucket_ledger(self.st, "savings"))
 
     def test_envelope_overflow_opens_the_purchase_it_came_from(self):
         """An envelope's overflow slice is not a ledger row — it is part of
@@ -240,6 +240,16 @@ class LedgerLinkApiTests(unittest.TestCase):
             r = self.client.get("/api/transactions",
                                 params={"bucket": "Yachts", "y": 2026})
             self.assertEqual(r.status_code, 400)
+
+    def test_a_years_bucket_pace_counts_only_the_months_it_summed(self):
+        """The year figure sums the budgeted months only (here, the month
+        in progress), so its per-day pace divides by those months' days —
+        not by every day since January 1, which reads several times too
+        low for a household that started budgeting mid-year."""
+        year = self.get(bucket="food", y=2026)
+        self.assertEqual(year["per_day_days"], TODAY.day)
+        self.assertEqual(year["per_day"],
+                         round(year["bucket_amount"] / TODAY.day, 2))
 
     def test_a_past_months_bucket_lists_that_month(self):
         body = self.get(bucket="food", y=2026, m=6)
@@ -415,6 +425,48 @@ class LedgerLinkApiTests(unittest.TestCase):
         self.assertEqual(keys["?"], "?")
         subs = {s[0]: s[2] for s in summary["amazon_subs"]}
         self.assertEqual(subs["Household"], "Amazon - Household")
+
+
+class BucketPaceIsTheTilesFigureTests(unittest.TestCase):
+    """A bucket's per-day pace is the number the tile counted over its
+    days. An envelope's overflow lists the whole purchase while the tile
+    counts only the part past the envelope, so the listed rows' raw sum
+    overstates the pace."""
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ["OIKONOME_DEV"] = "1"
+        _ensure_db()
+        import oikonome.web.app as appmod
+        appmod.DEV_MODE = True
+        cls.client = TestClient(appmod.app)
+        r = cls.client.post("/api/signup", data={
+            "email": f"pace-{uuid.uuid4().hex[:8]}@example.dev",
+            "password": "correct-horse-battery"})
+        assert r.status_code == 200, r.text
+        tid = cls.client.get("/api/me").json()["tenant_id"]
+        conn = tenancy.tenant_connect(tid)
+        try:
+            seed_accounts(conn)
+            write_config(conn, food_monthly=1000, other_monthly=1000)
+            add_txn(conn, dt.date(2026, 7, 9), 200.0, "GAS AND GO",
+                    primary="TRANSPORTATION")
+            add_bill(conn, "Gas and Go", 50.0, bill_type="envelope",
+                     last_seen=dt.date(2026, 7, 1))
+        finally:
+            conn.close()
+
+    def test_month_pace_divides_the_counted_figure_not_the_rows_sum(self):
+        with mock.patch("oikonome.localtime.now_local", return_value=LOCAL_NOW):
+            r = self.client.get("/api/transactions",
+                                params={"bucket": "other", "y": 2026, "m": 7})
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertLess(body["bucket_amount"], body["spend_sum"],
+                        "fixture: the overflow purchase is listed whole")
+        self.assertEqual(body["per_day_days"], TODAY.day)
+        self.assertEqual(body["per_day"],
+                         round(body["bucket_amount"] / TODAY.day, 2))
 
 
 class EmailLabelLinkTests(unittest.TestCase):

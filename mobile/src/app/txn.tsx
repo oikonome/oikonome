@@ -8,7 +8,7 @@
 // only the queries the write could really have moved.
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Alert, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput,
          View } from "react-native";
 
@@ -16,15 +16,16 @@ import * as DocumentPicker from "expo-document-picker";
 import * as ImagePicker from "expo-image-picker";
 
 import { Card, H, KV } from "../components/ui";
-import { errText, getHandedOffTxn, SplitPart, TodayFull, Txn,
+import { discardPicked, errText, getHandedOffTxn, Receipt, SplitPart, TodayFull, Txn,
          TxnPage } from "../lib/api";
 import { patchQueries, removeFromList } from "../lib/cache";
 import { categoryForServer, CLEAR_CATEGORY, catLabel, filterCategories,
-         isCategoryReset, spendPickerGroups } from "../lib/pure";
+         isCategoryReset, spendPickerGroups, CATEGORY_MAX, goneTxnIds } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { useDemo, useViewer } from "../lib/viewer";
-import { rankWaiting, useMatchReceipt, useUnmatchReceipt, useWaitingReceipts,
-         waitingMatches } from "../lib/waiting";
+import { forgetParseStart, parseStalled, rankWaiting, useMatchReceipt,
+         useUnmatchReceipt, useWaitingReceipts, waitingMatches }
+  from "../lib/waiting";
 import { C, mmddyy, money } from "../lib/theme";
 import MerchantAvatar from "../components/merchant-avatar";
 
@@ -51,7 +52,11 @@ export default function TxnDetail() {
   const { client } = useSession();
   const router = useRouter();
   const qc = useQueryClient();
-  const initial = getHandedOffTxn(id ? String(id) : undefined);
+  // The hand-off is one slot that the next row tap overwrites, so it is
+  // read once, when this screen mounts: coming back to it from a later
+  // transaction must still find its own receipts and history.
+  const [initial] = useState(() =>
+    getHandedOffTxn(id ? String(id) : undefined));
   const [txn, setTxn] = useState<Txn | null>(initial);
   const [picking, setPicking] = useState(false);
   const [filter, setFilter] = useState("");
@@ -102,15 +107,36 @@ export default function TxnDetail() {
     },
     onError: (e) => setErr(errText(e)),
   });
+  // the receipt writes (upload, parse, remove) are refused to viewers and
+  // on the demo; match and unmatch stay open there
+  const mayWriteReceipts = !viewer && !demo;
+  const waiting = useWaitingReceipts();
+  // a parse whose worker died stays 'parsing'; past the server's reclaim
+  // window the poll stops and a retry is offered
+  const [now, setNow] = useState(() => Date.now());
+  const stalled = (r: Receipt, at = now) => parseStalled(r, at);
+  // Poll only while a live parse is running: an 'uploaded' receipt on an
+  // instance with no vision model never changes, and a stalled parse will
+  // not finish on its own.
   const receipts = useQuery({
     queryKey: ["receipts", initial?.id],
     queryFn: () => client!.receipts(initial!.id),
     enabled: !!client && !!initial?.id,
     refetchInterval: (query) =>
-      query.state.data?.receipts.some(
-        (r) => r.status === "parsing" || r.status === "uploaded")
+      waiting.data?.ai_available !== false
+      && query.state.data?.receipts.some(
+        (r) => r.status === "parsing" && !stalled(r, Date.now()))
         ? 3000 : false,
   });
+  const parsingNow = (receipts.data?.receipts ?? []).some(
+    (r) => r.status === "parsing" && !stalled(r));
+  // a clock for the stall check while something is parsing, so the retry
+  // appears when the poll stops rather than on some later render
+  useEffect(() => {
+    if (!parsingNow) return;
+    const t = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(t);
+  }, [parsingNow]);
   const upload = useMutation({
     mutationFn: ({ uri, kind, name, type }: {
       uri: string; kind: "receipt" | "check";
@@ -118,6 +144,9 @@ export default function TxnDetail() {
     }) => client!.receiptUpload(txn!.id, uri, kind, name, type),
     onSuccess: () => { receipts.refetch(); invalidateLedgers(); },
     onError: (e) => setErr(errText(e)),
+    // the picker's copy (a check carries the full account number) does
+    // not stay in the cache once it has been sent or refused
+    onSettled: (_d, _e, v) => { void discardPicked(v.uri); },
   });
   const delReceipt = useMutation({
     mutationFn: (id: string) => client!.receiptDelete(id),
@@ -132,7 +161,6 @@ export default function TxnDetail() {
   // (the matcher could not decide, or nothing was read off the receipt),
   // and a matched one can be put back to waiting — the web ReceiptPanel's
   // "snapped earlier and still waiting" row and unmatch button
-  const waiting = useWaitingReceipts();
   const matchWaiting = useMatchReceipt();
   const unmatchReceipt = useUnmatchReceipt();
   // ranked against THIS charge (amount, then date), so the receipt that
@@ -229,6 +257,7 @@ export default function TxnDetail() {
   // it when the user lands back on it
   const dropRow = () => {
     const id = txn!.id;
+    goneTxnIds.add(id);
     const drop = (rows: Txn[]) => rows.filter((r) => r.id !== id);
     patchQueries<TxnPage>(qc, ["transactions"],
       (o) => ({ ...o, rows: drop(o.rows) }));
@@ -316,6 +345,10 @@ export default function TxnDetail() {
         // month the row is in — so it refetches either way (cheap)
         invalidateLedgers();
       }
+      // the row's spend moves between categories in the Spending report
+      // and both lenses
+      qc.invalidateQueries({ queryKey: ["report"] });
+      qc.invalidateQueries({ queryKey: ["lens"] });
     },
     onError: (e, _v, ctx) => {
       if (ctx?.before) setTxn(ctx.before);
@@ -332,8 +365,7 @@ export default function TxnDetail() {
     setSplitDraft(null);
     invalidateLedgers();
     qc.invalidateQueries({ queryKey: ["report"] });
-    qc.invalidateQueries({ queryKey: ["lens-month"] });
-    qc.invalidateQueries({ queryKey: ["lens-year"] });
+    qc.invalidateQueries({ queryKey: ["lens"] });
   };
   const splitSave = useMutation({
     mutationFn: (parts: SplitPart[]) => client!.txnSplitSet(txn!.id, parts),
@@ -863,7 +895,7 @@ export default function TxnDetail() {
                   </Text>
                 ) : null}
               </View>
-              {!viewer && (
+              {mayWriteReceipts && (
                 <Text style={[{ color: C.mut, fontSize: 16, padding: 4 },
                       delReceipt.isPending && delReceipt.variables === r.id
                         && { opacity: 0.4 }]}
@@ -872,7 +904,10 @@ export default function TxnDetail() {
               )}
             </View>
             {/* the web ReceiptPanel's depth, row by row */}
-            {r.status === "parsing" && (
+            {r.status === "parsing" && stalled(r) && (
+              <Text style={s.mut}>This read has stalled — retry it.</Text>
+            )}
+            {r.status === "parsing" && !stalled(r) && (
               <Text style={s.mut}>
                 Parsing… safe to navigate away — queued work shows under
                 Settings → System health.
@@ -916,13 +951,31 @@ export default function TxnDetail() {
                   original
                 </Text>
               ) : null}
-              {!viewer && r.status !== "parsed"
-                && r.status !== "parsing" && (
+              {/* the parse needs the instance's vision model: without one
+                  the server refuses it, so offer where one is added instead
+                  (the web panel's and the waiting list's rule) */}
+              {mayWriteReceipts && r.status !== "parsed"
+                && (r.status !== "parsing" || stalled(r))
+                && waiting.data?.ai_available && (
                 <Text style={{ color: C.accent, fontSize: 12 }}
-                      onPress={() => !parse.isPending && parse.mutate(r.id)}>
+                      onPress={() => {
+                        if (parse.isPending) return;
+                        forgetParseStart(r.id);
+                        parse.mutate(r.id);
+                      }}>
                   {parse.isPending && parse.variables === r.id ? "queuing…"
-                    : r.status === "failed" ? "retry parse" : "parse now"}
+                    : r.status === "failed" || r.status === "parsing"
+                      ? "retry parse" : "parse now"}
                 </Text>
+              )}
+              {mayWriteReceipts && r.status !== "parsed"
+                && r.status !== "parsing" && waiting.data
+                && !waiting.data.ai_available && (
+                <Text style={{ color: C.mut, fontSize: 12 }}>
+                  no AI endpoint to read it —{" "}
+                  <Text style={{ color: C.accent }}
+                        onPress={() => router.push("/settings")}>
+                    Settings → AI</Text></Text>
               )}
             </View>
           </View>
@@ -969,6 +1022,7 @@ export default function TxnDetail() {
               </View>)}
           </View>
         )}
+        {mayWriteReceipts && (
         <View style={{ flexDirection: "row", gap: 8, marginTop: 8,
                        flexWrap: "wrap" }}>
           <Pressable style={s.btn} disabled={upload.isPending}
@@ -1008,6 +1062,7 @@ export default function TxnDetail() {
             </Text>
           </Pressable>
         </View>
+        )}
         <Text style={s.mut}>
           Parsed line items also appear on the Items page and match the
           Transactions search.
@@ -1035,8 +1090,8 @@ export default function TxnDetail() {
           <KV k="Avg / active month"
               v={money(hist.data.lifetime.avg_monthly_active, false)}
               tone="mut" />
-          {hist.data.monthly.slice(-6).reverse().map((m) => (
-            <KV key={m.month} k={m.month}
+          {hist.data.monthly.slice(0, 6).map((m) => (
+            <KV key={m.month} k={mmddyy(m.month + "-01")}
                 v={`${money(m.total, false)} · ${m.count}`} tone="mut" />
           ))}
           {hist.data.bill ? (
@@ -1070,8 +1125,10 @@ export default function TxnDetail() {
         <View style={s.sheetWrap}>
           <View style={s.sheet}>
             <Text style={s.sheetTitle}>Category</Text>
+            {/* the filter doubles as a new custom name ("✎ Create …") */}
             <TextInput style={s.search} placeholder="filter…"
                        placeholderTextColor={C.mut} autoCapitalize="none"
+                       maxLength={CATEGORY_MAX}
                        value={filter} onChangeText={setFilter} />
             <ScrollView style={{ maxHeight: 420 }}>
               {cats.isPending && <Text style={s.mut}>Loading…</Text>}

@@ -40,6 +40,13 @@ RESTORED = {
     # the shadow set: without it a round trip un-shadows every duplicate
     # source of the same real account and the money aggregates double-count
     "account_links",
+    # the ids an account stood under before a reconnect moved it: a file
+    # row keeps the id it was hashed under, so without this lineage a
+    # statement re-imported after a restore adds every pre-feed line a
+    # second time. Only the lineage is restored, each row already
+    # reconciled, so the destination is never told to drop a backfill it
+    # has not held
+    "account_adoptions",
 }
 
 # Intentionally NOT round-tripped, with the reason. If you add a table here,
@@ -47,11 +54,12 @@ RESTORED = {
 SKIP = {
     "alerts_log": "log, regenerated",
     "import_staging": "import scratch",
+    "bulk_import_jobs": "import scratch and job bookkeeping",
+    "bulk_import_files": "import scratch and job bookkeeping",
     "job_progress": "job bookkeeping",
     "job_runs": "job bookkeeping / heartbeats",
     "feedback_reports": "operational ring buffer (off on hosted)",
     "sync_log": "sync history",
-    "account_adoptions": "reconnect bookkeeping — instance-local, and exporting it\n                          would tell a fresh instance to drop a backfill it does not have",
     "script_heartbeats": "collector heartbeats",
     "tenant_keys": "envelope key — SECRET, must never export",
     "receipts": "receipt images — bytes excluded from export by design",

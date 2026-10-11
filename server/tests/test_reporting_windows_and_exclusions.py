@@ -26,7 +26,7 @@ class FlowBreakdownExcludedAccountsTests(unittest.TestCase):
     def setUp(self):
         self.conn = make_db()
         seed_accounts(self.conn)
-        self.today = dt.date(2026, 8, 31)
+        self.today = dt.date(2026, 9, 1)   # the fixture months have closed
         reporting._FIXED_MONTH_CACHE.clear()
 
     def tearDown(self):
@@ -91,7 +91,7 @@ class EveryReportSharesTheExclusionTests(unittest.TestCase):
             "balance_current) VALUES "
             "('side','it1','Side Checking','depository','checking',900)")
         write_config(self.conn, excluded_accounts=["side"])
-        self.today = dt.date(2026, 8, 31)
+        self.today = dt.date(2026, 9, 1)   # the fixture months have closed
         reporting._FIXED_MONTH_CACHE.clear()
         # counted: $240 out, $3,000 in — both on the ordinary checking
         _txn(self.conn, "chk", dt.date(2026, 8, 12), 240.0, "GROCER",
@@ -132,6 +132,10 @@ class EveryReportSharesTheExclusionTests(unittest.TestCase):
         self.assertEqual(m["net"], 2760.0)
 
     def test_compute_cashflow_omits_the_excluded_accounts_rows(self):
+        # the counted checking feed covers all of 2026, so the year's income
+        # is known (a transfer opens it: neither spend nor income)
+        _txn(self.conn, "chk", dt.date(2026, 1, 2), 25.0, "FEED OPENED",
+             category_primary="TRANSFER_OUT")
         cf = reporting.compute_cashflow(self.conn, today=self.today)
         year = {r[0]: r for r in cf["savings_by_year"]}["2026"]
         self.assertEqual(year[1], 3000.0)          # income
@@ -187,7 +191,7 @@ class WindowMonthsDivisorTests(unittest.TestCase):
         self.conn = make_db()
         write_config(self.conn)
         seed_accounts(self.conn)
-        self.today = dt.date(2026, 8, 31)
+        self.today = dt.date(2026, 9, 1)   # the fixture months have closed
 
     def tearDown(self):
         self.conn.close()

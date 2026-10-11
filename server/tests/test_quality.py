@@ -15,13 +15,13 @@ from .util import make_db
 
 class SeedMatchTests(unittest.TestCase):
     def test_common_chains(self):
-        self.assertEqual(merchant_seed.match("TRADER JOES #451"),
+        self.assertEqual(merchant_seed.match("TRADER JOES #000"),
                          "FOOD_AND_DRINK")
-        self.assertEqual(merchant_seed.match("Trader Joe's #08"),
+        self.assertEqual(merchant_seed.match("Trader Joe's #00"),
                          "FOOD_AND_DRINK")
-        self.assertEqual(merchant_seed.match("SHELL OIL 5723"),
+        self.assertEqual(merchant_seed.match("SHELL OIL 00000"),
                          "TRANSPORTATION")
-        self.assertEqual(merchant_seed.match("WAL-MART #1234"),
+        self.assertEqual(merchant_seed.match("WAL-MART #0000"),
                          "GENERAL_MERCHANDISE")
         self.assertEqual(merchant_seed.match("NETFLIX.COM"),
                          "ENTERTAINMENT")
@@ -53,7 +53,7 @@ class SeedPipelineTests(unittest.TestCase):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith("OIKONOME_LLM")}
         with patch.dict(os.environ, env, clear=True):
-            add_raw_txn(self.conn, "t1", "2025-07-01", 63, "SHELL OIL 5723",
+            add_raw_txn(self.conn, "t1", "2025-07-01", 63, "SHELL OIL 00000",
                         raw={})
             stats = llm_categorize.categorize_new(self.conn)
         self.assertFalse(stats["configured"])
@@ -65,13 +65,13 @@ class SeedPipelineTests(unittest.TestCase):
     def test_seed_never_overwrites_existing_cache(self):
         self.conn.execute(
             "INSERT INTO merchant_categories (merchant, category_primary) "
-            "VALUES ('SHELL OIL 5723', 'TRAVEL')")
-        add_raw_txn(self.conn, "t1", "2025-07-01", 63, "SHELL OIL 5723",
+            "VALUES ('SHELL OIL 00000', 'TRAVEL')")
+        add_raw_txn(self.conn, "t1", "2025-07-01", 63, "SHELL OIL 00000",
                     raw={})
         llm_categorize.apply_seed(self.conn)
         self.assertEqual(self.conn.execute(
             "SELECT category_primary FROM merchant_categories "
-            "WHERE merchant='SHELL OIL 5723'").fetchone()["category_primary"],
+            "WHERE merchant='SHELL OIL 00000'").fetchone()["category_primary"],
             "TRAVEL")
 
 

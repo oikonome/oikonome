@@ -1,9 +1,9 @@
 """A waiting receipt's line items total under the ledger's name for the
 store, and under a date the receipt could really carry.
 
-The model reads the store as printed ("TRADER JOE'S #552"), while the
-ledger shows that business under its display name ("Trader Joe's"). Filed
-under the raw spelling, one store split into two rows on a screen that
+The model reads the store as printed ("JUNIPER'S MARKET #17"), while the
+ledger shows that business under its display name ("Juniper's Market").
+Filed under the raw spelling, one store split into two rows on a screen that
 exists to total it. The printed name goes through the canonicaliser the
 ledger uses and takes the ledger's display name for that business; a store
 the ledger has not seen still files every spelling of it on one row.
@@ -56,23 +56,23 @@ class WaitingItemsTotalWithTheirStore(unittest.TestCase):
             (rid,)).fetchone()["d"]
 
     def test_attached_and_waiting_receipts_of_one_store_are_one_group(self):
-        txn = add_txn(self.conn, TODAY, 300.00, "Trader Joe's")
-        self._add(txn, _receipt("Trader Joe's", 300.00, TODAY.isoformat(),
+        txn = add_txn(self.conn, TODAY, 300.00, "Juniper's Market")
+        self._add(txn, _receipt("Juniper's Market", 300.00, TODAY.isoformat(),
                                 "GROCERIES"))
         waiting = self._add(None, _receipt(
-            "TRADER JOE'S #552", 80.00,
+            "JUNIPER'S MARKET #17", 80.00,
             (TODAY - dt.timedelta(days=1)).isoformat(), "FLOWERS"))
         self.assertIsNone(self.conn.execute(
             "SELECT txn_id FROM receipts WHERE id=%s::uuid",
             (waiting,)).fetchone()["txn_id"])
         groups = receipts.search_items(self.conn, group="merchant")["groups"]
         self.assertEqual([(g["key"], g["total"]) for g in groups],
-                         [("Trader Joe's", 380.00)])
+                         [("Juniper's Market", 380.00)])
         row = receipts.search_items(self.conn, q="flowers")["rows"][0]
-        self.assertEqual(row["payee"], "Trader Joe's")
+        self.assertEqual(row["payee"], "Juniper's Market")
         receipts.set_tag(self.conn, waiting, 0, "gift")
         rep = receipts.report(self.conn, "gift", TODAY.year, TODAY.month)
-        self.assertEqual(rep["rows"][0]["payee"], "Trader Joe's")
+        self.assertEqual(rep["rows"][0]["payee"], "Juniper's Market")
 
     def test_a_store_the_ledger_has_not_seen_still_files_on_one_row(self):
         self._add(None, _receipt("CORNER HARDWARE #12", 9.00,

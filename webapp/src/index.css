@@ -240,7 +240,7 @@ h2{font-size:1.05rem;margin:1.4rem 0 .6rem;letter-spacing:-.01em}
 .hero-watch.bad{color:var(--red)}
 .hero-watch.bad .wdot{background:var(--red)}
 .mut{color:var(--mut)} .sub{color:var(--mut);font-size:13px}
-.pos{color:var(--green)} .neg{color:var(--red)}
+.pos{color:var(--green)} .neg{color:var(--red)} .sub.warn{color:var(--amber)}
 .num{text-align:right;font-variant-numeric:tabular-nums}
 
 /* ==== tables (dense rows + quiet headers) ==== */

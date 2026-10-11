@@ -152,11 +152,15 @@ class SettingsSaveKeepsLegacyEntries(_Household):
     def test_mailbox_inside_a_stored_entry_can_be_reinvited(self):
         """The sender mails each mailbox of a joined entry, so each is a
         saved recipient the owner can re-send an invite to."""
-        with mock.patch("oikonome.web.mailguard.invite_added") as inv:
+        with mock.patch("oikonome.notify.recipient_invites.resend",
+                        return_value={"sent": True,
+                                      "reason": "invited"}) as inv:
             r = self.owner.post("/api/settings/recipients/resend",
                                 json={"email": self.b})
         self.assertEqual(r.status_code, 200, r.text)
         inv.assert_called_once()
+        self.assertEqual(inv.call_args.args[1], self.b)
+        self.assertIs(r.json()["sent"], True)
 
     def test_bare_mailbox_decline_is_not_overwritten(self):
         accept_recipient_invite(self.tid, f"Some One <{self.c}>")

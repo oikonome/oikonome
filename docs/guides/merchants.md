@@ -1,9 +1,9 @@
 # Merchants
 
 Banks spell the same shop several ways. One month it arrives as
-"NORTHWIND DENTAL", the next as "Northwind Dental Group", the next in
+"NORTHWIND HARDWARE", the next as "Northwind Hardware Group", the next in
 lowercase — and each spelling becomes its own merchant, splitting one
-provider's totals across three rows that never add up on any page.
+shop's totals across three rows that never add up on any page.
 
 The app consolidates the obvious cases automatically — including a name
 the bank prints without its apostrophe ("Juniper's Market" and "JUNIPERS
@@ -109,6 +109,14 @@ It is deliberately cautious: it merges only when the raw descriptor
 actually names the surviving merchant, and it never touches a merchant
 you renamed yourself. A generic descriptor your bank reuses for
 unrelated purchases is left alone rather than guessed at.
+
+The same sweep also folds back a merchant that was created only because
+your bank's feed started spelling a payee you already had differently
+("… Hardware Su" becoming "… Hardware Supply", or a pending charge printed
+with the city and country after the name). It does that only for a
+merchant whose every charge is still pending or is the posted form of a
+pending charge, and only when the earlier charges point at one older
+merchant whose name the new spelling plainly continues.
 
 To see or drive it by hand on a self-hosted install, run the app's own
 command inside its container: `docker compose exec -T app oikonome

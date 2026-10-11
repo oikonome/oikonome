@@ -3,12 +3,28 @@ LLM-assisted W-2/1040, preview token flow, and per-column merge commits
 (a transcript never blanks SSA columns)."""
 
 import json
+import os
+import time
 import unittest
 from unittest import mock
 
 from oikonome.engine import taxdocs
 
 from .util import make_db, write_config
+
+
+def _png(size=(8, 8), mode="RGB") -> bytes:
+    """A real, tiny W-2 scan: the image path reads an image's size before
+    it decodes, and refuses bytes it cannot measure."""
+    import io
+
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new(mode, size, "white" if mode == "RGB" else 1).save(buf, "PNG")
+    return buf.getvalue()
+
+
+W2_PNG = _png()
 
 SSA_XML = b"""<?xml version="1.0"?>
 <osss:OnlineSocialSecurityStatementData xmlns:osss="http://ssa.gov/oss">
@@ -67,6 +83,34 @@ class DeterministicParseTests(unittest.TestCase):
         self.assertEqual(row["agi"], 95000.0)
         self.assertEqual(row["taxable_income"], 80000.0)
         self.assertEqual(row["tax_paid"], 15000.0)
+
+    def test_a_value_wrapped_onto_the_next_line_still_parses(self):
+        row = taxdocs.parse_transcript_text(
+            "TAX PERIOD: Dec. 31, 2024\n"
+            "ADJUSTED GROSS INCOME:\n    $95,000.00\n")[0]
+        self.assertEqual(row["agi"], 95000.0)
+
+
+class TranscriptParseTimeTests(unittest.TestCase):
+    """Parsing runs as one regex call per field and holds the GIL for the
+    whole server while it runs, so its cost must stay linear in the size
+    of the upload whatever the upload contains."""
+
+    def _assert_fast(self, text):
+        t0 = time.perf_counter()
+        taxdocs.parse_transcript_text(text)
+        self.assertLess(time.perf_counter() - t0, 1.0)
+
+    def test_many_blank_lines_parse_in_linear_time(self):
+        self._assert_fast("TAX PERIOD: Dec. 31, 2024\n"
+                          "ADJUSTED GROSS INCOME: $1\n" + "\n" * 200_000)
+
+    def test_a_label_followed_by_a_long_space_run_parses_in_linear_time(self):
+        for label in ("TOTAL INCOME", "TOTAL TAX LIABILITY",
+                      "WAGES, SALARIES, TIPS, ETC."):
+            with self.subTest(label=label):
+                self._assert_fast("TAX PERIOD: Dec. 31, 2024\n"
+                                  + label + " " * 200_000 + "x\n")
 
 
 class AnalyzeCommitTests(unittest.TestCase):
@@ -128,7 +172,7 @@ class AnalyzeCommitTests(unittest.TestCase):
                         return_value={"url": "http://localhost:11434",
                                       "model": "vl", "api_key": "",
                                       "extra_body": ""}):
-            out = taxdocs.analyze(self.conn, "w2.png", b"\x89PNG...",
+            out = taxdocs.analyze(self.conn, "w2.png", W2_PNG,
                                   "image/png")
             self.assertEqual(out["kind"], "w2")
             res = taxdocs.commit(self.conn, out["token"], out["rows"])
@@ -249,6 +293,30 @@ class AnalyzeCommitTests(unittest.TestCase):
                 taxdocs.parse_1040_text(self.conn, "Form 1040 ... AGI 1")
             self.assertIn("Social Security number", str(cm.exception))
 
+    def test_a_plain_text_upload_is_capped_like_extracted_pdf_text(self):
+        from oikonome.sync.pdfimport import MAX_TEXT_BYTES
+        data = (b"TAX PERIOD: Dec. 31, 2024\nADJUSTED GROSS INCOME: $1\n"
+                + b"x" * MAX_TEXT_BYTES)
+        with self.assertRaises(ValueError) as cm:
+            taxdocs.analyze(self.conn, "big.txt", data, "text/plain")
+        self.assertIn("larger", str(cm.exception))
+
+    def test_a_pdf_whose_forms_inflate_is_refused_with_bounded_memory(self):
+        import tracemalloc
+
+        from .test_pdfimport import many_inflating_forms_pdf
+        pdf = many_inflating_forms_pdf(200)
+        tracemalloc.start()
+        try:
+            with self.assertRaises(ValueError) as cm:
+                taxdocs.analyze(self.conn, "return.pdf", pdf,
+                                "application/pdf")
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 12_000_000)
+        self.assertIn("size limit", str(cm.exception))
+
     def test_unknown_document_says_what_is_supported(self):
         with self.assertRaises(ValueError) as cm:
             taxdocs.analyze(self.conn, "junk.txt", b"grocery list", "text/plain")
@@ -344,7 +412,7 @@ class EinIsNotKeptTests(unittest.TestCase):
                             return_value={"url": "http://localhost:11434",
                                           "model": "vl", "api_key": "",
                                           "extra_body": ""}):
-                out = taxdocs.analyze(conn, "w2.png", b"\x89PNG...",
+                out = taxdocs.analyze(conn, "w2.png", W2_PNG,
                                       "image/png")
             self.assertNotIn("3456789", json.dumps(out))
             self.assertEqual(out["rows"][0]["ein"], "•••••6789")
@@ -387,7 +455,7 @@ class UntrustedModelOutputTests(unittest.TestCase):
     def tearDown(self):
         self.conn.close()
 
-    def _analyze(self, reply, filename="w2.png", data=b"\x89PNG...",
+    def _analyze(self, reply, filename="w2.png", data=W2_PNG,
                  mime="image/png"):
         with mock.patch("oikonome.engine.llm_categorize._backend",
                         return_value=dict(self.LOCAL)), \
@@ -436,7 +504,7 @@ class UntrustedModelOutputTests(unittest.TestCase):
             with mock.patch("oikonome.engine.llm_categorize._chat",
                             return_value='{"year": 2019} then '
                             + json.dumps(w2) + ' and {"year": 2020}'):
-                out = taxdocs.analyze(self.conn, "w2.png", b"\x89PNG...",
+                out = taxdocs.analyze(self.conn, "w2.png", W2_PNG,
                                       "image/png")
             self.assertEqual(out["rows"][0]["year"], 2024)
             self.assertEqual(out["rows"][0]["box1"], 50000)
@@ -507,3 +575,133 @@ class VisionRoleConsentAgreementTests(unittest.TestCase):
                          "resolve the vision role")
         self.assertEqual(chat.call_args.kwargs["backend"]["url"],
                          self.LOCAL_URL)
+
+
+class CommitRefusesOutOfRangeInputTests(unittest.TestCase):
+    """Client-edited rows that cannot be numbers or text are refused.
+
+    The route turns ValueError into a 400. A 400-digit JSON integer, an
+    Infinity year or an object where text belongs must be refused the same
+    way, not escape as OverflowError or a database adapter error (a 500),
+    and the preview must survive for a corrected retry.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.conn = make_db()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.conn.close()
+
+    def _staged(self, kind):
+        from oikonome.db import staging
+        return staging.put(self.conn, "taxdoc", files=[("t.txt", b"x")],
+                           meta={"kind": kind})
+
+    def _refused(self, kind, rows):
+        token = self._staged(kind)
+        with self.assertRaises(ValueError):
+            taxdocs.commit(self.conn, token, rows)
+        # still usable: the refusal spent nothing
+        taxdocs.commit(self.conn, token, [{"year": 2020}])
+
+    def test_a_huge_integer_box_is_refused(self):
+        self._refused("w2", [{"year": 2024, "boxes": {"1": 10 ** 400}}])
+
+    def test_a_huge_integer_annual_amount_is_refused(self):
+        self._refused("irs", [{"year": 2024, "wages": 10 ** 400}])
+
+    def test_an_infinite_year_is_refused(self):
+        self._refused("irs", [{"year": float("inf"), "agi": 1.0}])
+
+    def test_an_object_employer_is_refused(self):
+        self._refused("w2", [{"year": 2024, "employer": {"x": 1},
+                              "boxes": {"1": 10.0}}])
+
+    def test_an_object_ein_is_refused(self):
+        self._refused("w2", [{"year": 2024, "ein": ["12"],
+                              "boxes": {"1": 10.0}}])
+
+    def test_rows_that_are_not_a_list_are_refused(self):
+        token = self._staged("irs")
+        with self.assertRaises(ValueError):
+            taxdocs.commit(self.conn, token, 5)
+
+    def test_ordinary_w2_still_commits(self):
+        token = self._staged("w2")
+        out = taxdocs.commit(self.conn, token,
+                             [{"year": 2023, "employer": "Example Co",
+                               "ein": "12-3456789", "boxes": {"1": 1000}}])
+        self.assertEqual(out["documents"], 1)
+
+
+class W2ImageDecodeIsBoundedTests(unittest.TestCase):
+    """The W-2 image path decodes with the receipt decoder, so it keeps the
+    receipt decoder's bounds: the byte cap, the pixel ceiling (an image
+    whose size cannot be read is refused, never sent on raw), the shared
+    decode gate, and no decode at all when no model is configured."""
+
+    LOCAL = {"url": "http://localhost:11434", "model": "vl", "api_key": "",
+             "extra_body": "", "vision_model": ""}
+    REPLY = json.dumps({"year": 2024, "employer": "ACME", "boxes": {}})
+
+    def setUp(self):
+        self.conn = make_db()
+        write_config(self.conn)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _parse(self, data, mime="image/png", backend=None):
+        with mock.patch("oikonome.engine.llm_categorize._backend",
+                        return_value=dict(backend or self.LOCAL)), \
+             mock.patch("oikonome.engine.llm_categorize._chat",
+                        return_value=self.REPLY) as chat:
+            try:
+                return taxdocs.parse_w2(self.conn, data, mime), chat
+            except ValueError:
+                self.assertFalse(chat.called, "refused bytes reached the model")
+                raise
+
+    def test_a_declared_pixel_bomb_is_refused_before_decode(self):
+        from oikonome.engine import receipts
+        side = int(receipts.MAX_DECODE_PX ** 0.5) + 10
+        bomb = _png((side, side), mode="1")    # a few KB, ~40 MP declared
+        self.assertLess(len(bomb), receipts.MAX_IMAGE)
+        with mock.patch("oikonome.engine.receipts._shrink_image") as shrink:
+            with self.assertRaises(ValueError):
+                self._parse(bomb)
+            self.assertFalse(shrink.called)
+
+    def test_unreadable_bytes_are_refused_not_passed_through(self):
+        with self.assertRaises(ValueError):
+            self._parse(b"\x89PNG not really an image")
+
+    def test_an_image_past_the_receipt_byte_cap_is_refused(self):
+        from oikonome.engine import receipts
+        with self.assertRaises(ValueError):
+            self._parse(W2_PNG + b"\0" * receipts.MAX_IMAGE)
+
+    def test_a_busy_gate_refuses_instead_of_decoding(self):
+        from oikonome.engine import receipts
+        with mock.patch.object(receipts, "_DECODE_WAIT_S", 0.01):
+            held = [receipts._DECODE_GATE.acquire(timeout=1)
+                    for _ in range(int(os.environ.get(
+                        "OIKONOME_RECEIPT_PARSE_CONCURRENCY", "2")))]
+            try:
+                with self.assertRaises(ValueError) as cm:
+                    self._parse(W2_PNG)
+                self.assertEqual(str(cm.exception), taxdocs.BUSY_ERROR)
+            finally:
+                for ok in held:
+                    if ok:
+                        receipts._DECODE_GATE.release()
+        rows, _ = self._parse(W2_PNG)
+        self.assertEqual(rows[0]["year"], 2024)
+
+    def test_no_model_means_no_decode(self):
+        with mock.patch("oikonome.engine.receipts._shrink_image") as shrink:
+            with self.assertRaises(ValueError):
+                self._parse(W2_PNG, backend={**self.LOCAL, "url": ""})
+            self.assertFalse(shrink.called)

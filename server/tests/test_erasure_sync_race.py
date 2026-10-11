@@ -164,11 +164,11 @@ class PurgeWaitsForSyncTests(unittest.TestCase):
             probe.close()
 
     def test_grace_purge_holds_the_lock_for_the_whole_transaction(self):
-        """_purge_tenant's own unlock lands BEFORE the worker's enclosing
-        commit, so the worker must also take an xact-scoped lock that only
-        commit releases — otherwise a sync starting in the unlock→commit
-        gap reads the not-yet-deleted rows and resurrects them."""
-        src = inspect.getsource(worker.purge_scheduled_deletions)
+        """The erase must hold an xact-scoped lock that only its commit
+        releases — otherwise a sync starting in a gap between a session
+        unlock and the commit reads the not-yet-deleted rows and
+        resurrects them."""
+        src = inspect.getsource(worker._purge_one)
         self.assertIn("hold_writers(admin, tid, xact=True)", src)
         src = inspect.getsource(erasure.hold_writers)
         self.assertIn("pg_advisory_xact_lock", src)
@@ -205,6 +205,19 @@ class AccountDeleteWaitsForSyncTests(unittest.TestCase):
         request under its own lock, and writes rules and categories for the
         whole ledger."""
         self._delete_waits_for("oikonome:sync-categorize:")
+
+    def test_delete_waits_for_an_email_send_in_flight(self):
+        """The daily email reads the household, spends seconds sending, then
+        records the run; a wipe that did not wait for it would leave that
+        record (with the verdict line) behind for an erased tenant, and the
+        household would get its verdict after its deletion receipt."""
+        self._delete_waits_for("oikonome:email:")
+
+    def test_delete_waits_for_a_net_worth_snapshot_in_flight(self):
+        self._delete_waits_for("oikonome:snapshot:")
+
+    def test_delete_waits_for_a_collector_alert_in_flight(self):
+        self._delete_waits_for("oikonome:script-alert:")
 
     def _delete_waits_for(self, prefix):
         client = TestClient(self.appmod.app)
@@ -281,8 +294,8 @@ class LockKeyContractTests(unittest.TestCase):
             self.assertIn("oikonome:sync:", src,
                           f"{name} does not use the shared sync lock key")
         erasures = {
-            "worker.purge_scheduled_deletions":
-                inspect.getsource(worker.purge_scheduled_deletions),
+            "worker._purge_one":
+                inspect.getsource(worker._purge_one),
             "app.account_delete": inspect.getsource(appmod.account_delete),
             "adminconsole._purge_tenant":
                 inspect.getsource(adminconsole._purge_tenant),
@@ -292,7 +305,9 @@ class LockKeyContractTests(unittest.TestCase):
                           f"{name} does not wait for the tenant's writers")
         self.assertEqual(erasure.writer_lock_keys("T"),
                          ["oikonome:sync:T", "oikonome:sync-categorize:T",
-                          "oikonome:nightly:T"])
+                          "oikonome:nightly:T", "oikonome:email:T",
+                          "oikonome:snapshot:T", "oikonome:script-alert:T",
+                          "oikonome:push:T"])
         # and each writer really holds the key the erasure waits on
         from oikonome.sync import base as sync_base
         from oikonome.web import api

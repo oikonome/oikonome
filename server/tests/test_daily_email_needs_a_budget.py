@@ -41,7 +41,10 @@ class DailyEmailNeedsABudgetTests(unittest.TestCase):
         self.conn.close()
 
     def _send(self, **kw):
-        with mock.patch.object(
+        # a relay is configured: with none, the email channel is off
+        with mock.patch.dict("os.environ",
+                             {"OIKONOME_SMTP_HOST": "smtp.example.com"}), \
+             mock.patch.object(
                 report, "send_each",
                 return_value=[{"email": "one@example.com", "ok": True,
                                "error": None}]) as m:

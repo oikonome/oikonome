@@ -6,7 +6,7 @@ free, and never wrong the way a small local model can be. The LLM only
 sees what these rules don't claim.
 
 Matching is word-boundary based on the upper-cased merchant string, so
-"SHELL" hits "SHELL OIL 5723" but not "SHELLY'S CAFE". PREFIXES handle
+"SHELL" hits "SHELL OIL 00000" but not "SHELLY'S CAFE". PREFIXES handle
 POS processors whose prefix itself implies the business type (TST* =
 Toast → restaurants). Deliberately NOT here: anything ambiguous
 (Amazon spans every category and has its own pipeline; SQ*/PAYPAL*

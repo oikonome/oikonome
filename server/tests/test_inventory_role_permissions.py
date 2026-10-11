@@ -112,7 +112,6 @@ MEMBER_OK = {
     "POST /api/business/entities/{entity_id}/archive",
     "POST /api/business/entities/{entity_id}/restore",
     "POST /api/business/entities/{entity_id}/status",
-    "POST /api/business/entities/{entity_id}/members",
     "POST /api/business/entities/{entity_id}/vendors",
     "POST /api/business/entities/{entity_id}/equity",
     "DELETE /api/business/entities/{entity_id}/equity/{movement_id}",
@@ -151,9 +150,12 @@ MEMBER_OK = {
     # gained the same zip-to-background-restore branch, POST /import —
     # read as owner-guarded above while members still import files.
     "POST /api/import/mapped",
+    "POST /api/import/ynab-accounts",
     "POST /api/import/rollback",
     "POST /api/import/bulk/analyze",
     "POST /api/import/bulk/run",
+    # stopping a folder import the household started only removes work
+    "POST /api/import/bulk/jobs/{job_id}/cancel",
     "POST /api/import/taxdoc/analyze",
     "POST /api/import/taxdoc/commit",
     "POST /api/import/plan-activity",
@@ -204,6 +206,19 @@ MEMBER_OK = {
 } | set(ext.gate.inventory().get('member_routes', ()))
 
 
+# Member routes with ONE owner-only option: a member may use the route,
+# and the handler refuses the named option to anyone but the owner. The
+# inline owner check those handlers carry is that option's gate, not the
+# route's, so they are not "both" — and each is held to actually naming
+# the option next to its owner check below.
+OWNER_ONLY_OPTIONS = {
+    # undoing an import is a member's; deleting the rows an older feed may
+    # rely on (force_kept) is the owner's, as on the account-remove door
+    "POST /api/import/rollback": "force_kept",
+    "POST /import/rollback": "force_kept",
+}
+
+
 class RolePermissionInventoryTests(unittest.TestCase):
 
     def setUp(self):
@@ -239,10 +254,19 @@ class RolePermissionInventoryTests(unittest.TestCase):
         two disagree the handler wins silently, so the list would be
         documentation of something that is not true."""
         both = sorted(k for k in MEMBER_OK
-                      if k in self.routes and self._owner_guarded(k))
+                      if k in self.routes and self._owner_guarded(k)
+                      and k not in OWNER_ONLY_OPTIONS)
         self.assertEqual(
             [], both,
             f"listed as member-allowed but owner-guarded in code: {both}")
+
+    def test_owner_only_options_are_gated_in_their_handlers(self):
+        for key, option in OWNER_ONLY_OPTIONS.items():
+            self.assertIn(key, MEMBER_OK, key)
+            path, src = self.routes[key]
+            self.assertFalse(permissions.owner_only(path), key)
+            self.assertTrue(INLINE_OWNER.search(src), key)
+            self.assertIn(option, src, key)
 
     def test_a_viewer_can_reach_its_own_account_doors(self):
         """SELF_WRITE_OK is 'every role holds these, viewers included' —

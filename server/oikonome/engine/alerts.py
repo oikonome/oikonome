@@ -34,7 +34,29 @@ def _mmdd(s) -> str:
 # failure mode: a dead scheduler, a crash, and a job that "succeeds" while
 # doing nothing.
 
-SYNC_MAX_HOURS = 6       # aggregator sync cadence tolerance
+SYNC_MAX_HOURS = 6       # aggregator sync cadence tolerance (the floor)
+# How many poll intervals may pass without a clean sync before it is stale.
+SYNC_MISSED_POLLS = 3
+
+
+def sync_max_hours() -> float:
+    """How old the last clean sync may be before it reads as stale.
+
+    The poll interval is the operator's: OIKONOME_SYNC_BUCKETS × five
+    minutes (jobs/worker.py), and raising it is the documented way to cut
+    aggregator traffic on a large instance. A fixed threshold shorter than
+    that interval would call every healthy tenant stale for part of each
+    cycle, and the alert would come back after every dismissal. So it is a
+    few missed polls, never less than SYNC_MAX_HOURS. Read from the
+    environment here, as the worker reads it, rather than imported from
+    the worker (which the web process does not load)."""
+    from ..envnum import env_num
+    try:
+        buckets = max(1, int(env_num("OIKONOME_SYNC_BUCKETS", "12")))
+    except ValueError:
+        buckets = 12
+    poll_hours = buckets * 5 / 60
+    return max(float(SYNC_MAX_HOURS), SYNC_MISSED_POLLS * poll_hours)
 
 
 def heartbeat(conn, job: str, note: str = "", zone: str | None = None):
@@ -68,7 +90,7 @@ def freshness(conn, jobs: list[tuple[str, str, int]] | None = None,
                         "link": "/accounts",
                         "message": "Bank sync has never completed — check the "
                                    "connection on the Accounts page."})
-        elif (now - last_ok["t"]).total_seconds() > SYNC_MAX_HOURS * 3600:
+        elif (now - last_ok["t"]).total_seconds() > sync_max_hours() * 3600:
             out.append({"kind": "stale-pull", "severity": "warn",
                         "link": "/accounts",
                         "message": f"Bank sync last succeeded "

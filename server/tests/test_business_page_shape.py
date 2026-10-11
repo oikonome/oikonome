@@ -26,6 +26,21 @@ class BusinessShapeTests(unittest.TestCase):
         except FileNotFoundError:
             self.skipTest("webapp/ not present")
 
+    def test_next_deadline_tile_shows_the_installment_due_on_it(self):
+        """From January 1 to 15 the next 1040-ES deadline collects last
+        year's fourth installment, which a quarter of this year's
+        projection misstates; the estimate says which amount is due, and
+        both clients' tile reads it, falling back to `quarterly` for a
+        server that does not send it."""
+        root = pathlib.Path(oikonome.__file__).parent.parent.parent
+        for rel in ("webapp/src/pages/Business.tsx",
+                    "mobile/src/app/business.tsx"):
+            src = (root / rel).read_text()
+            tile = re.search(r'"Next deadline".*?est\. quarterly', src, re.S)
+            self.assertIsNotNone(tile, rel)
+            self.assertRegex(tile.group(0),
+                             r"next_payment\s*\?\?\s*\S*quarterly", rel)
+
     def test_cash_tile_excludes_shadow_linked_rows(self):
         # The Overview cash sum must carry the same shadow filter TaxSetAside
         # uses: only the primary row of a link group contributes its balance.

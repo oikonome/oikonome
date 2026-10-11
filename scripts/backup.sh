@@ -19,14 +19,28 @@ set -euo pipefail
 # the 0600 files inside it are protected either way.
 umask 077
 INSTALL=${1:?install dir}; DEST=${2:?backup dir}; KEEP=${3:-30}
+# absolute: the lock's holder file is cleared on exit, after the cd below
+INSTALL=$(cd "$INSTALL" && pwd)
 # Same lock ./oikonome.sh takes around restore / reset / uninstall, so a
 # scheduled dump never starts under one of them (see maint_lock there).
 # Non-blocking-ish: a backup that cannot get the lock within the wait is
 # skipped with a message, not run against a database being replaced.
+# The skip says who holds it, because a scheduled backup that skips
+# quietly every night looks exactly like one that is working — and it
+# calls the lock stale only when the process that took it no longer
+# holds it (scripts/maint-lock.sh has the rules).
+. "$(dirname "$0")/maint-lock.sh"
+# the shared docker/.env reader (dotenv_get): the dump path below follows
+# COMPOSE_FILE, and it must be read the way compose reads it
+. "$(dirname "$0")/env-file.sh"
 if command -v flock >/dev/null 2>&1; then
   exec 9>"$INSTALL/.maintenance.lock"
-  flock -w "${OIKONOME_MAINT_LOCK_WAIT:-600}" 9 \
-    || { echo "backup skipped: a restore/reset is running on this instance" >&2; exit 1; }
+  if ! flock -w "${OIKONOME_MAINT_LOCK_WAIT:-600}" 9; then
+    maint_skip_message "$INSTALL" "${OIKONOME_MAINT_LOCK_STALE_HOURS:-6}" >&2
+    exit 1
+  fi
+  maint_holder_write "$INSTALL" backup
+  trap 'maint_holder_clear "$INSTALL"' EXIT
 fi
 cd "$INSTALL/docker"
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
@@ -50,7 +64,8 @@ OUT="$DEST/oikonome-$STAMP.sql.gz"
 # leading dot plus the .partial suffix keeps a half-written file out of the
 # `oikonome-*.sql.gz` glob the picker and `newest_backup` list.
 TMP="$DEST/.oikonome-$STAMP.sql.gz.partial"
-trap 'rm -f "$TMP"' EXIT
+# the holder names this run only while it holds the lock
+trap 'rm -f "$TMP"; maint_holder_clear "$INSTALL"' EXIT
 fail() { rm -f "$TMP"; echo "backup FAILED: $*" >&2; exit 1; }
 
 # --no-owner: dumps restore under ANY admin user (a managed provider has
@@ -60,8 +75,14 @@ fail() { rm -f "$TMP"; echo "backup FAILED: $*" >&2; exit 1; }
 dump_to() {  # dump_to <path> — returns PG_DUMP's status, never gzip's.
              # gzip happily reports success on a stream that stopped
              # halfway, which is the whole failure this guards.
-  local rc
-  if grep -q "^COMPOSE_FILE=.*external-db" .env 2>/dev/null; then
+  local rc files
+  # COMPOSE_FILE as compose resolves it: the environment first, then the
+  # last assignment in .env, `export`, quotes and comments handled. A
+  # literal `grep ^COMPOSE_FILE=` misses `export COMPOSE_FILE=…` and dumps
+  # from a bundled postgres container an external-database install never
+  # runs, failing every night.
+  files=${COMPOSE_FILE:-$(dotenv_get .env COMPOSE_FILE)}
+  if case $files in *external-db*) true ;; *) false ;; esac; then
     $C run --rm --no-deps -T migrate sh -c 'exec pg_dump --no-owner "$OIKONOME_ADMIN_DSN"' \
       | gzip > "$1"
     rc=${PIPESTATUS[0]}
@@ -108,7 +129,7 @@ chmod 600 "$TMP" 2>/dev/null || \
 # Verified: publish it. Same directory, so the rename is atomic — the
 # picker never sees a name it cannot restore.
 mv -f "$TMP" "$OUT" || fail "could not move the finished dump into place"
-trap - EXIT
+trap 'maint_holder_clear "$INSTALL"' EXIT
 find "$DEST" -name 'oikonome-*.sql.gz' -type f ! -perm 600 \
   -exec chmod 600 {} + 2>/dev/null || true
 find "$DEST" -name 'oikonome-*.sql.gz' -mtime +"$KEEP" -delete

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import datetime as dt
+import math
 import os
 from ..envnum import env_flag
 import time
@@ -25,7 +26,7 @@ import time
 import httpx
 
 from ..engine import budget
-from ..engine.compat import as_date, jsonb
+from ..engine.compat import MAX_AMOUNT, as_date, jsonb
 from .base import Account, ImportOverlapGuard, Transaction, \
     check_institution_cap, filter_import_duplicates, get_access_token, \
     log_sync, mark_removed, upsert_accounts, upsert_item, upsert_transactions
@@ -138,6 +139,7 @@ class Client:
     def __init__(self, client_id: str, secret: str,
                  base_url: str = ENV_URLS["production"], transport=None):
         self._auth = {"client_id": client_id, "secret": secret}
+        self.base_url = base_url
         self._http = httpx.Client(base_url=base_url, transport=transport,
                                   timeout=httpx.Timeout(120, connect=10))
 
@@ -334,7 +336,7 @@ class ReleaseCount(int):
         return self
 
 
-def release_tenant_items(tenant_id) -> ReleaseCount:
+def release_tenant_items(tenant_id, reason: str = "erasure") -> ReleaseCount:
     """Best-effort /item/remove for every Plaid Item of a tenant — the
     CCPA delete-account door and the admin console's tenant-delete call
     this BEFORE wiping rows, so no live access_token (and no Plaid
@@ -373,7 +375,8 @@ def release_tenant_items(tenant_id) -> ReleaseCount:
                 client.remove_item(token)
                 released += 1
                 # stamp the audit ledger on the erasure release path too
-                stamp_ledger_removed(r["id"], "erasure")
+                # (and on a data reset, which names itself as the reason)
+                stamp_ledger_removed(r["id"], reason)
             except Exception as e:                         # noqa: BLE001
                 failed.append(r["id"])
                 log.warning("plaid release failed tenant=%s item=%s: %s",
@@ -482,6 +485,32 @@ def _norm_txn(t: dict) -> Transaction:
 # ---- item lifecycle --------------------------------------------------------
 
 
+def link_lock(conn) -> None:
+    """Take the per-tenant lock a new Item's row is written under, for the
+    rest of the caller's transaction. The doors that swap or clear the
+    household's Plaid keys take it too: an access token works only with the
+    client that minted it, so a key swap landing between a link's token
+    exchange and its insert would leave a token nothing can sync or release.
+    Serialised, either the Item is in the table before the swap looks for
+    live connections, or the link sees the keys it exchanged under are gone
+    and hands the Item back."""
+    tid = conn.execute(
+        "SELECT current_setting('app.tenant_id', true) AS t"
+    ).fetchone()["t"]
+    conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                 (f"oikonome:instcap:{tid}",))
+
+
+def _keys_unchanged(conn, client: "Client") -> bool:
+    """True while the household's Plaid credentials are still the ones
+    `client` was built from."""
+    try:
+        cid, _, url = credentials(conn)
+    except PlaidError:
+        return False
+    return cid == client._auth["client_id"] and url == client.base_url
+
+
 def link_item(conn, public_token: str, institution_name: str = "",
               link_session_id: str | None = None, transport=None) -> str:
     """Exchange a public token (from a completed Link session) → item row
@@ -514,27 +543,41 @@ def link_item(conn, public_token: str, institution_name: str = "",
     # happened, so the Item is live and billing at Plaid, and abandoning it
     # would burn a plan slot (plaid_item_ledger never refunds) for a
     # connection the tenant never received.
-    if conn.execute("SELECT 1 FROM items WHERE id=%s", (item_id,)).fetchone():
-        upsert_item(conn, item_id, "plaid", institution_name or "Plaid",
-                    ex["access_token"])
-    else:
-        tid = conn.execute(
-            "SELECT current_setting('app.tenant_id', true) AS t"
-        ).fetchone()["t"]
-        try:
-            with conn.transaction():
-                conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
-                             (f"oikonome:instcap:{tid}",))
+    #
+    # The same lock makes the insert and a key swap take turns, and under
+    # it the keys are checked again: a token minted under keys that have
+    # since been replaced is handed back rather than stored.
+    existing = False
+    try:
+        with conn.transaction():
+            link_lock(conn)
+            existing = conn.execute("SELECT 1 FROM items WHERE id=%s",
+                                    (item_id,)).fetchone() is not None
+            if not _keys_unchanged(conn, client):
+                raise ValueError(
+                    "the Plaid keys changed while this bank was linking — "
+                    "link it again")
+            # a bank-link hold armed after this link's session started
+            # (a recovery landing mid-link): the login already reached the
+            # client, but a new Item is handed back below rather than kept
+            # on a client the owner has not confirmed, and an Item already
+            # held is left exactly as it was
+            from ..notify import outbound_pause
+            outbound_pause.refuse_if_held(budget.load_config(conn), "plaid")
+            if not existing:
                 check_institution_cap(conn)
-                upsert_item(conn, item_id, "plaid",
-                            institution_name or "Plaid", ex["access_token"])
-        except ValueError:
+            upsert_item(conn, item_id, "plaid",
+                        institution_name or "Plaid", ex["access_token"])
+    except ValueError:
+        # a re-auth of an Item already held is that Item, not a new one to
+        # hand back: removing it would end the connection it repairs
+        if not existing:
             try:
                 client.remove_item(ex["access_token"])
             except Exception as e:            # noqa: BLE001 - best effort
-                log.warning("item/remove after cap refusal failed item=%s: %s",
-                            item_id, e)
-            raise
+                log.warning("item/remove after link refusal failed "
+                            "item=%s: %s", item_id, e)
+        raise
     conn.execute(
         "UPDATE items SET institution_id=COALESCE(NULLIF(%s,''), "
         "institution_id), link_session_id=COALESCE(%s, link_session_id) "
@@ -608,7 +651,14 @@ def recurring_streams(conn, item_id: str, transport=None) -> list[dict]:
         for st in r.get(key) or []:
             avg = (st.get("average_amount") or {}).get("amount")
             last = (st.get("last_amount") or {}).get("amount")
-            amt = abs(float(avg if avg is not None else (last or 0)))
+            # one stream with an amount that is not a usable number is one
+            # stream left out, not the whole cross-check
+            try:
+                amt = abs(float(avg if avg is not None else (last or 0)))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not math.isfinite(amt) or amt > MAX_AMOUNT:
+                continue
             pfc = st.get("personal_finance_category") or {}
             out.append({
                 "stream_id": st.get("stream_id"), "direction": direction,
@@ -645,14 +695,37 @@ ENRICH_CAP_DEFAULT = 2000          # rows per calendar month, per tenant
 # category is one Plaid itself could not resolve — paying per row to hand
 # the same descriptor back to the same resolver buys nothing. Everything
 # else (files, SimpleFIN, OFX, the collectors) is what Enrich is for.
+# The outcome-unknown mark is read only when it is a valid timestamp: a
+# file import stores its source row as raw, keyed by the file's own
+# headers, so a column of that name can carry anything, and a failed cast
+# would break the candidate query for the whole household.
 _CANDIDATE_WHERE = """
             WHERE t.removed = 0 AND t.amount <> 0
               AND a.type IN ('depository', 'credit')
               AND NOT (t.raw ? 'personal_finance_category')
               AND (t.raw->>'_enriched_at') IS NULL
+              AND CASE WHEN jsonb_typeof(t.raw->'_enrich_unknown_at')
+                                = 'string'
+                            AND pg_input_is_valid(
+                                  t.raw->>'_enrich_unknown_at', 'timestamptz')
+                       THEN (t.raw->>'_enrich_unknown_at')::timestamptz
+                              < now() - interval '1 day'
+                       ELSE true END
               AND NOT EXISTS (SELECT 1 FROM items i
                                WHERE i.id = a.item_id
                                  AND i.aggregator = 'plaid')"""
+
+
+# What Enrich writes into a row's raw, as (Plaid's field, raw key). Kept
+# here beside the writer; base.ENRICHED_RAW_KEYS names the same keys for the
+# upsert that must not drop them, and a test holds the two together.
+ENRICH_FIELDS = (("merchant_name", "merchant_name"), ("website", "website"),
+                 ("logo_url", "logo_url"), ("check_number", "check_number"),
+                 ("payment_channel", "payment_channel"),
+                 ("entity_id", "merchant_entity_id"),
+                 ("counterparties", "counterparties"),
+                 ("location", "location"),
+                 ("personal_finance_category", "personal_finance_category"))
 
 
 def enrich_candidates(conn, limit: int | None = None) -> list[dict]:
@@ -686,12 +759,13 @@ def _cap_from(cfg) -> int:
     # Clamped at READ time to the same ceiling the settings door enforces:
     # a legacy oversized value written before the door clamped would
     # otherwise keep authorizing the operator's Plaid spend until the
-    # tenant happened to save settings again.
+    # tenant happened to save settings again. The DEFAULT goes through the
+    # same clamp: most households never save a cap at all, and the
+    # operator's ceiling (0 = OFF) must hold for them as much as for anyone.
     v = cfg.get("plaid_enrich_cap")
-    if v is None:
-        return ENRICH_CAP_DEFAULT
+    base = ENRICH_CAP_DEFAULT if v is None else int(v)
     from ..web.api import _enrich_cap_ceiling
-    return min(int(v), _enrich_cap_ceiling())
+    return max(0, min(base, _enrich_cap_ceiling()))
 
 
 def enrich_usage(conn) -> dict:
@@ -772,6 +846,16 @@ def enrich_rows(conn, *, limit: int = ENRICH_BATCH, transport=None) -> dict:
         tenancy.release_lock(conn, lock)
 
 
+def _enrich_outcome_unknown(e: Exception) -> bool:
+    """A transport failure after the request may have gone out (a read
+    timeout, a reset mid-answer) — as opposed to one that never connected,
+    or an answer Plaid actually gave."""
+    if not isinstance(e, httpx.TransportError):
+        return False
+    return not isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout,
+                              httpx.PoolTimeout))
+
+
 def _enrich_locked(conn, limit, transport, stats) -> dict:
     """The body of `enrich_rows`, under the per-tenant single-flight lock."""
     from ..engine import categories, merchant_identity
@@ -813,19 +897,29 @@ def _enrich_locked(conn, limit, transport, stats) -> dict:
                     # and lose the record of the chunks that HAD gone out and
                     # been billed.
                     stats["error"] = str(e) or e.__class__.__name__
+                    if _enrich_outcome_unknown(e):
+                        # The request may have reached Plaid and been billed
+                        # with only the answer lost. Its spend stays counted
+                        # against the cap, and its rows are marked so the
+                        # next runs leave them alone for a day instead of
+                        # paying for them again on every click while Plaid
+                        # is slow; after that they are offered once more,
+                        # reserved like any other row.
+                        stats["sent"] += len(chunk)
+                        stats["unknown"] = stats.get("unknown", 0) + len(chunk)
+                        mark = _jsonb({"_enrich_unknown_at":
+                                       dt.datetime.now(dt.timezone.utc).isoformat()})
+                        conn.execute(
+                            "UPDATE transactions SET raw = COALESCE(raw, "
+                            "'{}'::jsonb) || %s::jsonb WHERE id = ANY(%s)",
+                            (mark, [r["id"] for r in chunk]))
                     break
                 stats["sent"] += len(chunk)
                 now = dt.datetime.now(dt.timezone.utc).isoformat()
                 for et in resp.get("enriched_transactions") or []:
                     en = et.get("enrichments") or {}
                     add = {"_enriched_at": now}
-                    for src, dst in (("merchant_name", "merchant_name"), ("website", "website"),
-                                     ("logo_url", "logo_url"), ("check_number", "check_number"),
-                                     ("payment_channel", "payment_channel"),
-                                     ("entity_id", "merchant_entity_id"),
-                                     ("counterparties", "counterparties"),
-                                     ("location", "location"),
-                                     ("personal_finance_category", "personal_finance_category")):
+                    for src, dst in ENRICH_FIELDS:
                         if en.get(src) not in (None, "", [], {}):
                             add[dst] = en[src]
                     pfc = en.get("personal_finance_category") or {}
@@ -963,6 +1057,23 @@ def _filter_adopted(conn, txns: list) -> tuple[list, int]:
     return kept, dropped
 
 
+# The webhook flags a successful sync disproves, recorded before the run
+# started (one parameter: the run's start time). A NULL stamp is an old row
+# from before the stamp existed and is treated as before.
+_DISPROVED_FLAG_SQL = (
+    "((webhook_status LIKE 'error:%%' OR webhook_status = 'revoked') "
+    "AND (webhook_status_at IS NULL OR webhook_status_at < %s))")
+
+
+# An error the webhook door put on the status because new accounts were
+# waiting in webhook_status (plaid_webhook._record_item_status), recorded
+# after the run started (one parameter: the run's start time).
+_ERROR_BESIDE_NEW_ACCOUNTS_SQL = (
+    "(webhook_status = 'new_accounts' "
+    "AND (status LIKE 'error:%%' OR status = 'revoked') "
+    "AND webhook_status_at >= %s)")
+
+
 def sync(conn, item_id: str, transport=None) -> dict:
     """Balances + cursor-based incremental transactions for one item.
 
@@ -977,6 +1088,10 @@ def sync(conn, item_id: str, transport=None) -> dict:
     if not token:
         raise PlaidError({"error_code": "NO_TOKEN", "error_type": "CONFIG",
                           "error_message": f"item {item_id} has no token"}, 0)
+    # When this run began, on the database clock the webhook door stamps
+    # webhook_status_at with: a flag recorded after it is news this run's
+    # success cannot speak to.
+    started = conn.execute("SELECT clock_timestamp() AS t").fetchone()["t"]
     try:
         bal = client.post("/accounts/get", {"access_token": token})
         # Reconnecting after a restore: adopt the accounts the backup left
@@ -1070,16 +1185,32 @@ def sync(conn, item_id: str, transport=None) -> dict:
             if not page.get("has_more"):
                 break
         # the cursor is persisted ONLY after full pagination succeeded
-        # a clean sync also clears any out-of-band webhook flag (ITEM
-        # ERROR / PENDING_EXPIRATION / …) — the connection demonstrably works
-        # …but never resurrect an archived item: disconnect can land while
+        # A clean sync clears only the webhook flags a working pull
+        # disproves — an ITEM ERROR or a revoked consent, and only one
+        # recorded before this run began. PENDING_EXPIRATION,
+        # PENDING_DISCONNECT and NEW_ACCOUNTS_AVAILABLE are sent once and
+        # all still sync cleanly, so they stay until LOGIN_REPAIRED, an
+        # update-mode completion or a relink clears them; dropping them here
+        # would hide the re-auth door until the connection actually broke.
+        # …and never resurrect an archived item: disconnect can land while
         # a sync is in flight, and 'archived' must win over both the 'ok'
         # here and the error stamp below
-        conn.execute("UPDATE items SET tx_cursor=%s, status='ok', "
-                     "tx_update_status=COALESCE(%s, tx_update_status), "
-                     "webhook_status=NULL, webhook_status_at=NULL "
-                     "WHERE id=%s AND COALESCE(status,'') != 'archived'",
-                     (next_cursor, update_status, item_id))
+        # While new accounts wait to be shared, the webhook door records an
+        # error on the status rather than over that one-time flag; an error
+        # it recorded after this run began is news this success cannot
+        # speak to, the same rule as the flags above.
+        conn.execute(
+            "UPDATE items SET tx_cursor=%s, "
+            "status = CASE WHEN " + _ERROR_BESIDE_NEW_ACCOUNTS_SQL +
+            " THEN status ELSE 'ok' END, "
+            "tx_update_status=COALESCE(%s, tx_update_status), "
+            "webhook_status = CASE WHEN " + _DISPROVED_FLAG_SQL +
+            " THEN NULL ELSE webhook_status END, "
+            "webhook_status_at = CASE WHEN " + _DISPROVED_FLAG_SQL +
+            " THEN NULL ELSE webhook_status_at END "
+            "WHERE id=%s AND COALESCE(status,'') != 'archived'",
+            (next_cursor, started, update_status, started, started,
+             item_id))
         log_sync(conn, item_id, added, request_id=last_request_id,
                  modified=modified, removed=removed_n)
         # Close the reconnect-adoption guard on demonstrated success: the
@@ -1430,14 +1561,38 @@ def sync_holdings(conn, item_id: str, client: Client | None = None,
     # would commit on its own, so a bad holding further down the
     # response would leave the account with no positions at all until the
     # next successful run, and every net-worth read in between would see $0
-    rows = []
+    # Holdings are one row per (account, symbol), and a feed can report one
+    # symbol under two securities in the same account. Written one by one,
+    # the second would overwrite the first under that key and the account's
+    # positions would be short of what the feed reports; so positions that
+    # share a symbol are added together first.
+    merged: dict[tuple, dict] = {}
     for h in hold.get("holdings") or []:
         if not isinstance(h, dict) or not h.get("account_id"):
             continue
         sym, nm = sym_name(h.get("security_id"))
-        rows.append((h["account_id"], sym, nm, h.get("quantity"),
-                     h.get("institution_price"), h.get("institution_value"),
-                     jsonb(h)))
+        m = merged.get((h["account_id"], sym))
+        if m is None:
+            merged[(h["account_id"], sym)] = {
+                "name": nm, "quantity": h.get("quantity"),
+                "price": h.get("institution_price"),
+                "value": h.get("institution_value"), "raw": [h]}
+            continue
+        for k, src in (("quantity", "quantity"), ("value", "institution_value")):
+            if h.get(src) is not None:
+                m[k] = (m[k] or 0) + h[src]
+        m["raw"].append(h)
+        # one price for the merged position, the one its value implies, so
+        # quantity × price (what the net-worth history multiplies) still
+        # equals the value the feed reported
+        if m["quantity"] and m["value"] is not None:
+            m["price"] = m["value"] / m["quantity"]
+        elif m["price"] is None:
+            m["price"] = h.get("institution_price")
+    rows = [(aid, sym, m["name"], m["quantity"], m["price"], m["value"],
+             jsonb(m["raw"][0] if len(m["raw"]) == 1
+                   else _merged_raw(m["raw"])))
+            for (aid, sym), m in merged.items()]
     # Replace covers every account we are about to WRITE, not just the
     # ones the response calls investment: a holding whose account Plaid
     # types as something else (or omits from `accounts` altogether) would
@@ -1457,6 +1612,21 @@ def sync_holdings(conn, item_id: str, client: Client | None = None,
                        price=EXCLUDED.price, value=EXCLUDED.value,
                        as_of=now(), raw=EXCLUDED.raw""", row)
     return len(rows)
+
+
+def _merged_raw(lots: list[dict]) -> dict:
+    """The stored source record of a position merged from several lots.
+    The P/L reader takes a holding's cost basis from the top level of its
+    record, so the lots' bases are added up there: a lot without one counts
+    at its value, the same "no basis means no gain" rule the reader applies
+    to a single holding. With no basis on any lot the key is left out and
+    the whole position reads that way."""
+    out: dict = {"holdings": lots}
+    if any(h.get("cost_basis") is not None for h in lots):
+        out["cost_basis"] = sum(
+            float(h["cost_basis"]) if h.get("cost_basis") is not None
+            else float(h.get("institution_value") or 0) for h in lots)
+    return out
 
 
 def sync_products(conn, item_id: str, transport=None) -> dict:

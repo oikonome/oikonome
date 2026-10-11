@@ -6,6 +6,7 @@
 import * as WebBrowser from "expo-web-browser";
 
 import { Client } from "./api";
+import { linkPollMayRetry } from "./pure";
 
 export type PlaidLinkOutcome = {
   kind?: "add" | "add_failed" | "update" | "update_failed" | "exited"
@@ -23,9 +24,21 @@ export async function plaidHostedLink(
   WebBrowser.openBrowserAsync(started.hosted_link_url)
     .then(() => { closedAt = Date.now(); })
     .catch(() => { closedAt = Date.now(); });
+  // A failed poll backs off and polls again until the deadline (see
+  // linkPollMayRetry); only a definite refusal ends the wait early.
   const deadline = Date.now() + 15 * 60_000;
+  let wait = 2500;
   while (Date.now() < deadline) {
-    const s = await client.plaidLinkStatus(started.link_token);
+    let s: Awaited<ReturnType<Client["plaidLinkStatus"]>>;
+    try {
+      s = await client.plaidLinkStatus(started.link_token);
+    } catch (e) {
+      if (!linkPollMayRetry(e)) throw e;
+      wait = Math.min(wait * 2, 30_000);
+      await new Promise((r) => setTimeout(r, wait));
+      continue;
+    }
+    wait = 2500;
     if (s.done) {
       WebBrowser.dismissBrowser?.();
       return s;
@@ -36,7 +49,7 @@ export async function plaidHostedLink(
     // sync lock, so keep waiting for it
     if (closedAt && s.kind !== "busy" && Date.now() - closedAt > 9_000)
       return { kind: "exited" };
-    await new Promise((r) => setTimeout(r, 2500));
+    await new Promise((r) => setTimeout(r, wait));
   }
   throw new Error("Timed out waiting for the bank connection");
 }

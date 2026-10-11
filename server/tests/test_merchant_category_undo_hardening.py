@@ -306,6 +306,47 @@ class MerchantDetailInputTests(unittest.TestCase):
                             params={"display": "A" * 300})
         self.assertEqual(r.status_code, 404, r.text)
 
+    def test_an_over_long_imported_name_can_be_renamed_and_merged(self):
+        """The long descriptors are the ones that most need cleaning, so
+        the name being renamed is read like the detail read reads it —
+        uncapped. Only a NEW name being written keeps the cap."""
+        long_name = ("LONG IMPORTED DESCRIPTOR " * 11).strip()   # 274 chars
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            add_txn(conn, "2026-08-03", 12, long_name)
+        finally:
+            conn.close()
+        r = self.client.post("/api/merchants/rename",
+                             json={"display": long_name, "to": "Tidy Name"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertGreaterEqual(r.json()["raws"], 1)
+        # an unknown long source is not-found, never refused for its length
+        r = self.client.post("/api/merchants/rename",
+                             json={"display": "B" * 300, "to": "Tidy Name"})
+        self.assertEqual(r.status_code, 404, r.text)
+        # a brand-new over-long target is still refused
+        r = self.client.post("/api/merchants/rename",
+                             json={"display": "Tidy Name", "to": "C" * 201})
+        self.assertEqual(r.status_code, 400, r.text)
+        # control characters are refused on either side
+        r = self.client.post("/api/merchants/rename",
+                             json={"display": "Tidy\x07Name", "to": "X"})
+        self.assertEqual(r.status_code, 400, r.text)
+
+    def test_a_merge_into_an_existing_over_long_name_is_allowed(self):
+        """Merging INTO a long-named merchant writes no new name — the
+        target already exists in the ledger, so its length is not refused."""
+        long_name = ("ANOTHER LONG IMPORTED NAME " * 9).strip()  # 242 chars
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            add_txn(conn, "2026-08-04", 9, long_name)
+            add_txn(conn, "2026-08-05", 9, "Short Shop")
+        finally:
+            conn.close()
+        r = self.client.post("/api/merchants/rename",
+                             json={"display": "Short Shop", "to": long_name})
+        self.assertEqual(r.status_code, 200, r.text)
+
     def test_a_real_name_still_reads(self):
         r = self.client.get("/api/merchants/detail",
                             params={"display": "Cedar Physio"})

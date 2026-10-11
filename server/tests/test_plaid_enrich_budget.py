@@ -159,6 +159,59 @@ class EnrichSurvivesATransportFailure(unittest.TestCase):
         self.assertEqual(st["sent"], 1)
         self.assertEqual(plaid.enrich_usage(self.conn)["used"], 1)
 
+    def test_a_chunk_lost_to_a_read_timeout_stays_charged_and_is_not_resent(self):
+        """A read timeout may follow a request Plaid received and billed:
+        the chunk is not refunded against the cap, and its rows sit out the
+        next runs instead of being paid for again on every click."""
+        calls = {"n": 0}
+
+        def handler(request):
+            calls["n"] += 1
+            raise httpx.ReadTimeout("timed out")
+
+        st = plaid.enrich_rows(self.conn, limit=10,
+                               transport=httpx.MockTransport(handler))
+        self.assertIsNotNone(st["error"])
+        lost = st["unknown"]
+        self.assertGreater(lost, 0)
+        self.assertEqual(plaid.enrich_usage(self.conn)["used"], lost)
+        before = plaid.enrich_candidate_count(self.conn)
+        n = calls["n"]
+        plaid.enrich_rows(self.conn, limit=10,
+                          transport=httpx.MockTransport(handler))
+        # the lost chunk is not among what the next run sends
+        self.assertLessEqual(calls["n"] - n, 1)
+        self.assertEqual(plaid.enrich_candidate_count(self.conn),
+                         before - (plaid.enrich_usage(self.conn)["used"]
+                                   - lost))
+        # a day later the rows are offered once more
+        self.conn.execute(
+            "UPDATE transactions SET raw = raw || jsonb_build_object("
+            "'_enrich_unknown_at', (now() - interval '2 days')::text)")
+        self.assertGreaterEqual(plaid.enrich_candidate_count(self.conn),
+                                before + lost)
+
+    def test_a_file_column_named_like_the_unknown_mark_never_breaks_selection(self):
+        """A CSV import stores its row as raw under the file's own headers,
+        so a column can carry the outcome-unknown key with any value. A
+        value that is not a timestamp must neither break the candidate
+        query nor hold the row out of Enrich."""
+        from oikonome.sync import csvimport
+        before = plaid.enrich_candidate_count(self.conn)
+        text = ("Date,Description,Amount,_enrich_unknown_at\n"
+                f"{TODAY - dt.timedelta(days=2)},CORNER SHOP,-7.25,not a date\n"
+                f"{TODAY - dt.timedelta(days=3)},HARDWARE,-9.10,\n")
+        csvimport.import_csv(self.conn, "chk", text,
+                             {"date": "Date", "name": "Description",
+                              "amount": "Amount"})
+        n = self.conn.execute(
+            "SELECT count(*) AS n FROM transactions"
+            " WHERE raw ? '_enrich_unknown_at'").fetchone()["n"]
+        self.assertEqual(n, 2)
+        self.assertEqual(plaid.enrich_candidate_count(self.conn), before + 2)
+        st = plaid.enrich_rows(self.conn, limit=10, transport=_reply())
+        self.assertIsNone(st["error"])
+
     def test_a_failure_after_the_send_still_refunds_the_unsent_rows(self):
         """The reservation is committed before Plaid is asked; if the
         bookkeeping after a partial send raises, the rows that never went

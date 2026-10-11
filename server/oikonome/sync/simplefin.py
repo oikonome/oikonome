@@ -28,13 +28,16 @@ from __future__ import annotations
 
 import base64
 import datetime as dt
+import json
 import logging
+import math
 import re
+import time
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 import httpx
 
-from ..engine.compat import as_date
+from ..engine.compat import MAX_AMOUNT, as_date
 from .adopt import stored_account_id
 from .base import DEBT_TYPES, Account, Transaction, \
     filter_import_duplicates, log_sync, reconcile_vanished_pendings, \
@@ -77,6 +80,47 @@ def _guard(url: str, what: str) -> str:
     return url
 
 
+# Both SimpleFIN servers are whichever the setup token names, so a reply is
+# read with a ceiling on its size and on the whole exchange, not only on
+# each read: a server sending gigabytes, or one byte a minute, would
+# otherwise hold the hourly sync (and every household queued behind it) or
+# the worker's memory. The claim answers with one URL; a fetch carries up
+# to two years of every bank on the bridge.
+CLAIM_READ_MAX = 16 * 1024
+CLAIM_DEADLINE = 30.0
+FETCH_READ_MAX = 64 * 1024 * 1024
+FETCH_DEADLINE = 180.0
+
+
+class ReplyTooLarge(ValueError):
+    """The bridge's reply ran past its ceiling."""
+
+
+def _client(transport, deadline: float) -> httpx.Client:
+    """A client whose every socket operation shares one wall-clock
+    deadline (the webhook sender's own mechanism). A test's transport is
+    used as given."""
+    c = httpx.Client(transport=transport or _pinned(),
+                     timeout=min(60.0, deadline - time.monotonic()))
+    if transport is None:
+        from ..notify.webhooks import _with_deadline
+        _with_deadline(c, deadline)
+    return c
+
+
+def _read(r: httpx.Response, cap: int, deadline: float, what: str) -> bytes:
+    """The decoded body, at most `cap` bytes (decoded, so a compressed
+    reply cannot inflate past it) and only while the deadline lasts."""
+    got = bytearray()
+    for chunk in r.iter_bytes():
+        got += chunk
+        if len(got) > cap:
+            raise ReplyTooLarge(f"{what} is larger than {cap} bytes")
+        if time.monotonic() > deadline:
+            raise ValueError(f"{what} took too long to arrive")
+    return bytes(got)
+
+
 def _pinned():
     """both SimpleFIN URLs are tenant-supplied, so on hosted the
     fetch pins DNS (see netguard.pinned_transport). Explicit `transport=`
@@ -93,7 +137,8 @@ def claim_setup_token(setup_token: str, transport=None) -> str:
     # private SimpleFIN bridge; the metadata IP is always blocked.
     _guard(claim_url, "the SimpleFIN claim URL")
     post_url, auth = _url_auth(claim_url)
-    with httpx.Client(transport=transport or _pinned(), timeout=30) as c:
+    deadline = time.monotonic() + CLAIM_DEADLINE
+    with _client(transport, deadline) as c:
         # The claim secret is a PATH segment of the claim URL, and every
         # httpx error names the URL — a refused or unreachable bridge would
         # otherwise put a still-unclaimed token into the app log (and the
@@ -101,18 +146,21 @@ def claim_setup_token(setup_token: str, transport=None) -> str:
         # The replacement names the status only, and `from None` keeps the
         # original exception out of the chained traceback too.
         try:
-            r = c.post(post_url, auth=auth)
+            with c.stream("POST", post_url, auth=auth) as r:
+                if r.is_error:
+                    raise ValueError("the SimpleFIN bridge refused the claim "
+                                     f"(HTTP {r.status_code})")
+                body = _read(r, CLAIM_READ_MAX, deadline,
+                             "the SimpleFIN claim reply")
         except httpx.HTTPError as e:
             raise ValueError("the SimpleFIN claim request failed "
                              f"({type(e).__name__})") from None
-        if r.is_error:
-            raise ValueError("the SimpleFIN bridge refused the claim "
-                             f"(HTTP {r.status_code})")
         # The claim RESPONSE is the access URL we will hit on every sync
         # forever — checking only the claim URL guarded the door we knock on,
         # not the address that door hands back. A public claim endpoint could
         # answer "http://169.254.169.254/…" and we would have persisted it.
-        return _guard(r.text.strip(), "the SimpleFIN access URL")
+        return _guard(body.decode("utf-8", "replace").strip(),
+                      "the SimpleFIN access URL")
 
 
 def _classify(acct: dict, type_hint: str | None) -> tuple[str, str | None]:
@@ -195,10 +243,55 @@ def fetch(access_url: str, since: dt.date | None = None,
         params["start-date"] = int(dt.datetime.combine(
             since, dt.time.min, dt.timezone.utc).timestamp())
     get_url, auth = _url_auth(access_url.rstrip("/") + "/accounts")
-    with httpx.Client(transport=transport or _pinned(), timeout=60) as c:
-        r = c.get(get_url, params=params, auth=auth)
-        r.raise_for_status()
-        return r.json()
+    deadline = time.monotonic() + FETCH_DEADLINE
+    with _client(transport, deadline) as c:
+        with c.stream("GET", get_url, params=params, auth=auth) as r:
+            # A refusal is raised on its status alone and its body is never
+            # read: reading it decodes it whole, and a compressed error
+            # page could inflate past any memory the worker has.
+            r.raise_for_status()
+            body = _read(r, FETCH_READ_MAX, deadline,
+                         "the SimpleFIN bridge reply")
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        raise ValueError("the SimpleFIN bridge reply is not JSON") from None
+    return _well_formed(payload)
+
+
+def _well_formed(payload) -> dict:
+    """The reply with every account that has no id, and every account or
+    row that is not an object, left out. One bridge token carries every
+    bank, so one malformed entry must cost that entry, not the pull."""
+    if not isinstance(payload, dict):
+        raise ValueError("the SimpleFIN bridge reply is not an object")
+    accounts = []
+    raw_accounts = payload.get("accounts")
+    for a in raw_accounts if isinstance(raw_accounts, list) else []:
+        if not isinstance(a, dict) or a.get("id") in (None, ""):
+            log.warning("SimpleFIN account skipped (malformed)")
+            continue
+        rows = a.get("transactions")
+        a = {**a, "transactions": [t for t in rows if isinstance(t, dict)]
+             if isinstance(rows, list) else []}
+        if not isinstance(a.get("org"), dict):
+            a["org"] = {}
+        accounts.append(a)
+    return {**payload, "accounts": accounts}
+
+
+def _amount(v) -> float | None:
+    """A bridge balance as a finite number, or None (unknown) for anything
+    else: a non-numeric string is not a reason to fail the pull, and NaN or
+    infinity would poison every sum and reply that reads the account."""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        n = float(v)
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: a JSON integer too wide for a double
+        return None
+    return n if math.isfinite(n) else None
 
 
 # Depth of an institution's FIRST pull — the same window the claim-time
@@ -248,6 +341,36 @@ def _first_pull_since(conn, item_id: str, payload: dict,
     return None
 
 
+# How far before a disconnect a bank brought back by a new setup token
+# reaches on its next pull, so the days either side of the gap overlap.
+# The mark is items.resync_from. The migration that added that column
+# describes only MX's reconnect door, which wrote it first; both
+# aggregators write it now, each reading back only its own items.
+RESYNC_OVERLAP = dt.timedelta(days=7)
+
+
+def _resync_owed(conn, item_id: str, payload: dict,
+                 institution_name: str) -> tuple[dt.date | None, list[str]]:
+    """The earliest day a bank brought back by a new token still needs, and
+    which of its children asked — only those this payload actually
+    carries. The bridge takes one start-date for every bank, so a gap owed
+    to a bank the bridge no longer returns must not deepen every routine
+    pull for ever; it waits until that bank is back in the payload."""
+    rows = conn.execute(
+        "SELECT id, resync_from FROM items WHERE aggregator='simplefin-org' "
+        "AND id LIKE %s AND resync_from IS NOT NULL "
+        "AND COALESCE(status,'') != 'archived'",
+        (item_id + ":%",)).fetchall()
+    if not rows:
+        return None, []
+    present = {_child_item(item_id, a.get("org") or {}, institution_name)[0]
+               for a in payload.get("accounts") or []}
+    owed = [r for r in rows if r["id"] in present]
+    if not owed:
+        return None, []
+    return min(r["resync_from"] for r in owed), [r["id"] for r in owed]
+
+
 def sync(conn, item_id: str, access_url: str, *, since: dt.date | None = None,
          institution_name: str = "SimpleFIN",
          account_types: dict[str, str] | None = None,
@@ -265,15 +388,28 @@ def sync(conn, item_id: str, access_url: str, *, since: dt.date | None = None,
         payload = fetch(access_url, since=since, transport=transport)
         deep = _first_pull_since(conn, item_id, payload, since,
                                  institution_name)
+        # a bank a new token brought back reaches back over the time it was
+        # disconnected, which the routine window never would
+        owed, owed_items = _resync_owed(conn, item_id, payload,
+                                        institution_name)
+        if (owed is not None and since is not None
+                and owed < (deep or since)):
+            deep = owed
         if deep is not None:
             payload = fetch(access_url, since=deep, transport=transport)
     except Exception as e:                       # noqa: BLE001
         log_sync(conn, item_id, 0, error=f"{type(e).__name__}: {e}")
         # mark the bridge AND its per-org child items (accounts hang off the
         # org items, and links health reads the account's own item) so a
-        # dead token fails over immediately instead of after 48h stale
+        # dead token fails over immediately instead of after 48h stale.
+        # A disconnected (archived) child or bridge keeps its status: an
+        # error stamp would drop it out of the archived set the next good
+        # pull skips, and that pull would bring the bank back with its
+        # history. A restored shell keeps its status for the reason the
+        # worker's own error write gives.
         conn.execute(
-            "UPDATE items SET status=%s WHERE id=%s OR id LIKE %s",
+            "UPDATE items SET status=%s WHERE (id=%s OR id LIKE %s) "
+            "AND COALESCE(status,'') NOT IN ('archived', 'restored')",
             (f"error:{type(e).__name__}", item_id, item_id + ":%"))
         raise
     # One SimpleFIN bridge token returns EVERY institution the user added
@@ -282,7 +418,8 @@ def sync(conn, item_id: str, access_url: str, *, since: dt.date | None = None,
     # token + health; each org gets a child item (aggregator
     # 'simplefin-org', no token — the worker's sync loop skips it) and
     # accounts hang off their org, so the UI groups by real institution.
-    upsert_item(conn, item_id, "simplefin", "SimpleFIN bridge", access_url)
+    upsert_item(conn, item_id, "simplefin", "SimpleFIN bridge", access_url,
+                keep_archived=True)
 
     # a DISCONNECTED per-bank child stays disconnected: upsert_item resets
     # status='ok', so archived children must be skipped entirely (no item
@@ -295,7 +432,8 @@ def sync(conn, item_id: str, access_url: str, *, since: dt.date | None = None,
     def _org_item(org: dict) -> str:
         child, name = _child_item(item_id, org, institution_name)
         if child not in archived:
-            upsert_item(conn, child, "simplefin-org", name, None)
+            upsert_item(conn, child, "simplefin-org", name, None,
+                        keep_archived=True)
         return child
 
     # user-classified accounts: persisted type wins over the name heuristic
@@ -314,9 +452,8 @@ def sync(conn, item_id: str, access_url: str, *, since: dt.date | None = None,
         aid = stored_account_id(conn, str(a["id"]), renamed_ids)
         types = account_types or {}
         typ, sub = _classify(a, types.get(aid, types.get(a["id"])))
-        bal = float(a["balance"]) if a.get("balance") is not None else None
-        avail = (float(a["available-balance"])
-                 if a.get("available-balance") is not None else None)
+        bal = _amount(a.get("balance"))
+        avail = _amount(a.get("available-balance"))
         if pinned.get(aid, typ) in DEBT_TYPES:
             # SimpleFIN reports debt negative (a card's and a loan's alike);
             # the engine wants the amount owed positive
@@ -359,11 +496,28 @@ def sync(conn, item_id: str, access_url: str, *, since: dt.date | None = None,
                 log.warning("SimpleFIN row skipped (date out of range): "
                             "%s/%s", a["id"], t.get("id"))
                 continue
+            # one row with no id or no usable amount is one skipped row:
+            # raised out of here it would fail the pull for every bank on
+            # the bridge, every hour, for as long as the row stays in the
+            # window (the same isolation the MX syncer gives its rows)
+            try:
+                if t.get("id") in (None, ""):
+                    raise KeyError("id")
+                amount = -float(t["amount"])     # bank sign → Plaid sign
+                # a value too wide for a double raises OverflowError; one
+                # that converts to infinity or past any real sum would fail
+                # every cents conversion later in the pull
+                if not math.isfinite(amount) or abs(amount) > MAX_AMOUNT:
+                    raise ValueError("amount")
+            except (KeyError, TypeError, ValueError, OverflowError):
+                log.warning("SimpleFIN row skipped (no id or bad amount): "
+                            "%s/%s", a["id"], t.get("id"))
+                continue
             txns.append(Transaction(
                 id=f"sfin:{a['id']}:{t['id']}",
                 account_id=aid,
                 date=posted_on,
-                amount=-float(t["amount"]),      # bank sign → Plaid sign
+                amount=amount,
                 name=t.get("description") or "?",
                 merchant_name=t.get("payee"),
                 pending=bool(t.get("pending")),
@@ -402,7 +556,13 @@ def sync(conn, item_id: str, access_url: str, *, since: dt.date | None = None,
     for cid in set(org_of.values()) - archived:
         log_sync(conn, cid, per_child.get(cid, 0),
                  removed=removed_per_child.get(cid, 0))
-    conn.execute("UPDATE items SET status='ok' WHERE id=%s", (item_id,))
+    # the owner may have disconnected the bridge while this pull ran
+    conn.execute("UPDATE items SET status='ok' WHERE id=%s "
+                 "AND COALESCE(status,'') != 'archived'", (item_id,))
+    if owed_items:
+        # the gap is filled; later pulls go back to the usual window
+        conn.execute("UPDATE items SET resync_from=NULL WHERE id = ANY(%s) "
+                     "AND COALESCE(status,'') != 'archived'", (owed_items,))
     return {"accounts": len(accounts), "transactions": added,
             "removed": len(retired),
             "skipped_import_duplicates": skipped_imports,

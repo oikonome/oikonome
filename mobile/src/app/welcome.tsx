@@ -24,15 +24,18 @@ import { Alert, Animated, Easing, Pressable, ScrollView, StyleSheet, Text,
 import PullRefresh from "../components/pull-refresh";
 
 import StaleBanner from "../components/stale-banner";
-import { Card, Pill } from "../components/ui";
+import { Card, Pill, SharedLock } from "../components/ui";
 import type { BillsData, Proposal } from "../lib/api";
-import { patchQuery, removeFromList, saveSettings } from "../lib/cache";
-import { type Delivery, deliveryOf, flagsOf, institutionAllowance } from "../lib/pure";
+import { patchQuery, removeFromList, saveSettings, seedSettings }
+  from "../lib/cache";
+import { rebaseSched, storedSched } from "../lib/schedule";
+import { type Delivery, deliveryOf, flagsOf, institutionAllowance,
+         proposalSuperseded, SHARED_GRANT_NOTE } from "../lib/pure";
 import { registerNativePush } from "../lib/push";
 import { ext } from "../ext";
 import { useSession } from "../lib/session";
 import { C, mmddyy, money } from "../lib/theme";
-import { useViewer } from "../lib/viewer";
+import { useSharedLock, useViewer } from "../lib/viewer";
 import { markLeftWizard } from "../lib/storage";
 import { plaidHostedLink } from "../lib/plaid";
 import { ago } from "../lib/dates";
@@ -79,6 +82,10 @@ export default function Welcome() {
 
   const d = ob.data;
   const hosted = !!(me.data as { hosted?: boolean } | undefined)?.hosted;
+  // linking or disconnecting a bank starts or ends a connection that
+  // outlives the shared demonstration login, so the server refuses it
+  // both; the connect step says so in place, as the hub does
+  const credentialLock = useSharedLock("credential");
   const keys = stepKeys(hosted);
   // how many of the plan's institutions are spent — both figures from the
   // server, never a constant here: the cap has a per-tenant override an
@@ -209,7 +216,7 @@ export default function Welcome() {
         qc.invalidateQueries({ queryKey: ["onboarding-backfill"] });
       }
     },
-    onError: (e) => setLinkMsg(String(e)),
+    onError: (e) => setLinkMsg(errText(e)),
   });
   const disconnect = useMutation({
     mutationFn: (id: string) => client!.connectionDisconnect(id),
@@ -226,7 +233,7 @@ export default function Welcome() {
       // Connect button disabled after the disconnect that freed one
       qc.invalidateQueries({ queryKey: ["me"] });
     },
-    onError: (e) => setLinkMsg(String(e)),
+    onError: (e) => setLinkMsg(errText(e)),
   });
   // Step 2 runs the finder itself once the history is in — the web's
   // autoDetect. Without it the step says "the finder already scanned"
@@ -335,8 +342,8 @@ export default function Welcome() {
       <ScrollView style={s.wrap}>
         <Card>
           <Text style={s.h1}>Setup</Text>
-          <Text style={s.mut}>View-only access — the instance owner runs
-            the guided setup.</Text>
+          <Text style={s.mut}>The account owner runs the guided setup — it
+            connects banks and configures this instance.</Text>
         </Card>
       </ScrollView>
     );
@@ -373,9 +380,11 @@ export default function Welcome() {
                 {ext.allowanceNote(instUsed, instCap, instFull)}
               </Text>
             )}
+            <SharedLock note={credentialLock}>
             <Pressable style={[s.btn, (link.isPending || instFull)
                                       && { opacity: 0.5 }]}
-                       disabled={link.isPending || instFull}
+                       disabled={link.isPending || instFull
+                                 || !!credentialLock}
                        onPress={() => link.mutate()}>
               <Text style={s.btnText}>
                 {link.isPending ? "Finish signing in at your bank…"
@@ -384,12 +393,14 @@ export default function Welcome() {
                                   : "+ Connect an account ↗"}
               </Text>
             </Pressable>
+            </SharedLock>
             <Text style={s.mut}>Opens your bank's sign-in (Plaid). When
               you finish, the connection appears below so you can link
               another or continue.</Text>
             {linkMsg && <Text style={[s.mut, { color: C.warn }]}>{linkMsg}</Text>}
             {(conns.data?.connections ?? []).length > 0 && (
               <LinkedBanks conns={conns.data!.connections}
+                           locked={!!credentialLock}
                            onDisconnect={(id) => disconnect.mutate(id)}
                            busyId={disconnect.isPending
                              ? disconnect.variables ?? null : null} />
@@ -486,12 +497,14 @@ export default function Welcome() {
 
 /** The web's linked-bank rows: one row per bank — status dot, name,
  *  accounts · last pull, Disconnect. */
-function LinkedBanks({ conns, onDisconnect, busyId }: {
+function LinkedBanks({ conns, onDisconnect, busyId, locked }: {
   conns: { id: string; institution_name: string | null; status: string | null;
            last_ok: string | null; accounts?: number;
            bank_updated_at?: string | null }[];
   // the one row whose disconnect is in flight — never the whole list
-  onDisconnect: (id: string) => void; busyId: string | null }) {
+  onDisconnect: (id: string) => void; busyId: string | null;
+  // refused to this login; the reason is stated once above the list
+  locked: boolean }) {
   const total = conns.reduce((t, c) => t + (c.accounts ?? 0), 0);
   return (
     <View style={{ marginTop: 6 }}>
@@ -533,7 +546,7 @@ function LinkedBanks({ conns, onDisconnect, busyId }: {
                     ? ` · bank sent data ${ago(c.bank_updated_at)}` : ""}
                 </Text>
               </View>
-              <Pressable disabled={busyId === c.id}
+              <Pressable disabled={busyId === c.id || locked}
                          onPress={() => Alert.alert(
                            `Disconnect ${c.institution_name || c.id}?`,
                            "It stops syncing — history is kept.",
@@ -542,7 +555,8 @@ function LinkedBanks({ conns, onDisconnect, busyId }: {
                               onPress: () => onDisconnect(c.id) }])}
                          style={{ borderWidth: StyleSheet.hairlineWidth,
                                   borderColor: C.border, borderRadius: 8,
-                                  paddingHorizontal: 10, paddingVertical: 4 }}>
+                                  paddingHorizontal: 10, paddingVertical: 4,
+                                  opacity: locked ? 0.55 : 1 }}>
                 <Text style={{ color: C.mut, fontSize: 12 }}>Disconnect</Text>
               </Pressable>
             </View>
@@ -589,12 +603,23 @@ function ProposalsInline() {
         { pid: string; action: "approve" | "reject" }) =>
       client!.billsProposal(pid, action),
     onSuccess: (r, v) => {
-      setNotice(`${v.action === "approve" ? "Approved" : "Rejected"}: ${r.payee}`);
+      const gone = proposalSuperseded(r);
+      setNotice(gone ? `${r.payee} is already tracked — the offer was withdrawn`
+        : `${v.action === "approve" ? "Approved" : "Rejected"}: ${r.payee}`);
       removeFromList<BillsData, Proposal>(qc, ["bills"], "proposals",
         (p) => p.id === v.pid);
-      refetch(v.action === "approve");
+      refetch(v.action === "approve" && !gone);
     },
-    onError: (e) => setNotice(String(e)),
+    onError: (e, v) => {
+      setNotice(errText(e));
+      // an offer for a bill already tracked is withdrawn by the server as
+      // it refuses: the card could neither be approved nor dismissed
+      if (proposalSuperseded(e)) {
+        removeFromList<BillsData, Proposal>(qc, ["bills"], "proposals",
+          (p) => p.id === v.pid);
+        refetch(false);
+      }
+    },
   });
   const approveAll = useMutation({
     mutationFn: () => client!.billsApproveAll(),
@@ -610,7 +635,7 @@ function ProposalsInline() {
       });
       refetch(true);
     },
-    onError: (e) => setNotice(String(e)),
+    onError: (e) => setNotice(errText(e)),
   });
   if (!q.data) return <Text style={s.mut}>Loading proposals…</Text>;
   const props = q.data.proposals;
@@ -855,22 +880,34 @@ function FinishStep({ d }: {
   // (VAPID) reaches browsers, never this app, so it does not make the
   // choice available here; registering would "succeed" and deliver nothing
   const pushReady = !!notify.data?.native_push_available;
-  // the reply seeds ["settings"], so the on/off line flips with it
+  type DailyFlags = { on: boolean; push: boolean; hour: number;
+                      summary: boolean };
+  // nothing to lay a change over until the stored settings have answered
+  const notLoaded = !settings.data;
+  // The schedule saves whole, so the daily change is laid over the
+  // schedule stored NOW (the Email & Push screen's rule): the weekly,
+  // monthly and yearly reports, and any daily field this tap did not
+  // change, stay as they are stored. One save at a time, so each read
+  // sees the save before it. The reply seeds ["settings"], so the on/off
+  // line flips with it.
   const save = useMutation({
-    mutationFn: (next: { on: boolean; push: boolean; hour: number;
-                         summary: boolean }) =>
-      saveSettings(qc, client!, {
-        email_schedule: {
-          ...(cfg.email_schedule ?? {}),
-          daily: { ...(daily ?? {}), on: next.on, push: next.push,
-                   hour: next.hour, summary: next.summary },
-        },
-      }),
+    mutationFn: async (v: { base: DailyFlags; patch: Partial<DailyFlags> }) => {
+      const live = (await client!.settingsSchedule()) ?? {};
+      const sent = rebaseSched({ daily: { ...v.base, ...v.patch } },
+                               { daily: v.base }, live, "daily");
+      const r = await client!.settingsSaveSchedule(sent);
+      seedSettings(qc, { ...r, email_schedule: storedSched(r, sent) });
+      return r;
+    },
+    scope: { id: "settings-email" },
     onError: () => setDeliveryOv(null),
   });
-  const commit = (patch: Partial<{ on: boolean; push: boolean; hour: number;
-                                    summary: boolean }>) =>
-    save.mutate({ on, push, hour: hourVal, summary: summaryVal, ...patch });
+  const commit = (patch: Partial<DailyFlags>) =>
+    save.mutate({ base: { on: daily?.on ?? true, push: !!daily?.push,
+                          hour: daily?.hour ?? 7,
+                          summary: daily?.summary ?? false },
+                  patch: { on, push, hour: hourVal, summary: summaryVal,
+                           ...patch } });
   // choosing push registers THIS phone too — the same door the launch
   // offers once — and says what the OS answered, so the choice is not a
   // promise the phone never agreed to
@@ -881,6 +918,7 @@ function FinishStep({ d }: {
       const r = await registerNativePush(client, { force: true });
       setPushNote(
         r === "ok" ? { text: "This phone will receive it." }
+        : r === "shared" ? { bad: true, text: SHARED_GRANT_NOTE }
         : r === "denied" ? { bad: true, text: "Notifications are off for "
             + "this app in the phone's settings — allow them, then choose "
             + "Push again." }
@@ -923,11 +961,12 @@ function FinishStep({ d }: {
           const blocked = (v === "push" || v === "both") && !pushReady;
           const active = delivery === v;
           return (
-            <Pressable key={v} disabled={save.isPending || blocked}
+            <Pressable key={v} disabled={save.isPending || blocked || notLoaded}
                        onPress={() => choose(v)}
                        style={[s.btn, active && { backgroundColor: C.accent,
                                                   borderColor: C.accent },
-                               (blocked || save.isPending) && { opacity: 0.5 }]}>
+                               (blocked || save.isPending || notLoaded)
+                                 && { opacity: 0.5 }]}>
               <Text style={[s.btnText, active && { color: "#fff" }]}>{label}</Text>
             </Pressable>
           );
@@ -948,12 +987,12 @@ function FinishStep({ d }: {
         {(on || push) && (
           <View style={{ flexDirection: "row", alignItems: "center",
                          gap: 6, marginTop: 8 }}>
-            <Pressable onPress={() => { const h = (hourVal + 23) % 24;
+            <Pressable disabled={notLoaded} onPress={() => { const h = (hourVal + 23) % 24;
                                         setHour(h); commit({ hour: h }); }}>
               <Text style={s.link}>−</Text></Pressable>
             <Text style={{ color: C.text, fontSize: 13 }}>
               at {hourLabel(hourVal)}</Text>
-            <Pressable onPress={() => { const h = (hourVal + 1) % 24;
+            <Pressable disabled={notLoaded} onPress={() => { const h = (hourVal + 1) % 24;
                                         setHour(h); commit({ hour: h }); }}>
               <Text style={s.link}>+</Text></Pressable>
           </View>
@@ -965,7 +1004,8 @@ function FinishStep({ d }: {
                 + "spending buckets, recent transactions, upcoming bills"],
              [true, "Verdict only", "just the card: on budget or not, left "
                 + "to spend, pinned bills"]] as const).map(([v, t, sub]) => (
-            <Pressable key={t} onPress={() => { setSummary(v);
+            <Pressable key={t} disabled={notLoaded}
+                       onPress={() => { setSummary(v);
                                                 commit({ summary: v }); }}
                        style={{ flexDirection: "row", gap: 8,
                                 alignItems: "flex-start" }}>
@@ -982,7 +1022,7 @@ function FinishStep({ d }: {
       {/* no recipient line / household link here — the web's rule: the
           link led out of the wizard; household is added later */}
       {save.isError && <Text style={[s.mut, { color: C.warn }]}>
-        {String(save.error)}</Text>}
+        {errText(save.error)}</Text>}
     </View>
   );
 }

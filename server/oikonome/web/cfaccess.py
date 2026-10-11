@@ -102,6 +102,10 @@ def verify(token: str) -> dict:
         signature = _b64u_decode(parts[2])
     except Exception:                                        # noqa: BLE001
         raise ValueError("undecodable Access assertion")
+    # request-supplied JSON may decode to an array, a number or a string;
+    # only objects are an assertion, and anything else is a refusal
+    if not isinstance(header, dict) or not isinstance(claims, dict):
+        raise ValueError("malformed Access assertion")
     if header.get("alg") != "RS256":
         # never trust the token's own algorithm choice beyond the one we
         # accept — "alg": "none" and HS256-with-the-public-key are the

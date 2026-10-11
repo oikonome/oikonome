@@ -125,6 +125,77 @@ class PushDoorTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_a_push_during_an_erasure_writes_nothing(self):
+        """A push authenticated before an account erasure began must not
+        write the household's rows back behind it: while the erasure holds
+        the writer locks the door answers 409, and nothing lands."""
+        from oikonome import erasure
+        bare = TestClient(self.client.app)
+        payload = dict(CB_PAYLOAD,
+                       transactions=[dict(CB_PAYLOAD["transactions"][0],
+                                          id="coinbase:erase-t1")])
+        admin = tenancy.admin_connect()
+        erasure.hold_writers(admin, self.tid)
+        try:
+            r = bare.post("/api/import/coinbase", headers=self.hdr,
+                          json=payload)
+        finally:
+            erasure.release_writers(admin, self.tid)
+            admin.close()
+        self.assertEqual(r.status_code, 409, r.text)
+        conn = self._conn()
+        try:
+            n = conn.execute("SELECT count(*) AS n FROM transactions "
+                             "WHERE id='coinbase:erase-t1'").fetchone()["n"]
+        finally:
+            conn.close()
+        self.assertEqual(n, 0)
+
+    def test_a_statement_push_during_an_erasure_writes_nothing(self):
+        """The statement-file door the collector scripts push to joins the
+        same writer lock: while an erasure holds it, 409 and no account or
+        row is written back."""
+        from oikonome import erasure
+        bare = TestClient(self.client.app)
+        csv = b"Date,Amount,Description\n07/01/2026,-4.25,ERASE PUSH\n"
+        admin = tenancy.admin_connect()
+        erasure.hold_writers(admin, self.tid)
+        try:
+            r = bare.post("/api/import", headers=self.hdr,
+                          files={"file": ("bank.csv", csv, "text/csv")},
+                          data={"new_account_name": "Erase Push Bank",
+                                "amount_sign": "bank"})
+        finally:
+            erasure.release_writers(admin, self.tid)
+            admin.close()
+        self.assertEqual(r.status_code, 409, r.text)
+        conn = self._conn()
+        try:
+            n = conn.execute("SELECT count(*) AS n FROM transactions "
+                             "WHERE name='ERASE PUSH'").fetchone()["n"]
+            a = conn.execute("SELECT count(*) AS n FROM accounts "
+                             "WHERE name='Erase Push Bank'").fetchone()["n"]
+        finally:
+            conn.close()
+        self.assertEqual((n, a), (0, 0))
+
+    def test_a_push_in_flight_never_refuses_the_next_push(self):
+        """Two collector pushes for one household overlap routinely (a slow
+        store import while the next timer fires): the second must still be
+        let in, not told the household is being deleted. An erasure is the
+        only thing that refuses a push."""
+        from oikonome import erasure
+        first = self._conn()
+        second = self._conn()
+        try:
+            with first.transaction():
+                self.assertTrue(erasure.push_may_write(first, self.tid))
+                with second.transaction():
+                    self.assertTrue(erasure.push_may_write(second, self.tid))
+        finally:
+            first.close()
+            second.close()
+
     def test_bad_payloads_are_400(self):
         bare = TestClient(self.client.app)
         self.assertEqual(bare.post("/api/import/coinbase", headers=self.hdr,

@@ -68,6 +68,23 @@ class RestoreCredentialCompanionTests(unittest.TestCase):
         write_config(self.conn, mx_client_id="new", mx_api_key="k")
         self.assertIsNone(mx.creds(self.conn)["user_guid"])
 
+    def test_the_keys_saved_stamps_stay_with_the_keys_they_date(self):
+        """The bank-link hold banner tells the owner whether the held keys
+        were saved before or after the pause — the one fact that says
+        whether the keys are theirs. The stamp dates THIS instance's keys,
+        which an archive never carries, so an archive's stamp must neither
+        replace the destination's own nor appear where no keys were saved:
+        either would make held keys read as saved at a time they were not."""
+        mine = "2026-01-05T12:00:00+00:00"
+        write_config(self.conn, plaid_client_id="mine", plaid_secret="s",
+                     plaid_keys_saved_at=mine)
+        restore.restore_zip(self.conn, _settings_zip(dict(
+            ARCHIVE, plaid_keys_saved_at="2030-01-01T00:00:00+00:00",
+            mx_keys_saved_at="2030-01-01T00:00:00+00:00")))
+        cfg = budget.load_config(self.conn)
+        self.assertEqual(cfg.get("plaid_keys_saved_at"), mine)
+        self.assertNotIn("mx_keys_saved_at", cfg)
+
 
 if __name__ == "__main__":
     unittest.main()

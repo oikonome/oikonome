@@ -23,6 +23,7 @@ import { Platform } from "react-native";
 
 import type { Client } from "./api";
 import { credentialStamp, type Glance, type GlanceCache, ownedCache,
+         shouldRefreshWidget,
          saveStillOwned, widgetOwner, widgetOwnerChanged }
   from "./glance-pure";
 
@@ -30,6 +31,9 @@ export const KEY_WIDGET_TOKEN = "oikonome.widgetToken";
 export const KEY_WIDGET_URL = "oikonome.widgetServerUrl";
 const KEY_WIDGET_CACHE = "oikonome.widgetGlance";
 const KEY_WIDGET_OWNER = "oikonome.widgetOwner";
+/** iOS: the extension's own last payload (targets/glance, `Cache`), a
+ *  Keychain item in the shared access group — keep the name in step. */
+const KEY_WIDGET_CACHE_IOS = "oikonome.widgetGlanceExt";
 
 /** iOS: the app group the widget extension shares, `group.<bundle id>`
  *  (plugins/with-widget-sharing.js grants it to both). Used as the
@@ -49,7 +53,33 @@ const OPTS: SecureStore.SecureStoreOptions = {
   ...(sharedAccessGroup() ? { accessGroup: sharedAccessGroup() } : {}),
 };
 
+// The glance cache (the household's day: verdict, amounts, chips) and the
+// owner stamp beside it are financial data, so they stay off backups too.
+// They are read only by app JS — the Android widget's headless task; the iOS
+// extension keeps its own copy — so no shared access group, which keeps the
+// read and write queries the same as they always were.
+const LOCAL_OPTS: SecureStore.SecureStoreOptions = {
+  keychainAccessible: SecureStore.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY,
+};
+
 let minted = false;
+let movedLocal = false;
+
+/** Items written before LOCAL_OPTS carry the backup-able default, and an
+ *  update keeps an existing Keychain item's accessibility — so re-create
+ *  them once per launch (delete, then add). Only iOS has the distinction. */
+async function moveLocalToDeviceOnly() {
+  if (movedLocal || Platform.OS !== "ios") return;
+  movedLocal = true;
+  for (const key of [KEY_WIDGET_OWNER, KEY_WIDGET_CACHE]) {
+    try {
+      const v = await SecureStore.getItemAsync(key);
+      if (v === null) continue;
+      await SecureStore.deleteItemAsync(key);
+      await SecureStore.setItemAsync(key, v, LOCAL_OPTS);
+    } catch { movedLocal = false; }   // tried again next launch
+  }
+}
 
 /** the signed-in identity the tabs already fetched, without a second
  *  /api/me at launch; the network only when nothing is cached yet */
@@ -67,6 +97,7 @@ export async function ensureWidgetToken(client: Client, serverUrl: string,
   if (minted && !opts.force) return;
   minted = true;
   try {
+    await moveLocalToDeviceOnly();
     const me = await meOf(client);
     const owner = widgetOwner(serverUrl, me.tenant_id);
     const heldFor = await SecureStore.getItemAsync(KEY_WIDGET_OWNER);
@@ -81,7 +112,7 @@ export async function ensureWidgetToken(client: Client, serverUrl: string,
     // it BEFORE the new credential lands, so no redraw can pair the two
     if (widgetOwnerChanged(heldFor, owner))
       await dropGlanceCaches();
-    await SecureStore.setItemAsync(KEY_WIDGET_OWNER, owner);
+    await SecureStore.setItemAsync(KEY_WIDGET_OWNER, owner, LOCAL_OPTS);
     await SecureStore.setItemAsync(KEY_WIDGET_TOKEN, token, OPTS);
     await SecureStore.setItemAsync(KEY_WIDGET_URL, serverUrl, OPTS);
     await refreshWidget(client);
@@ -104,11 +135,13 @@ export async function clearWidget() {
 }
 
 /** Both caches of the last glance: the JS one (the Android widget's) and
- *  the iOS extension's, which lives in the app group's defaults where
- *  only native code reaches it. */
+ *  the iOS extension's — a Keychain item in the shared group, plus the
+ *  app group's defaults where older builds of the extension kept it. */
 async function dropGlanceCaches() {
   await SecureStore.deleteItemAsync(KEY_WIDGET_CACHE).catch(() => {});
   if (Platform.OS === "ios") {
+    await SecureStore.deleteItemAsync(KEY_WIDGET_CACHE_IOS, OPTS)
+      .catch(() => {});
     try {
       const { clearWidgetCache } = await import("../../modules/widget-reload");
       clearWidgetCache();
@@ -143,13 +176,19 @@ export async function readGlanceCache(): Promise<GlanceCache | null> {
  *  only if it still is. The check runs after the fetch, so a sign-out or a
  *  sign-in to another household that happened while it was in flight
  *  wins; the stamp inside the entry covers a change that lands between
- *  this check and the write. Returns whether it saved. */
-async function writeGlanceCache(glance: Glance, token: string) {
+ *  this check and the write. `startedAt` is when the request was sent,
+ *  not when it landed: a fetch sent at 11:59 PM carries the day that was
+ *  ending, so if it lands after midnight it must read as yesterday's (grey)
+ *  rather than as today's allowance. Returns whether it saved. */
+async function writeGlanceCache(glance: Glance, token: string,
+                                startedAt: number) {
+  await moveLocalToDeviceOnly();
   const now = (await readWidgetCredential())?.token;
   if (!saveStillOwned(token, now)) return false;
-  const c: GlanceCache = { glance, fetched_at: Date.now(),
+  const c: GlanceCache = { glance, fetched_at: startedAt,
                            owner: credentialStamp(token) };
-  await SecureStore.setItemAsync(KEY_WIDGET_CACHE, JSON.stringify(c));
+  await SecureStore.setItemAsync(KEY_WIDGET_CACHE, JSON.stringify(c),
+                              LOCAL_OPTS);
   return true;
 }
 
@@ -161,12 +200,19 @@ async function writeGlanceCache(glance: Glance, token: string) {
 export async function fetchGlanceForWidget(): Promise<GlanceCache | null> {
   const cred = await readWidgetCredential();
   if (!cred) return null;
+  const startedAt = Date.now();
   try {
     const r = await fetch(cred.url + "/api/today/glance", {
+      // no-store: kept out of the platform's HTTP disk cache, as in api.ts
       headers: { Authorization: `Bearer ${cred.token}`,
-                 Accept: "application/json" } });
+                 Accept: "application/json", "Cache-Control": "no-store" } });
     if (r.status === 401) {
-      // the payload goes with the credential it was fetched under
+      // the payload goes with the credential it was fetched under — but
+      // only if that is still the one stored: the app may have signed in
+      // again and minted a fresh credential while this request was out,
+      // and the refusal says nothing about that one
+      const now = (await readWidgetCredential())?.token;
+      if (!saveStillOwned(cred.token, now)) return readGlanceCache();
       await SecureStore.deleteItemAsync(KEY_WIDGET_TOKEN, OPTS);
       await SecureStore.deleteItemAsync(KEY_WIDGET_CACHE);
       return null;
@@ -175,8 +221,10 @@ export async function fetchGlanceForWidget(): Promise<GlanceCache | null> {
     const glance = (await r.json()) as Glance;
     // the credential changed while this was in flight: these numbers are
     // the previous credential's, so draw whatever the current one owns
-    if (!(await writeGlanceCache(glance, cred.token))) return readGlanceCache();
-    return { glance, fetched_at: Date.now(), owner: credentialStamp(cred.token) };
+    if (!(await writeGlanceCache(glance, cred.token, startedAt)))
+      return readGlanceCache();
+    return { glance, fetched_at: startedAt,
+             owner: credentialStamp(cred.token) };
   } catch {
     return readGlanceCache();
   }
@@ -189,10 +237,48 @@ export async function refreshWidget(client: Client) {
   try {
     // stamp with the widget credential current when the fetch begins; no
     // credential (signed out, not minted yet) means nothing to save for
-    const cred = await readWidgetCredential();
-    if (cred) await writeGlanceCache(await client.glance(), cred.token);
+    // Only Android reads this cache: the iOS extension fetches the glance
+    // itself when its timeline reloads, so fetching here too would run the
+    // server's Today computation a second time for nothing.
+    const cred = Platform.OS === "android" ? await readWidgetCredential() : null;
+    if (cred) {
+      const startedAt = Date.now();
+      await writeGlanceCache(await client.glance(), cred.token, startedAt);
+    }
   } catch { /* the widget keeps what it has */ }
   await redrawWidgets();
+}
+
+/** How many of this app's widgets sit on the home screen, or null when the
+ *  platform cannot say (Expo Go, a build whose native module predates the
+ *  count). */
+export async function placedWidgetCount(): Promise<number | null> {
+  try {
+    if (Platform.OS === "android") {
+      const { getWidgetInfo } = await import("react-native-android-widget");
+      const { WIDGET_NAME } = await import("../widgets/android");
+      return (await getWidgetInfo(WIDGET_NAME)).length;
+    }
+    if (Platform.OS === "ios") {
+      const { placedWidgets } = await import("../../modules/widget-reload");
+      return await placedWidgets();
+    }
+  } catch { /* fall through: unknown */ }
+  return null;
+}
+
+// the last refresh this process made, for shouldRefreshWidget
+let lastRefresh: { stamp: string; at: number } | null = null;
+
+/** The Today screen's hook: refresh the widget only when one is placed
+ *  (or, when that cannot be known, at most every fifteen minutes and only
+ *  when Today changed). */
+export async function refreshWidgetIfPlaced(client: Client, stamp: string) {
+  const placed = await placedWidgetCount();
+  const now = Date.now();
+  if (!shouldRefreshWidget(placed, stamp, lastRefresh, now)) return;
+  lastRefresh = { stamp, at: now };
+  await refreshWidget(client);
 }
 
 /** Ask the OS to redraw every placed widget from the cache. Android

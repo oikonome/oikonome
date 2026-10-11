@@ -30,15 +30,17 @@ class RecurringLoadTests(unittest.TestCase):
     def test_monthly_bill_and_income_load(self):
         add_bill(self.conn, "Rent", 2000.0, next_due=TODAY.replace(day=1),
                  last_seen=TODAY.replace(day=1))
-        # biweekly: 26 payments a year, so 26/12 a month — NOT 2, which is
-        # what a naive "twice monthly" reading gives, and what would make the
-        # hero disagree with the plan by ~$400/mo on a $5k paycheck
+        # biweekly: about 26.09 payments a year (a mean year over a 14-day
+        # cycle), so that over 12 a month — NOT 2, which is what a naive
+        # "twice monthly" reading gives, and what would make the hero
+        # disagree with the plan by ~$400/mo on a $5k paycheck
         add_bill(self.conn, "Paycheck Co", 5000.0, frequency="WEEKLY",
                  interval=2, next_due=TODAY + dt.timedelta(days=2),
                  income=True, last_seen=TODAY - dt.timedelta(days=12))
         t = budget.recurring_load(self.conn, TODAY)
         self.assertAlmostEqual(t["bills_monthly"], 2000.0, places=2)
-        self.assertAlmostEqual(t["income_monthly"], 5000 * 26 / 12, places=0)
+        self.assertAlmostEqual(t["income_monthly"],
+                               5000 * (365.2425 / 14) / 12, delta=0.01)
 
     def test_it_agrees_with_the_budget_plan_on_the_same_bills(self):
         """The whole reason for reusing the plan's helper."""

@@ -126,6 +126,151 @@ export function mergePlannerBuckets(
   return out;
 }
 
+// ---- a whole-value save, rebased onto what is stored now ----
+// Some settings save whole: the server replaces the list or object it is
+// sent. An editor's copy is from when it opened, so posting it as-is
+// would undo whatever another device saved in between. These lay only
+// the person's own changes over the stored value fetched just before the
+// save.
+
+const sameValue = (a: unknown, b: unknown) =>
+  JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+
+/** One record after this editor's changes: a field the person changed
+ *  since `base` takes their value, every other field the stored (`live`)
+ *  one. No `base` means the record was added here: all of it is theirs. */
+export function rebaseFields<T extends object>(
+  mine: T, base: T | undefined, live: T,
+): T {
+  const m = mine as Record<string, unknown>;
+  const b = (base ?? {}) as Record<string, unknown>;
+  const out: Record<string, unknown> = { ...(live as object) };
+  for (const k of new Set([...Object.keys(m), ...Object.keys(b)])) {
+    if (base !== undefined && sameValue(m[k], b[k])) continue;
+    if (m[k] === undefined) delete out[k];
+    else out[k] = m[k];
+  }
+  return out as T;
+}
+
+/** A keyed collection, rebased onto the stored one. Per key: changed
+ *  here → the person's fields over the stored copy (their own copy when
+ *  it was deleted elsewhere); untouched → the stored copy, or gone if it
+ *  was deleted elsewhere; removed here → stays removed; added here or
+ *  elsewhere → kept. Stored order first, then what was added here. */
+export function rebaseKeyed<T extends object>(
+  mine: Readonly<Record<string, T>>,
+  base: Readonly<Record<string, T>>,
+  live: Readonly<Record<string, T>>,
+): Record<string, T> {
+  const has = (o: object, k: string) => Object.prototype.hasOwnProperty.call(o, k);
+  const out: Record<string, T> = {};
+  for (const [k, l] of Object.entries(live)) {
+    if (!has(base, k)) out[k] = has(mine, k) ? rebaseFields(mine[k], undefined, l) : l;
+    else if (has(mine, k)) out[k] = rebaseFields(mine[k], base[k], l);
+  }
+  for (const [k, v] of Object.entries(mine))
+    if (!has(live, k) && (!has(base, k) || !sameValue(v, base[k]))) out[k] = v;
+  return out;
+}
+
+/** Each row's identity in a list that has no ids: its name, numbered by
+ *  occurrence so two rows of one name stay two. */
+export function nameKeys(rows: readonly { name: string }[]): string[] {
+  const seen = new Map<string, number>();
+  return rows.map((r) => {
+    const n = seen.get(r.name) ?? 0;
+    seen.set(r.name, n + 1);
+    return `${r.name}\u0000${n}`;
+  });
+}
+
+const byNameKey = <T extends { name: string }>(rows: readonly T[]) => {
+  const keys = nameKeys(rows);
+  return Object.fromEntries(rows.map((r, i) => [keys[i], r])) as Record<string, T>;
+};
+
+/** A name-keyed list (the net-worth assets) rebased onto the stored one.
+ *  `rows` are the edited rows, each carrying `orig`, its nameKeys() key in
+ *  `baseline` (absent: added here); a baseline row missing from `rows`
+ *  was removed here. */
+export function rebaseNamedList<T extends { name: string }>(
+  rows: readonly (T & { orig?: string })[],
+  baseline: readonly T[],
+  live: readonly T[],
+): T[] {
+  const mine: Record<string, T> = {};
+  rows.forEach((r, i) => {
+    const { orig, ...rest } = r;
+    mine[orig ?? `\u0001added\u0000${i}`] = rest as unknown as T;
+  });
+  return Object.values(rebaseKeyed(mine, byNameKey(baseline), byNameKey(live)));
+}
+
+/** Whether the stored asset list reads as `sent`, the list a Save wrote:
+ *  compared the way the server stores a row (name trimmed and cut to 60,
+ *  kind defaulted, value to the cent). A row sent without a date comes
+ *  back stamped with today, so its date is compared only when it had one. */
+export function assetListLanded(
+  sent: readonly { name: string }[], live: readonly { name: string }[],
+): boolean {
+  const cents = (v: unknown) => pyround(Number(v ?? 0) * 100);
+  return sent.length === live.length && sent.every((s, i) => {
+    const a = s as Record<string, unknown>;
+    const b = live[i] as Record<string, unknown>;
+    return String(a.name ?? "").trim().slice(0, 60) === b.name
+      && String(a.kind || "other").trim().slice(0, 30) === b.kind
+      && cents(a.value) === cents(b.value)
+      && (!a.as_of || String(a.as_of) === String(b.as_of));
+  });
+}
+
+/** rebaseNamedList for a Save that may follow one whose reply never came
+ *  (a timeout or a dropped connection after the server had written it).
+ *  `sent` is the list that earlier attempt wrote, and each row's `sent`
+ *  the place it took there. When the stored list reads as `sent`, that
+ *  attempt landed: the stored list becomes the baseline and each row is
+ *  keyed by the place it took, so nothing it added or renamed goes in a
+ *  second time. Otherwise the rebase runs against `baseline` as if the
+ *  attempt never happened. Returns the list to send, the baseline to keep,
+ *  and per row its new `orig` and `sent` (null: the row is already gone
+ *  from the stored list and leaves the editor). */
+export function rebaseNamedSave<T extends { name: string }>(
+  rows: readonly (T & { orig?: string; sent?: number })[],
+  baseline: readonly T[],
+  live: readonly T[],
+  sent: readonly T[] | null,
+): { list: T[]; baseline: T[];
+     rows: ({ orig?: string; sent?: number } | null)[] } {
+  const landed = !!sent && assetListLanded(sent, live);
+  const base = landed ? live : baseline;
+  const liveKeys = nameKeys(live);
+  const mine: Record<string, T> = {};
+  const keyOf = rows.map((r, i) => {
+    const { orig, sent: at, ...rest } = r;
+    let k: string | undefined = orig ?? `\u0001added\u0000${i}`;
+    if (landed) {
+      if (at !== undefined) k = liveKeys[at];
+      else if (orig !== undefined) k = undefined;
+    }
+    if (k !== undefined) mine[k] = rest as unknown as T;
+    return k;
+  });
+  const out = rebaseKeyed(mine, byNameKey(base), byNameKey(live));
+  const order = Object.keys(out);
+  return {
+    list: Object.values(out),
+    baseline: [...base],
+    rows: rows.map((r, i) => {
+      const k = keyOf[i];
+      if (k === undefined) return null;
+      const at = order.indexOf(k);
+      const orig = landed ? (k.startsWith("\u0001") ? undefined : k) : r.orig;
+      return { orig, sent: at < 0 ? undefined : at };
+    }),
+  };
+}
+
 // ---- reimbursements, the category pickers, local dates, the device zone ----
 // Mobile keeps a twin of each in mobile/src/lib/pure.ts under the same
 // name; the shared case table runs against both.
@@ -311,6 +456,13 @@ export function localYmd(d: Date): string {
     + String(d.getDate()).padStart(2, "0");
 }
 
+/** The local day a timestamp fell on, as YYYY-MM-DD; the text itself when
+ *  it is not a time JS can read, so a date-only value still prints. */
+export function localDayOf(ts: string): string {
+  const d = new Date(ts);
+  return Number.isNaN(d.getTime()) ? ts : localYmd(d);
+}
+
 /** Whether a client adopts its device's zone as the household's, unasked.
  *
  *  Only on a hosted instance: there the instance clock is the operator's,
@@ -329,4 +481,45 @@ export function adoptsDeviceZone(m: {
   if (m.timezone_source !== "instance") return false;
   if (!device || device === m.timezone) return false;
   return !/^(Etc\/|UTC$|GMT$|Universal$|Zulu$)/.test(device);
+}
+
+/** Interest a plan saves against paying only the minimums, or 0 when there
+ *  is no honest figure. A baseline that never pays off stops at the
+ *  simulation horizon, so its interest is a truncation total, not a cost. */
+export function interestSaved(
+  base: { debt_free: string | null; total_interest: number },
+  plan: { total_interest: number },
+): number {
+  return base.debt_free ? base.total_interest - plan.total_interest : 0;
+}
+
+/** "Everything else" before the person edits it: the variable pool less
+ *  the carve-outs, less the savings typed in THIS session. A Savings plan
+ *  that was already saved sits beside other_monthly, not inside it (the
+ *  saved other_monthly is already net of it), so only the change from the
+ *  saved plan comes out of the pool — taking the whole plan out again on
+ *  every reopen would cut the stored budget by that much on each save.
+ *  Twin: plannerUnallocAuto in mobile/src/lib/planner.ts. */
+export function plannerUnallocAuto(o: {
+  otherBase: number; catsTotal: number; savingsTouched: boolean;
+  savingsTyped: number; savingsSeed: number;
+}): number {
+  const taken = o.savingsTouched ? o.savingsTyped - o.savingsSeed : 0;
+  return Math.max(0, Math.round(o.otherBase - o.catsTotal - taken));
+}
+
+/** The money map's Savings row figure for a month. `month` is what was
+ *  posted toward the plan inside the month, when the payload carries it;
+ *  without it the only figure is the goal's trailing 90-day average, and
+ *  the row must say that is what it shows rather than call it this
+ *  month's transfers. A plan-only goal (saved === null) stays null.
+ *  Twin: monthSavings in mobile/src/lib/planner.ts. */
+export function monthSavings(
+  goal: { monthly_plan: number; rate_90d: number | null },
+  month?: number | null,
+): { plan: number; saved: number | null; averaged: boolean } {
+  if (typeof month === "number" && Number.isFinite(month))
+    return { plan: goal.monthly_plan, saved: month, averaged: false };
+  return { plan: goal.monthly_plan, saved: goal.rate_90d,
+           averaged: goal.rate_90d !== null };
 }

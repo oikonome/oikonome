@@ -863,6 +863,9 @@
         // data-ticket: the host-issued recovery link stands in for a session
         // (passkey-only console — there is no token to sign in with first)
         var ticket = enrolForm.getAttribute("data-ticket") || "";
+        // the first key only: the operator token, re-entered, is the proof
+        // the server asks for when there is no key to assert with yet
+        var token = (enrolForm.querySelector("[name=token]") || {}).value || "";
         if (btn) btn.disabled = true;
         // data-stepup: a key already exists, so the server demands a fresh
         // assertion with one you HOLD before it will store another.
@@ -897,7 +900,7 @@
             };
             return post("/admin/console/passkey", {
               challenge_id: o.challenge_id, credential: credential,
-              label: label, ticket: ticket, stepup: stepup
+              label: label, ticket: ticket, stepup: stepup, token: token
             });
           });
         });
@@ -912,6 +915,11 @@
     for (var i = 0; i < stepupForms.length; i++) {
       (function (form) {
         form.addEventListener("submit", function (e) {
+          // The data-confirm guard runs first (document, capture phase) and
+          // only prevents the default when the operator presses Cancel.
+          // Honour that: otherwise a Cancel still leads to a passkey prompt
+          // and a form.submit() that never asks the question again.
+          if (e.defaultPrevented) return;
           var field = form.querySelector("[name=stepup]");
           if (!field || field.value) return;          // already ticketed — let it go
           e.preventDefault();
@@ -927,6 +935,13 @@
             })
             .catch(function (err) {
               if (btn) btn.disabled = false;
+              // Every key was removed since this page rendered: the server
+              // asks for no assertion now, so send the form as it is
+              // rather than fail on a ceremony with nothing to sign with.
+              if (err && String(err.message || "").indexOf("no operator passkeys enrolled") >= 0) {
+                form.submit();
+                return;
+              }
               say(form, friendly(err));
             });
         });

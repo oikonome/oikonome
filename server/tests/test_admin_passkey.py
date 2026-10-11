@@ -103,8 +103,11 @@ class _Base(unittest.TestCase):
         o = o.json()
         with mock.patch("oikonome.auth.admin_passkeys."
                         "verify_registration_response", return_value=_FakeReg()) as v:
+            # the first key is enrolled with the operator token re-entered,
+            # as the dashboard's form asks for it
             r = self.client.post("/admin/console/passkey", json={
                 "challenge_id": o["challenge_id"], "label": label,
+                "token": TOKEN,
                 "credential": {"id": CRED_B64, "rawId": CRED_B64,
                                "response": {"transports": ["usb"]}}})
         self.assertEqual(r.status_code, 200, r.text)
@@ -802,6 +805,11 @@ class StepUpTests(_Base):
         super().setUp()
         self.state = tempfile.TemporaryDirectory()
         os.makedirs(os.path.join(self.state.name, "cmd"), exist_ok=True)
+        # both host watchers installed, each leaving its marker
+        marks = os.path.join(self.state.name, "ops", "watchers")
+        os.makedirs(marks, exist_ok=True)
+        for kind in ("command", "reboot"):
+            open(os.path.join(marks, kind), "w").close()
         os.environ["OIKONOME_STATE_DIR"] = self.state.name
         import oikonome.web.adminconsole as ac
         ac._CMD_NONCES.clear()
@@ -953,7 +961,7 @@ class StepUpTests(_Base):
         self.assertTrue(self._queued())
 
     def test_upgrade_is_destructive_and_refused_without_a_fresh_assertion(self):
-        """Rebuild / restart tears the whole stack down and back up from
+        """Upgrade tears the whole stack down and back up from
         the checkout — one POST from a stolen cookie must not do that. It
         arms like restore/reset/uninstall and needs the nonce, the typed
         word and a fresh passkey assertion."""
@@ -966,7 +974,7 @@ class StepUpTests(_Base):
         self.assertFalse(self._queued(), "one click must only ARM upgrade")
         m = re.search(r'name="nonce" value="([^"]+)"', r.text)
         self.assertIsNotNone(m)
-        self.assertIn("Rebuild / restart tears the stack down", r.text)
+        self.assertIn("Upgrade moves this instance to the LATEST release", r.text)
         self.assertIn('data-admin-stepup="upgrade"', r.text)
         r = self.client.post("/admin/console/run-command", data={
             "command": "upgrade", "stage": "go", "nonce": m.group(1),
@@ -1047,6 +1055,38 @@ class StepUpTests(_Base):
         self.assertTrue(self._reboot_flagged())
         _admin("DELETE FROM broadcast WHERE id = 1 RETURNING id")
 
+    def test_each_lever_waits_for_its_own_watcher(self):
+        """The command runner and the reboot lever share the drop-box, but
+        each is consumed by a different root watcher. One watcher alone
+        must not make the other lever look ready: a reboot flag nothing
+        reads broadcasts a countdown to a restart that never comes, and a
+        command nothing runs blocks every later one."""
+        self._token_login()
+        marks = os.path.join(self.state.name, "ops", "watchers")
+        # only the command watcher: the reboot lever is not configured
+        os.remove(os.path.join(marks, "reboot"))
+        before = _admin("SELECT set_at FROM broadcast WHERE id = 1")
+        nonce, _ = self._arm_reboot()
+        r = self.client.post("/admin/console/host-reboot", data={
+            "stage": "go", "nonce": nonce, "confirm": "reboot"},
+            follow_redirects=False)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("reboot watcher", r.text)
+        self.assertFalse(self._reboot_flagged())
+        # no countdown was broadcast for a restart nothing would perform
+        self.assertEqual(
+            _admin("SELECT set_at FROM broadcast WHERE id = 1"), before)
+        # only the reboot watcher: the command runner is not configured
+        open(os.path.join(marks, "reboot"), "w").close()
+        os.remove(os.path.join(marks, "command"))
+        r = self.client.post("/admin/console/run-command",
+                             data={"command": "backup"},
+                             follow_redirects=False)
+        self.assertIn("command watcher isn't installed", r.text)
+        self.assertFalse(self._queued())
+        page = self.client.get("/admin/console").text
+        self.assertNotIn('value="backup"', page)
+
     def test_self_host_without_a_passkey_behaves_exactly_as_before(self):
         # no credential enrolled → no step-up, or an install that cannot
         # enrol one (plain http) would lose its own recovery tools
@@ -1079,8 +1119,12 @@ class StepUpTests(_Base):
     def test_last_key_cannot_be_removed_while_the_flag_is_set(self):
         self._token_login()
         cred = self._enrol()
-        ticket = self._ticket()
         os.environ["OIKONOME_ADMIN_REQUIRE_PASSKEY"] = "1"
+        # under the flag the token's own session no longer acts, so the
+        # removal comes from a passkey session — the only kind left
+        self.client = TestClient(self.appmod.app)
+        self._passkey_login()
+        ticket = self._ticket()
         r = self.client.post("/admin/console/passkey/delete",
                              data={"cred_id": cred["id"], "stepup": ticket},
                              follow_redirects=False)
@@ -1172,6 +1216,21 @@ class CloudflareAccessTests(_Base):
         with self.assertRaises(ValueError):
             self.cf.verify(_mint(self.key, self._claims(),
                                  header={"alg": "none"}))
+
+    def test_an_assertion_that_is_not_json_objects_is_refused(self):
+        """The assertion is request-supplied: its header and claims may
+        decode to an array, a number or a string. Each is a refusal (and a
+        cloaked console), never an unhandled error."""
+        for header, claims in (([1], self._claims()), (7, self._claims()),
+                               ("RS256", self._claims()),
+                               ({"alg": "RS256", "kid": "k1"}, []),
+                               ({"alg": "RS256", "kid": "k1"}, 3)):
+            with self.subTest(header=header, claims=claims):
+                tok = _mint(self.key, claims, header=header)
+                with self.assertRaises(ValueError):
+                    self.cf.verify(tok)
+                self.assertEqual(self.client.get("/admin/console", headers={
+                    "Cf-Access-Jwt-Assertion": tok}).status_code, 404)
 
     def test_origin_direct_request_is_cloaked(self):
         # no assertion at all — the whole point of verifying at the origin
@@ -1297,3 +1356,365 @@ class EnrolTicketWithLiveSessionTests(_Base):
             "credential": {"id": CRED_B64, "rawId": CRED_B64,
                            "response": {"transports": ["usb"]}}})
         self.assertEqual(r.status_code, 403, r.text)
+
+
+def _second_key():
+    """A second operator credential written straight into the table — the
+    WebAuthn ceremony is not what these tests are about, and the shared
+    fake registration can only ever produce one credential id."""
+    raw = b"\xee\x01" + uuid.uuid4().bytes
+    b64 = base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+    return str(_admin(
+        "INSERT INTO admin_credentials (label, credential_id, public_key, "
+        "sign_count, transports) VALUES ('second', %s, 'cHVi', 0, '') "
+        "RETURNING id", (b64,))[0]["id"])
+
+
+def _tenant_with_owner(email=None):
+    email = email or f"own-{uuid.uuid4().hex[:8]}@x.dev"
+    a = tenancy.admin_connect()
+    try:
+        tid = str(tenancy.create_tenant(a, email))
+        uid = a.execute(
+            "INSERT INTO users (tenant_id, email, password_hash, totp_secret) "
+            "VALUES (%s, %s, 'x', 'JBSWY3DPEHPK3PXP') RETURNING id",
+            (tid, email)).fetchone()["id"]
+    finally:
+        a.close()
+    return tid, str(uid), email
+
+
+def _form(html, action, nth=0):
+    """The nth <form …action="…"> … </form> on a page, tag included."""
+    starts = [m.start() for m in re.finditer(
+        r'<form[^>]*action="%s"' % re.escape(action), html)]
+    if len(starts) <= nth:
+        return ""
+    chunk = html[starts[nth]:]
+    return chunk[:chunk.index("</form>")]
+
+
+class FirstOperatorKeyNeedsTheTokenTests(_Base):
+    """The first operator key outlives every session and every token
+    rotation, so a console cookie on its own must not be able to add one:
+    a stolen cookie would otherwise become a permanent credential. Once a
+    key exists the step-up is the proof; before that, the operator token
+    re-entered at the moment of enrolment is."""
+
+    def _post(self, **extra):
+        o = self.client.post("/admin/console/passkey/options",
+                             json={"label": "thief"})
+        self.assertEqual(o.status_code, 200, o.text)
+        with mock.patch("oikonome.auth.admin_passkeys."
+                        "verify_registration_response", return_value=_FakeReg()):
+            return self.client.post("/admin/console/passkey", json={
+                "challenge_id": o.json()["challenge_id"], "label": "thief",
+                "credential": {"id": CRED_B64, "rawId": CRED_B64,
+                               "response": {"transports": ["usb"]}},
+                **extra})
+
+    def test_a_console_cookie_alone_cannot_enrol_the_first_key(self):
+        self._token_login()
+        r = self._post()
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertIn("operator token", r.json()["error"])
+        self.assertEqual(_admin("SELECT 1 FROM admin_credentials"), [])
+        self.assertEqual(
+            _admin("SELECT action FROM admin_audit "
+                   "ORDER BY id DESC LIMIT 1")[0]["action"],
+            "admin_passkey_enrol_refused")
+
+    def test_a_wrong_token_does_not_count_as_proof(self):
+        self._token_login()
+        for bad in ("nope", "", TOKEN + "x"):
+            r = self._post(token=bad)
+            self.assertEqual(r.status_code, 403, bad)
+        self.assertEqual(_admin("SELECT 1 FROM admin_credentials"), [])
+
+    def test_the_token_does_not_stand_in_for_the_stepup_later(self):
+        self._token_login()
+        self._enrol()
+        raw2 = b"\xf1\x02" + uuid.uuid4().bytes
+        b64_2 = base64.urlsafe_b64encode(raw2).rstrip(b"=").decode()
+
+        class _Reg2(_FakeReg):
+            credential_id = raw2
+
+        o = self.client.post("/admin/console/passkey/options",
+                             json={"label": "second"})
+        with mock.patch("oikonome.auth.admin_passkeys."
+                        "verify_registration_response", return_value=_Reg2()):
+            r = self.client.post("/admin/console/passkey", json={
+                "challenge_id": o.json()["challenge_id"], "label": "second",
+                "token": TOKEN,
+                "credential": {"id": b64_2, "rawId": b64_2,
+                               "response": {"transports": ["usb"]}}})
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertEqual(len(_admin("SELECT 1 FROM admin_credentials")), 1)
+
+    def test_the_dashboard_asks_for_the_token_before_the_first_key(self):
+        self.client = TestClient(self.appmod.app, base_url="http://localhost")
+        self._token_login()
+        page = self.client.get("/admin/console").text
+        form = page[page.index("data-admin-passkey-enrol"):]
+        form = form[:form.index("</form>")]
+        self.assertIn('name="token"', form)
+        self._enrol()
+        page = self.client.get("/admin/console").text
+        form = page[page.index("data-admin-passkey-enrol"):]
+        form = form[:form.index("</form>")]
+        self.assertNotIn('name="token"', form,
+                         "once a key exists the step-up is the proof")
+
+    def test_the_browser_sends_the_token_with_the_enrolment(self):
+        from pathlib import Path
+
+        import oikonome.web as webpkg
+        js = (Path(webpkg.__file__).parent / "static" / "pages.js").read_text()
+        block = js[js.index("enrolForm.addEventListener"):]
+        block = block[:block.index("for (var i = 0; i < stepupForms.length")]
+        self.assertIn('enrolForm.querySelector("[name=token]")', block)
+        self.assertRegex(block, r"post\(\"/admin/console/passkey\", \{[^}]*"
+                                r"token: token")
+
+
+class TokenSessionsFollowTheTokenPolicyTests(_Base):
+    """A session minted by the operator token is only as good as the
+    token's right to sign in. When that right is withdrawn (passkeys made
+    mandatory, or the instance turned hosted), sessions the token already
+    opened must stop working too, or a leaked token keeps its reach for the
+    rest of the session's life after the operator has shut the door."""
+
+    def tearDown(self):
+        os.environ.pop("OIKONOME_HOSTED", None)
+        super().tearDown()
+
+    def _dashboard_ok(self):
+        r = self.client.get("/admin/console")
+        return r.status_code == 200 and "Operator access" in r.text
+
+    def test_token_session_ends_once_a_passkey_is_required(self):
+        self._token_login()
+        self._enrol()
+        self.assertTrue(self._dashboard_ok())
+        os.environ["OIKONOME_ADMIN_REQUIRE_PASSKEY"] = "1"
+        self.assertFalse(self._dashboard_ok())
+        # and the action routes refuse it as well
+        r = self.client.post("/admin/console/broadcast",
+                             data={"message": "x"}, follow_redirects=False)
+        self.assertEqual(r.status_code, 303)
+
+    def test_token_session_ends_when_the_instance_is_hosted(self):
+        self._token_login()
+        os.environ["OIKONOME_HOSTED"] = "1"
+        self.assertFalse(self._dashboard_ok())
+
+    def test_token_session_survives_while_the_token_may_sign_in(self):
+        # bootstrap: the flag is ignored while no key exists, and so is
+        # the session the token opened
+        os.environ["OIKONOME_ADMIN_REQUIRE_PASSKEY"] = "1"
+        self._token_login()
+        self.assertTrue(self._dashboard_ok())
+
+    def test_passkey_session_is_untouched_by_the_policy(self):
+        self._token_login()
+        self._enrol()
+        os.environ["OIKONOME_ADMIN_REQUIRE_PASSKEY"] = "1"
+        self.client = TestClient(self.appmod.app)
+        self._passkey_login()
+        self.assertTrue(self._dashboard_ok())
+
+
+class PasskeyRemovalIsAtomicTests(_Base):
+    """The last-key guard is a count followed by a delete. Two removals
+    racing each other must not both read "two keys" and both delete, which
+    would leave a passkey-required console with no key at all."""
+
+    def test_two_concurrent_removals_leave_one_key(self):
+        import threading
+
+        from oikonome.auth import admin_passkeys
+        self._token_login()
+        first = self._enrol()["id"]
+        second = _second_key()
+        os.environ["OIKONOME_ADMIN_REQUIRE_PASSKEY"] = "1"
+        self.client = TestClient(self.appmod.app)
+        self._passkey_login()
+        t1, t2 = self._ticket(), self._ticket()
+        cookie = self.client.cookies.get("oikonome_admin")
+        real_count = admin_passkeys.count
+        armed = {"on": True}
+        other = {}
+
+        def _remove_second():
+            c = TestClient(self.appmod.app)
+            c.cookies.set("oikonome_admin", cookie, path="/admin")
+            other["r"] = c.post("/admin/console/passkey/delete",
+                                data={"cred_id": second, "stepup": t2},
+                                follow_redirects=False)
+
+        def _count_while_another_removal_runs(admin):
+            n = real_count(admin)
+            if armed.pop("on", False):
+                th = threading.Thread(target=_remove_second)
+                th.start()
+                # give the other removal every chance to finish in between
+                th.join(timeout=1.5)
+                other["thread"] = th
+            return n
+
+        with mock.patch("oikonome.auth.admin_passkeys.count",
+                        side_effect=_count_while_another_removal_runs):
+            self.client.post("/admin/console/passkey/delete",
+                             data={"cred_id": first, "stepup": t1},
+                             follow_redirects=False)
+            other["thread"].join(timeout=10)
+        self.assertFalse(other["thread"].is_alive())
+        self.assertEqual(
+            len(_admin("SELECT 1 FROM admin_credentials")), 1,
+            "both removals went through — the console has no key left")
+
+
+class TenantExportStepupTests(_Base):
+    """A copy of a household's data that has left the instance cannot be
+    called back, so the export takes the same fresh passkey assertion the
+    other irreversible console actions do whenever a key is enrolled."""
+
+    def _consented_tenant(self):
+        tid, _uid, _email = _tenant_with_owner()
+        a = tenancy.admin_connect()
+        try:
+            a.execute(
+                "INSERT INTO support_consents (tenant_id, granted_by, "
+                "reason, expires_at) VALUES (%s, %s, %s, now() + "
+                "interval '1 hour')",
+                (tid, "00000000-0000-0000-0000-000000000001", "debugging"))
+        finally:
+            a.close()
+        self.addCleanup(self._drop, tid)
+        return tid
+
+    def _drop(self, tid):
+        a = tenancy.admin_connect()
+        try:
+            tenancy.delete_tenant_rows(a, tid)
+        finally:
+            a.close()
+
+    def test_export_needs_a_fresh_assertion_once_a_key_exists(self):
+        self._token_login()
+        self._enrol()
+        tid = self._consented_tenant()
+        r = self.client.post("/admin/console/tenant-export",
+                             data={"tenant_id": tid})
+        self.assertNotIn("zip", r.headers.get("content-type", ""))
+        self.assertIn("passkey confirmation", r.text)
+        row = _admin("SELECT action, detail FROM admin_audit WHERE target=%s "
+                     "ORDER BY id DESC LIMIT 1", (tid,))[0]
+        self.assertEqual(row["action"], "tenant_export_refused")
+        self.assertIn("passkey", str(row["detail"]))
+        r = self.client.post("/admin/console/tenant-export",
+                             data={"tenant_id": tid,
+                                   "stepup": self._ticket()})
+        self.assertIn("zip", r.headers.get("content-type", ""))
+
+    def test_export_with_no_key_enrolled_is_unchanged(self):
+        self._token_login()
+        tid = self._consented_tenant()
+        r = self.client.post("/admin/console/tenant-export",
+                             data={"tenant_id": tid})
+        self.assertIn("zip", r.headers.get("content-type", ""))
+
+
+class TenantPageFormsMatchTheServerTests(_Base):
+    """The tenant page's destructive forms must ask for exactly what the
+    server will demand. A form that runs the passkey ceremony on a console
+    with no key enrolled can never submit (the ceremony has nothing to
+    sign with), and one that skips it where the server wants it always
+    bounces."""
+
+    STEPUP_FORMS = ("/admin/console/clear-2fa", "/admin/console/tenant-export")
+
+    def setUp(self):
+        super().setUp()
+        self.tid, _uid, _email = _tenant_with_owner()
+
+    def tearDown(self):
+        os.environ.pop("OIKONOME_DELETE_GRACE_DAYS", None)
+        a = tenancy.admin_connect()
+        try:
+            tenancy.delete_tenant_rows(a, self.tid)
+        finally:
+            a.close()
+        super().tearDown()
+
+    def _page(self):
+        r = self.client.get(f"/admin/console/tenant/{self.tid}")
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.text
+
+    def _immediate(self, page):
+        # the second tenant-delete form is "delete now"
+        return _form(page, "/admin/console/tenant-delete", 1)
+
+    def test_no_key_enrolled_means_no_ceremony(self):
+        self._token_login()
+        page = self._page()
+        for f in (self._immediate(page),
+                  *(_form(page, a) for a in self.STEPUP_FORMS)):
+            self.assertTrue(f)
+            self.assertNotIn("data-admin-stepup", f, f)
+
+    def test_with_a_key_every_gated_form_collects_the_assertion(self):
+        self._token_login()
+        self._enrol()
+        page = self._page()
+        for f in (self._immediate(page),
+                  *(_form(page, a) for a in self.STEPUP_FORMS)):
+            self.assertIn("data-admin-stepup", f, f)
+            self.assertIn('name="stepup"', f, f)
+        # a grace delete is restorable, so it stays ungated…
+        self.assertNotIn("data-admin-stepup",
+                         _form(page, "/admin/console/tenant-delete", 0))
+
+    def test_grace_delete_with_no_window_collects_the_assertion(self):
+        # …except where there is no window: the server then purges at once
+        # and demands the same assertion an immediate delete does
+        os.environ["OIKONOME_DELETE_GRACE_DAYS"] = "0"
+        self._token_login()
+        self._enrol()
+        f = _form(self._page(), "/admin/console/tenant-delete", 0)
+        self.assertIn("data-admin-stepup", f)
+        self.assertIn('name="stepup"', f)
+
+
+class StepupFormBrowserHalfTests(unittest.TestCase):
+    """The browser half of the step-up forms, checked against the source
+    (there is no DOM in this suite)."""
+
+    @classmethod
+    def setUpClass(cls):
+        from pathlib import Path
+
+        import oikonome.web as webpkg
+        js = (Path(webpkg.__file__).parent / "static" / "pages.js").read_text()
+        start = js.index("for (var i = 0; i < stepupForms.length")
+        cls.block = js[start:js.index("}(stepupForms[i]))", start)]
+        cls.js = js
+
+    def test_a_cancelled_confirm_does_not_start_the_ceremony(self):
+        """The data-confirm guard runs first (capture phase) and only
+        prevents the default on Cancel. The step-up listener must honour
+        that, or a Cancel still leads to a passkey prompt and a submit
+        that skips the confirm entirely."""
+        guard = self.block.index("e.defaultPrevented")
+        self.assertLess(guard, self.block.index("e.preventDefault()"))
+        self.assertLess(guard, self.block.index("assert("))
+
+    def test_a_console_with_no_key_left_submits_without_one(self):
+        """A key removed since the page rendered: the server no longer
+        asks for an assertion, so the form goes through unticketed rather
+        than failing on a ceremony that has nothing to sign with."""
+        self.assertIn("no operator passkeys enrolled", self.block)
+        tail = self.block[self.block.index("no operator passkeys enrolled"):]
+        self.assertIn("form.submit()", tail)

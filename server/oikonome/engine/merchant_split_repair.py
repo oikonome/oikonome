@@ -253,6 +253,148 @@ def _descriptors_of(conn, mid) -> set[str]:
         (mid,)).fetchall()}
 
 
+def _renamed_feed_twins(conn, scan_limit: int) -> list[dict]:
+    """Merchants minted for a payee the ledger already had, under a name
+    the feed only started using later.
+
+    The resolver now asks, before it mints, whether the rows' bank line or
+    the hold they settled already belongs to a merchant
+    (merchant_identity.identity_answers). Twins minted before it asked are
+    still on the books, and nothing else converges them: the descriptor
+    sweep above groups on one exact line, and a hold's line is often carried
+    by no live row but the twin's own, while a posted charge and its hold sit
+    under two different lines.
+
+    A candidate is narrow on purpose. It is a string-clean merchant with no
+    entity, no parent, no child and no alias anyone reviewed or typed, and
+    EVERY live row it has is either a pending hold or a posted charge whose
+    hold the feed named — the rows identity_answers can judge on evidence
+    outside the merchant itself. A merchant with one ordinary posted charge
+    of its own is a payee with a history, and it is never offered. The
+    ledger's answer for every one of those rows must be the same single
+    merchant, other than itself and older than it: the twin is the
+    newcomer. The merchant itself is not allowed to vote."""
+    cands = conn.execute(
+        """SELECT m.id, m.name, m.created_at FROM merchants m
+            WHERE m.name_source = 'layer1' AND m.plaid_entity_id IS NULL
+              AND m.merged_into IS NULL AND m.parent_id IS NULL
+              AND coalesce(m.kind, 'merchant') = 'merchant'
+              AND EXISTS (SELECT 1 FROM transactions t
+                           WHERE t.merchant_id = m.id AND t.removed = 0)
+              AND NOT EXISTS (SELECT 1 FROM transactions t
+                               WHERE t.merchant_id = m.id AND t.removed = 0
+                                 AND t.pending = 0
+                                 AND t.pending_transaction_id IS NULL)
+              AND NOT EXISTS (SELECT 1 FROM merchant_canonical a
+                               WHERE a.merchant_id = m.id
+                                 AND a.method <> 'layer1')
+              AND NOT EXISTS (SELECT 1 FROM merchants c
+                               WHERE c.parent_id = m.id OR c.merged_into = m.id)
+            ORDER BY m.created_at, m.id LIMIT %s""", (scan_limit,)).fetchall()
+    if not cands:
+        return []
+    # Every candidate's rows in one read, and the ledger's evidence for all
+    # of their lines in one grouped pass below. Asked candidate by
+    # candidate, each was several reads of the whole ledger (nothing
+    # indexes the bank line), up to the scan limit, every night, inside the
+    # household identity lock every sync's resolve waits on.
+    by_mid: dict = {}
+    for r in conn.execute(
+            f"""SELECT t.merchant_id AS mid, t.id,
+                       {merchant_sql.RAW_KEY} AS raw_key, t.name,
+                       (t.pending = 1) AS is_pending
+                  FROM transactions t
+                 WHERE t.merchant_id = ANY(%s) AND t.removed = 0""",
+            ([c["id"] for c in cands],)).fetchall():
+        by_mid.setdefault(r["mid"], []).append(r)
+    judged = []
+    for c in cands:
+        rows = by_mid.get(c["id"]) or []
+        if any(_COUNTERPARTY_MARK in (r["raw_key"] or "") for r in rows):
+            continue
+        groups: dict = {}
+        for r in rows:
+            groups.setdefault((r["raw_key"], r["name"]), []).append(r)
+        mine = [r["id"] for r in rows]
+        asks = [{"bank": bank if (bank or "").strip() else None,
+                 # every row of the merchant is left out of every answer
+                 "ids": mine,
+                 "pending": all(r["is_pending"] for r in g),
+                 "name": key if key != bank else None,
+                 "ignore": {c["id"]}}
+                for (key, bank), g in groups.items()]
+        judged.append((c, rows, groups, asks))
+    # The grouped evidence leaves a row out of its own line's answer; one
+    # line asked by two candidates would leave each one's rows out of the
+    # other's answer too. Such a line (rare: two newcomers sharing a bank
+    # line) is read for its candidates one at a time, as before.
+    owners: dict = {}
+    for c, _rows, _g, asks in judged:
+        for a in asks:
+            if a["bank"]:
+                owners.setdefault(a["bank"], set()).add(c["id"])
+    shared = {b for b, who in owners.items() if len(who) > 1}
+    batch = [j for j in judged
+             if not any(a["bank"] in shared for a in j[3])]
+    alone = [j for j in judged if j not in batch]
+    # only a candidate's rows ON a line can be excluded from that line
+    pairs = [(a["bank"], [r["id"] for r in rows if r["name"] == a["bank"]])
+             for _c, rows, _g, asks in batch for a in asks if a["bank"]]
+    flat = [a for j in batch for a in j[3]]
+    got = merchant_identity.identity_answers(
+        conn, flat, evidence=merchant_identity._descriptor_evidence(
+            conn, pairs)) if flat else []
+    answers_of: dict = {}
+    k = 0
+    for c, _rows, _g, asks in batch:
+        answers_of[c["id"]] = got[k:k + len(asks)]
+        k += len(asks)
+    for c, _rows, _g, asks in alone:
+        answers_of[c["id"]] = merchant_identity.identity_answers(conn, asks)
+    out = []
+    for c, rows, groups, asks in judged:
+        answers = {merchant_identity._survivor(conn, a) if a else None
+                   for a in answers_of[c["id"]]}
+        if len(answers) != 1 or None in answers:
+            continue
+        sid = next(iter(answers))
+        s = conn.execute(
+            "SELECT id, name, name_source, created_at FROM merchants"
+            " WHERE id = %s AND merged_into IS NULL", (sid,)).fetchone()
+        if s is None or s["id"] == c["id"] or s["created_at"] >= c["created_at"]:
+            continue
+        # two live merchants of one name are fold_twins' to join, and a
+        # rename could not tell them apart anyway
+        if s["name"].lower() == c["name"].lower():
+            continue
+        out.append({"descriptor": sorted({b for _k, b in groups if b})[0]
+                    if any(b for _k, b in groups) else None,
+                    "kind": "renamed-feed-name",
+                    "survivor": s["name"], "survivor_source": s["name_source"],
+                    "merge": [c["name"]], "rows": len(rows),
+                    "_survivor": {"id": s["id"], "name": s["name"]},
+                    "_losers": [{"id": c["id"], "name": c["name"]}]})
+    return out
+
+
+def _rules_disagree(conn, survivor: dict, losers: list[dict]) -> bool:
+    """Has the person taught the survivor one category and a loser another?
+
+    The merge carries the old name's rules to the survivor, and where both
+    sides hold a person's rule the survivor's is kept. A person who merges
+    on the Merchants page chooses that; this sweep decides on its own, so
+    it does not get to overrule one of the household's corrections with
+    another. Two payees taught different categories are, besides, better
+    evidence of two payees than any string likeness the sweep works from."""
+    def taught(m):
+        return {r["category_primary"] for r in merchant_dedup.rules_reaching(
+            conn, m["name"], m["id"]) if r["source"] == "user" and not r["disabled"]}
+    have = taught(survivor)
+    if not have:
+        return False
+    return any((t := taught(lo)) and t != have for lo in losers)
+
+
 def plan(conn, *, scan_limit: int = SCAN_LIMIT, limit: int = MAX_MERGES) -> dict:
     """What the sweep WOULD merge, changing nothing.
 
@@ -262,8 +404,25 @@ def plan(conn, *, scan_limit: int = SCAN_LIMIT, limit: int = MAX_MERGES) -> dict
     rule stopped a merge rather than wondering why nothing happened."""
     merges, refused = [], []
     deferred = 0
+    # Renamed-feed twins first: each is one merchant into one survivor, on
+    # evidence of its own, and a descriptor the sweep below would refuse
+    # because of that same twin is then not reported as a refusal.
+    twins = _renamed_feed_twins(conn, scan_limit)
+    taken = {lo["id"] for t in twins for lo in t["_losers"]}
+    for t in twins:
+        if _rules_disagree(conn, t["_survivor"], t["_losers"]):
+            refused.append({"descriptor": t["descriptor"],
+                            "reason": "rules-disagree",
+                            "merchants": sorted([t["survivor"], *t["merge"]])})
+            continue
+        if len(merges) >= limit:
+            deferred += 1
+            continue
+        merges.append(t)
     groups = _candidates(conn, scan_limit)
     for g in groups:
+        if any(c["id"] in taken for c in g["merchants"]):
+            continue
         survivor, losers, reason = _decide(g["descriptor"], g["merchants"])
         if survivor is not None:
             # The evidence is one descriptor; the rename moves EVERY row the
@@ -277,6 +436,9 @@ def plan(conn, *, scan_limit: int = SCAN_LIMIT, limit: int = MAX_MERGES) -> dict
                     survivor, losers = None, []
                     reason = "loser-rows-under-other-descriptors"
                     break
+        if survivor is not None and _rules_disagree(conn, survivor, losers):
+            survivor, losers = None, []
+            reason = "rules-disagree"
         if survivor is None:
             refused.append({"descriptor": g["descriptor"], "reason": reason,
                             "merchants": sorted(c["name"]
@@ -329,6 +491,20 @@ def repair(conn, *, apply: bool = False, scan_limit: int = SCAN_LIMIT,
                     moved = merchant_dedup.rename(conn, lo["name"],
                                                   survivor["name"])
                     rows += moved["rows"]
+                    if rec.get("kind") == "renamed-feed-name":
+                        # A twin's line key can be mapped with no live row
+                        # under it (a hold's unenriched line, a posted
+                        # charge's own descriptor), and the rename moves
+                        # keys by the rows that display them. The machine
+                        # aliases left on the twin follow it to the
+                        # survivor, so nothing keeps it alive and anything
+                        # holding its id — a bill — follows merged_into.
+                        conn.execute(
+                            "UPDATE merchant_canonical SET merchant_id = %s"
+                            " WHERE merchant_id = %s AND method = 'layer1'",
+                            (survivor["id"], lo["id"]))
+                        merchant_identity._retire_if_empty(
+                            conn, lo["id"], survivor["id"])
                     changes += [r["id"] for r in conn.execute(
                         "SELECT id FROM merchant_renames WHERE id > %s "
                         " ORDER BY id", (before,)).fetchall()]

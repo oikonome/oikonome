@@ -19,6 +19,7 @@ import calendar
 import contextlib
 import datetime as dt
 import json
+import math
 import re
 
 from .. import localtime
@@ -53,8 +54,15 @@ EARLY_MONTH_FRAC = 0.10
 # understated, a false UNDER BUDGET. link_reimbursement caps links at the
 # charge, but a restored row need not have passed through it, and a floor is
 # the cheaper invariant to keep true.
+#
+# Only a deposit that is still on the ledger repays anything. A refund the
+# bank feed withdraws is retired in place and its pair can outlive it (the
+# pair waits for a re-numbered twin to carry it to), so every reader that
+# nets a pair reads the other side's `removed` — a withdrawn refund leaves
+# the charge as unrepaid spend.
 NET_AMOUNT = """GREATEST(t.amount - COALESCE((SELECT SUM(pr.amount)
     FROM reimbursements pr
+    JOIN transactions pd ON pd.id = pr.reimburse_id AND pd.removed = 0
     WHERE pr.expense_id = t.id AND pr.partial = 1), 0), 0)"""
 
 # A full reimbursement pair on a deposit no more than this short of the
@@ -68,15 +76,17 @@ REIMB_FULL_SLACK_ABS = 1.00
 # definition of "received" for linking, the flag that clears when enough came
 # back, the awaiting list and its alert, so none can disagree about whether a
 # charge is still owed. Not a spend figure: NET_AMOUNT nets partial links
-# only, because a fully paired charge leaves spend by its category.
+# only, because a fully paired charge leaves spend by its category. A pair
+# whose deposit has left the ledger (the feed withdrew it) repays nothing,
+# as in NET_AMOUNT.
 REIMB_RECEIVED = f"""COALESCE((SELECT SUM(CASE
         WHEN rr.partial = 1 THEN rr.amount
         WHEN ABS(dep.amount) >= ABS(t.amount) - {REIMB_FULL_SLACK_ABS}
             THEN ABS(t.amount)
-        ELSE LEAST(ABS(t.amount), COALESCE(ABS(dep.amount), ABS(t.amount)))
+        ELSE LEAST(ABS(t.amount), ABS(dep.amount))
         END)
     FROM reimbursements rr
-    LEFT JOIN transactions dep ON dep.id = rr.reimburse_id
+    JOIN transactions dep ON dep.id = rr.reimburse_id AND dep.removed = 0
     WHERE rr.expense_id = t.id), 0)"""
 
 # hard separation: business-entity money is excluded from every
@@ -165,6 +175,10 @@ def load_config(conn, *, memo: dict | None = None) -> dict:
     return cfg
 
 
+# the keys a first-run budget seed fills in (_seed_config)
+_SEED_KEYS = ("food_monthly", "other_monthly", "dynamic_variable_budget")
+
+
 def _load_config(conn) -> dict:
     row = conn.execute("SELECT config FROM tenant_settings").fetchone()
     cfg = dict(row["config"]) if row else {}
@@ -177,7 +191,10 @@ def _load_config(conn) -> dict:
         return cfg
     seed = _seed_config(conn, excluded=excluded_account_ids(cfg),
                         today=localtime.now_local(cfg).date())
+    provisional = seed.pop("_provisional", False)
     cfg = {**seed, **cfg}
+    if provisional:
+        return cfg
     # Don't LOCK IN a zero seed computed before any spend has synced (e.g.
     # load_config called during setup, before the first sync) — that leaves
     # onboarding budgets stuck at 0 forever. Persist only once there's real
@@ -251,6 +268,23 @@ def config_txn(conn, *, skip_unchanged: bool = True):
     every reader — `load_config`, tenancy and app.py all treat a missing row
     and an empty config identically, and the column defaults produce exactly
     the '{}' they already assume.
+
+    LOCK ORDER — the one place it is written down. A write that holds this
+    row lock and also locks an `accounts` row takes THIS row first and the
+    account after (the classify doors and `entities.assign_account` open
+    the block, then `SELECT ... FROM accounts ... FOR UPDATE` inside it).
+    Two writers taking the pair in opposite orders deadlock, and PostgreSQL
+    aborts one of them. A writer that has to reach the document after an
+    account row — the reconnect adoption, `sync.adopt._adopt_one` — may
+    only TRY this lock out of order (`FOR UPDATE NOWAIT`) and must start
+    over with nothing held when the try fails; a try never waits, so it
+    cannot close a cycle.
+
+    Bill writes take the pending `bill_proposals` rows first, then the
+    `bills` rows (each set in id order), and only then any `transactions`
+    row: an approval stamps its bill's category onto the rows the bill
+    matches while it holds both, so a merchant rename locks the offers and
+    bills it rewrites (`bills.lock_merchant_rename`) before it moves a row.
     """
     with conn.transaction():
         tid = conn.execute(
@@ -265,6 +299,17 @@ def config_txn(conn, *, skip_unchanged: bool = True):
                      "ON CONFLICT (tenant_id) DO NOTHING")
         conn.execute("SELECT config FROM tenant_settings FOR UPDATE")
         cfg = load_config(conn)
+        # a provisional budget seed (see _load_config) rides the loaded
+        # document but is not the household's: the keys it filled that the
+        # stored row lacks are left out of the save unless the block set
+        # them, or the first unrelated write would freeze the partial read
+        # and the seed would never track the backfill again. The row is
+        # read again after the load, which persists a seed that is no
+        # longer provisional.
+        stored = dict(conn.execute(
+            "SELECT config FROM tenant_settings").fetchone()["config"] or {})
+        seeded = {k: cfg[k] for k in _SEED_KEYS
+                  if k in cfg and k not in stored}
         # A SHALLOW-ish snapshot: json round-trip, not deepcopy. This runs
         # inside the row lock, at 28 call sites, on a document with no size
         # bound (recipient lists, MX/Plaid state, budget history all grow),
@@ -282,6 +327,9 @@ def config_txn(conn, *, skip_unchanged: bool = True):
         # pay nothing for the comparison.
         if skip_unchanged and cfg == before:
             return
+        if seeded:
+            cfg = {k: v for k, v in cfg.items()
+                   if not (k in seeded and v == seeded[k])}
         save_config(conn, cfg)
 
 
@@ -326,7 +374,8 @@ def _freeze_bills(conn, today: dt.date) -> dict:
             "income_monthly": load["income_monthly"]}
 
 
-def snapshot_month(conn, today: dt.date) -> bool:
+def snapshot_month(conn, today: dt.date, *,
+                   unchanged_since: dt.datetime | None = None) -> bool:
     """Upsert (today.year, today.month)'s snapshot from the live config,
     plus the bill schedule it ran beside (_freeze_bills). Skipped while no
     variable budget is set — a $0/$0 month is a month the budget feature
@@ -337,11 +386,33 @@ def snapshot_month(conn, today: dt.date) -> bool:
     dropped keys feed month_status, and duplicating SMTP/API secrets into
     a second table — one the data export ships verbatim — would widen the
     secret surface for nothing. (Lazy import: engine→sync, same pattern
-    as save_config's demoguard hook.)"""
+    as save_config's demoguard hook.)
+
+    `unchanged_since` (an aware datetime) freezes the month only if the
+    settings have not been saved after that moment, and returns False
+    without writing otherwise. A month closed late — the close sweep missed
+    the first hour of the new month — may be frozen from the live settings
+    only while they are still the ones the month ended under; an edit made
+    since belongs to the new month and must not reach back into the closed
+    one. The caller passes the moment the month ended. Any save counts,
+    since the document does not say which key changed when: a skipped
+    re-freeze leaves the month's earlier snapshot standing, which is the
+    safe side."""
+    if unchanged_since is not None and unchanged_since.tzinfo is None:
+        raise ValueError("unchanged_since must be timezone-aware")
     cfg = load_config(conn)
     if not ((cfg.get("food_monthly") or 0) > 0
             or (cfg.get("other_monthly") or 0) > 0):
         return False
+    if unchanged_since is not None:
+        # read AFTER the config: a save landing between the two reads then
+        # shows here and skips, so the config written below can never be
+        # one saved after the moment asked about
+        row = conn.execute(
+            "SELECT updated_at FROM tenant_settings").fetchone()
+        if row is None or row["updated_at"] is None \
+                or row["updated_at"] > unchanged_since:
+            return False
     from ..sync.restore import scrub_config
     conn.execute(
         """INSERT INTO budget_snapshots (year, month, config, bills)
@@ -506,6 +577,36 @@ def monthly_income(conn) -> float:
     return round(float(row["mi"]), 2)
 
 
+def ledger_start(conn, excluded: list | None = None) -> dt.date | None:
+    """The first day the ledger has data for — months before it are not
+    $0 spending, they are no data. Excluded accounts do not count: an
+    investment account with years of history must not make a month-old
+    checking feed look like a long one."""
+    excl = list(excluded or [])
+    row = conn.execute(
+        "SELECT MIN(t.date) AS d FROM transactions t WHERE t.removed = 0"
+        + (" AND NOT (t.account_id = ANY(%s))" if excl else ""),
+        (excl,) if excl else ()).fetchone()
+    return as_date(row["d"]) if row and row["d"] else None
+
+
+def month_coverage(first: dt.date | None, year: int, month: int,
+                   today: dt.date) -> float:
+    """The share of a calendar month the ledger actually covers, 0..1: a
+    month before the ledger starts is 0, the month it starts in counts
+    from its first day, and the month in progress counts through today.
+    Monthly averages divide by the sum of these, never by a fixed count,
+    so a month of history is not read as a third of a three-month window."""
+    days = calendar.monthrange(year, month)[1]
+    lo = dt.date(year, month, 1)
+    hi = min(dt.date(year, month, days), today)
+    if first is not None:
+        lo = max(lo, first)
+    if hi < lo:
+        return 0.0
+    return ((hi - lo).days + 1) / days
+
+
 def _seed_config(conn, excluded: list | None = None, *,
                  today: dt.date | None = None) -> dict:
     """First run: derive bucket budgets from the last 3 full months.
@@ -520,27 +621,60 @@ def _seed_config(conn, excluded: list | None = None, *,
     from . import merchant_seed
     today = today or localtime.now_local(None).date()
     start = (today.replace(day=1) - dt.timedelta(days=85)).replace(day=1)
-    rows = _spend_rows(conn, start, today.replace(day=1), excluded=excluded)
+    month_start = today.replace(day=1)
     recurring = _recurring_bills(conn)
     food = other = 0.0
-    for r in rows:
-        if _match_recurring(r, recurring):
-            continue
-        # the seed often runs BEFORE the first categorize pass finishes, so
-        # sparse-source bank mechanics (card payments, transfers) are still
-        # uncategorized and would count as spend — the very leak the
-        # categorize pass guards against. Filter them by TEXT here: without
-        # it a sparse-source instance can seed other_monthly at ~2× reality.
-        txt = f"{r['payee'] or ''} {r['name'] or ''}"
-        if merchant_seed.flow_match(txt) or merchant_seed.skip_llm(txt):
-            continue
-        if r["is_food"]:
-            food += r["amount"]
-        else:
-            other += r["amount"]
-    return {"food_monthly": round(food / 3, -1),
-            "other_monthly": round(other / 3, -1),
-            "dynamic_variable_budget": True}
+
+    def _add(rows):
+        nonlocal food, other
+        for r in rows:
+            if _match_recurring(r, recurring):
+                continue
+            # the seed often runs BEFORE the first categorize pass
+            # finishes, so sparse-source bank mechanics (card payments,
+            # transfers) are still uncategorized and would count as spend —
+            # the very leak the categorize pass guards against. Filter them
+            # by TEXT here: without it a sparse-source instance can seed
+            # other_monthly at ~2× reality.
+            txt = f"{r['payee'] or ''} {r['name'] or ''}"
+            if merchant_seed.flow_match(txt) or merchant_seed.skip_llm(txt):
+                continue
+            if r["is_food"]:
+                food += r["amount"]
+            else:
+                other += r["amount"]
+
+    _add(_spend_rows(conn, start, month_start, excluded=excluded))
+    # Divide by the months the ledger actually covers in the window, not
+    # by three: a household that imported its last 30 days would otherwise
+    # be seeded at a third of its real spending and read OVER BUDGET every
+    # day.
+    first = ledger_start(conn, excluded)
+    closed = 0.0
+    m = start
+    while m < month_start:
+        closed += month_coverage(first, m.year, m.month, today)
+        m = (m + dt.timedelta(days=32)).replace(day=1)
+    covered = closed
+    if closed < 1.0:
+        # under a month of closed history, the month in progress is most of
+        # what the ledger knows: read it through today and divide by the
+        # whole span covered, the rule suggest_budgets uses, rather than
+        # take a few days of last month as the month's whole budget
+        _add(_spend_rows(conn, month_start, today + dt.timedelta(days=1),
+                         excluded=excluded))
+        covered += month_coverage(first, today.year, today.month, today)
+    # never below one month, so a few days of data are not scaled up into
+    # a monthly figure
+    months = max(1.0, covered)
+    return {"food_monthly": round(food / months, -1),
+            "other_monthly": round(other / months, -1),
+            "dynamic_variable_budget": True,
+            # under a complete closed month of history the seed is
+            # provisional: it is never saved, so it re-seeds as the feed's
+            # backfill and the month in progress arrive instead of freezing
+            # a partial read
+            "_provisional": closed < 1.0}
 
 
 # ---- recurring schedule expansion -------------------------------------
@@ -707,10 +841,12 @@ def _envelope_prior_used(conn, envelopes, today: dt.date,
     """Dollars each ANNUAL envelope already drew from this calendar year's
     pool, before the current month.
 
-    Monthly envelopes are never asked: their period IS the month being
-    matched, so they always start it empty. First-match-wins mirrors
-    `match_envelopes`, so two envelopes claiming one merchant can't both
-    count the same row.
+    Monthly envelopes start every month empty, so nothing is counted for
+    them — but they still CLAIM rows here, over the whole envelope list in
+    the order `match_envelopes` uses. A monthly merchant envelope wins its
+    merchant's rows in the current month; left out of this pass, an annual
+    envelope matching by category would absorb those same rows for every
+    earlier month and report its pool spent on purchases it never owned.
 
     `bills` are the occurrence bills: a row an occurrence claims is the
     bill's, exactly as in the current month, where envelopes only see the
@@ -731,7 +867,7 @@ def _envelope_prior_used(conn, envelopes, today: dt.date,
     # excluded accounts and the schedules, so it is computed once per
     # request. Copied out so a caller cannot mutate the cached dict.
     key = _memo_key("envelope_prior_used", month_start, excluded,
-                    [e["payee"] for e in annual],
+                    [(e["payee"], e["period_months"]) for e in envelopes],
                     [(b["payee"], b["amount"]) for b in (bills or [])])
     if memo is not None and key in memo:
         return dict(memo[key])
@@ -755,14 +891,14 @@ def _envelope_prior_used(conn, envelopes, today: dt.date,
     # an envelope with a merchant identity is claimed by merchant id and
     # never reads the row's words, so the year's rows are tokenised only
     # when some envelope still matches on text
-    by_words = any(e.get("ids") is None for e in annual)
+    by_words = any(e.get("ids") is None for e in envelopes)
     for i, r in enumerate(rows):
         if i in claimed:
             continue
         txt = f"{r['payee'] or ''} {r['name'] or ''}".lower()
         toks = _tokens(txt) if by_words else set()
-        e = _claim_envelope(annual, r, toks, txt)
-        if e is not None:
+        e = _claim_envelope(envelopes, r, toks, txt)
+        if e is not None and e["period_months"] > 1:
             used[e["payee"]] += r["amount"]
     if memo is not None:
         memo[key] = dict(used)
@@ -894,6 +1030,78 @@ def month_occurrences(bills: list[dict], year: int, month: int) -> list[dict]:
                 "floored": bill["floor"] is not None and d < bill["floor"],
             })
     return occs
+
+
+# The mean Gregorian year (400 years hold 146,097 days). A cycle measured
+# in days or weeks repeats over it exactly, where any one calendar year
+# holds a whole extra occurrence some of the time.
+MEAN_YEAR_DAYS = 365.2425
+
+
+def _ends_before(rec: dict, day: dt.date) -> bool:
+    """The recurrence carries an end date earlier than `day`. An end date
+    that does not parse is no end date, as the occurrence expansion reads
+    it."""
+    end_on = rec.get("endOn")
+    if not end_on:
+        return False
+    try:
+        return dt.date.fromisoformat(str(end_on)[:10]) < day
+    except (TypeError, ValueError):
+        return False
+
+
+def evened_monthly_load(bills: list[dict], today: dt.date) -> float:
+    """What a schedule of occurrence bills costs per month, evened over each
+    bill's own cycle — the one figure the Bills headline, the month plan's
+    avg_bills and the planner quote.
+
+    Counted without the history floor: the floor says a series with no
+    payment history has no occurrence before its first due date, which is
+    what paid/overdue expectations need, but a load figure that honoured it
+    would read a new $2,000 rent due in November as $333 a month. And
+    counted over whole cycles, not one calendar year: a bill due every two
+    years falls in one calendar year of two, so a single-year count reads it
+    as nothing one year and double the next. A one-time bill keeps the
+    calendar-year count — it has no cycle to even over.
+
+    A daily or weekly cycle never lines up with calendar years at all: a
+    biweekly payday whose phase lands on January 1 falls 27 times that
+    year, and a weekly bill falls 53 times in a year that opens on its
+    weekday. Counted over one calendar year those years read 27/26 or 53/52
+    of the standing cost, then drop back the next January. So such a bill
+    costs its cycle's exact rate over a mean Gregorian year. The calendar
+    count stays only where the year itself is partial: a series that ends
+    before the year does, or one capped per month (the cap, not the cycle,
+    then decides how many occurrences a month holds)."""
+    total = 0.0
+    for bill in bills:
+        rec = bill["recurrence"] or {}
+        freq = (rec.get("frequency") or "").upper()
+        try:
+            interval = max(1, int(rec.get("interval") or 1))
+        except (TypeError, ValueError):
+            interval = 1
+        if (freq in ("DAILY", "WEEKLY") and bill.get("anchor")
+                and not bill.get("cap")
+                and not _ends_before(rec, dt.date(today.year, 12, 31))):
+            step = interval * (7 if freq == "WEEKLY" else 1)
+            # what each occurrence costs, as month_occurrences plans it
+            planned = round(bill["amount"] + bill.get("fee_total", 0), 2)
+            total += planned * MEAN_YEAR_DAYS / step
+            continue
+        if freq == "YEARLY":
+            years = interval
+        elif freq == "MONTHLY":
+            years = math.lcm(interval, 12) // 12
+        else:
+            years = 1
+        # a cycle longer than a decade is not a budget line worth a loop
+        years = min(years, 10)
+        total += sum(o["planned"] for y in range(today.year, today.year + years)
+                     for m in range(1, 13)
+                     for o in month_occurrences([bill], y, m)) / years
+    return total / 12
 
 
 def occurrences_in_month(bill: dict, year: int, month: int) -> list[dt.date]:
@@ -1105,9 +1313,11 @@ def _pending_expense_monthly(conn) -> tuple[float, int]:
 
 def suggest_budgets(conn, today: dt.date) -> dict:
     """'Suggest from history' (§3): per-bucket trailing ~6 months
-    median (including the in-progress month so mid-month onboarding sees
-    this month's groceries), outlier months >2× the initial median
-    excluded — rounded to $10. Read-only; the user approves each number
+    median over the complete months, outlier months >2× the initial
+    median excluded — rounded to $10. The in-progress month and the month
+    the ledger starts in are partial; they speak only when no complete
+    month has spend for the bucket (mid-month onboarding still sees this
+    month's groceries), averaged over the months they cover. Read-only; the user approves each number
     before it lands in config."""
     cfg = load_config(conn)
     customs = _compiled_buckets(custom_bucket_specs(cfg))
@@ -1136,11 +1346,15 @@ def suggest_budgets(conn, today: dt.date) -> dict:
         months.append(_month_key(m))
         m = (m + dt.timedelta(days=32)).replace(day=1)
     # months before the ledger starts aren't $0 spending — they're no data
-    first = conn.execute("SELECT MIN(date) AS d FROM transactions "
-                         "WHERE removed = 0").fetchone()
-    if first and first["d"]:
-        first_key = _month_key(first["d"])
+    first = ledger_start(conn, excluded_account_ids(cfg))
+    if first:
+        first_key = _month_key(first)
         months = [mk for mk in months if mk >= first_key]
+    # how much of each month the ledger covers: the in-progress month and
+    # the month the ledger starts in are partial, and averaging a few days
+    # of one with a whole other month halves the suggestion
+    cover = {mk: month_coverage(first, int(mk[:4]), int(mk[5:]), today)
+             for mk in months}
 
     # Envelopes join the same merchant-exclude set
     bill_shaped = list(bills) + list(envelopes)
@@ -1187,11 +1401,26 @@ def suggest_budgets(conn, today: dt.date) -> dict:
             return round(_median(nz), -1)
         return round(sug, -1)
 
+    def _suggest_covered(per_month: dict[str, float]) -> float:
+        """Median over the COMPLETE months; partial months (the one in
+        progress, the one the ledger starts in) stay out of it. With no
+        complete month, or a bucket only the partial months touch, the
+        partial spend is averaged over the months it covers — never fewer
+        than one, so two days of groceries are not scaled into a month."""
+        full = [v for mk, v in per_month.items() if cover[mk] >= 1.0]
+        sug = _suggest_monthly(full) if full else 0.0
+        if sug > 0:
+            return sug
+        part = [mk for mk in per_month if cover[mk] < 1.0]
+        spent = sum(per_month[mk] for mk in part)
+        if spent <= 0:
+            return 0.0
+        return round(spent / max(1.0, sum(cover[mk] for mk in part)), -1)
+
     suggestions: dict = {"buckets": {}}
     samples: dict = {}
     for k in keys:
-        vals = [totals[k][mk] for mk in months]
-        suggestion = _suggest_monthly(vals)
+        suggestion = _suggest_covered(totals[k])
         if k == "food":
             suggestions["food_monthly"] = suggestion
         elif k == "other":
@@ -1235,23 +1464,24 @@ def suggest_budgets(conn, today: dt.date) -> dict:
                 or cat.replace(" ", "_").upper() in claimed:
             continue
         # Same sparse-month logic as food/other — don't zero a real category
-        med = _suggest_monthly(list(per_month.values()))
+        med = _suggest_covered(per_month)
         if med >= 75:
             candidates.append({"name": cat.title(),
                                "category": cat.replace(" ", "_").upper(),
                                "monthly": med})
     candidates.sort(key=lambda c: -c["monthly"])
     # monthly bill load for the savings-surplus prefill — same
-    # evened-out year_total/12 the month plan uses. Approved bills only for
+    # evened_monthly_load the month plan uses. Approved bills only for
     # the occurrence engine (pending rows lack recurrence anchors); when
     # none are approved yet (mid-wizard), fall back to pending proposals'
     # monthly-equivalent — same pattern as income_monthly above.
-    approved = [b for b in bills if not b.get("pending")]
-    year_total = sum(o["planned"] for m2 in range(1, 13)
-                     for o in month_occurrences(approved, today.year, m2)
-                     if not o["floored"])
-    year_total += sum(e["monthly"] for e in envelopes) * 12
-    avg_bills = round(year_total / 12, 2)
+    # and the same bill set: a hand-tracked card-payment bill leaves the
+    # plan while live card debt is there for the card machinery to pay
+    # (drop_card_pay_bills), so it leaves the planner's prefill too
+    approved = drop_card_pay_bills(
+        conn, [b for b in bills if not b.get("pending")], cfg=cfg)
+    avg_bills = round(evened_monthly_load(approved, today)
+                      + sum(e["monthly"] for e in envelopes), 2)
     bills_count = len(approved) + len(envelopes)
     if avg_bills <= 0:
         pend_mo, pend_n = _pending_expense_monthly(conn)
@@ -1986,6 +2216,90 @@ def match_occurrences(rows, occurrences) -> tuple[set[int], list]:
     return matched_rows, occurrences
 
 
+def withdrawn_rows(conn, since: dt.date, until: dt.date, cfg: dict, *,
+                   memo: dict | None = None) -> list[dict]:
+    """The posted charges the bank feed withdrew between `since` and
+    `until`, whole (a split's parts are one charge to a bill). The ONE
+    reader of that evidence: the Today line (mark_withdrawn) and the Bills
+    health verdict (bills._withdrawn_rows) both load it here, so they search
+    the same rows — the Accounts page's excluded accounts dropped
+    (excluded_account_ids), and only the account types a bill is paid from.
+    An excluded account supplies no evidence anywhere, as it supplies no
+    spend."""
+    return _spend_rows(conn, since, until, excluded=excluded_account_ids(cfg),
+                       slim=True, parts=False, memo=memo, withdrawn=True)
+
+
+def _months_between(first: dt.date, last: dt.date) -> list[tuple[int, int]]:
+    """(year, month) for every calendar month from `first`'s to `last`'s."""
+    out, y, m = [], first.year, first.month
+    while (y, m) <= (last.year, last.month):
+        out.append((y, m))
+        y, m = (y, m + 1) if m < 12 else (y + 1, 1)
+    return out
+
+
+def mark_withdrawn(conn, occs: list[dict], today: dt.date, *,
+                   since: dt.date, cfg: dict,
+                   memo: dict | None = None) -> None:
+    """Set `withdrawn_on` on every unpaid occurrence whose charge the bank
+    feed took back.
+
+    A feed can withdraw rows it already posted (a "removed" delta), and a
+    bill that WAS charged then reads as never paid. When no live row pays
+    an occurrence but a withdrawn posted row would have — same merchant,
+    amount and date-window rules, the one matcher — the honest word is
+    "withdrawn by the bank feed", not "overdue". It changes the wording
+    only: the occurrence stays unpaid for every sum, because the money is
+    not in the ledger either way. Nothing is stored; the moment a live
+    matching charge lands the occurrence is simply paid.
+
+    Every occurrence joins the match, the paid ones as decoys: a feed that
+    re-ids a row leaves a withdrawn twin of a live payment, and that twin
+    must bind to the occurrence it duplicates rather than vouch for its
+    unpaid neighbour. The evidence window reaches back before the month
+    (`since`), so the earlier months' occurrences of the same bills join as
+    decoys too: a withdrawn twin of LAST month's payment sits nearer last
+    month's due date and binds there, instead of reading as this month's
+    charge taken back.
+
+    The word has a shelf life — the occurrence's own match window, the
+    furthest a charge may sit from its due date and still count. A charge
+    withdrawn longer ago than that is not coming back, and the bill reads
+    overdue like any other."""
+    for occ in occs:
+        occ["withdrawn_on"] = None
+    if not any(o["txn"] is None and not o["floored"] for o in occs):
+        return
+    gone = withdrawn_rows(conn, since, today + dt.timedelta(days=1), cfg,
+                          memo=memo)
+    if not gone:
+        return
+    twins = [dict(o, txn=None, companions=[]) for o in occs]
+    distinct = list({id(o["bill"]): o["bill"] for o in occs}.values())
+    month_start = today.replace(day=1)
+    decoys = [d for y, m in _months_between(since, month_start
+                                            - dt.timedelta(days=1))
+              for d in month_occurrences(distinct, y, m)]
+    match_occurrences(gone, decoys + twins)
+    for occ, twin in zip(occs, twins):
+        if occ["txn"] is not None or occ["floored"] or twin["txn"] is None:
+            continue
+        on = as_date(twin["txn"]["date"])
+        if (today - on).days <= occ["window"]:
+            occ["withdrawn_on"] = on
+
+
+def overdue_entries(st: dict) -> list[tuple]:
+    """`overdue_unpaid` as (payee, planned, due, withdrawn_on) tuples. The
+    fourth slot is newer than the other three, and a status built or
+    stored before it existed (a cached payload, or one saved by an older
+    version) carries
+    three: those read as never posted rather than failing to unpack."""
+    return [(o[0], o[1], o[2], o[3] if len(o) > 3 else None)
+            for o in st.get("overdue_unpaid") or []]
+
+
 # display label for a transaction's account: the institution name is prefixed
 # only when the account's own name does not already start with it
 # ("Northwind Checking 1234" keeps its name, "Everyday 5678" gains one)
@@ -1997,6 +2311,77 @@ ACCT_LABEL_SQL = (
     "|| CASE WHEN COALESCE(a.mask,'')!='' THEN ' '||a.mask ELSE '' END)")
 
 
+# the key sync.base.mark_removed stamps into a row's `raw` when the
+# aggregator's removal delta retires it — the one mark that tells a charge
+# the bank feed withdrew from a row retired for any other reason
+FEED_REMOVED_KEY = "feed_removed_at"
+
+# "withdrawn more than N days ago" on alias `t`, one placeholder for N. A
+# restored archive keeps a row's raw record as it was written, so the stamp
+# can be anything; one that does not read as a time is never old enough
+# (the row is skipped and named by `log_unreadable_removed_stamps`) rather
+# than a cast error that aborts the sweep for every other row.
+FEED_REMOVED_OLDER_SQL = (
+    f" AND (CASE WHEN pg_input_is_valid(t.raw->>'{FEED_REMOVED_KEY}',"
+    f" 'timestamptz') THEN (t.raw->>'{FEED_REMOVED_KEY}')::timestamptz"
+    " END) < now() - make_interval(days => %s)")
+
+
+def log_unreadable_removed_stamps(conn, txn_ids: list[str], what: str) -> None:
+    """Warn about the rows among `txn_ids` whose withdrawal stamp does not
+    read as a time, which the age test above skips for good: someone has to
+    look at them, and a skip that says nothing would hide them forever."""
+    bad = [r["id"] for r in conn.execute(
+        f"""SELECT t.id FROM transactions t
+             WHERE t.id = ANY(%s) AND t.raw ? '{FEED_REMOVED_KEY}'
+               AND NOT pg_input_is_valid(t.raw->>'{FEED_REMOVED_KEY}',
+                                         'timestamptz')""",
+        (list(txn_ids),)).fetchall()]
+    if bad:
+        import logging
+        logging.getLogger("oikonome.budget").warning(
+            "%s: skipped %d withdrawn row(s) whose withdrawal time is "
+            "unreadable: %s", what, len(bad), ", ".join(map(str, bad[:20])))
+
+
+def release_withdrawn_pairs(conn, txn_ids: list[str], *,
+                           older_than_days: int | None = None) -> int:
+    """Release the reimbursement pairs still on rows the bank feed withdrew,
+    the way an unlink does, so the side left on the ledger gets back the
+    category its link set aside. Returns how many pairs were removed.
+
+    For the nightly re-anchor sweep, after its twin search found no
+    re-numbered twin to carry each row onto. `older_than_days` keeps a row
+    whose withdrawal is more recent than that: its twin can still be on its
+    way, and a released pair cannot follow it. The readers already treat such a pair as absent, but a full
+    pair also stamped the surviving charge TRANSFER_OUT (or the deposit
+    TRANSFER_IN), and that stamp keeps the charge out of spend for a refund
+    that never arrived until the pair is gone. Only posted rows the feed
+    itself withdrew qualify: a retired pending hold is the ordinary
+    pending-to-posted swap, and a row a merge or restate retired lives on
+    under another id."""
+    ids = [i for i in dict.fromkeys(txn_ids or []) if i]
+    if not ids:
+        return 0
+    age = ""
+    params: list = [ids]
+    if older_than_days is not None:
+        age = FEED_REMOVED_OLDER_SQL
+        params.append(int(older_than_days))
+        log_unreadable_removed_stamps(conn, ids, "release_withdrawn_pairs")
+    dead = [r["id"] for r in conn.execute(
+        f"""SELECT t.id FROM transactions t
+             WHERE t.id = ANY(%s) AND t.removed = 1 AND t.pending = 0
+               AND t.raw ? '{FEED_REMOVED_KEY}'{age}
+               AND EXISTS (SELECT 1 FROM reimbursements r
+                            WHERE r.expense_id = t.id
+                               OR r.reimburse_id = t.id)""",
+        params).fetchall()]
+    if not dead:
+        return 0
+    from ..web.data import detach_pairs
+    return detach_pairs(conn, dead)
+
 # what a month's ledger rows are read from, for the checkout memo
 _LEDGER_TABLES = ("transactions", "transaction_splits", "reimbursements",
                   "manual_categories", "accounts", "items", "merchants",
@@ -2005,7 +2390,8 @@ _LEDGER_TABLES = ("transactions", "transaction_splits", "reimbursements",
 
 def _spend_rows(conn, since: dt.date, until: dt.date,
                 excluded: list | None = None, *, slim: bool = False,
-                memo: dict | None = None, parts: bool = True) -> list[dict]:
+                memo: dict | None = None, parts: bool = True,
+                withdrawn: bool = False) -> list[dict]:
     """excluded: config 'excluded_accounts' account-id list — those accounts'
     transactions are invisible to the budget math (the Accounts page 'excl'
     toggle). Linked shadow accounts (a lower-ranked source of the
@@ -2025,8 +2411,16 @@ def _spend_rows(conn, since: dt.date, until: dt.date,
     is what makes the verdict, the buckets, the bill matcher and the Why
     see the groceries half of a mixed receipt as food and the rest as other;
     a reader that wants the charge whole (the anomaly pass asks whether the
-    CHARGE was unusual) passes parts=False."""
-    key = _memo_key("spend_rows", since, until, excluded, slim, parts)
+    CHARGE was unusual) passes parts=False.
+
+    withdrawn=True reads the other side of the ledger: POSTED rows the bank
+    feed later took back (removed by the aggregator's removal delta, never
+    by a merge or restate — see FEED_REMOVED_KEY). They are never spend — only
+    the evidence mark_withdrawn needs to tell "never charged" from "charged,
+    then withdrawn by the feed". A removed PENDING row is the ordinary
+    pending-to-posted swap and says nothing about a bill."""
+    key = _memo_key("spend_rows", since, until, excluded, slim, parts,
+                    withdrawn)
     if memo is not None and key in memo:
         return memo[key]
     # the checkout's own memo behind the request memo: a Today request
@@ -2043,6 +2437,15 @@ def _spend_rows(conn, since: dt.date, until: dt.date,
     excl_sql = "AND NOT (t.account_id = ANY(%s))" if excluded else ""
     params: tuple = ((since, until, list(excluded)) if excluded
                      else (since, until))
+    # a withdrawal is what the aggregator's removal delta did
+    # (sync.base.mark_removed stamps it on the row): a row retired by a
+    # merge, a file restate or a full-replace push was never taken back by
+    # the bank, and its charge usually lives on under another id. Only the
+    # account types a bill is paid from, as the Bills page's ledger reads.
+    live_sql = (f"t.removed = 1 AND t.pending = 0 AND t.raw ? '{FEED_REMOVED_KEY}'"
+                " AND t.account_id IN (SELECT id FROM accounts"
+                " WHERE type IN ('depository', 'credit'))" if withdrawn
+                else "t.removed = 0")
     if parts:
         cat_disp, cat_key = _cats.PART_CAT_DISPLAY, f"COALESCE({_cats.PART_CAT}, '?')"
         amount, food = _cats.part_net(NET_AMOUNT), PART_FOOD_SQL
@@ -2062,6 +2465,7 @@ def _spend_rows(conn, since: dt.date, until: dt.date,
                    -- category label into a ledger filter has the value the
                    -- ledger actually compares against
                    {cat_key} AS stored_category,
+                   t.category_detailed,
                    {food} AS is_food, t.pending,
                    {split_line} AS split_line"""
         joins = split_join
@@ -2079,6 +2483,9 @@ def _spend_rows(conn, since: dt.date, until: dt.date,
                    {cat_disp} AS category,
                    -- the stored key behind the display form above (see slim)
                    {cat_key} AS stored_category,
+                   -- the feed's detailed category: the reports tell a
+                   -- mortgage from the other loan payments by it
+                   t.category_detailed,
                    {food} AS is_food, t.pending,
                    {split_line} AS split_line,
                    {ACCT_LABEL_SQL} AS account"""
@@ -2090,7 +2497,7 @@ def _spend_rows(conn, since: dt.date, until: dt.date,
         f"""SELECT {cols}
             FROM transactions t
                  {joins}
-            WHERE t.removed = 0 {SPEND_ONLY_SQL}
+            WHERE {live_sql} {SPEND_ONLY_SQL}
               AND t.date >= %s AND t.date < %s
               {PERSONAL_ONLY_SQL}
               {excl_sql}
@@ -2311,6 +2718,169 @@ def upcoming_bill_occurrences(conn, cfg: dict, today: dt.date,
 
 # ---- cash events: bonus + investment funding ---------------------------
 
+# Words an institution's name shares with every other institution's: they say
+# nothing about who sent a deposit, the bank's text seldom carries them, and
+# requiring them would miss the institution's own transfers ('FIDELITY
+# MONEYLINE' from 'Fidelity Investments').
+_INSTITUTION_FILLER = {
+    "bank", "banks", "brokerage", "capital", "company", "financial",
+    "group", "investment", "investments", "invest", "management",
+    "securities", "services", "trust", "wealth", "advisors", "advisor",
+    "funds", "fund", "markets", "holdings", "national", "association",
+}
+
+# Connector and product words in the marketing form of a name ('Raymond
+# James Client Access', 'Empower Retirement', a payroll bill's 'Payroll'):
+# a bank descriptor never prints them, so they are dropped before the brand
+# is read, even from the full phrase.
+_BRAND_NOISE = {
+    "the", "of", "and", "from", "by", "for", "co", "inc", "llc", "corp",
+    "ltd", "plc", "na", "assoc", "associates", "retirement", "plan",
+    "plans", "client", "clients", "access", "netbenefits", "edge",
+    "investing", "online", "center", "portal", "participant", "workplace",
+    "benefits", "account", "accounts", "ira", "roth", "payroll", "salary",
+    "paycheck", "wages", "direct", "deposit", "dep", "ach", "transfer",
+    "xfer",
+}
+
+# Words that are never a brand on their own: common given names that lead
+# or make up brokerage names, and ordinary words any deposit may carry. A
+# brand made only of these is matched on its whole phrase ('raymond james',
+# 'morgan stanley'), never on one of its words — 'ZELLE FROM CHARLES
+# WILSON' is not Schwab and 'JAMES AUTO REPAIR' is not Raymond James.
+_NOT_A_BRAND_ALONE = {
+    "charles", "edward", "james", "raymond", "morgan", "stanley", "john",
+    "thomas", "william", "robert", "george", "franklin", "lincoln",
+    "jones", "smith", "allen", "mason", "jackson", "nelson", "harris",
+    "russell", "scott", "grant", "price", "rowe", "wells", "lynch",
+    "trade", "first", "united", "american", "state", "street", "principal",
+    "interactive", "brokers", "public", "global", "mutual", "life",
+    "insurance", "northern", "southern", "eastern", "western", "central",
+    "pacific", "atlantic", "union", "federal", "savings", "credit", "home",
+    "prime", "select", "premier", "liberty", "freedom", "security",
+    "standard", "guardian", "pioneer", "saint", "health", "system",
+    "clinic", "labs", "city", "county", "york", "new",
+}
+
+
+def _brand_norm(text: str) -> str:
+    """_text_norm, with an asterisk inside a word JOINED rather than split:
+    'E*TRADE' and 'ETRADE' are one word on both sides of the match."""
+    return _text_norm(re.sub(r"(?<=[a-z0-9])\*(?=[a-z0-9])", "",
+                             (text or "").lower()))
+
+
+def brand_phrases(name: str) -> set[str]:
+    """The word-boundary-padded phrases that name `name`'s brand in a bank
+    descriptor; a text names the brand when any one of them is in its
+    _brand_norm form.
+
+    The name is cut at a product suffix (' - NetBenefits', ' from Morgan
+    Stanley') into segments, each read as a brand of its own. A segment
+    contributes each distinctive word that may stand alone, and its whole
+    phrase — with and without the generic institution words — so a brand
+    made only of given names or ordinary words still matches when the bank
+    prints it in full. A name with nothing distinctive left yields nothing:
+    an alert that stays quiet beats one that fires on every Zelle."""
+    out: set[str] = set()
+    low = (name or "").lower()
+    for seg in re.split(r"\s+-\s+|\s+from\s+|[|(),/]", low):
+        words = [w for w in _brand_norm(seg).split()
+                 if w not in _BRAND_NOISE]
+        core = [w for w in words if w not in _INSTITUTION_FILLER]
+        for w in core:
+            if len(w) >= 3 and w not in _NOT_A_BRAND_ALONE \
+                    and w not in STOP_TOKENS:
+                out.add(f" {w} ")
+        for phrase in (words, core):
+            if len(phrase) >= 2:
+                out.add(" " + " ".join(phrase) + " ")
+        if "*" in seg:
+            # the bank may print the asterisk as a space: 'E TRADE'
+            spaced = [w for w in _text_norm(seg).split()
+                      if w not in _BRAND_NOISE]
+            if len(spaced) >= 2:
+                out.add(" " + " ".join(spaced) + " ")
+    return out
+
+
+# Brokerage brands that a bank descriptor prints on their own ('SCHWAB
+# BROKERAGE MONEYLINK' for Charles Schwab, 'ETRADE SECURITIES' for E*TRADE
+# from Morgan Stanley). Each is a coined or unmistakable brand word — no
+# given name, surname or ordinary word — so it may stand for the
+# institution alone. It only ever applies to an institution whose own name
+# carries the word.
+_BRAND_ALIASES = {
+    "schwab", "fidelity", "vanguard", "etrade", "empower", "wealthfront",
+    "betterment", "robinhood", "merrill", "ameritrade", "webull", "tiaa",
+    "firstrade", "tastytrade", "tastyworks", "wealthsimple", "nuveen",
+    "blackrock", "invesco", "pimco",
+}
+
+
+def institution_matchers(name: str) -> set:
+    """What a deposit's text must carry to be recognised as coming from the
+    investment institution `name`. Each matcher is one of:
+
+    * a frozenset of words: the institution's FULL normalised name — every
+      word left once noise and generic institution words are dropped — all
+      present as whole words, in any order ('Charles Schwab' needs both
+      'charles' and 'schwab'; 'Franklin Templeton' both 'franklin' and 'templeton');
+    * a padded phrase that must appear as written, for a name made only of
+      given names and ordinary words ('raymond james', 'morgan stanley'):
+      such a name read in any order is a person ('JAMES RAYMOND');
+    * a padded brand alias from _BRAND_ALIASES, when the institution's name
+      carries one ('schwab' alone for Charles Schwab).
+
+    There is no single-word fallback. A multi-word brand whose words are
+    not in the alias table — 'Franklin Templeton', 'Northwestern Mutual', 'M1
+    Finance' — is matched only by its full phrase, so a deposit naming one
+    of its words ('TEMPLETON HARDWARE', 'MUTUAL AID SOCIETY', 'FINANCE
+    CHARGE') is never read as money pulled from investments. A real
+    transfer the bank prints with fewer words is missed instead: the alert
+    staying quiet is the cheaper mistake."""
+    out: set = set()
+    low = (name or "").lower()
+    for seg in re.split(r"\s+-\s+|\s+from\s+|[|(),/]", low):
+        words = [w for w in _brand_norm(seg).split()
+                 if w not in _BRAND_NOISE]
+        core = [w for w in words if w not in _INSTITUTION_FILLER]
+        distinctive = [w for w in core
+                       if len(w) >= 3 and w not in _NOT_A_BRAND_ALONE
+                       and w not in STOP_TOKENS]
+        if distinctive:
+            out.add(frozenset(core))
+        else:
+            for phrase in (words, core):
+                if len(phrase) >= 2:
+                    out.add(" " + " ".join(phrase) + " ")
+        for w in core:
+            if w in _BRAND_ALIASES:
+                out.add(f" {w} ")
+        if "*" in seg:
+            # the bank may print the asterisk as a space: 'E TRADE'
+            spaced = [w for w in _text_norm(seg).split()
+                      if w not in _BRAND_NOISE]
+            if len(spaced) >= 2:
+                out.add(" " + " ".join(spaced) + " ")
+    return out
+
+
+def _matches(matchers, text: str) -> bool:
+    """Whether `text` carries any matcher of institution_matchers (padded
+    phrases, as brand_phrases returns, are matched the same way)."""
+    norm = _brand_norm(text)
+    have = None
+    for m in matchers:
+        if isinstance(m, frozenset):
+            if have is None:
+                have = set(norm.split())
+            if m <= have:
+                return True
+        elif m in norm:
+            return True
+    return False
+
 
 def cash_events(conn, month_start: dt.date, until: dt.date) -> dict:
     """Detect (a) an annual bonus — a payroll deposit far above the normal
@@ -2332,16 +2902,27 @@ def cash_events(conn, month_start: dt.date, until: dt.date) -> dict:
         "WHERE amount > 0 AND active = 1 "
         "ORDER BY amount DESC LIMIT 1").fetchone()
     paycheck = pay["amt"] if pay and pay["amt"] else 5000.0
-    pay_key = _key_token(pay["payee"] or "") if pay else None
+    # the employer is recognised by its brand, the same way an institution
+    # is: a payroll bill named for an employer that leads with a given name
+    # must not read a large Zelle from someone of that name as a bonus
+    pay_brand = brand_phrases(pay["payee"] or "") if pay else set()
 
-    inst_keys = {k for k in (
-        _key_token(r["institution_name"] or "") for r in conn.execute(
+    # Each investment institution is recognised by its full name or a
+    # curated brand alias (institution_matchers), as whole words of the
+    # inflow's text — never by one ordinary word or surname of it: 'Franklin
+    # Templeton' must not claim a Zelle from someone named Templeton.
+    inst_matchers: set = set()
+    for r in conn.execute(
             """SELECT DISTINCT i.institution_name
                FROM accounts a JOIN items i ON i.id = a.item_id
-               WHERE a.type = 'investment'""").fetchall()) if k}
+               WHERE a.type = 'investment'""").fetchall():
+        inst_matchers |= institution_matchers(r["institution_name"] or "")
+
+    def _names(phrases: set[str], text: str) -> bool:
+        return _matches(phrases, text)
 
     def _hit(text: str) -> bool:
-        return any(k in text for k in inst_keys)
+        return _matches(inst_matchers, text)
 
     def inflows(since):
         # Budget bank accounts only — and a depository account AT an
@@ -2372,7 +2953,7 @@ def cash_events(conn, month_start: dt.date, until: dt.date) -> dict:
         if _hit(name):
             (large_mtd if r["inflow"] >= LARGE else funding_mtd).append(
                 (day, r["inflow"]))
-        elif pay_key and pay_key in name and r["inflow"] > paycheck * 1.75:
+        elif _names(pay_brand, name) and r["inflow"] > paycheck * 1.75:
             bonus.append((day, r["inflow"]))
 
     ytd = sum(r["inflow"] for r in inflows(month_start.replace(month=1, day=1))
@@ -2386,7 +2967,7 @@ def recurring_load(conn, today: dt.date) -> dict:
     """What the recurring schedule costs and brings in, per month, plus the
     week ahead — the Bills page's headline.
 
-    Deliberately the SAME evened-out year_total/12 the month plan uses
+    Deliberately the SAME evened_monthly_load the month plan uses
     (`avg_bills` above and in month_status), not a fresh sum of cadences.
     A page that says "$3,000/mo bills" beside a Budget page saying something
     else for the identical schedule makes both untrustworthy. Two
@@ -2396,17 +2977,19 @@ def recurring_load(conn, today: dt.date) -> dict:
     """
     cfg = load_config(conn)
     caps, disabled = cfg.get("occurrence_caps"), cfg.get("disabled_bills")
-    bills = _recurring_bills(conn, caps=caps, disabled=disabled)
+    # the month plan's bill set as well as its method: a hand-tracked
+    # card-payment bill is left out while live card debt exists, because
+    # the card machinery already pays that debt (drop_card_pay_bills) —
+    # counting it here would put it in the headline, the week ahead and
+    # every month snapshot twice over
+    bills = drop_card_pay_bills(
+        conn, _recurring_bills(conn, caps=caps, disabled=disabled), cfg=cfg)
     income = _recurring_bills(conn, caps=caps, disabled=disabled, income=True)
     envelopes = _envelope_bills(conn, disabled=disabled)
 
-    def _year(rows):
-        return sum(o["planned"] for m in range(1, 13)
-                   for o in month_occurrences(rows, today.year, m)
-                   if not o["floored"])
-
-    bills_mo = _year(bills) / 12 + sum(e["monthly"] for e in envelopes)
-    income_mo = _year(income) / 12
+    bills_mo = (evened_monthly_load(bills, today)
+                + sum(e["monthly"] for e in envelopes))
+    income_mo = evened_monthly_load(income, today)
     # the week ahead, from the same occurrence engine — envelopes have no
     # due dates and correctly contribute nothing here
     horizon = today + dt.timedelta(days=7)
@@ -2508,6 +3091,9 @@ def month_status(conn, today: dt.date, *, historical: bool = False,
     occs += month_occurrences(bills, ny, nm)
     matched_all, occs = match_occurrences(match_rows, occs)
     occs = occs[:n_this] + [o for o in occs[n_this:] if o["txn"] is not None]
+    mark_withdrawn(conn, occs, today,
+                   since=month_start - dt.timedelta(days=PREPAY_MATCH_DAYS),
+                   cfg=cfg, memo=memo)
     # translate to `rows` indices; a match on a PRIOR-month payment has no
     # in-month row and simply drops out of the spend side
     matched_idx = {_pos[i] for i in matched_all if i in _pos}
@@ -2535,7 +3121,7 @@ def month_status(conn, today: dt.date, *, historical: bool = False,
         return pinned.setdefault(bill["payee"], {
             "payee": bill["payee"], "planned": 0.0, "paid": 0.0,
             "paid_count": 0, "occ_count": 0, "next_due": None,
-            "overdue": False})
+            "overdue": False, "withdrawn_on": None})
 
     for occ in occs:
         if occ["txn"] is not None:
@@ -2574,6 +3160,10 @@ def month_status(conn, today: dt.date, *, historical: bool = False,
                 p["occ_count"] += 1
                 if p["next_due"] is None or occ["due"] < p["next_due"]:
                     p["next_due"] = occ["due"]
+                    # the card speaks for its earliest unpaid occurrence
+                    p["withdrawn_on"] = (occ["withdrawn_on"].isoformat()
+                                         if occ["withdrawn_on"]
+                                         and occ["due"] <= today else None)
                 p["overdue"] = p["overdue"] or occ["due"] <= today
 
     # envelope bills: cap-only — used dollars are fixed, expected at payment
@@ -2595,6 +3185,30 @@ def month_status(conn, today: dt.date, *, historical: bool = False,
 
     def total(rs):
         return sum(r["amount"] for r in rs)
+
+    # Expected-to-date covers the elapsed days (`frac`) plus whatever of
+    # TODAY's allowance has been used so far. The actual side holds every
+    # row through today, so without the second term a household that
+    # spends exactly the allowance the today-ledger hands out (remaining at
+    # midnight ÷ days left, today included — todayview.allowances) adds a
+    # full day to actual and nothing to expected, and reads OVER BUDGET
+    # while its tile says $0 left today. Only the part of today's spend up
+    # to the allowance counts: spending past it is over, spending under it
+    # is not yet "ahead" (the day is not over), a refund today never earns
+    # extra room, and a morning with nothing bought sits exactly where
+    # yesterday ended. A closed month has no day in progress.
+    days_left_live = max(1, days_in_month - today.day + 1)
+
+    def spent_on_today(rs):
+        return sum(r["amount"] for r in rs if as_date(r["date"]) == today)
+
+    def to_date(month_budget, actual, rs):
+        base = month_budget * frac
+        if closed:
+            return base
+        t = spent_on_today(rs)
+        allowance = max(0.0, month_budget - (actual - t)) / days_left_live
+        return base + max(0.0, min(t, allowance))
 
     # Dynamic variable budget: the month's variable budget is what income
     # leaves after this month's fixed-bill schedule, split in the configured
@@ -2624,9 +3238,13 @@ def month_status(conn, today: dt.date, *, historical: bool = False,
                   "month_budget": fixed_month, "rows": fixed_rows,
                   # occurrence-matched bill payments ONLY (no envelope swipes)
                   "occ_rows": [rows[i] for i in matched_idx]},
-        "food": {"actual": total(buckets["food"]), "expected": food_budget * frac,
+        "food": {"actual": total(buckets["food"]),
+                 "expected": to_date(food_budget, total(buckets["food"]),
+                                     buckets["food"]),
                  "month_budget": food_budget, "rows": buckets["food"]},
-        "other": {"actual": total(buckets["other"]), "expected": other_budget * frac,
+        "other": {"actual": total(buckets["other"]),
+                  "expected": to_date(other_budget, total(buckets["other"]),
+                                      buckets["other"]),
                   "month_budget": other_budget, "rows": buckets["other"]},
     }
     for v in b.values():
@@ -2655,11 +3273,13 @@ def month_status(conn, today: dt.date, *, historical: bool = False,
     for pname in ("food", "other"):
         v = b[pname]
         kids = [c for c in customs if c["parent"] == pname]
-        v["children"] = [
-            {"name": c["name"], "actual": c["actual"],
-             "month_budget": c["monthly"], "expected": c["monthly"] * frac,
-             "variance": c["actual"] - c["monthly"] * frac, "rows": c["rows"]}
-            for c in kids]
+        v["children"] = []
+        for c in kids:
+            c_exp = to_date(c["monthly"], c["actual"], c["rows"])
+            v["children"].append(
+                {"name": c["name"], "actual": c["actual"],
+                 "month_budget": c["monthly"], "expected": c_exp,
+                 "variance": c["actual"] - c_exp, "rows": c["rows"]})
         # display decomposition: parent actual = raw − carved-out dollars;
         # the parent's own budget stays the user-set number, its REMAINING
         # budget (after the children's shares) is shown alongside (spec §1)
@@ -2667,7 +3287,10 @@ def month_status(conn, today: dt.date, *, historical: bool = False,
                          - sum(c["monthly"] for c in kids))
         v["display_actual"] = v["actual"] - carved[pname]
         v["remaining_budget"] = rem_budget
-        v["display_expected"] = rem_budget * frac
+        kid_ids = {id(r) for c in kids for r in c["rows"]}
+        v["display_expected"] = to_date(
+            rem_budget, v["display_actual"],
+            [r for r in v["rows"] if id(r) not in kid_ids])
 
     # The VERDICT is variable-only: fixed bills are obligations with their own
     # schedule — a bill posting late is not "under budget".
@@ -2936,11 +3559,8 @@ def month_status(conn, today: dt.date, *, historical: bool = False,
     irregular.sort(key=lambda x: -x["amount"])
 
     # --- month weight + cash plan (annual bills, evened-out view) ---
-    year_total = sum(o["planned"] for m in range(1, 13)
-                     for o in month_occurrences(bills, today.year, m)
-                     if not o["floored"])
-    year_total += sum(e["monthly"] for e in envelopes) * 12
-    avg_bills = year_total / 12
+    avg_bills = (evened_monthly_load(bills, today)
+                 + sum(e["monthly"] for e in envelopes))
     # planned savings-goal contributions are commitments like
     # fixed bills — they reduce the plan surplus (never the verdict).
     # Plan surplus is a STANDING metric, so it
@@ -2953,8 +3573,12 @@ def month_status(conn, today: dt.date, *, historical: bool = False,
     # excess-conditional by definition — it takes from the surplus, so
     # subtracting it from the surplus first would both understate the
     # excess line and make the sweep's own availability self-referential.
+    # A goal on a business's account is the business's commitment, paid
+    # from its own checking, so it stays out of every household figure
+    # here (savings.household_goals).
     from . import savings as _savings
-    goals_plan = _savings.monthly_plan_total(cfg, mode="monthly")
+    goals_plan = _savings.monthly_plan_total(cfg, mode="monthly",
+                                             conn=conn)
     plan_surplus = (income - avg_bills - cfg["food_monthly"]
                     - cfg["other_monthly"] - goals_plan
                     if income else None)
@@ -2964,7 +3588,7 @@ def month_status(conn, today: dt.date, *, historical: bool = False,
     # — overspending eats the surplus, underspending adds to it. Floored
     # at zero: a month that didn't work out has nothing to sweep. This is
     # the one number every "$Y available so far this month" surface reads.
-    sweep_plan = _savings.monthly_plan_total(cfg, mode="sweep")
+    sweep_plan = _savings.monthly_plan_total(cfg, mode="sweep", conn=conn)
     sweep_available = None
     if plan_surplus is not None and sweep_plan > 0.005:
         sweep_available = round(max(0.0, plan_surplus * frac - variance), 2)
@@ -2972,7 +3596,7 @@ def month_status(conn, today: dt.date, *, historical: bool = False,
     # the same matched-transfer evidence goal progress runs on
     sweep_posted = 0.0
     if sweep_plan > 0.005:
-        for g in _savings.goals(cfg):
+        for g in _savings.household_goals(conn, cfg):
             if (_savings.goal_mode(g) == "sweep"
                     and float(g.get("monthly_plan") or 0) > 0
                     and not _savings.is_plan_only(g)):
@@ -2992,7 +3616,12 @@ def month_status(conn, today: dt.date, *, historical: bool = False,
         "variable_scale": scale, "irregular_bills": irregular,
         "events": cash_events(conn, month_start, today + dt.timedelta(days=1)),
         "reasons": reasons, "why": why, "buckets": b, "drifts": drifts,
-        "overdue_unpaid": [(o["bill"]["payee"], o["planned"], o["due"].isoformat())
+        # the fourth slot is the date the bank feed withdrew the charge
+        # (None when it never posted); readers of the first three are
+        # unaffected
+        "overdue_unpaid": [(o["bill"]["payee"], o["planned"], o["due"].isoformat(),
+                            o["withdrawn_on"].isoformat()
+                            if o.get("withdrawn_on") else None)
                            for o in overdue_unpaid],
         "avg_bills": avg_bills, "plan_surplus": plan_surplus, "income": income,
         # the surplus subtracts the savings plan, so every surface that
@@ -3006,6 +3635,12 @@ def month_status(conn, today: dt.date, *, historical: bool = False,
         "sweep_available": sweep_available,
         "sweep_posted": sweep_posted,
         "variable_actual": variable_actual, "variable_expected": variable_expected,
+        # the part of variable_actual dated today: a pace taken over the
+        # ELAPSED days (the forecast's) must leave it out, or it divides
+        # day-many days of spend by day-minus-one
+        "variable_today": (0.0 if closed else
+                           spent_on_today(b["food"]["rows"])
+                           + spent_on_today(b["other"]["rows"])),
         "total_actual": variable_actual + b["fixed"]["actual"],
         "total_expected": variable_expected + b["fixed"]["expected"],
         "config": cfg, "days_in_month": days_in_month, "rows": rows,
@@ -3034,9 +3669,11 @@ BUCKET_LABELS = {"food": "Food", "other": "Everything else"}
 def bucket_ledger(status: dict, bucket: str) -> dict | None:
     """The ledger rows behind ONE bucket tile of a month_status result.
 
-    `bucket` is 'food', 'other', or a custom bucket's configured name.
-    Returns {"bucket", "label", "amount", "txn_ids"} — or None when the
-    name is not a bucket of this month's plan, which is the caller's 400.
+    `bucket` is 'food', 'other', 'fixed' (the Bills row: the month's bill
+    payments and envelope swipes, the rows the fixed bucket owns), or a
+    custom bucket's configured name. Returns {"bucket", "label", "amount",
+    "txn_ids"} — or None when the name is not a bucket of this month's
+    plan, which is the caller's 400.
 
     A parent tile with carve-outs shows its DISPLAY number (its own rows
     minus the children's), because the children have tiles of their own;
@@ -3047,7 +3684,9 @@ def bucket_ledger(status: dict, bucket: str) -> dict | None:
     the tile counts only the part beyond the envelope.
     """
     b = status["buckets"]
-    if bucket in ("food", "other"):
+    if bucket == "fixed":
+        rows, amount, label = b["fixed"]["rows"], b["fixed"]["actual"], "Bills"
+    elif bucket in ("food", "other"):
         v = b[bucket]
         kids = v.get("children") or []
         kid_rows = {id(r) for c in kids for r in c["rows"]}

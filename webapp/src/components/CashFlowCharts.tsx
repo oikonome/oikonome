@@ -27,12 +27,14 @@ export interface FlowNode { key: string; label: string; value: number; color: st
 /** The layout the SVG draws — pure, so the mobile twin runs the same
  *  function over the same numbers. `L` is the balanced total. */
 export function flowLayout(f: FlowPeriod) {
-  const inTotal = f.in.total, outTotal = f.out.total;
-  const saved = f.saved;
+  // unknown income (no bank feed covers the window) draws no income
+  // side and no saved/overspent node — nothing to balance against
+  const inTotal = f.in.total ?? 0, outTotal = f.out.total;
+  const saved = f.saved ?? 0;
   const sources: FlowNode[] = [
-    { key: "paychecks", label: "Paychecks", value: f.in.paychecks, color: COL.paychecks },
-    { key: "interest", label: "Interest & dividends", value: f.in.interest, color: COL.interest },
-    { key: "other", label: "Other income", value: f.in.other, color: COL.other },
+    { key: "paychecks", label: "Paychecks", value: f.in.paychecks ?? 0, color: COL.paychecks },
+    { key: "interest", label: "Interest & dividends", value: f.in.interest ?? 0, color: COL.interest },
+    { key: "other", label: "Other income", value: f.in.other ?? 0, color: COL.other },
   ];
   if (saved < 0) sources.push({ key: "overspent", label: "Overspent by",
                                 value: -saved, color: COL.overspent });
@@ -50,6 +52,10 @@ export function flowLayout(f: FlowPeriod) {
 export function FlowChart({ flow, width = 720, height = 250 }: {
   flow: FlowPeriod; width?: number; height?: number;
 }) {
+  // unknown income (no bank feed covers the window): the story line
+  // under the picture says so and gives the spend — an empty-picture
+  // sentence here would claim nothing went out either
+  if (flow.income_unknown || flow.in.total === null) return null;
   const { sources, sinks, L } = flowLayout(flow);
   if (!L || !sources.length || !sinks.length)
     return <p className="mut" style={{ margin: ".8rem 0" }}>
@@ -102,7 +108,7 @@ export function FlowChart({ flow, width = 720, height = 250 }: {
         {S.filter(inline).map((n) => (
           <text key={n.key} x={nodeW + 8} y={textY(n)} fontSize={12} fill="var(--ink)">
             {n.label}<tspan fill="var(--mut)" fontSize={11}>
-              {"  "}{money(n.value)}{n.key === "overspent" ? "" : pct(n.value, flow.in.total)}</tspan>
+              {"  "}{money(n.value)}{n.key === "overspent" ? "" : pct(n.value, flow.in.total ?? 0)}</tspan>
           </text>))}
         {K.filter(inline).map((n) => (
           <text key={n.key} x={x1 - 8} y={textY(n)} fontSize={12} fill="var(--ink)"
@@ -118,7 +124,7 @@ export function FlowChart({ flow, width = 720, height = 250 }: {
               <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: 2,
                              background: n.color, marginRight: 4, verticalAlign: -1 }} />
               {n.label} {money(n.value)}
-              {n.key === "overspent" ? "" : pct(n.value, n.side === "in" ? flow.in.total : L)}
+              {n.key === "overspent" ? "" : pct(n.value, n.side === "in" ? flow.in.total ?? 0 : L)}
             </span>))}
         </div>)}
     </>

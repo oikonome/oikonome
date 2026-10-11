@@ -78,6 +78,93 @@ class ParseDecodeGateTests(unittest.TestCase):
             self.assertEqual(out["status"], "parsed")
 
 
+class BusyFailedReceiptsAreRetriedBySweep(unittest.TestCase):
+    """A receipt that gave up waiting for the decode gate failed only because
+    the server was busy, so the sweep takes it up again — for a bounded
+    number of days, so one that can never get a turn does not queue for
+    ever. Any other failure stays for a person to retry."""
+
+    def setUp(self):
+        self.conn = make_db()
+        write_config(self.conn)
+        _enable_llm(self.conn)
+        self.txn = add_txn(self.conn, TODAY, 10.0, "STORE")
+
+    def tearDown(self):
+        self.conn.close()
+
+    @staticmethod
+    def _model(calls):
+        def handler(request):
+            calls.append(1)
+            return httpx.Response(200, json={"choices": [{"message": {
+                "content": json.dumps({"merchant": "X", "total": 10.0,
+                                       "items": []})}}]})
+        return httpx.MockTransport(handler)
+
+    def _failed(self, error, age_days=0):
+        rid = receipts.add(self.conn, self.txn, _png(), "image/png")
+        self.conn.execute(
+            "UPDATE receipts SET status='failed', error=%s,"
+            " created_at = now() - make_interval(days => %s)"
+            " WHERE id=%s::uuid", (error, age_days, rid))
+        return rid
+
+    def _status(self, rid):
+        return self.conn.execute(
+            "SELECT status FROM receipts WHERE id=%s::uuid",
+            (rid,)).fetchone()["status"]
+
+    def test_the_sweep_parses_a_receipt_that_failed_busy(self):
+        rid = self._failed(receipts.BUSY_ERROR)
+        calls = []
+        out = receipts.parse_pending(self.conn, transport=self._model(calls))
+        self.assertEqual(out["parsed"], 1)
+        self.assertEqual(self._status(rid), "parsed")
+
+    def test_other_failures_are_left_for_a_person(self):
+        rid = self._failed(receipts.PROSE_ERROR)
+        calls = []
+        out = receipts.parse_pending(self.conn, transport=self._model(calls))
+        self.assertEqual(out["parsed"], 0)
+        self.assertEqual(calls, [])
+        self.assertEqual(self._status(rid), "failed")
+
+    def test_retries_stop_after_the_window(self):
+        rid = self._failed(receipts.BUSY_ERROR,
+                           age_days=receipts.BUSY_RETRY_DAYS + 1)
+        calls = []
+        receipts.parse_pending(self.conn, transport=self._model(calls))
+        self.assertEqual(calls, [])
+        self.assertEqual(self._status(rid), "failed")
+
+    def test_a_busy_gate_stops_the_sweep_instead_of_waiting_on_every_row(self):
+        for _ in range(3):
+            self._failed(receipts.BUSY_ERROR)
+        held = 0
+        while receipts._DECODE_GATE.acquire(blocking=False):
+            held += 1
+        saved = receipts._DECODE_WAIT_S
+        receipts._DECODE_WAIT_S = 0.05
+        waits = []
+        real_acquire = receipts._DECODE_GATE.acquire
+
+        def counting_acquire(*a, **k):
+            waits.append(1)
+            return real_acquire(*a, **k)
+        try:
+            receipts._DECODE_GATE.acquire = counting_acquire
+            out = receipts.parse_pending(self.conn,
+                                         transport=self._model([]))
+        finally:
+            receipts._DECODE_GATE.acquire = real_acquire
+            receipts._DECODE_WAIT_S = saved
+            for _ in range(held):
+                receipts._DECODE_GATE.release()
+        self.assertEqual(len(waits), 1)
+        self.assertEqual(out["failed"], 1)
+
+
 class ParseRouteIsRateLimitedTests(unittest.TestCase):
     def test_parse_route_declares_a_rate_limit(self):
         import os

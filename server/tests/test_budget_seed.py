@@ -9,6 +9,19 @@ import unittest
 from .util import add_txn, make_db
 
 
+def _recent_months():
+    """The 5th of each of the last three full months: the seed reads
+    exactly that window, so fixed fixture dates age out of it and the
+    test starts failing on its own one morning."""
+    import datetime as dt
+    first = dt.date.today().replace(day=1)
+    out = []
+    for _ in range(3):
+        first = (first - dt.timedelta(days=1)).replace(day=1)
+        out.append(first.replace(day=5).isoformat())
+    return sorted(out)
+
+
 class BudgetSeedTests(unittest.TestCase):
     def test_seed_honors_already_excluded_accounts(self):
         from oikonome.engine import budget
@@ -20,7 +33,7 @@ class BudgetSeedTests(unittest.TestCase):
                 "INSERT INTO accounts (id,item_id,name,type,subtype,"
                 "balance_current) VALUES "
                 "('side','it1','Side','depository','checking',0)")
-            for d in ("2026-04-05", "2026-05-05", "2026-06-05"):
+            for d in _recent_months():
                 add_txn(conn, d, 900.0, "BIG THING", account="side",
                         primary="GENERAL_MERCHANDISE")
             budget.save_config(conn, {"excluded_accounts": ["side"]})
@@ -33,7 +46,7 @@ class BudgetSeedTests(unittest.TestCase):
                     "INSERT INTO accounts (id,item_id,name,type,subtype,"
                     "balance_current) VALUES "
                     "('side','it1','Side','depository','checking',0)")
-                for d in ("2026-04-05", "2026-05-05", "2026-06-05"):
+                for d in _recent_months():
                     add_txn(conn2, d, 900.0, "BIG THING", account="side",
                             primary="GENERAL_MERCHANDISE")
                 cfg2 = budget.load_config(conn2)
@@ -55,7 +68,7 @@ class BudgetSeedTests(unittest.TestCase):
             self.assertLessEqual(persisted.get("food_monthly", 0), 0,
                                  "zero seed must NOT be locked in before data")
             # spend arrives (as a later sync would) → real seed, persisted
-            for d in ("2026-04-05", "2026-05-05", "2026-06-05"):
+            for d in _recent_months():
                 add_txn(conn, d, 600.0, "GROCERY", account="card",
                         primary="FOOD_AND_DRINK")
                 add_txn(conn, d, 300.0, "STUFF", account="card",

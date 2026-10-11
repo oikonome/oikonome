@@ -7,7 +7,7 @@ import PullRefresh from "../components/pull-refresh";
 
 import StaleBanner from "../components/stale-banner";
 import { Card, HelpLink, Pill } from "../components/ui";
-import { KIND_ROUTE } from "../lib/alert-routes";
+import { alertCta, alertRoute } from "../lib/alert-routes";
 import type { Alert, AlertRow, TodayFull } from "../lib/api";
 import { patchList, removeFromList } from "../lib/cache";
 import { listPhase } from "../lib/pure";
@@ -132,11 +132,11 @@ export default function Alerts() {
               </View>
               <Text style={s.msg}>{a.message}</Text>
               <View style={{ flexDirection: "row", gap: 16 }}>
-                {KIND_ROUTE[a.kind] && !!a.active && (
+                {alertRoute(a) && !!a.active && (
                   <Text style={{ color: C.accent, fontSize: 12 }}
                         onPress={() =>
-                          router.push(KIND_ROUTE[a.kind] as never)}>
-                    fix this ›
+                          router.push(alertRoute(a) as never)}>
+                    {alertCta(a.kind)} ›
                   </Text>
                 )}
                 {!viewer && (a.active || a.dismissed) ? (() => {

@@ -14,7 +14,7 @@ import Sparkline from "../components/sparkline";
 import StaleBanner from "../components/stale-banner";
 import { Card, H, KV } from "../components/ui";
 import type { FlowKey } from "../lib/api";
-import { TREND_RANGES, catLabel, RANGE_LABEL } from "../lib/pure";
+import { TREND_RANGES, catLabel, RANGE_LABEL, windowLabel } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { C, money } from "../lib/theme";
 
@@ -102,14 +102,28 @@ export default function Spending() {
   });
   const w = query.data;
   const perMonth = w ? w.total / Math.max(w.months, 1) : 0;
-  const top = w?.categories[0];
-  const movers = !w || w.prev_total === null ? [] :
-    w.categories
-      .map(([c, v, p]) => ({ c, v, p: p ?? 0, d: v - (p ?? 0) }))
-      .filter((m) => Math.abs(m.d) >= Math.max(25, w.total * 0.005))
+  // the server follows the ranked categories with ones spent on only in
+  // the previous window, at 0: they belong in "what changed", never in a
+  // ranking of where this window's money went
+  const spent = w?.categories.filter(([, v]) => v > 0) ?? [];
+  const top = spent[0];
+  // biggest absolute changes either way — a category that fell to nothing
+  // included — then merchants paid only in the previous window, in the
+  // same row shape, as on the web
+  const moved = (rows: [string, number, number | null][], n: number,
+                 label: (k: string) => string) =>
+    rows.map(([c, v, p]) => ({ k: c, c: label(c), v, p: p ?? 0,
+                               d: v - (p ?? 0) }))
+      .filter((m) => Math.abs(m.d) >= Math.max(25, (w?.total ?? 0) * 0.005))
       .sort((a, b) => Math.abs(b.d) - Math.abs(a.d))
-      .slice(0, 4);
-  const cats = w?.categories.slice(0, 15) ?? [];
+      .slice(0, n);
+  const movers = !w || w.prev_total === null ? [] : [
+    ...moved(w.categories, 4, catLabel).map((m) => ({ ...m, k: `c:${m.k}` })),
+    ...moved((w.dropped_merchants ?? []).map(([payee, v, , p]) =>
+               [payee, v, p] as [string, number, number | null]), 3,
+             (k) => k).map((m) => ({ ...m, k: `m:${m.k}` })),
+  ];
+  const cats = spent.slice(0, 15);
   const merchants = (allMerch ? w?.merchants : w?.merchants.slice(0, 10)) ?? [];
   const maxCat = cats[0]?.[1] || 1;
   const maxMerch = w?.merchants[0]?.[1] || 1;
@@ -134,9 +148,12 @@ export default function Spending() {
             </View>
           </View>
           <Text style={[s.mut, { marginTop: 8 }]}>
-            {w.label}: <Text style={s.big}>{m$(w.total)}</Text> spent ·{" "}
-            <Text style={{ color: C.text, fontWeight: "600" }}>
-              {m$(perMonth)}</Text>/mo
+            {/* live_month: the month so far, where a per-month pace would
+                only repeat the total (as on the web) */}
+            {windowLabel(w)}: <Text style={s.big}>{m$(w.total)}</Text> spent
+            {!w.live_month ? <>{" "}·{" "}
+              <Text style={{ color: C.text, fontWeight: "600" }}>
+                {m$(perMonth)}</Text>/mo</> : null}
             {top ? <> · biggest{" "}
               <Text style={{ color: C.text, fontWeight: "600" }}>
                 {catLabel(top[0])}</Text>{" "}
@@ -165,10 +182,10 @@ export default function Spending() {
             <Text style={{ color: C.mut, fontSize: 12, fontWeight: "400" }}>
               — vs the {PREV_NAME[range]}</Text></H>
           {movers.map((m) => (
-            <Text key={m.c} style={{ fontSize: 13, marginVertical: 2 }}>
+            <Text key={m.k} style={{ fontSize: 13, marginVertical: 2 }}>
               <Text style={{ color: m.d > 0 ? C.bad : C.good,
                              fontWeight: "700" }}>
-                {m.d > 0 ? "▲" : "▼"} {catLabel(m.c)}{" "}
+                {m.d > 0 ? "▲" : "▼"} {m.c}{" "}
                 {m.d > 0 ? "+" : "−"}{m$(Math.abs(m.d))}
               </Text>
               <Text style={{ color: C.mut }}>

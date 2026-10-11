@@ -160,14 +160,20 @@ def _plan_rows(st: dict) -> list[dict]:
     # verdict" tail anywhere (the pace carets already say which rows count)
     rows.append({"label": "Bills", "judged": False, "actual": posted,
                  "expected": fixed["expected"],
-                 "budget": fixed["month_budget"], "pending": pend})
+                 "budget": fixed["month_budget"], "pending": pend,
+                 "to": _ledger(st, "fixed")})
     goal = next((g for g in st.get("savings_goals") or []
                  if g["name"] == "Savings"), None)
     if goal and ((goal["monthly_plan"] or 0) > 0
                  or (goal.get("rate_90d") or 0) > 0):
         plan_only = goal.get("rate_90d") is None
+        # this month's posted transfer — the card is this month's, and the
+        # 90-day average can read "on plan" in a month nothing moved; the
+        # average is the fallback only for a payload without the field
+        month = goal.get("saved_this_month")
         rows.append({"label": "Savings / Investment", "judged": False,
-                     "actual": goal.get("rate_90d") or 0,
+                     "actual": (month if month is not None
+                                else goal.get("rate_90d")) or 0,
                      "expected": goal["monthly_plan"],
                      "budget": goal["monthly_plan"],
                      "actual_label": "—" if plan_only else None,
@@ -193,12 +199,15 @@ def _map_cells(row: dict) -> list[dict]:
     if unbudgeted:
         return [{"w": 100.0, "bg": _MAP_AMBER_DIM}]
     pending = row.get("pending") or 0
-    extent = max(row["budget"], row["actual"] + pending, 1)
-    isover = (row["actual"] > row["expected"] + 0.5 if row["judged"]
-              else row["actual"] > row["budget"] + 0.5)
-    spent = min(row["actual"], row["budget"])
+    # a savings month that was a net withdrawal has a negative actual; the
+    # bar draws it as nothing filled (the figure beside it says how much)
+    actual = max(row["actual"], 0)
+    extent = max(row["budget"], actual + pending, 1)
+    isover = (actual > row["expected"] + 0.5 if row["judged"]
+              else actual > row["budget"] + 0.5)
+    spent = min(actual, row["budget"])
     pend = min(pending, max(row["budget"] - spent, 0))
-    over = max(row["actual"] - row["budget"], 0)
+    over = max(actual - row["budget"], 0)
     remaining = max(row["budget"] - spent - pend, 0)
     cells = []
     for width, bg in [(spent, "var(--red)" if isover else "var(--green)"),
@@ -548,7 +557,14 @@ def _bill_cards(st: dict) -> list[dict]:
         remaining = max(0.0, p["planned"] - p["paid"])
         due = (dt.date.fromisoformat(p["next_due"]).strftime("%m/%d")
                if p["next_due"] else None)
-        if p["overdue"]:
+        gone = p.get("withdrawn_on")
+        if p["overdue"] and gone:
+            # charged, then taken back by the feed: still unpaid in the
+            # sums, but a warning to check, not a missed payment
+            status = ("charge withdrawn by the bank feed "
+                      f"({dt.date.fromisoformat(gone):%m/%d})")
+            tone = "warn"
+        elif p["overdue"]:
             status, tone = f"overdue — was due {due}", "neg"
         elif due:
             status, tone = f"due {due}", None
@@ -558,7 +574,8 @@ def _bill_cards(st: dict) -> list[dict]:
             status = tone = None
         cards.append({
             "kind": "bill", "label": p["payee"],
-            "left": round(remaining, 2), "over": bool(p["overdue"]),
+            "left": round(remaining, 2),
+            "over": bool(p["overdue"]) and not gone,
             "sub": (f"paid ${p['paid']:,.0f} of ${p['planned']:,.0f} "
                     "this month"),
             "frac": (min(1.0, p["paid"] / p["planned"])
@@ -892,6 +909,8 @@ _CLASS_STYLES = {
     "ax": "color:#8b98a3;font-size:11px;",
     "num": "text-align:right;",
     "pos": "color:#5cb56b;", "neg": "color:#e0695d;",
+    # only ever on a .sub status line (the web scopes it .sub.warn)
+    "warn": "color:#f0b429;",
     "pill": ("display:inline-block;padding:2px 9px;border-radius:999px;"
              "font-size:12px;font-weight:700;"),
     "g": "background:rgba(92,181,107,.16);color:#5cb56b;",
@@ -1121,11 +1140,25 @@ def render_email(st: dict, *, summary: bool = False,
         email=True, summary=summary,
         face="summary" if summary else "detail",
         **(ctx if ctx is not None else build_context(st, email=True)))
+    return mail_shell(f'Daily budget — {fmt_date(st["today"])}', body)
+
+
+def mail_shell(heading: str, body: str) -> str:
+    """The one mail shell: brand header, the heading, the body with the
+    dark stylesheet baked in. Every cadence email goes through here, so
+    the monthly reads as the daily's sibling, not a second design."""
     return (
         '<div style="background:#0f141a;padding:8px;">'
         '<div style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;'
         'max-width:680px;margin:0 auto;padding:16px;color:#dbe3ea;background:#0f141a;'
         'border-radius:12px;font-size:15px;line-height:1.5;">'
         f'{_brand_header()}'
-        f'<h2 style="font-size:18px;margin:0 0 12px;">Daily budget — {fmt_date(st["today"])}</h2>'
+        f'<h2 style="font-size:18px;margin:0 0 12px;">{heading}</h2>'
         f'{_inline(body)}</div></div>')
+
+
+def render_mail(heading: str, template: str, **ctx) -> str:
+    """A cadence email from its own template, email mode, in the shared
+    shell — the monthly and yearly bodies render this way."""
+    body = _env.get_template(template).render(email=True, **ctx)
+    return mail_shell(heading, body)

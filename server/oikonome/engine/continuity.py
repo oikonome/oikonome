@@ -510,7 +510,12 @@ def render_pdf(p: dict) -> bytes:
             if e.get("ein_last4"):
                 facts.append(f"EIN ending {e['ein_last4']}")
             if e.get("fiscal_year_end"):
-                facts.append(f"fiscal year ends {e['fiscal_year_end']}")
+                # the books in Oikonome are kept by calendar year whatever
+                # the business's own fiscal year is; say so where they differ
+                fy = e["fiscal_year_end"]
+                facts.append(f"fiscal year ends {fy}" + (
+                    "" if fy == "12-31" else
+                    " (the books in Oikonome are kept by calendar year)"))
             block.append(P(" · ".join(facts), body))
             if e.get("registered_agent"):
                 block.append(P(f"Registered agent: {e['registered_agent']}",

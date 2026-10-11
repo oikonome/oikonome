@@ -117,6 +117,19 @@ class PasskeyOnlyStepupTests(unittest.TestCase):
             "totp_code": codes[0]})
         self.assertEqual(r2.status_code, 401)
 
+    def test_a_wrong_recovery_code_says_the_code_did_not_match(self):
+        """A passkey-only sign-in with a mistyped recovery code must answer
+        differently from one with no code at all — otherwise the clients
+        re-prompt for the lost passkey and never say the code was wrong."""
+        self._make_passkey_only()
+        anon = TestClient(self.appmod.app)
+        r = anon.post("/api/login", data={
+            "email": self.email, "password": "correct-horse-battery",
+            "totp_code": "not-a-real-code"})
+        self.assertEqual(r.status_code, 401, r.text)
+        self.assertNotIn("passkey_required", r.text)
+        self.assertIn("bad one-time code", r.text)
+
     # ---- step-up -------------------------------------------------------
     def test_passkey_only_password_change_needs_recovery(self):
         self._make_passkey_only()

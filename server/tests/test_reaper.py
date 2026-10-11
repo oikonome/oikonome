@@ -293,6 +293,27 @@ class ReapThresholdTests(ReaperBase):
         self.assertEqual(self._status(iid)["status"],
                          "error:ITEM_LOGIN_REQUIRED")
 
+    def test_disabled_mode_still_finishes_a_disconnect(self):
+        """0 stops the app removing connections on its own. A removal the
+        household asked for, whose /item/remove failed, is a different
+        thing: the retry is the only thing that ever finishes it, and
+        without it the Item bills at Plaid every month."""
+        os.environ["OIKONOME_PLAID_REAP_DAYS"] = "0"
+        dead = self._item(error_days_ago=100)
+        asked = self._item(error_days_ago=None, name="Left Bank")
+        self.conn.execute(
+            "UPDATE items SET status='archived', "
+            "archived_reason='disconnect-release-failed' WHERE id=%s",
+            (asked,))
+        calls: list = []
+        out = reaper.reap(self.conn, client=_client(calls), now=NOW)
+        self.assertTrue(out["disabled"])
+        self.assertEqual(out["reaped"], [])
+        self.assertEqual(out["released_archived"], ["Left Bank"])
+        self.assertEqual(calls, [("/item/remove", f"tok-{asked}")])
+        self.assertEqual(self._status(dead)["status"],
+                         "error:ITEM_LOGIN_REQUIRED")
+
     def test_custom_threshold_env(self):
         os.environ["OIKONOME_PLAID_REAP_DAYS"] = "7"
         self._item(error_days_ago=8)

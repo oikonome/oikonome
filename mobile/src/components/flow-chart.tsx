@@ -12,6 +12,10 @@ import { C, money } from "../lib/theme";
 function FlowChart({ flow, width, height = 200 }: {
   flow: FlowPeriod; width: number; height?: number;
 }) {
+  // unknown income (no bank feed covers the window): the line under the
+  // picture says so and gives the spend — the web does the same — so an
+  // empty-picture sentence here would claim nothing went out either
+  if (flow.income_unknown || flow.in.total === null) return null;
   const g = flowGeometry(flow, width, height);
   if (!g)
     return <Text style={{ color: C.mut, fontSize: 12, marginVertical: 8 }}>
@@ -36,7 +40,7 @@ function FlowChart({ flow, width, height = 200 }: {
           <SvgText key={n.key} x={g.nodeW + 6} y={textY(n)} fontSize={11}
                    fill={C.text}>
             {n.label}{" "}{money(n.value, false)}
-            {n.key === "overspent" ? "" : pct(n.value, flow.in.total)}
+            {n.key === "overspent" ? "" : pct(n.value, flow.in.total ?? 0)}
           </SvgText>))}
         {g.K.filter(inline).map((n) => (
           <SvgText key={n.key} x={g.x1 - 6} y={textY(n)} fontSize={11}
@@ -48,7 +52,7 @@ function FlowChart({ flow, width, height = 200 }: {
         <Text style={{ color: C.mut, fontSize: 11, marginTop: 2 }}>
           {small.map((n, i) => `${i ? " · " : ""}${n.label} ${money(n.value, false)}`
             + (n.key === "overspent" ? ""
-               : pct(n.value, n.side === "in" ? flow.in.total : g.L))).join("")}
+               : pct(n.value, n.side === "in" ? flow.in.total ?? 0 : g.L))).join("")}
         </Text>)}
     </View>
   );

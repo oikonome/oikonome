@@ -18,7 +18,8 @@ import { ELEVATION_CANCELLED, errText, registerElevationPrompter,
          type ElevationPrompt, type ElevationProof,
          type ElevationStatus } from "../lib/api";
 import { passkeyMaybeAvailable } from "../lib/passkey";
-import { elevationProof, recoveryNeedsPassword } from "../lib/pure";
+import { elevationProof, oneTimeCodeSentence,
+         recoveryNeedsPassword } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { stepupTicket } from "../lib/stepup";
 import { C } from "../lib/theme";
@@ -30,8 +31,8 @@ function explain(e: unknown): string {
     return "That password didn't match.";
   if (/totp_required/i.test(t))
     return "Two-factor is on — enter the current 6-digit code too.";
-  if (/one-time code|doesn't match/i.test(t))
-    return "That code didn't match — check your app's clock.";
+  const codeSentence = oneTimeCodeSentence(t);
+  if (codeSentence) return codeSentence;
   if (/recovery/i.test(t))
     return "That recovery code didn't match.";
   if (/too many/i.test(t))

@@ -7,13 +7,14 @@ from __future__ import annotations
 
 import csv as csvmod
 import io
+import logging
 import time
 
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Request, \
     UploadFile
 from urllib.parse import quote
 
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from ..db import tenancy
 from ..envnum import env_flag
@@ -362,6 +363,33 @@ def _redeem_export_ticket(user_id, kind: str, ticket: str) -> None:
                                  "request the download again")
 
 
+def _export_ticket_live(user_id, kind: str, ticket: str) -> None:
+    """The same refusal _redeem_export_ticket gives, without burning the
+    ticket: the precheck door asks it, so a refusal is shown in the app
+    before the browser navigates to the download."""
+    import hashlib
+
+    from .app import _control_conn
+    if not ticket or not ticket.startswith("oikx-"):
+        raise HTTPException(403, "export_ticket_required: POST "
+                                 "/api/export/token with your password first")
+    with _control_conn() as conn:
+        row = conn.execute(
+            """SELECT 1 FROM webauthn_challenges
+               WHERE purpose = %s AND user_id = %s AND challenge = %s
+                 AND expires_at > now()""",
+            (f"export-ticket:{kind}", user_id,
+             hashlib.sha256(ticket.encode()).hexdigest())).fetchone()
+    if row is None:
+        raise HTTPException(403, "export ticket expired or already used — "
+                                 "request the download again")
+
+
+SHARED_EXPORT_DENIED = ("This is a shared demonstration login — the "
+                        "full export carries every member's address, so "
+                        "it is not available to it")
+
+
 @router.post("/api/export/token")
 def export_token(user: dict = Depends(_user()), body: dict = Body(...)):
     """Re-prove identity and mint the one-shot ticket that GET /export or
@@ -376,6 +404,11 @@ def export_token(user: dict = Depends(_user()), body: dict = Body(...)):
         raise HTTPException(400, "kind must be zip or dump")
     if kind in ("dump", "continuity") and user["role"] != "owner":
         raise HTTPException(403, "owner only")
+    if kind in ("zip", "dump") and demoguard.people_hidden(user):
+        # the archive carries every member's address — in the settings, the
+        # activity log, the invites — which the shared demonstration login
+        # is shown nowhere else. Refused before the ticket.
+        raise HTTPException(403, SHARED_EXPORT_DENIED)
     if kind == "dump":
         # the dump is the whole database, not the household's view of it —
         # on a demo instance its printed login would hand every visitor the
@@ -393,26 +426,32 @@ def export_token(user: dict = Depends(_user()), body: dict = Body(...)):
             "expires_in": int(EXPORT_TICKET_TTL.total_seconds())}
 
 
-@router.get("/export/dump")
-def export_dump(user: dict = Depends(_user()), t: str = ""):
-    """Exact-fidelity database dump (pg_dump, plain SQL, gzipped) — the
-    SAME format the manager's backups produce, so `./oikonome.sh restore
-    <file>` consumes it directly. Owner-only: the dump is the whole
-    instance, not one user's view. Restore stays in the manager on purpose
-    (confirm-gated, stops the app first)."""
-    import datetime as _dt2
+def _dsn_without_password(dsn: str) -> tuple[str, dict]:
+    """`dsn` with its password taken out, and the environment to run a
+    libpq client with so it still signs in. A process's command line is
+    readable by every account on the host (ps, /proc/<pid>/cmdline), so a
+    password must never be on one; libpq reads PGPASSWORD from the
+    environment instead, which only the process's own user can see."""
+    import os
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+    params = conninfo_to_dict(dsn)
+    password = params.pop("password", None)
+    env = dict(os.environ)
+    if password is not None:
+        env["PGPASSWORD"] = str(password)
+    return make_conninfo(**params), env
+
+
+def _dump_gates(user: dict) -> None:
+    """Every refusal the database dump gives before its ticket is
+    redeemed, shared with the precheck door."""
     import shutil
-    import subprocess
-    import zlib
-
-    from fastapi.responses import StreamingResponse
-
-
-    from ..db import tenancy as _tenancy
     if user["role"] != "owner":
         raise HTTPException(403, "owner only")
     # a ticket minted before the instance became a demo must not open it
     demoguard.deny(user)
+    if demoguard.people_hidden(user):
+        raise HTTPException(403, SHARED_EXPORT_DENIED)
     # HOSTED gate: pg_dump bypasses RLS and dumps EVERY
     # tenant's rows (incl. password hashes + encrypted secrets). Safe on a
     # single-tenant self-hosted box; on the shared hosted DB an owner would
@@ -435,15 +474,34 @@ def export_dump(user: dict = Depends(_user()), t: str = ""):
     if shutil.which("pg_dump") is None:
         raise HTTPException(500, "pg_dump not available in this image — "
                                  "upgrade the instance (git pull + install)")
+
+
+@router.get("/export/dump")
+def export_dump(user: dict = Depends(_user()), t: str = ""):
+    """Exact-fidelity database dump (pg_dump, plain SQL, gzipped) — the
+    SAME format the manager's backups produce, so `./oikonome.sh restore
+    <file>` consumes it directly. Owner-only: the dump is the whole
+    instance, not one user's view. Restore stays in the manager on purpose
+    (confirm-gated, stops the app first)."""
+    import datetime as _dt2
+    import subprocess
+    import zlib
+
+    from fastapi.responses import StreamingResponse
+
+
+    from ..db import tenancy as _tenancy
+    _dump_gates(user)
     # last, so a refused gate above does not burn the ticket
     _redeem_export_ticket(user["user_id"], "dump", t)
     stamp = f"{_dt2.datetime.now():%Y%m%d-%H%M%S}"
 
     def stream():
         import threading
+        dsn, env = _dsn_without_password(_tenancy.ADMIN_DSN)
         proc = subprocess.Popen(
-            ["pg_dump", "--dbname", _tenancy.ADMIN_DSN, "--no-owner"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            ["pg_dump", "--dbname", dsn, "--no-owner"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         # drain stderr in a thread — pg_dump warnings past the ~64KB pipe
         # buffer would otherwise block its stdout and hang the stream
         errbuf: list[bytes] = []
@@ -491,6 +549,10 @@ def export_dump(user: dict = Depends(_user()), t: str = ""):
 EXPORT_SKIP = {
     "tenant_keys",       # envelope key material — secret, never travels
     "import_staging",    # import scratch
+    # a folder import's frozen plan and the files it has not reached yet:
+    # import scratch and job bookkeeping, never the household's data
+    "bulk_import_jobs",
+    "bulk_import_files",
     "job_progress",      # job bookkeeping
     "job_runs",          # job bookkeeping / heartbeats
     "feedback_reports",  # operational ring buffer (may embed log lines)
@@ -500,11 +562,10 @@ EXPORT_SKIP = {
     # legible data; derived from merchant_categories (which exports fully)
     # and retrained nightly, so the export carries the source, not the cache
     "categorizer_model",
-    # Which Plaid account adopted which restored one, and the date before
-    # which the restore is authoritative. Instance-LOCAL by nature: the
-    # ids are this instance's, and carrying it into a fresh one would tell
-    # that instance to drop a backfill it has never held.
-    "account_adoptions",
+    # account_adoptions is NOT skipped: a file row keeps the id its account
+    # had when it was imported, and the old->new pairs are how a later
+    # re-import finds it. A restore loads only that lineage, reconciled, so
+    # the destination is never told to drop a backfill it has not held.
     # Outbound webhooks and their outbox. A receiver URL is a credential in
     # its own right — a Home Assistant webhook id or a chat incoming-webhook
     # URL lets whoever holds it trigger the automation or post to the
@@ -553,6 +614,8 @@ def export_data(user: dict = Depends(_user()), t: str = ""):
     ticket flow is next rearranged."""
     if user["role"] != "owner":
         raise HTTPException(403, "owner only")
+    if demoguard.people_hidden(user):
+        raise HTTPException(403, SHARED_EXPORT_DENIED)
     _redeem_export_ticket(user["user_id"], "zip", t)
 
     import os as _os
@@ -571,14 +634,28 @@ def export_data(user: dict = Depends(_user()), t: str = ""):
     tmp = _tf.NamedTemporaryFile(prefix="oik-export-", suffix=".zip",
                                  delete=False)
     conn = tenancy.tenant_connect(user["tenant_id"])
+    warnings: list[str] = []
     try:
-        _export.build_zip(conn, out=tmp)
+        _export.build_zip(conn, out=tmp, warnings=warnings)
         tmp.close()
         fh = open(tmp.name, "rb")
     except BaseException:
         tmp.close()
         _os.unlink(tmp.name)
         raise
+    else:
+        # what this export found, for a client that downloaded by
+        # navigation (or through a file API) and so never sees a header:
+        # GET /api/export/last answers it after the download
+        try:
+            import json as _json
+
+            from ..engine import alerts as _alerts
+            _alerts.heartbeat(conn, EXPORT_LAST_JOB, _json.dumps(warnings))
+        except Exception:                                 # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "export: could not record its warnings",
+                        exc_info=True)
     finally:
         conn.close()
     _os.unlink(tmp.name)
@@ -592,10 +669,76 @@ def export_data(user: dict = Depends(_user()), t: str = ""):
                 yield chunk
         finally:
             fh.close()
+    headers = {"Content-Disposition":
+               'attachment; filename="oikonome-export.zip"'}
+    if warnings:
+        # An archive a restore would refuse is still the household's copy,
+        # so it downloads; the reasons ride a header (the body is the ZIP
+        # itself, and the same text is in its RESTORE-NOTE.txt). JSON with
+        # every non-ASCII character escaped, since a header is Latin-1.
+        import json as _json
+        headers[EXPORT_WARNINGS_HEADER] = _json.dumps(warnings)
     return StreamingResponse(
-        _stream(), media_type="application/zip",
-        headers={"Content-Disposition":
-                 'attachment; filename="oikonome-export.zip"'})
+        _stream(), media_type="application/zip", headers=headers)
+
+
+# the header the full-data export names what a restore would refuse in
+EXPORT_WARNINGS_HEADER = "X-Oikonome-Export-Warnings"
+# the job_runs row the last full-data export's warnings are kept under
+EXPORT_LAST_JOB = "export-zip"
+
+
+@router.get("/api/export/last")
+def export_last(user: dict = Depends(_user())):
+    """What the household's most recent full-data export found: when it
+    was built and what a restore would refuse in it. A browser download is
+    a navigation and the phone saves through a file API, so neither can
+    read the download's own header; the client asks here once the
+    download is done. `at` is null when no export has been built.
+
+    {"at": ISO-8601 | null, "warnings": [str, ...]}"""
+    if user["role"] != "owner":
+        raise HTTPException(403, "owner only")
+    import json as _json
+    conn = tenancy.tenant_connect(user["tenant_id"])
+    try:
+        row = conn.execute("SELECT ran_at, note FROM job_runs WHERE job=%s",
+                           (EXPORT_LAST_JOB,)).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return {"at": None, "warnings": []}
+    try:
+        got = _json.loads(row["note"] or "[]")
+    except ValueError:
+        got = []
+    return {"at": row["ran_at"].isoformat(),
+            "warnings": [str(w) for w in got] if isinstance(got, list)
+            else []}
+
+
+@router.get("/api/export/precheck")
+def export_precheck(user: dict = Depends(_user()), kind: str = "zip",
+                    t: str = ""):
+    """Would the download this ticket opens be refused? The browser saves
+    an export by navigating to it, so a refusal there replaces the app
+    with a bare error page; the client asks here first and shows the
+    refusal where the person clicked. Runs every check the download runs
+    before it builds anything — the role, the shared-login rules, the
+    dump's instance gates, the ticket itself — and never spends the
+    ticket. 204 when the download would start; the download's own error
+    otherwise."""
+    if kind not in _EXPORT_KINDS:
+        raise HTTPException(400, "kind must be zip or dump")
+    if kind == "dump":
+        _dump_gates(user)
+    else:
+        if user["role"] != "owner":
+            raise HTTPException(403, "owner only")
+        if kind == "zip" and demoguard.people_hidden(user):
+            raise HTTPException(403, SHARED_EXPORT_DENIED)
+    _export_ticket_live(user["user_id"], kind, t)
+    return Response(status_code=204)
 
 
 @router.get("/export/continuity")
@@ -634,6 +777,11 @@ def _continuity_pdf(user: dict) -> tuple[bytes, str]:
         members = [dict(r) for r in cc.execute(
             "SELECT email, role FROM users WHERE tenant_id = %s "
             "ORDER BY created_at", (user["tenant_id"],)).fetchall()]
+    # the packet prints every member's address and the owner's note; the
+    # shared demonstration login is shown neither, as on /api/continuity
+    mine = set(demoguard.own_addresses_only(
+        user, [m["email"] for m in members]))
+    members = [m for m in members if m["email"] in mine]
     conn = tenancy.tenant_connect(user["tenant_id"])
     try:
         packet = continuity.gather(
@@ -641,6 +789,8 @@ def _continuity_pdf(user: dict) -> tuple[bytes, str]:
             base_url=_os.environ.get("OIKONOME_BASE_URL", ""))
     finally:
         conn.close()
+    if demoguard.people_hidden(user):
+        packet["note"], packet["prepared_for"] = "", ""
     return (continuity.render_pdf(packet),
             continuity.filename(packet["generated_date"]))
 
@@ -697,6 +847,9 @@ def settings_email(user: dict = Depends(_user()),
     # send mail (Doctor already says "email disabled — demo instance"),
     # exactly like the /api/settings door's refused-keys list
     demoguard.deny(user)
+    # this form replaces the whole list, and the shared demonstration login
+    # is never shown the other members on it — its save would drop them
+    demoguard.deny_shared_grant(user)
     conn = tenancy.tenant_connect(user["tenant_id"])
     try:
         recips = mailguard.parse_recipients(email_recipients)
@@ -814,14 +967,18 @@ def _start_plaid_session(user: dict, item_id: str = "",
     stops Plaid billing it. A deselected account simply stops being
     returned; the status route auto-hides its local row on completion.
     """
-    demoguard.deny(user)
+    # every Plaid link starts here, web and mobile alike, so the shared
+    # demonstration login is refused at the helper as well as at the
+    # request gate: a bank linked with a handed-out password outlives it
+    demoguard.deny_shared_credentials(user)
     conn = tenancy.tenant_connect(user["tenant_id"])
     try:
         access_token, inst, kind = None, None, "add"
         if item_id:
             row = conn.execute(
-                "SELECT id, institution_name, status FROM items "
-                "WHERE id=%s AND aggregator='plaid'", (item_id,)).fetchone()
+                "SELECT id, institution_name, status, webhook_status "
+                "FROM items WHERE id=%s AND aggregator='plaid'",
+                (item_id,)).fetchone()
             if not row:
                 raise HTTPException(404, "unknown item")
             # An archived item is not re-authenticated, it is re-LINKED: a
@@ -840,10 +997,24 @@ def _start_plaid_session(user: dict, item_id: str = "",
                     "That connection has no credentials to refresh — link "
                     "the bank again.")
             inst, kind = row["institution_name"], "update"
+            # Plaid only offers newly opened accounts through the
+            # shared-accounts checklist, so an item flagged with new
+            # accounts gets it whatever the client asked for: the door
+            # that prompt opens must be able to share them, from every
+            # client including builds already installed.
+            if (row["webhook_status"] or "") == "new_accounts":
+                manage_accounts = True
         else:
             # hosted soft-cap on connected institutions — only the
             # ADD door; update/re-auth of an existing item is always allowed
             sync_base.check_institution_cap(conn)
+        # While a credential rotation's bank-link hold stands, the
+        # household's own Plaid client may be one a hijacker saved: a new
+        # link AND a re-auth would both hand it the bank login typed into
+        # Link, so both modes are refused (ValueError: a 400 for JSON
+        # callers, the redirect message for form callers)
+        from ..notify import outbound_pause
+        outbound_pause.refuse_if_held(budget.load_config(conn), "plaid")
         client = plaid.Client.for_tenant(conn)
         created = client.create_hosted_link(
             str(user["tenant_id"]), client_name="Oikonome",
@@ -973,7 +1144,13 @@ def _apply_account_selection(conn, client, token, item_id: str) -> None:
 def plaid_link_status(link_token: str, user: dict = Depends(_user())):
     """Polled by the link page. Completes the exchange + first sync (add)
     or verifies the item and clears its error status (update) the moment
-    Plaid reports the session finished."""
+    Plaid reports the session finished.
+
+    This GET writes the exchange and the item, so the request gate's
+    write-only credential check never sees it; the shared demonstration
+    login cannot start a link, and must not finish one an owner of the
+    same household started either."""
+    demoguard.deny_shared_credentials(user)
     sess = _plaid_session(link_token, user)
     if not sess:
         raise HTTPException(404, "unknown link session")
@@ -1075,7 +1252,14 @@ def plaid_link_status(link_token: str, user: dict = Depends(_user())):
             try:
                 item_err = client.get_item(token)["item"].get("error")
             except Exception as e:               # noqa: BLE001
-                item_err = {"error_code": str(e)[:80]}
+                # the code goes back to the page, so it is Plaid's own
+                # error code or the exception's kind — never its message,
+                # which can carry request ids and response text; the
+                # message is logged instead
+                logging.getLogger("oikonome.plaid").warning(
+                    "item check after Link failed: %s", e)
+                item_err = {"error_code": getattr(e, "code", None)
+                            or type(e).__name__}
             sess["done"] = True
             if item_err is None:
                 # A successful update-mode re-auth clears the stale
@@ -1087,11 +1271,19 @@ def plaid_link_status(link_token: str, user: dict = Depends(_user())):
                 # session was open — the same guard every other status
                 # writer carries, or a re-auth finishing late silently
                 # reverts the user's disconnect
+                # The new-accounts prompt is cleared only by a session that
+                # could have shared them — one with the checklist. Plaid
+                # does not send that webhook again, so clearing it after a
+                # plain re-auth would drop the only offer of those accounts.
+                keep_new = not sess.get("manage_accounts")
                 revived = conn.execute(
-                    "UPDATE items SET status='ok', webhook_status=NULL, "
-                    "webhook_status_at=NULL WHERE id=%s "
-                    "AND COALESCE(status,'') != 'archived'",
-                    (sess["item_id"],)).rowcount
+                    "UPDATE items SET status='ok', "
+                    "webhook_status = CASE WHEN %s AND "
+                    "webhook_status='new_accounts' THEN webhook_status END, "
+                    "webhook_status_at = CASE WHEN %s AND "
+                    "webhook_status='new_accounts' THEN webhook_status_at END "
+                    "WHERE id=%s AND COALESCE(status,'') != 'archived'",
+                    (keep_new, keep_new, sess["item_id"])).rowcount
                 if not revived:
                     item_err = {"error_code": "archived"}
                 if sess.get("manage_accounts") and item_err is None:
@@ -1155,6 +1347,7 @@ def _account_sync(user: dict, item_id: str) -> tuple[str, str]:
     if not _tenant_sync_allowed(user):
         return "limited", _SYNC_LIMITED_MSG
     outcome = "ok"
+    got = False
     conn = tenancy.tenant_connect(user["tenant_id"])
     try:
         # This door must take the per-tenant advisory lock every sibling
@@ -1187,6 +1380,13 @@ def _account_sync(user: dict, item_id: str) -> tuple[str, str]:
                    "— reconnect it to sync.")
         else:
             name = row["institution_name"] or row["id"]
+            # A pull from this button lands rows exactly as the hourly sweep
+            # would, so the household's webhooks hear about them the same
+            # way; the next sweep's own before-snapshot already holds these
+            # rows and would never name them.
+            from ..jobs import worker as _worker
+            pulls = row["aggregator"] in ("plaid", "simplefin")
+            before_ids = _worker._recent_txn_ids(conn) if pulls else None
             try:
                 if row["aggregator"] == "plaid":
                     r = plaid.sync(conn, item_id)
@@ -1198,6 +1398,9 @@ def _account_sync(user: dict, item_id: str) -> tuple[str, str]:
                             "manual product sync failed item=%s", item_id)
                     _categorize_after_pull_async(user["tenant_id"])
                     n = r["added"]
+                    _worker._webhooks_after_sync(
+                        conn, {item_id: f"ok:{n}"}, before_ids,
+                        user["tenant_id"])
                     if n:
                         msg = (f"{name} synced — {n} new transaction"
                                f"{'s' if n != 1 else ''}.")
@@ -1224,6 +1427,9 @@ def _account_sync(user: dict, item_id: str) -> tuple[str, str]:
                         conn, item_id, token,
                         since=_dt.date.today() - _dt.timedelta(days=30))
                     _categorize_after_pull_async(user["tenant_id"])
+                    _worker._webhooks_after_sync(
+                        conn, {item_id: f"ok:{r['transactions']}"},
+                        before_ids, user["tenant_id"])
                     msg = (f"{name} synced — {r['transactions']} "
                            "transactions pulled.")
                 else:
@@ -1234,13 +1440,22 @@ def _account_sync(user: dict, item_id: str) -> tuple[str, str]:
                 # browser history + access logs. Belt-and-suspenders with the
                 # source-side _url_auth redaction in simplefin.
                 clean = sync_base.redact_url_credentials(str(e)) or ""
+                if pulls:
+                    _worker._webhooks_after_sync(
+                        conn, {item_id: f"error:{type(e).__name__}"},
+                        before_ids, user["tenant_id"])
                 outcome = "failed"
                 msg = f"{name} sync failed: {clean[:160]}"
     finally:
         # explicit unlock: the connection is pooled, and a session-level
         # advisory lock survives a return-to-pool; a failed unlock drops
         # the connection instead (tenancy.release_lock)
-        tenancy.release_lock(conn, f"oikonome:sync:{user['tenant_id']}")
+        if got and not tenancy.release_lock(
+                conn, f"oikonome:sync:{user['tenant_id']}"):
+            # this pull covered one item; a full sync turned away while it
+            # ran asked for every other one
+            from ..jobs.worker import answer_sync_nudge
+            answer_sync_nudge(conn, user["tenant_id"])
         conn.close()
     return outcome, msg
 
@@ -1474,6 +1689,29 @@ def import_page(user: dict = Depends(_user()), msg: str = ""):
 # CSV files awaiting a manual column mapping (auto-detect failed). Staged
 # in the tenant-bound import_staging table so any worker can
 # finish the mapping a different worker started.
+def upload_text(data: bytes) -> str:
+    """Decode an uploaded text file (CSV, QIF) for the importers.
+
+    UTF-8 is the norm, but spreadsheet "Unicode text" exports are UTF-16
+    with a byte-order mark; read as UTF-8 they turn into text full of NUL
+    characters, which PostgreSQL cannot store, so they are decoded by their
+    mark instead. A file that still holds a NUL after decoding is not text
+    this importer can store: refuse it with a reason (a ValueError, the
+    importers' user-facing refusal) rather than failing at the first
+    insert."""
+    import codecs
+    if data.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+        text = data.decode("utf-32", errors="replace")
+    elif data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        text = data.decode("utf-16", errors="replace")
+    else:
+        text = data.decode("utf-8-sig", errors="replace")
+    if "\x00" in text:
+        raise ValueError("this file contains NUL characters, so it isn't "
+                         "plain text — export it again as a UTF-8 CSV")
+    return text
+
+
 def _stash_csv(conn, account_id: str, amount_sign: str, filename: str,
                text: str, header: list[str]) -> str:
     from ..db import staging
@@ -1544,8 +1782,12 @@ async def read_capped(file, cap: int = MAX_UPLOAD) -> bytes | None:
 # whole multipart body and is the SMALLER of the two — it has to move with
 # this number, or the request is refused before the handler sees a byte.
 RESTORE_MAX_UPLOAD = 500 * 1024 * 1024
-RESTORE_OVERSIZE_MSG = ("archive is larger than 500 MB — restore it on the "
-                        "host with ./oikonome.sh restore instead")
+# The in-app restore is the only door an export ZIP restores through (the
+# host's restore command takes database dumps, not this archive), so the
+# refusal names that door's limit rather than sending anyone elsewhere.
+RESTORE_OVERSIZE_MSG = ("archive is larger than the 500 MB the restore takes "
+                        "(Import, with the export ZIP on its own) — see "
+                        "the import guide's limits for what fills an export")
 
 
 async def read_restore_capped(file, cap: int = RESTORE_MAX_UPLOAD):
@@ -1613,10 +1855,17 @@ def restore_result(counts: dict) -> dict:
 
 def _dispatch_import_unlocked(conn, account_id: str, amount_sign: str,
                               filename: str, data: bytes,
-                              role: str = "") -> tuple[dict, dict | None]:
+                              role: str = "", ynab_choice: bool = False
+                              ) -> tuple[dict, dict | None]:
     """One import dispatch for BOTH the Jinja route and /api/import.
     Returns (result, mapping_needed). Errors come back in result["error"]
-    — never raises, except the two authorization refusals below.
+    — never raises, except the authorization refusals below.
+
+    `ynab_choice` is a client saying it can ask the person where each
+    account of a multi-account YNAB register goes: such a register is
+    then parked and answered with the accounts to place. Every other
+    caller — an older app, the no-JS page, a folder import — gets a
+    refusal naming the accounts, and nothing is written.
 
     `role` is the caller's household role. It decides one thing: a `.zip`
     is a whole-ledger RESTORE, which is owner-only. It defaults to the
@@ -1681,7 +1930,7 @@ def _dispatch_import_unlocked(conn, account_id: str, amount_sign: str,
                                 + (f" (confidence {conf:.0%})"
                                    if conf is not None else ""))
         elif name.endswith(".qif"):
-            text = data.decode("utf-8-sig", errors="replace")
+            text = upload_text(data)
             bid = batches.create(conn, "qif", account_id, filename)
             result = qifimport.import_qif(conn, account_id, text,
                                           batch_id=bid)
@@ -1691,7 +1940,7 @@ def _dispatch_import_unlocked(conn, account_id: str, amount_sign: str,
                     "PDF statement conventions (card / bank statement) "
                     "apply to PDFs — for a CSV pick bank or positive=out "
                     "CSV, or investment for brokerage activity CSVs")
-            text = data.decode("utf-8-sig", errors="replace")
+            text = upload_text(data)
             header = next(csvmod.reader(io.StringIO(text)), [])
             from ..sync import plan_csv as _plan
             # Never auto-import a workplace-plan CSV here: the generic path
@@ -1719,6 +1968,11 @@ def _dispatch_import_unlocked(conn, account_id: str, amount_sign: str,
             ]
             for looks, src, imp, label in detected:
                 if looks(header):
+                    if src == "ynab":
+                        need = _ynab_accounts_needed(
+                            conn, account_id, filename, text, ynab_choice)
+                        if need is not None:
+                            return {}, need
                     bid = batches.create(conn, src, account_id, filename)
                     result = imp(conn, account_id, text, batch_id=bid)
                     result["source"] = label
@@ -1745,6 +1999,11 @@ def _dispatch_import_unlocked(conn, account_id: str, amount_sign: str,
                     amount_sign=amount_sign, batch_id=bid)
         if bid is not None and "imported" in result:
             batches.finish(conn, bid, result["imported"])
+    except _TokenRefused as e:
+        # an authorization refusal, so a 403 — raised here, past the
+        # catch-alls below, which would turn it into an import error
+        batches.discard(conn, bid)
+        raise HTTPException(403, str(e))
     except ValueError as e:                   # deliberate importer guidance
         # wrong file type, missing account, card-convention hint … — meant for
         # the user, show it verbatim (these are NOT internal errors).
@@ -1760,6 +2019,43 @@ def _dispatch_import_unlocked(conn, account_id: str, amount_sign: str,
         batches.discard(conn, bid)
         result = {"error": f"import failed ({type(e).__name__})"}
     return result, None
+
+
+class _TokenRefused(Exception):
+    """A script token pushed a file it may not import; the dispatcher
+    answers 403."""
+
+
+def _ynab_accounts_needed(conn, account_id: str, filename: str, text: str,
+                          ynab_choice: bool) -> dict | None:
+    """None for a YNAB register of one account (it imports into the pick
+    as it always has); for a register of several, the accounts the person
+    must place, with the file parked under a claim token.
+
+    Nothing about a destination is guessed here — not from a YNAB account
+    name, not from an id that happens to exist somewhere — so a door that
+    cannot ask gets a refusal: a script token, whose collector could only
+    have meant one account (403), and a client that does not say it can
+    ask (an older app, the no-JS page, a folder import)."""
+    from ..db import staging
+    from ..sync import heartbeat
+    lines = ynabimport.parse(text)
+    names = ynabimport.account_names(lines)
+    if len(names) <= 1:
+        return None
+    if heartbeat.PUSH_VIA.get() == "token":
+        raise _TokenRefused(
+            "script tokens cannot import a YNAB register of several "
+            "accounts — export one account at a time")
+    if not ynab_choice:
+        raise ValueError(ynabimport.multi_account_refusal(names))
+    token = staging.put(conn, "ynab",
+                        files=[(filename or "register.csv",
+                                text.encode("utf-8"))],
+                        meta={"account_id": account_id})
+    return {"kind": "ynab_accounts", "token": token,
+            "filename": filename, "pick": account_id,
+            "accounts": ynabimport.summary(conn, lines, account_id)}
 
 
 def dispatch_import(conn, account_id: str, amount_sign: str,
@@ -1782,7 +2078,8 @@ def dispatch_import(conn, account_id: str, amount_sign: str,
                                          filename, data, role=role)
 
 
-def _mapping_retry(conn, stash: dict, message: str) -> dict:
+def _mapping_retry(conn, stash: dict, message: str,
+                   kind: str = "csv") -> dict:
     """A refusal the person can act on WITHOUT re-uploading the file.
 
     The mapping card exists because a column mapping was guessed wrong, and
@@ -1807,7 +2104,7 @@ def _mapping_retry(conn, stash: dict, message: str) -> dict:
     """
     from ..db import staging
     try:
-        fresh = staging.put(conn, "csv", stash["files"], stash["meta"])
+        fresh = staging.put(conn, kind, stash["files"], stash["meta"])
     except Exception:                          # noqa: BLE001 — budget, DB…
         import logging
         logging.getLogger("oikonome.import").exception("re-stash failed")
@@ -1933,6 +2230,136 @@ def _run_mapped_import_unlocked(conn, token: str, cols: dict) -> dict:
                 "expired": True}
 
 
+def run_ynab_import(conn, token: str, accounts, remove_earlier) -> dict:
+    """`_run_ynab_import_unlocked` under the per-tenant sync lock, like
+    every import that writes rows (see dispatch_import). A held lock is
+    refusal shape 1: nothing consumed, resubmit as-is."""
+    from ..sync.base import tenant_sync_lock
+    tid = conn.execute(
+        "SELECT current_setting('app.tenant_id', true) AS t").fetchone()["t"]
+    with tenant_sync_lock(conn, tid) as held:
+        if not held:
+            return {"error": "a sync is running for this household — try "
+                             "the import again in a moment"}
+        return _run_ynab_import_unlocked(conn, token, accounts,
+                                         remove_earlier)
+
+
+def _ynab_answers(conn, names: list[str], accounts, remove_earlier
+                  ) -> tuple[dict, str | None]:
+    """The person's answer for each YNAB account, checked: (answers,
+    refusal). An answer is an existing visible account id, "skip", or
+    {"new": "<name>"}. Every account must be answered, and something must
+    be imported."""
+    if not isinstance(accounts, dict):
+        return {}, "accounts must map each YNAB account to a destination"
+    if remove_earlier is not None and not isinstance(remove_earlier, dict):
+        return {}, "remove_earlier must map YNAB accounts to true or false"
+    missing = [n for n in names if n not in accounts]
+    if missing:
+        return {}, ("choose where these YNAB accounts go: "
+                    + ", ".join(ynabimport.label(n) for n in missing))
+    answers: dict = {}
+    ids: set[str] = set()
+    for n in names:
+        a = accounts[n]
+        if a == "skip":
+            answers[n] = ("skip",)
+        elif isinstance(a, dict) and isinstance(a.get("new"), str) \
+                and a["new"].strip():
+            answers[n] = ("new", a["new"].strip()[:120])
+        elif isinstance(a, str) and a:
+            answers[n] = ("id", a)
+            ids.add(a)
+        else:
+            return {}, (f"choose where “{ynabimport.label(n)}” goes: an "
+                        f"account, a new account, or skip")
+    if all(v[0] == "skip" for v in answers.values()):
+        return {}, ("every YNAB account is skipped — choose where at least "
+                    "one goes")
+    if ids:
+        # a hidden account is not a destination: upsert_transactions
+        # refuses its rows, and the import would land nothing
+        have = {r["id"] for r in conn.execute(
+            "SELECT id FROM accounts WHERE id = ANY(%s)"
+            "   AND user_removed_at IS NULL", (sorted(ids),)).fetchall()}
+        bad = [n for n, v in answers.items() if v[0] == "id"
+               and v[1] not in have]
+        if bad:
+            return {}, ("not an account you can import into: "
+                        + ", ".join(ynabimport.label(n) for n in bad)
+                        + " — choose another destination")
+    return answers, None
+
+
+def _run_ynab_import_unlocked(conn, token: str, accounts,
+                              remove_earlier) -> dict:
+    """Finish a parked multi-account YNAB register with the person's answer
+    for each YNAB account. The refusal shapes are the mapped CSV's
+    (see _run_mapped_import_unlocked), and every check that can refuse
+    without writing runs BEFORE the upload is consumed, so the card keeps
+    a token that still works."""
+    from ..db import staging
+    from ..sync import heartbeat
+    if not isinstance(token, str):
+        return {"error": "token must be a string"}
+    if heartbeat.PUSH_VIA.get() == "token":
+        raise HTTPException(403, "script tokens cannot import a YNAB "
+                                 "register of several accounts")
+    stash = staging.peek(conn, "ynab", token)
+    if stash is None:
+        return {"error": "upload expired — please upload the file again",
+                "expired": True}
+    meta = stash["meta"] or {}
+    pick = meta.get("account_id") or ""
+    filename, raw_text = stash["files"][0]
+    text = bytes(raw_text).decode("utf-8", errors="replace")
+    try:
+        names = ynabimport.account_names(ynabimport.parse(text))
+    except ValueError as e:
+        return {"error": str(e)}
+    answers, refusal = _ynab_answers(conn, names, accounts, remove_earlier)
+    if refusal:
+        return {"error": refusal}
+    stash = staging.pop(conn, "ynab", token)       # destroy the upload
+    if stash is None:                              # spent between the two
+        return {"error": "upload expired — please upload the file again",
+                "expired": True}
+    from .bulk_import import _ensure_account
+    bid = None
+    try:
+        dest: dict[str, str | None] = {}
+        for n, v in answers.items():
+            if v[0] == "new":
+                dest[n] = _ensure_account(conn, v[1], "bank")
+            else:
+                dest[n] = v[1] if v[0] == "id" else None
+        places = {d for d in dest.values() if d}
+        bid = batches.create(conn, "ynab",
+                             next(iter(places)) if len(places) == 1
+                             else None, filename)
+        result = ynabimport.import_ynab(
+            conn, pick, text, batch_id=bid, accounts=dest,
+            remove_earlier={n: (remove_earlier or {}).get(n) is True
+                            for n in names})
+        batches.finish(conn, bid, result["imported"])
+        result["source"] = "YNAB register detected"
+        return result
+    except ValueError as e:                   # deliberate importer guidance
+        # the importer parses and checks every line before it writes one,
+        # so a refusal here changed nothing: park the upload again and let
+        # the card answer against the new token
+        batches.discard(conn, bid)
+        return _mapping_retry(conn, stash, str(e), kind="ynab")
+    except Exception as e:                     # noqa: BLE001 — UNEXPECTED
+        import logging
+        logging.getLogger("oikonome.import").exception(
+            "YNAB register import failed")
+        return {"error": f"import failed ({type(e).__name__}) — upload the "
+                         f"file again to retry",
+                "expired": True}
+
+
 # The no-JS form door is the same 50 MB upload as the API hub next to it,
 # and an expensive door without a limiter is a door an attacker walks
 # through — same budget, so switching flavors buys them nothing.
@@ -1960,6 +2387,10 @@ async def import_submit(user: dict = Depends(_user()),
         # refuse once started — both before a byte is spooled
         if not permissions.may_restore(user["role"]):
             raise HTTPException(403, permissions.RESTORE_DENIED)
+        # the shared demonstration login's step-up proves nothing (its
+        # password is handed out), so the endpoints an archive carries are
+        # refused to it here as the Settings save refuses them
+        demoguard.deny_shared_grant(user)
         from .app import _require_elevation
         _require_elevation(user, password=password, totp_code=totp_code,
                            recovery_code=recovery_code)
@@ -2068,11 +2499,27 @@ def import_mapped(user: dict = Depends(_user()), token: str = Form(...),
 
 
 @router.post("/import/rollback")
-def import_rollback(user: dict = Depends(_user()), batch_id: str = Form(...)):
+def import_rollback(user: dict = Depends(_user()), batch_id: str = Form(...),
+                    force_kept: str = Form("")):
     demoguard.deny(user)
+    from ..sync.base import SyncRunning
+    # the same contract as /api/import/rollback: rows held only by a note
+    # naming no feed account are deleted only on the owner's literal
+    # force_kept=true; otherwise the undo changes nothing and says how many
+    force = force_kept == "true"
+    if force and (user.get("role") != "owner" or user.get("script_token")):
+        raise HTTPException(403, "owner only")
     conn = tenancy.tenant_connect(user["tenant_id"])
     try:
-        n = batches.rollback(conn, batch_id)
+        n = batches.rollback(conn, batch_id, force_kept=force,
+                             ask_first=not force)
+    except batches.KeptRowsUnconfirmed as e:
+        from .api import kept_rows_refusal
+        return kept_rows_refusal(user, e)
+    except (SyncRunning, batches.ArchivedBusinessRows) as e:
+        # nothing was deleted: say so on the page, like the other refusals
+        return RedirectResponse(f"/import?msg={quote(str(e))}",
+                                status_code=303)
     finally:
         conn.close()
     msg = f"{int(n)} rows removed."

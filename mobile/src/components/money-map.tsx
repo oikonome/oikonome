@@ -118,7 +118,9 @@ export function planRows(
   if (opts.fixedBudget !== undefined || opts.fixedActual !== undefined) {
     const posted = opts.fixedActual ?? 0;
     rows.push({
-      label: "Bills", judged: false, actual: posted,
+      // the row opens the period's bill payments and envelope swipes —
+      // the rows the fixed bucket owns — like the variable rows do
+      label: "Bills", judged: false, actual: posted, to: ledger("fixed"),
       expected: buckets.fixed?.expected ?? 0,
       budget: opts.fixedBudget ?? buckets.fixed?.month_budget ?? 0,
       pending: opts.fixedPending,

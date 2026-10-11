@@ -13,11 +13,22 @@ already requires). Menu:
 5) Restore from backup — list dumps (date+size), pick one, CONFIRM-GATED
    (type 'restore'): stack up if needed, drop+recreate db from dump,
    migrate, health-check
-6) Reset — CONFIRM-GATED (type 'reset'): stack down, delete ./data,
-   reinstall → fresh setup wizard (secrets regenerate)
-7) Uninstall — delegates to uninstall.sh (type 'delete')
+6) Reset — CONFIRM-GATED (type 'reset'): checks the master key first
+   (nothing is touched if docker/.env's value is not a key), saves it
+   beside the backups, releases bank links, stack down, deletes ./data —
+   or, on an external database, drops and recreates that database —
+   then reinstalls → fresh setup wizard. The generated secrets (database
+   and queue passwords, setup token) regenerate; every other docker/.env
+   setting is carried into the reinstall through the environment
+   (OIKONOME_RESET_SETTINGS), and the key through OIKONOME_KEEP_MASTER_KEY
+   unless `--new-key`.
+7) Uninstall — delegates to uninstall.sh (type the instance name).
+   Releases bank links when the database goes with the folder; a
+   database that outlives it (OIKONOME_DATA_DIR outside the folder, or an
+   external database, which uninstall never drops) keeps its links, and
+   its docker/.env is saved owner-only before anything is removed.
 
-Non-interactive: `./oikonome.sh <install|status|logs|backup|restore <file>|reset|uninstall>`
+Non-interactive: `./oikonome.sh <install|status|logs|backup|restore <file>|reset|uninstall|start-at-boot>`
 also works (CI/scripts). install.sh and uninstall.sh remain as thin
 wrappers/back-compat entry points. Docs: quickstart switches its primary
 instructions use ./oikonome.sh.

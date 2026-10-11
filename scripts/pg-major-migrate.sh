@@ -28,11 +28,16 @@ set -euo pipefail
 # (postgres refuses to start on a group/world-accessible one).
 umask 077
 ROOT=${1:?install dir}
+# where this script's helpers are, resolved before the cd below
+SCRIPTS=$(cd "$(dirname "$0")" && pwd)
 cd "$ROOT/docker"
 say()  { printf "  %s\n" "$*"; }
 die()  { printf "  ERROR: %s\n" "$*" >&2; exit 1; }
+# dotenv_get / data_dir_resolve / pg_data_version: .env read the way
+# compose reads it, so this looks at the folder postgres actually mounts
+. "$SCRIPTS/env-file.sh"
 
-grep -q "^COMPOSE_FILE=.*external-db" .env 2>/dev/null && exit 0
+case $(dotenv_get .env COMPOSE_FILE) in *external-db*) exit 0 ;; esac
 
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
   ENGINE=docker; COMPOSE="docker compose"
@@ -42,24 +47,52 @@ else
   ENGINE=podman; COMPOSE="podman-compose"
 fi
 # rootless podman maps host uid to the container's postgres uid via
-# compose.override.yaml; a sudo-less docker host owns the folder as root
+# compose.override.yaml; on rootful docker the folder belongs to the
+# container's uid. A passwordless sudo is used when there is one; without
+# it the moves below still work (they rename entries of the parent folder,
+# which the operator owns), and the version is read through a container.
 SUDO=""
-[ "$ENGINE" = docker ] && [ "$(id -u)" != 0 ] && command -v sudo >/dev/null && SUDO="sudo -n"
+[ "$ENGINE" = docker ] && [ "$(id -u)" != 0 ] && command -v sudo >/dev/null \
+  && sudo -n true 2>/dev/null && SUDO="sudo -n"
 
-DATA_DIR=$(grep "^OIKONOME_DATA_DIR=" .env 2>/dev/null | cut -d= -f2- || true)
-DATA_DIR=${DATA_DIR:-../data/postgres}
-case $DATA_DIR in /*) ABS_DATA=$DATA_DIR ;; *) ABS_DATA="$PWD/$DATA_DIR" ;; esac
-ABS_DATA=$(python3 -c 'import os,sys; print(os.path.normpath(sys.argv[1]))' "$ABS_DATA" 2>/dev/null || echo "$ABS_DATA")
+ABS_DATA=$(data_dir_resolve "$PWD" ../data/postgres)
 
 WANT=$(grep -oE 'image: docker.io/library/postgres:[0-9]+' compose.yaml | head -1 | grep -oE '[0-9]+$')
-HAVE=$($SUDO cat "$ABS_DATA/PG_VERSION" 2>/dev/null || true)
-[ -n "$WANT" ] && [ -n "$HAVE" ] || exit 0
+[ -n "$WANT" ] || exit 0
+# "No cluster here" (a fresh install) and "a cluster this user cannot read"
+# are different answers: the second must stop the upgrade, because starting
+# the new major on an old folder leaves postgres crash-looping.
+rc=0
+HAVE=$(pg_data_version "$ABS_DATA" "$ENGINE" "docker.io/library/postgres:${WANT}-alpine") || rc=$?
+if [ "$rc" -ne 0 ]; then
+  die "can't read which Postgres version wrote $ABS_DATA (its files belong to the database container and a probe container could not read them either) — nothing was changed. Check that $ENGINE can run containers, or re-run the upgrade as root."
+fi
+[ -n "$HAVE" ] || exit 0
 [ "$HAVE" != "$WANT" ] || exit 0
+
+# The maintenance lock every whole-database operation shares (backup.sh,
+# restore, reset, uninstall). Without it a scheduled backup can connect
+# during the reload: the reload's DROP DATABASE then fails on the open
+# connection and stops the upgrade, or the backup dumps a half-loaded
+# database that passes every check and becomes the newest "good" backup.
+# Taken only when there is a migration to run, so an ordinary upgrade
+# never waits on a backup. A caller that already holds it (oikonome.sh's
+# maint_lock) says so in OIKONOME_MAINT_LOCK_HELD — re-opening the file
+# here would wait on that caller's own lock.
+ROOT_ABS=$(cd "$ROOT" && pwd)
+if [ "${OIKONOME_MAINT_LOCK_HELD:-}" != "$ROOT_ABS" ] && command -v flock >/dev/null 2>&1; then
+  exec 9>"$ROOT_ABS/.maintenance.lock"
+  flock -w "${OIKONOME_MAINT_LOCK_WAIT:-600}" 9 \
+    || die "a backup/restore/reset is still running on this instance — wait for it, then re-run the upgrade (nothing was changed)"
+  # say who holds it, so a backup waiting behind a long migration names
+  # the migration rather than whoever held the lock last
+  . "$SCRIPTS/maint-lock.sh"
+  maint_holder_write "$ROOT_ABS" pg-major-migrate
+  trap 'maint_holder_clear "$ROOT_ABS"' EXIT
+fi
 
 say "Database folder is Postgres $HAVE; this release runs Postgres $WANT."
 say "Migrating in place (dump with $HAVE → reload into $WANT)…"
-PGPW=$(grep "^POSTGRES_PASSWORD=" .env | cut -d= -f2-)
-[ -n "$PGPW" ] || die "POSTGRES_PASSWORD missing from docker/.env — can't open the old database"
 STAMP=$(date +%Y%m%d-%H%M%S)
 DUMP="$(dirname "$ABS_DATA")/pg${HAVE}-to-${WANT}-${STAMP}.sql"
 $COMPOSE stop >/dev/null 2>&1 || true
@@ -69,9 +102,14 @@ USERNS=""
 if [ "$ENGINE" = podman ] && [ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" = "true" ]; then
   USERNS="--userns=keep-id:uid=999,gid=999"
 fi
-$ENGINE run -d --rm --name "$MIG" $USERNS \
+# No password and no network: the entrypoint asks for POSTGRES_PASSWORD only
+# when it initialises an EMPTY folder, and every statement below runs through
+# `exec` over the container's local socket. A password on this command line
+# would sit in the client's argv, readable by every account on the host, for
+# as long as the old-major image takes to pull.
+$ENGINE run -d --rm --name "$MIG" $USERNS --network none \
   -v "$ABS_DATA:/var/lib/postgresql/data:Z" -e PGDATA=/var/lib/postgresql/data \
-  -e POSTGRES_PASSWORD="$PGPW" "docker.io/library/postgres:${HAVE}-alpine" >/dev/null \
+  "docker.io/library/postgres:${HAVE}-alpine" >/dev/null \
   || die "couldn't start postgres:$HAVE to read the old database"
 for i in $(seq 1 60); do $ENGINE exec "$MIG" pg_isready -U postgres -q 2>/dev/null && break; sleep 1; done
 # Exact per-table row counts of the oikonome database (one "table<TAB>rows"

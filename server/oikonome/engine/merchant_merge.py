@@ -905,6 +905,11 @@ def side_facts(conn, ids: list[str]) -> dict[str, dict]:
     with the offer is the ledger as it was the night the offer was made."""
     if not ids:
         return {}
+    # a linked account's non-primary sources and hidden accounts count for
+    # nothing, as in every other total: a dual-sourced card would otherwise
+    # show each side's spend twice
+    from . import links
+    shadows = links.shadow_ids(conn)
     facts: dict[str, dict] = {}
     for r in conn.execute(
             """SELECT t.merchant_id::text AS id, count(*) AS n,
@@ -920,7 +925,8 @@ def side_facts(conn, ids: list[str]) -> dict[str, dict]:
                  LEFT JOIN accounts a ON a.id = t.account_id
                 WHERE t.removed = 0 AND t.amount > 0
                   AND t.merchant_id = ANY(%s::uuid[])
-                GROUP BY 1""", (list(ids),)).fetchall():
+                  AND NOT (t.account_id = ANY(%s))
+                GROUP BY 1""", (list(ids), shadows)).fetchall():
         facts[r["id"]] = {
             "rows": r["n"], "total": round(float(r["total"] or 0), 2),
             "first": str(as_date(r["first"])) if r["first"] else None,
@@ -938,8 +944,10 @@ def side_facts(conn, ids: list[str]) -> dict[str, dict]:
                    FROM transactions t
                    LEFT JOIN accounts a ON a.id = t.account_id
                   WHERE t.removed = 0 AND t.amount > 0
-                    AND t.merchant_id = ANY(%s::uuid[])) x
-               WHERE k <= %s ORDER BY id, k""", (list(ids), RECENT_SHOWN)).fetchall():
+                    AND t.merchant_id = ANY(%s::uuid[])
+                    AND NOT (t.account_id = ANY(%s))) x
+               WHERE k <= %s ORDER BY id, k""",
+            (list(ids), shadows, RECENT_SHOWN)).fetchall():
         # The totals and the lines are two statements, so a charge ingested
         # between them puts a merchant in this answer that the first read
         # never saw. Its totals would be a year out of date anyway, so the

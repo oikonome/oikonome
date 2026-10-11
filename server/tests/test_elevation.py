@@ -36,6 +36,17 @@ def _fresh_code(secret):
     return _t.code_now(secret)
 
 
+def _spent_step(email: str) -> int:
+    """The last TOTP step this account has burnt."""
+    admin = tenancy.admin_connect()
+    try:
+        return admin.execute(
+            "SELECT totp_last_counter FROM users WHERE email = %s",
+            (email,)).fetchone()["totp_last_counter"]
+    finally:
+        admin.close()
+
+
 def _set_elevated_age(email: str, seconds: int) -> None:
     """Age every session of this user's elevation by `seconds` — the
     clock the server consults is the database's, so the window is
@@ -351,6 +362,34 @@ class ElevationWindowTests(_Base):
             "POST /api/support-access": (
                 c, "post", "/api/support-access", {"json": {"hours": 1}},
                 False),
+            # lifting an outbound pause re-opens the relay, recipients and
+            # AI endpoint a rotation paused — the same act as typing them in
+            "POST /api/settings/outbound/resume": (
+                c, "post", "/api/settings/outbound/resume", {}, False),
+            # repointing where the household's bank data goes is a
+            # step-up door like the other outbound settings
+            "POST /api/accounts/mx/keys": (
+                c, "post", "/api/accounts/mx/keys",
+                {"json": {"client_id": "c", "api_key": "k",
+                          "env": "sandbox"}}, False),
+            "POST /api/accounts/plaid/keys": (
+                c, "post", "/api/accounts/plaid/keys",
+                {"json": {"client_id": "c", "secret": "s",
+                          "env": "sandbox"}}, False),
+            # a verified SMS number receives the daily summary, and its
+            # code goes to the number being set; clearing does not step up
+            "POST /api/notify/phone": (
+                c, "post", "/api/notify/phone",
+                {"json": {"number": "+12175551234",
+                          "consent": ["summary"]}}, False),
+            # a new browser push subscription receives the household's
+            # verdicts and alerts; refreshing one already held does not
+            "POST /api/notify/push/subscribe": (
+                c, "post", "/api/notify/push/subscribe",
+                {"json": {"endpoint": "https://fcm.googleapis.com/fcm/send/"
+                                      + uuid.uuid4().hex,
+                          "keys": {"p256dh": "p" * 20, "auth": "a" * 12}}},
+                False),
             "POST /api/connections/export": (
                 c, "post", "/api/connections/export",
                 {"json": {"passphrase": "a-long-passphrase"}}, True),
@@ -589,6 +628,57 @@ class TotpAccountTests(_Base):
         r = c.post("/api/password/change", json={
             "current_password": PW, "new_password": "brand-new-passphrase"})
         self.assertEqual(r.status_code, 403, r.text)
+
+    def test_disable_resent_after_elevation_says_the_code_was_used(self):
+        """The real client sequence, with nothing reset between steps: the
+        card's code C goes to an unelevated disable (refused 403, nothing
+        burnt), the sheet elevates with the authenticator's current code
+        (burning C's step or a later one), and the client resends C. That
+        resend can never succeed, and it is not a guess: it must answer a
+        distinct "code already used" 401 and spend nothing from the
+        session's step-up budget. The next step's code then works."""
+        from oikonome.auth import totp as totp_mod
+        from oikonome.web import security
+        c, email = self._signup("totp")
+        secret = self._enroll_totp(c)
+        # enrolment burnt the current step; start the sequence clean once
+        clear_totp_burn()
+        card_code = totp_mod.code_now(secret)
+        r = c.post("/api/totp/disable", data={"code": card_code})
+        self.assertEqual(r.status_code, 403, r.text)
+        r = c.post("/api/auth/elevate", json={
+            "password": PW, "totp_code": totp_mod.code_now(secret)})
+        self.assertEqual(r.status_code, 200, r.text)
+        with mock.patch.object(self.appmod, "_step_up_factor_miss",
+                               wraps=self.appmod._step_up_factor_miss) as miss, \
+                mock.patch.object(security, "release_step_up_guess",
+                                  wraps=security.release_step_up_guess) as rel:
+            r = c.post("/api/totp/disable", data={"code": card_code})
+        self.assertEqual(r.status_code, 401, r.text)
+        self.assertTrue(r.json()["detail"].startswith("code_used:"), r.text)
+        self.assertFalse(miss.called, "a replay was charged as a guess")
+        self.assertTrue(rel.called, "the replay kept its step-up slot")
+        self.assertTrue(c.get("/api/auth/elevation").json()["totp"])
+        # a code from the step after the spent one turns it off
+        r = c.post("/api/totp/disable", data={
+            "code": totp_mod._code(secret, _spent_step(email) + 1)})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertFalse(c.get("/api/auth/elevation").json()["totp"])
+
+    def test_wrong_code_at_disable_is_still_charged_as_a_guess(self):
+        c, _ = self._signup("totp")
+        secret = self._enroll_totp(c)
+        r = c.post("/api/auth/elevate", json={
+            "password": PW, "totp_code": _fresh_code(secret)})
+        self.assertEqual(r.status_code, 200, r.text)
+        from oikonome.auth import totp as totp_mod
+        wrong = "000000" if totp_mod.code_now(secret) != "000000" else "111111"
+        with mock.patch.object(self.appmod, "_step_up_factor_miss",
+                               wraps=self.appmod._step_up_factor_miss) as miss:
+            r = c.post("/api/totp/disable", data={"code": wrong})
+        self.assertEqual(r.status_code, 401, r.text)
+        self.assertEqual(r.json()["detail"], "bad one-time code")
+        self.assertTrue(miss.called)
 
     def test_totp_disable_unelevated_still_needs_password_and_code(self):
         c, _ = self._signup("totp")

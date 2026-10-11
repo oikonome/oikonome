@@ -106,6 +106,25 @@ optional starting balance — progress is measured from the ledger, not
 self-reported. A goal can carry a target amount and date; pace projects
 from your trailing three months of actual contributions.
 
+A goal with **no account (plan only)** is not measured: its monthly plan
+still lowers excess cash and rides the forecast (the forecast always
+treats it as still owed), but it shows no progress. Match words need an
+account. On their own they would match both sides of every transfer, the
+money arriving in savings and the money leaving checking, and nothing
+says which side is the fund. So a goal with match words and no account
+cannot be saved (the account picker labels the empty choice *no
+account (plan only)*); pick the account the money lands in, or clear the
+words. A goal already stored with match words and no account keeps its
+plan, can be saved unchanged, and shows "match words need an account" on
+Today and here until you pick one.
+
+A goal whose destination is a **business** account belongs to that
+business: its progress counts the business's own money in that account,
+and its monthly plan does not come out of the household plan surplus,
+the household forecast or the sweep line (unless the combined
+household-and-business view is on, where the household figures include
+the businesses anyway).
+
 Each goal has a **contribution mode**:
 
 - **every month (fixed plan)** — the default. The plan is a commitment:

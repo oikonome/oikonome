@@ -13,17 +13,18 @@ import { Alert, Image, KeyboardAvoidingView, Modal, Platform, Pressable,
 import PullRefresh from "../../components/pull-refresh";
 
 import StaleBanner from "../../components/stale-banner";
-import { Card, H, HelpLink, KV, Pill } from "../../components/ui";
-import { Account, AccountRemoveMode, countsInTotals, linkCardVisible }
-  from "../../lib/api";
+import { Card, H, HelpLink, KV, Pill, SharedLock } from "../../components/ui";
+import { Account, AccountRemoveMode, countsInTotals, errText,
+         linkCardVisible } from "../../lib/api";
 import { patchList, patchQuery, removeFromList } from "../../lib/cache";
 import { plaidHostedLink } from "../../lib/plaid";
 import { ago } from "../../lib/dates";
-import { accountRemoveMoved, hueOf, institutionAllowance, lastSyncPhrase,
-         listPhase, monogram, signedBalance } from "../../lib/pure";
+import { accountRemoveMoved, accountRemoveNote, hueOf, keptRowsQuestion, institutionAllowance, lastSyncPhrase,
+         listPhase, monogram, purgeKeptRows, signedBalance, classifyChange }
+  from "../../lib/pure";
 import { useLogosOn } from "../../components/merchant-avatar";
 import { useSession } from "../../lib/session";
-import { useMe, useOwner, useViewer } from "../../lib/viewer";
+import { useMe, useOwner, useSharedLock, useViewer } from "../../lib/viewer";
 import { C, money } from "../../lib/theme";
 import { LogoSpinner } from "../../components/logo-spinner";
 
@@ -157,6 +158,9 @@ export default function Accounts() {
   // Self-host keeps both: there it is the owner's call. The web Accounts
   // card applies the same gate.
   const me = useMe();
+  // every connect door plants a credential that outlives the shared
+  // demonstration login, so the server refuses it; the buttons say so
+  const credentialLock = useSharedLock("credential");
   const hosted = !!me.data?.hosted;
   // the web header's sync chip, brought to where the connections live
   const status = useQuery({
@@ -200,13 +204,15 @@ export default function Accounts() {
     queryFn: () => client!.accountLinks(),
     enabled: !!client && !viewer, staleTime: 5 * 60_000,
   });
-  const plaid = async (itemId = "") => {
+  // `manage` opens Link's account checklist, which update mode needs
+  // before it offers accounts opened at the bank since the link
+  const plaid = async (itemId = "", manage = false) => {
     setPlaidBusy(true);
     setNotice("Finish signing in at your bank…");
     let changed = true;
     let added = false;
     try {
-      const s0 = await plaidHostedLink(client!, itemId);
+      const s0 = await plaidHostedLink(client!, itemId, manage);
       if (s0.kind === "exited" || s0.kind === "cancelled") {
         // backing out is normal, never red — and nothing changed
         setNotice("No change — the sign-in window was closed.");
@@ -215,7 +221,7 @@ export default function Accounts() {
         setNotice(`Link failed: ${s0.error ?? "unknown"}`, true);
       else if (s0.kind === "update") setNotice("Reconnected.");
       else { setNotice(`Linked ${s0.institution || "bank"} ✓`); added = true; }
-    } catch (e) { setNotice(String(e), true); }
+    } catch (e) { setNotice(errText(e), true); }
     setPlaidBusy(false);
     if (!changed) return;
     qc.invalidateQueries({ queryKey: ["connections"] });
@@ -240,7 +246,7 @@ export default function Accounts() {
       qc.invalidateQueries({ queryKey: ["me"] });
       qc.invalidateQueries({ queryKey: ["accounts"] });
     },
-    onError: (e) => setNotice(String(e), true),
+    onError: (e) => setNotice(errText(e), true),
   });
   // in-flight per INSTITUTION — one mutation object's isPending is
   // global, which spun every row's ↻ and dropped a tap on bank B while
@@ -264,7 +270,7 @@ export default function Accounts() {
     },
     // a refused or failed sync (rate limit, bank down, offline) must say
     // so — otherwise the spinner just stops, which reads as "synced"
-    onError: (e) => setNotice(String(e).replace(/^\d+:\s*/, ""), true),
+    onError: (e) => setNotice(errText(e), true),
   });
   // `id` names the row the tap belongs to (a suggestion key or a group
   // id) so only that row shows pending; `drop` is a suggestion key that
@@ -294,7 +300,7 @@ export default function Accounts() {
     onError: (e) => {
       // overlapping suggestions go stale after one is linked — surface
       // the message AND refetch so dead pairs drop out
-      setNotice(String(e).replace(/^\d+:\s*/, ""), true);
+      setNotice(errText(e), true);
       qc.invalidateQueries({ queryKey: ["account-links"] });
     },
   });
@@ -331,9 +337,9 @@ export default function Accounts() {
       const revert = !trimmed || trimmed === a.bank_name;
       if ((revert ? a.bank_name || a.name : trimmed) !== a.name)
         writes.push(client!.accountRename(a.id, revert ? "" : trimmed));
-      if (f.kind !== a.kind || f.primary !== (a.id === primary))
-        writes.push(client!.accountClassify(a.id, f.kind, f.primary));
-      if (f.excl !== excludedSet.has(a.id))
+      const cls = classifyChange(a.kind, f.kind, f.primary);
+      if (cls) writes.push(client!.accountClassify(a.id, cls.kind, cls.primary));
+      if (f.excl !== null)
         writes.push(client!.accountExclude(a.id, f.excl));
       if (f.owner.trim() !== (a.owner ?? ""))
         writes.push(client!.accountOwner(a.id, f.owner.trim()));
@@ -361,10 +367,10 @@ export default function Accounts() {
       // patched into ["settings"], the one cache of GET /api/settings,
       // so a primary/exclusion change is visible to every settings reader
       const newSettingsAccts = {
-        checking_account_id: f.primary ? a.id
-          : wasPrimary ? null : primary,
-        excluded_accounts: f.excl
-          ? [...new Set([...excludedSet, a.id])]
+        checking_account_id: f.primary === null ? primary
+          : f.primary ? a.id : wasPrimary ? null : primary,
+        excluded_accounts: f.excl === null ? [...excludedSet]
+          : f.excl ? [...new Set([...excludedSet, a.id])]
           : [...excludedSet].filter((id) => id !== a.id),
       };
       patchQuery(qc, ["settings"], newSettingsAccts);
@@ -373,7 +379,8 @@ export default function Accounts() {
       // only the forecast anchor, the budget exclusion, a balance and
       // the kind (income detection and the card-payment forecast key on
       // it) move the verdict; a rename or a new owner cannot
-      if (f.primary !== wasPrimary || f.excl !== wasExcl || balChanged
+      if ((f.primary !== null && f.primary !== wasPrimary)
+          || (f.excl !== null && f.excl !== wasExcl) || balChanged
           || f.kind !== a.kind)
         qc.invalidateQueries({ queryKey: ["today"], refetchType: "none" });
     },
@@ -393,6 +400,24 @@ export default function Accounts() {
       qc.invalidateQueries({ queryKey: ["today"], refetchType: "none" });
       qc.invalidateQueries({ queryKey: ["transactions"], refetchType: "none" });
     },
+  });
+  // A disconnected MX bank is still alive at MX, so it comes back on the
+  // owner's word rather than through a new link; the server marks how far
+  // back the next sync has to reach.
+  const reconnect = useMutation({
+    mutationFn: (a: Account) => client!.connectionReconnect(a.item_id!),
+    onSuccess: (_r, a) => {
+      patchList<{ accounts: Account[] }, Account>(qc, ["accounts"],
+        "accounts", (x) => x.item_id === a.item_id, { status: "ok" });
+      setEditing(null);
+      setNotice(`${a.institution_name || "The bank"} is reconnected — the `
+                + "next sync also brings in what arrived while it was "
+                + "disconnected.");
+      qc.invalidateQueries({ queryKey: ["accounts"] });
+      qc.invalidateQueries({ queryKey: ["connections"] });
+      qc.invalidateQueries({ queryKey: ["me"] });
+    },
+    onError: (e) => setNotice(errText(e), true),
   });
   const confirmHide = () => {
     const a = editing!;
@@ -415,13 +440,17 @@ export default function Accounts() {
   // the remove sheet opens once it has gone.
   const removeAfterEdit = useRef<Account | null>(null);
   const remove = useMutation({
-    mutationFn: () => client!.accountRemove(removing!.id, rmMode),
+    mutationFn: (forceKept: boolean = false) =>
+      client!.accountRemove(removing!.id, rmMode, forceKept),
     onSuccess: (r) => {
       // the server names every account the mode touched: purged rows
       // leave the list now, a hidden one moves pile now; a plain
       // disconnect keeps its rows (only their status changes)
       const hit = new Set(r.affected_accounts ?? [removing!.id]);
-      if (rmMode === "purge" || rmMode === "disconnect_purge")
+      // a purge that kept rows keeps their account too; the refetch
+      // below says which
+      if ((rmMode === "purge" || rmMode === "disconnect_purge")
+          && !purgeKeptRows(r))
         removeFromList<{ accounts: Account[] }, Account>(qc, ["accounts"],
           "accounts", (x) => hit.has(x.id));
       else if (rmMode === "hide")
@@ -429,15 +458,26 @@ export default function Accounts() {
           "accounts", (x) => hit.has(x.id),
           { user_removed_at: new Date().toISOString() });
       setRemoving(null); setEditing(null);
-      setNotice((r.note || "Removed.")
-        + (r.plaid_released ? " Plaid connection released." : ""));
+      setNotice(accountRemoveNote(r));
       // One list, so the mode decides the keys in one place and the web
       // decides them the same way (pure.ts `accountRemoveMoved`). The
       // allowance on /api/me is exactly the thing a disconnect frees.
       for (const k of accountRemoveMoved(rmMode))
         qc.invalidateQueries({ queryKey: [k] });
     },
-    onError: (e) => setNotice(String(e).replace(/^\d+:\s*/, ""), true),
+    onError: (e) => {
+      // rows only a note naming no feed account keeps: the server asks
+      // before deleting them, and the answer re-sends the same removal
+      const q = keptRowsQuestion(e);
+      if (q) {
+        Alert.alert("Delete anyway?", q,
+          [{ text: "Delete anyway", style: "destructive",
+             onPress: () => remove.mutate(true) },
+           { text: "Cancel", style: "cancel" }]);
+        return;
+      }
+      setNotice(errText(e), true);
+    },
   });
   const isPullAgg = (a: Account) =>
     ["plaid", "mx", "simplefin", "simplefin-org"]
@@ -455,7 +495,7 @@ export default function Accounts() {
           : `Hide ${a.name} from active accounts?`;
     Alert.alert("Remove account", text,
       [{ text: "Confirm remove", style: "destructive",
-         onPress: () => remove.mutate() },
+         onPress: () => remove.mutate(false) },
        { text: "Cancel", style: "cancel" }]);
   };
   const add = useMutation({
@@ -603,19 +643,21 @@ export default function Accounts() {
             // closes at the plan's cap, like the web's ConnectCard: the
             // server refuses past it anyway, but on the hosted link path
             // that refusal can land after the bank was authorized
-            <Pressable style={[s.syncBtn, (plaidBusy || instFull)
-                                          && { opacity: 0.5 }]}
-                       disabled={plaidBusy || instFull}
-                       onPress={() => plaid()}>
-              <Text style={s.syncText}>
-                {plaidBusy ? "Connecting…" : "＋ Connect account ↗"}
-              </Text>
-            </Pressable>
+            <SharedLock note={credentialLock}>
+              <Pressable style={[s.syncBtn, (plaidBusy || instFull)
+                                            && { opacity: 0.5 }]}
+                         disabled={plaidBusy || instFull}
+                         onPress={() => plaid()}>
+                <Text style={s.syncText}>
+                  {plaidBusy ? "Connecting…" : "＋ Connect account ↗"}
+                </Text>
+              </Pressable>
+            </SharedLock>
           )}
           <Pressable style={s.syncBtn} onPress={() => setAdding(true)}>
             <Text style={s.syncText}>＋ Add account</Text>
           </Pressable>
-          {owner && !hosted && (
+          {owner && !hosted && !credentialLock && (
             <Text style={[s.syncText, { color: C.mut }]}
                   onPress={() => setSfOpen((x) => !x)}>SimpleFIN…</Text>
           )}
@@ -697,6 +739,9 @@ export default function Accounts() {
       )}
 
       {owner && brokenPlaid.length > 0 && (
+        // fix and reconnect open a Link session, refused the shared
+        // demonstration login like every other credential door
+        <SharedLock note={credentialLock}>
         <View style={{ marginHorizontal: 12 }}>
           {brokenPlaid.map((c) => (
             <View key={c.id} style={{ flexDirection: "row",
@@ -707,21 +752,26 @@ export default function Accounts() {
                   ? "sign-in expired — re-authenticate at the bank"
                   : c.status === "reaped"
                     ? "connection removed after 30 days of failure"
-                    : "sync failing"}
+                    : c.status === "new_accounts"
+                      ? "new accounts to share"
+                      : "sync failing"}
               </Text>
               <Pressable style={[s.btn, plaidBusy && { opacity: 0.5 }]}
                          disabled={plaidBusy}
                          onPress={() =>
                            // a reaped Item's token is gone — reconnect
                            // must be a FRESH link, not update mode
-                           plaid(c.status === "reaped" ? "" : c.id)}>
+                           plaid(c.status === "reaped" ? "" : c.id,
+                                 c.status === "new_accounts")}>
                 <Text style={s.btnText}>
-                  {c.status === "reaped" ? "reconnect ↗" : "fix ↗"}
+                  {c.status === "reaped" ? "reconnect ↗"
+                    : c.status === "new_accounts" ? "share ↗" : "fix ↗"}
                 </Text>
               </Pressable>
             </View>
           ))}
         </View>
+        </SharedLock>
       )}
 
       {/* status the owner may put away — reorder/unlink live in the
@@ -907,8 +957,9 @@ export default function Accounts() {
                         {consent && owner && !broken && (
                           <Pressable
                             style={[s.btn, { paddingVertical: 5 },
-                                    plaidBusy && { opacity: 0.5 }]}
-                            disabled={plaidBusy}
+                                    (plaidBusy || !!credentialLock)
+                                      && { opacity: 0.5 }]}
+                            disabled={plaidBusy || !!credentialLock}
                             onPress={() => plaid(itemId!)}>
                             <Text style={s.btnText}>grant ↗</Text>
                           </Pressable>
@@ -927,18 +978,25 @@ export default function Accounts() {
                 <View style={{ flex: 1 }} />
                 {owner && reaped && (
                   <Pressable style={[s.btn, { paddingVertical: 5 },
-                               plaidBusy && { opacity: 0.5 }]}
-                             disabled={plaidBusy}
+                               (plaidBusy || !!credentialLock)
+                                 && { opacity: 0.5 }]}
+                             disabled={plaidBusy || !!credentialLock}
                              onPress={() => plaid()}>
                     <Text style={s.btnText}>reconnect ↗</Text>
                   </Pressable>
                 )}
                 {owner && broken && conn!.aggregator === "plaid" && (
                   <Pressable style={[s.btn, { paddingVertical: 5 },
-                               plaidBusy && { opacity: 0.5 }]}
-                             disabled={plaidBusy}
-                             onPress={() => plaid(itemId!)}>
-                    <Text style={s.btnText}>fix ↗</Text>
+                               (plaidBusy || !!credentialLock)
+                                 && { opacity: 0.5 }]}
+                             disabled={plaidBusy || !!credentialLock}
+                             onPress={() =>
+                               // update mode offers newly opened accounts
+                               // only with its account checklist on
+                               plaid(itemId!, newAccounts)}>
+                    <Text style={s.btnText}>
+                      {newAccounts ? "share ↗" : "fix ↗"}
+                    </Text>
                   </Pressable>
                 )}
                 {!viewer && conn && !reaped && (
@@ -1079,7 +1137,7 @@ export default function Accounts() {
                             excluded={excludedSet.has(editing.id)}
                             manual={isManual(editing)}
                             saving={save.isPending}
-                            error={save.isError ? String(save.error) : null}
+                            error={save.isError ? errText(save.error) : null}
                             onSave={(f) => save.mutate(f)} />
             )}
             {/* the account's place in a multi-source link — who it is
@@ -1138,7 +1196,7 @@ export default function Accounts() {
             })()}
             {setHidden.isError ? (
               <Text style={{ color: C.bad, fontSize: 12 }}>
-                {String(setHidden.error)}
+                {errText(setHidden.error)}
               </Text>
             ) : null}
             <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8,
@@ -1159,7 +1217,11 @@ export default function Accounts() {
                            const a = editing!;
                            const liveConn = !!a.item_id && isPullAgg(a)
                              && (a.status || "ok") !== "archived";
-                           setRmMode(liveConn ? "disconnect" : "purge");
+                           // both disconnect modes are refused the
+                           // shared demonstration login, so its ladder
+                           // starts on the one rung it may take
+                           setRmMode(!liveConn ? "purge"
+                             : credentialLock ? "hide" : "disconnect");
                            setEditing(null);
                            if (Platform.OS === "ios")
                              removeAfterEdit.current = a;
@@ -1187,6 +1249,7 @@ export default function Accounts() {
               {editing?.aggregator === "plaid" && editing.item_id
                 && (editing.status || "ok") !== "archived"
                 && (editing.status || "ok") !== "reaped" && (
+                <SharedLock note={credentialLock}>
                 <Text style={{ color: C.accent, fontSize: 12 }}
                       onPress={async () => {
                         // Link's account-selection checklist — the ONLY
@@ -1204,7 +1267,7 @@ export default function Accounts() {
                             : s0.kind === "exited"
                               ? "no change — the window was closed"
                               : "shared accounts updated");
-                        } catch (e) { setNotice(String(e)); }
+                        } catch (e) { setNotice(errText(e)); }
                         setPlaidBusy(false);
                         qc.invalidateQueries({ queryKey: ["accounts"] });
                         qc.invalidateQueries({ queryKey: ["connections"] });
@@ -1213,6 +1276,21 @@ export default function Accounts() {
                       }}>
                   edit connected accounts ↗
                 </Text>
+                </SharedLock>
+              )}
+              {owner && (editing?.aggregator === "mx"
+                         || editing?.aggregator === "simplefin-org")
+                && editing.item_id && editing.status === "archived" && (
+                // reconnecting restarts syncing (and its billing) for a
+                // connection that outlives the shared demonstration login
+                <SharedLock note={credentialLock}>
+                <Text style={{ color: C.accent, fontSize: 12 }}
+                      onPress={() => {
+                        if (!reconnect.isPending) reconnect.mutate(editing!);
+                      }}>
+                  {reconnect.isPending ? "reconnecting…" : "reconnect"}
+                </Text>
+                </SharedLock>
               )}
             </View>
           </View>
@@ -1272,7 +1350,25 @@ export default function Accounts() {
                         + "single sub-account."
                       : "This account is not actively syncing."}
                   </Text>
-                  {opts.map(([mode, title, sub]) => (
+                  {/* at the allowance, the likely reason to disconnect
+                      is to make room — and a released bank keeps its
+                      place for 30 days (the web panel says the same) */}
+                  {liveConn && isPlaid && instFull && (
+                    <Text style={[s.mut, { color: C.warn }]}>
+                      Disconnecting does not free a slot for 30 days.
+                    </Text>
+                  )}
+                  {[opts.filter(([m]) => m.startsWith("disconnect")),
+                    opts.filter(([m]) => !m.startsWith("disconnect"))]
+                    .map((group, gi) => (
+                  // disconnecting ends a bank connection (a Plaid release
+                  // cannot be undone) that outlives the shared
+                  // demonstration login, so the server refuses it both
+                  // disconnect rungs; hiding one account stays open
+                  <SharedLock key={gi}
+                              note={gi === 0 && group.length
+                                    ? credentialLock : null}>
+                  {group.map(([mode, title, sub]) => (
                     <Pressable key={mode} style={{ flexDirection: "row",
                                  gap: 8, paddingVertical: 6 }}
                                onPress={() => setRmMode(mode)}>
@@ -1288,6 +1384,8 @@ export default function Accounts() {
                         <Text style={s.mut}>{sub}</Text>
                       </View>
                     </Pressable>
+                  ))}
+                  </SharedLock>
                   ))}
                 </>
               );
@@ -1318,7 +1416,7 @@ export default function Accounts() {
             <Text style={s.sheetTitle}>Add a manual account</Text>
             {adding && (
               <AddFields pending={add.isPending}
-                         error={add.isError ? String(add.error) : null}
+                         error={add.isError ? errText(add.error) : null}
                          onAdd={(f) => add.mutate(f)}
                          onCancel={() => setAdding(false)} />
             )}
@@ -1337,8 +1435,11 @@ const isManual = (a: Account) =>
 // in the tab, so a keystroke does not re-render the whole Accounts screen
 // (groups, categories, hero math recomputed) for one character.
 
+// primary / excl are null when the switch was left as the editor opened
+// it, so a save never re-sends a household setting read from the cache
 interface EditorForm { name: string; owner: string; kind: string;
-                       primary: boolean; excl: boolean; bal: string }
+                       primary: boolean | null; excl: boolean | null;
+                       bal: string }
 
 // the web's per-account editor fields: rename, owner, kind, primary
 // checking, exclude-from-budget — and a balance field ONLY for manual
@@ -1353,6 +1454,8 @@ function EditorFields({ a, primary, excluded, manual, saving, error,
   const [eKind, setEKind] = useState(a.kind);
   const [ePrimary, setEPrimary] = useState(primary);
   const [eExcl, setEExcl] = useState(excluded);
+  // what the switches showed on open (the props can move under a refetch)
+  const [seed] = useState({ primary, excluded });
   const [editBal, setEditBal] = useState(
     a.balance_current !== null ? String(a.balance_current) : "");
   return (
@@ -1425,7 +1528,9 @@ function EditorFields({ a, primary, excluded, manual, saving, error,
                          saving && { opacity: 0.5 }]}
                  disabled={saving}
                  onPress={() => onSave({ name: eName, owner: eOwner,
-                   kind: eKind, primary: ePrimary, excl: eExcl,
+                   kind: eKind,
+                   primary: ePrimary === seed.primary ? null : ePrimary,
+                   excl: eExcl === seed.excluded ? null : eExcl,
                    bal: editBal })}>
         <Text style={s.btnText}>Save</Text>
       </Pressable>

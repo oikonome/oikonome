@@ -551,6 +551,39 @@ class ImportApiTests(unittest.TestCase):
 
 
 class OnboardingApiTests(unittest.TestCase):
+    def test_a_provisional_seed_is_not_a_budget(self):
+        """Under a month of history the loader fills in a budget seed that
+        is never saved, so it can follow the backfill. That guess is not a
+        plan the household made: the wizard's Budgets step and the widget
+        must still read as no budget yet."""
+        import os
+        os.environ["OIKONOME_DEV"] = "1"
+        _ensure_db()
+        import oikonome.web.app as appmod
+        appmod.DEV_MODE = True
+        from oikonome.engine import budget
+        from oikonome.web.app import app
+        c = TestClient(app)
+        c.post("/api/signup", data={
+            "email": f"onb-{uuid.uuid4().hex[:8]}@example.dev",
+            "password": "correct-horse-battery"})
+        conn = tenancy.tenant_connect(c.get("/api/me").json()["tenant_id"])
+        try:
+            seed_accounts(conn)
+            # a week of this month's spend and nothing older
+            today = dt.date.today()
+            for i in range(min(7, today.day)):
+                add_txn(conn, today - dt.timedelta(days=i), 120.0,
+                        f"FIRST WEEK {i}")
+            cfg = budget.load_config(conn)
+            self.assertTrue(cfg.get("food_monthly")
+                            or cfg.get("other_monthly"),
+                            "the fixture needs a nonzero provisional seed")
+        finally:
+            conn.close()
+        self.assertFalse(c.get("/api/onboarding").json()["budgets_set"])
+        self.assertFalse(c.get("/api/today/glance").json()["budgets_set"])
+
     def test_fresh_tenant_counts(self):
         import os
         os.environ["OIKONOME_DEV"] = "1"
@@ -598,10 +631,28 @@ class OnboardingApiTests(unittest.TestCase):
         r = c.post("/api/settings", json={"timezone": "Mars/Olympus_Mons"})
         self.assertEqual(r.status_code, 400)
         self.assertIsNone(c.get("/api/settings").json()["timezone"])
-        # theme pin round-trips; auto clears; junk rejected
+        # a device adopting its own zone is welcome while the household
+        # still follows the instance, and refused once someone chose a
+        # zone by hand — a phone in another place, or one restoring an
+        # old snapshot, must not overwrite that choice
+        r = c.post("/api/settings", json={"timezone": "Europe/Paris",
+                                           "timezone_adopted": True})
+        self.assertEqual(r.status_code, 200)
+        c.post("/api/settings", json={"timezone": "America/Denver"})
+        r = c.post("/api/settings", json={"timezone": "Asia/Tokyo",
+                                           "timezone_adopted": True})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(c.get("/api/settings").json()["timezone"],
+                         "America/Denver")
+        c.post("/api/settings", json={"timezone": ""})
+        # every theme round-trips — "auto" too, because the clients read
+        # an absent theme as the dark default, so auto stored as absence
+        # could never be kept; an empty value clears; junk rejected
         c.post("/api/settings", json={"theme": "light"})
         self.assertEqual(c.get("/api/settings").json()["theme"], "light")
         c.post("/api/settings", json={"theme": "auto"})
+        self.assertEqual(c.get("/api/settings").json()["theme"], "auto")
+        c.post("/api/settings", json={"theme": None})
         self.assertIsNone(c.get("/api/settings").json()["theme"])
         self.assertEqual(
             c.post("/api/settings", json={"theme": "neon"}).status_code, 400)

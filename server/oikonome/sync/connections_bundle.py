@@ -28,6 +28,7 @@ reattach).
 from __future__ import annotations
 
 import base64
+import copy
 import datetime as dt
 import json
 import os
@@ -184,10 +185,16 @@ def build_payload(conn) -> dict:
              if v}
     items = []
     # manual items hold no credential — nothing to migrate, and their tokens
-    # are NULL; skip so the bundle is only live aggregator links.
+    # are NULL; skip so the bundle is only live aggregator links. A
+    # disconnected connection is not a live link: the owner is done with
+    # it, and a Plaid item whose release failed keeps its token only so this
+    # install's reaper can finish the release. A restored shell has no
+    # credential to carry either.
     for r in conn.execute(
             "SELECT id, aggregator, institution_name, access_token, raw "
-            "FROM items WHERE aggregator <> 'manual'").fetchall():
+            "FROM items WHERE aggregator <> 'manual' "
+            "AND COALESCE(status, '') NOT IN ('archived', 'restored')"
+            ).fetchall():
         items.append({
             "id": r["id"],
             "aggregator": r["aggregator"],
@@ -329,14 +336,119 @@ def _check_item(it: dict) -> None:
         raise ValueError(str(e))
 
 
+def _checked_shapes(payload: dict) -> tuple[dict, dict, list]:
+    """The payload's config, secrets and items, refused (ValueError, a 400)
+    unless each holds the shapes an export writes. Any passphrase seals a
+    valid file, so every value here is attacker-shaped: an item id that is
+    a list cannot be looked up, and a secret that is a number cannot be
+    encrypted — either would otherwise surface as a 500, or be stored and
+    break every later read of the setting."""
+    config = payload.get("config")
+    secrets = payload.get("secrets")
+    items = payload.get("items")
+    if config is not None and not isinstance(config, dict):
+        raise ValueError("this file's config entry is malformed")
+    if secrets is not None and not isinstance(secrets, dict):
+        raise ValueError("this file's secrets entry is malformed")
+    if items is not None and not isinstance(items, list):
+        raise ValueError("this file's items entry is malformed")
+    config, secrets, items = config or {}, secrets or {}, items or []
+    for k, v in config.items():
+        if k in _CONFIG_KEYS and v not in (None, "") and (
+                isinstance(v, bool) or not isinstance(v, (str, int))):
+            raise ValueError(f"this file's {k} setting is malformed")
+    for k, v in secrets.items():
+        if k in _SECRET_KEYS and v is not None and not isinstance(v, str):
+            raise ValueError(f"this file's {k} is malformed")
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        for k in ("id", "aggregator"):
+            if it.get(k) and not isinstance(it[k], str):
+                raise ValueError(f"a connection's {k} in this file is "
+                                 "malformed")
+        for k in ("institution_name", "access_token"):
+            if it.get(k) is not None and not isinstance(it[k], str):
+                raise ValueError(f"a connection's {k} in this file is "
+                                 "malformed")
+        if it.get("raw") is not None and not isinstance(it["raw"], dict):
+            raise ValueError("a connection's details in this file are "
+                             "malformed")
+    return dict(config), dict(secrets), items
+
+
+def _bundle_value(config: dict, k: str):
+    v = config.get(k)
+    return v if k in _CONFIG_KEYS and v not in (None, "") else None
+
+
+def _live_items(conn, aggregator: str) -> list[str]:
+    tok = "AND access_token IS NOT NULL " if aggregator == "plaid" else ""
+    return [r["institution_name"] or r["id"] for r in conn.execute(
+        "SELECT id, institution_name FROM items WHERE aggregator=%s "
+        + tok + "AND COALESCE(status,'ok') <> 'archived' ORDER BY id",
+        (aggregator,)).fetchall()]
+
+
+def _refuse_stranding_key_swaps(conn, config: dict) -> set:
+    """Refuse (ValueError) a bundle whose Plaid or MX client or environment
+    differs from the one this household's live connections were made
+    under, the check the dedicated key doors make: a Plaid access token and
+    an MX user only work with the client that made them, so swapping the
+    keys under them leaves those connections syncing nothing, and still
+    billing, with nothing left to release them by. Also keeps a live MX
+    user's guid from being replaced by the bundle's, and drops a guid the
+    new MX client cannot reach: the settings keys to drop are returned,
+    and `config` loses a guid it must not write."""
+    cur = budget.load_config(conn)
+    inc_id = _bundle_value(config, "plaid_client_id")
+    inc_env = _bundle_value(config, "plaid_env")
+    if inc_id or inc_env:
+        had_id = (cur.get("plaid_client_id")
+                  or os.environ.get("OIKONOME_PLAID_CLIENT_ID"))
+        default_env = os.environ.get("OIKONOME_PLAID_ENV", "production")
+        had_env = ((cur.get("plaid_env") if cur.get("plaid_client_id")
+                    else None) or default_env)
+        new_id = inc_id or had_id
+        # a stored environment only counts beside a stored client id
+        new_env = ((inc_env or cur.get("plaid_env"))
+                   if (inc_id or cur.get("plaid_client_id")) else None
+                   ) or default_env
+        if (new_id, new_env) != (had_id, had_env):
+            live = _live_items(conn, "plaid")
+            if live:
+                raise ValueError(
+                    "this bundle carries different Plaid keys — disconnect "
+                    f"these Plaid connections first: {', '.join(live)}")
+    guid = cur.get("mx_user_guid")
+    if guid:
+        mx_id = _bundle_value(config, "mx_client_id")
+        mx_env = _bundle_value(config, "mx_env")
+        moving = ((mx_id is not None and mx_id != cur.get("mx_client_id"))
+                  or (mx_env is not None
+                      and mx_env != (cur.get("mx_env") or "production")))
+        live = _live_items(conn, "mx")
+        if moving and live:
+            raise ValueError(
+                "this bundle carries different MX keys — disconnect these "
+                f"MX connections first: {', '.join(live)}")
+        if live:
+            # the user holding live members stays; the bundle's is another
+            # install's, reachable from here by nothing
+            config.pop("mx_user_guid", None)
+        elif moving and not _bundle_value(config, "mx_user_guid"):
+            # the new client cannot see the old user; the next use mints one
+            return {"mx_user_guid"}
+    return set()
+
+
 def apply_payload(conn, payload: dict) -> dict:
     """Merge a decrypted payload into the current tenant, re-encrypting every
     secret under THIS install's master key. Idempotent (items upsert by id)."""
     if not isinstance(payload, dict) or \
             payload.get("oikonome_config") != FORMAT:
         raise ValueError("unsupported config file version")
-    config = dict(payload.get("config") or {})
-    secrets = dict(payload.get("secrets") or {})
+    config, secrets, items_raw = _checked_shapes(payload)
     # On hosted, tenants NEVER bring their own aggregator credentials (the
     # platform runs Plaid/MX under its own keys). A bundle must not become a
     # side door around that — strip any BYO aggregator keys before applying,
@@ -346,10 +458,7 @@ def apply_payload(conn, payload: dict) -> dict:
     # key — would surface as an AttributeError 500 instead of the clean
     # 400 every other malformed field gets. Same doctrine as
     # _clean_backends' isinstance check.
-    items_raw = payload.get("items")
-    if items_raw is not None and not isinstance(items_raw, list):
-        raise ValueError("this file's items entry is malformed")
-    items_in = [it for it in items_raw or []
+    items_in = [it for it in items_raw
                 if isinstance(it, dict)
                 and it.get("id") and it.get("aggregator")]
     if env_flag("OIKONOME_HOSTED"):
@@ -364,23 +473,6 @@ def apply_payload(conn, payload: dict) -> dict:
         # all refuse BYO on hosted (_no_byo_on_hosted); a bundle must not be
         # the side door around them, so items are stripped like the keys.
         items_in = []
-    # The institution cap has to be enforced here as well as at the Plaid
-    # doors — otherwise a bundle of
-    # N hand-written items sails straight past it. Refuse the whole bundle
-    # up front (validation stays above the row lock); an uncapped instance
-    # skips this.
-    if items_in:
-        existing = {r["id"] for r in
-                    conn.execute("SELECT id FROM items").fetchall()}
-        fresh = [it for it in items_in if it["id"] not in existing]
-        cap = sync_base.institution_cap(conn)
-        if cap is not None and fresh:
-            n = sync_base.institution_count(conn)
-            if n + len(fresh) > cap:
-                raise ValueError(
-                    f"this bundle would connect {len(fresh)} more "
-                    f"institution(s), passing this instance's cap of {cap} "
-                    f"(currently {n}) — disconnect some first")
     # WHITELIST both sides — a bundle can only set known config/secret keys,
     # never inject arbitrary tenant config.
     # The whitelist covers key NAMES, not VALUES. `llm_url` saved through
@@ -391,51 +483,107 @@ def apply_payload(conn, payload: dict) -> dict:
     backends = _clean_backends(payload.get("llm_backends"))
     roles = _clean_roles(payload.get("llm_roles"),
                          {b["id"] for b in backends})
-    # Under the row lock: this merges into the WHOLE settings document, so an
-    # unlocked read-modify-write here discards whatever a concurrent Settings
-    # save wrote. Validation stays ABOVE the lock deliberately — a bundle that
-    # is going to be refused should never take the row lock at all.
-    with budget.config_txn(conn) as cfg:
-        for k, v in config.items():
-            if k in _CONFIG_KEYS and v not in (None, ""):
-                cfg[k] = v
-        for k, v in secrets.items():
-            if k in _SECRET_KEYS and v is not None:
-                cfg[k] = crypto.encrypt(conn, v)
-        if backends:
-            # a bundle brings a whole AI setup, so its list replaces this
-            # tenant's by id — same-id entries are the same backend arriving
-            # with its credential, and entries only this install has are
-            # kept, since the bundle says nothing about them
-            enc = crypto.encryptor(conn)
-            prior = {b["id"]: b for b in (cfg.get("llm_backends") or [])
-                     if isinstance(b, dict) and b.get("id")}
-            for ent in backends:
-                for k in _BACKEND_SECRETS:
-                    if ent.get(k):
-                        ent[k] = enc(ent[k])
-                prior[ent["id"]] = ent
-            if len(prior) > _MAX_BACKENDS:
-                # the merged total is the only count that can exceed the
-                # ceiling, and it is knowable only under the lock — so this
-                # one check lives here and aborts the transaction
-                raise ValueError(
-                    f"importing these AI backends would pass the limit of "
-                    f"{_MAX_BACKENDS} — remove some first")
-            cfg["llm_backends"] = list(prior.values())
-        if roles:
-            cfg["llm_roles"] = {**(cfg.get("llm_roles") or {}), **roles}
+    # Everything from the cap count to the last item upsert runs under the
+    # link lock, in one transaction, as the dedicated key doors do: a bank
+    # link in flight either lands before the live-connection checks below
+    # or sees its keys replaced and hands its Item back, and a concurrent
+    # link cannot pass the institution cap beside this bundle. The caller
+    # holds the tenant sync lock, so no MX user or member is minted under
+    # the old keys meanwhile either.
+    from . import plaid as plaid_mod
+    with conn.transaction():
+        plaid_mod.link_lock(conn)
+        drop = _refuse_stranding_key_swaps(conn, config)
+        # The institution cap has to be enforced here as well as at the Plaid
+        # doors — otherwise a bundle of
+        # N hand-written items sails straight past it. Refuse the whole
+        # bundle before the settings row lock; an uncapped instance skips
+        # this.
+        if items_in:
+            existing = {r["id"] for r in
+                        conn.execute("SELECT id FROM items").fetchall()}
+            fresh = [it for it in items_in if it["id"] not in existing]
+            cap = sync_base.institution_cap(conn)
+            if cap is not None and fresh:
+                n = sync_base.institutions_held(conn)
+                if n + len(fresh) > cap:
+                    raise ValueError(
+                        f"this bundle would connect {len(fresh)} more "
+                        f"institution(s), passing this instance's cap of "
+                        f"{cap} (currently {n}) — disconnect some first")
+        # Under the row lock: this merges into the WHOLE settings document,
+        # so an unlocked read-modify-write here discards whatever a
+        # concurrent Settings save wrote. The shape validation stays above
+        # both locks — a bundle that is going to be refused for its content
+        # should never take either.
+        with budget.config_txn(conn) as cfg:
+            # what was set before the bundle landed, so a credential
+            # rotation's armed pause can be widened to whatever it brings in
+            before = copy.deepcopy(cfg)
+            for k, v in config.items():
+                if k in _CONFIG_KEYS and v not in (None, ""):
+                    cfg[k] = v
+            for k in drop:
+                cfg.pop(k, None)
+            for k, v in secrets.items():
+                if k in _SECRET_KEYS and v is not None:
+                    cfg[k] = crypto.encrypt(conn, v)
+            # keys the bundle brought in were saved now, as far as the
+            # bank-link hold's banner is concerned (server-written only)
+            for prov, fields in (
+                    ("plaid", ("plaid_client_id", "plaid_secret",
+                               "plaid_env")),
+                    ("mx", ("mx_client_id", "mx_api_key", "mx_env"))):
+                if not cfg.get(f"{prov}_client_id"):
+                    cfg.pop(f"{prov}_keys_saved_at", None)
+                elif any(cfg.get(k) != before.get(k) for k in fields):
+                    cfg[f"{prov}_keys_saved_at"] = dt.datetime.now(
+                        dt.timezone.utc).isoformat()
+            if backends:
+                # a bundle brings a whole AI setup, so its list replaces this
+                # tenant's by id — same-id entries are the same backend arriving
+                # with its credential, and entries only this install has are
+                # kept, since the bundle says nothing about them
+                enc = crypto.encryptor(conn)
+                prior = {b["id"]: b for b in (cfg.get("llm_backends") or [])
+                         if isinstance(b, dict) and b.get("id")}
+                for ent in backends:
+                    for k in _BACKEND_SECRETS:
+                        if ent.get(k):
+                            ent[k] = enc(ent[k])
+                    prior[ent["id"]] = ent
+                if len(prior) > _MAX_BACKENDS:
+                    # the merged total is the only count that can exceed the
+                    # ceiling, and it is knowable only under the lock — so this
+                    # one check lives here and aborts the transaction
+                    raise ValueError(
+                        f"importing these AI backends would pass the limit of "
+                        f"{_MAX_BACKENDS} — remove some first")
+                cfg["llm_backends"] = list(prior.values())
+            if roles:
+                cfg["llm_roles"] = {**(cfg.get("llm_roles") or {}), **roles}
+            # a relay or AI endpoint imported while a rotation's pause is armed
+            # stands down with the rest until the owner presses Resume, rather
+            # than sending at once
+            from .restore import widen_armed_pause
+            widen_armed_pause(before, cfg, conn)
 
-    n_items = 0
-    for it in items_in:
-        _check_item(it)
-        sync_base.upsert_item(
-            conn, it["id"], it["aggregator"],
-            it.get("institution_name") or it["aggregator"],
-            it.get("access_token"), it.get("raw"))
-        n_items += 1
-    return {"config": _summary_groups(config, secrets, backends),
-            "items": n_items}
+        # a connection the owner disconnected here stays disconnected: a bundle
+        # written before the disconnect (or by another install) must not hand
+        # it back its credential or switch it on again
+        archived = {r["id"] for r in conn.execute(
+            "SELECT id FROM items WHERE status = 'archived'").fetchall()}
+        items_in = [it for it in items_in if it["id"] not in archived]
+        n_items = 0
+        for it in items_in:
+            _check_item(it)
+            sync_base.upsert_item(
+                conn, it["id"], it["aggregator"],
+                it.get("institution_name") or it["aggregator"],
+                it.get("access_token"), it.get("raw"))
+            n_items += 1
+        return {"config": _summary_groups(config, secrets, backends),
+                "items": n_items}
 
 
 def import_bytes(conn, data: bytes, passphrase: str) -> dict:

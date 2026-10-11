@@ -28,6 +28,9 @@ from .util import _ensure_db
 PW = "correct-horse-battery"
 RELAY = "8.8.8.8"          # a literal public address: no DNS in the test
 OTHER_RELAY = "8.8.4.4"
+# a relay is saved with the address it sends as (an empty From is refused
+# unless the relay username can stand in)
+FROM = "money@example.dev"
 LLM = "http://8.8.8.8:11434/v1"
 
 
@@ -97,7 +100,8 @@ class SmtpRelayTests(_Base):
     def test_each_smtp_field_is_part_of_the_destination(self):
         """Same host, someone else's login is someone else's Sent folder."""
         self._elevate()
-        self.assertEqual(self._save({"smtp_host": RELAY, "smtp_user": "me"})
+        self.assertEqual(self._save({"smtp_host": RELAY, "smtp_user": "me",
+                                     "smtp_from": FROM})
                          .status_code, 200)
         self._unelevate()
         for body in ({"smtp_host": OTHER_RELAY}, {"smtp_user": "thief"},
@@ -111,7 +115,8 @@ class SmtpRelayTests(_Base):
     def test_resaving_the_unchanged_relay_does_not_ask(self):
         self._elevate()
         self.assertEqual(self._save({"smtp_host": RELAY, "smtp_port": 587,
-                                     "smtp_user": "me"}).status_code, 200)
+                                     "smtp_user": "me", "smtp_from": FROM})
+                         .status_code, 200)
         self._unelevate()
         r = self._save({"smtp_host": RELAY, "smtp_port": 587,
                         "smtp_user": "me", "food_monthly": 50})
@@ -122,7 +127,8 @@ class SmtpRelayTests(_Base):
         (587, STARTTLS on) for a relay stored without them repoints
         nothing."""
         self._elevate()
-        self.assertEqual(self._save({"smtp_host": RELAY}).status_code, 200)
+        self.assertEqual(self._save({"smtp_host": RELAY, "smtp_from": FROM})
+                         .status_code, 200)
         self._unelevate()
         r = self._save({"smtp_host": RELAY, "smtp_port": 587,
                         "smtp_starttls": True})
@@ -130,7 +136,7 @@ class SmtpRelayTests(_Base):
 
     def test_clearing_the_relay_does_not_ask(self):
         self._elevate()
-        self._save({"smtp_host": RELAY})
+        self._save({"smtp_host": RELAY, "smtp_from": FROM})
         self._unelevate()
         r = self._save({"smtp_host": ""})
         self.assertEqual(r.status_code, 200, r.text)
@@ -138,12 +144,13 @@ class SmtpRelayTests(_Base):
 
     def test_elevated_session_repoints_the_relay(self):
         self._elevate()
-        r = self._save({"smtp_host": RELAY})
+        r = self._save({"smtp_host": RELAY, "smtp_from": FROM})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(self._stored()["smtp_host"], RELAY)
 
     def test_older_app_build_proves_with_the_password_in_the_body(self):
-        r = self._save({"smtp_host": RELAY, "password": PW})
+        r = self._save({"smtp_host": RELAY, "smtp_from": FROM,
+                        "password": PW})
         self.assertEqual(r.status_code, 200, r.text)
         r = self._save({"smtp_host": OTHER_RELAY, "password": "wrong-one"})
         self.assertEqual(r.status_code, 401, r.text)

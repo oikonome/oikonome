@@ -1,0 +1,14 @@
+-- What a rename or merge did to the category rules of the merchant it
+-- moved, so undoing it can put them back.
+--
+-- A category rule is stored under a merchant's NAME. When a rename or a
+-- merge moves every row of a name somewhere else, a rule left under the
+-- old name reaches nothing: the household's correction still shows on the
+-- Rules page and no longer files a single charge, and a machine rule takes
+-- over the merchant. So the rename carries the rule to the merchant the
+-- rows went to, and where the survivor already has a rule of its own, one
+-- of the two is set aside. Both are recorded here, on every journal row
+-- of that rename, because undo replays the journal one raw string at a
+-- time and the rule has to come back with whichever string is undone.
+-- NULL on rows written before this, and on renames that moved no rule.
+ALTER TABLE merchant_renames ADD COLUMN IF NOT EXISTS rules JSONB;

@@ -205,7 +205,8 @@ class MemberRoleTests(unittest.TestCase):
         a budget must not be able to re-point the household's mail."""
         self.owner.post("/api/settings",
                         json={"smtp_host": "mail.example.dev",
-                              "smtp_port": 587})
+                              "smtp_port": 587,
+                              "smtp_from": "money@example.dev"})
         before = self._config()
         self.assertEqual(before.get("smtp_host"), "mail.example.dev")
         r = self.member.post("/api/settings",
@@ -258,6 +259,23 @@ class MemberRoleTests(unittest.TestCase):
                   or (k == "email_muted" and after.get(k) == ["evil@x"])]
         self.assertEqual(leaked, [],
                          f"member POST changed owner-only keys: {leaked}")
+
+    def test_a_member_cannot_edit_the_mute_list_one_address_at_a_time(self):
+        """The one-address delta keys edit the same stored mute and
+        recipient lists as the whole-list keys, so a member's save drops
+        them too — otherwise a member could silence the owner, or un-mute
+        someone who opted out, by spelling the key differently."""
+        self.owner.post("/api/settings", json={"email_muted": ["quiet@x"]})
+        r = self.member.post("/api/settings",
+                             json={"email_muted_add": ["owner@x"],
+                                   "email_muted_remove": ["quiet@x"],
+                                   "email_recipients_added": ["new@x"],
+                                   "email_recipients_removed": ["quiet@x"],
+                                   "food_monthly": 321})
+        self.assertEqual(r.status_code, 200, r.text)
+        after = self._config()
+        self.assertEqual(after["food_monthly"], 321)
+        self.assertEqual(after.get("email_muted"), ["quiet@x"])
 
     # ---- the owner moves people between roles --------------------------
 

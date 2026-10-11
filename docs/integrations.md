@@ -189,7 +189,7 @@ def verify(secret: str, header: str, body: bytes, tolerance: int = 300) -> bool:
 | `transactions.new` | A sync brought rows into the ledger | `count`, `transactions[]` (up to 50: id, date, amount, payee, bank_text, account, account_id, category, pending) |
 | `sync.completed` | A sync finished, rows or not | `connections[]` (id, name, ok, error), `new_transactions`, `ok` |
 | `alert.raised` | An alert appeared on the Today page (or came back after clearing) | `kind`, `severity`, `message`, `link`, `date` |
-| `connection.changed` | A bank connection broke or recovered | `connections[]` (name, from, to) |
+| `connection.changed` | A bank connection broke or recovered — once per change, whether or not the alert email went out | `connections[]` (name, from, to) |
 | `report.daily` | The daily verdict, once a day at the household's daily report hour — even with email, SMS and push all off. Like the daily email, it waits for a budget (none is sent until the Food or Everything else budget is set) and starts the day after the household was created | the whole `/api/integrations/summary` document |
 | `networth.snapshot` | The nightly net-worth snapshot was recorded | `date`, `total`, `with_property`, `by_institution[]` |
 | `activity.logged` | Someone in the household changed a category, bill, note, rule… | `actor`, `kind`, `action`, `target`, `label`, `summary` (the sentence), `detail` |

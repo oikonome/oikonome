@@ -387,6 +387,13 @@ class OperatorClearTests(_Fixture):
         self.assertFalse(self._factors())
 
     def test_the_clear_form_collects_the_assertion(self):
+        # only where the server will demand one: with no operator key the
+        # ceremony has nothing to sign with and would block the clear
+        r = self.console.get(f"/admin/console/tenant/{self.tid}")
+        form = r.text[r.text.index('action="/admin/console/clear-2fa"'):]
+        form = form[:form.index("</form>")]
+        self.assertNotIn("data-admin-stepup", form)
+        self._enrol_operator_key()
         r = self.console.get(f"/admin/console/tenant/{self.tid}")
         form = r.text[r.text.index('action="/admin/console/clear-2fa"'):]
         form = form[:form.index("</form>")]

@@ -139,8 +139,9 @@ class PnlTests(unittest.TestCase):
             books.pnl(self.conn, self.ent["id"])
             self.assertEqual(calls, [None])
             calls.clear()
+            # one history read, the year's rows filtered from it
             selfemploy.estimated_tax(self.conn, self.ent["id"], TODAY.year)
-            self.assertEqual(len(calls), 2, calls)
+            self.assertEqual(calls, [None])
 
     def test_bucket_only_reclassify_keeps_the_confirmed_schedule_c_line(self):
         """`sched_c_line` is an OPTIONAL argument, so the Books tab's
@@ -491,6 +492,40 @@ class YearEndPackageTests(unittest.TestCase):
         for f in ("README.txt", "profit-and-loss.csv", "ledger.csv",
                   "balance-sheet.csv", "vendors-1099.csv", "mileage.csv"):
             self.assertIn(f, names, f"package is missing {f}")
+
+    def test_vendor_csv_total_is_the_whole_amount_paid(self):
+        """'Total paid' is everything the business paid the vendor; the card
+        part and the 1099-NEC amount are separate columns, so no column
+        headed as the whole holds only a part of it."""
+        import csv
+        import io
+        import zipfile
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            conn.execute(
+                "INSERT INTO accounts (id,item_id,name,type,subtype,"
+                "balance_current) VALUES ('vbiz','it1','Biz Checking',"
+                "'depository','checking',0), ('vcard','it1','Biz Card',"
+                "'credit','credit card',0)")
+            for acct in ("vbiz", "vcard"):
+                entities.assign_account(conn, acct, self.ent["id"])
+            today = dt.date.today()
+            add_txn(conn, today, 1000.0, "PAID CONTRACTOR", account="vbiz",
+                    txn_id="vc1")
+            add_txn(conn, today, 500.0, "PAID CONTRACTOR", account="vcard",
+                    txn_id="vc2")
+            conn.commit()
+        finally:
+            conn.close()
+        r = self.client.get(
+            f"/api/business/entities/{self.ent['id']}/package.zip")
+        rows = list(csv.reader(io.StringIO(zipfile.ZipFile(
+            io.BytesIO(r.content)).read("vendors-1099.csv").decode())))
+        self.assertEqual(rows[0], ["Vendor", "Total paid",
+                                   "Paid by card (not 1099-NEC)",
+                                   "1099-NEC amount", "Marked reportable"])
+        row = next(x for x in rows[1:] if x[0] == "PAID CONTRACTOR")
+        self.assertEqual(row[1:4], ["1500.00", "500.00", "1000.00"])
 
     def test_readme_says_what_this_is_not(self):
         """Bookkeeping output, not a filed return — and unclassified rows

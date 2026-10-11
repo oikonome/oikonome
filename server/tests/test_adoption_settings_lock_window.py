@@ -136,6 +136,54 @@ class AdoptionSettingsLockWindowTests(unittest.TestCase):
                          "the settings document was rewritten without the "
                          "row lock — two writers can lose an update")
 
+    def test_a_settings_writer_waiting_on_the_account_does_not_deadlock(self):
+        """The doors that classify an account or move it to a business
+        take the settings row FIRST and the account row after. An adoption
+        holding the account and waiting for the settings row would close
+        that cycle; it must let the account go instead, wait, and finish.
+        """
+        import threading
+        import time
+
+        a_pid = self.conn.info.backend_pid
+        out = {}
+
+        def run():
+            try:
+                out["done"] = self._adopt()
+            except Exception as e:              # noqa: BLE001
+                out["error"] = e
+
+        writer = self.observer
+        with writer.transaction():
+            writer.execute("SELECT config FROM tenant_settings FOR UPDATE")
+            t = threading.Thread(target=run)
+            t.start()
+            # wait until the adoption is queued behind the settings row
+            watcher = tenancy.admin_connect()
+            try:
+                for _ in range(200):
+                    w = watcher.execute(
+                        "SELECT wait_event_type FROM pg_stat_activity "
+                        "WHERE pid = %s", (a_pid,)).fetchone()
+                    if w and w["wait_event_type"] == "Lock":
+                        break
+                    time.sleep(0.025)
+                else:
+                    self.fail("the adoption never waited for the settings row")
+            finally:
+                watcher.close()
+            # the door's second lock: the account the adoption is renaming
+            writer.execute("SET LOCAL lock_timeout = '3s'")
+            writer.execute(
+                "SELECT 1 FROM accounts WHERE id = 'old-chk' FOR UPDATE")
+        t.join(15)
+        self.assertFalse(t.is_alive())
+        self.assertNotIn("error", out)
+        self.assertEqual(len(out["done"]), 2)
+        cfg = budget.load_config(self.conn)
+        self.assertEqual(cfg["checking_account_id"], "new-chk")
+
     def test_the_probe_leaves_no_lock_timeout_on_the_pooled_connection(self):
         self._settings_lock_free()
         self.assertEqual(

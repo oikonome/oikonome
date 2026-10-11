@@ -26,7 +26,7 @@ class WindowedTabsTests(unittest.TestCase):
         self.bank = self.conn.execute(
             "SELECT id FROM accounts WHERE type='depository' LIMIT 1"
         ).fetchone()["id"]
-        self.today = dt.date(2026, 8, 31)
+        self.today = dt.date(2026, 9, 1)   # the fixture months have closed
 
     def tearDown(self):
         self.conn.close()
@@ -79,6 +79,36 @@ class WindowedTabsTests(unittest.TestCase):
         self.assertEqual(koa[0][2], 2)
         self.assertEqual(koa[0][3], 50.0)        # prev window, same fold
 
+    def test_spending_that_stopped_still_shows_as_a_change(self):
+        """A category or merchant with spend only in the previous window is
+        the biggest move there is, and the headline delta already counts
+        it. Leaving it out of the per-category rows means the listed
+        changes cannot add up to the headline, and the largest one is
+        never shown. It ranks after every current row, at 0."""
+        _txn(self.conn, self.bank, dt.date(2026, 8, 12), 240.0, "GROCER",
+             category_primary="FOOD_AND_DRINK")
+        _txn(self.conn, self.bank, dt.date(2026, 4, 5), 100.0, "GROCER",
+             category_primary="FOOD_AND_DRINK")
+        _txn(self.conn, self.bank, dt.date(2026, 4, 9), 6000.0, "AIRLINE",
+             category_primary="TRAVEL")
+        w = reporting.spending_window(self.conn, self.today, "3m")
+        self.assertEqual(w["categories"], [["FOOD AND DRINK", 240.0, 100.0],
+                                           ["TRAVEL", 0.0, 6000.0]])
+        self.assertEqual(w["total"], 240.0)
+        self.assertEqual(
+            round(sum(c[1] - c[2] for c in w["categories"]), 2),
+            round(w["total"] - w["prev_total"], 2))
+        self.assertEqual([m[0] for m in w["merchants"]], ["GROCER"])
+        self.assertEqual([m[:4] for m in w["dropped_merchants"]],
+                         [["AIRLINE", 0.0, 0, 6000.0]])
+
+    def test_all_time_has_nothing_dropped(self):
+        _txn(self.conn, self.bank, dt.date(2026, 8, 12), 50.0, "GROCER",
+             category_primary="FOOD_AND_DRINK")
+        w = reporting.spending_window(self.conn, self.today, "all")
+        self.assertEqual(len(w["categories"]), 1)
+        self.assertEqual(w["dropped_merchants"], [])
+
     def test_spending_all_time_has_no_previous_window(self):
         _txn(self.conn, self.bank, dt.date(2026, 8, 12), 50.0, "GROCER",
              category_primary="FOOD_AND_DRINK")
@@ -113,6 +143,18 @@ class WindowedTabsTests(unittest.TestCase):
         self.assertIsNone(both["prev_kinds"])
         self.assertIsNone(both["sources"][0][3])
 
+    def test_a_payer_who_stopped_paying_is_listed(self):
+        _txn(self.conn, self.bank, dt.date(2026, 8, 5), -500.0, "NEW CLIENT",
+             category_primary="INCOME")
+        _txn(self.conn, self.bank, dt.date(2026, 4, 5), -4000.0,
+             "FORMER EMPLOYER", category_primary="INCOME")
+        w = reporting.income_window(self.conn, self.today, "3m")
+        self.assertEqual([s[0] for s in w["sources"]], ["NEW CLIENT"])
+        self.assertEqual([s[:4] for s in w["dropped_sources"]],
+                         [["FORMER EMPLOYER", 0.0, 0, 4000.0]])
+        self.assertEqual(reporting.income_window(
+            self.conn, self.today, "all")["dropped_sources"], [])
+
     def test_previous_window_stops_as_far_into_its_month_as_today(self):
         """A window running to today holds only part of its last month, so
         the previous window must stop the same number of days into its
@@ -129,10 +171,11 @@ class WindowedTabsTests(unittest.TestCase):
              category_primary="FOOD_AND_DRINK")
         _txn(self.conn, self.bank, dt.date(2026, 8, 20), 400.0, "GROCER",
              category_primary="FOOD_AND_DRINK")
-        # 3m on Sep 3 is Jul 1..Sep 3; the previous one is Apr 1..Jun 3
-        _txn(self.conn, self.bank, dt.date(2026, 6, 3), 11.0, "CINEMA",
+        # 3m on Sep 3 is the three closed months Jun 1..Aug 31; the
+        # previous one is Mar 1..May 31, whole against whole
+        _txn(self.conn, self.bank, dt.date(2026, 5, 31), 11.0, "CINEMA",
              category_primary="ENTERTAINMENT")
-        _txn(self.conn, self.bank, dt.date(2026, 6, 4), 700.0, "CINEMA",
+        _txn(self.conn, self.bank, dt.date(2026, 6, 1), 700.0, "CINEMA",
              category_primary="ENTERTAINMENT")
         inc = reporting.income_window(self.conn, today, "cur")
         self.assertEqual(inc["prev_total"], 100.0)
@@ -141,6 +184,8 @@ class WindowedTabsTests(unittest.TestCase):
         self.assertEqual(sp["prev_total"], 30.0)
         sp3 = reporting.spending_window(self.conn, today, "3m")
         self.assertEqual(sp3["prev_total"], 11.0)
+        self.assertEqual(sp3["total"], 700.0 + 430.0)
+        self.assertEqual(sp3["to"], "2026-08-31")
 
     def test_previous_window_is_whole_when_today_closes_the_month(self):
         """On the last day of a month the current month is complete, so

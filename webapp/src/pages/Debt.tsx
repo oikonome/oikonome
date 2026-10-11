@@ -6,6 +6,7 @@
 // what-ifs, the retirement page's pattern.
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
+import { interestSaved, rebaseFields, rebaseKeyed } from "../moneymath";
 import { isViewer } from "../role";
 import { api, errText, money, type DebtMethod, type DebtPlan, type DebtRow,
          type DebtSchedule } from "../api/client";
@@ -49,6 +50,7 @@ function Fld({ label, value, step = "1", w = "6rem", ph, onChange }: {
 }
 
 type Draft = Record<string, { apr: string; min_payment: string; skip: boolean }>;
+type PlanFields = { method: DebtMethod; extra_monthly: number | string };
 
 const draftOf = (rows: DebtRow[]): Draft => Object.fromEntries(rows.map((d) => [d.id, {
   // the box shows what the household typed; an issuer/estimated value
@@ -70,15 +72,34 @@ export default function Debt() {
   const qc = useQueryClient();
   const [extra, setExtra] = useState<string | null>(null);
   const [draft, setDraft] = useState<Draft | null>(null);
+  // the overrides as they were when the first box was edited
+  const [opened, setOpened] = useState<Draft | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const save = useMutation({
-    mutationFn: (body: Parameters<typeof api.debtPlanSave>[0]) => api.debtPlanSave(body),
+    // The server replaces the whole plan, and the draft is a copy from
+    // when this page loaded: another device may have saved since. Read
+    // the stored plan now and lay only this page's changes over it.
+    mutationFn: async (v: { plan: PlanFields; planBase: PlanFields;
+                            mine: Draft; base: Draft }) => {
+      const fresh = await api.debtPlan();
+      const plan = rebaseFields(v.plan, v.planBase, fresh.saved);
+      const debts = rebaseKeyed(v.mine, v.base, draftOf(fresh.debts));
+      return api.debtPlanSave({
+        method: plan.method, extra_monthly: plan.extra_monthly,
+        debts: Object.fromEntries(Object.entries(debts).map(([id, x]) => [id, {
+          apr: x.apr === "" ? null : x.apr,
+          min_payment: x.min_payment === "" ? null : x.min_payment,
+          skip: x.skip,
+        }])),
+      });
+    },
     onSuccess: (d) => {
       // the reply IS the saved plan: seed the unparameterised key and
       // drop the what-if so the page reads what it just wrote
       qc.setQueryData(["debt-plan", {}], d);
       qc.invalidateQueries({ queryKey: ["debt-plan"] });
-      setParams({}); setExtra(null); setDraft(null); setErr(null);
+      setParams({}); setExtra(null); setDraft(null); setOpened(null);
+      setErr(null);
     },
     onError: (e) => setErr(errText(e)),
   });
@@ -103,17 +124,20 @@ export default function Debt() {
     setParams({ method, extra: extraStr === "" ? "0" : extraStr });
   };
   const pick = (m: DebtMethod) => setParams({ method: m, extra: extraStr === "" ? "0" : extraStr });
-  const setRow = (id: string, patch: Partial<Draft[string]>) =>
+  const setRow = (id: string, patch: Partial<Draft[string]>) => {
+    if (draft === null) setOpened(d);
     setDraft({ ...d, [id]: { ...d[id], ...patch } });
+  };
+  // a typed "1,000" compares equal to the stored 1000; text that is not a
+  // number goes out as typed so the server's refusal names it
+  const extraN = Number(extraStr.replace(/[$,\s]/g, "") || "0");
   const persist = () => save.mutate({
-    method, extra_monthly: extraStr === "" ? 0 : extraStr,
-    debts: Object.fromEntries(Object.entries(d).map(([id, v]) => [id, {
-      apr: v.apr === "" ? null : v.apr,
-      min_payment: v.min_payment === "" ? null : v.min_payment,
-      skip: v.skip,
-    }])),
+    plan: { method,
+            extra_monthly: Number.isFinite(extraN) ? extraN : extraStr },
+    planBase: { method: r.saved.method, extra_monthly: r.saved.extra_monthly },
+    mine: d, base: opened ?? d,
   });
-  const saved = (s: DebtSchedule) => base.total_interest - s.total_interest;
+  const saved = (s: DebtSchedule) => interestSaved(base, s);
 
   if (r.debts.length === 0) {
     return (
@@ -184,7 +208,9 @@ export default function Debt() {
           </div>
         </div>
 
-        <form onSubmit={recalc} className="assume"
+        {/* The server validates the amount; the spinner step is only a
+            convenience and must not block a cent-precise what-if. */}
+        <form onSubmit={recalc} className="assume" noValidate
               style={{ display: "flex", gap: ".7rem", flexWrap: "wrap", alignItems: "flex-end" }}>
           <div className="seg" role="radiogroup" aria-label="Payoff method"
                style={{ display: "inline-flex", gap: ".3rem" }}>

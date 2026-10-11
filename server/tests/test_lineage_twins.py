@@ -65,6 +65,89 @@ class LineageTwinTests(unittest.TestCase):
         # idempotent: nothing left to retire
         self.assertEqual(adopt.dedupe_twins(self.conn, "biz"), [])
 
+    def test_a_retired_twin_stays_retired_when_the_feed_sends_it_again(self):
+        """A feed re-sends every row inside its window, and a re-sent row
+        comes back live. The twin the dedup retired is the same charge as
+        its survivor, so bringing it back would count the charge twice."""
+        from oikonome.sync import base
+        _txn(self.conn, "raw", "biz", self.d, 20.00,
+             "REF000000000042 NORTHWIND HOSTING.COM NORTHWINDHOST.US",
+             merchant="Northwindhost.us")
+        _txn(self.conn, "clean", "biz", self.d, 20.00, "Northwind Hosting",
+             merchant="Northwind Hosting")
+        adopt.dedupe_twins(self.conn, "biz")
+        base.upsert_transactions(self.conn, [base.Transaction(
+            id="raw", account_id="biz", date=self.d, amount=20.00,
+            name="REF000000000042 NORTHWIND HOSTING.COM NORTHWINDHOST.US")])
+        live = self._live()
+        self.assertEqual(live["raw"]["removed"], 1)
+        self.assertEqual(live["clean"]["removed"], 0)
+
+    def test_everything_attached_to_a_retired_twin_reaches_its_survivor(self):
+        """The retired twin stays retired through a feed re-delivery, so
+        the nightly re-anchor sweep never looks at it again; everything a
+        person attached to it — a reimbursement pairing, a store-order
+        match, a Schedule C class, an equity movement — must therefore be
+        on the survivor once the dedup is done, or every read hides it."""
+        from oikonome.sync import base, reanchor
+        _txn(self.conn, "raw", "biz", self.d, 20.00,
+             "REF000000000042 NORTHWIND HOSTING.COM NORTHWINDHOST.US",
+             merchant="Northwindhost.us")
+        _txn(self.conn, "clean", "biz", self.d, 20.00, "Northwind Hosting",
+             merchant="Northwind Hosting")
+        _txn(self.conn, "payback", "biz", self.d, -20.00, "PARTNER PAYBACK")
+        ent = self.conn.execute(
+            "INSERT INTO business_entity (name, structure) VALUES"
+            " ('Northwind LLC', 'single_member_llc')"
+            " RETURNING id").fetchone()["id"]
+        self.conn.execute("INSERT INTO reimbursements (expense_id,"
+                          " reimburse_id, partial) VALUES ('raw','payback',0)")
+        self.conn.execute("INSERT INTO amazon_matches (transaction_id,"
+                          " dedup_key) VALUES ('raw','order-1')")
+        self.conn.execute("INSERT INTO business_txn_class (txn_id, bucket,"
+                          " sched_c_line) VALUES ('raw','operating','Supplies')")
+        self.conn.execute(
+            "INSERT INTO equity_movement (entity_id, kind, amount, date,"
+            " txn_id) VALUES (%s,'contribution',20.00,%s,'raw')",
+            (ent, self.d))
+        out = adopt.dedupe_twins(self.conn, "biz")
+        self.assertEqual([(o["kept"], o["removed"]) for o in out],
+                         [("clean", "raw")])
+        reanchor.reanchor_stranded(self.conn)
+        base.upsert_transactions(self.conn, [base.Transaction(
+            id="raw", account_id="biz", date=self.d, amount=20.00,
+            name="REF000000000042 NORTHWIND HOSTING.COM NORTHWINDHOST.US")])
+
+        def one(sql):
+            return self.conn.execute(sql).fetchone()
+        self.assertEqual(self._live()["raw"]["removed"], 1)
+        self.assertEqual(one("SELECT expense_id FROM reimbursements")
+                         ["expense_id"], "clean")
+        self.assertEqual(one("SELECT transaction_id FROM amazon_matches")
+                         ["transaction_id"], "clean")
+        self.assertEqual(one("SELECT txn_id FROM business_txn_class")
+                         ["txn_id"], "clean")
+        self.assertEqual(one("SELECT txn_id FROM equity_movement")
+                         ["txn_id"], "clean")
+        self.assertEqual(reanchor.stranded(self.conn), [])
+
+    def test_a_twin_is_not_retired_onto_a_survivor_that_left_meanwhile(self):
+        """The scan picks the survivor before the retirement locks it; if a
+        pull retired the survivor in between, retiring the other copy too
+        would hide the charge altogether."""
+        _txn(self.conn, "raw", "biz", self.d, 20.00,
+             "REF000000000042 NORTHWIND HOSTING.COM", merchant="Northwindhost.us")
+        _txn(self.conn, "clean", "biz", self.d, 20.00, "Northwind Hosting",
+             merchant="Northwind Hosting", override="SOFTWARE")
+        self.conn.execute("UPDATE transactions SET removed = 1"
+                          " WHERE id = 'clean'")
+        adopt._retire_twin(self.conn, "clean", "raw")
+        row = self.conn.execute(
+            "SELECT removed, retired_at FROM transactions WHERE id = 'raw'"
+        ).fetchone()
+        self.assertEqual(row["removed"], 0)
+        self.assertIsNone(row["retired_at"])
+
     def test_posted_charge_beats_its_stale_card_hold(self):
         _txn(self.conn, "hold", "biz", self.d, 10.00,
              "Card Hold; 000000000000001 NORTHWIND*STREAMING", pending=1)

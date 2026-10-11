@@ -4,8 +4,8 @@
 // token, read from the Keychain in the app group the app shares with it
 // (src/lib/glance.ts writes it there through expo-secure-store). Every
 // string is composed by the server; this file mirrors the decisions in
-// src/lib/glance-pure.ts — stale after an hour, "Sign in" without a
-// credential, "Set a plan" before a budget exists — line for line.
+// src/lib/glance-pure.ts — stale after an hour or once the local day has
+// turned since the fetch, "Sign in" without a credential, "Set a plan" before a budget exists — line for line.
 import CryptoKit
 import SwiftUI
 import WidgetKit
@@ -39,21 +39,41 @@ enum Shared {
 
   /// expo-secure-store writes an unauthenticated item under service
   /// "app:no-auth" with the key as both account and generic attribute.
-  static func read(_ key: String) -> String? {
+  static func query(_ key: String) -> [String: Any] {
     let keyData = Data(key.utf8)
-    let query: [String: Any] = [
+    return [
       kSecClass as String: kSecClassGenericPassword,
       kSecAttrService as String: "app:no-auth",
       kSecAttrGeneric as String: keyData,
       kSecAttrAccount as String: keyData,
       kSecAttrAccessGroup as String: accessGroup,
-      kSecReturnData as String: true,
-      kSecMatchLimit as String: kSecMatchLimitOne,
     ]
+  }
+
+  static func read(_ key: String) -> String? {
+    var q = query(key)
+    q[kSecReturnData as String] = true
+    q[kSecMatchLimit as String] = kSecMatchLimitOne
     var item: CFTypeRef?
-    guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+    guard SecItemCopyMatching(q as CFDictionary, &item) == errSecSuccess,
           let data = item as? Data else { return nil }
     return String(data: data, encoding: .utf8)
+  }
+
+  /// Written the way expo-secure-store writes, so the app can delete it by
+  /// name. Delete-then-add, because an update keeps an existing item's
+  /// accessibility: after first unlock (a timeline reloads while the phone
+  /// is locked) and this device only, like every item the app keeps.
+  static func write(_ key: String, _ value: Data) {
+    SecItemDelete(query(key) as CFDictionary)
+    var item = query(key)
+    item[kSecValueData as String] = value
+    item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+    SecItemAdd(item as CFDictionary, nil)
+  }
+
+  static func delete(_ key: String) {
+    SecItemDelete(query(key) as CFDictionary)
   }
 
   static var credential: (url: String, token: String)? {
@@ -76,6 +96,14 @@ struct Entry: TimelineEntry {
 let staleAfter: TimeInterval = 60 * 60
 let refreshEvery: TimeInterval = 30 * 60
 
+/// Stale beats wrong: past an hour, or fetched on an earlier local day —
+/// the glance is one day's allowance, so last night's "$0 left" is wrong
+/// at 12:30 AM however young it is (glance-pure.sameLocalDay).
+func isStale(fetched: Date, at now: Date) -> Bool {
+  now.timeIntervalSince(fetched) > staleAfter
+    || !Calendar.current.isDate(fetched, inSameDayAs: now)
+}
+
 struct Provider: TimelineProvider {
   func placeholder(in context: Context) -> Entry {
     Entry(date: .now, signedIn: true, glance: Glance.sample, fetchedAt: .now)
@@ -88,7 +116,27 @@ struct Provider: TimelineProvider {
 
   func getTimeline(in context: Context, completion: @escaping (Timeline<Entry>) -> Void) {
     load { entry in
-      completion(Timeline(entries: [entry], policy: .after(.now + refreshEvery)))
+      // A face is decided per entry, so the day turning needs an entry of
+      // its own: at the next local midnight the same payload redraws grey,
+      // even if the system holds back the next reload.
+      // The hour rule needs the same: an entry just past an hour after the
+      // fetch draws the payload grey if no reload has come by then.
+      var entries = [entry]
+      let cal = Calendar.current
+      if entry.glance != nil,
+         let midnight = cal.date(byAdding: .day, value: 1, to: cal.startOfDay(for: entry.date)) {
+        entries.append(Entry(date: midnight, signedIn: entry.signedIn,
+                             glance: entry.glance, fetchedAt: entry.fetchedAt))
+        if let fetched = entry.fetchedAt {
+          let hourOld = fetched.addingTimeInterval(staleAfter + 1)
+          if hourOld > entry.date && hourOld < midnight {
+            entries.append(Entry(date: hourOld, signedIn: entry.signedIn,
+                                 glance: entry.glance, fetchedAt: entry.fetchedAt))
+          }
+        }
+        entries.sort { $0.date < $1.date }
+      }
+      completion(Timeline(entries: entries, policy: .after(.now + refreshEvery)))
     }
   }
 
@@ -107,12 +155,24 @@ struct Provider: TimelineProvider {
     guard let url = URL(string: cred.url + "/api/today/glance") else {
       done(Entry(date: .now, signedIn: true, glance: nil, fetchedAt: nil)); return
     }
-    var req = URLRequest(url: url, timeoutInterval: 20)
+    var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData,
+                         timeoutInterval: 20)
     req.setValue("Bearer \(cred.token)", forHTTPHeaderField: "Authorization")
     req.setValue("application/json", forHTTPHeaderField: "Accept")
-    URLSession.shared.dataTask(with: req) { data, resp, _ in
+    // no-store: kept out of any HTTP disk cache, as in the app (api.ts)
+    req.setValue("no-store", forHTTPHeaderField: "Cache-Control")
+    // older builds fetched through the shared session, whose disk cache
+    // kept the response and the request with its bearer header
+    URLCache.shared.removeAllCachedResponses()
+    // when the request went out, not when it landed: a fetch sent before
+    // midnight carries the day that was ending, so landing after it must
+    // read as yesterday's (grey), never as today's allowance
+    let started = Date.now
+    glanceSession.dataTask(with: req) { data, resp, _ in
       let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
-      if status == 401 {
+      // a refusal is about the credential this request carried; if the app
+      // has minted another since, that one and its payload are left alone
+      if status == 401, Shared.credential?.token == cred.token {
         Cache.clear()
         done(Entry(date: .now, signedIn: false, glance: nil, fetchedAt: nil)); return
       }
@@ -120,8 +180,8 @@ struct Provider: TimelineProvider {
         // the app may have signed out or minted for another household
         // while this was in flight: then these are the previous
         // credential's numbers, never saved or drawn under the new one
-        if Cache.save(g, fetchedWith: cred.token) {
-          done(Entry(date: .now, signedIn: true, glance: g, fetchedAt: .now)); return
+        if Cache.save(g, fetchedWith: cred.token, at: started) {
+          done(Entry(date: .now, signedIn: true, glance: g, fetchedAt: started)); return
         }
       }
       // re-read: a sign-out while this was in flight draws "Sign in"
@@ -132,41 +192,60 @@ struct Provider: TimelineProvider {
   }
 }
 
-/// The last payload, in the app group's defaults, so a redraw with no
-/// network still shows something honest (grey, with its time). The entry
-/// carries a digest of the widget token it was fetched under ("glance_owner")
-/// and is read back only while that token is still the credential, so a
-/// fetch that lands after a sign-out or a change of household can never be
-/// shown as the new household's day. The app removes the same keys
-/// (modules/widget-reload, `clearCache`) at sign-out and on a change of
-/// household — keep the names in step.
+/// The extension's network session: ephemeral, with no URL cache, so
+/// neither the household's numbers nor the request carrying the widget's
+/// bearer token are ever written to a disk cache.
+let glanceSession: URLSession = {
+  let c = URLSessionConfiguration.ephemeral
+  c.urlCache = nil
+  c.requestCachePolicy = .reloadIgnoringLocalCacheData
+  return URLSession(configuration: c)
+}()
+
+/// The last payload, so a redraw with no network still shows something
+/// honest (grey, with its time). It is one household's financial day, so it
+/// lives in the Keychain beside the credential (shared group, this device
+/// only, kept off backups) rather than in a defaults plist. The entry
+/// carries a digest of the widget token it was fetched under and is read
+/// back only while that token is still the credential, so a fetch that
+/// lands after a sign-out or a change of household can never be shown as
+/// the new household's day. The app deletes the same item by name
+/// (src/lib/glance.ts, `dropGlanceCaches`) at sign-out and on a change of
+/// household — keep the name in step.
 enum Cache {
-  static var defaults: UserDefaults? { UserDefaults(suiteName: Shared.accessGroup) }
-  /// A digest, not the token: the defaults are not the Keychain.
+  static let key = "oikonome.widgetGlanceExt"
+  struct Stored: Codable { let glance: Glance; let at: Double; let owner: String }
+  /// A digest, not the token: equality is all the entry needs.
   static func stamp(_ token: String) -> String {
     SHA256.hash(data: Data(token.utf8)).map { String(format: "%02x", $0) }.joined()
   }
   /// Save only if the credential the fetch began with is still current.
-  /// Returns whether it saved.
+  /// Returns whether it was (and so whether the payload may be drawn).
   @discardableResult
-  static func save(_ g: Glance, fetchedWith token: String) -> Bool {
-    guard Shared.credential?.token == token,
-          let d = defaults, let data = try? JSONEncoder().encode(g) else { return false }
-    d.set(data, forKey: "glance"); d.set(Date.now.timeIntervalSince1970, forKey: "glance_at")
-    d.set(stamp(token), forKey: "glance_owner")
+  static func save(_ g: Glance, fetchedWith token: String, at started: Date) -> Bool {
+    dropLegacy()
+    guard Shared.credential?.token == token else { return false }
+    let s = Stored(glance: g, at: started.timeIntervalSince1970, owner: stamp(token))
+    if let data = try? JSONEncoder().encode(s) { Shared.write(key, data) }
     return true
   }
-  /// The payload, only if it was fetched under the current credential; an
-  /// entry with no stamp (an older build) is nobody's.
+  /// The payload, only if it was fetched under the current credential.
   static func load() -> (Glance, Date)? {
-    guard let token = Shared.credential?.token, let d = defaults,
-          d.string(forKey: "glance_owner") == stamp(token),
-          let data = d.data(forKey: "glance"),
-          let g = try? JSONDecoder().decode(Glance.self, from: data) else { return nil }
-    return (g, Date(timeIntervalSince1970: d.double(forKey: "glance_at")))
+    dropLegacy()
+    guard let token = Shared.credential?.token, let raw = Shared.read(key),
+          let s = try? JSONDecoder().decode(Stored.self, from: Data(raw.utf8)),
+          s.owner == stamp(token) else { return nil }
+    return (s.glance, Date(timeIntervalSince1970: s.at))
   }
   static func clear() {
-    for k in ["glance", "glance_at", "glance_owner"] { defaults?.removeObject(forKey: k) }
+    Shared.delete(key)
+    dropLegacy()
+  }
+  /// Older builds kept the payload in the app group's defaults, a plist
+  /// that device backups carry; whatever is left there is removed.
+  static func dropLegacy() {
+    guard let d = UserDefaults(suiteName: Shared.accessGroup) else { return }
+    for k in ["glance", "glance_at", "glance_owner"] { d.removeObject(forKey: k) }
   }
 }
 
@@ -245,7 +324,9 @@ struct GlanceView: View {
 
   func verdict(_ g: Glance) -> some View {
     let fetched = entry.fetchedAt ?? .distantPast
-    let stale = Date.now.timeIntervalSince(fetched) > staleAfter
+    // judged at the entry's own date, not the wall clock: WidgetKit may
+    // render a future entry (the midnight one) before its time comes
+    let stale = isStale(fetched: fetched, at: entry.date)
     let allow = g.day_allow ?? 0, spent = g.day_spent ?? 0
     let over = spent > allow + 0.5
     let fill = over ? 1.0 : allow > 0 ? min(1.0, spent / allow) : 0.0

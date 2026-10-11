@@ -1,0 +1,114 @@
+{# ============================================================================
+   The report card body the monthly AND the yearly email share — one
+   anatomy at two scales: a pane with the verdict, two net tiles and the
+   period month by month (and, in the yearly, every year's net); the
+   budget as bars; spending by category as a ring chart. Rendered through
+   todayview.render_mail, which bakes the dark theme into style=
+   attributes; the classes below are the ones the inliner knows.
+
+   Everything here is PRESENTATION of `ctx` (web/lens_email.month_mail_context
+   / year_mail_context); no number is derived in the template, so the
+   plain-text mirror and the HTML cannot disagree.
+
+   Email-safe: tables, no flex, no SVG, no scripts, no external URLs; the
+   chart is an inline PNG. Mail clients have no absolute positioning, so
+   every bar is a table whose cells are the segments.
+   ========================================================================== #}
+{% macro bar(f, tone, h=14, r=7) %}
+    <table cellpadding="0" cellspacing="0" width="100%" role="presentation"
+           style="border-collapse:collapse;table-layout:fixed;background:var(--hover);border-radius:{{ r }}px;margin-top:5px;">
+      <tr>{% if f > 0.2 %}<td style="width:{{ f }}%;height:{{ h }}px;font-size:0;line-height:0;padding:0;border:none;background:{{ tone }};border-radius:{{ r }}px;">&nbsp;</td>{% endif %}
+          <td style="height:{{ h }}px;font-size:0;line-height:0;padding:0;border:none;">&nbsp;</td></tr>
+    </table>
+{% endmacro %}
+
+{# ---- 1. ONE pane for the money question: the verdict, two net tiles,
+      then the period month by month (two rows of six so a phone keeps
+      them legible; each is a month's net, coloured by its sign) ---- #}
+<div class="card" style="margin-top:1rem;">
+  <div>
+    <span class="pill m" style="float:right;margin-left:.65rem;">{{ ctx.status_text }}</span>
+    <span class="{{ ctx.verdict_tone }}" style="font-size:21px;font-weight:800;letter-spacing:-.01em;">{{ ctx.headline }}</span>
+  </div>
+  <div style="clear:both;"></div>
+  <table cellpadding="0" cellspacing="0" width="100%" role="presentation" style="border-collapse:separate;border-spacing:8px 0;table-layout:fixed;margin:12px -8px 0;">
+    <tr>
+      {% for t in ctx.tiles %}
+      <td style="width:50%;background:var(--hover);border-radius:8px;padding:10px 12px;vertical-align:top;">
+        <div class="sub" style="letter-spacing:.08em;text-transform:uppercase;font-size:11.5px;">{{ t.eyebrow }}</div>
+        <div class="kpi {{ t.tone }}" style="font-size:30px;font-weight:750;letter-spacing:-.02em;line-height:1.1;margin-top:2px;">{{ t.value }}</div>
+        {% if t.sub %}<div class="sub" style="font-size:12px;margin-top:3px;">{{ t.sub }}</div>{% endif %}</td>
+      {% endfor %}
+    </tr>
+  </table>
+  {% for row in ctx.strip|batch(6) %}
+  <table cellpadding="0" cellspacing="0" width="100%" role="presentation" style="border-collapse:separate;border-spacing:4px 0;table-layout:fixed;margin:{{ '12px' if loop.first else '4px' }} -4px 0;">
+    <tr>
+      {% for c in row %}
+      <td style="width:16.6%;border-radius:6px;padding:6px 0 5px;text-align:center;font-size:11px;font-weight:700;background:{{ c.bg }};color:{{ c.fg }};{% if c.current %}outline:2px solid var(--ink);{% endif %}">
+        {{ c.abbr }}<br><span style="font-weight:400;font-size:10px;">{{ c.text }}</span>
+      </td>
+      {% endfor %}
+    </tr>
+  </table>
+  {% endfor %}
+  <div class="sub" style="font-size:12px;margin-top:6px;">{{ ctx.strip_legend }}</div>
+  {% if ctx.year_strip %}
+  {# the year in review only: every year the ledger holds, its net, the
+     same cells — six to a row #}
+  <div class="sub" style="letter-spacing:.08em;text-transform:uppercase;font-size:11.5px;margin:1rem 0 .3rem;">Net by year</div>
+  {% for row in ctx.year_strip|batch(6) %}
+  <table cellpadding="0" cellspacing="0" width="100%" role="presentation" style="border-collapse:separate;border-spacing:4px 0;table-layout:fixed;margin:{{ '0' if loop.first else '4px' }} -4px 0;">
+    <tr>
+      {% for c in row %}
+      <td style="width:16.6%;border-radius:6px;padding:6px 0 5px;text-align:center;font-size:11px;font-weight:700;background:{{ c.bg }};color:{{ c.fg }};{% if c.current %}outline:2px solid var(--ink);{% endif %}">
+        {{ c.abbr }}<br><span style="font-weight:400;font-size:10px;">{{ c.text }}</span>
+      </td>
+      {% endfor %}
+      {% for _ in range(6 - row|length) %}<td style="width:16.6%;padding:0;border:none;"></td>{% endfor %}
+    </tr>
+  </table>
+  {% endfor %}
+  {% endif %}
+  <div class="sub" style="margin-top:.8rem;padding-top:.6rem;border-top:1px solid var(--line);">{{ ctx.variable_line | safe }}</div>
+  {% for note in ctx.notes %}<div class="sub warn" style="margin-top:.35rem;">{{ note }}</div>{% endfor %}
+</div>
+
+{# ---- 2. the budget: the bills in one bar, then the variable budget as
+      the household split it, then any bill pinned to Today. The first
+      row of each item is label / actual / "of plan" in three plain
+      cells; the second carries the bar and the note. A year with no
+      budget on record has no card. ---- #}
+{% if ctx.rows %}
+<div class="card">
+  <h2 style="font-size:17px;margin:0 0 8px;font-weight:700;">{{ ctx.bars_title }}</h2>
+  <div class="sub" style="font-size:12px;margin-bottom:6px;">{{ ctx.bars_intro }}</div>
+  <table cellpadding="0" cellspacing="0" width="100%" role="presentation" style="border-collapse:collapse;">
+    {% for r in ctx.rows %}
+    <tr><td style="padding:10px 0 0;border:none;font-weight:700;">{{ r.label }}</td><td class="num {{ r.actual_tone }}" style="padding:10px 0 0;border:none;white-space:nowrap;">{{ r.actual_text }}</td><td class="num sub" style="padding:10px 0 0 8px;border:none;white-space:nowrap;">of {{ r.plan_text }}</td></tr>
+    <tr>
+      <td colspan="3" style="padding:0;border:none;">
+        {{ bar(r.frac, r.bar) }}
+        {% if r.note %}<div class="sub{% if r.note_tone %} {{ r.note_tone }}{% endif %}" style="font-size:12px;margin-top:3px;">{{ r.note }}</div>{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+
+{# ---- 3. where the money went — a ring with a legend (an inline PNG:
+      mail clients strip SVG), the bills under their categories ---- #}
+{% if ctx.cats %}
+<div class="card">
+  <h2 style="font-size:17px;margin:0 0 8px;font-weight:700;">{{ ctx.pie_title }}</h2>
+  <div class="sub" style="font-size:12px;margin-bottom:6px;">{{ ctx.pie_sub }}</div>
+  {% if ctx.cat_pie %}
+  <img src="{{ ctx.cat_pie }}" alt="Spending by category" width="100%" style="display:block;width:100%;max-width:720px;height:auto;border:0;border-radius:8px;">
+  {% else %}
+  <table>
+    {% for c in ctx.cats %}<tr><td>{{ c.label }}</td><td class="num" style="white-space:nowrap;">{{ c.pct }}%</td><td class="num" style="white-space:nowrap;">{{ c.amount_text }}</td></tr>{% endfor %}
+  </table>
+  {% endif %}
+</div>
+{% endif %}

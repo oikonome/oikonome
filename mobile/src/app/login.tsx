@@ -7,7 +7,7 @@ import { useEffect, useState } from "react";
 import { Linking, Platform, Pressable, StyleSheet, Text,
          TextInput, View } from "react-native";
 
-import { abandonMintGrant, ApiError, getVerifiedServerUrl,
+import { abandonMintGrant, ApiError, errText, getVerifiedServerUrl,
          loginAndMintDevice, mintDeviceWithGrant, requestUnlock,
          PINNED_SERVER_URL } from "../lib/api";
 import { deviceLimitRetry, mintGrantRefused,
@@ -132,6 +132,12 @@ export default function Login() {
   // see passkeyMaybeAvailable); whether the SERVER does passkeys at all
   // is only learned when the button is tapped
   const canPasskey = passkeyMaybeAvailable(serverUrl ?? "");
+  // A refusal after a good login (the mint said no) leaves that login's
+  // session open on the server. Every way out that does not spend the
+  // grant closes it, so no half-made session is left behind.
+  const dropGrant = (grant: MintGrant | null | undefined) =>
+    serverUrl && grant ? abandonMintGrant(serverUrl, grant)
+                       : Promise.resolve();
 
   const passkey = async (replaceDeviceId = "") => {
     if (!serverUrl) { router.replace("/connect"); return; }
@@ -146,7 +152,10 @@ export default function Login() {
     } catch (e) {
       if (tookDeviceLimit(e, "passkey", false)) {
         // the picker is showing; nothing else to say
-      } else if (e instanceof ApiError && e.status === 404) {
+        return;
+      }
+      if (e instanceof ApiError) void dropGrant(e.mintGrant);
+      if (e instanceof ApiError && e.status === 404) {
         setErr("This server doesn't offer passkey sign-in. Use your "
                + "password.");
       } else if (e instanceof PasskeySheetError) {
@@ -178,7 +187,10 @@ export default function Login() {
     } catch (e) {
       if (tookDeviceLimit(e, "password", totp.trim() !== "")) {
         // the picker is showing; nothing else to say
-      } else if (e instanceof ApiError && e.detail === "totp_required") {
+        return;
+      }
+      if (e instanceof ApiError) void dropGrant(e.mintGrant);
+      if (e instanceof ApiError && e.detail === "totp_required") {
         setNeedsTotp(true);
         setErr(null);
       } else if (e instanceof ApiError && e.detail === "passkey_required") {
@@ -199,7 +211,7 @@ export default function Login() {
             + "yourself a sign-in link below: open it, then sign in here "
             + "as usual.");
       } else {
-        setErr(e instanceof ApiError ? e.detail : String(e));
+        setErr(errText(e));
       }
     } finally {
       setBusy(false);
@@ -214,8 +226,12 @@ export default function Login() {
   const replaceAndFinish = async (lim: NonNullable<typeof limit>,
                                   deviceId: string) => {
     if (!serverUrl) { router.replace("/connect"); return; }
-    const fallBack = () => {
+    // the fallback signs in afresh, so this grant's session is closed
+    // first — closed after, its logout could take the new sign-in's
+    // session with it
+    const fallBack = async () => {
       const plan = deviceLimitRetry(null, Date.now(), lim.usedCode);
+      await dropGrant(lim.grant);
       setLimit(null);
       if (lim.via === "passkey") void passkey(deviceId);
       else if (plan === "login") void submit(deviceId);
@@ -231,7 +247,7 @@ export default function Login() {
     };
     if (deviceLimitRetry(lim.grant, Date.now(), lim.usedCode) !== "mint"
         || !lim.grant) {
-      fallBack();
+      await fallBack();
       return;
     }
     setBusy(true);
@@ -247,9 +263,11 @@ export default function Login() {
         // still at the ceiling (the roster changed meanwhile): the picker
         // shows the fresh roster, with the same grant
       } else if (e instanceof ApiError && mintGrantRefused(e.status)) {
-        fallBack();
+        await fallBack();
       } else {
-        setErr(e instanceof ApiError ? e.detail : String(e));
+        // the grant may still be good (a dropped connection): the picker
+        // stays, and its Cancel closes the session
+        setErr(errText(e));
       }
     } finally {
       setBusy(false);
@@ -337,8 +355,7 @@ export default function Login() {
                                 + "usual — the link itself does not sign "
                                 + "you in.");
                        })
-                       .catch((e) => setErr(e instanceof ApiError
-                         ? e.detail : String(e)))
+                       .catch((e) => setErr(errText(e)))
                        .finally(() => setBusy(false));
                    }}>
           <Text style={s.link}>

@@ -10,8 +10,8 @@ import { flushSync } from "react-dom";
 import { Link, useNavigate } from "react-router";
 import ReceiptPanel from "./ReceiptPanel";
 import SplitPanel from "./SplitPanel";
-import { api, errText, mmdd, money as money$, type Entity, type Txn, catLabel } from "../api/client";
-import { patchQueries } from "../api/cache";
+import { api, BULK_CHUNK, BULK_MAX, errText, mmdd, money as money$, type Entity, type Txn, catLabel, promptCategoryName } from "../api/client";
+import { invalidateRollups, patchQueries } from "../api/cache";
 import MerchantAvatar from "./MerchantAvatar";
 import { isViewer } from "../role";
 import { spendPickerGroups } from "../moneymath";
@@ -604,9 +604,14 @@ export default memo(function TxnTable({ rows, showAccount = true,
     if (n.has(id)) n.delete(id); else n.add(id);
     return n;
   }), []);
+  // pieces written so far of a selection larger than one request
+  const [bulkProg, setBulkProg] = useState<{ done: number; total: number } | null>(null);
+  const tooMany = sel.size > BULK_MAX;
   const bulk = useMutation({
     mutationFn: ({ action, category }: { action: string; category?: string }) =>
-      api.txnBulk([...sel], action, category),
+      api.txnBulkChunked([...sel], action, category,
+        (done, total) => setBulkProg(total > BULK_CHUNK ? { done, total } : null)),
+    onSettled: () => setBulkProg(null),
     // the ids the write covered, captured at send time — the selection is
     // cleared on success, after the rows it named have been patched
     onMutate: () => ({ ids: new Set(sel) }),
@@ -631,8 +636,12 @@ export default memo(function TxnTable({ rows, showAccount = true,
       window.dispatchEvent(new CustomEvent("oiko-toast",
         { detail: bits.join(" · ") }));
     },
-    onError: (e) => window.dispatchEvent(new CustomEvent("oiko-toast",
-      { detail: `Bulk update failed — ${errText(e)}` })),
+    onError: (e) => {
+      // pieces before a failed one stay written, so the lists refetch
+      invalidate();
+      window.dispatchEvent(new CustomEvent("oiko-toast",
+        { detail: `Bulk update failed — ${errText(e)}` }));
+    },
   });
   // a business cost paid on a personal card can be capitalized
   // (contribution) or marked reimbursable, assigning it to an entity. Only
@@ -668,6 +677,7 @@ export default memo(function TxnTable({ rows, showAccount = true,
     // the Merchants detail panel shows the merchant's category and rule,
     // which an "all" recategorize just changed
     qc.invalidateQueries({ queryKey: ["merchant-detail"] });
+    invalidateRollups(qc);
   }, [qc]);
   // the row is gone, not changed — take it out of every cached list
   // showing it so it leaves the table in the same frame the response
@@ -699,6 +709,7 @@ export default memo(function TxnTable({ rows, showAccount = true,
       qc.invalidateQueries({ queryKey: ["txns"] });
       qc.invalidateQueries({ queryKey: ["today"] });
       qc.invalidateQueries({ queryKey: ["bills-history"] });
+      invalidateRollups(qc);
       window.dispatchEvent(new CustomEvent("oiko-toast",
         { detail: "Pending transaction removed." }));
     },
@@ -740,6 +751,8 @@ export default memo(function TxnTable({ rows, showAccount = true,
       qc.invalidateQueries({ queryKey: ["txns"] });
       qc.invalidateQueries({ queryKey: ["today"] });
       qc.invalidateQueries({ queryKey: ["bills-history"] });
+      // the Month / Year lenses and the reports total by category
+      invalidateRollups(qc);
       if (flagging || v.category === "__unflag__")
         qc.invalidateQueries({ queryKey: ["reimb"] });
       // only a merchant-wide write changes the merchant's rule
@@ -850,7 +863,7 @@ export default memo(function TxnTable({ rows, showAccount = true,
       return;
     }
     if (category === "__customcat__") {
-      const name = window.prompt("Custom category name:")?.trim();
+      const name = promptCategoryName();
       if (!name) return;
       category = name;
     }
@@ -873,6 +886,7 @@ export default memo(function TxnTable({ rows, showAccount = true,
       qc.invalidateQueries({ queryKey: ["biz"] });
       qc.invalidateQueries({ queryKey: ["today"] });
       qc.invalidateQueries({ queryKey: ["bills-history"] });
+      invalidateRollups(qc);
     },
   });
   const bizMutate = biz.mutate;
@@ -976,9 +990,14 @@ export default memo(function TxnTable({ rows, showAccount = true,
         no-op */}
     {sel.size > 0 && (
       <div className="bulkbar">
-        <b>{sel.size} selected</b>
+        <b>{bulkProg ? `Updating ${bulkProg.done.toLocaleString()} of `
+                       + `${bulkProg.total.toLocaleString()}…`
+                     : `${sel.size.toLocaleString()} selected`}</b>
+        {tooMany && (
+          <span className="mut">select fewer than {BULK_MAX.toLocaleString()}</span>
+        )}
         <select value="" aria-label="set a category for the selected rows"
-                disabled={bulk.isPending}
+                disabled={bulk.isPending || tooMany}
                 onChange={(e) => {
                   if (e.target.value) bulk.mutate({ action: "category",
                                                     category: e.target.value });
@@ -987,16 +1006,16 @@ export default memo(function TxnTable({ rows, showAccount = true,
           <option value="">recategorize…</option>
           {catGroups}
         </select>
-        <button disabled={bulk.isPending}
+        <button disabled={bulk.isPending || tooMany}
                 onClick={() => bulk.mutate({ action: "biz_on" })}>
           mark business</button>
-        <button disabled={bulk.isPending}
+        <button disabled={bulk.isPending || tooMany}
                 onClick={() => bulk.mutate({ action: "biz_off" })}>
           unmark business</button>
-        <button disabled={bulk.isPending}
+        <button disabled={bulk.isPending || tooMany}
                 onClick={() => bulk.mutate({ action: "reimb_flag" })}>
           ⚑ expect reimbursement</button>
-        <button disabled={bulk.isPending}
+        <button disabled={bulk.isPending || tooMany}
                 onClick={() => bulk.mutate({ action: "reimb_unflag" })}>
           unflag</button>
         <button style={{ marginLeft: "auto" }}

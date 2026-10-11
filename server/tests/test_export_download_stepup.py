@@ -65,6 +65,85 @@ class ExportDownloadStepupTests(unittest.TestCase):
         # deleting on read is what makes a leaked URL worthless
         self.assertEqual(self.client.get(url).status_code, 403)
 
+    def test_the_download_names_what_a_restore_would_refuse(self):
+        """The archive still downloads whole; the reasons the export found
+        travel beside it, where a client can show them, and a clean
+        archive carries none."""
+        import json
+        from oikonome.sync import export
+        from oikonome.web import pages
+
+        def _get():
+            r = self.client.post("/api/export/token",
+                                 json={"kind": "zip", "password": PW})
+            return self.client.get(r.json()["url"])
+
+        clean = _get()
+        self.assertEqual(clean.status_code, 200)
+        self.assertNotIn(pages.EXPORT_WARNINGS_HEADER, clean.headers)
+        note = "notes.csv in this ZIP is too large to restore (9 MB — the cap)"
+        with mock.patch.object(export, "restore_limits",
+                               return_value=[note]):
+            got = _get()
+        self.assertEqual(got.status_code, 200)
+        self.assertIn("RESTORE-NOTE.txt",
+                      zipfile.ZipFile(io.BytesIO(got.content)).namelist())
+        self.assertEqual(json.loads(
+            got.headers[pages.EXPORT_WARNINGS_HEADER]), [note])
+
+    def test_the_warnings_can_be_read_back_after_the_download(self):
+        """A browser download is a navigation and the phone saves through
+        a file API: neither reads a response header, so the export's
+        findings are also answered by GET /api/export/last."""
+        from oikonome.sync import export
+        note = "the archive is 900 MB, over the 512 MB a restore upload takes"
+        with mock.patch.object(export, "restore_limits",
+                               return_value=[note]):
+            r = self.client.post("/api/export/token",
+                                 json={"kind": "zip", "password": PW})
+            self.assertEqual(self.client.get(r.json()["url"]).status_code,
+                             200)
+        last = self.client.get("/api/export/last").json()
+        self.assertEqual(last["warnings"], [note])
+        self.assertTrue(last["at"])
+        r = self.client.post("/api/export/token",
+                             json={"kind": "zip", "password": PW})
+        self.client.get(r.json()["url"])
+        self.assertEqual(self.client.get("/api/export/last").json()
+                         ["warnings"], [])
+
+    def test_the_record_is_written_before_the_body_is_sent(self):
+        """A client that starts the download by navigation polls
+        /api/export/last until `at` moves past what it read before. The
+        record is written once the archive is built, before its first byte
+        goes out, so a poll during a long download already sees it."""
+        from oikonome.db import tenancy
+        from oikonome.web import pages
+        admin = tenancy.admin_connect()
+        try:
+            row = admin.execute(
+                "SELECT id, tenant_id FROM users WHERE email = %s",
+                (self.email,)).fetchone()
+        finally:
+            admin.close()
+        before = self.client.get("/api/export/last").json()["at"]
+        user = {"role": "owner", "user_id": row["id"],
+                "tenant_id": str(row["tenant_id"])}
+        with mock.patch.object(pages, "_redeem_export_ticket"):
+            resp = pages.export_data(user=user, t="oikx-test")
+        try:
+            after = self.client.get("/api/export/last").json()["at"]
+            self.assertTrue(after)
+            self.assertNotEqual(after, before)
+        finally:
+            # send the body now, which closes the archive's handle
+            import asyncio
+
+            async def drain():
+                async for _ in resp.body_iterator:
+                    pass
+            asyncio.run(drain())
+
     def test_ticket_is_bound_to_its_kind_and_user(self):
         # a dump ticket does not open the ZIP door (nor the reverse)
         d = self.client.post("/api/export/token",
@@ -93,6 +172,38 @@ class ExportDownloadStepupTests(unittest.TestCase):
             r = self.client.post("/api/export/token",
                                  json={"kind": "zip", "password": PW})
         self.assertEqual(self.client.get(r.json()["url"]).status_code, 403)
+
+    def test_the_precheck_answers_without_spending_the_ticket(self):
+        """The browser saves by navigating, so a refusal at the download
+        would replace the app with a bare error page; the precheck gives
+        the same answer first, and leaves the ticket for the download."""
+        r = self.client.post("/api/export/token",
+                             json={"kind": "zip", "password": PW})
+        tok = r.json()["token"]
+        pre = self.client.get(f"/api/export/precheck?kind=zip&t={tok}")
+        self.assertEqual(pre.status_code, 204, pre.text)
+        self.assertEqual(self.client.get(r.json()["url"]).status_code, 200)
+        # spent now: the precheck says so, in JSON the app can show
+        pre = self.client.get(f"/api/export/precheck?kind=zip&t={tok}")
+        self.assertEqual(pre.status_code, 403)
+        self.assertIn("expired or already used", pre.json()["detail"])
+
+    def test_the_precheck_refuses_what_the_download_refuses(self):
+        self.assertEqual(self.client.get(
+            "/api/export/precheck?kind=zip").status_code, 403)
+        d = self.client.post("/api/export/token",
+                             json={"kind": "dump", "password": PW})
+        tok = d.json()["token"]
+        # a dump ticket does not answer for the ZIP
+        self.assertEqual(self.client.get(
+            f"/api/export/precheck?kind=zip&t={tok}").status_code, 403)
+        # and the dump's own instance gates are asked too
+        with mock.patch.dict(os.environ, {"OIKONOME_HOSTED": "1"}):
+            pre = self.client.get(f"/api/export/precheck?kind=dump&t={tok}")
+        self.assertEqual(pre.status_code, 403)
+        self.assertIn("self-hosted", pre.json()["detail"])
+        self.assertEqual(self.client.get(
+            "/api/export/precheck?kind=bogus&t=x").status_code, 400)
 
     def test_totp_account_needs_a_live_code(self):
         from fastapi.testclient import TestClient

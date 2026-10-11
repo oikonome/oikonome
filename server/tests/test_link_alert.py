@@ -93,7 +93,8 @@ class BuildAlertTests(unittest.TestCase):
                         "new": "error:ITEM_LOGIN_REQUIRED"}]
         with mock.patch("oikonome.web.report.send") as send:
             out = link_alert.notify(transitions, ["a@x.dev"])
-        self.assertEqual(out, {"broke": ["Chase"], "fixed": []})
+        self.assertEqual(out, {"broke": ["Chase"], "fixed": [],
+                               "delivered": True})
         send.assert_called_once()
         self.assertEqual(send.call_args.args[3], ["a@x.dev"])
         # nothing alert-worthy → no send, no recipients needed
@@ -205,6 +206,84 @@ class WorkerTransitionTests(unittest.TestCase):
                         side_effect=OSError("smtp down")):
             out = worker.sync_tenant(self.tid)          # must not raise
         self.assertEqual(out["pl-1"], "error:PlaidError")
+
+
+    def test_a_refused_alert_is_sent_again_on_the_next_sweep(self):
+        """Every recipient refused by a configured relay = nothing went
+        out: the edge stays unannounced (and the push waits with it) so the
+        next sweep mails the break again instead of losing it for good."""
+        def fail(conn, item_id):
+            raise plaid.PlaidError(
+                {"error_code": "ITEM_LOGIN_REQUIRED",
+                 "error_type": "ITEM_ERROR", "error_message": "x"}, 400)
+        relay = {"configured": True, "host": "relay.example", "port": 587}
+        with mock.patch("oikonome.web.report.resolve_smtp",
+                        return_value=relay):
+            with mock.patch.object(worker.plaid, "sync", side_effect=fail), \
+                 mock.patch.object(worker.plaid, "sync_products",
+                                   return_value={}), \
+                 mock.patch("oikonome.web.report.send",
+                            side_effect=OSError("relay down")), \
+                 mock.patch("oikonome.notify.push_native.send_tenant") as n1:
+                worker.sync_tenant(self.tid)
+            n1.assert_not_called()
+            send, _, native = self._run(fail)
+        send.assert_called_once()
+        self.assertTrue(send.call_args.args[0].startswith("⚠️"))
+        native.assert_called_once()
+        send, _, native = self._run(fail)                # now announced
+        send.assert_not_called()
+
+    def test_a_mail_that_keeps_failing_is_given_up_and_the_push_sent(self):
+        """A relay that never comes back must not hold the edge, and the
+        push waiting on it, forever: after the bounded retries the edge is
+        announced without the mail, the push goes out once, and later
+        sweeps stay silent."""
+        def fail(conn, item_id):
+            raise plaid.PlaidError(
+                {"error_code": "ITEM_LOGIN_REQUIRED",
+                 "error_type": "ITEM_ERROR", "error_message": "x"}, 400)
+        relay = {"configured": True, "host": "relay.example", "port": 587}
+        pushes = 0
+        mails = 0
+        with mock.patch("oikonome.web.report.resolve_smtp",
+                        return_value=relay):
+            for _ in range(link_alert.MAIL_RETRY_SWEEPS + 2):
+                with mock.patch.object(worker.plaid, "sync",
+                                       side_effect=fail), \
+                     mock.patch.object(worker.plaid, "sync_products",
+                                       return_value={}), \
+                     mock.patch("oikonome.web.report.send",
+                                side_effect=OSError("relay down")) as send, \
+                     mock.patch("oikonome.notify.push.send_tenant"), \
+                     mock.patch("oikonome.notify.push_native.send_tenant"
+                                ) as native:
+                    worker.sync_tenant(self.tid)
+                mails += send.call_count
+                pushes += native.call_count
+        self.assertEqual(mails, link_alert.MAIL_RETRY_SWEEPS)
+        self.assertEqual(pushes, 1)
+
+    def test_sync_heartbeat_stamped_when_one_connection_keeps_failing(self):
+        """One connection that fails every hour (a bank wanting a fresh
+        login) must not keep Doctor's bank-sync row red while the others
+        sync: the pass ran, and the failure is counted in the note."""
+        self.conn.execute(
+            "INSERT INTO items (id, aggregator, institution_name, "
+            "access_token, status) VALUES "
+            "('pl-2','plaid','Good Bank','enc-tok','ok')")
+
+        def some(conn, item_id):
+            if item_id == "pl-1":
+                raise plaid.PlaidError(
+                    {"error_code": "ITEM_LOGIN_REQUIRED",
+                     "error_type": "ITEM_ERROR", "error_message": "x"}, 400)
+            return {"added": 0}
+        self._run(some)
+        hb = self.conn.execute(
+            "SELECT note FROM job_runs WHERE job='sync'").fetchone()
+        self.assertIsNotNone(hb)
+        self.assertEqual(hb["note"], "1 ok, 1 failed")
 
 
 if __name__ == "__main__":

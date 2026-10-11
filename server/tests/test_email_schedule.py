@@ -1,5 +1,5 @@
 """Email scheduling: cadence due-logic (local-time, per-day
-guards, legacy fallback) and the weekly/monthly lens-email builders."""
+guards, legacy fallback) and the monthly/yearly lens-email builders."""
 
 import datetime as dt
 import unittest
@@ -42,7 +42,7 @@ class DueTests(unittest.TestCase):
         """A restore can plant non-dict cadence entries (the API validates
         writes; restore does not). The hourly sweep must skip them, not
         crash — a crash here silences EVERY cadence for the tenant."""
-        _set_sched(self.conn, daily=True, weekly="x", monthly=7, yearly=[1])
+        _set_sched(self.conn, daily=True, monthly="x", yearly=[1])
         with mock.patch.dict("os.environ", {"OIKONOME_TZ": "UTC"}):
             self.assertEqual(
                 worker.emails_due(self.conn, _utc(2026, 7, 15, 23)), [])
@@ -94,47 +94,76 @@ class DueTests(unittest.TestCase):
     def test_cadences_fire_on_their_local_slots(self):
         _set_sched(self.conn,
                    daily={"on": True, "hour": 7},
-                   weekly={"on": True, "hour": 8, "weekday": 2},  # Wednesday
-                   monthly={"on": True, "hour": 9})
+                   monthly={"on": True, "hour": 9},
+                   # a stored weekly entry from before the report was
+                   # retired: ignored, never due
+                   weekly={"on": True, "hour": 8, "weekday": 2})
         with mock.patch.dict("os.environ", {"OIKONOME_TZ": "UTC"}):
             # chronological sweeps, stamping each cadence as it "sends"
             # (job_runs persists, so out-of-order dates would false-guard).
-            # 2026-07-01 is a Wednesday AND the 1st → all three fire.
+            # 2026-07-01 is a Wednesday AND the 1st → daily and monthly fire.
             self.assertEqual(
                 worker.emails_due(self.conn, _utc(2026, 7, 1, 7)), ["daily"])
             self._stamp("daily-email", _utc(2026, 7, 1, 7))
             self.assertEqual(
-                worker.emails_due(self.conn, _utc(2026, 7, 1, 8)), ["weekly"])
-            self._stamp("weekly-email", _utc(2026, 7, 1, 8))
+                worker.emails_due(self.conn, _utc(2026, 7, 1, 8)), [])
             self.assertEqual(
                 worker.emails_due(self.conn, _utc(2026, 7, 1, 9)), ["monthly"])
             self._stamp("monthly-email", _utc(2026, 7, 1, 9))
             self.assertEqual(   # all guarded the rest of the day
                 worker.emails_due(self.conn, _utc(2026, 7, 1, 10)), [])
-            # 2026-07-15 (Wed, not the 1st): daily + weekly, no monthly
+            # 2026-07-15 (Wed, not the 1st): daily only
             self.assertEqual(
                 worker.emails_due(self.conn, _utc(2026, 7, 15, 7)), ["daily"])
             self._stamp("daily-email", _utc(2026, 7, 15, 7))
             self.assertEqual(
-                worker.emails_due(self.conn, _utc(2026, 7, 15, 8)), ["weekly"])
-            self._stamp("weekly-email", _utc(2026, 7, 15, 8))
+                worker.emails_due(self.conn, _utc(2026, 7, 15, 8)), [])
             self.assertEqual(
                 worker.emails_due(self.conn, _utc(2026, 7, 15, 20)), [])
 
+    def test_a_missed_first_still_sends_the_monthly_and_yearly_cards(self):
+        """A relay outage or a worker down from the send hour to midnight
+        on the 1st must not lose the month's (or the year's) card: it stays
+        due for a few days until this period's send is stamped, then stops;
+        weeks late it is never sent."""
+        _set_sched(self.conn, monthly={"on": True, "hour": 9},
+                   yearly={"on": True, "hour": 9})
+        with mock.patch.dict("os.environ", {"OIKONOME_TZ": "UTC"}):
+            # last period's sends happened on time
+            self._stamp("monthly-email", _utc(2026, 12, 1, 9))
+            self._stamp("yearly-email", _utc(2026, 1, 1, 9))
+            # Jan 1 never sent (every attempt failed): Jan 2 catches up,
+            # from the household's send hour (never in the small hours)
+            self.assertEqual(worker.emails_due(self.conn, _utc(2027, 1, 2, 3)),
+                             [])
+            self.assertEqual(worker.emails_due(self.conn, _utc(2027, 1, 2, 9)),
+                             ["monthly", "yearly"])
+            self._stamp("monthly-email", _utc(2027, 1, 2, 9))
+            self.assertEqual(worker.emails_due(self.conn, _utc(2027, 1, 2, 10)),
+                             ["yearly"])
+            self._stamp("yearly-email", _utc(2027, 1, 2, 10))
+            self.assertEqual(
+                worker.emails_due(self.conn, _utc(2027, 1, 3, 9)), [])
+            # a February 1 that never sent is not sent weeks late
+            self.assertEqual(
+                worker.emails_due(self.conn, _utc(2027, 2, 3, 9)), ["monthly"])
+            self.assertEqual(
+                worker.emails_due(self.conn, _utc(2027, 2, 10, 9)), [])
+
     def test_off_cadence_never_fires_and_guard_dedupes(self):
         _set_sched(self.conn, daily={"on": False, "hour": 7},
-                   weekly={"on": True, "hour": 7, "weekday": 2})
+                   monthly={"on": True, "hour": 7})
         with mock.patch.dict("os.environ", {"OIKONOME_TZ": "UTC"}):
             self.assertEqual(
-                worker.emails_due(self.conn, _utc(2026, 7, 15, 7)), ["weekly"])
+                worker.emails_due(self.conn, _utc(2026, 7, 1, 7)), ["monthly"])
             # heartbeat stamped INSIDE the fake day → guarded
             self.conn.execute(
                 "INSERT INTO job_runs (job, ran_at) VALUES "
-                "('weekly-email', %s) ON CONFLICT (tenant_id, job) "
+                "('monthly-email', %s) ON CONFLICT (tenant_id, job) "
                 "DO UPDATE SET ran_at=EXCLUDED.ran_at",
-                (_utc(2026, 7, 15, 7),))
+                (_utc(2026, 7, 1, 7),))
             self.assertEqual(
-                worker.emails_due(self.conn, _utc(2026, 7, 15, 7)), [])
+                worker.emails_due(self.conn, _utc(2026, 7, 1, 7)), [])
 
     def test_a_household_zone_beats_the_instance_zone(self):
         """A hosted instance runs on one clock and its households on many.
@@ -191,17 +220,12 @@ class LensEmailTests(unittest.TestCase):
     def tearDown(self):
         self.conn.close()
 
-    def test_weekly_builds(self):
-        subject, plain, html = lens_email.build_weekly(self.conn, TODAY)
-        self.assertIn("Week of", subject)
-        self.assertIn("budget", subject.lower())
-        self.assertIn("Day by day", html)
-        self.assertIn("$", plain)
-
     def test_monthly_builds(self):
         subject, plain, html = lens_email.build_monthly(self.conn, TODAY)
         self.assertIn("report card", subject)
-        self.assertIn("LAST MONTH SHOP", html)
+        self.assertNotIn("budget budget", subject.lower())
+        self.assertRegex(subject, r"report card: (ON|OVER|UNDER) budget \(")
+        self.assertIn("Spending by category", html)
         self.assertIn("$", plain)
 
 

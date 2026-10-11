@@ -24,6 +24,11 @@ def _h(token: str) -> str:
 def create_session(conn, user_id, tenant_id, user_agent: str = "",
                    ip: str = "") -> str:
     token = secrets.token_urlsafe(32)
+    # Sessions past their deadline are refused on lookup but would stay as
+    # rows, and what hangs off a session (a browser's web-push
+    # subscription) is removed only when its row goes. Each sign-in clears
+    # the expired ones, so a dead cookie's channel dies with it.
+    conn.execute("DELETE FROM sessions WHERE expires_at <= now()")
     conn.execute(
         """INSERT INTO sessions (token_hash, user_id, tenant_id, expires_at,
                                  user_agent, ip)

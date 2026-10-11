@@ -24,9 +24,30 @@ from __future__ import annotations
 import logging
 import math
 
+from .budget import FEED_REMOVED_KEY as _FEED_REMOVED_KEY
+
 log = logging.getLogger("oikonome.equity")
 
 KINDS = ("contribution", "draw", "distribution", "reimbursement")
+
+# The two ways a personally-paid business cost is explained. One expense
+# takes exactly one of them, for exactly one entity.
+FRONTED_KINDS = ("contribution", "reimbursement")
+
+
+# Which movements (alias `m`) the capital figures count. A fronted movement
+# on a charge the bank feed withdrew explains a cost the books no longer
+# count (they skip removed rows), so it stops counting at the same moment,
+# not only once the nightly sweep removes it (release_withdrawn_fronted).
+COUNTS_IN_CAPITAL = f"""NOT (m.kind IN ('contribution', 'reimbursement')
+    AND EXISTS (SELECT 1 FROM transactions wt
+                 WHERE wt.id = m.txn_id AND wt.removed = 1
+                   AND wt.raw ? '{_FEED_REMOVED_KEY}'))"""
+
+
+class FrontedExpenseConflict(ValueError):
+    """The transaction is already explained by a different movement — the
+    other kind, or the same kind for another entity."""
 
 
 def _row(r: dict) -> dict:
@@ -82,6 +103,13 @@ def record_movement(conn, entity_id: str, *, kind: str, amount, date,
         r = conn.execute(
             "SELECT * FROM equity_movement WHERE txn_id=%s AND kind=%s",
             (txn_id, kind)).fetchone()
+        # the unique key carries no entity: the movement that won may belong
+        # to another entity, and handing it back as this one's would report
+        # success for a booking that never happened
+        if r is not None and str(r["entity_id"]) != str(entity_id):
+            raise FrontedExpenseConflict(
+                f"that transaction already has a {kind} recorded for "
+                "another business")
     if r is None:
         raise ValueError("could not record the movement")
     return _row(r)
@@ -114,8 +142,10 @@ def capital_summary(conn, entity_id: str, *, lifetime=None) -> dict:
     just isn't the capital account. `lifetime` is the entity's all-history
     transaction list (books.entity_transactions) when the caller has it."""
     rows = conn.execute(
-        "SELECT kind, COALESCE(SUM(amount),0) AS s FROM equity_movement "
-        "WHERE entity_id = %s GROUP BY kind", (entity_id,)).fetchall()
+        f"""SELECT m.kind, COALESCE(SUM(m.amount),0) AS s
+              FROM equity_movement m
+             WHERE m.entity_id = %s AND {COUNTS_IN_CAPITAL}
+             GROUP BY m.kind""", (entity_id,)).fetchall()
     by = {r["kind"]: float(r["s"]) for r in rows}
     contrib = by.get("contribution", 0.0)
     draws = by.get("draw", 0.0) + by.get("distribution", 0.0)
@@ -131,23 +161,50 @@ def capital_summary(conn, entity_id: str, *, lifetime=None) -> dict:
             .get("net_operating") or 0)
     except Exception:                                     # noqa: BLE001
         log.warning("capital summary: net income unavailable", exc_info=True)
+    balance = round(contrib + net_income - draws, 2)
+    # the household member's share of the capital account, by their
+    # ownership percentage, when one member is marked as the household
+    ours = conn.execute(
+        "SELECT ownership_pct FROM entity_membership "
+        "WHERE entity_id = %s AND is_household "
+        "ORDER BY created_at, id LIMIT 1",
+        (entity_id,)).fetchone()
+    pct = (float(ours["ownership_pct"])
+           if ours and ours["ownership_pct"] is not None else None)
     return {"contributions": round(contrib, 2),
             "draws": round(by.get("draw", 0.0), 2),
             "distributions": round(by.get("distribution", 0.0), 2),
             "reimbursements": round(by.get("reimbursement", 0.0), 2),
             "net_income": round(net_income, 2),
             "movements_balance": round(contrib - draws, 2),
-            "capital_balance": round(contrib + net_income - draws, 2)}
+            "capital_balance": balance,
+            "household_share_pct": pct,
+            "household_capital": (round(balance * pct / 100.0, 2)
+                                  if pct is not None else None)}
 
 
 def _txn_row(conn, txn_id: str) -> tuple:
     """The expense (amount, date) for a fronted business cost — ONE query.
     positive = money out (an expense); contribute/reimburse only make sense for
-    an expense, so a deposit/revenue row is rejected."""
-    r = conn.execute("SELECT amount, date FROM transactions WHERE id = %s",
-                     (txn_id,)).fetchone()
+    an expense, so a deposit/revenue row is rejected.
+
+    A fronted cost is one a member paid PERSONALLY. A charge on an account
+    a business owns was paid by that business, so booking it as a member's
+    contribution (or as money the business owes the member) would raise a
+    capital account with money that came out of a business's bank, and
+    move the cost off the paying business's books. A personal charge
+    already booked to a business by hand stays allowed: the account, not
+    the override, says who paid."""
+    r = conn.execute(
+        """SELECT t.amount, t.date, a.entity_id AS account_entity
+             FROM transactions t LEFT JOIN accounts a ON a.id = t.account_id
+            WHERE t.id = %s FOR UPDATE OF t""", (txn_id,)).fetchone()
     if not r:
         raise ValueError("no such transaction")
+    if r["account_entity"] is not None:
+        raise FrontedExpenseConflict(
+            "that charge was paid from a business account, not personally: "
+            "only a cost a member paid can be capitalized or reimbursed")
     if r["amount"] is None:
         raise ValueError("that transaction has no amount")
     amt = float(r["amount"])
@@ -174,8 +231,42 @@ def _front_expense(conn, entity_id: str, txn_id: str, *, kind: str,
     transaction stayed booked to the business with nothing recording why —
     the P&L and capital summary silently wrong, and no 'unassign' in the UI
     to undo it. Either both halves happen or neither does."""
-    amt, txn_date = _txn_row(conn, txn_id)
+    from . import entities
     with conn.transaction():
+        # Under the transaction's row lock, so two picks for one expense
+        # serialize: the expense is capitalized OR reimbursed, to ONE
+        # entity. A second pick naming another entity would otherwise move
+        # the row while the first entity keeps the contribution (one capital
+        # account overstated, the other understated), and capitalize-then-
+        # reimburse would count one cost twice. Repeating the same pick is
+        # a no-op; changing it means deleting the first movement.
+        # A pending hold that has posted is fronted as its posted row, at the
+        # posted amount (entities.live_txn_id).
+        txn_id = entities.live_txn_id(conn, txn_id)
+        if txn_id is None:
+            raise ValueError("no such transaction")
+        amt, txn_date = _txn_row(conn, txn_id)
+        # the entity is checked under this transaction, after the row lock
+        # (the order entities.delete_forever takes them in), so an archive
+        # cannot land between the check and the movement
+        entities.require_active(conn, entity_id)
+        prior = conn.execute(
+            """SELECT m.*, e.name AS entity_name FROM equity_movement m
+               LEFT JOIN business_entity e ON e.id = m.entity_id
+               WHERE m.txn_id = %s AND m.kind = ANY(%s)
+               ORDER BY m.created_at, m.id""",
+            (txn_id, list(FRONTED_KINDS))).fetchall()
+        for p in prior:
+            if str(p["entity_id"]) == str(entity_id) and p["kind"] == kind:
+                return _row(p)
+        if prior:
+            p = prior[0]
+            how = ("capitalized" if p["kind"] == "contribution"
+                   else "marked reimbursable")
+            raise FrontedExpenseConflict(
+                f"that expense is already {how} for "
+                f"{p['entity_name'] or 'another business'}: delete that "
+                "movement first")
         _assign(conn, txn_id, entity_id)
         return record_movement(conn, entity_id, kind=kind, amount=amt,
                                date=date or txn_date, member_id=member_id,
@@ -198,3 +289,56 @@ def reimburse_expense(conn, entity_id: str, txn_id: str, *,
     return _front_expense(
         conn, entity_id, txn_id, kind="reimbursement", member_id=member_id,
         date=date, note=note or "reimbursement of personally-paid expense")
+
+
+def release_withdrawn_fronted(conn, txn_ids: list[str], *,
+                              older_than_days: int | None = None) -> int:
+    """Remove the fronted movements (a capitalized cost or one marked
+    reimbursable) still on charges the bank feed withdrew, once their
+    twin wait is over. Returns how many were removed.
+
+    The books stop counting a withdrawn charge, so the cost leaves the
+    entity's P&L; the movement explaining who funded it would otherwise
+    stay on the capital account (or as money the business owes the
+    member) for a payment that never happened. The nightly re-anchor sweep
+    calls this beside budget.release_withdrawn_pairs with the same row ids
+    — those its twin search found no re-numbered twin for — and the same
+    `older_than_days`: a row withdrawn more recently can still be carried
+    onto its twin, and the movement with it. Only posted rows the feed
+    itself withdrew qualify (see release_withdrawn_pairs). Each removal is
+    written to the activity log with what it was, so it is never silent."""
+    from . import activity
+    ids = [i for i in dict.fromkeys(txn_ids or []) if i]
+    if not ids:
+        return 0
+    age = ""
+    params: list = [ids, list(FRONTED_KINDS)]
+    if older_than_days is not None:
+        from .budget import (FEED_REMOVED_OLDER_SQL,
+                             log_unreadable_removed_stamps)
+        age = FEED_REMOVED_OLDER_SQL
+        params.append(int(older_than_days))
+        log_unreadable_removed_stamps(conn, ids, "release_withdrawn_fronted")
+    removed = 0
+    with conn.transaction():
+        rows = conn.execute(
+            f"""SELECT m.*, e.name AS entity_name, t.name AS txn_name
+                  FROM equity_movement m
+                  JOIN transactions t ON t.id = m.txn_id
+                  LEFT JOIN business_entity e ON e.id = m.entity_id
+                 WHERE m.txn_id = ANY(%s) AND m.kind = ANY(%s)
+                   AND t.removed = 1 AND t.pending = 0
+                   AND t.raw ? '{_FEED_REMOVED_KEY}'{age}
+                   FOR UPDATE OF m""", params).fetchall()
+        for r in rows:
+            conn.execute("DELETE FROM equity_movement WHERE id = %s",
+                         (r["id"],))
+            removed += 1
+            activity.record(
+                conn, "the bank feed", "business", "released",
+                target=r["txn_id"],
+                label=(f"{r['kind']} of {activity.money(r['amount'])} for "
+                       f"{r['entity_name'] or 'a business'} on "
+                       f"{r['txn_name'] or 'a charge'} the bank withdrew"),
+                detail={"movement": _row(r)})
+    return removed

@@ -246,7 +246,7 @@ export default function Retirement() {
                   onClick={() => setWizard(true)}>re-run wizard</button>
         </div>
         {adjust && (
-          <form onSubmit={recalc}
+          <form onSubmit={recalc} noValidate
                 style={{ background: "var(--hover)", borderRadius: "var(--rs)",
                          padding: ".6rem .8rem", marginTop: ".5rem",
                          display: "flex", gap: ".7rem", flexWrap: "wrap",

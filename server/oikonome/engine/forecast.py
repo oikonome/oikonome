@@ -240,8 +240,12 @@ def build(conn, today: dt.date | None = None, days: int = HORIZON_DAYS,
     # fixed outflows and are handled after month_status below — their
     # contribution exists only if the month's own surplus does.
     from . import savings as _savings
+    # The walk starts from household-only balances, so a goal on a
+    # business's account (paid from the business's own checking) is not
+    # walked out of it.
     first = today.replace(day=1)
-    for g in _savings.goals(cfg):
+    hh_goals = _savings.household_goals(conn, cfg)
+    for g in hh_goals:
         plan = float(g.get("monthly_plan") or 0)
         if plan <= 0 or _savings.goal_mode(g) == "sweep":
             continue
@@ -258,8 +262,9 @@ def build(conn, today: dt.date | None = None, days: int = HORIZON_DAYS,
                 # still owed and lands at max(1st, tomorrow). Posted
                 # money is already out of the live starting balance —
                 # scheduling it again would double-count. A plan-only
-                # goal (no account, no tokens) has no ledger to
-                # check; the conservative read is still-owed.
+                # goal (no destination account — match words alone
+                # cannot tell the savings leg from the checking leg) has
+                # no ledger to check; the conservative read is still-owed.
                 # posted_for_plan also accepts the CHECKING
                 # leg as evidence — a transfer whose destination account
                 # carries no rows yet has already left the live balance, so
@@ -311,7 +316,7 @@ def build(conn, today: dt.date | None = None, days: int = HORIZON_DAYS,
     # several sweep goals the surplus is a single pool claimed in config
     # order — priority ordering is deliberately not a feature yet.
     sweep_months: list[tuple[dt.date, list[tuple[str, float]]]] = []
-    _sweep_goals = [g for g in _savings.goals(cfg)
+    _sweep_goals = [g for g in hh_goals
                     if _savings.goal_mode(g) == "sweep"
                     and float(g.get("monthly_plan") or 0) > 0]
     if _sweep_goals and st.get("plan_surplus") is not None:
@@ -345,8 +350,11 @@ def build(conn, today: dt.date | None = None, days: int = HORIZON_DAYS,
                 sweep_months.append((due, wants))
     plan_daily = ((b["food"]["month_budget"] + b["other"]["month_budget"])
                   / st["days_in_month"])
-    # over elapsed days, like the verdict's pace: today is not over yet
-    pace_daily = (st["variable_actual"] / (today.day - 1)) if today.day >= 5 else plan_daily
+    # over elapsed days, like the verdict's pace: today is not over yet, so
+    # today's spending stays out of the numerator as well — spend through
+    # yesterday over the days through yesterday, one horizon on both sides
+    pace_daily = ((st["variable_actual"] - (st.get("variable_today") or 0.0))
+                  / (today.day - 1)) if today.day >= 5 else plan_daily
     pace_daily = max(pace_daily, plan_daily * 0.25)   # a quiet week isn't a trend
 
     # Envelope drip: charge what's LEFT of each pool over the days left

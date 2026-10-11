@@ -349,6 +349,23 @@ class AmazonPushBadInputTests(unittest.TestCase):
             "SELECT dedup_key FROM amazon_orders").fetchall()}
         self.assertEqual(keys, {"good"})
 
+    def test_an_object_in_a_text_field_skips_its_row_not_500(self):
+        from oikonome.sync import amazon_orders
+        out = amazon_orders.import_orders(self.conn, [
+            {"dedup_key": {"k": 1}, "date": "2024-01-02", "amount": 10},
+            {"dedup_key": "p", "date": "2024-01-02", "amount": 10,
+             "payee": ["Amazon"]},
+            {"dedup_key": "m", "date": "2024-01-02", "amount": 10,
+             "memo": {"x": 1}},
+            {"dedup_key": "good", "date": "2024-01-02", "amount": 12,
+             "order_number": 1234567},
+        ])
+        self.assertEqual(out["new"], 1)
+        rows = self.conn.execute(
+            "SELECT dedup_key, order_number FROM amazon_orders").fetchall()
+        self.assertEqual([(r["dedup_key"], r["order_number"]) for r in rows],
+                         [("good", "1234567")])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -255,6 +255,13 @@ def resolve_role(cfg: dict, role: str = "categorize"):
     The single source of truth for role→backend precedence, consumed by
     BOTH the execution path (_backend below) and the Settings "what uses
     what" display (api._settings_view), so the two cannot drift apart."""
+    from ..notify import outbound_pause
+    _p = outbound_pause.paused(cfg)
+    if _p and _p["llm"]:
+        # a tenant endpoint paused by the owner's credential rotation:
+        # transaction text goes nowhere a hijacker may have pointed it
+        # until the owner confirms the endpoint in Settings
+        return "env", None
     bid = str((cfg.get("llm_roles") or {}).get(role) or "")
     if bid and bid != "bundled":
         b = next((x for x in (cfg.get("llm_backends") or [])
@@ -342,6 +349,17 @@ _SECRET_QUERY_KEYS = frozenset({
     "key", "apikey", "api_key", "api-key", "token", "access_token",
     "auth", "authorization", "secret", "password", "pass", "pwd",
     "sig", "signature", "code", "client_secret"})
+# A query key is a credential when it CONTAINS one of these, the way the
+# export's config scrub reads config keys: a proxy that takes its key in
+# the query names it however it likes (subscription-key, x-api-key,
+# api_token, auth_token, X-Amz-Signature), and an exact list misses them.
+_SECRET_QUERY_PARTS = ("key", "token", "secret", "password", "passwd",
+                       "auth", "signature", "credential")
+
+
+def _secret_query_key(k: str) -> bool:
+    k = k.lower()
+    return k in _SECRET_QUERY_KEYS or any(p in k for p in _SECRET_QUERY_PARTS)
 
 
 def redact_url(url: str) -> str:
@@ -361,9 +379,9 @@ def redact_url(url: str) -> str:
         query = parts.query
         if query:
             pairs = parse_qsl(query, keep_blank_values=True)
-            if any(k.lower() in _SECRET_QUERY_KEYS for k, _ in pairs):
+            if any(_secret_query_key(k) for k, _ in pairs):
                 query = urlencode(
-                    [(k, URL_SECRET_MASK if k.lower() in _SECRET_QUERY_KEYS
+                    [(k, URL_SECRET_MASK if _secret_query_key(k)
                       else v) for k, v in pairs], safe="*")
         if netloc == parts.netloc and query == parts.query:
             return url
@@ -401,6 +419,7 @@ def _prepare(be: dict, transport):
     tenant-URL netguard applies to BOTH — a tenant-configured llm_url is
     re-checked at USE time (SimpleFIN's every-fetch guard) and the connect is
     DNS-pinned."""
+    _honour_pause(be)
     base = (be["url"] or "").rstrip("/")
     if not base:
         raise LLMError("no LLM backend configured (tenant llm_url config "
@@ -417,6 +436,43 @@ def _prepare(be: dict, transport):
     if be["api_key"]:
         headers["Authorization"] = f"Bearer {be['api_key']}"
     return base, transport, headers
+
+
+def _pausable(conn, backend: dict, role: str = "categorize") -> dict:
+    """`backend` made to notice an outbound pause that lands while a run is
+    under way. A run resolves its backend once and then spends minutes on
+    batch after batch; a recovery in that time pauses the tenant endpoint
+    (notify/outbound_pause), and a backend captured before it would keep
+    receiving transaction text until the run ended. Only a tenant endpoint
+    can be paused, so the operator's own backend is returned untouched."""
+    if backend.get("source") != "tenant" or conn is None:
+        return backend
+
+    def _paused_now() -> bool:
+        from ..notify import outbound_pause
+        from . import budget
+        p = outbound_pause.paused(budget.load_config(conn))
+        return bool(p and p["llm"])
+    return {**backend, "pause_check": _paused_now, "pause_role": role,
+            "pause_conn": conn}
+
+
+def _honour_pause(be: dict) -> None:
+    """Before each request on a backend from `_pausable`: when the tenant
+    endpoint has been paused since the run resolved it, switch this
+    backend, in place, to what resolves now — the operator's — so every
+    later batch of the run follows too."""
+    check = be.get("pause_check")
+    if not callable(check) or be.get("source") != "tenant":
+        return
+    if not check():
+        return
+    log.warning("the household's AI endpoint was paused during this run; "
+                "the rest of the run uses the instance's own backend")
+    fresh = _backend(be.get("pause_conn"), be.get("pause_role") or
+                     "categorize")
+    be.clear()
+    be.update(fresh)
 
 
 def _merge_extra_body(body: dict, extra_body: str) -> None:
@@ -464,7 +520,32 @@ def read_json(client: httpx.Client, method: str, url: str, **kw):
             buf += chunk
             if len(buf) > MAX_RESPONSE_BYTES:
                 raise LLMError("LLM reply too large")
-    return json.loads(bytes(buf))
+    try:
+        return json.loads(bytes(buf))
+    except ValueError:
+        # A 200 that is not JSON — an auth proxy's login page, an app's
+        # catch-all route at the base URL — is the backend failing, the
+        # same as a 5xx: every caller already answers LLMError per batch.
+        # Said without quoting it (see _reply_shape).
+        raise LLMError("the LLM endpoint did not answer with JSON ("
+                       + _reply_shape(bytes(buf).decode("utf-8", "replace"))
+                       + "); check its URL")
+
+
+def _completion_message(reply) -> dict:
+    """The assistant message of a chat-completion reply, or LLMError when
+    the reply is not one: `{"error": ...}`, `{"choices": []}` from a
+    content filter, or any other shape. Indexed blindly, those raised
+    KeyError or IndexError past every caller's per-batch handler and took
+    the rest of the nightly run with them."""
+    try:
+        msg = reply["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError):
+        msg = None
+    if not isinstance(msg, dict):
+        raise LLMError("the LLM endpoint answered, but not with a chat "
+                       "completion")
+    return msg
 
 
 def _chat(messages: list[dict], max_tokens: int, transport=None,
@@ -483,13 +564,14 @@ def _chat(messages: list[dict], max_tokens: int, transport=None,
     from ..web.netguard import BlockedURL
     try:
         with httpx.Client(transport=transport, timeout=REQUEST_TIMEOUT) as c:
-            msg = _read_completion(c, f"{base}/v1/chat/completions", body,
-                                   headers)["choices"][0]["message"]
+            msg = _completion_message(_read_completion(
+                c, f"{base}/v1/chat/completions", body, headers))
     except BlockedURL as e:
         # fetch-time pin rejection (rebind caught mid-flight) reads like
         # the save-time rejection, not a transport crash
         raise LLMError(str(e))
-    return msg.get("content") or msg.get("reasoning_content") or ""
+    out = msg.get("content") or msg.get("reasoning_content") or ""
+    return out if isinstance(out, str) else ""
 
 
 def chat_tools(messages: list[dict], tools: list[dict], max_tokens: int,
@@ -512,8 +594,8 @@ def chat_tools(messages: list[dict], tools: list[dict], max_tokens: int,
     from ..web.netguard import BlockedURL
     try:
         with httpx.Client(transport=transport, timeout=timeout) as c:
-            return _read_completion(c, f"{base}/v1/chat/completions", body,
-                                    headers)["choices"][0]["message"]
+            return _completion_message(_read_completion(
+                c, f"{base}/v1/chat/completions", body, headers))
     except BlockedURL as e:
         raise LLMError(str(e))
 
@@ -1318,7 +1400,11 @@ def record_run(conn, stats: dict, backend: dict) -> None:
            # a piece of the backend's reply; last_run refuses to hand back
            # the error of a record that lacks this flag
            "error_classified": True,
-           "model": backend.get("model"), "url": backend.get("url"),
+           # masked as it is written: this row is bookkeeping that export
+           # and support bundles carry, and an endpoint's password or key
+           # must not ride along in it
+           "model": backend.get("model"),
+           "url": redact_url(backend.get("url") or "") or None,
            "produced": produced,
            "pending": (stats.get("pending_merchants", 0)
                        + stats.get("pending_items", 0)
@@ -1357,6 +1443,9 @@ def last_run(conn) -> dict | None:
         # off never has one, so the text is dropped on the way out rather
         # than shown.
         prog["error"] = "the last run failed (no detail was recorded)"
+    if prog.get("url"):
+        # a record written before the URL was masked at write time
+        prog["url"] = redact_url(str(prog["url"]))
     return {"state": row["state"], "at": row["updated_at"], **prog}
 
 
@@ -1738,7 +1827,7 @@ def categorize_new(conn, *, limit: int | None = SYNC_MERCHANT_LIMIT,
     tags depend on nightly detection output and stay in run. apply runs
     regardless of backend so the cached map (flow-guarded) sharpens the new
     rows even when no LLM is configured."""
-    backend = _backend(conn)
+    backend = _pausable(conn, _backend(conn))
     stats = {"pending_merchants": 0, "merchants_classified": 0,
              "pending_items": 0, "items_classified": 0,
              "seeded": 0, "flow_classified": 0, "unparseable": 0,
@@ -1773,7 +1862,7 @@ def categorize_new(conn, *, limit: int | None = SYNC_MERCHANT_LIMIT,
                                      dry_run=False, stats=stats,
                                      transport=transport, backend=backend)
                 from . import amazon_match
-                amazon_match.run_match(conn)
+                _match_guarded(conn, amazon_match.run_match, "amazon")
                 if backend["url"] and summaries_pending(conn, limit=1):
                     _summarize_amazon(conn, limit=limit, batch_size=20,
                                       dry_run=False, stats=stats,
@@ -1784,7 +1873,7 @@ def categorize_new(conn, *, limit: int | None = SYNC_MERCHANT_LIMIT,
         with amazon_chain_lock(conn) as got:
             if got:
                 from . import costco_match
-                costco_match.run_match(conn)
+                _match_guarded(conn, costco_match.run_match, "costco")
     # the FULL sweep, deliberately. Scoping this to the merchants the run
     # touched would break this function's contract (a cached rule must
     # reach a newly pulled row even with no LLM), and the candidate set that
@@ -1795,7 +1884,49 @@ def categorize_new(conn, *, limit: int | None = SYNC_MERCHANT_LIMIT,
     return stats
 
 
+def _match_guarded(conn, run_match, store: str) -> None:
+    """A store match inside the sync-time pass, never its end. The merchant
+    map applied below is what this hour's new rows are waiting for, and a
+    failing match (one bad stored record) must not cost the household
+    that; the nightly sweep runs the match again."""
+    try:
+        run_match(conn)
+    except Exception:                                    # noqa: BLE001
+        log.warning("sync-time %s match failed", store, exc_info=True)
+
+
 _AMAZON_LOCK = "hashtext('oikonome:amazon:' || current_setting('app.tenant_id'))"
+
+# How long a waiting door (the nightly sweep) waits for a per-household LLM
+# lock before giving that household up for the night. The holder is usually
+# a sync-time pass talking to the household's own model backend, which the
+# household chooses and can be slow without limit; an unbounded wait would
+# let one household's backend stall the sweep for every household after it.
+# Every step under these locks is pending-gated, so a skipped night is
+# caught up by the next pass.
+LOCK_WAIT_SECONDS = 60.0
+_LOCK_POLL_SECONDS = 0.5
+
+
+class LockBusy(RuntimeError):
+    """A waiting door gave up on a per-household lock after LOCK_WAIT_SECONDS.
+    Raised rather than yielded so a caller that ignores the yielded flag can
+    never run the guarded work without the lock."""
+
+
+def _take_lock(conn, key_sql: str, wait: bool) -> bool:
+    """Try the session advisory lock once, or, with `wait`, keep trying for
+    up to LOCK_WAIT_SECONDS and raise LockBusy if it never frees."""
+    import time
+    deadline = time.monotonic() + LOCK_WAIT_SECONDS
+    while True:
+        got = conn.execute(
+            f"SELECT pg_try_advisory_lock({key_sql}) AS ok").fetchone()["ok"]
+        if got or not wait:
+            return bool(got)
+        if time.monotonic() >= deadline:
+            raise LockBusy(f"lock still held after {LOCK_WAIT_SECONDS:g}s")
+        time.sleep(_LOCK_POLL_SECONDS)
 
 
 @contextmanager
@@ -1812,15 +1943,10 @@ def amazon_chain_lock(conn, *, wait: bool = False):
     per-tenant lock closes that: the sync door skips when it's held
     (wait=False — every step is idempotent and pending-gated, the next pass
     redoes it), the nightly door waits (wait=True — it is the
-    reconciliation pass and must not silently skip). Session-level, so the
+    reconciliation pass and must not silently skip), but only for
+    LOCK_WAIT_SECONDS, then raises LockBusy. Session-level, so the
     finally-unlock matters on pooled connections."""
-    if wait:
-        conn.execute(f"SELECT pg_advisory_lock({_AMAZON_LOCK})")
-        got = True
-    else:
-        got = conn.execute(
-            f"SELECT pg_try_advisory_lock({_AMAZON_LOCK}) AS ok"
-        ).fetchone()["ok"]
+    got = _take_lock(conn, _AMAZON_LOCK, wait)
     try:
         yield got
     finally:
@@ -1846,15 +1972,10 @@ def merchant_classify_lock(conn, *, wait: bool = False):
     amazon_chain_lock: the sync-side doors skip when it's held
     (wait=False — classification is idempotent and pending-gated, the
     next pass catches up), the nightly door waits (wait=True — it is the
-    mop-up pass and must not silently skip). Session-level, so the
+    mop-up pass and must not silently skip), but only for
+    LOCK_WAIT_SECONDS, then raises LockBusy. Session-level, so the
     finally-unlock matters on pooled connections."""
-    if wait:
-        conn.execute(f"SELECT pg_advisory_lock({_MERCHANT_LOCK})")
-        got = True
-    else:
-        got = conn.execute(
-            f"SELECT pg_try_advisory_lock({_MERCHANT_LOCK}) AS ok"
-        ).fetchone()["ok"]
+    got = _take_lock(conn, _MERCHANT_LOCK, wait)
     try:
         yield got
     finally:
@@ -1868,8 +1989,10 @@ def run(conn, *, limit: int | None = None, batch_size: int = BATCH_SIZE,
     proposal tags). No-op when no backend is configured — but apply() of the
     cached merchant map (cheap SQL, flow-guarded) runs regardless, so
     migrated merchant_categories keep sharpening rows. Backend resolved
-    ONCE here: tenant config wins over env (see _backend)."""
-    backend = _backend(conn)
+    ONCE here: tenant config wins over env (see _backend) — except that
+    an outbound pause landing mid-run takes effect at the next batch
+    (_pausable)."""
+    backend = _pausable(conn, _backend(conn))
     stats = {"pending_items": 0, "items_classified": 0,
              "pending_merchants": 0, "merchants_classified": 0,
              "seeded": 0, "flow_classified": 0,
@@ -1892,10 +2015,19 @@ def run(conn, *, limit: int | None = None, batch_size: int = BATCH_SIZE,
             # Wait, don't skip: this is the mop-up pass. _classify_merchants
             # re-reads pending_merchants under the lock, so a sync that
             # classified everything while we waited leaves nothing to bill.
-            with merchant_classify_lock(conn, wait=True):
-                _classify_merchants(conn, limit=limit, batch_size=batch_size,
-                                    dry_run=dry_run, stats=stats,
-                                    transport=transport, backend=backend)
+            # The wait is bounded: a pass that never lets go (a backend
+            # answering a byte at a time) costs this household its merchant
+            # pass tonight, never the rest of the run or the next household.
+            try:
+                with merchant_classify_lock(conn, wait=True):
+                    _classify_merchants(conn, limit=limit,
+                                        batch_size=batch_size,
+                                        dry_run=dry_run, stats=stats,
+                                        transport=transport, backend=backend)
+            except LockBusy as e:
+                log.warning("merchant classification skipped: another pass "
+                            "holds the household's lock (%s)", e)
+                stats["merchant_classify_skipped"] = "busy"
         if summaries_pending(conn, limit=1):
             _summarize_amazon(conn, limit=limit, batch_size=20,
                               dry_run=dry_run, stats=stats,

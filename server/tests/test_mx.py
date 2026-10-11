@@ -139,10 +139,12 @@ class MxKeysApiTests(unittest.TestCase):
     def test_keys_validated_then_saved_encrypted(self):
         with mock.patch("oikonome.sync.mx.validate", return_value=False):
             r = self.client.post("/api/accounts/mx/keys", json={
+                "password": "correct-horse-battery",
                 "client_id": "c", "api_key": "k", "env": "sandbox"})
         self.assertEqual(r.status_code, 400)
         with mock.patch("oikonome.sync.mx.validate", return_value=True):
             r = self.client.post("/api/accounts/mx/keys", json={
+                "password": "correct-horse-battery",
                 "client_id": "c", "api_key": "k", "env": "sandbox"})
         self.assertEqual(r.status_code, 200)
         conn = tenancy.tenant_connect(self.tid)

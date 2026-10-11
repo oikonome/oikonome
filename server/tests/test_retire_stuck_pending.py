@@ -85,6 +85,28 @@ class RetirePendingTests(unittest.TestCase):
         self.assertIn("already posted", str(caught.exception))
         self.assertEqual(self._removed(tid), 0)
 
+    def test_a_hold_that_posts_while_the_retire_waits_is_not_retired(self):
+        """The checks run before the pairing lock, and the lock can wait
+        behind a sync settling this hold under the same id. A hold that has
+        posted by the time the lock is held is refused, not retired — a
+        person's retirement outlives every later sync."""
+        tid = self._pending(OLD)
+        real = self.conn
+
+        class _PostsDuringTheLock:
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            def execute(self, sql, *a, **kw):
+                if sql == data._REIMB_LOCK:
+                    real.execute("UPDATE transactions SET pending=0 "
+                                 "WHERE id=%s", (tid,))
+                return real.execute(sql, *a, **kw)
+        with self.assertRaises(ValueError) as caught:
+            data.retire_pending(_PostsDuringTheLock(), tid, today=TODAY)
+        self.assertIn("already posted", str(caught.exception))
+        self.assertEqual(self._removed(tid), 0)
+
     def test_an_unknown_row_is_not_found(self):
         with self.assertRaises(LookupError):
             data.retire_pending(self.conn, "no-such-txn", today=TODAY)
@@ -132,6 +154,53 @@ class ARetiredHoldStaysRetiredThroughTheNextSync(unittest.TestCase):
             pending=True)])
         self.assertEqual(self.conn.execute(
             "SELECT removed FROM transactions WHERE id=%s", (other,)).fetchone()["removed"], 0)
+
+    def test_an_exchange_pull_re_reporting_the_hold_does_not_bring_it_back(self):
+        """The exchange connector writes its rows through its own upsert;
+        a hold the person retired stays retired through it too, while a
+        row the pull itself restated away still comes back."""
+        from oikonome.sync import coinbase
+        old = TODAY - dt.timedelta(days=20)
+        hold = {"id": "held-1", "status": "pending", "type": "send",
+                "created_at": f"{old.isoformat()}T12:00:00Z",
+                "amount": {"currency": "BTC"},
+                "native_amount": {"amount": "-42.00"}}
+        coinbase._upsert_txn(self.conn, "chk", hold)
+        data.retire_pending(self.conn, "coinbase:held-1", today=TODAY)
+        coinbase._upsert_txn(self.conn, "chk", hold)
+        self.assertEqual(self.conn.execute(
+            "SELECT removed FROM transactions WHERE id='coinbase:held-1'"
+        ).fetchone()["removed"], 1)
+        gone = dict(hold, id="restated-1")
+        coinbase._upsert_txn(self.conn, "chk", gone)
+        self.conn.execute("UPDATE transactions SET removed=1 "
+                          "WHERE id='coinbase:restated-1'")
+        coinbase._upsert_txn(self.conn, "chk", gone)
+        self.assertEqual(self.conn.execute(
+            "SELECT removed FROM transactions WHERE id='coinbase:restated-1'"
+        ).fetchone()["removed"], 0)
+
+    def test_a_plan_file_re_import_does_not_bring_back_a_retired_row(self):
+        """The retirement-plan importer re-writes every row its file
+        carries; a row retired by a decision (a person's, or a dedup's)
+        stays retired through it."""
+        from oikonome.sync import plan_csv
+        day = TODAY - dt.timedelta(days=20)
+        csv = ('"Trade Date","Investments","Ticker","Transaction",'
+               '"Transaction Amount","Share Price","Total Shares"\n'
+               f'"{day:%m/%d/%Y}","Fund A","FUNDA","Contribution",'
+               '"50.00","10.00","5.000"\n')
+        plan_csv.import_csv(self.conn, "401K", csv)
+        aid = plan_csv.account_id(plan_csv.DEFAULT_PROVIDER, "401K")
+        tid = self.conn.execute(
+            "SELECT id FROM transactions WHERE account_id=%s",
+            (aid,)).fetchone()["id"]
+        self.conn.execute("UPDATE transactions SET removed=1, "
+                          "retired_at=now() WHERE id=%s", (tid,))
+        plan_csv.import_csv(self.conn, "401K", csv)
+        self.assertEqual(self.conn.execute(
+            "SELECT removed FROM transactions WHERE id=%s",
+            (tid,)).fetchone()["removed"], 1)
 
 
 class RetirePendingRouteTests(unittest.TestCase):

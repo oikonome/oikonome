@@ -17,14 +17,11 @@ import { removeFromList } from "../lib/cache";
 import { useSession } from "../lib/session";
 import { useDemo, useViewer } from "../lib/viewer";
 import { C, mmddyy, money } from "../lib/theme";
-import { catLabel, looksUnnamed, MERCHANT_FILTERS, MERCHANT_ORDERS,
+import { catalogLimit, catLabel, looksUnnamed, MERCHANT_FILTERS, MERCHANT_ORDERS,
          serverOrder, sortMerchants } from "../lib/pure";
 import type { MerchantFilter, MerchantOrder } from "../lib/pure";
 import MerchantAvatar from "../components/merchant-avatar";
 
-// the server caps the catalog at its 200 most frequent merchants;
-// the long tail is reachable only through search
-const CATALOG_LIMIT = 200;
 type CatalogRow = MerchantCatalog["merchants"][number];
 
 // the server caps the `variants` array it returns, so the array's length
@@ -50,10 +47,13 @@ export default function Merchants() {
   const [flt, setFlt] = useState<MerchantFilter>("all");
   const [recentOpen, setRecentOpen] = useState(false);
 
-  const key = ["merchants", q, serverOrder(order)];
+  // the server caps the catalog; the long tail is reachable through search
+  const limit = catalogLimit(order, flt);
+  const key = ["merchants", q, serverOrder(order), order, flt];
   const query = useQuery({
     queryKey: key,
-    queryFn: () => client!.merchantCatalog(q, serverOrder(order)),
+    queryFn: () => client!.merchantCatalog(q, serverOrder(order),
+                                           { sort: order, filter: flt, limit }),
     enabled: !!client,
     // keep the last page on screen while refetching — a debounce fire
     // shouldn't flash "Loading…"
@@ -214,9 +214,12 @@ export default function Merchants() {
         </Card>
       )}
 
-      {rows.length >= CATALOG_LIMIT && !q && flt === "all" && (
+      {/* capped is judged on what the server sent, before the filter: a
+          filter over a capped window can come back short or empty while
+          the merchants it wants sit past the cap */}
+      {(query.data?.merchants.length ?? 0) >= limit && !q && (
         <Text style={s.mut}>
-          Showing the {CATALOG_LIMIT} most frequent — search to find any merchant.
+          Showing the {limit} most frequent — search to find any merchant.
         </Text>
       )}
     </ScrollView>

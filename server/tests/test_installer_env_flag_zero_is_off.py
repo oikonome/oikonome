@@ -23,9 +23,10 @@ SCRIPT = ROOT / "oikonome.sh"
 
 def _shell_env_flag(value: str | None, key: str = "OIKONOME_BEHIND_CLOUDFLARE") -> bool:
     src = SCRIPT.read_text()
-    funcs = "".join(
+    # env_get reads through the shared .env readers, so those come first
+    funcs = f'. "{ROOT}/scripts/env-file.sh"\n' + "".join(
         m.group(0)
-        for m in re.finditer(r"^(env_get|env_flag)\(\) \{\n.*?^\}\n",
+        for m in re.finditer(r"^(env_value|env_get|env_flag)\(\) \{\n.*?^\}\n",
                              src, re.M | re.S))
     assert "env_flag()" in funcs, "oikonome.sh lost its env_flag helper"
     with tempfile.TemporaryDirectory() as d:

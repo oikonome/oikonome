@@ -65,6 +65,8 @@ _KEY_CACHE: dict[str, dict] = {}
 # clearing the table when it passes a small ceiling costs one extra key
 # fetch, never correctness.
 _CACHE_MAX = 64
+# Plaid key ids are short opaque strings; anything longer is not one.
+_KID_MAX = 256
 _TRANSPORT = None            # tests inject an httpx.MockTransport here
 
 # This endpoint is UNAUTHENTICATED and the
@@ -111,7 +113,8 @@ async def _fetch_key(kid: str) -> dict | None:
                                       "key_id": kid})
             if r.status_code != 200:
                 return None
-            return r.json().get("key")
+            key = r.json().get("key")
+            return key if isinstance(key, dict) else None
     except Exception:                                      # noqa: BLE001
         return None
 
@@ -174,11 +177,20 @@ async def verify(header_jwt: str, body: bytes) -> bool:
         hdr = json.loads(_b64url(h_b64))
     except (ValueError, AttributeError):
         return _refuse("malformed")
+    # The header is attacker-chosen JSON: it may decode to an array, a
+    # number or a string, and its kid to anything at all. Only an object
+    # with a short string kid is a header — the kid is a cache key and a
+    # field in an outbound request, so it must be hashable and bounded.
+    if not isinstance(hdr, dict):
+        return _refuse("malformed")
+    kid = hdr.get("kid")
+    if not isinstance(kid, str) or not 0 < len(kid) <= _KID_MAX:
+        return _refuse("malformed")
     # pin the algorithm — accepting attacker-chosen algs (none/HS256) is
     # the classic JWT verification bypass
-    if hdr.get("alg") != "ES256" or not hdr.get("kid"):
+    if hdr.get("alg") != "ES256":
         return _refuse("bad_alg")
-    jwk = await _key_for(hdr["kid"])
+    jwk = await _key_for(kid)
     if not jwk:
         # fetch failed, negative-cached, or at the fetch ceiling
         return _refuse("no_key")
@@ -207,6 +219,8 @@ async def verify(header_jwt: str, body: bytes) -> bool:
     try:
         claims = json.loads(_b64url(p_b64))
     except ValueError:
+        return _refuse("bad_claims")
+    if not isinstance(claims, dict):
         return _refuse("bad_claims")
     iat = claims.get("iat")
     if not isinstance(iat, (int, float)) or isinstance(iat, bool) \
@@ -278,11 +292,25 @@ async def _enqueue_sync(tenant_id: str, item_id: str) -> bool:
         return False
 
 
+def _error_code(evt: dict) -> str:
+    """The event's error code, or UNKNOWN when the error is not an object
+    carrying a string code — the status column takes it verbatim."""
+    err = evt.get("error")
+    code = err.get("error_code") if isinstance(err, dict) else None
+    return code[:64] if isinstance(code, str) and code else "UNKNOWN"
+
+
+# Plaid sends NEW_ACCOUNTS_AVAILABLE once, and only an update session with
+# the shared-accounts checklist can act on it. The flag lives in
+# webhook_status, which every other ITEM webhook also writes, so it must not
+# be the slot a later, unrelated status lands in.
+NEW_ACCOUNTS = "new_accounts"
+
+
 # ITEM webhook codes we persist; everything else is acknowledged and
 # dropped (the hourly poll discovers whatever state matters).
 _ITEM_STATUS = {
-    "ERROR": lambda evt: "error:" + (
-        (evt.get("error") or {}).get("error_code") or "UNKNOWN"),
+    "ERROR": lambda evt: "error:" + _error_code(evt),
     "PENDING_EXPIRATION": lambda evt: "pending_expiration",
     # the sibling of PENDING_EXPIRATION: consent is about to lapse and
     # update mode is what prevents the disconnect, so it is surfaced
@@ -293,7 +321,7 @@ _ITEM_STATUS = {
     # prompt update mode so they can share it; ignoring this is why a
     # newly-opened account would simply never appear, with nothing on
     # screen suggesting the app knew.
-    "NEW_ACCOUNTS_AVAILABLE": lambda evt: "new_accounts",
+    "NEW_ACCOUNTS_AVAILABLE": lambda evt: NEW_ACCOUNTS,
 }
 
 # The one that CLEARS rather than sets. Plaid fires LOGIN_REPAIRED when
@@ -316,28 +344,71 @@ def _clear_item_status(item_id: str) -> bool:
         tenant_id = _live_tenant(admin, item_id)
         if tenant_id is None:
             return False
+        # …but not a new-accounts offer: the bank healing says nothing about
+        # the accounts waiting to be shared, and Plaid never repeats it
         cur = admin.execute(
-            "UPDATE items SET webhook_status=NULL, webhook_status_at=NULL, "
+            "UPDATE items SET "
+            "webhook_status = CASE WHEN webhook_status = %s "
+            "THEN webhook_status END, "
+            "webhook_status_at = CASE WHEN webhook_status = %s "
+            "THEN webhook_status_at END, "
             "status='ok' WHERE id=%s AND tenant_id=%s AND aggregator='plaid' "
             "AND COALESCE(status,'') NOT IN ('archived', 'restored')",
-            (item_id, tenant_id))
+            (NEW_ACCOUNTS, NEW_ACCOUNTS, item_id, tenant_id))
         return cur.rowcount > 0
     finally:
         admin.close()
 
 
+def _breaks_the_item(status: str | None) -> bool:
+    """An error or a revoked consent — the flags a working sync disproves,
+    and the ones the connection's status can carry instead of the
+    webhook slot."""
+    return bool(status) and (status.startswith("error:")
+                             or status == "revoked")
+
+
 def _record_item_status(item_id: str, status: str) -> bool:
+    """Record an ITEM webhook's flag without erasing a pending new-accounts
+    offer.
+
+    * An error or revoked consent arriving while new accounts wait goes on
+      the connection's status instead, which the connections list shows
+      first and a clean sync clears — so the person fixes the sign-in, and
+      the update session that does it still carries the checklist.
+    * The offer arriving over an error moves the error to the status the
+      same way, rather than overwriting it.
+    * An expiry warning while new accounts wait changes nothing: the
+      update session the offer opens renews consent too.
+    """
     admin = tenancy.admin_connect()
     try:
         tenant_id = _live_tenant(admin, item_id)
         if tenant_id is None:
             return False
-        cur = admin.execute(
-            "UPDATE items SET webhook_status=%s, webhook_status_at=now() "
-            "WHERE id=%s AND tenant_id=%s AND aggregator='plaid' "
-            "AND COALESCE(status,'') NOT IN ('archived', 'restored')",
-            (status, item_id, tenant_id))
-        return cur.rowcount > 0
+        with admin.transaction():
+            row = admin.execute(
+                "SELECT status, webhook_status FROM items "
+                "WHERE id=%s AND tenant_id=%s AND aggregator='plaid' "
+                "AND COALESCE(status,'') NOT IN ('archived', 'restored') "
+                "FOR UPDATE", (item_id, tenant_id)).fetchone()
+            if row is None:
+                return False
+            held = row["webhook_status"]
+            new_status = row["status"]
+            slot = status
+            if held == NEW_ACCOUNTS and status != NEW_ACCOUNTS:
+                if not _breaks_the_item(status):
+                    return True
+                new_status, slot = status, NEW_ACCOUNTS
+            elif status == NEW_ACCOUNTS and _breaks_the_item(held) \
+                    and (row["status"] or "ok") == "ok":
+                new_status = held
+            admin.execute(
+                "UPDATE items SET status=%s, webhook_status=%s, "
+                "webhook_status_at=now() WHERE id=%s AND tenant_id=%s",
+                (new_status, slot, item_id, tenant_id))
+        return True
     finally:
         admin.close()
 
@@ -363,9 +434,12 @@ async def plaid_webhook(request: Request):
         event = json.loads(payload)
     except ValueError:
         raise HTTPException(400, "invalid payload")
+    if not isinstance(event, dict):
+        raise HTTPException(400, "invalid payload")
     wtype = event.get("webhook_type")
     wcode = event.get("webhook_code")
-    item_id = event.get("item_id") or ""
+    item_id = event.get("item_id")
+    item_id = item_id if isinstance(item_id, str) else ""
     disposition = "ignored"
     # INITIAL_UPDATE / HISTORICAL_UPDATE matter for the same reason as
     # SYNC_UPDATES_AVAILABLE: each says "more transactions are ready".

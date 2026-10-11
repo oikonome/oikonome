@@ -1,10 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router";
 import { api, errText, type Receipt, type Txn } from "../api/client";
 import { patchList, patchQueries, removeFromList } from "../api/cache";
-import { rankWaiting, useMatchReceipt, useUnmatchReceipt, useWaitingReceipts,
-         waitingMatches } from "../api/waiting";
+import { forgetParseStart, parseStalled, rankWaiting, useMatchReceipt,
+         useUnmatchReceipt, useWaitingReceipts, waitingMatches }
+  from "../api/waiting";
 import { isViewer } from "../role";
 
 // receipts on a transaction — upload, parsed line items, retry,
@@ -24,16 +25,33 @@ const OFFER_HEAD = 3;
 
 export default function ReceiptPanel({ txnId }: { txnId: string }) {
   const qc = useQueryClient();
-  // upload / parse / remove are owner writes; viewers still view
+  // upload / parse / remove are owner writes; viewers still view, and the
+  // demo refuses all three (match and unmatch stay open there)
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const viewer = isViewer(me);
-  // the vision parse runs in the background — poll while any
-  // receipt is 'parsing' so the progress bar and result appear live
+  const mayWrite = !viewer && !me.data?.demo;
+  const waiting = useWaitingReceipts();
+  const [now, setNow] = useState(() => Date.now());
+  const stale = (r: Receipt, at = now) => parseStalled(r, at);
+  // the vision parse runs in the background — poll while a receipt is
+  // 'parsing' so the progress bar and result appear live, but not for a
+  // parse that has gone stale, nor on an instance with no vision model
   const q = useQuery({ queryKey: ["receipts", txnId],
                        queryFn: () => api.receipts(txnId),
                        refetchInterval: (query) =>
-                         query.state.data?.receipts.some(
-                           (r) => r.status === "parsing") ? 1500 : false });
+                         waiting.data?.ai_available !== false
+                         && query.state.data?.receipts.some(
+                           (r) => r.status === "parsing"
+                                  && !stale(r, Date.now())) ? 1500 : false });
+  const parsingNow = (q.data?.receipts ?? []).some(
+    (r) => r.status === "parsing" && !stale(r));
+  // a clock for the stale check while something is parsing, so the retry
+  // appears when the poll stops rather than on some later render
+  useEffect(() => {
+    if (!parsingNow) return;
+    const t = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(t);
+  }, [parsingNow]);
   // the 📎 on the ledger row reads has_receipt from whichever list the row
   // sits in; set it from what this panel now knows, then let the ledger
   // refetch confirm (the list is the one key this write really moves)
@@ -77,7 +95,6 @@ export default function ReceiptPanel({ txnId }: { txnId: string }) {
   // receipts snapped before a charge arrived: offered here for a hand match
   // (the matcher could not decide, or nothing was read off the receipt), and
   // a matched one can be put back to waiting
-  const waiting = useWaitingReceipts();
   const match = useMatchReceipt();
   const unmatch = useUnmatchReceipt();
   // ranked against THIS charge (amount, then date), so the receipt that
@@ -95,7 +112,7 @@ export default function ReceiptPanel({ txnId }: { txnId: string }) {
       <div style={{ display: "flex", gap: ".7rem", alignItems: "center",
                     flexWrap: "wrap" }}>
         <b>Receipts</b>
-        {!viewer && (<>
+        {mayWrite && (<>
         <label className="btn" style={{ cursor: "pointer" }}>
           {upload.isPending ? "uploading…" : "attach image / PDF"}
           <input type="file" accept="image/*,.pdf"
@@ -158,6 +175,7 @@ export default function ReceiptPanel({ txnId }: { txnId: string }) {
         </div>)}
       {match.isError && <p style={{ color: "var(--red)" }}>{errText(match.error)}</p>}
       {del.isError && <p style={{ color: "var(--red)" }}>{errText(del.error)}</p>}
+      {parse.isError && <p style={{ color: "var(--red)" }}>{errText(parse.error)}</p>}
       {(q.data?.receipts ?? []).map((r) => (
         <div key={r.id} style={{ marginTop: ".6rem", borderTop:
               "1px solid var(--line)", paddingTop: ".5rem" }}>
@@ -203,13 +221,28 @@ export default function ReceiptPanel({ txnId }: { txnId: string }) {
           {r.parsed?.merchant && <span className="mut">
             {" "}{r.parsed.merchant}{r.parsed.total != null &&
               ` · $${r.parsed.total}`}</span>}
-          {!viewer && r.status !== "parsed" && r.status !== "parsing" && (
+          {/* the parse needs the instance's vision model: without one the
+              server refuses it, so the button would be a dead end — point
+              at where one is added instead (the waiting list's rule) */}
+          {mayWrite && r.status !== "parsed"
+            && (r.status !== "parsing" || stale(r))
+            && waiting.data?.ai_available && (
             <button style={{ marginLeft: 8, fontSize: 12 }}
               disabled={parse.isPending && parse.variables === r.id}
-              onClick={() => parse.mutate(r.id)}>
-              {r.status === "failed" ? "retry parse" : "parse now"}</button>
+              onClick={() => {
+                forgetParseStart(r.id);
+                parse.mutate(r.id);
+              }}>
+              {r.status === "failed" || r.status === "parsing"
+                ? "retry parse" : "parse now"}</button>
           )}
-          {!viewer && (
+          {mayWrite && r.status !== "parsed" && r.status !== "parsing"
+            && waiting.data && !waiting.data.ai_available && (
+            <span className="mut" style={{ marginLeft: 8, fontSize: 12 }}>
+              no AI endpoint to read it —{" "}
+              <Link to="/settings/ai">Settings → AI</Link></span>
+          )}
+          {mayWrite && (
           <button style={{ marginLeft: 8, fontSize: 12 }}
             disabled={del.isPending && del.variables === r.id}
             onClick={() => del.mutate(r.id)}>remove</button>
@@ -217,7 +250,10 @@ export default function ReceiptPanel({ txnId }: { txnId: string }) {
           {r.status === "failed" && r.error && (
             <div style={{ color: "var(--red)", fontSize: 12,
                           marginTop: ".25rem" }}>{r.error}</div>)}
-          {r.status === "parsing" && (
+          {r.status === "parsing" && stale(r) && (
+            <div className="mut" style={{ fontSize: 12, marginTop: ".25rem" }}>
+              This read has stalled — retry it.</div>)}
+          {r.status === "parsing" && !stale(r) && (
             <div style={{ marginTop: ".35rem" }}>
               <div className="rcpt-progress"><span /></div>
               <div className="mut" style={{ fontSize: 12,

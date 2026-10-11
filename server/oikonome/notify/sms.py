@@ -43,7 +43,7 @@ def valid_e164(number: str) -> bool:
 # the SPA. Carriers do not accept one consent statement covering several
 # programs (a single opt-in cannot cover multiple use cases), so every
 # program is its own opt-in, recorded separately:
-#   summary — the scheduled budget verdict (daily/weekly/monthly/yearly)
+#   summary — the scheduled budget verdict (daily/monthly/yearly)
 #
 # Only programs a sender actually exists for belong in this tuple. A name
 # here is an affirmative promise — to the person who ticks the box, and to

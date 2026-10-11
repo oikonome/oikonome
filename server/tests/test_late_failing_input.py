@@ -264,6 +264,10 @@ class MigrationOverExistingDuplicatesTests(unittest.TestCase):
                     txn_id="dup1")
             # drop the guard, plant the duplicate a double-submit creates
             admin.execute("DROP INDEX IF EXISTS equity_movement_txn_kind_uniq")
+            # the later one-per-transaction index would refuse the same
+            # plant; it is rebuilt by the re-run below once the rows are clean
+            admin.execute(
+                "DROP INDEX IF EXISTS equity_movement_one_fronted_per_txn")
             for _ in range(2):
                 conn.execute(
                     """INSERT INTO equity_movement (entity_id, kind, amount,
@@ -272,6 +276,7 @@ class MigrationOverExistingDuplicatesTests(unittest.TestCase):
                     (ent["id"],))
             self.assertEqual(self._n(conn), 2, "precondition: duplicates exist")
             admin.execute("DELETE FROM schema_migrations WHERE name LIKE '067%'")
+            admin.execute("DELETE FROM schema_migrations WHERE name LIKE '159%'")
 
             migrate.run(_admin_dsn(TEST_DB))          # must not raise
 

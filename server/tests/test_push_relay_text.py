@@ -70,7 +70,7 @@ class RelayTextTests(unittest.TestCase):
                 self.assertEqual(sent, [])
 
     def test_a_bad_event_poisons_the_whole_batch(self):
-        # the batch is validated before anything is sent, so one weekly
+        # the batch is validated before anything is sent, so one monthly
         # item carrying a line takes the daily one down with it rather
         # than half-delivering
         sent = []
@@ -83,7 +83,7 @@ class RelayTextTests(unittest.TestCase):
                 {"token": "tok-" + "a" * 20, "platform": "fcm",
                  "event": "daily", "text": "fine"},
                 {"token": "tok-" + "b" * 20, "platform": "fcm",
-                 "event": "weekly", "text": "not fine"}]})
+                 "event": "monthly", "text": "not fine"}]})
         self.assertEqual(r.status_code, 400, r.text)
         self.assertEqual(sent, [])
 
@@ -113,7 +113,7 @@ class RelayTextTests(unittest.TestCase):
             self.assertEqual(msg["notification"]["body"],
                              "UNDER budget by $30.")
             self.assertEqual(msg["notification"]["title"], title)
-            fcm.send("tok", "weekly")
+            fcm.send("tok", "monthly")
             self.assertEqual(
                 post.call_args.kwargs["json"]["message"]["notification"]["body"],
-                fcm._DISPLAY["weekly"][1])
+                fcm._DISPLAY["monthly"][1])

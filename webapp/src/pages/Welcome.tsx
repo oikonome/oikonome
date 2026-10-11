@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type CSSProperties, type ReactNode, useEffect, useRef, useState }
   from "react";
 import { useNavigate } from "react-router";
-import { api, kindIs, type Onboarding, type WizardStep } from "../api/client";
+import { api, errText, kindIs, type Onboarding, type WizardStep } from "../api/client";
 import { saveSettings } from "../api/cache";
 import { browserPushBlocked, enableBrowserPush } from "../push";
 import { leftWizard } from "../wizardexit";
@@ -10,6 +10,7 @@ import BudgetPlanner from "../components/BudgetPlanner";
 import ConnectHub from "../components/ConnectHub";
 import Bills from "./Bills";
 import { isOwner } from "../role";
+import { sharedLock } from "../sharedlogin";
 
 /** strict linear guided setup. One step at a time, one clear
  *  primary action per step; the dots are a passive progress indicator.
@@ -319,6 +320,12 @@ function FinishStep({ d }: { d: Onboarding | undefined }) {
     // nobody, and the person would only learn that tomorrow morning
     if ((next === "push" || next === "both") && pushReady && !pushHere
         && notify.data?.vapid_public_key) {
+      // the shared demonstration login may choose push for the schedule
+      // (phones already registered still get it) but may not plant this
+      // browser as a new destination: the server refuses the subscription,
+      // so stop before the browser asks for permission it can't use
+      const grantLock = sharedLock(me.data, "grant");
+      if (grantLock) { setPushNote({ bad: true, text: grantLock }); return; }
       if (browserPushBlocked()) {
         setPushNote({ bad: true, text: "This browser cannot receive push on "
           + "http:// — the phone app can, or open the instance over https." });
@@ -329,7 +336,7 @@ function FinishStep({ d }: { d: Onboarding | undefined }) {
         setPushNote(r.ok ? { text: "This browser will receive it." }
                          : { bad: true, text: r.reason });
         if (r.ok) qc.invalidateQueries({ queryKey: ["notify"] });
-      } catch (e) { setPushNote({ bad: true, text: String(e) }); }
+      } catch (e) { setPushNote({ bad: true, text: errText(e) }); }
     }
   };
   const smtpSet = !!(s.data?.smtp_host || s.data?.smtp_password_set)
@@ -467,19 +474,23 @@ function EmailStep() {
   const [user, setUser] = useState<string | null>(null);
   const [pw, setPw] = useState("");
   const [from, setFrom] = useState<string | null>(null);
+  const [tls, setTls] = useState<boolean | null>(null);
   const hostVal = host ?? s.data?.smtp_host ?? "";
   const portVal = port ?? String(s.data?.smtp_port ?? 587);
   const userVal = user ?? s.data?.smtp_user ?? "";
   const fromVal = from ?? s.data?.smtp_from ?? "";
+  const tlsVal = tls ?? s.data?.smtp_starttls !== false;
   const save = useMutation({
     mutationFn: () => api.settingsSave({
       smtp_host: hostVal.trim(), smtp_port: portVal,
       smtp_user: userVal.trim(), smtp_password: pw,
-      smtp_from: (fromVal || userVal).trim() }),
+      smtp_from: (fromVal || userVal).trim(), smtp_starttls: tlsVal }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["settings"] }),
   });
   const test = useMutation({ mutationFn: api.smtpTest });
-  const saved = !!(s.data?.smtp_host && s.data?.smtp_password_set);
+  // a LAN relay may take mail with no login at all, so a stored host is
+  // all the server needs to send — the account and password are optional
+  const saved = !!s.data?.smtp_host;
   const inp = (val: string, set: (v: string) => void, ph: string,
                type = "text", width = "14rem") => (
     <input type={type} value={val} placeholder={ph}
@@ -527,10 +538,17 @@ function EmailStep() {
         <label>From address <span className="mut">(defaults to user)</span>
           <br />{inp(fromVal, setFrom, userVal || "money@example.com")}</label>
       </div>
+      <label style={{ display: "flex", alignItems: "center", gap: ".4rem",
+                      marginTop: ".5rem" }}>
+        <input type="checkbox" checked={tlsVal}
+               onChange={(e) => setTls(e.target.checked)} />
+        Use STARTTLS
+        <span className="sub">— turn off only for a plain relay on your own
+          network that doesn't offer it</span>
+      </label>
       <div style={{ display: "flex", gap: ".5rem", marginTop: ".7rem",
                     alignItems: "center" }}>
-        <button className="pri" disabled={save.isPending || !hostVal
-                                          || !userVal}
+        <button className="pri" disabled={save.isPending || !hostVal.trim()}
           onClick={() => save.mutate()}>
           {save.isPending ? "saving…" : "Save"}</button>
         <button disabled={!saved || test.isPending}

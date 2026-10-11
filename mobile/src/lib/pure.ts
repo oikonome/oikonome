@@ -295,6 +295,28 @@ export function serverUrlVerdict(url: string): ServerUrlVerdict {
   return isPrivateHost(hostOf(url)) ? "http-private" : "http-public";
 }
 
+/** Did approving an offer find the bill already tracked? The server then
+ *  withdraws the offer itself, so the card can neither be approved nor
+ *  dismissed and must leave the list. Read from the reply's flag, or from
+ *  a refusal (an ApiError: `detail` its sentence, `body` the parsed reply)
+ *  that carries the flag or says "already tracked" — a server that
+ *  predates the flag. The web keeps the same rule in api/client.ts. */
+export function proposalSuperseded(replyOrError: unknown): boolean {
+  if (!replyOrError || typeof replyOrError !== "object") return false;
+  const o = replyOrError as { superseded?: unknown; detail?: unknown;
+                              body?: unknown; message?: unknown };
+  if (o.superseded === true) return true;
+  const b = o.body as { superseded?: unknown } | null | undefined;
+  if (b && typeof b === "object" && b.superseded === true) return true;
+  const text = typeof o.detail === "string" ? o.detail
+    : typeof o.message === "string" ? o.message : "";
+  return /already tracked/i.test(text);
+}
+
+/** The longest category name the server stores; it refuses longer ones,
+ *  so the box a custom name is typed into stops there. */
+export const CATEGORY_MAX = 64;
+
 /** Display form of a category (or any underscored enum key such as a
  *  payment kind): `FOOD_AND_DRINK` → `FOOD AND DRINK`. Custom names
  *  pass through untouched. Every surface that shows a category goes
@@ -425,6 +447,55 @@ export function withRecoveryCode(
  *  Null means the Confirm button stays disabled. It is the same rule the
  *  button and the submit use, so the two cannot disagree about whether
  *  there is enough to send. */
+/** The classify write an account editor owes, or null when neither the
+ *  kind nor the primary toggle changed. `primary` is null when the person
+ *  left the toggle alone: the key is then omitted and the server keeps the
+ *  household's anchor where it is, rather than this device re-sending a
+ *  pin it read from a cache another device may have moved since. */
+export function classifyChange(kindBefore: string, kindAfter: string,
+                               primary: boolean | null):
+    { kind: string; primary?: boolean } | null {
+  if (kindAfter === kindBefore && primary === null) return null;
+  return primary === null ? { kind: kindAfter }
+                          : { kind: kindAfter, primary };
+}
+
+/** The SVG markup inside an `image/svg+xml` data URI (percent-encoded or
+ *  base64), or null for anything else. The native image views decode no
+ *  SVG, so the enrolment QR is drawn from this markup instead. A root with
+ *  only width/height gains a matching viewBox, so the drawing scales to the
+ *  box it is given rather than being cropped. */
+export function svgFromDataUri(uri: string): string | null {
+  const m = /^data:image\/svg\+xml(;[^,]*)?,([\s\S]*)$/i.exec(uri);
+  if (!m) return null;
+  let xml: string;
+  try {
+    xml = /;base64/i.test(m[1] ?? "") ? atob(m[2]) : decodeURIComponent(m[2]);
+  } catch {
+    return null;
+  }
+  const root = /<svg\b[^>]*>/i.exec(xml);
+  if (!root) return null;
+  if (!/\bviewBox=/i.test(root[0])) {
+    const w = /\bwidth=["']?([\d.]+)/i.exec(root[0]);
+    const h = /\bheight=["']?([\d.]+)/i.exec(root[0]);
+    if (w && h)
+      xml = xml.replace(/<svg\b/i, `<svg viewBox="0 0 ${w[1]} ${h[1]}"`);
+  }
+  return xml;
+}
+
+/** The sentence for a refused one-time code, or null when the refusal is
+ *  about something else. A code from a step already spent is not a clock
+ *  problem, so it gets its own sentence and is checked first. */
+export function oneTimeCodeSentence(text: string): string | null {
+  if (/code_used|already (been )?used/i.test(text))
+    return "That code was already used — enter the next one from your app.";
+  if (/one-time code|doesn't match/i.test(text))
+    return "That code didn't match — check your app's clock.";
+  return null;
+}
+
 export function elevationProof(
   form: "password" | "recovery",
   status: Pick<ElevationStatus, "methods" | "totp"> | null,
@@ -550,8 +621,9 @@ export const RANGE_MONTHS: Record<TrendRange, number | null> =
 /** The ledger's quick date ranges — the same eight windows instead of a
  *  vocabulary of its own. A range is a from-date on the first of the
  *  window's opening month with an open end: "3m" in September is Jul 1
- *  onward, the same three calendar months Cash Flow's 3m covers, so the
- *  two pages agree on what a window holds; "This month" is from the 1st;
+ *  onward — the ledger shows what is there to edit, so it keeps the month
+ *  in progress that Cash Flow's complete-month windows leave out; "This
+ *  month" is from the 1st;
  *  "1m" is the last complete month CLOSED on its last day (in September:
  *  Aug 1 – Aug 31). "all" is no date filter at all. A calendar date is
  *  device-LOCAL (the `ymd` rule in dates.ts: never through UTC), and
@@ -613,8 +685,8 @@ export function monthsBackFrom(anchor: string, months: number): string {
 // different zone reads a different month for hours at each month boundary:
 // a household in Los Angeles at 6pm on Aug 31 is still in August, while the
 // device's UTC month is already September. Cutting the chart on the device
-// would drop June from a "3m" window whose server figures cover
-// Jun+Jul+Aug, computing the caption's best and worst month over a window
+// would drop May from a "3m" window whose server figures cover
+// May+Jun+Jul, computing the caption's best and worst month over a window
 // one month shorter than the one being read.
 //
 // The report itself names the household's month: the cash graph's history
@@ -630,17 +702,34 @@ export function graphCurrentMonth(
   return graph.points[graph.forecast_from]?.[0] ?? null;
 }
 
+// How many COMPLETE months each cash-flow range holds — the server's
+// reporting.FLOW_RANGES, read through `_range_window`: every key but "cur"
+// is N complete months ending with LAST month, and "cur" is the month in
+// progress alone (no closed month at all). Kept apart from RANGE_MONTHS on
+// purpose: that table counts back from the current month INCLUSIVE, which
+// is right for the ledger filter and the net-worth trend (both keep the
+// month in progress) and one month short for a complete-months window.
+const CASHFLOW_COMPLETE_MONTHS: Record<TrendRange, number | null> =
+  { cur: 0, "1m": 1, "3m": 3, "6m": 6, "1y": 12, "3y": 36, "5y": 60, all: null };
+
 /** The first month a cash-flow range covers, anchored on the household's
- *  month rather than the device's. `today` is only the fallback for a
- *  report with no forecast tail to read the household's month from. */
+ *  month rather than the clock here. `today` is only the fallback for a
+ *  report with no forecast tail to read the household's month from.
+ *  In October, "3m" opens in July (Jul+Aug+Sep, the server's window), "1m"
+ *  in September and "cur" in October — whose history is empty, because the
+ *  cash graph's history stops before the current month.
+ *  The twin is `cashflowCutoffMonth` in webapp/src/components/RangePicker.tsx — keep them identical. */
 export function cashflowCutoffMonth(
   graph: { points: [string, number][]; forecast_from: number },
   range: TrendRange, today: Date = new Date(),
 ): string | null {
-  const months = RANGE_MONTHS[range];
-  if (months === null) return null;
-  const cur = graphCurrentMonth(graph);
-  return cur ? monthsBackFrom(cur, months) : rangeCutoffMonth(range, today);
+  const complete = CASHFLOW_COMPLETE_MONTHS[range];
+  if (complete === null) return null;
+  const cur = graphCurrentMonth(graph)
+    ?? new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), 1))
+      .toISOString().slice(0, 7);
+  // a window of `complete` months whose last month is the one before `cur`
+  return monthsBackFrom(cur, complete + 1);
 }
 
 // ---- what a removal moved ----
@@ -665,6 +754,54 @@ export function accountRemoveMoved(mode: AccountRemoveMode): string[] {
   if (mode.endsWith("purge")) keys.push("settings", "calendar");
   return keys;
 }
+
+/** What to say after a removal. A purge that kept rows (the bank feed
+ *  already relies on them) explains so in the purge's own note, beside
+ *  the removal's note; the same sentence is never said twice. */
+export function accountRemoveNote(r: {
+  note?: string | null; plaid_released?: boolean;
+  purged?: { note?: string | null } | null;
+}): string {
+  const parts: string[] = [];
+  if (r.note) parts.push(r.note);
+  const kept = r.purged?.note;
+  if (kept && !(r.note ?? "").includes(kept)) parts.push(kept);
+  return (parts.join(" ") || "Removed.")
+    + (r.plaid_released ? " Plaid connection released." : "");
+}
+
+/** The question a delete refused with "kept_rows_unconfirmed" asks, or
+ *  null for any other error. The server keeps imported rows a bank feed
+ *  may have set its own copy aside for; when every kept row is held only
+ *  by a note that names no feed account, nothing would ever release them,
+ *  so it asks the owner instead and a "delete anyway" re-sends with
+ *  `force_kept`. Structural, so node can pin it without the API module.
+ *  The web twin is in webapp/src/components/RemoveAccountPanel.tsx. */
+export function keptRowsQuestion(e: unknown): string | null {
+  const x = e as { status?: unknown; detail?: unknown; body?: unknown };
+  const body = x?.body as { error?: unknown; detail?: unknown } | undefined;
+  if (x?.status !== 409 || body?.error !== "kept_rows_unconfirmed")
+    return null;
+  return typeof body.detail === "string" && body.detail ? body.detail
+    : typeof x.detail === "string" ? x.detail : null;
+}
+
+/** The note an undo refused with "kept_rows" carries: a member's undo
+ *  that would leave such rows is told why and offered nothing, because
+ *  deleting them anyway is the owner's call. Null for any other error.
+ *  The web twin is in webapp/src/components/RemoveAccountPanel.tsx. */
+export function keptRowsNote(e: unknown): string | null {
+  const x = e as { status?: unknown; detail?: unknown; body?: unknown };
+  const body = x?.body as { error?: unknown; detail?: unknown } | undefined;
+  if (x?.status !== 409 || body?.error !== "kept_rows") return null;
+  return typeof body.detail === "string" && body.detail ? body.detail
+    : typeof x.detail === "string" && x.detail ? x.detail : null;
+}
+
+/** Did a purge keep rows, and so keep the account to hold them? */
+export const purgeKeptRows = (r: {
+  purged?: { kept_transactions?: number } | null;
+}): boolean => (r.purged?.kept_transactions ?? 0) > 0;
 
 /** `iso` moved `months` months earlier, in the shape it came in: a
  *  "YYYY-MM-DD" keeps its day, clamped to the target month's length (May 31
@@ -771,6 +908,9 @@ export interface BizProfitRow {
    *  charge may sit in another period or year). Null for money in that is
    *  not a refund; absent from an older server. */
   effective_bucket?: string | null;
+  /** the Schedule C line the user chose; a tax payment with one is a
+   *  business cost again (see bizPeriodProfit) */
+  sched_c_line?: string | null;
 }
 
 /** Money IN still carrying one of these spending categories is a merchant
@@ -805,7 +945,10 @@ export const BIZ_REFUND_CATEGORIES: ReadonlySet<string> = new Set([
  *    returned pre-opening purchase would show as profit.
  *  - Money out is an operating cost only in the operating bucket;
  *    organizational and start-up costs are capitalized, and an unbucketed
- *    cost dated before the business opened is a start-up cost. */
+ *    cost dated before the business opened is a start-up cost.
+ *  - An owner's tax payment (and a tax refund) is not a business cost:
+ *    income and self-employment tax belong on the owner's return, so it is
+ *    skipped like a transfer unless the user gave it a Schedule C line. */
 export function bizPeriodProfit(
   rows: readonly BizProfitRow[], businessStart: string | null | undefined,
   period: string,
@@ -817,6 +960,9 @@ export function bizPeriodProfit(
     const net = t.net_amount ?? t.amount;
     const cat = (t.category || "").toUpperCase();
     const card = (t.cat_detailed || "") === "LOAN_PAYMENTS_CREDIT_CARD_PAYMENT";
+    const ownerTax = !t.sched_c_line
+      && (t.cat_detailed === "GOVERNMENT_AND_NON_PROFIT_TAX_PAYMENT"
+        || t.cat_detailed === "INCOME_TAX_REFUND");
     // the server's own bucket first, so a refund nets against the cost it
     // reverses rather than being re-bucketed by its own date
     const bucket = t.effective_bucket ?? (t.bucket
@@ -828,7 +974,7 @@ export function bizPeriodProfit(
       if (t.partly_claimed) { revenue += -net; continue; }
       const wasTransfer = (t.cat_original || "").toUpperCase()
         .includes("TRANSFER");
-      if (cat.includes("TRANSFER") || card
+      if (cat.includes("TRANSFER") || card || ownerTax
           || (wasTransfer && cat !== "INCOME")) continue;
       if (BIZ_REFUND_CATEGORIES.has(cat)) {
         // net is negative: the refund lowers the cost it reverses
@@ -836,11 +982,59 @@ export function bizPeriodProfit(
       } else revenue += -net;
       continue;
     }
-    if (cat === "TRANSFER_OUT" || cat === "TRANSFER_IN" || card) continue;
+    if (cat === "TRANSFER_OUT" || cat === "TRANSFER_IN" || card
+        || ownerTax) continue;
     if (capitalized) continue;
     if (net > 0) operating += net;
   }
   return pyround((revenue - operating) * 100) / 100;
+}
+
+/** The tax years the year-end package and the 1099 list offer, newest
+ *  first: this year back to the year the business was formed or started,
+ *  whichever is earlier (pre-opening costs sit in the formation year), at
+ *  most six; three when neither date is known, the same reach as the
+ *  P&L's own year list. */
+export function bizTaxYears(
+  today: Date, formed: string | null | undefined,
+  started: string | null | undefined,
+): number[] {
+  const now = today.getFullYear();
+  const known = [formed, started]
+    .map((d) => Number((d || "").slice(0, 4)))
+    .filter((y) => y > 1900 && y <= now);
+  const oldest = known.length ? Math.max(Math.min(...known), now - 5)
+    : now - 2;
+  const out: number[] = [];
+  for (let y = now; y >= oldest; y--) out.push(y);
+  return out;
+}
+
+/** The year a tax control opens on. From January through April last
+ *  year's return is the one being filed (the accountant's package, the
+ *  1099-NEC due January 31), so it opens on last year when the business
+ *  had one; otherwise on this year. */
+export function bizDefaultTaxYear(
+  today: Date, years: readonly number[],
+): number {
+  const now = today.getFullYear();
+  return today.getMonth() <= 3 && years.includes(now - 1) ? now - 1 : now;
+}
+
+/** What the year's tax estimate still asks for: the estimate less what the
+ *  business already paid toward it (the P&L's estimated_tax_paid), never
+ *  below zero. A tax reserve is measured against this, not the whole
+ *  year's figure, or paying the estimates out of it reads as a shortfall
+ *  that grows each quarter. */
+export function bizTaxStillDue(
+  estimated: number, paid: number | null | undefined,
+): number {
+  // The estimate is the tax on profit earned so far, so it already grows
+  // with the calendar; the payments are simply taken off it. The books
+  // cannot tell April's prior-year balance due from the first estimate
+  // paid the same day, so the card says that such a payment is in `paid`
+  // rather than guessing a split.
+  return pyround(Math.max(0, estimated - (paid ?? 0)) * 100) / 100;
 }
 
 // ---- what a household-invite mint actually did ----
@@ -913,6 +1107,11 @@ export const MERCHANT_FILTERS = [
   ["all", "all"], ["oneoff", "one-off"], ["unnamed", "unnamed"], ["month", "seen this month"],
 ] as const;
 export type MerchantFilter = (typeof MERCHANT_FILTERS)[number][0];
+// A filter or a spend/recency sort is cut from whatever the capped catalog
+// sent, so it asks for the widest window the server allows (500) before
+// cutting; the plain orders keep the 200-row page.
+export const catalogLimit = (order: MerchantOrder, flt: MerchantFilter): number =>
+  flt !== "all" || order === "spend" || order === "recent" ? 500 : 200;
 // a name the aggregator never resolved: a digits run, a terminal's * or #,
 // or an all-caps string no one would call a name
 export const looksUnnamed = (name: string) =>
@@ -924,7 +1123,10 @@ export function sortMerchants<T extends { display: string; rows: number; total: 
   if (flt === "oneoff") r = r.filter((m) => m.rows === 1);
   else if (flt === "unnamed") r = r.filter((m) => looksUnnamed(m.display));
   else if (flt === "month") {
-    const m0 = today.toISOString().slice(0, 7);
+    // the local month, as the web's twin reads it: the UTC one is already
+    // next month on the evening of the last day west of Greenwich, and
+    // "this month" would empty
+    const m0 = localYmd(today).slice(0, 7);
     r = r.filter((m) => (m.last ?? "").slice(0, 7) >= m0);
   }
   if (order === "alpha") r = [...r].sort((a, b) => a.display.localeCompare(b.display));
@@ -1083,14 +1285,263 @@ export function mergePlannerBuckets(
   return out;
 }
 
+// ---- a whole-value save, rebased onto what is stored now ----
+// Some settings save whole: the server replaces the list or object it is
+// sent. An editor's copy is from when it opened, so posting it as-is
+// would undo whatever another device saved in between. These lay only
+// the person's own changes over the stored value fetched just before the
+// save.
+
+const sameValue = (a: unknown, b: unknown) =>
+  JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+
+/** One record after this editor's changes: a field the person changed
+ *  since `base` takes their value, every other field the stored (`live`)
+ *  one. No `base` means the record was added here: all of it is theirs. */
+export function rebaseFields<T extends object>(
+  mine: T, base: T | undefined, live: T,
+): T {
+  const m = mine as Record<string, unknown>;
+  const b = (base ?? {}) as Record<string, unknown>;
+  const out: Record<string, unknown> = { ...(live as object) };
+  for (const k of new Set([...Object.keys(m), ...Object.keys(b)])) {
+    if (base !== undefined && sameValue(m[k], b[k])) continue;
+    if (m[k] === undefined) delete out[k];
+    else out[k] = m[k];
+  }
+  return out as T;
+}
+
+/** A keyed collection, rebased onto the stored one. Per key: changed
+ *  here → the person's fields over the stored copy (their own copy when
+ *  it was deleted elsewhere); untouched → the stored copy, or gone if it
+ *  was deleted elsewhere; removed here → stays removed; added here or
+ *  elsewhere → kept. Stored order first, then what was added here. */
+export function rebaseKeyed<T extends object>(
+  mine: Readonly<Record<string, T>>,
+  base: Readonly<Record<string, T>>,
+  live: Readonly<Record<string, T>>,
+): Record<string, T> {
+  const has = (o: object, k: string) => Object.prototype.hasOwnProperty.call(o, k);
+  const out: Record<string, T> = {};
+  for (const [k, l] of Object.entries(live)) {
+    if (!has(base, k)) out[k] = has(mine, k) ? rebaseFields(mine[k], undefined, l) : l;
+    else if (has(mine, k)) out[k] = rebaseFields(mine[k], base[k], l);
+  }
+  for (const [k, v] of Object.entries(mine))
+    if (!has(live, k) && (!has(base, k) || !sameValue(v, base[k]))) out[k] = v;
+  return out;
+}
+
+/** Each row's identity in a list that has no ids: its name, numbered by
+ *  occurrence so two rows of one name stay two. */
+export function nameKeys(rows: readonly { name: string }[]): string[] {
+  const seen = new Map<string, number>();
+  return rows.map((r) => {
+    const n = seen.get(r.name) ?? 0;
+    seen.set(r.name, n + 1);
+    return `${r.name}\u0000${n}`;
+  });
+}
+
+const byNameKey = <T extends { name: string }>(rows: readonly T[]) => {
+  const keys = nameKeys(rows);
+  return Object.fromEntries(rows.map((r, i) => [keys[i], r])) as Record<string, T>;
+};
+
+/** A name-keyed list (the net-worth assets) rebased onto the stored one.
+ *  `rows` are the edited rows, each carrying `orig`, its nameKeys() key in
+ *  `baseline` (absent: added here); a baseline row missing from `rows`
+ *  was removed here. */
+export function rebaseNamedList<T extends { name: string }>(
+  rows: readonly (T & { orig?: string })[],
+  baseline: readonly T[],
+  live: readonly T[],
+): T[] {
+  const mine: Record<string, T> = {};
+  rows.forEach((r, i) => {
+    const { orig, ...rest } = r;
+    mine[orig ?? `\u0001added\u0000${i}`] = rest as unknown as T;
+  });
+  return Object.values(rebaseKeyed(mine, byNameKey(baseline), byNameKey(live)));
+}
+
+/** Whether the stored asset list reads as `sent`, the list a Save wrote:
+ *  compared the way the server stores a row (name trimmed and cut to 60,
+ *  kind defaulted, value to the cent). A row sent without a date comes
+ *  back stamped with today, so its date is compared only when it had one. */
+export function assetListLanded(
+  sent: readonly { name: string }[], live: readonly { name: string }[],
+): boolean {
+  const cents = (v: unknown) => pyround(Number(v ?? 0) * 100);
+  return sent.length === live.length && sent.every((s, i) => {
+    const a = s as Record<string, unknown>;
+    const b = live[i] as Record<string, unknown>;
+    return String(a.name ?? "").trim().slice(0, 60) === b.name
+      && String(a.kind || "other").trim().slice(0, 30) === b.kind
+      && cents(a.value) === cents(b.value)
+      && (!a.as_of || String(a.as_of) === String(b.as_of));
+  });
+}
+
+/** rebaseNamedList for a Save that may follow one whose reply never came
+ *  (a timeout or a dropped connection after the server had written it).
+ *  `sent` is the list that earlier attempt wrote, and each row's `sent`
+ *  the place it took there. When the stored list reads as `sent`, that
+ *  attempt landed: the stored list becomes the baseline and each row is
+ *  keyed by the place it took, so nothing it added or renamed goes in a
+ *  second time. Otherwise the rebase runs against `baseline` as if the
+ *  attempt never happened. Returns the list to send, the baseline to keep,
+ *  and per row its new `orig` and `sent` (null: the row is already gone
+ *  from the stored list and leaves the editor). */
+export function rebaseNamedSave<T extends { name: string }>(
+  rows: readonly (T & { orig?: string; sent?: number })[],
+  baseline: readonly T[],
+  live: readonly T[],
+  sent: readonly T[] | null,
+): { list: T[]; baseline: T[];
+     rows: ({ orig?: string; sent?: number } | null)[] } {
+  const landed = !!sent && assetListLanded(sent, live);
+  const base = landed ? live : baseline;
+  const liveKeys = nameKeys(live);
+  const mine: Record<string, T> = {};
+  const keyOf = rows.map((r, i) => {
+    const { orig, sent: at, ...rest } = r;
+    let k: string | undefined = orig ?? `\u0001added\u0000${i}`;
+    if (landed) {
+      if (at !== undefined) k = liveKeys[at];
+      else if (orig !== undefined) k = undefined;
+    }
+    if (k !== undefined) mine[k] = rest as unknown as T;
+    return k;
+  });
+  const out = rebaseKeyed(mine, byNameKey(base), byNameKey(live));
+  const order = Object.keys(out);
+  return {
+    list: Object.values(out),
+    baseline: [...base],
+    rows: rows.map((r, i) => {
+      const k = keyOf[i];
+      if (k === undefined) return null;
+      const at = order.indexOf(k);
+      const orig = landed ? (k.startsWith("\u0001") ? undefined : k) : r.orig;
+      return { orig, sent: at < 0 ? undefined : at };
+    }),
+  };
+}
+
+/** The list of device tokens still to revoke, after this sign-out's
+ *  revoke did not reach its server: the token joins it once, and the list
+ *  keeps only tokens the server could still honour (a device token lives
+ *  90 days at most) and the newest few, so it stays small. */
+export const UNREVOKED_MAX = 5;
+export function queueUnrevoked<T extends { token: string; at: number }>(
+  list: readonly T[], add: T | null, nowMs: number,
+): T[] {
+  const live = list.filter((x) => nowMs - x.at < 90 * 86_400_000
+                                  && x.token !== add?.token);
+  return [...live, ...(add ? [add] : [])].slice(-UNREVOKED_MAX);
+}
+
+/** A failed bank-link status poll worth trying again. The poll is what
+ *  makes the server exchange the bank's token, so one lost request must
+ *  not end it: no answer at all (offline, the connection dropped while
+ *  the bank's own app was open, the request cut short), an unreadable
+ *  2xx (a Wi-Fi sign-in page), a server or gateway error (a restart, an
+ *  edge timeout while the first sync runs), a request timeout or a rate
+ *  limit all keep polling. Any other 4xx, a sign-out among them, is
+ *  final. */
+export function linkPollMayRetry(e: unknown): boolean {
+  const status = (e as { status?: unknown } | null)?.status;
+  if (typeof status !== "number") return true;
+  return status < 400 || status >= 500 || status === 408 || status === 429;
+}
+
+/** The bucket a business cost shows on the Books control: the one the
+ *  server's P&L counts it in (a cost dated before the business started is
+ *  start-up there), else the stored class, else operating. A control that
+ *  showed "Operating" for a start-up cost could not send Operating: the
+ *  choice would already be selected. */
+export function bizShownBucket(
+  t: { bucket: string | null; effective_bucket?: string | null },
+): string {
+  return t.effective_bucket || t.bucket || "operating";
+}
+
+/** Whether a Books row still needs a Schedule C line: a cost given an
+ *  operating bucket and no line. The server keeps such a row in review,
+ *  and the Books tab is where it was bucketed, so the line is offered
+ *  there too. Start-up and organizational costs are capitalized, not
+ *  filed on a line, and a row with no class at all is the review
+ *  queue's. */
+export function bizNeedsLine(
+  t: { amount: number; bucket: string | null; sched_c_line: string | null },
+): boolean {
+  return t.amount > 0 && t.bucket === "operating" && !t.sched_c_line;
+}
+
+/** A typed number for a field that is not money (a tax rate, a floor
+ *  area, an ownership share, miles). Blank is null, the field cleared;
+ *  "1,200" reads as 1200. Anything else that is not a plain number
+ *  ("22,5", "22%") is undefined, refused: sent as Number() it would be
+ *  NaN, which JSON writes as null, and the server takes null as "clear"
+ *  and wipes the stored value. */
+export function numberDraft(v: string): number | null | undefined {
+  const t = (v ?? "").trim();
+  if (!t) return null;
+  const plain = /^\d{1,3}(,\d{3})+(\.\d+)?$/.test(t) ? t.replace(/,/g, "") : t;
+  if (!/^-?(\d+\.?\d*|\.\d+)$/.test(plain)) return undefined;
+  const n = Number(plain);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+/** The number fields a save sends: only those whose text differs from
+ *  what the form was loaded with, so saving one field never writes back
+ *  a stale copy of another that changed elsewhere since. Throws, naming
+ *  the field, when its text is not a number (see numberDraft). */
+export function numberFieldsPatch(
+  fields: Record<string, { draft: string; loaded: string; label: string }>,
+): Record<string, number | null> {
+  const out: Record<string, number | null> = {};
+  for (const [key, f] of Object.entries(fields)) {
+    if (f.draft.trim() === f.loaded.trim()) continue;
+    const n = numberDraft(f.draft);
+    if (n === undefined) throw new Error(`The ${f.label} is not a number`);
+    out[key] = n;
+  }
+  return out;
+}
+
+/** Whether a refused member edit or removal means the server has no such
+ *  door (an older server): an unknown path answers the framework's bare
+ *  "Not Found", a known path asked with another method 405. A 404 that
+ *  names the member is the member already gone, not a missing door. */
+export function bizMemberDoorMissing(
+  status: number | null | undefined, detail: string | null | undefined,
+): boolean {
+  return status === 405
+    || (status === 404 && (detail ?? "").trim() === "Not Found");
+}
+
 /** Whether a file in the app cache is one this app downloaded or wrote
  *  for the share sheet: the full-data export, the database dump
  *  (.sql.gz), CSVs, the year-end ZIP, the continuity PDF, the compliance
- *  calendar, receipt images and the passphrase-sealed connections bundle
- *  (.oikx). Everything else in the cache (the platform's own
- *  subdirectories, image-picker scratch) is not ours to delete. */
+ *  calendar, receipt images, the diagnostic bundle (.json) and the
+ *  passphrase-sealed connections bundle (.oikx). The platform's own subdirectories are not ours to delete;
+ *  the pickers' scratch folders are swept on their own (PICKER_SCRATCH). */
 export const isSharedDownload = (name: string): boolean =>
-  /\.(zip|csv|sql|gz|pdf|ics|jpe?g|png|webp|oikx)$/i.test(name);
+  /\.(zip|csv|sql|gz|pdf|ics|jpe?g|png|webp|oikx|json)$/i.test(name);
+
+/** The folders in the app cache the photo and document pickers copy a
+ *  picked file into: a photographed check (its routing and account
+ *  number), a tax form, a statement. They are the household's own
+ *  documents, so they go once uploaded and at sign-out with the rest. */
+export const PICKER_SCRATCH = ["ImagePicker/", "DocumentPicker/"] as const;
+
+/** Whether `uri` is a picked file's copy in one of those folders. */
+export const isPickerScratch = (uri: string, cacheDir: string | null):
+    boolean =>
+  !!cacheDir && PICKER_SCRATCH.some((d) => uri.startsWith(cacheDir + d));
 
 /** Which of those files a sweep deletes. `maxAgeS` 0 deletes every one
  *  (sign-out: nothing of this household's may stay behind); a positive
@@ -1198,6 +1649,13 @@ export function localYmd(d: Date): string {
     + String(d.getDate()).padStart(2, "0");
 }
 
+/** The local day a timestamp fell on, as YYYY-MM-DD; the text itself when
+ *  it is not a time JS can read, so a date-only value still prints. */
+export function localDayOf(ts: string): string {
+  const d = new Date(ts);
+  return Number.isNaN(d.getTime()) ? ts : localYmd(d);
+}
+
 /** Whether a client adopts its device's zone as the household's, unasked.
  *
  *  Only on a hosted instance: there the instance clock is the operator's,
@@ -1216,6 +1674,26 @@ export function adoptsDeviceZone(m: {
   if (m.timezone_source !== "instance") return false;
   if (!device || device === m.timezone) return false;
   return !/^(Etc\/|UTC$|GMT$|Universal$|Zulu$)/.test(device);
+}
+
+/** The zone to adopt now, or null. Only an /api/me answer the network
+ *  just gave counts: the phone also restores last session's answer from
+ *  disk, and a household zone chosen on another device since then is not
+ *  in it — adopting off that snapshot would overwrite the choice. */
+export function zoneToAdopt(fresh: Parameters<typeof adoptsDeviceZone>[0] | null,
+                            device: string): string | null {
+  return fresh && adoptsDeviceZone(fresh, device) ? device : null;
+}
+
+/** After a failed adopt, whether the next fresh /api/me may try again.
+ *  A refusal (any 4xx — a demo, a zone already chosen) is the server's
+ *  answer and is final; a dropped connection or a server error is
+ *  retried, a few times per launch, so a flaky first load does not leave
+ *  the household on the instance clock until the next cold start. */
+export const ZONE_ADOPT_TRIES = 3;
+export function retriesZoneAdopt(status: number, attempts: number): boolean {
+  if (status >= 400 && status < 500) return false;
+  return attempts < ZONE_ADOPT_TRIES;
 }
 
 /** What a sign-in left behind when its device mint was refused at the
@@ -1421,3 +1899,704 @@ export function pushStillLive(
   if (lastSent !== sending || !devices) return false;
   return devices.find((d) => d.current)?.push === "on";
 }
+
+/** The theme an owner's account asks for, from the stored settings value
+ *  (the web's reconcile in App.tsx, same rule). Absent means never chosen,
+ *  which is the dark default; "auto" is a choice of its own — follow the
+ *  OS — and must survive the reconcile, or picking "match system" would
+ *  snap back to dark on the next launch. Anything else is not a theme this
+ *  build knows, and changes nothing. */
+export function accountTheme(
+    stored: unknown): "auto" | "light" | "dark" | null {
+  if (stored === undefined || stored === null || stored === "")
+    return "dark";
+  return stored === "auto" || stored === "light" || stored === "dark"
+    ? stored : null;
+}
+
+// Bill cadence words and the edit picker's option list. The web keeps an
+// identical copy in webapp/src/cadence.ts; the pure-logic suite runs both
+// and checks the two are the same text.
+/** A FREQ:interval cadence value in the words the bills list uses for it
+ *  ("monthly", "every 4 months", "envelope (annual pool)") — the server's
+ *  phrasing, so a bill outside the standard list reads the same in the edit
+ *  picker as it does in the row it was opened from. */
+export function cadenceWords(value: string): string {
+  const [freq, raw] = value.toUpperCase().split(":");
+  const n = parseInt(raw ?? "1", 10) || 1;
+  if (freq === "ENVELOPE")
+    return n >= 12 ? "envelope (annual pool)" : "envelope (monthly pool)";
+  if (!freq || freq === "ONE_TIME") return "one-time";
+  const unit: Record<string, [string, string]> = {
+    DAILY: ["daily", "day"], WEEKLY: ["weekly", "week"],
+    MONTHLY: ["monthly", "month"], YEARLY: ["yearly", "year"] };
+  const u = unit[freq];
+  if (!u) return value;
+  return n === 1 ? u[0] : `every ${n} ${u[1]}s`;
+}
+
+/** The edit picker's options: the server's list, then every cadence the
+ *  bill must still be able to land on that the list lacks — the bill's own
+ *  saved interval (an "every 4 months" bill), and a ledger-fit prefill or
+ *  the current pick. Without the saved one, touching the picker once loses
+ *  the bill's real cadence for good. */
+export function cadenceChoices(list: [string, string][],
+                               keep: (string | null | undefined)[]
+                               ): [string, string][] {
+  const out = [...list];
+  for (const v of keep) {
+    if (v && !out.some(([k]) => k === v)) out.push([v, cadenceWords(v)]);
+  }
+  return out;
+}
+
+// ---- the shared demonstration login: one owner login whose password is
+// handed out, so every holder signs in as the same owner. The server refuses it
+// every door that changes the login itself or grants something that
+// outlives it; these are the sentences those refusals carry, so the
+// control that is switched off says what the 403 would have said. ----
+export const SHARED_LOGIN_NOTE = "This is a shared demonstration login — "
+  + "its password, email, sign-in factors and sessions can't be changed.";
+export const SHARED_GRANT_NOTE = "This is a shared demonstration login — "
+  + "it can't add people, script tokens, support access or new outbound "
+  + "destinations to this household.";
+export const SHARED_CREDENTIAL_NOTE = "This is a shared demonstration login — "
+  + "it can't connect, disconnect or reconnect a bank or exchange, save "
+  + "aggregator keys or take the credential bundle, since those outlive "
+  + "the login.";
+
+/** Why a control is switched off for the shared demonstration login, or
+ *  null when it is live. `login` is a change to the login's own posture
+ *  (password, email, factors, sessions, the account itself); `grant` is a
+ *  principal or channel that would outlive it (a member, a token, a hook,
+ *  support access, a new mail or AI destination). A demo instance answers
+ *  null: it already greys the whole screen under its own banner, and two
+ *  notes on one card would say the same thing twice. Unknown answers
+ *  null too, like useDemo — the common login is not this one, and every
+ *  such control is also owner-gated, which fails closed on the same
+ *  query. */
+export function sharedLock(
+  me: { demo?: boolean; shared_login?: boolean } | undefined,
+  kind: "login" | "grant" | "credential",
+): string | null {
+  if (!me || me.demo || !me.shared_login) return null;
+  return kind === "login" ? SHARED_LOGIN_NOTE
+    : kind === "credential" ? SHARED_CREDENTIAL_NOTE : SHARED_GRANT_NOTE;
+}
+
+/** The body one edit of the daily-mail list posts: the field it changed
+ *  and nothing else. Every other field rides from a copy of the settings
+ *  loaded earlier, and the server stores whatever it is sent — so a
+ *  schedule or a mute list that tagged along would put back a cadence
+ *  changed on another device, or a member's own "turn off for me". A mute
+ *  or a recipient edit names only its own address; the server applies it
+ *  to the stored list. */
+export function recipientEditBody(e:
+  | { kind: "mute"; email: string; on: boolean; muted: string[] }
+  | { kind: "add" | "remove"; email: string; recipients: string[] },
+): Record<string, unknown> {
+  // The one-address delta is what a current server applies, so a toggle
+  // or an edit made from this phone's cached copy of a list can never
+  // drop or un-mute an address another device changed since. The whole
+  // list from that copy rides along only because a server older than the
+  // delta keys knows nothing else; a current server ignores it when a
+  // delta is present.
+  if (e.kind === "mute") {
+    const low = e.email.toLowerCase();
+    const rest = e.muted.map((x) => x.toLowerCase()).filter((x) => x !== low);
+    return e.on
+      ? { email_muted_add: [low], email_muted: [...new Set([...rest, low])] }
+      : { email_muted_remove: [low], email_muted: [...new Set(rest)] };
+  }
+  const low = e.email.toLowerCase();
+  const rest = e.recipients.filter((x) => x.toLowerCase() !== low);
+  return e.kind === "add"
+    ? { email_recipients_added: [e.email],
+        email_recipients: [...rest, e.email] }
+    : { email_recipients_removed: [e.email], email_recipients: rest };
+}
+
+// ---- the recipient add box and the Resend reply ----
+// The web keeps the same rules in webapp/src/recipients.ts; the pure-logic
+// suite runs every case against both copies.
+
+/** Is this shaped like one mailbox? Never stricter than the server, which
+ *  accepts a dotless domain on purpose: a LAN relay's single-label domain
+ *  is a real mailbox. The server has the final say. */
+export function looksLikeMailbox(v: string): boolean {
+  return /^[^\s@]+@[^\s@.]+(\.[^\s@.]+)*$/.test(v);
+}
+
+/** Why the add box will not add this address, which is already on the
+ *  list, or null when it is new. The owner is mailed by construction and
+ *  never invited to their own household's email. */
+export function recipientDuplicate(
+  v: string, recipients: string[], ownerEmail: string | null | undefined,
+): string | null {
+  const low = v.toLowerCase();
+  if (ownerEmail && ownerEmail.toLowerCase() === low)
+    return "That's you — you're already on the list.";
+  if (recipients.some((r) => r.toLowerCase() === low))
+    return "Already on the list.";
+  return null;
+}
+
+/** What a member's own daily-email card says about their inbox. The
+ *  worker's rule is not "on and not muted": once the owner saves a list,
+ *  only the owner and the addresses that ACCEPTED their invitation are
+ *  mailed; with no list, every verified user is (on self-host, everyone,
+ *  until anyone has verified). So the sentence is worked out from the
+ *  same facts. `recipients`/`status` come from the settings view and are
+ *  undefined until it loads; `needBaseUrl` from /api/notify, absent on an
+ *  older server. */
+export function myDailyLine(x: {
+  me: string; on: boolean; muted: boolean;
+  prefs?: Partial<Record<string, boolean>> | null;
+  verified?: boolean | null; hosted?: boolean;
+  recipients?: string[] | null;
+  status?: { email: string; verified?: boolean | null;
+             invite?: string | null; delivery?: string | null }[] | null;
+  needBaseUrl?: boolean;
+}): { receiving: boolean; text: string } {
+  const no = (text: string) => ({ receiving: false, text });
+  if (x.muted) return no("You've muted all household mail for yourself.");
+  if (!x.on) return no("Off.");
+  if (x.prefs?.daily === false) return no("You've turned the daily email off for yourself.");
+  const low = x.me.toLowerCase();
+  const row = x.status?.find((r) => r.email.toLowerCase() === low);
+  if (row?.delivery === "bouncing" || row?.delivery === "complained")
+    return no("Held — mail to your address isn't being delivered.");
+  if (x.status && x.recipients?.length) {
+    if (!row) return no("The owner's mail list doesn't include you.");
+    if (row.invite !== "accepted") {
+      if (x.needBaseUrl)
+        return no("Your invitation can't be sent until the server has a "
+          + "public address (OIKONOME_BASE_URL).");
+      if (row.invite === "invited")
+        return no("Accept the invitation in your inbox to start receiving it.");
+      if (row.invite === "declined")
+        return no("You declined the invitation — ask the owner to send another.");
+      return no("You haven't accepted an invitation yet — ask the owner to "
+        + "send one.");
+    }
+  } else if (x.verified === false
+             && (x.hosted || x.status?.some((r) => r.verified === true))) {
+    return no("Confirm your email address to receive it.");
+  }
+  return { receiving: true, text: "You receive it." };
+}
+
+/** What the add box says instead of adding, when this server cannot mail
+ *  the invitation an added address needs before it is ever mailed. */
+export const NEED_BASE_URL =
+  "Set OIKONOME_BASE_URL on the server before adding recipients.";
+
+/** Why Resend sent nothing, or null when it sent. The server answers ok
+ *  even when it held the mail back, and names why in `reason`; a reply
+ *  without `sent` comes from a server that always sent. */
+export function resendHeld(
+  r: { sent?: boolean | null; reason?: string | null } | null | undefined,
+  email: string,
+): string | null {
+  if (r?.sent !== false) return null;
+  if (r.reason === "cooldown")
+    return `An invitation went to ${email} a few minutes ago — try again `
+      + "shortly.";
+  if (r.reason === "cap")
+    return "Too many invitations sent for now — try again later.";
+  if (r.reason === "no_mail")
+    return `The invitation to ${email} was not sent: this instance has no `
+      + "way to mail it (no relay, or no OIKONOME_BASE_URL to build the "
+      + "link under). Their previous link, if any, still works.";
+  if (r.reason === "undelivered")
+    return `The mail relay refused the invitation to ${email}. Their `
+      + "previous link, if any, still works.";
+  if (r.reason === "error")
+    return `The invitation to ${email} could not be sent right now — try `
+      + "again shortly.";
+  return `The invitation to ${email} was not sent.`;
+}
+
+// What the bill screen says after Enable/Disable: the state the server
+// settled on, worded as the web's toast words it, so the person sees the
+// outcome rather than being returned to the list without a word.
+export function billToggleNote(disabled: boolean): string {
+  return disabled ? "Disabled — excluded from the budget."
+                  : "Enabled — counts toward the budget.";
+}
+
+// A bill that missed its date reads one of two ways. Usually it is overdue
+// (red). But a bank feed can withdraw a charge it already posted, and a
+// bill that WAS charged then looks unpaid — the server marks those with the
+// date the charge was withdrawn, and the honest word is a warning, not a
+// missed payment. Same words as the web Bills row and the Today footnote.
+export function missedBillPill(withdrawnOn: string | null | undefined): {
+  text: string; tone: "warn" | "bad"; note: string | null;
+} {
+  if (!withdrawnOn || withdrawnOn.length < 10) {
+    return { text: "overdue", tone: "bad", note: null };
+  }
+  const [y, m, d] = withdrawnOn.slice(0, 10).split("-");
+  return { text: "withdrawn", tone: "warn",
+           note: `charge withdrawn by the bank feed (${m}/${d}/${y.slice(2)})` };
+}
+
+/** Interest a plan saves against paying only the minimums, or 0 when there
+ *  is no honest figure. A baseline that never pays off stops at the
+ *  simulation horizon, so its interest is a truncation total, not a cost. */
+export function interestSaved(
+  base: { debt_free: string | null; total_interest: number },
+  plan: { total_interest: number },
+): number {
+  return base.debt_free ? base.total_interest - plan.total_interest : 0;
+}
+
+// Which 401 replies are a step-up refusal rather than a lost session. A
+// wrong password, a missing or spent one-time code, or a refused passkey on
+// an in-app form is a 401 too, and it means "try again", not "your session
+// is gone" — treating it as gone wipes the device token and drops to login.
+// "one-time code" rather than "bad one-time": the server also says "current
+// one-time code required". A code the authenticator app is still showing
+// after it was spent answers "code_used: that code has already been used",
+// which names neither. The web keeps the same list in webapp/src/reauth.ts;
+// the pure-logic suite runs both copies.
+const REAUTH = /totp_required|recovery_required|password_required|code_used|already been used|wrong password|one-time code|bad credentials|passkey/i;
+
+/** The server's own marker on a step-up refusal: `error: "reauth"`, at the
+ *  top of the body or inside FastAPI's `detail` wrapper. Read before the
+ *  wording, which an older server is the only reason to keep. */
+function hasReauthMarker(body: unknown): boolean {
+  if (typeof body === "string") {
+    try { body = JSON.parse(body); } catch { return false; }
+  }
+  if (!body || typeof body !== "object") return false;
+  const b = body as { error?: unknown; detail?: { error?: unknown } | unknown };
+  if (b.error === "reauth") return true;
+  const d = b.detail;
+  return !!d && typeof d === "object"
+    && (d as { error?: unknown }).error === "reauth";
+}
+
+/** Is this 401 a re-auth refusal the form shows, rather than a session
+ *  that is gone? `detail` is the reply's sentence; `body` the parsed reply,
+ *  checked for the marker first. */
+export function isReauthReply(detail: string, body?: unknown): boolean {
+  return hasReauthMarker(body) || hasReauthMarker(detail)
+    || REAUTH.test(detail);
+}
+
+/** A month's net saved figure as the cash-flow footer prints it: a "+"
+ *  only on a gain, so the best month of an all-negative range reads
+ *  "-$40" in the loss colour rather than "+-$40" in the gain one. */
+export function savedFigure(n: number): { text: string;
+                                          tone: "good" | "bad" | "plain" } {
+  const r = pyround(n);
+  if (r > 0) return { text: "+" + money(n, false), tone: "good" };
+  return { text: money(n, false), tone: r < 0 ? "bad" : "plain" };
+}
+
+/** When a tapped notification was sent. expo-notifications reports the
+ *  date in seconds on iOS and milliseconds on Android, so a value too
+ *  small to be milliseconds since 2001 is read as seconds; anything that
+ *  still lands outside a sane window (unset, garbage, far future) falls
+ *  back to the moment of the tap. */
+export function pushSentAt(raw: unknown, now: Date = new Date()): Date {
+  if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) return now;
+  const ms = raw < 1e12 ? raw * 1000 : raw;
+  const lo = Date.UTC(2020, 0, 1), hi = now.getTime() + 86_400_000;
+  return ms >= lo && ms <= hi ? new Date(ms) : now;
+}
+
+/** The year and month an instant falls in on the household's clock. The
+ *  server dates a report by the household's day, so a phone in another
+ *  zone (or travelling) must not read the instant on its own clock — late
+ *  on the 31st in the household is already the 1st somewhere east. An
+ *  unknown or missing zone falls back to the device's. */
+export function zonedYearMonth(at: Date, zone?: string): { y: number; m: number } {
+  if (zone) {
+    try {
+      const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone: zone, year: "numeric", month: "numeric",
+      }).formatToParts(at);
+      const y = Number(parts.find((p) => p.type === "year")?.value);
+      const m = Number(parts.find((p) => p.type === "month")?.value);
+      if (Number.isInteger(y) && Number.isInteger(m)) return { y, m };
+    } catch { /* an unknown zone name: read the device clock instead */ }
+  }
+  return { y: at.getFullYear(), m: at.getMonth() + 1 };
+}
+
+/** Where tapping a push lands. The monthly report goes out on the 1st and
+ *  the yearly one on Jan 1, and both describe the period that just ENDED —
+ *  opening the bare Month or Year screen would show the period that began a
+ *  few hours ago, nearly empty. A payload that names the period (`y`, `m`)
+ *  wins; otherwise the period is the one before the day the push was sent,
+ *  read on the household's clock (`zone`) — the same rule the report
+ *  itself uses — so a tap days later, or from another zone, still opens
+ *  the report the push announced. */
+export function pushRoute(event: string,
+                          data: Record<string, unknown> | undefined,
+                          sentAt: Date, zone?: string): string {
+  const int = (v: unknown, lo: number, hi: number): number | null => {
+    const n = typeof v === "number" ? v : typeof v === "string" && v.trim()
+      ? Number(v) : NaN;
+    return Number.isInteger(n) && n >= lo && n <= hi ? n : null;
+  };
+  if (event === "alert") return "/alerts";
+  if (event === "monthly") {
+    let y = int(data?.y, 1900, 2100), m = int(data?.m, 1, 12);
+    if (y === null || m === null) {
+      const sent = zonedYearMonth(sentAt, zone);
+      y = sent.m === 1 ? sent.y - 1 : sent.y;
+      m = sent.m === 1 ? 12 : sent.m - 1;
+    }
+    return `/month?y=${y}&m=${m}`;
+  }
+  if (event === "yearly") {
+    const y = int(data?.y, 1900, 2100) ?? zonedYearMonth(sentAt, zone).y - 1;
+    return `/year?y=${y}`;
+  }
+  return "/";
+}
+
+// ---- who receives which kind of email ----
+// The web keeps the same rules in webapp/src/recipients.ts; the pure-logic
+// suite runs every case against both copies. The kinds are the server's
+// (notify/email_prefs.py), in the grid's column order.
+export const EMAIL_KINDS = ["daily", "monthly", "yearly", "alerts"] as const;
+export const EMAIL_KIND_LABEL: Record<string, string> = {
+  daily: "Daily", monthly: "Monthly", yearly: "Yearly", alerts: "Alerts",
+};
+
+/** Whether this address receives this kind; a row from a server that
+ *  predates the grid carries no prefs, and that means all of them. */
+export function prefOn(
+  prefs: Partial<Record<string, boolean>> | null | undefined, kind: string,
+): boolean {
+  return prefs?.[kind] !== false;
+}
+
+/** Why a column is dimmed: the household does not send that kind at all
+ *  right now, so the boxes under it decide nothing until it is on.
+ *  Alerts have no schedule and are never dimmed. */
+export function kindOffNote(
+  kind: string, sending: Partial<Record<string, boolean>> | null | undefined,
+): string | null {
+  if (kind === "alerts" || sending?.[kind]) return null;
+  return kind === "daily" ? "daily email is off"
+    : kind === "yearly" ? "year in review is off"
+    : `${kind} report is off`;
+}
+
+/** The recipient rows with one box flipped — the cache patch a tap makes
+ *  before the server's reply settles it. Matches the address the way the
+ *  server does, ignoring case. */
+export function withPref<T extends { email: string;
+                                     prefs?: Partial<Record<string, boolean>> }>(
+  rows: T[], email: string, kind: string, on: boolean,
+): T[] {
+  const low = email.toLowerCase();
+  return rows.map((r) => r.email.toLowerCase() === low
+    ? { ...r, prefs: { ...r.prefs, [kind]: on } } : r);
+}
+
+/** A whole number from a route param, or null when it is missing, not a
+ *  plain integer, or outside lo..hi. Route params arrive from deep links
+ *  anyone can write (`oikonome://transactions?m=13`), and a screen that
+ *  indexes the month names with one renders nothing at all — so every
+ *  numeric param is read through this, never through Number(). A repeated
+ *  param reaches the screen as a list; its first value counts. */
+export function routeInt(v: unknown, lo: number, hi: number): number | null {
+  const raw = Array.isArray(v) ? v[0] : v;
+  const s = typeof raw === "number" ? String(raw) : raw;
+  if (typeof s !== "string" || !/^\s*-?\d+\s*$/.test(s)) return null;
+  const n = Number(s);
+  return n >= lo && n <= hi ? n : null;
+}
+
+/** The year and month a screen opens on: the route's own, each falling
+ *  back to the current one when absent or out of range. */
+export function routeYm(
+  y: unknown, m: unknown, now: Date,
+): { y: number; m: number } {
+  return { y: routeInt(y, 1900, 2100) ?? now.getFullYear(),
+           m: routeInt(m, 1, 12) ?? now.getMonth() + 1 };
+}
+
+/** The sentence a credential change adds when it paused the household's
+ *  text number (the reply's `sms_number_needs_verify`), or "" when it
+ *  did not. The web twin is smsPauseNote in webapp/src/api/cache.ts. */
+export function smsPauseSentence(
+  r: { sms_number_needs_verify?: boolean } | null | undefined,
+): string {
+  return r?.sms_number_needs_verify
+    ? " Texts to the household's number are paused until you confirm it "
+      + "again (More → Email & Push)."
+    : "";
+}
+
+
+// ---- bulk actions: one selection, sent in one request ---------------------
+// The server applies up to 10,000 ids in one bulk write, all or nothing, so
+// a selection up to that size goes in ONE request: split, a failure part-way
+// would leave the first pieces applied and the rest not. A selection past
+// BULK_MAX is not offered at all: a write that size is a rule, not a
+// selection (webapp/src/components/TxnTable.tsx does the same). BULK_CHUNK
+// stays the server's cap, so only what one request could never carry is
+// split.
+export const BULK_MAX = 10000;
+export const BULK_CHUNK = BULK_MAX;
+export function chunkIds<T>(ids: readonly T[], size: number = BULK_CHUNK): T[][] {
+  const n = Math.max(1, Math.floor(size));
+  const out: T[][] = [];
+  for (let i = 0; i < ids.length; i += n) out.push(ids.slice(i, i + n));
+  return out;
+}
+export type BulkTally = { applied: number; missing: number; flow: number };
+// Sends each piece in turn and adds up what the server reports. A piece
+// that fails stops the walk, and the error says how many were already
+// written, because the pieces before it stay applied.
+export async function runChunked(
+    ids: readonly string[],
+    send: (piece: string[]) => Promise<Partial<BulkTally>>,
+    onProgress?: (done: number, total: number) => void,
+    size: number = BULK_CHUNK): Promise<BulkTally> {
+  const tally: BulkTally = { applied: 0, missing: 0, flow: 0 };
+  let done = 0;
+  onProgress?.(0, ids.length);
+  for (const piece of chunkIds(ids, size)) {
+    let r: Partial<BulkTally>;
+    try {
+      r = await send(piece);
+    } catch (e) {
+      if (done === 0) throw e;
+      const why = e instanceof Error ? e.message : String(e);
+      throw new Error(`stopped after ${done} of ${ids.length} — ${why}`);
+    }
+    tally.applied += r.applied ?? 0;
+    tally.missing += r.missing ?? 0;
+    tally.flow += r.flow ?? 0;
+    done += piece.length;
+    onProgress?.(done, ids.length);
+  }
+  return tally;
+}
+
+/** The heading a windowed report prints before its total. A household
+ *  whose ledger starts this month has no complete month for a range of
+ *  months to hold, so the server shows the month so far instead and says
+ *  `live_month` — the heading names that, so a partial month never reads
+ *  as the whole range the picker promised. */
+export const windowLabel = (w: { label: string; live_month?: boolean }) =>
+  w.live_month ? `${w.label} so far` : w.label;
+
+/** The search list's "Load more" pile, kept as one slot per page so a
+ *  later edit can reach it. Each slot is refreshed from that page's cached
+ *  response whenever one exists: a single-row edit patches (or drops the
+ *  row from) every cached ["transactions"] page, so re-reading them is how
+ *  the change lands on rows already shown. A page the cache has since
+ *  evicted keeps the copy last seen rather than vanishing from the list.
+ *
+ *  An edit can also shift the server's pages: a row on page 1 that stops
+ *  matching pulls the first row of page 2 onto page 1, and the refetched
+ *  page 2 starts one row later while the cached page 1 is still the old
+ *  copy. That row would then be in no slot and silently skipped for the
+ *  rest of the session, so rows the previous copy of the slot held ahead
+ *  of the new first row are kept, unless they are shown elsewhere already
+ *  or `removed` says the row is gone (retired, deleted). */
+export function mergePilePages<T extends { id: string }>(
+  prev: T[][], page: number, incoming: T[],
+  cached: (page: number) => T[] | undefined, reset: boolean,
+  removed?: ReadonlySet<string>,
+): T[][] {
+  if (reset) return [incoming];
+  const next = prev.slice();
+  for (let i = 0; i < next.length; i++) {
+    if (i === page - 1) continue;
+    const c = cached(i + 1);
+    if (c) next[i] = c;
+    else if (!next[i]) next[i] = [];
+  }
+  const old = prev[page - 1] ?? [];
+  const inNew = new Set(incoming.map((r) => r.id));
+  const firstKept = old.findIndex((r) => inNew.has(r.id));
+  const elsewhere = new Set<string>();
+  next.forEach((rows, i) => {
+    if (i !== page - 1) for (const r of rows ?? []) elsewhere.add(r.id);
+  });
+  const carried = (firstKept < 0 ? [] : old.slice(0, firstKept)).filter(
+    (r) => !elsewhere.has(r.id) && !removed?.has(r.id));
+  next[page - 1] = carried.length ? [...carried, ...incoming] : incoming;
+  return next;
+}
+
+/** Ids of rows this session retired or deleted, so the search pile
+ *  never carries one back (see mergePilePages). */
+export const goneTxnIds = new Set<string>();
+
+/** The pages in order, each row once (a row can shift across a page
+ *  boundary between fetches; the first copy wins). */
+export function flattenPile<T extends { id: string }>(pages: T[][]): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const rows of pages) {
+    for (const r of rows ?? []) {
+      if (seen.has(r.id)) continue;
+      seen.add(r.id);
+      out.push(r);
+    }
+  }
+  return out;
+}
+
+/** A folder import runs as a background job on the server: the run door
+ *  answers with the job at once, and the screen polls it until it
+ *  settles. Same shape the web app reads. */
+export interface BulkJobFile {
+  index: number; name: string;
+  state: "pending" | "running" | "done" | "failed" | "skipped";
+  ok?: boolean; imported?: number; error?: string;
+  account_id?: string | null;
+  warnings?: string[];
+  corrected?: number;
+  // an export ZIP in the folder restores on its own background job
+  restore_started?: boolean;
+}
+export interface BulkJob {
+  job_id: string;
+  state: "queued" | "running" | "cancelling" | "cancelled" | "stopped"
+    | "done" | "error";
+  stop_reason?: string | null;
+  total: number; done: number;
+  started_at?: string | null; updated_at?: string | null;
+  files: BulkJobFile[];
+  restore_started?: boolean;
+  // no word from the worker for a while — waiting, not failing
+  waiting?: boolean; note?: string;
+}
+export type BulkJobStatus = BulkJob | { state: "idle" };
+
+/** Still going: queued, running, or finishing its file after a cancel. */
+export function bulkJobLive(s?: { state: string } | null): boolean {
+  return !!s && (s.state === "queued" || s.state === "running"
+                 || s.state === "cancelling");
+}
+
+/** The job query's poll: every two seconds while the job is live, and
+ *  never once it has settled (done, cancelled, stopped, error) or there
+ *  is no job — a settled job does not change again. */
+export function bulkJobPoll(s?: { state: string } | null): number | false {
+  return bulkJobLive(s) ? 2000 : false;
+}
+
+const BULK_STOPPED_WHY: Record<string, string> = {
+  signed_out: "whoever started it was signed out",
+  role_changed: "whoever started it may no longer import",
+  household_deleted: "this household is being deleted",
+  locked_out: "this account is locked right now",
+  read_only: "this account is read-only right now",
+  second_factor: "the account needs a second factor first",
+  unchecked: "the account's standing could not be checked",
+  expired: "it waited too long for the server",
+};
+
+/** The one line that sums a folder import up, live or settled — the
+ *  web Import page's words. */
+export function bulkJobHeadline(job: BulkJob): string {
+  const ok = job.files.filter((f) => f.ok).length;
+  const files = (n: number) => `${n} file${n === 1 ? "" : "s"}`;
+  if (bulkJobLive(job))
+    return `Importing — ${job.done} of ${files(job.total)} done`;
+  if (job.state === "cancelled")
+    return `Cancelled — ${ok} of ${files(job.total)} imported.`;
+  if (job.state === "stopped")
+    return `Stopped — ${BULK_STOPPED_WHY[job.stop_reason ?? ""]
+      ?? "the import could not go on"}. ${ok} of ${files(job.total)} `
+      + "imported; drop the rest again.";
+  if (job.state === "error")
+    return `The import stopped unexpectedly — ${ok} of ${files(job.total)} `
+      + "imported; drop the rest again.";
+  return `${ok}/${job.total} imported.`;
+}
+
+/** whether a drafted goal has any match words (the comma list, blanks
+ *  ignored) */
+export function goalHasWords(r: Pick<GoalDraft, "tokens">): boolean {
+  return r.tokens.split(",").some((t) => t.trim() !== "");
+}
+
+/** A drafted goal with match words but no account. Such a goal can never
+ *  be measured — the words match both legs of a transfer and nothing says
+ *  which side is the fund — so the server refuses the shape and the
+ *  editors prompt for the account the money lands in. The web editor
+ *  (SavingsGoalsCard) applies the same rule. */
+export function goalNeedsAccount(
+  r: Pick<GoalDraft, "tokens" | "account_id">): boolean {
+  return !r.account_id && goalHasWords(r);
+}
+
+/** the slice of the Settings view the bank-link hold reads */
+export type BankLinkHoldView = { outbound_paused?: {
+  reason?: string; aggregator?: boolean;
+  aggregator_keys?: readonly { provider: string }[] } | null } | undefined;
+
+/** Whether new bank links through `provider` are held. After a credential
+ *  rotation the household's own Plaid / MX client may be one a hijacker
+ *  saved, so the server refuses a new link, a re-auth and the MX widget on
+ *  it until the owner resumes in the Settings banner or removes the keys.
+ *  Only the owner is told which clients are held, so only the owner's
+ *  buttons close ahead of the server's refusal (a stale screen still gets
+ *  the server's sentence). The web mirrors this as bankLinkHoldNote in
+ *  ConnectHub.tsx. */
+export function bankLinksHeld(s: BankLinkHoldView, provider: "plaid" | "mx"): boolean {
+  const p = s?.outbound_paused;
+  return !!p?.aggregator
+    && (p.aggregator_keys ?? []).some((k) => k.provider === provider);
+}
+
+/** The sentence a held bank-link door shows (the server's own wording),
+ *  or null when links through `provider` are open. */
+export function bankLinkHoldNote(s: BankLinkHoldView,
+                                 provider: "plaid" | "mx"): string | null {
+  if (!bankLinksHeld(s, provider)) return null;
+  const why = s?.outbound_paused?.reason === "recovery"
+    ? "your account was recovered"
+    : "your password, login email or second factor changed";
+  return `New bank links are on hold since ${why}: confirm the `
+    + `${provider === "mx" ? "MX" : "Plaid"} keys saved in Settings are `
+    + "yours (Settings, top banner), or disconnect their banks and remove "
+    + "the keys.";
+}
+
+/** The sentence an owner's password, login-address or second-factor
+ *  change adds when it removed members who joined in the last days through
+ *  the owner's own invites; empty when nobody was removed. The web says
+ *  the same on its Settings security cards. */
+export function membersRemovedNote(
+  r: { members_removed?: readonly { email: string }[] } | null | undefined,
+): string {
+  const gone = r?.members_removed ?? [];
+  if (!gone.length) return "";
+  return ` Removed ${gone.length} ${gone.length === 1 ? "member" : "members"}`
+    + ` who joined through your recent invites: `
+    + `${gone.map((m) => m.email).join(", ")} — invite back the ones that `
+    + "are yours.";
+}
+
+/** Every YNAB account of a multi-account register has an answer — an
+ *  account, a new account with a name ("__new__" plus a name), or "skip" —
+ *  and not every one is skipped. The server refuses the same cases, so the
+ *  import button only lights when the answer will be taken. */
+export function ynabAllAnswered(
+  names: readonly string[],
+  dest: Readonly<Record<string, string | undefined>>,
+  newName: Readonly<Record<string, string | undefined>>,
+): boolean {
+  const answered = names.every((n) => !!dest[n]
+    && (dest[n] !== "__new__" || !!(newName[n] ?? "").trim()));
+  return answered && names.some((n) => !!dest[n] && dest[n] !== "skip");
+}
+
+/** A folder import's refusal of a YNAB register of several accounts:
+ *  that file is finished on its own, where the accounts can be placed. */
+export const YNAB_SEVERAL = /covers \d+ YNAB accounts/;

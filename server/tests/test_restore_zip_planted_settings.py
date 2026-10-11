@@ -128,11 +128,11 @@ class PlantedPhoneTests(unittest.TestCase):
             "food_monthly": 1, "other_monthly": 1})
         restore.restore_zip(self.conn, _zip(config={
             "notify_phone": {"number": "+15555550100", "verified": True},
-            "email_schedule": {"weekly": {"on": True, "sms": True}}}))
+            "email_schedule": {"monthly": {"on": True, "sms": True}}}))
         cfg = budget.load_config(self.conn)
         self.assertEqual(cfg["notify_phone"]["number"], "+15555550123")
         # a live verified number keeps the toggle meaningful
-        self.assertTrue(cfg["email_schedule"]["weekly"]["sms"])
+        self.assertTrue(cfg["email_schedule"]["monthly"]["sms"])
 
 
 class PlantedReceiptTests(unittest.TestCase):

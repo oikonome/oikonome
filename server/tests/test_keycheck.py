@@ -97,6 +97,54 @@ class KeycheckTests(_KeyFixture):
         self.assertFalse(cli.keycheck())
 
 
+class WebPushKeyMadeBeforeTheMasterKeyTests(_KeyFixture):
+    """The instance web-push key is minted on first use; minted before the
+    instance had a master key, it was stored in the clear (encryption is
+    a passthrough then). Adding the key later must encrypt it at the next
+    start, as it does every TOTP seed, and until then keycheck must say
+    it is there in the clear rather than count only what it can decrypt."""
+
+    def _plaintext_push_key(self):
+        from oikonome.notify import push
+        held = os.environ.pop("OIKONOME_MASTER_KEY")
+        admin = tenancy.admin_connect()
+        try:
+            priv, _pub = push.vapid_keys(admin)
+            self.assertEqual(admin.execute(
+                "SELECT private_key FROM push_vapid WHERE id=1"
+            ).fetchone()["private_key"], priv)
+        finally:
+            admin.close()
+            os.environ["OIKONOME_MASTER_KEY"] = held
+        return priv
+
+    def test_the_startup_sweep_encrypts_it(self):
+        from oikonome.db.migrate import _encrypt_cp_secrets
+        from oikonome.notify import push
+        priv = self._plaintext_push_key()
+        admin = tenancy.admin_connect()
+        try:
+            self.assertGreaterEqual(_encrypt_cp_secrets(admin), 1)
+            stored = admin.execute(
+                "SELECT private_key FROM push_vapid WHERE id=1"
+            ).fetchone()["private_key"]
+            self.assertTrue(stored.startswith(crypto.CP_PREFIX))
+            self.assertEqual(push.vapid_keys(admin)[0], priv)
+            self.assertEqual(_encrypt_cp_secrets(admin), 0)
+        finally:
+            admin.close()
+        self.assertTrue(cli.keycheck())
+
+    def test_keycheck_names_a_plaintext_secret(self):
+        import contextlib
+        import io
+        self._plaintext_push_key()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            cli.keycheck()
+        self.assertIn("unencrypted", err.getvalue())
+
+
 class RotateMasterKeyTests(_KeyFixture):
     """`oikonome rotate-master-key` — same fixture as keycheck
     (fresh master key per test, cross-suite rows cleared)."""

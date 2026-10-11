@@ -49,6 +49,15 @@ def _transport(state: dict):
         if path == "/item/public_token/exchange":
             return httpx.Response(200, text=json.dumps(
                 {"item_id": "pl-new-1", "access_token": "access-prod-new"}))
+        if path == "/item/get" and state.get("item_get_fails") == "plaid":
+            return httpx.Response(400, text=json.dumps(
+                {"error_type": "API_ERROR",
+                 "error_code": "INTERNAL_SERVER_ERROR",
+                 "error_message": "detail-from-plaid-xyz",
+                 "request_id": "req-secret-123"}))
+        if path == "/item/get" and state.get("item_get_fails") == "network":
+            raise httpx.ConnectError("connect to 10.9.8.7:443 refused",
+                                     request=request)
         if path == "/item/get":
             return httpx.Response(200, text=json.dumps(
                 {"item": {"institution_id": "ins_1",
@@ -198,6 +207,67 @@ class PlaidLinkPagesTests(unittest.TestCase):
                 "manage_accounts": "1"}, follow_redirects=False)
         self.assertNotIn("update", state["create_body"])
 
+    def _flag_new_accounts(self, item_id):
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            sync_base.upsert_item(conn, item_id, "plaid", "Demo",
+                                  "access-prod-abc")
+            conn.execute("UPDATE items SET webhook_status='new_accounts', "
+                         "webhook_status_at=now() WHERE id=%s", (item_id,))
+        finally:
+            conn.close()
+
+    def _webhook_status(self, item_id):
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            return conn.execute("SELECT webhook_status FROM items WHERE id=%s",
+                                (item_id,)).fetchone()["webhook_status"]
+        finally:
+            conn.close()
+
+    def test_new_accounts_to_share_opens_the_checklist_by_itself(self):
+        """An item Plaid flagged with new accounts can only share them
+        through the shared-accounts checklist, so the server asks Link for
+        it whatever the client sends — an installed app that sends no
+        manage_accounts must still get a picker that can do what its
+        'share' button says. Its completion then clears the flag."""
+        self._flag_new_accounts("it-new")
+        state = {"link_token": "lt-new", "mode": "update"}
+        with _patch_client(state):
+            r = self.client.post("/accounts/plaid/link",
+                                 data={"item_id": "it-new"},
+                                 headers={"accept": "application/json"})
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(state["create_body"].get("update"),
+                             {"account_selection_enabled": True})
+            state["link_done"] = True
+            s = self.client.get("/accounts/plaid/link/lt-new/status").json()
+        self.assertEqual(s["kind"], "update")
+        self.assertIsNone(self._webhook_status("it-new"))
+
+    def test_a_session_without_the_checklist_leaves_new_accounts_flagged(self):
+        """A completion that could not have shared anything (a session
+        opened before the flag arrived, so without the checklist) must not
+        clear the new-accounts prompt: Plaid does not send it again, and
+        the new accounts would never be offered."""
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            sync_base.upsert_item(conn, "it-late", "plaid", "Demo",
+                                  "access-prod-abc")
+        finally:
+            conn.close()
+        state = {"link_token": "lt-late", "mode": "update"}
+        with _patch_client(state):
+            self.client.post("/accounts/plaid/link",
+                             data={"item_id": "it-late"},
+                             headers={"accept": "application/json"})
+            self.assertNotIn("update", state["create_body"])
+            self._flag_new_accounts("it-late")      # arrives mid-session
+            state["link_done"] = True
+            s = self.client.get("/accounts/plaid/link/lt-late/status").json()
+        self.assertEqual(s["kind"], "update")
+        self.assertEqual(self._webhook_status("it-late"), "new_accounts")
+
     def test_deselected_accounts_are_hidden_when_selection_completes(self):
         """A deselected account stops being returned by Plaid — hide its
         local row on completion or it lingers looking connected with a
@@ -329,6 +399,34 @@ class PlaidLinkPagesTests(unittest.TestCase):
             self.assertEqual(st, "error:ITEM_LOGIN_REQUIRED")
         finally:
             conn.close()
+
+    def test_a_failed_item_check_reports_a_code_not_its_message(self):
+        """When the after-Link item check itself fails, the page is told
+        Plaid's error code, or the failure's kind — never the message,
+        which carries request ids, hosts and response text."""
+        for i, (how, want) in enumerate((("plaid", "INTERNAL_SERVER_ERROR"),
+                                         ("network", "ConnectError"))):
+            item, token = f"pl-chk{i}", f"lt-chk{i}"
+            conn = tenancy.tenant_connect(self.tid)
+            try:
+                sync_base.upsert_item(conn, item, "plaid", "Check Bank",
+                                      "access-prod-chk")
+                conn.execute("UPDATE items SET "
+                             "status='error:ITEM_LOGIN_REQUIRED' "
+                             "WHERE id=%s", (item,))
+            finally:
+                conn.close()
+            state = {"link_token": token, "mode": "update",
+                     "link_done": True, "item_get_fails": how}
+            with _patch_client(state), self.assertLogs("oikonome.plaid"):
+                self.client.post("/accounts/plaid/link",
+                                 data={"item_id": item},
+                                 follow_redirects=False)
+                r = self.client.get(f"/accounts/plaid/link/{token}/status")
+            self.assertEqual(r.json()["kind"], "update_failed", r.text)
+            self.assertEqual(r.json()["error"], want)
+            for leak in ("detail-from-plaid", "req-secret", "10.9.8.7"):
+                self.assertNotIn(leak, r.text)
 
     def test_link_session_pinned_to_tenant(self):
         pages._PLAID_LINK["lt-foreign"] = {

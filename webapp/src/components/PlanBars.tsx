@@ -33,7 +33,11 @@ export function planRows(
   buckets: Record<string, PlanBucket>,
   opts: { scale?: number; fixedActual?: number; fixedBudget?: number;
           fixedPending?: number; fixedCount?: number;
-          savings?: { plan: number; saved: number | null } | null;
+          // averaged: `saved` is the trailing 90-day monthly average, not
+          // this period's transfers — the caption says so. estimated:
+          // `saved` is that average scaled to the period, not a measure
+          savings?: { plan: number; saved: number | null;
+                      averaged?: boolean; estimated?: boolean } | null;
           excess?: number | null;
           // the period the rows cover; the ledger link opens that month —
           // or, with no month, that YEAR's bucket (the year lens's map)
@@ -96,7 +100,9 @@ export function planRows(
   if (opts.fixedBudget !== undefined || opts.fixedActual !== undefined) {
     const posted = opts.fixedActual ?? 0;
     rows.push({
-      label: "Bills", judged: false, actual: posted,
+      // the row opens the period's bill payments and envelope swipes —
+      // the rows the fixed bucket owns — like the variable rows do
+      label: "Bills", judged: false, actual: posted, to: ledger("fixed"),
       expected: buckets.fixed?.expected ?? 0,
       budget: opts.fixedBudget ?? buckets.fixed?.month_budget ?? 0,
       pending: opts.fixedPending,
@@ -117,7 +123,11 @@ export function planRows(
       actualLabel: planOnly ? "—" : undefined,
       caption: planOnly
         ? "plan only — set a destination account on the Budget page to track transfers · not counted in the verdict"
-        : "transferred vs plan · not counted in the verdict",
+        : opts.savings.estimated
+          ? "estimate from the last 90 days · not counted in the verdict"
+        : opts.savings.averaged
+          ? "avg / mo, last 90 days · not counted in the verdict"
+          : "transferred vs plan · not counted in the verdict",
     });
   }
   // the plan's residual — income the plan deliberately leaves

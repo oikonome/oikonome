@@ -19,18 +19,25 @@ from ..db import crypto, tenancy
 
 STRUCTURES = ("single_member_llc", "multi_member_llc", "sole_prop", "s_corp")
 
-# columns safe to return to the client (no ein ciphertext)
+# columns safe to return to the client (no ein ciphertext). The table's
+# filing_status column is left out here and below: no estimate reads it, so
+# offering it would be a setting that changes nothing. The column stays for
+# export and restore round-trips.
 _PUBLIC = ("id", "name", "structure", "state", "formation_date",
            "business_start_date", "ein_last4", "registered_agent",
            "fiscal_year_end", "status", "home_office_sqft", "income_tax_rate",
-           "filing_status", "tax_reserve_account_id", "archived_at",
+           "tax_reserve_account_id", "archived_at",
            "created_at", "updated_at")
 
 
 def _ein_digits(ein: str | None) -> str | None:
     """Normalize an EIN to 9 digits, or None. Accepts 'XX-XXXXXXX' etc."""
-    if not ein:
+    if ein is None or ein == "":
         return None
+    if not isinstance(ein, str):
+        # a JSON number would lose a leading zero, and anything else is not
+        # an EIN at all
+        raise ValueError("EIN must be text (formatted XX-XXXXXXX)")
     digits = re.sub(r"\D", "", ein)
     if len(digits) != 9:
         raise ValueError("EIN must be 9 digits (formatted XX-XXXXXXX)")
@@ -52,13 +59,59 @@ def _row(r: dict) -> dict:
     return out
 
 
+# Free-text entity fields, as stored: text or nothing. A JSON object, list
+# or number reaching the database is a 500 (psycopg cannot adapt a dict, a
+# NOT NULL name refuses null); every one of them is a bad request.
+_TEXT = ("name", "state", "registered_agent", "fiscal_year_end")
+_TEXT_MAX = 200
+
+
+def _text(field: str, v) -> str | None:
+    """A free-text field's value, trimmed; None for empty. ValueError for
+    anything that is not text."""
+    if v is None:
+        return None
+    if not isinstance(v, str):
+        raise ValueError(f"{field} must be text")
+    v = v.strip()
+    if len(v) > _TEXT_MAX:
+        raise ValueError(f"{field} is too long")
+    return v or None
+
+
+def _name(v) -> str:
+    v = _text("name", v)
+    if not v:
+        raise ValueError("name is required")
+    return v
+
+
+def _fiscal_year_end(v) -> str | None:
+    """'MM-DD', a real calendar day (Feb 29 allowed), or None. The books are
+    kept by calendar year whatever this says; it is a fact about the
+    business that the continuity document prints for whoever takes over."""
+    v = _text("fiscal_year_end", v)
+    if v is None:
+        return None
+    import datetime as _dt
+    m = re.fullmatch(r"(\d{2})-(\d{2})", v)
+    try:
+        if m is None:
+            raise ValueError
+        _dt.date(2000, int(m.group(1)), int(m.group(2)))
+    except ValueError:
+        raise ValueError("fiscal_year_end must be MM-DD, e.g. 12-31")
+    return v
+
+
 def create_entity(conn, *, name: str, structure: str, state: str | None = None,
                   formation_date=None, business_start_date=None,
                   ein: str | None = None, registered_agent: str | None = None,
                   fiscal_year_end: str | None = None) -> dict:
-    name = (name or "").strip()
-    if not name:
-        raise ValueError("name is required")
+    name = _name(name)
+    state = _text("state", state)
+    registered_agent = _text("registered_agent", registered_agent)
+    fiscal_year_end = _fiscal_year_end(fiscal_year_end)
     if structure not in STRUCTURES:
         raise ValueError(f"structure must be one of {STRUCTURES}")
     from .compat import as_date        # parse/validate optional dates (400 not 500)
@@ -114,7 +167,7 @@ def reveal_ein(conn, entity_id: str) -> str | None:
 
 _EDITABLE = {"name", "state", "formation_date", "business_start_date",
              "registered_agent", "fiscal_year_end", "structure",
-             "home_office_sqft", "income_tax_rate", "filing_status",
+             "home_office_sqft", "income_tax_rate",
              "tax_reserve_account_id"}
 
 
@@ -128,14 +181,21 @@ def update_entity(conn, entity_id: str, **fields) -> dict | None:
     if cur["status"] != "active":
         raise ValueError("entity is archived (read-only)")
     from .compat import as_date
-    if "structure" in fields and fields["structure"] not in STRUCTURES:
+    if "structure" in fields and (not isinstance(fields["structure"], str)
+                                  or fields["structure"] not in STRUCTURES):
         raise ValueError(f"structure must be one of {STRUCTURES}")
     sets, params = [], []
     for k in _EDITABLE:
         if k not in fields:
             continue
         v = fields[k]
-        if k in ("formation_date", "business_start_date"):
+        if k == "name":
+            v = _name(v)
+        elif k == "fiscal_year_end":
+            v = _fiscal_year_end(v)
+        elif k in _TEXT:
+            v = _text(k, v)
+        elif k in ("formation_date", "business_start_date"):
             v = as_date(v)                        # parse/validate → 400 not 500
         elif k == "income_tax_rate" and v is not None and v != "":
             try:
@@ -185,9 +245,16 @@ def update_entity(conn, entity_id: str, **fields) -> dict | None:
         return get_entity(conn, entity_id)
     sets.append("updated_at = now()")
     params.append(entity_id)
+    # the status is checked again by the write itself: an archive that
+    # commits after the early check above must not be followed by an edit
     r = conn.execute(
         f"UPDATE business_entity SET {', '.join(sets)} WHERE id = %s "
-        "RETURNING *", tuple(params)).fetchone()
+        "AND status = 'active' RETURNING *", tuple(params)).fetchone()
+    if r is None:
+        if conn.execute("SELECT 1 FROM business_entity WHERE id = %s",
+                        (entity_id,)).fetchone() is None:
+            return None
+        raise ValueError("entity is archived (read-only)")
     return _row(r)
 
 
@@ -264,6 +331,16 @@ def delete_forever(conn, entity_id: str, confirm_name: str) -> dict | None:
         raise ValueError(
             "type the business's exact name to delete it forever")
     with conn.transaction():
+        # The delete's SET NULL cascade rewrites every account and
+        # transaction booked to the entity. Those rows are locked first, in
+        # id order, and the entity row last — the order an assignment takes
+        # them in (its row, then the entity's FOR SHARE) — so a delete and a
+        # concurrent assignment queue behind each other instead of each
+        # holding what the other waits for.
+        conn.execute("SELECT id FROM accounts WHERE entity_id = %s "
+                     "ORDER BY id FOR UPDATE", (entity_id,))
+        conn.execute("SELECT id FROM transactions WHERE entity_id = %s "
+                     "ORDER BY id FOR UPDATE", (entity_id,))
         conn.execute("DELETE FROM business_entity WHERE id = %s",
                      (entity_id,))
     # the FK returns the entity's accounts to personal (SET NULL), which
@@ -272,14 +349,34 @@ def delete_forever(conn, entity_id: str, confirm_name: str) -> dict | None:
     return impact
 
 
+def _in_transaction(conn) -> bool:
+    from psycopg import pq
+    return conn.info.transaction_status != pq.TransactionStatus.IDLE
+
+
 def require_active(conn, entity_id: str) -> dict:
     """Existence + not-archived guard for every business WRITE path (equity,
     mileage, members, classification, obligations…). Archived entities are
     read-only — an archived entity must reject writes, not just entity-update.
     Returns the entity row; raises ValueError (→ 404/409) otherwise."""
-    e = get_entity(conn, entity_id)
-    if not e:
+    if not _valid_uuid(entity_id):
         raise ValueError("no such entity")
+    # Inside the caller's writing transaction the row is read FOR SHARE and
+    # held until the write commits, so an archive (an UPDATE of the row)
+    # waits for it, and a write that starts after the archive sees it.
+    # Outside a transaction a lock would end with the statement and protect
+    # nothing, so there this is only the early answer a door gives before
+    # it starts: a door whose write must not land in a closed entity's
+    # books makes the check again inside the transaction that writes.
+    # Lock order: a write that also locks transaction or account rows takes
+    # those first and checks the entity after (assign_transaction,
+    # assign_account and delete_forever all go rows, then entity).
+    lock = " FOR SHARE" if _in_transaction(conn) else ""
+    r = conn.execute("SELECT * FROM business_entity WHERE id = %s" + lock,
+                     (entity_id,)).fetchone()
+    if not r:
+        raise ValueError("no such entity")
+    e = _row(r)
     if e["status"] != "active":
         raise ValueError("entity is archived (read-only)")
     return e
@@ -293,8 +390,11 @@ _ARCHIVED = "entity is archived (read-only)"
 def _is_archived(conn, entity_id) -> bool:
     if not entity_id:
         return False
-    r = conn.execute("SELECT status FROM business_entity WHERE id = %s",
-                     (entity_id,)).fetchone()
+    # FOR SHARE for the reason require_active gives: the callers hold a
+    # transaction, and an archive must wait for the move it would forbid.
+    # Taken after the caller's row lock, never before (see delete_forever).
+    r = conn.execute("SELECT status FROM business_entity WHERE id = %s "
+                     "FOR SHARE", (entity_id,)).fetchone()
     return bool(r) and r["status"] != "active"
 
 
@@ -335,14 +435,52 @@ def assign_account(conn, account_id: str, entity_id: str | None) -> bool:
     return True
 
 
+def live_txn_id(conn, txn_id: str) -> str | None:
+    """The live row that stands for `txn_id` now, row-locked: the row
+    itself while it is on the ledger, else the posted row a settled pending
+    hold became, else None. Call inside a transaction.
+
+    A list can show a pending charge after the sync has already posted it.
+    A write aimed at the retired hold would land on a row every read hides,
+    after the settlement's one-time carry has run: the business tag and
+    any capital movement would sit on the hold forever while the posted
+    charge stays personal spend. The posted charge may be for a different
+    amount (a tip, a fuel pre-authorisation), so it is found by the hold's
+    id it carries, never by amount.
+
+    Takes the pairing lock first — the lock the settlement holds from its
+    carry to its retire — so a write either commits before the settlement
+    starts, and is carried with the rest, or waits and is sent to the
+    posted row."""
+    from ..sync.reanchor import hold_pairing_lock
+    hold_pairing_lock(conn)
+    row = conn.execute(
+        "SELECT id, removed FROM transactions WHERE id = %s FOR UPDATE",
+        (txn_id,)).fetchone()
+    if row is None:
+        return None
+    if not row["removed"]:
+        return row["id"]
+    nxt = conn.execute(
+        "SELECT id FROM transactions WHERE pending_transaction_id = %s "
+        "AND removed = 0 ORDER BY id LIMIT 1 FOR UPDATE",
+        (txn_id,)).fetchone()
+    return nxt["id"] if nxt else None
+
+
 def assign_transaction(conn, txn_id: str, entity_id: str | None) -> bool:
     """Per-transaction override — a business cost paid on a personal card, or
     None to clear the override (falls back to the account's assignment).
+    A pending hold that has since posted is assigned through its posted row
+    (live_txn_id); a row that has left the ledger otherwise is refused.
 
     Refused (ValueError) when the row's effective entity — the override,
     else the account's — would change to or from an archived entity: that
     rewrites the archived entity's read-only books either way."""
     with conn.transaction():
+        txn_id = live_txn_id(conn, txn_id)
+        if txn_id is None:
+            return False
         row = conn.execute(
             "SELECT t.entity_id AS own, a.entity_id AS acct "
             "FROM transactions t LEFT JOIN accounts a ON a.id = t.account_id "
@@ -364,29 +502,148 @@ def assign_transaction(conn, txn_id: str, entity_id: str | None) -> bool:
 # ---- members ---------------------------------------------------------------
 
 def add_member(conn, entity_id: str, *, member_name: str,
-               ownership_pct=None, is_manager: bool = False) -> dict:
-    member_name = (member_name or "").strip()
+               ownership_pct=None, is_manager: bool = False,
+               is_household: bool = False) -> dict:
+    """`is_household` marks this member as the household this instance
+    keeps the books for — at most one per entity, so marking one clears
+    the others. The estimate and the capital account then also give that
+    member's share."""
+    member_name = _text("member_name", member_name)
     if not member_name:
         raise ValueError("member_name is required")
-    if ownership_pct is not None and ownership_pct != "":
-        try:
-            ownership_pct = float(ownership_pct)
-        except (TypeError, ValueError, OverflowError):
-            raise ValueError("ownership_pct must be a number")
-        if not 0 <= ownership_pct <= 100:
-            raise ValueError("ownership_pct must be 0–100")
-    else:
-        ownership_pct = None
-    r = conn.execute(
-        """INSERT INTO entity_membership
-             (entity_id, member_name, ownership_pct, is_manager)
-           VALUES (%s,%s,%s,%s) RETURNING id, member_name, ownership_pct,
-                   is_manager""",
-        (entity_id, member_name, ownership_pct, is_manager)).fetchone()
+    ownership_pct = _member_pct(ownership_pct)
+    is_manager = bool(is_manager)
+    if not isinstance(is_household, bool):
+        raise ValueError("is_household must be true or false")
+    with conn.transaction():
+        if is_household:
+            _hold_household_mark(conn, entity_id)
+            conn.execute("UPDATE entity_membership SET is_household = FALSE "
+                         "WHERE entity_id = %s AND is_household", (entity_id,))
+        r = conn.execute(
+            """INSERT INTO entity_membership
+                 (entity_id, member_name, ownership_pct, is_manager, is_household)
+               VALUES (%s,%s,%s,%s,%s) RETURNING id, member_name, ownership_pct,
+                       is_manager, is_household""",
+            (entity_id, member_name, ownership_pct, is_manager,
+             is_household)).fetchone()
+    return _member_out(r)
+
+
+def _hold_household_mark(conn, entity_id: str) -> None:
+    """Serialise the writers that set a business's household mark.
+
+    Clear-the-others-then-set is only safe one writer at a time: two
+    concurrent marks each clear what the other has not committed yet, so
+    both land (the unique index then refuses the second with an error
+    instead). The doors hold the business row FOR SHARE, which writers
+    share, and upgrading that to FOR UPDATE in two transactions at once
+    deadlocks — so the mark takes a transaction-scoped lock of its own,
+    keyed by tenant and business. The second writer waits, and its clear
+    then sees the first writer's committed mark and replaces it."""
+    conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtext('entity-household'), hashtext("
+        "    coalesce(current_setting('app.tenant_id', true), '') || ':' || %s))",
+        (str(entity_id),))
+
+
+def _member_pct(v):
+    """An ownership share: 0–100, or None for none given."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, bool):
+        raise ValueError("ownership_pct must be a number")
+    try:
+        v = float(v)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("ownership_pct must be a number")
+    if not 0 <= v <= 100:         # NaN fails this too
+        raise ValueError("ownership_pct must be 0–100")
+    return v
+
+
+def _member_out(r) -> dict:
     return {"id": str(r["id"]), "member_name": r["member_name"],
             "ownership_pct": (float(r["ownership_pct"])
                               if r["ownership_pct"] is not None else None),
-            "is_manager": r["is_manager"]}
+            "is_manager": r["is_manager"],
+            "is_household": bool(r["is_household"])}
+
+
+def update_member(conn, entity_id: str, member_id: str, **fields) -> dict | None:
+    """Change one member's name, ownership share or manager flag. Only the
+    fields given change; scoped by entity so one entity's door cannot edit
+    another's member. None when no such member. The write doors (web)
+    allow it to the owner alone, as they do adding a member, after
+    require_active in the same transaction."""
+    if not _valid_uuid(member_id):
+        return None
+    sets, params = [], []
+    if "member_name" in fields:
+        v = _text("member_name", fields["member_name"])
+        if not v:
+            raise ValueError("member_name is required")
+        sets.append("member_name = %s"); params.append(v)
+    if "ownership_pct" in fields:
+        sets.append("ownership_pct = %s")
+        params.append(_member_pct(fields["ownership_pct"]))
+    if "is_manager" in fields:
+        if not isinstance(fields["is_manager"], bool):
+            raise ValueError("is_manager must be true or false")
+        sets.append("is_manager = %s"); params.append(fields["is_manager"])
+    household = None
+    if "is_household" in fields:
+        if not isinstance(fields["is_household"], bool):
+            raise ValueError("is_household must be true or false")
+        household = fields["is_household"]
+        sets.append("is_household = %s"); params.append(household)
+    if not sets:
+        r = conn.execute(
+            "SELECT id, member_name, ownership_pct, is_manager, is_household "
+            "FROM entity_membership WHERE id = %s AND entity_id = %s",
+            (member_id, entity_id)).fetchone()
+        return _member_out(r) if r else None
+    with conn.transaction():
+        if household:
+            # one household per business: marking this member clears any
+            # other, inside the same transaction as the write
+            _hold_household_mark(conn, entity_id)
+            # a member that is not this business's (deleted elsewhere, or a
+            # stale id) must not cost the real one its mark: look first,
+            # under the same lock, and change nothing when it is not here
+            if not conn.execute(
+                    "SELECT 1 FROM entity_membership WHERE id = %s "
+                    "AND entity_id = %s FOR UPDATE",
+                    (member_id, entity_id)).fetchone():
+                return None
+            conn.execute("UPDATE entity_membership SET is_household = FALSE "
+                         "WHERE entity_id = %s AND id <> %s AND is_household",
+                         (entity_id, member_id))
+        r = conn.execute(
+            f"UPDATE entity_membership SET {', '.join(sets)} "
+            "WHERE id = %s AND entity_id = %s "
+            "RETURNING id, member_name, ownership_pct, is_manager, is_household",
+            (*params, member_id, entity_id)).fetchone()
+    return _member_out(r) if r else None
+
+
+def delete_member(conn, entity_id: str, member_id: str) -> bool:
+    """Remove one member (a partner who left, a duplicate). Scoped by
+    entity. A movement that named the member keeps its amount and stops
+    naming them, so the capital account does not change and no movement is
+    left pointing at a member who is not there."""
+    if not _valid_uuid(member_id):
+        return False
+    with conn.transaction():
+        gone = conn.execute(
+            "DELETE FROM entity_membership WHERE id = %s AND entity_id = %s",
+            (member_id, entity_id)).rowcount > 0
+        if gone:
+            conn.execute(
+                "UPDATE equity_movement SET member_id = NULL "
+                "WHERE member_id = %s AND entity_id = %s",
+                (member_id, entity_id))
+    return gone
 
 
 # ---- reconcile the legacy business_flags tags + combined toggle -------------
@@ -438,10 +695,11 @@ def set_combined(conn, on: bool) -> bool:
 
 def list_members(conn, entity_id: str) -> list[dict]:
     rows = conn.execute(
-        "SELECT id, member_name, ownership_pct, is_manager FROM "
+        "SELECT id, member_name, ownership_pct, is_manager, is_household FROM "
         "entity_membership WHERE entity_id = %s ORDER BY created_at",
         (entity_id,)).fetchall()
     return [{"id": str(r["id"]), "member_name": r["member_name"],
+             "is_household": bool(r["is_household"]),
              "ownership_pct": (float(r["ownership_pct"])
                                if r["ownership_pct"] is not None else None),
              "is_manager": r["is_manager"]} for r in rows]

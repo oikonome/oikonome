@@ -206,6 +206,38 @@ class TestPriorUsedSkipsBillOccurrences(unittest.TestCase):
         self.assertEqual(100.0, round(st["buckets"]["fixed"]["actual"] - 50.0, 2))
 
 
+class TestPriorUsedLeavesMonthlyEnvelopesTheirRows(unittest.TestCase):
+    """The current month matches envelopes over the whole list: a monthly
+    envelope naming a merchant wins that merchant's rows before an annual
+    envelope matching by category sees them. The lookback must apply the
+    same claim, or the annual pool reads spent on the monthly envelope's
+    purchases for every earlier month of the year."""
+
+    def setUp(self):
+        self.conn = make_db()
+        write_config(self.conn)
+        add_bill(self.conn, "Corner Books", 100.0, bill_type="envelope",
+                 frequency=None, interval=1)
+        add_bill(self.conn, "Gifts", 1200.0, bill_type="envelope",
+                 frequency=None, interval=12, category="GENERAL_MERCHANDISE",
+                 match_category=True)
+        for m in range(1, 7):
+            add_txn(self.conn, dt.date(2026, m, 5), 90.0, "CORNER BOOKS",
+                    primary="GENERAL_MERCHANDISE")
+        add_txn(self.conn, dt.date(2026, 3, 9), 200.0, "TOY PARADE",
+                primary="GENERAL_MERCHANDISE")
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_annual_pool_counts_only_the_rows_it_would_have_won(self):
+        st = budget.month_status(self.conn, TODAY)
+        envs = {e["payee"]: e for e in st["buckets"]["fixed"]["envelopes"]}
+        self.assertAlmostEqual(envs["Gifts"]["period_used"], 200.0, places=2)
+        self.assertAlmostEqual(envs["Gifts"]["period_left"], 1000.0,
+                               places=2)
+
+
 class TestCadenceSurface(AnnualEnvelopeBase):
     def test_cadence_round_trips_through_the_edit_form(self):
         from oikonome.web.api import CADENCES, _bill_cadence

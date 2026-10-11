@@ -23,7 +23,7 @@ class ShortLedgerDivisorTests(unittest.TestCase):
     def setUp(self):
         self.conn = make_db()
         seed_accounts(self.conn)
-        self.today = dt.date(2026, 8, 31)
+        self.today = dt.date(2026, 9, 1)   # the fixture months have closed
 
     def tearDown(self):
         self.conn.close()
@@ -55,7 +55,7 @@ class FlowPictureIncomeExclusionTests(unittest.TestCase):
     def setUp(self):
         self.conn = make_db()
         seed_accounts(self.conn)
-        self.today = dt.date(2026, 8, 31)
+        self.today = dt.date(2026, 9, 1)   # the fixture months have closed
         reporting._FIXED_MONTH_CACHE.clear()
 
     def tearDown(self):

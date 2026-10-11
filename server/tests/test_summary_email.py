@@ -98,11 +98,11 @@ class SummaryToggleApiTests(unittest.TestCase):
     def test_summary_is_daily_only(self):
         r = self.client.post("/api/settings", json={
             "email_schedule": {"daily": {"on": True, "hour": 7},
-                               "weekly": {"on": True, "hour": 7,
-                                          "weekday": 0, "summary": True}}})
+                               "monthly": {"on": True, "hour": 7,
+                                           "summary": True}}})
         self.assertEqual(r.status_code, 200, r.text)
         got = self.client.get("/api/settings").json()["email_schedule"]
-        self.assertNotIn("summary", got["weekly"])
+        self.assertNotIn("summary", got["monthly"])
 
 
 if __name__ == "__main__":

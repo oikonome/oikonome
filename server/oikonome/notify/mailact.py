@@ -422,7 +422,8 @@ def _issued(tok: dict):
                                      dt.timezone.utc)
 
 
-def _cat_moot(conn, tok: dict, r: dict) -> dict | None:
+def _cat_moot(conn, tok: dict, r: dict,
+              txn_id: str | None = None) -> dict | None:
     """Why a 'file under' button no longer applies, or None. The button
     was minted for an UNCATEGORIZED charge, so anything that has touched
     the charge since the mail went out makes it stale: a category on it
@@ -433,8 +434,11 @@ def _cat_moot(conn, tok: dict, r: dict) -> dict | None:
     button's own value would let a week-old mailed guess silently replace
     a later, deliberate decision."""
     v = tok["value"]
+    # `txn_id` is the row the tap now writes: the mailed charge, or the
+    # posted row a mailed pending hold settled into
+    txn_id = txn_id or tok["target"]
     if conn.execute("SELECT 1 FROM transaction_splits WHERE txn_id=%s "
-                    "LIMIT 1", (tok["target"],)).fetchone():
+                    "LIMIT 1", (txn_id,)).fetchone():
         return {"state": "already",
                 "sentence": f"{r['payee']} was split since the email went "
                             "out, and its parts carry their own categories. "
@@ -450,9 +454,9 @@ def _cat_moot(conn, tok: dict, r: dict) -> dict | None:
                             "— it was filed after the email went out. Open "
                             "the charge in the app to change it."}
     if conn.execute(
-            "SELECT 1 FROM activity_log WHERE target=%s AND kind IN "
+            "SELECT 1 FROM activity_log WHERE target = ANY(%s) AND kind IN "
             "('category','split') AND at >= %s LIMIT 1",
-            (tok["target"], _issued(tok))).fetchone():
+            (list({tok["target"], txn_id}), _issued(tok))).fetchone():
         return {"state": "already",
                 "sentence": f"{r['payee']} was changed after the email went "
                             "out. Open the charge in the app to file it."}
@@ -520,13 +524,18 @@ def describe(tok: dict) -> dict:
                     "sentence": f"Drop the proposed {cad} {what} "
                                 f"{p['payee']} {_money(p['amount'])}?"}
         if a == "cat":
-            r = conn.execute(
+            from ..web import data
+            # a mailed pending hold that has since posted is filed through
+            # its posted row, as the in-app category door does
+            with conn.transaction():
+                t = data.live_edit_ids(conn, [t]).get(t)
+            r = t and conn.execute(
                 "SELECT COALESCE(merchant_name, name) AS payee, amount, "
                 "category_override, category_primary FROM transactions "
                 "WHERE id=%s AND removed=0", (t,)).fetchone()
             if not r:
                 return {"state": "unknown"}
-            moot = _cat_moot(conn, tok, r)
+            moot = _cat_moot(conn, tok, r, t)
             if moot is not None:
                 return moot
             return {"state": "confirm", "button": f"File under {_label(v)}",
@@ -546,6 +555,15 @@ def describe(tok: dict) -> dict:
         return {"state": "unknown"}
     finally:
         conn.close()
+
+
+class _Undo(Exception):
+    """Leave the tap's transaction without writing anything, answering
+    `answer`."""
+
+    def __init__(self, answer: dict):
+        super().__init__(answer.get("state"))
+        self.answer = answer
 
 
 def apply(tok: dict) -> dict:
@@ -602,26 +620,59 @@ def apply(tok: dict) -> dict:
             # does, and holding the transaction row across it takes the two
             # in the opposite order — an in-app edit of the same charge at
             # that moment deadlocks with the tap.
-            with conn.transaction():
-                conn.execute(
-                    "SELECT pg_advisory_xact_lock(hashtext(COALESCE("
-                    "current_setting('app.tenant_id', true), '')), "
-                    "hashtext('mailact-cat:' || %s))", (t,))
-                r = conn.execute(
-                    "SELECT COALESCE(merchant_name, name) AS payee, "
-                    "category_override, category_primary FROM transactions "
-                    "WHERE id=%s AND removed=0", (t,)).fetchone()
-                if not r:
-                    return {"state": "unknown"}
-                moot = _cat_moot(conn, tok, r)
-                if moot is not None:
-                    return moot
-                data.set_category(conn, t, v, scope="one")
-                _activity.record(
-                    conn, tok["email"], "category", "set", target=t,
-                    label=_activity.txn_label(conn, t),
-                    detail={"before": r["category_override"], "after": v,
-                            "scope": "one", "via": "email"})
+            #
+            # And against the in-app writer, which takes no lock of ours:
+            # its first write is the charge's manual_categories row, so the
+            # tap claims that same row first. Inserted here, an in-app edit
+            # landing meanwhile waits on it and writes after the tap — the
+            # later decision stands. Already there, the row is locked and
+            # the charge is read again below, after any in-app edit that
+            # beat the tap has committed, and the staleness check sees it.
+            try:
+                with conn.transaction():
+                    # the pairing lock first (shared), then follow a mailed
+                    # pending hold a settlement retired to its posted row:
+                    # a settlement then either carries this category with
+                    # the hold or waits, and it never lands on a hidden row
+                    t = data.live_edit_ids(conn, [t]).get(t)
+                    if not t:
+                        return {"state": "unknown"}
+                    conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtext(COALESCE("
+                        "current_setting('app.tenant_id', true), '')), "
+                        "hashtext('mailact-cat:' || %s))", (t,))
+                    if not conn.execute(
+                            "SELECT 1 FROM transactions WHERE id=%s "
+                            "AND removed=0", (t,)).fetchone():
+                        return {"state": "unknown"}
+                    if not conn.execute(
+                            """INSERT INTO manual_categories
+                                   (transaction_id, category, set_at, bill_id)
+                               VALUES (%s, %s, now(), NULL)
+                               ON CONFLICT (tenant_id, transaction_id)
+                               DO NOTHING RETURNING 1""",
+                            (t, v)).fetchone():
+                        conn.execute(
+                            "SELECT 1 FROM manual_categories "
+                            "WHERE transaction_id=%s FOR UPDATE", (t,))
+                    r = conn.execute(
+                        "SELECT COALESCE(merchant_name, name) AS payee, "
+                        "category_override, category_primary "
+                        "FROM transactions WHERE id=%s AND removed=0",
+                        (t,)).fetchone()
+                    if not r:
+                        raise _Undo({"state": "unknown"})
+                    moot = _cat_moot(conn, tok, r, t)
+                    if moot is not None:
+                        raise _Undo(moot)      # and take the claim back
+                    data.set_category(conn, t, v, scope="one")
+                    _activity.record(
+                        conn, tok["email"], "category", "set", target=t,
+                        label=_activity.txn_label(conn, t),
+                        detail={"before": r["category_override"], "after": v,
+                                "scope": "one", "via": "email"})
+            except _Undo as u:
+                return u.answer
             return {"state": "done",
                     "sentence": f"{r['payee']} is filed under {_label(v)}. "
                                 "To teach the merchant, open the charge in "

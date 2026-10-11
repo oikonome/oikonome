@@ -34,6 +34,13 @@ from psycopg.types.json import Jsonb
 _YEAR_MIN, _YEAR_MAX = 1800, 2200
 
 
+# The largest amount any money field may hold: far past any charge a
+# household ledger sees, and far inside what a double rounds to exact
+# cents. Finite alone is not a bound — 1e308 is finite, and the first
+# conversion of it to cents overflows.
+MAX_AMOUNT = 1e12
+
+
 def as_date(v) -> dt.date | None:
     if v is None or isinstance(v, dt.date):
         d = v
@@ -63,5 +70,51 @@ def as_dict(v) -> dict:
     return json.loads(v)
 
 
+def strip_nul(v):
+    """`v` with every U+0000 removed from its strings, nested dicts and
+    lists included. Postgres text and jsonb cannot hold the character, so a
+    value carrying one fails its whole write; it means nothing in a name or
+    a memo, and it arrives in honest input (a UTF-16 file decoded as UTF-8
+    has one after every ASCII letter).
+
+    A dict KEY holding one is refused with ValueError, never rewritten.
+    Dropping the NUL would turn "limit\\x00" into "limit" and replace the real
+    key's value, after every check that compares keys exactly (a policy
+    denylist, a guarded destination, a network check on a URL) had already
+    waved the stranger through. No honest document needs one in a key."""
+    if isinstance(v, str):
+        return v.replace("\x00", "") if "\x00" in v else v
+    if isinstance(v, dict):
+        out = {}
+        for k, x in v.items():
+            if isinstance(k, str) and "\x00" in k:
+                raise ValueError(
+                    "a key holds a NUL character (U+0000), which no genuine "
+                    "document carries")
+            out[k] = strip_nul(x)
+        return out
+    if isinstance(v, (list, tuple)):
+        return [strip_nul(x) for x in v]
+    return v
+
+
+def _dumps_without_nul(v) -> str:
+    s = json.dumps(v)
+    # JSON spells U+0000 as the escape \u0000, which jsonb refuses. The
+    # escape's text can also appear without one (an escaped backslash
+    # followed by "u0000"), so a hit only means "look closer": the value is
+    # stripped and dumped again, and an honest backslash survives that. A
+    # NUL in a key raises there instead (see strip_nul).
+    if "\\u0000" in s:
+        s = json.dumps(strip_nul(v))
+    return s
+
+
 def jsonb(v: dict) -> Jsonb:
-    return Jsonb(v)
+    # Every jsonb write in the app goes through here, so no document that
+    # carries a NUL in a value from a feed, a file or a push can fail its
+    # write. The document is serialised now rather than when the statement
+    # binds it, so a NUL in a key surfaces as ValueError at the caller,
+    # which every import door already answers as a bad file or payload.
+    s = _dumps_without_nul(v)
+    return Jsonb(v, dumps=lambda _obj: s)

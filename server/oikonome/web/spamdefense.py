@@ -120,13 +120,14 @@ def _admin_or(admin):
 
 # ---- live signals (monkeypatched out in tests) ---------------------------
 
-def _sfs_lookup(email: str, ip: str | None, timeout_s: float) -> dict | None:
+def _sfs_lookup(email: str, timeout_s: float) -> dict | None:
     """StopForumSpam email lookup (aggregates domain reputation). Returns the
     parsed 'email' block, or None on any error/timeout (→ fail open). Callers
-    pass a SYNTHETIC probe address, never the real user's email."""
+    pass a SYNTHETIC probe address, never the real user's email. Nothing
+    else about the visitor goes out — not their IP either: the verdict is
+    read from the domain block alone and cached by domain, so sending it
+    would hand a third party who signed up, and when, for nothing."""
     params = {"email": email, "json": ""}
-    if ip:
-        params["ip"] = ip
     try:
         with httpx.Client(timeout=timeout_s) as c:
             r = c.get(SFS_API_URL, params=params)
@@ -140,7 +141,7 @@ def _sfs_lookup(email: str, ip: str | None, timeout_s: float) -> dict | None:
     return data.get("email") or {}
 
 
-def _live_verdict(domain: str, ip: str | None) -> tuple[str, dict]:
+def _live_verdict(domain: str) -> tuple[str, dict]:
     """Compute a live verdict for a domain not on any list, via a StopForumSpam
     lookup on a SYNTHETIC probe address (SFS returns domain-level reputation
     for any local-part, so we never send the real user's email to a third
@@ -149,7 +150,7 @@ def _live_verdict(domain: str, ip: str | None) -> tuple[str, dict]:
     call is bounded by OIKONOME_SPAM_API_BUDGET_MS; there is no un-timeout'd
     DNS resolve on the request path."""
     score: dict = {}
-    res = _sfs_lookup(f"probe@{domain}", ip, _budget_ms() / 1000.0)
+    res = _sfs_lookup(f"probe@{domain}", _budget_ms() / 1000.0)
     if res is None:
         return "unknown", score
     score = {"blacklisted": res.get("blacklisted"),
@@ -244,8 +245,7 @@ def recipient_blocked(email: str, admin=None) -> bool:
             conn.close()
 
 
-def check(surface: str, email: str, ip: str | None = None,
-          admin=None) -> dict:
+def check(surface: str, email: str, admin=None) -> dict:
     """The intake gate. Returns {"blocked": bool, "reason": str|None}.
 
     Blocked submissions are logged to spam_drops and, when the live check
@@ -276,7 +276,7 @@ def check(surface: str, email: str, ip: str | None = None,
             return {"blocked": True, "reason": "public_list"}
         verdict = _cached_verdict(conn, domain)
         if verdict is None and _live_enabled():
-            verdict, score = _live_verdict(domain, ip)
+            verdict, score = _live_verdict(domain)
             if verdict in ("spam", "clean"):
                 _cache_put(conn, domain, verdict, score)
         if verdict == "spam":

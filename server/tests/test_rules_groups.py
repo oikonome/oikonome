@@ -55,6 +55,15 @@ class RulesPaginationTests(unittest.TestCase):
         self.assertEqual(out["total"], 0)
         self.assertEqual(out["counts"], {"user": 0, "llm": 0, "seed": 0, "model": 0})
 
+    def test_a_category_is_found_as_the_page_shows_it(self):
+        """The page shows GENERAL_MERCHANDISE as 'GENERAL MERCHANDISE', so
+        typing what is on screen must find it, in any case."""
+        for q in ("general merch", "General Merchandise", "GENERAL_MERCH"):
+            with self.subTest(q=q):
+                out = data.list_rules(self.conn, q=q)
+                self.assertEqual(out["counts"]["llm"], 50)
+                self.assertEqual(out["counts"]["seed"], 10)
+
 
 class PromotionTests(unittest.TestCase):
     def setUp(self):

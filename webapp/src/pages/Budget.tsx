@@ -18,6 +18,7 @@ import SavingsGoalsCard from "../components/SavingsGoalsCard";
 import ViewerLock from "../components/ViewerLock";
 import { api, money } from "../api/client";
 import { canEdit } from "../role";
+import { monthSavings } from "../moneymath";
 
 const toast = (m: string) =>
   window.dispatchEvent(new CustomEvent("oiko-toast", { detail: m }));
@@ -180,8 +181,9 @@ export default function Budget() {
               fixedActual: d.buckets.fixed.actual,
               fixedBudget: d.buckets.fixed.month_budget,
               fixedPending: d.fixed_unpaid_due,
-              savings: goal ? { plan: goal.monthly_plan,
-                                saved: goal.rate_90d } : null,
+              // this month's posted contribution, or the 90-day average
+              // (labelled as one) from a server that doesn't send it
+              savings: goal ? monthSavings(goal, goal.saved_this_month) : null,
               excess: d.plan_surplus,
             })} />
           {/* the excess-cash caption that stood here is gone: the hero's

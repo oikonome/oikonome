@@ -141,6 +141,48 @@ class MintTicketTests(unittest.TestCase):
             "Authorization": f"Bearer {m.json()['token']}"})
         self.assertEqual(me.status_code, 200, me.text)
 
+    def test_a_phone_that_gives_up_can_close_its_login_with_the_ticket(self):
+        """A phone that abandons its sign-in (cancel at the device picker,
+        a refused mint, a fallback re-login) holds no cookie on iOS, so the
+        ticket is its only handle on the session that login opened. Spending
+        the ticket without minting closes that session; the ticket is then
+        gone, and a replay closes nothing and reveals nothing."""
+        r = self._login()
+        session = r.cookies.get(sessions.COOKIE_NAME)
+        ticket = r.json()["mint_ticket"]
+        naked = TestClient(self.app)
+        naked.cookies.clear()
+        a = naked.post("/api/devices/abandon", json={"mint_ticket": ticket})
+        self.assertEqual(a.status_code, 200, a.text)
+        conn = tenancy.control_connect()
+        try:
+            self.assertIsNone(sessions.lookup_session(conn, session),
+                              "the abandoned login's session is still open")
+        finally:
+            conn.close()
+        m = naked.post("/api/devices", json={
+            "mint_ticket": ticket, "device_name": "iPad", "platform": "ios"})
+        self.assertEqual(m.status_code, 401, m.text)
+        again = naked.post("/api/devices/abandon", json={"mint_ticket": ticket})
+        self.assertEqual(again.status_code, 200, again.text)
+        for bad in (None, "", 5, "oikm-not-a-real-ticket"):
+            r = naked.post("/api/devices/abandon", json={"mint_ticket": bad})
+            self.assertEqual(r.status_code, 200, f"{bad!r}: {r.text}")
+
+    def test_abandoning_never_touches_another_login(self):
+        keep = self._login()
+        drop = self._login()
+        naked = TestClient(self.app)
+        naked.cookies.clear()
+        naked.post("/api/devices/abandon",
+                   json={"mint_ticket": drop.json()["mint_ticket"]})
+        conn = tenancy.control_connect()
+        try:
+            self.assertIsNotNone(sessions.lookup_session(
+                conn, keep.cookies.get(sessions.COOKIE_NAME)))
+        finally:
+            conn.close()
+
     def test_the_session_cookie_path_still_mints(self):
         """Browsers and every shipped client keep working unchanged."""
         c = TestClient(self.app)

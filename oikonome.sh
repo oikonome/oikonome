@@ -44,6 +44,10 @@ ROOT=$SCRIPT_HOME
 # sourced by install.sh, so the installer and this script can never disagree
 # about what version an instance is running
 . "$SCRIPT_HOME/scripts/version-stamp.sh"
+# dotenv_get / canon_path / data_dir_resolve — the docker/.env reads every
+# lifecycle script shares, so none of them acts on a different database
+# folder or database than the one compose gave the stack
+. "$SCRIPT_HOME/scripts/env-file.sh"
 
 say()  { printf "\033[1;36m▸ %s\033[0m\n" "$*"; }
 ok()   { printf "\033[1;32m✓ %s\033[0m\n" "$*"; }
@@ -60,12 +64,35 @@ die()  { printf "\033[1;31m✗ %s\033[0m\n" "$*"; exit 1; }
 # ten minutes) and then refuses,
 # so a hung operation blocks the next one loudly rather than silently.
 # The descriptor is inherited across exec, so uninstall keeps it.
+# The lock lasts as long as the process holding descriptor 9, so a command
+# that takes it from the interactive menu runs in its own subshell
+# (in_lock_scope): the menu loop outlives every command, and a lock taken
+# in the menu's own shell would stay held — skipping every backup — until
+# the operator quit. The holder file names who took it and when, so a
+# backup that times out can say who it waited for; it is cleared when the
+# shell holding the lock exits (scripts/maint-lock.sh has the rules).
 maint_lock() {
   command -v flock >/dev/null 2>&1 || return 0   # no flock: as before
+  . "$SCRIPT_HOME/scripts/maint-lock.sh"
   exec 9>"$ROOT/.maintenance.lock"
   flock -w "${OIKONOME_MAINT_LOCK_WAIT:-600}" 9 || die \
     "another backup/restore/reset is still running on this instance — wait for it, or set OIKONOME_MAINT_LOCK_WAIT"
+  maint_holder_write "$ROOT" "${1:-maintenance}"
+  # the shell that took the lock is the one that gives it back: the menu's
+  # subshell (in_lock_scope), or the whole run of a one-shot command. The
+  # trap goes with an exec (uninstall), whose process keeps the pid and the
+  # descriptor and so stays the recorded holder until it ends.
+  trap 'maint_holder_clear "$ROOT"' EXIT
+  # a child that takes the lock itself (scripts/pg-major-migrate.sh, under
+  # the reinstall a reset runs) would open its own description of the file
+  # and wait on ours; this tells it the lock is already held for it
+  export OIKONOME_MAINT_LOCK_HELD="$ROOT"
 }
+
+# Run a command that takes the maintenance lock in a subshell, so the lock
+# is released however the command ends — success, a cancelled prompt, a
+# `return 1`, or a `die` — and the menu that called it keeps going.
+in_lock_scope() { ( "$@" ); }
 
 # ── shared plumbing ──────────────────────────────────────────────────────────
 
@@ -89,9 +116,63 @@ find_compose() {
   require_prereqs
 }
 
-# KEY from docker/.env (empty if unset / no .env yet)
+# KEY from docker/.env read the way compose reads it: the last assignment
+# wins, a leading `export ` and a trailing CR are dropped, a quoted value
+# loses its quotes and an unquoted one its trailing ` # comment`. Empty if
+# unset or there is no .env yet.
+env_value() {
+  dotenv_get "$ROOT/docker/.env" "$1"
+}
+
+# KEY from docker/.env — the same compose reading as env_value. Every
+# setting this script acts on is one the running stack was given: a literal
+# `grep ^KEY=` read misses `export KEY=`, keeps quotes and returns both
+# lines of a key set twice, and a COMPOSE_PROJECT_NAME read that way sends
+# backup, restore, reset and uninstall to another project's containers and
+# volumes.
 env_get() {
-  grep "^$1=" "$ROOT/docker/.env" 2>/dev/null | cut -d= -f2- || true
+  env_value "$1"
+}
+
+# env_get_in DIR KEY — the same reading of another instance's docker/.env
+env_get_in() {
+  dotenv_get "$1/docker/.env" "$2"
+}
+
+# master_key_normal VALUE — prints VALUE as a master key (32 bytes, urlsafe
+# base64: 43 characters and one '='), or fails. The standard alphabet's
+# + and / decode to the same bytes as - and _, so they are rewritten, not
+# refused. install.sh applies the same test to the key it is handed.
+master_key_normal() {
+  local k; k=$(printf '%s' "$1" | tr '+/' '-_')
+  case $k in *[!A-Za-z0-9_=-]*|"") return 1;; esac
+  case ${k%=} in *=*) return 1;; esac
+  [ "${#k}" -eq 44 ] && [ "${k%=}" != "$k" ] || return 1
+  printf '%s' "$k"
+}
+
+# The docker/.env lines a reset carries into the reinstall: every operator
+# setting (port aside, which travels separately), minus what install.sh
+# mints for a new instance — the database and queue passwords, the master
+# key (handed over on its own, checked), the setup token, the version
+# stamp. On an external database POSTGRES_PASSWORD is the provider's admin
+# password, which nothing here can mint, so it is carried too.
+# reset_carried_settings [external]
+reset_carried_settings() {
+  [ -f "$ROOT/docker/.env" ] || return 0
+  awk -v ext="${1:-}" '
+    { sub(/\r$/, "") }
+    /^[ \t]*(#|$)/ { next }
+    {
+      line = $0; sub(/^[ \t]*(export[ \t]+)?/, "", line)
+      eq = index(line, "="); if (!eq) next
+      k = substr(line, 1, eq - 1); sub(/[ \t]+$/, "", k)
+      v = substr(line, eq + 1); sub(/^[ \t]+/, "", v)
+      if (k !~ /^[A-Za-z_][A-Za-z0-9_]*$/) next
+      if (k == "POSTGRES_PASSWORD" && ext != "") { print k "=" v; next }
+      if (k ~ /^(POSTGRES_PASSWORD|OIKONOME_APP_PASSWORD|OIKONOME_ADMIN_PASSWORD|REDIS_PASSWORD|OIKONOME_MASTER_KEY|OIKONOME_SETUP_TOKEN|OIKONOME_PORT|OIKONOME_VERSION|OIKONOME_VERSION_NOTE|OIKONOME_VERSION_NOTE_FOR|OIKONOME_INSTALLED_COMMIT)$/) next
+      print k "=" v
+    }' "$ROOT/docker/.env"
 }
 
 # KEY from docker/.env read as a BOOLEAN: true only for 1/true/yes/on
@@ -106,11 +187,13 @@ env_flag() {
 }
 
 # set/clear KEY=VALUE in docker/.env without sed (values may contain anything).
+# Every spelling of KEY is replaced (`export KEY=`, `KEY = …`), not only
+# `KEY=`: a left-over line that compose reads after ours would win.
 # chmod every time: mv replaces .env with a umask-mode temp file, and the
 # file holds the database passwords + master key — keep it owner-only
 set_env() {
   local envf="$ROOT/docker/.env"
-  grep -v "^$1=" "$envf" > "$envf.tmp" 2>/dev/null || true
+  grep -Ev "^[[:space:]]*(export[[:space:]]+)?$1[[:space:]]*=" "$envf" > "$envf.tmp" 2>/dev/null || true
   [ -n "${2:-}" ] && printf '%s=%s\n' "$1" "$2" >> "$envf.tmp"
   mv "$envf.tmp" "$envf"
   chmod 600 "$envf"
@@ -258,16 +341,107 @@ wait_ready() { # wait_ready [tries] — poll /readyz until the app answers
 
 # ── commands ─────────────────────────────────────────────────────────────────
 
+# pre_upgrade_snapshot — dump the running database into ./backups before
+# an upgrade's migrations touch it. Several migrations rewrite stored data
+# for good (account numbers cut to their last four digits, account ids
+# renamed), and the image is rebuilt in place under the same tag, so
+# without this dump there is no earlier state to go back to. Held to the
+# rule the pre-restore snapshot keeps: a database with accounts on it is
+# never migrated without one. Only a database that is already up is
+# dumped: starting postgres here could start the NEW release's server
+# image on a folder an older major wrote.
+pre_upgrade_snapshot() {
+  [ -f "$ROOT/docker/.env" ] || return 0      # first install: nothing to keep
+  find_compose
+  local snap part users
+  if ! ( cd "$ROOT/docker" && pg_ready ); then
+    warn "The database isn't running, so no pre-upgrade snapshot was taken."
+    local last; last=$(newest_backup)
+    if [ -n "$last" ]; then
+      echo "  Your newest backup is the way back if this upgrade goes wrong:"
+      echo "    $last"
+    else
+      echo "  There is no backup in $(backup_dir) either: if this upgrade goes"
+      echo "  wrong there is nothing to go back to."
+    fi
+    return 0
+  fi
+  users=$( cd "$ROOT/docker" && pg_app_sql -tA -c "SELECT count(*) FROM users;" 2>/dev/null | tr -dc '0-9' ) || true
+  users=${users:-0}
+  snap="$(backup_dir)/oikonome-pre-upgrade-$(date +%Y%m%d-%H%M%S).sql.gz"
+  # written under a dotted .partial name and moved into place only once it
+  # checks out (as backup.sh does), so an interrupted dump is never listed
+  # by the restore picker as the newest way back
+  part="$(backup_dir)/.$(basename "$snap").partial"
+  shared_umask mkdir -p "$(backup_dir)"
+  say "Snapshotting the database before the upgrade…"
+  if ( umask 077; ( cd "$ROOT/docker" && pg_dump_db 2>/dev/null ) | gzip > "$part" ) \
+      && dump_looks_real "$part" && mv -f "$part" "$snap"; then
+    chmod 600 "$snap" 2>/dev/null || true   # the whole database in plaintext
+    ok "Pre-upgrade snapshot: $snap"
+    PRE_UPGRADE_SNAPSHOT=$snap
+    return 0
+  fi
+  rm -f "$part"
+  if [ "$users" -gt 0 ]; then
+    die "Couldn't snapshot the database before upgrading, and it holds $users account(s) — nothing was changed. Free disk space or take a backup (./oikonome.sh backup), then retry."
+  fi
+  warn "Couldn't snapshot the database (empty instance?) — upgrading without one."
+}
+
+# non_interactive — true when nobody is at a terminal to read a warning
+# (the admin console's host agent, cron, CI): an upgrade that could not
+# fetch the new code must fail there, or the console records "done".
+non_interactive() { [ -n "${OIKONOME_ASSUME_YES:-}" ] || [ ! -t 1 ]; }
+
 cmd_install() {
   [ -f "$ROOT/install.sh" ] || die "No install.sh in $ROOT."
+  # Held from before the snapshot until install.sh returns: a backup or
+  # restore running meanwhile would be dumped half-loaded into the snapshot
+  # (or have its load raced by the rebuild), and the host's reboot check
+  # defers to this lock, so a nightly reboot never lands mid-migration.
+  # pg-major-migrate, run by install.sh, sees OIKONOME_MAINT_LOCK_HELD and
+  # does not wait on it. The menu runs this in in_lock_scope.
+  maint_lock upgrade
+  PRE_UPGRADE_SNAPSHOT=""
   # Upgrade means UPGRADE: pull the latest code first when this install
   # is a git checkout with an upstream (a plain download just installs
   # what's there). --ff-only so a dirty/diverged tree warns instead of
   # merging surprises into someone's instance.
   if git -C "$ROOT" rev-parse --abbrev-ref '@{upstream}' >/dev/null 2>&1; then
-    local before after
+    local before after pull_err
     before=$(describe_version "$ROOT"); before=${before:-?}
-    if git -C "$ROOT" pull --ff-only -q 2>/dev/null; then
+    git -C "$ROOT" fetch -q 2>/dev/null || warn "Couldn't reach the code's upstream (offline?)."
+    if git -C "$ROOT" rev-parse -q --verify '@{upstream}' >/dev/null 2>&1 \
+        && ! git -C "$ROOT" merge-base HEAD '@{upstream}' >/dev/null 2>&1; then
+      # The upstream was replaced by a history this checkout shares no
+      # commit with (the published repository is recreated, not rewritten).
+      # No pull can ever succeed from here, and installing as-is would
+      # rebuild the old version every time while reporting success.
+      die "This checkout's history and the upstream's no longer share a commit (the
+  published repository was recreated), so it cannot be updated by a pull —
+  nothing was changed. Your settings (docker/.env), data and backups are not
+  tracked by git, so moving the code across is safe:
+    ./oikonome.sh backup
+    git -C '$ROOT' reset --hard '@{upstream}'
+    ./oikonome.sh install
+  (git reset --hard discards edits you made to tracked files; 'git status' lists them.)"
+    fi
+    # Snapshot whenever the code about to be installed is not the code
+    # that last migrated this database — not merely when git still has
+    # commits to pull. A tree the operator pulled by hand, main checked
+    # out again after a rollback, or a retry after an install that failed
+    # part-way all have HEAD == upstream, yet their migrations run on the
+    # database just the same. install.sh records the commit once an
+    # install comes up healthy (OIKONOME_INSTALLED_COMMIT); no record at
+    # all (an instance from before it) reads as new code.
+    local head
+    head=$(git -C "$ROOT" rev-parse -q --verify HEAD 2>/dev/null || true)
+    if [ "$head" != "$(git -C "$ROOT" rev-parse '@{upstream}' 2>/dev/null)" ] \
+        || [ -z "$head" ] || [ "$head" != "$(env_get OIKONOME_INSTALLED_COMMIT)" ]; then
+      pre_upgrade_snapshot
+    fi
+    if pull_err=$(git -C "$ROOT" pull --ff-only -q 2>&1); then
       after=$(describe_version "$ROOT"); after=${after:-?}
       if [ "$before" = "$after" ]; then
         ok "Code already current ($after)."
@@ -275,10 +449,24 @@ cmd_install() {
         ok "Code updated: $before → $after"
       fi
     else
-      warn "Couldn't update (local changes or diverged history) — installing the code as-is."
+      warn "Couldn't update the code: ${pull_err:-git pull failed}"
+      echo "  (Usually local edits to tracked files — 'git -C $ROOT status' lists them.)"
+      non_interactive && die "Upgrade stopped: the new code could not be fetched, so nothing was installed."
+      warn "Installing the code as-is ($before)."
     fi
+  else
+    # a plain download: the files may already be a newer release
+    pre_upgrade_snapshot
   fi
-  shared_umask "$ROOT/install.sh"
+  local rc=0
+  shared_umask "$ROOT/install.sh" || rc=$?
+  if [ -n "$PRE_UPGRADE_SNAPSHOT" ]; then
+    # said whether the install worked or not: a release that will not start
+    # is exactly when the way back is needed
+    echo "  To undo this upgrade: check out the previous version, run ./install.sh,"
+    echo "  then ./oikonome.sh restore $(basename "$PRE_UPGRADE_SNAPSHOT")  (docs/quickstart.md → Upgrades)"
+  fi
+  [ "$rc" -eq 0 ] || return "$rc"
   # install.sh has already passed the prereq check, so this resolves the
   # engine without prompting
   find_compose
@@ -328,7 +516,7 @@ source_checkout() {
 # stamp still order correctly), then the .env mtime as a last resort.
 _created_epoch() {
   local dir=$1 c
-  c=$(grep "^OIKONOME_CREATED=" "$dir/docker/.env" 2>/dev/null | cut -d= -f2- || true)
+  c=$(env_get_in "$dir" OIKONOME_CREATED)
   if [ -n "$c" ]; then printf '%s' "$c"; return; fi
   c=$(stat -c %W "$dir" 2>/dev/null || echo 0)
   if [ -n "$c" ] && [ "$c" != 0 ]; then printf '%s' "$c"; return; fi
@@ -351,7 +539,7 @@ all_instances() {
     IFS='|' read -r dir proj port state <<<"$line"
     # stopped containers publish no port — fall back to the instance's .env
     if [ -z "$port" ]; then
-      p=$(grep "^OIKONOME_PORT=" "$dir/docker/.env" 2>/dev/null | cut -d= -f2- || true)
+      p=$(env_get_in "$dir" OIKONOME_PORT)
       port=${p:-8042}
     fi
     seen="$seen$dir"$'\n'
@@ -362,9 +550,8 @@ all_instances() {
     if [ ! -f "$d/docker/.env" ]; then continue; fi
     case $seen in *$'\n'"$d"$'\n'*) continue;; esac
     seen="$seen$d"$'\n'
-    # `|| true`: a sparse .env must not trip set -e
-    p=$(grep "^OIKONOME_PORT=" "$d/docker/.env" 2>/dev/null | cut -d= -f2- || true)
-    proj=$(grep "^COMPOSE_PROJECT_NAME=" "$d/docker/.env" 2>/dev/null | cut -d= -f2- || true)
+    p=$(env_get_in "$d" OIKONOME_PORT)
+    proj=$(env_get_in "$d" COMPOSE_PROJECT_NAME)
     buf="$buf$(_created_epoch "$d")|$d|${proj:-—}|${p:-8042}|stopped"$'\n'
   done
   # sort by the creation epoch (numeric), then drop the sort key
@@ -654,7 +841,8 @@ cmd_backup() {
 # db for DROP/CREATE DATABASE). Local installs keep the exec-in-postgres
 # path byte-for-byte.
 db_external() {
-  grep -q "^COMPOSE_FILE=.*external-db" "$ROOT/docker/.env" 2>/dev/null
+  case $(env_value COMPOSE_FILE) in *external-db*) return 0;; esac
+  return 1
 }
 db_run() {  # db_run '<shell snippet using $OIKONOME_*_DSN>'
   $COMPOSE run --rm --no-deps -T migrate sh -c "$1"
@@ -677,15 +865,34 @@ pg_maint_sql() {  # psql against the MAINTENANCE db (DROP/CREATE DATABASE)
   else $COMPOSE exec -T postgres psql -U postgres -d postgres "$@"; fi
 }
 drop_recreate_db() {
-  local db; db=$(db_name)
+  # The name is spliced into SQL, so it is checked and then quoted as an
+  # identifier: unquoted, psql folds `Ledger` to `ledger` and would force-
+  # drop a DIFFERENT database on a shared cluster while leaving the app's
+  # own in place, and a hyphenated name is a syntax error that makes every
+  # reset and restore fail. Quoted, it is the exact name the app's DSN uses.
+  local db; db=$(db_name) || return 1
   pg_maint_sql -q \
-    -c "DROP DATABASE IF EXISTS $db WITH (FORCE);" \
-    -c "CREATE DATABASE $db;"
+    -c "DROP DATABASE IF EXISTS \"$db\" WITH (FORCE);" \
+    -c "CREATE DATABASE \"$db\";"
 }
 db_name() {
+  # OIKONOME_DB_NAME names the database only in external-db mode: the
+  # bundled postgres's DSNs, POSTGRES_DB and every dump/load above use
+  # `oikonome` whatever the setting says, so a value left over from an
+  # external setup must not make a reset or restore drop some other name
+  # while loading into `oikonome`.
+  db_external || { echo oikonome; return 0; }
+  # read the way compose reads it, since compose builds the app's DSN from it
   local n
-  n=$(grep "^OIKONOME_DB_NAME=" "$ROOT/docker/.env" 2>/dev/null | cut -d= -f2-)
-  echo "${n:-oikonome}"
+  n=$(env_value OIKONOME_DB_NAME)
+  n=${n:-oikonome}
+  case $n in
+    *[!A-Za-z0-9_-]*)
+      warn "OIKONOME_DB_NAME in docker/.env ('$n') may use only letters, digits, '_' and '-' — nothing touched." >&2
+      return 1;;
+  esac
+  [ "${#n}" -le 63 ] || { warn "OIKONOME_DB_NAME is longer than PostgreSQL's 63-character limit — nothing touched." >&2; return 1; }
+  echo "$n"
 }
 
 # dump_looks_real FILE — 0 when FILE can plausibly be an Oikonome dump.
@@ -749,7 +956,7 @@ restore_rollback() {
 
 cmd_restore() {
   local file=${1:-} dest choice n i f
-  maint_lock
+  maint_lock restore
   dest=$(backup_dir)
 
   if [ -z "$file" ]; then
@@ -797,6 +1004,12 @@ cmd_restore() {
   Nothing was touched. Pick another backup (./oikonome.sh restore) — the
   newest one is not always the good one: a backup interrupted mid-dump
   lands with the newest timestamp."
+  fi
+
+  # an external database's name is spliced into the drop below: a name the
+  # drop would refuse stops here, before the confirm and the snapshot
+  if db_external; then
+    db_name >/dev/null || die "Fix OIKONOME_DB_NAME in docker/.env, then re-run restore."
   fi
 
   echo
@@ -906,9 +1119,23 @@ cmd_restore() {
   # migrations run at app-container start (advisory-locked); /readyz only
   # answers once they're done, so the health wait below covers both
   say "Starting app + worker (migrations run at start)…"
-  $COMPOSE up -d
   say "Health check…"
-  wait_ready 60 || return 1
+  # The start itself is tested, not run bare: under docker compose v2 a
+  # one-shot migrate service that fails makes `up -d` exit non-zero, and
+  # under errexit a bare call would end the script before the rollback.
+  if ! $COMPOSE up -d || ! wait_ready 60; then
+    # The current code cannot start on what was just loaded (a migration
+    # that fails on an old dump, a schema it cannot read). Left here, the
+    # instance stays down on data nothing runs on, so put the snapshot
+    # taken above back; the dump itself is untouched and can be tried again.
+    # app + worker first: their restart loop would otherwise reconnect and
+    # re-run migrations into the database being reloaded.
+    # With no snapshot (the instance was empty) there is nothing to go back
+    # to, and the restored data stays where it is.
+    [ -n "$pre" ] || return 1
+    $COMPOSE stop app worker >/dev/null 2>&1 || true
+    restore_failed "The app did not come up on the restored database (see ./oikonome.sh logs). The dump is unchanged: $file"
+  fi
 
   # The restored ciphertexts must decrypt under THIS instance's
   # OIKONOME_MASTER_KEY — a dump from another install loads fine, but its
@@ -938,29 +1165,87 @@ cmd_restore() {
 }
 
 cmd_reset() {
-  local data_dir keep_port
-  maint_lock
+  local data_dir keep_port raw_key old_key="" new_key="" saved="" external=""
+  local settings db_host
+  case ${1:-} in
+    "") : ;;
+    --new-key) new_key=1 ;;
+    *) die "Usage: ./oikonome.sh reset [--new-key]" ;;
+  esac
+  maint_lock reset
+  # --new-key: mint a fresh master key too (e.g. the old one may have
+  # leaked). Without it the reinstall keeps the old key, because every
+  # backup in ./backups was encrypted under it: its two-factor seeds,
+  # webhook secrets and API keys decrypt under that key and no other.
+  # Either way the old key is written beside the backups before anything
+  # is deleted, since docker/.env, its only other copy, is replaced below.
+  # Read and check the key BEFORE anything is touched. It is read the way
+  # compose reads it (quotes, CR, inline comment), so a key the running
+  # stack accepts is the key carried over; a value that is not a key at all
+  # stops the reset here, with the database and docker/.env still intact.
+  raw_key=$(env_value OIKONOME_MASTER_KEY)
+  if [ -n "$raw_key" ]; then
+    old_key=$(master_key_normal "$raw_key") || die \
+      "OIKONOME_MASTER_KEY in docker/.env is not a master key (32 bytes, urlsafe base64) — nothing touched. Correct that line (docs/master-key.md), then re-run reset."
+  fi
+  db_external && external=1
+  settings=$(reset_carried_settings "$external")
+
+  # read the data location BEFORE deleting .env, the way compose reads it
+  # (OIKONOME_DATA_DIR overrides; relative to docker/), so the folder this
+  # deletes is the folder postgres mounted. Unset, the whole ./data goes.
+  data_dir=$(data_dir_resolve "$ROOT/docker" "$ROOT/data")
+  if [ -n "$external" ]; then
+    # checked before the confirm, so a name the drop would refuse stops
+    # the reset with nothing deleted
+    db_name >/dev/null || die "Fix OIKONOME_DB_NAME in docker/.env, then re-run reset."
+  fi
+  db_host=$(env_value OIKONOME_DB_HOST)
+
   echo
   echo "  This WIPES the instance at $ROOT:"
-  echo "    • stack down, DATABASE deleted (./data), secrets regenerated"
+  if [ -n "$external" ]; then
+    echo "    • stack down; the database $(db_name) on ${db_host:-the external server} is"
+    echo "      DROPPED and created again empty"
+  else
+    echo "    • stack down, DATABASE deleted ($data_dir)"
+  fi
+  echo "    • linked banks are disconnected at the provider (link them again after)"
+  echo "    • the generated passwords and the setup link are replaced"
   echo "    • then reinstalls → the fresh setup wizard"
-  echo "  The code and your backups are kept. This cannot be undone."
+  echo "  Kept: the code, your backups, and every other setting in docker/.env —"
+  echo "  port, HTTPS domain, bind address, external database, admin console,"
+  echo "  email (SMTP), LLM, data folder and provider keys."
+  if [ -n "$old_key" ] && [ -z "$new_key" ]; then
+    echo "  The master key is kept as well, and a copy is saved beside the"
+    echo "  backups: restoring one brings back its two-factor seeds, webhook"
+    echo "  secrets and API keys. Its banks have to be linked again — this reset"
+    echo "  disconnects them, so no backup can bring them back."
+  elif [ -n "$old_key" ]; then
+    echo "  The master key is replaced: backups taken before now cannot restore"
+    echo "  their two-factor seeds, webhook secrets or API keys without the OLD"
+    echo "  key. It is saved next to them, owner-only, as"
+    echo "  $(backup_dir)/master-key-before-reset-<date>.env —"
+    echo "  move it to a password manager (docs/master-key.md). Banks are linked"
+    echo "  again after any restore: this reset disconnects them."
+  fi
+  echo "  This cannot be undone."
   confirm_word reset "Type 'reset' to confirm: " || return 1
+  if [ -n "$old_key" ]; then
+    # written before anything is deleted, and the reset stops if it cannot
+    # be: a key that only lived in the .env about to go is unrecoverable,
+    # and so is one handed to a reinstall that then fails
+    saved="$(backup_dir)/master-key-before-reset-$(date +%Y%m%d-%H%M%S).env"
+    ( umask 077; mkdir -p "$(backup_dir)" \
+        && printf '# master key the backups in this folder were taken under (docs/master-key.md)\nOIKONOME_MASTER_KEY=%s\n' \
+             "$old_key" > "$saved" ) \
+      || die "Couldn't save the master key to $saved — nothing deleted."
+    chmod 600 "$saved"
+    ok "Master key saved: $saved"
+  fi
 
   find_compose
   cd "$ROOT/docker"
-
-  # read the data location BEFORE deleting .env (OIKONOME_DATA_DIR overrides;
-  # its value is relative to docker/, matching install.sh)
-  data_dir=$(env_get OIKONOME_DATA_DIR)
-  if [ -n "$data_dir" ]; then
-    case $data_dir in
-      /*) : ;;                                # absolute — use as-is
-      *)  data_dir="$ROOT/docker/$data_dir";; # relative to docker/, like compose
-    esac
-  else
-    data_dir="$ROOT/data"
-  fi
 
   # remember the port before .env is deleted: a reset regenerates
   # secrets, but the instance should not silently move ports
@@ -971,35 +1256,72 @@ cmd_reset() {
   # database is a bind mount deleted below — just the multi-GB ollama
   # model cache and Caddy's certs, both worth keeping across a reset
   # (same port → same project name → the reinstall reattaches them).
+  # Linked banks hold their access tokens only in this database. Release
+  # them at the provider while the app can still run, or every Item keeps
+  # billing (and keeps its bank consent) with no handle left to remove it.
+  # Best effort: what could not be released is named, for the dashboard.
+  local proj cname
+  proj=$(env_get COMPOSE_PROJECT_NAME); proj=${proj:-oikonome}
+  cname=$(svc_container "$proj" app)
+  if [ -n "$cname" ]; then
+    say "Disconnecting linked banks at the provider…"
+    $ENGINE exec "$cname" python -m oikonome.db.reset --release-links \
+      || warn "Some bank links could not be released (listed above) — remove them in the provider's dashboard."
+  else
+    warn "The app isn't running, so linked banks can't be released here — remove them in the provider's dashboard (Plaid: Items), or they keep billing."
+  fi
+
   say "Stopping the stack…"
   $COMPOSE down >/dev/null 2>&1 || true
 
-  say "Deleting the database at $data_dir …"
-  if ! rm -rf "$data_dir" 2>/dev/null; then
-    # rootless podman: postgres's files belong to a subuid, so plain rm
-    # gets EPERM — deleting inside the user namespace is the fix
-    if command -v podman >/dev/null 2>&1; then
-      podman unshare rm -rf "$data_dir" 2>/dev/null || true
+  if [ -n "$external" ]; then
+    # There is no data folder to remove: the database lives on the external
+    # server, and only dropping it there deletes it — the same drop a
+    # restore makes, through the migrate service's maintenance connection.
+    # The app and admin roles stay; the reinstall's migrate gives them the
+    # new passwords.
+    say "Dropping the database $(db_name) on ${db_host:-the external server} …"
+    drop_recreate_db || die "Couldn't drop the database on the external server — docker/.env and the database are untouched. Check the connection (./oikonome.sh status), then re-run reset."
+  else
+    say "Deleting the database at $data_dir …"
+    if ! rm -rf "$data_dir" 2>/dev/null; then
+      # rootless podman: postgres's files belong to a subuid, so plain rm
+      # gets EPERM — deleting inside the user namespace is the fix
+      if command -v podman >/dev/null 2>&1; then
+        podman unshare rm -rf "$data_dir" 2>/dev/null || true
+      fi
+      # rootful docker: postgres's files belong to the container uid (e.g.
+      # 999), so a host rm gets EPERM. A throwaway ROOT container removes them
+      # without needing host sudo — the fix for headless/non-root callers like
+      # the admin-console host-agent.
+      if [ -e "$data_dir" ] && command -v docker >/dev/null 2>&1; then
+        docker run --rm -v "$data_dir":/d busybox \
+          find /d -mindepth 1 -delete >/dev/null 2>&1 || true
+        rmdir "$data_dir" 2>/dev/null || rm -rf "$data_dir" 2>/dev/null || true
+      fi
     fi
-    # rootful docker: postgres's files belong to the container uid (e.g.
-    # 999), so a host rm gets EPERM. A throwaway ROOT container removes them
-    # without needing host sudo — the fix for headless/non-root callers like
-    # the admin-console host-agent.
-    if [ -e "$data_dir" ] && command -v docker >/dev/null 2>&1; then
-      docker run --rm -v "$data_dir":/d busybox \
-        find /d -mindepth 1 -delete >/dev/null 2>&1 || true
-      rmdir "$data_dir" 2>/dev/null || rm -rf "$data_dir" 2>/dev/null || true
+    if [ -e "$data_dir" ] && [ -n "$(ls -A "$data_dir" 2>/dev/null)" ]; then
+      die "Couldn't delete $data_dir (files owned by the container uid). Run: sudo rm -rf '$data_dir'  then re-run reset."
     fi
+    rm -rf "$data_dir" 2>/dev/null || true
   fi
-  if [ -e "$data_dir" ] && [ -n "$(ls -A "$data_dir" 2>/dev/null)" ]; then
-    die "Couldn't delete $data_dir (files owned by the container uid). Run: sudo rm -rf '$data_dir'  then re-run reset."
-  fi
-  rm -rf "$data_dir" 2>/dev/null || true
   rm -f "$ROOT/docker/.env" "$ROOT/docker/compose.override.yaml"
-  ok "Data and secrets removed."
+  ok "Database and generated passwords removed; settings carried over."
 
-  say "Reinstalling (fresh secrets, fresh setup wizard)…"
-  shared_umask env OIKONOME_PORT="$keep_port" "$ROOT/install.sh"
+  # The kept settings and key travel in the environment, never on a
+  # command line, where any account on the host could read them in ps.
+  if [ -z "$new_key" ] && [ -n "$old_key" ]; then
+    say "Reinstalling (fresh passwords, same master key, same settings, fresh setup wizard)…"
+  else
+    say "Reinstalling (fresh secrets, same settings, fresh setup wizard)…"
+  fi
+  (
+    export OIKONOME_PORT="$keep_port" OIKONOME_RESET_SETTINGS="$settings"
+    if [ -z "$new_key" ] && [ -n "$old_key" ]; then
+      export OIKONOME_KEEP_MASTER_KEY="$old_key"
+    fi
+    shared_umask "$ROOT/install.sh"
+  )
 }
 
 # The proxy trust `https <domain>` writes when the operator set none: the
@@ -1332,13 +1654,30 @@ cmd_clear_2fa() {
   proj=$(env_get COMPOSE_PROJECT_NAME); proj=${proj:-oikonome}
   cname=$(svc_container "$proj" app)
   [ -n "$cname" ] || die "app container not running — ./oikonome.sh install first"
+  # An owner's clear also deletes the logins of members who joined through
+  # that owner's recent invites (they may be what a thief planted). The
+  # prompt names them, and the clear is handed that same list back
+  # (--expect-members): if someone joined while the prompt waited, it
+  # refuses rather than remove a login the operator never saw named.
+  local members expect
+  members=$($ENGINE exec "$cname" oikonome clear-2fa --preview "$email") || {
+    warn "No account with the email '$email' on this instance, or it could not be read."
+    return 1
+  }
   say "This removes the authenticator, every passkey and every recovery code"
   say "for $email, and signs out all of their sessions and devices."
+  if [ -n "$members" ]; then
+    warn "It also DELETES these household logins, who joined through this"
+    warn "owner's invites in the last few days (re-invite any that are genuine):"
+    printf '%s\n' "$members" | sed 's/^/      /'
+  fi
   printf "  Type the email again to confirm: "
   local again; tty_read again
   [ "$again" = "$email" ] || { warn "Emails differ — nothing done."; return 1; }
-  if ! $ENGINE exec "$cname" oikonome clear-2fa "$email"; then
-    warn "No account with the email '$email' on this instance, or the clear failed."
+  # the address leads each preview line
+  expect=$(printf '%s\n' "$members" | awk 'NF { print $1 }' | paste -sd, -)
+  if ! $ENGINE exec "$cname" oikonome clear-2fa --expect-members "$expect" "$email"; then
+    warn "Nothing was cleared for '$email' (see above) — no such account, the clear failed, or the household changed since the list was shown."
     return 1
   fi
   echo
@@ -1387,12 +1726,91 @@ cmd_reset_password() {
     fi
   fi
   echo "  Opening it sets a new password and signs the account out everywhere."
-  echo "  (Two-factor settings are unchanged.)"
+  # the same reset the emailed link performs, so the same rules: an account
+  # with a second factor proves itself with a recovery code, and the reset
+  # then removes every factor (docs/troubleshooting.md)
+  echo "  If the account uses an authenticator app or a passkey, the link first"
+  echo "  asks for one of its recovery codes, and the reset then removes the"
+  echo "  authenticator, every passkey and the recovery codes — set them up again"
+  echo "  after signing in. Recovery codes lost too? Run"
+  echo "  ./oikonome.sh clear-2fa $email  first (verify who is asking)."
+}
+
+# ── start at boot (Podman) ─────────────────────────────────────────────────
+# Every service is `restart: unless-stopped`. Docker's daemon applies that
+# at boot, so a Docker host brings the stack back by itself. Podman has no
+# daemon, and nothing applies a restart policy at boot: a rebooted Podman
+# host leaves the instance down until someone starts it. `start-at-boot`
+# writes a systemd unit that runs `compose up -d` at boot — a user unit
+# for rootless Podman, with lingering turned on so the user's manager
+# starts without anyone logging in, or a system unit when run as root.
+# /oikonome.sh start-at-boot [on|off]
+cmd_start_at_boot() {
+  local action=${1:-on} proj unit dir scope="" wanted first rest="" run
+  [ -f "$ROOT/docker/.env" ] || die "No install here yet — run ./oikonome.sh install first."
+  case $action in on|off) : ;; *) die "Usage: ./oikonome.sh start-at-boot [on|off]" ;; esac
+  find_compose
+  proj=$(env_get COMPOSE_PROJECT_NAME); proj=${proj:-oikonome}
+  unit="oikonome-$proj.service"
+  if [ "$(id -u)" = 0 ]; then
+    dir=/etc/systemd/system; wanted=multi-user.target
+  else
+    dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"; scope=--user; wanted=default.target
+  fi
+  if [ "$action" = off ]; then
+    command -v systemctl >/dev/null 2>&1 || die "systemd isn't available on this host."
+    systemctl $scope disable "$unit" >/dev/null 2>&1 || true
+    rm -f "$dir/$unit"
+    systemctl $scope daemon-reload >/dev/null 2>&1 || true
+    ok "Start at boot turned off ($unit removed)."
+    return 0
+  fi
+  if [ "$ENGINE" = docker ]; then
+    ok "Docker restarts this stack at boot by itself (with docker.service enabled) — nothing to set up."
+    return 0
+  fi
+  command -v systemctl >/dev/null 2>&1 || die \
+    "systemd isn't available here — start the stack at boot with this host's init system: cd '$ROOT/docker' && $COMPOSE up -d"
+  first=${COMPOSE%% *}
+  [ "$first" = "$COMPOSE" ] || rest=" ${COMPOSE#* }"
+  run="$(command -v "$first")$rest"
+  mkdir -p "$dir"
+  cat > "$dir/$unit" <<UNIT
+# written by ./oikonome.sh start-at-boot — remove with ./oikonome.sh start-at-boot off
+[Unit]
+Description=Oikonome instance $proj ($ROOT)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=$ROOT/docker
+Environment=PODMAN_COMPOSE_IN_POD=false
+ExecStart=$run up -d
+ExecStop=$run stop
+TimeoutStartSec=900
+
+[Install]
+WantedBy=$wanted
+UNIT
+  chmod 644 "$dir/$unit"
+  systemctl $scope daemon-reload || die "systemctl daemon-reload failed — is a systemd manager running for this user?"
+  systemctl $scope enable "$unit" >/dev/null || die "couldn't enable $unit"
+  ok "The stack now starts at boot ($dir/$unit)."
+  if [ -n "$scope" ]; then
+    if loginctl enable-linger "$(id -un)" 2>/dev/null; then
+      ok "Lingering on for $(id -un): the unit starts at boot without a login."
+    else
+      warn "Couldn't turn on lingering — until it is on, the unit starts only when $(id -un) logs in."
+      echo "  An administrator can: sudo loginctl enable-linger $(id -un)"
+    fi
+  fi
 }
 
 cmd_uninstall() {
   [ -f "$ROOT/uninstall.sh" ] || die "No uninstall.sh in $ROOT."
-  maint_lock
+  maint_lock uninstall
   # uninstall.sh confirms ('delete'), downs the stack, and removes the WHOLE
   # folder — possibly including this script, so replace ourselves instead
   # of returning
@@ -1585,8 +2003,8 @@ cmd_demo() {
   (cd "$dest" && shared_umask ./install.sh </dev/null) \
     || { demo_cleanup "$dest"; die "demo install failed"; }
   local port proj cname
-  port=$(grep "^OIKONOME_PORT=" "$dest/docker/.env" | cut -d= -f2)
-  proj=$(grep "^COMPOSE_PROJECT_NAME=" "$dest/docker/.env" | cut -d= -f2)
+  port=$(env_get_in "$dest" OIKONOME_PORT)
+  proj=$(env_get_in "$dest" COMPOSE_PROJECT_NAME)
   say "Generating the synthetic household (this is quick)…"
   # label-based lookup: a hardcoded ${proj}_app_1 only matches
   # podman-compose/v1 names — docker compose v2 uses {proj}-app-1
@@ -1627,7 +2045,7 @@ cmd_demo() {
 
 
 usage() {
-  echo "Usage: ./oikonome.sh [install|upgrade|status|logs|backup|restore <file>|reset|reset-data [tenant]|reset-password [email]|clear-2fa [email]|uninstall|demo [seed|clean]|https <domain>|llm <on|off|vision> [model]|script <list|add|remove> [name]]"
+  echo "Usage: ./oikonome.sh [install|upgrade|status|logs|backup|restore <file>|reset [--new-key]|reset-data [tenant]|reset-password [email]|clear-2fa [email]|uninstall|start-at-boot [on|off]|demo [seed|clean]|https <domain>|llm <on|off|vision> [model]|script <list|add|remove> [name]]"
   echo "  upgrade is an alias for install (same in-place path)."
   echo "  llm vision downloads the receipt/tax-document vision model."
   echo "Run with no arguments for the interactive menu."
@@ -1686,12 +2104,12 @@ menu() {
     [ -n "$choice" ] || choice=$def
     # menu actions may fail (e.g. stack down) — report and re-menu, don't die
     case $choice in
-      1) cmd_install   || warn "install failed";;
+      1) in_lock_scope cmd_install || warn "install failed";;
       2) cmd_status    || warn "status failed";;
       3) cmd_logs      || warn "logs failed";;
       4) cmd_backup    || warn "backup failed";;
-      5) cmd_restore   || warn "restore did not complete";;
-      6) cmd_reset     || warn "reset did not complete";;
+      5) in_lock_scope cmd_restore || warn "restore did not complete";;
+      6) in_lock_scope cmd_reset   || warn "reset did not complete";;
       7) cmd_uninstall;;
       8) cmd_reset_data || warn "reset-data did not complete";;
       p|P) cmd_reset_password || warn "reset-password did not complete";;
@@ -1717,8 +2135,9 @@ case ${1:-} in
   logs)      cmd_logs;;
   backup)    cmd_backup;;
   restore)   cmd_restore "${2:-}";;
-  reset)     cmd_reset;;
+  reset)     cmd_reset "${2:-}";;
   uninstall) cmd_uninstall;;
+  start-at-boot) cmd_start_at_boot "${2:-}";;
   https)     cmd_https "${2:-}";;
   llm)       find_compose; cmd_llm "${2:-}" "${3:-}";;
   script)    cmd_script "${2:-}" "${3:-}";;

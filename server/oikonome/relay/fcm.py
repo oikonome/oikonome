@@ -134,7 +134,6 @@ def _access_token() -> str | None:
 # from its own server when opened.
 _DISPLAY = {
     "daily":   ("Oikonome", "Today's verdict is ready"),
-    "weekly":  ("Oikonome", "Your weekly summary is ready"),
     "monthly": ("Oikonome", "Your monthly summary is ready"),
     "yearly":  ("Oikonome", "Your yearly summary is ready"),
     "alert":   ("Oikonome", "Something on your budget needs a look"),

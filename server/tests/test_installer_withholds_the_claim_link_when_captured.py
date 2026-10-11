@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def _success_box(env: dict) -> str:
     src = (ROOT / "install.sh").read_text()
-    start = src.index("SETUP_TOKEN=$(grep")
+    start = src.index("SETUP_TOKEN=$(env_read")
     end = src.index('B "1. The setup wizard', start)
     block = src[start:end]
     with tempfile.TemporaryDirectory() as d:
@@ -34,7 +34,11 @@ def _success_box(env: dict) -> str:
             "esac\n")
         os.chmod(Path(d, "curl"), 0o755)
         Path(d, ".env").write_text("OIKONOME_SETUP_TOKEN=tok-SECRET-123\n")
-        script = f"cd {d}\nPORT=8042\n" + block
+        # the installer's .env reader, over the shared readers it uses
+        reader = re.search(r"^env_read\(\) \{.*?\}\n", src, re.M)
+        assert reader, "install.sh lost its env_read helper"
+        script = (f'. "{ROOT}/scripts/env-file.sh"\n{reader.group(0)}'
+                  f"cd {d}\nPORT=8042\n" + block)
         r = subprocess.run(["bash", "-c", script], capture_output=True,
                            text=True,
                            env={**os.environ, **env,

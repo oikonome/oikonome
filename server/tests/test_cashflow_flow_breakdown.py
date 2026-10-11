@@ -31,7 +31,7 @@ class FlowBreakdownTests(unittest.TestCase):
         self.conn.close()
 
     def test_sides_balance_and_kinds_are_told_apart(self):
-        today = dt.date(2026, 8, 31)
+        today = dt.date(2026, 9, 1)   # August has closed: a range holds complete months
         # the paycheck is recognised by the household's INCOME bill, not by
         # an aggregator tag — imported and legacy deposits carry none
         add_bill(self.conn, "ACME PAYROLL", 5000.0, frequency="MONTHLY",
@@ -66,9 +66,13 @@ class FlowBreakdownTests(unittest.TestCase):
         six = reporting.flow_breakdown(self.conn, today, "6m")
         self.assertEqual(six["label"], "Mar–Aug 2026")
         self.assertEqual(six["out"]["total"], 1740.0)
+        # the year would open in Sep 2025, but the checking feed's first row
+        # is the OLD one in Oct 2025 and income is unknown before it, so the
+        # picture starts there and says so
         year = reporting.flow_breakdown(self.conn, today, "1y")
-        self.assertEqual(year["from"], "2025-09-01")
-        self.assertEqual(year["label"], "Sep 2025–Aug 2026")
+        self.assertEqual(year["from"], "2025-10-01")
+        self.assertEqual(year["label"], "Oct 2025–Aug 2026")
+        self.assertTrue(year["income_clipped"])
         self.assertEqual(year["out"]["total"], 2739.0)   # + the OLD row
         # 'all' opens at the earliest transaction's month
         both = reporting.flow_breakdown(self.conn, today, "all")
@@ -92,7 +96,7 @@ class FlowBreakdownTests(unittest.TestCase):
         total must always be computed live."""
         from unittest import mock
         from oikonome.engine import budget
-        today = dt.date(2026, 8, 31)
+        today = dt.date(2026, 9, 1)
         reporting._FIXED_MONTH_CACHE.clear()
         real = budget.month_status
         calls: list[str] = []
@@ -106,9 +110,15 @@ class FlowBreakdownTests(unittest.TestCase):
             first = len(calls)
             self.assertEqual(first, 3)              # Jun, Jul, Aug
             reporting.flow_breakdown(self.conn, today, "3m")
-            # only the live month (Aug) recomputes; Jun and Jul come from
+            # every month of a range is closed, so all three come from
             # the cache
+            self.assertEqual(calls[first:], [])
+            # "This month" is the one window on a live month, and that
+            # month is computed every time
+            reporting.flow_breakdown(self.conn, dt.date(2026, 8, 31), "cur")
             self.assertEqual(calls[first:], ["2026-08-31"])
+            reporting.flow_breakdown(self.conn, dt.date(2026, 8, 31), "cur")
+            self.assertEqual(calls[first:], ["2026-08-31", "2026-08-31"])
         reporting._FIXED_MONTH_CACHE.clear()
 
     def test_a_closed_months_cached_fixed_total_follows_a_ledger_edit(self):

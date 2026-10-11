@@ -116,14 +116,14 @@ class TotpAtRestTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
 
     def test_migrate_sweep_encrypts_legacy_rows(self):
-        from oikonome.db.migrate import _encrypt_totp_secrets
+        from oikonome.db.migrate import _encrypt_cp_secrets
         secret = totp_mod.new_secret()
         with _control() as conn:
             conn.execute("UPDATE users SET totp_secret=%s WHERE email=%s",
                          (secret, self.email))
         admin = tenancy.admin_connect()
         try:
-            n = _encrypt_totp_secrets(admin)
+            n = _encrypt_cp_secrets(admin)
         finally:
             admin.close()
         self.assertGreaterEqual(n, 1)
@@ -133,7 +133,7 @@ class TotpAtRestTests(unittest.TestCase):
         # idempotent: a second sweep rewrites nothing
         admin = tenancy.admin_connect()
         try:
-            self.assertEqual(_encrypt_totp_secrets(admin), 0)
+            self.assertEqual(_encrypt_cp_secrets(admin), 0)
         finally:
             admin.close()
         # and login still works after the sweep
@@ -149,10 +149,10 @@ class TotpAtRestTests(unittest.TestCase):
         os.environ.pop("OIKONOME_MASTER_KEY", None)
         secret = self._enroll()
         self.assertEqual(self._raw(), secret)
-        from oikonome.db.migrate import _encrypt_totp_secrets
+        from oikonome.db.migrate import _encrypt_cp_secrets
         admin = tenancy.admin_connect()
         try:
-            self.assertEqual(_encrypt_totp_secrets(admin), 0)
+            self.assertEqual(_encrypt_cp_secrets(admin), 0)
         finally:
             admin.close()
         self.client.post("/api/logout")

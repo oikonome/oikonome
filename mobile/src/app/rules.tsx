@@ -67,6 +67,11 @@ export default function Rules() {
       // re-enabling re-applies the rule to its rows, so the ledger moved
       if (!v.disabled) qc.invalidateQueries({ queryKey: ["transactions"], refetchType: "none" });
     },
+    // a refused toggle (a demo, a dropped connection) must say so — the
+    // row not flipping is otherwise indistinguishable from still loading
+    onError: (e, v) => Alert.alert(
+      `Couldn't turn ${v.disabled ? "off" : "on"} the rule`,
+      `${v.merchant}: ${errText(e)}`),
   });
   // change a rule's category — same picker idiom as the txn detail
   const [changing, setChanging] = useState<string | null>(null);
@@ -108,10 +113,14 @@ export default function Rules() {
     },
     onError: (e) => Alert.alert("Couldn't delete", errText(e)),
   });
+  // Only a rule of your own stays deleted: the next sync puts a built-in
+  // or learned rule back, so for those the prompt points at Disable.
   const del = (merchant: string) =>
-    Alert.alert("Delete rule",
-      `Stop auto-categorizing "${merchant}"? Existing transactions `
-      + "keep their category.",
+    Alert.alert("Delete rule", source === "user"
+      ? `Delete the rule for "${merchant}"? It stops auto-categorizing `
+        + "this merchant; existing transactions keep their category."
+      : `Delete the rule for "${merchant}"? The next sync adds it back — `
+        + "Disable stops it for good.",
       [{ text: "Delete", style: "destructive",
          onPress: () => delRule.mutate(merchant) },
        { text: "Cancel", style: "cancel" }]);
@@ -172,7 +181,7 @@ export default function Rules() {
         <Card style={query.isPlaceholderData ? { opacity: 0.6 } : undefined}>
           {disable.isError && (
             <Text style={{ color: C.bad, fontSize: 12 }}>
-              {String(disable.error)}
+              {errText(disable.error)}
             </Text>
           )}
           {d.rules.map((r) => {

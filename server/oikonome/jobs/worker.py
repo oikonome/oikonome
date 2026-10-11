@@ -1,7 +1,8 @@
 """arq worker — the product's scheduler. One worker serves every tenant; each task is tenant-scoped through
 tenancy.tenant_connect so RLS applies inside jobs exactly as in the web app.
 
-Schedule (cron, UTC — per-tenant send-time preference comes later):
+Schedule (cron, in the instance's zone OIKONOME_TZ — each entry a _ZonedCronJob;
+the maintenance reboot alone is pinned to UTC):
   * sync_all        hourly/tenant — pull every simplefin/plaid item, heartbeat;
                                    fires every 5 min, each run serving one
                                    hash slot of tenants (SYNC_BUCKETS), so
@@ -14,12 +15,46 @@ Schedule (cron, UTC — per-tenant send-time preference comes later):
   * nightly_all     04:17        — recurring detection + drift per tenant,
                                    THEN the net-worth snapshot per tenant
                                    (must run from day one, or the recorded
-                                   series gets a hole)
-  * email_all       07:00        — daily verdict email per tenant
+                                   series gets a hole), the reaper, the
+                                   gate's sweeps, the never-confirmed
+                                   freeze and the purge — each step under
+                                   its own budget (NIGHTLY_STEP_BUDGET)
+  * email_all       hourly :05   — each household's cadences at ITS local
+                                   send hour (emails_due)
+  * staging_sweep   hourly :47   — every household's expired staged uploads
+  * bulk_import_sweep every minute — queued folder imports, and ones whose
+                                      worker went quiet
+  * nightly_reboot  09 UTC hour  — maintenance reboot, OIKONOME_AUTO_REBOOT;
+                                   at local :37 (09:37 UTC in whole-hour
+                                   zones), clear of email_all's :05
 
 Task bodies are synchronous (the engine is sync); they run in a thread so
 the worker loop stays responsive. Per-tenant error isolation: one tenant's
 failure logs + continues, never kills the sweep.
+
+Locks, and the orders every holder keeps (each written down once, where
+cited; two holders taking a pair the other way round deadlock):
+  * per-tenant writer locks (sync, categorize, nightly, email, snapshot,
+    script-alert) — try-locked by each job, all waited on in one fixed
+    order by an erasure: erasure.WRITER_LOCKS;
+  * the reimbursement-pairing lock before any transaction row a write
+    retires or carries: sync.reanchor.hold_pairing_lock;
+  * pairing, then merchant identity, then rows; bills before rows; category
+    writes and renames both under identity: erasure (the paragraph under
+    WRITER_LOCKS);
+  * the settings row before any accounts row: engine.budget.config_txn;
+  * the settings row before the household-member lock
+    (oikonome:tenant-members), then the inviter's invite rows, then a
+    removed member's factor lock, then users rows — an owner's rotation or
+    recovery pauses the outbound settings first; a member's own rotation
+    never takes the member lock: auth/reset._cancel_invites_and_read_invitees;
+  * the per-user factor lock before the users row — the account-security
+    doors only, never the worker: the canonical lock order in web/app.py.
+And no lock another household's request can queue behind is held across
+a call to an outside service: the grace purge releases a household's
+links with no tenants-row lock held, the webhook drain and the email fan-out
+hold no pooled connection while a receiver or the mail relay answers,
+and the SMS re-read lets its row go before the provider is called.
 
 Run: `python -m arq oikonome.jobs.worker.WorkerSettings` (compose `worker`
 service). Env: REDIS_URL, OIKONOME_DSN/ADMIN_DSN, OIKONOME_MASTER_KEY,
@@ -29,12 +64,16 @@ OIKONOME_SMTP_*.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import datetime as dt
 import logging
 import os
 import threading
+import time
 
 from arq import cron
+from arq.cron import CronJob
+from arq.worker import func as arq_func
 
 from .. import ext
 from ..db import tenancy
@@ -43,8 +82,17 @@ from ..envnum import env_flag, env_num
 from ..sync import base as sync_base
 from ..sync import plaid, simplefin
 from . import link_alert
+from . import bulk_import_job
 
 log = logging.getLogger("oikonome.jobs")
+
+# A hosted instance says how it bills before this process polls a bank,
+# mails a household or runs a nightly sweep, the same check the web app
+# runs at import (ext.require_hosted_billing). The worker never imports
+# the web app, so without it a hosted image built without the add-on
+# would refuse to serve pages while this process kept doing the work that
+# costs money and reaches households, under a gate that bills nobody.
+ext.require_hosted_billing()
 
 
 def _tenant_ids(prioritize: bool = False) -> list[str]:
@@ -60,6 +108,28 @@ def _tenant_ids(prioritize: bool = False) -> list[str]:
             "SELECT id FROM tenants WHERE status='active'").fetchall()]
     finally:
         admin.close()
+
+
+def _household_active(conn, tenant_id) -> bool:
+    """Whether the household is still active, read NOW on `conn`. Every
+    send path asks this right before something leaves the box: the sweeps
+    list the active households once and then work through them for a
+    minute or more, and a suspension, or an erasure (which flips the
+    status first and only then waits for the household's writers), can
+    land anywhere in that stretch. A household that is gone or no longer
+    active is sent nothing; a read that fails sends nothing either."""
+    try:
+        # in a savepoint of its own, so a failed read cannot leave a
+        # caller's open transaction aborted
+        with conn.transaction():
+            row = conn.execute(
+                "SELECT coalesce(status, 'active') AS s FROM tenants "
+                "WHERE id = %s", (str(tenant_id),)).fetchone()
+    except Exception as e:                       # noqa: BLE001
+        log.warning("tenant %s: status re-read failed, nothing sent: %s",
+                    tenant_id, e)
+        return False
+    return bool(row) and row["s"] == "active"
 
 
 # ---- per-tenant task bodies (sync; unit-testable without redis) ------------
@@ -79,6 +149,10 @@ def _push_alert(tenant_id: str, title: str, body: str) -> None:
     try:
         cc = control_connect()
         try:
+            if not _household_active(cc, tenant_id):
+                log.info("tenant %s: alert push skipped — the household is "
+                         "no longer active", tenant_id)
+                return
             _push.send_tenant(cc, tenant_id, title, body, url="/app/alerts")
             _native.send_tenant(cc, tenant_id, "alert")
             cc.commit()
@@ -88,7 +162,14 @@ def _push_alert(tenant_id: str, title: str, body: str) -> None:
         log.warning("alert push fan-out failed for %s: %s", tenant_id, e)
 
 
-def _recipients_raw(conn, tenant_id: str) -> list[str]:
+def _recipients_raw(conn, tenant_id: str,
+                    kind: str | None = None) -> list[str]:
+    """See `_recipient_lists`; the list after the per-kind choices."""
+    return _recipient_lists(conn, tenant_id, kind)[1]
+
+
+def _recipient_lists(conn, tenant_id: str, kind: str | None = None
+                     ) -> tuple[list[str], list[str]]:
     """Tenant alert/email recipients: the account OWNER always, plus anyone
     configured in `email_recipients`. With nothing configured, every
     verified user on the tenant (else every user).
@@ -116,7 +197,16 @@ def _recipients_raw(conn, tenant_id: str) -> list[str]:
     explicit per-address state, so it cannot become a silent drop —
     Settings shows it.
 
-    This is the UNFILTERED list — `_recipients` is what callers want."""
+    `kind` (one of `email_prefs.KINDS`) names what is being sent, and an
+    address that turned that kind off is left out too; the mute still
+    wins over it. No kind leaves those choices out of it.
+
+    This is the UNFILTERED list — `_recipients` is what callers want.
+
+    Returns `(before the per-kind choices, after them)`: everyone this
+    household would mail, and who still wants `kind`. A first list with an
+    empty second one is a household whose people all turned this kind off —
+    a decision, distinct from having nobody to mail at all."""
     from ..engine import budget
     cfg = budget.load_config(conn)
     recips = cfg.get("email_recipients")
@@ -126,8 +216,11 @@ def _recipients_raw(conn, tenant_id: str) -> list[str]:
     muted = ({str(m).lower() for m in _muted_raw}
              if isinstance(_muted_raw, list) else set())
 
-    def _unmuted(emails: list[str]) -> list[str]:
-        return [e for e in emails if e.lower() not in muted]
+    from ..notify import email_prefs
+
+    def _unmuted(emails: list[str]) -> tuple[list[str], list[str]]:
+        audible = [e for e in emails if e.lower() not in muted]
+        return audible, email_prefs.keep(cfg, audible, kind)
 
     admin = tenancy.admin_connect()
     try:
@@ -190,6 +283,15 @@ def _recipients_raw(conn, tenant_id: str) -> list[str]:
                     if mine and mine.get("state") == "accepted":
                         seen.add(b.lower())
                         recips.append(b)
+            # An address paused by the owner's credential rotation is left
+            # off until the owner confirms it — the list a hijacked session
+            # could have extended stops reaching its additions at the
+            # moment the owner recovers (notify/outbound_pause).
+            from ..notify import outbound_pause
+            _p = outbound_pause.paused(cfg)
+            if _p and _p["recipients"]:
+                held = set(_p["recipients"])
+                recips = [b for b in recips if b.lower() not in held]
             # NOTE the missing `if recips:` — this branch is entered because
             # the household CONFIGURED a list, and it must be left with the
             # owner, never widened. The filters above can empty `recips`
@@ -237,7 +339,8 @@ def _recipients_raw(conn, tenant_id: str) -> list[str]:
         admin.close()
 
 
-def _recipients_and_raw(conn, tenant_id: str) -> tuple[list[str], list[str]]:
+def _recipients_and_raw(conn, tenant_id: str, kind: str | None = None,
+                        ) -> tuple[list[str], list[str]]:
     """`(deliverable, raw)` from ONE computation.
 
     `email_tenant` needs both — the addresses to mail, and whether there was
@@ -246,18 +349,27 @@ def _recipients_and_raw(conn, tenant_id: str) -> tuple[list[str], list[str]]:
     the whole thing twice per tenant per cadence, since the first calls the
     second: two unpooled admin connections, two hosted-member queries, two
     invite lookups."""
+    send_to, raw, _ = _recipients_detail(conn, tenant_id, kind)
+    return send_to, raw
+
+
+def _recipients_detail(conn, tenant_id: str, kind: str | None = None,
+                       ) -> tuple[list[str], list[str], bool]:
+    """`(deliverable, raw, opted_out)`: `_recipients_and_raw`, plus whether
+    the raw list is empty only because every address turned `kind` off."""
     from ..notify import delivery
-    raw = _recipients_raw(conn, tenant_id)
+    audible, raw = _recipient_lists(conn, tenant_id, kind)
+    opted_out = bool(audible) and not raw
     send_to, held = delivery.hold(raw)
     if held:
         log.warning("tenant %s: holding scheduled mail for %s — the provider "
                     "reports these addresses as undeliverable; the account "
                     "owner sees this in Settings → Email",
                     tenant_id, ", ".join(held))
-    return send_to, raw
+    return send_to, raw, opted_out
 
 
-def _recipients(conn, tenant_id: str) -> list[str]:
+def _recipients(conn, tenant_id: str, kind: str | None = None) -> list[str]:
     """`_recipients_raw`, minus the addresses known to be
     undeliverable.
 
@@ -272,8 +384,16 @@ def _recipients(conn, tenant_id: str) -> list[str]:
     Held addresses are logged every time rather than once, because the
     failure this guards against is one nobody could see: a silent filter
     would be the same fault wearing a different hat. The person's own
-    signal is the banner and the Settings row, not this log line."""
-    return _recipients_and_raw(conn, tenant_id)[0]
+    signal is the banner and the Settings row, not this log line.
+
+    Every caller mails what this returns straight away, from inside a sweep
+    that listed the household as active some time before, so a household
+    suspended or put up for erasure since gets nobody."""
+    if not _household_active(conn, tenant_id):
+        log.info("tenant %s: alert mail skipped — the household is no "
+                 "longer active", tenant_id)
+        return []
+    return _recipients_and_raw(conn, tenant_id, kind)[0]
 
 
 PRODUCTS_MAX_AGE_H = 20  # plaid liabilities/holdings refresh ~daily; 20h (not
@@ -483,6 +603,48 @@ def _claim_sync_nudge(conn) -> bool:
         return False
 
 
+def answer_sync_nudge(conn, tenant_id: str) -> bool:
+    """For a holder of the tenant sync lock that does not pull every bank
+    itself — a disconnect, a reconnect, a first sync of one new link, the
+    webhook's one-item pull. A full sync turned away while it held the lock
+    left a nudge and went away, trusting the holder to answer before it
+    lets go; only sync_tenant answers by making another pass, so every
+    other holder queues that sync instead, once it has released the lock.
+
+    Called after the release, so the queued run can take the lock. True
+    when a request was waiting (and is now consumed)."""
+    if not _claim_sync_nudge(conn):
+        return False
+    log.info("a sync was turned away while tenant %s's lock was held — "
+             "queueing it now", tenant_id)
+    _enqueue_tenant_sync(tenant_id)
+    return True
+
+
+def _enqueue_tenant_sync(tenant_id: str) -> None:
+    """Queue one full sync for the tenant on the worker, without making the
+    door that asked wait on Redis: a pool that cannot connect retries for
+    seconds, and the request it answers already waited. A queue that is
+    down is logged; the hourly sweep stays the floor."""
+    async def _enqueue():
+        from arq import create_pool
+        pool = await create_pool(_redis_settings())
+        try:
+            await pool.enqueue_job("sync_one", tenant_id)
+        finally:
+            await pool.close()
+
+    def _run():
+        try:
+            asyncio.run(_enqueue())
+        except Exception as e:                               # noqa: BLE001
+            log.warning("could not queue the sync tenant %s asked for: %s",
+                        tenant_id, e)
+
+    threading.Thread(target=_run, name=f"sync-nudge-{tenant_id}",
+                     daemon=True).start()
+
+
 def _alert_failovers(conn, tenant_id: str) -> None:
     """A linked account's favorite source is down and its backup is
     serving: log the in-app alert and mail the household once per outage.
@@ -514,17 +676,27 @@ def _alert_failovers(conn, tenant_id: str) -> None:
                localtime.now_local(budget.load_config(conn)).date(),
                partial=True)
     smtp = report_mod.resolve_smtp(conn)
+    subject = "Oikonome: an account source failed over"
+    push_body = (lines[0] if len(lines) == 1 else
+                 f"{len(lines)} accounts are serving from their backup "
+                 f"source.")
     if not smtp["configured"]:
+        # no relay at all: the email channel is off on this instance, a
+        # decision rather than a failure to retry, so the push still goes
+        # and the edge is stamped with it (unstamped, the push would repeat
+        # every sweep; unsent, a push-only household never hears of it)
+        links_mod.mark_failover_alerted(conn,
+                                        [f["group_id"] for f in failovers])
+        _push_alert(tenant_id, subject, push_body)
         return
     # nobody deliverable (the only address is held as bouncing) is the
     # same as no mail server: the in-app alert stands, the edge stays
     # unstamped, and the mail goes out on the first sweep after the
     # address is fixed
-    recipients = _recipients(conn, tenant_id)
+    recipients = _recipients(conn, tenant_id, "alerts")
     if not recipients:
         return
     import html as _html2
-    subject = "Oikonome: an account source failed over"
     results = report_mod.send_each(
         subject,
         "\n".join(lines) + "\n\nData keeps flowing from the backup source; "
@@ -541,9 +713,7 @@ def _alert_failovers(conn, tenant_id: str) -> None:
     links_mod.mark_failover_alerted(conn, [f["group_id"] for f in failovers])
     # push rides the SAME stamped edge as the email — a push before the
     # stamp would repeat every sweep on an SMTP-less install
-    _push_alert(tenant_id, subject,
-                lines[0] if len(lines) == 1 else
-                f"{len(lines)} accounts are serving from their backup source.")
+    _push_alert(tenant_id, subject, push_body)
 
 
 def _sync_pass(conn, tenant_id: str, since_days: int, progress,
@@ -657,7 +827,8 @@ def _sync_pass(conn, tenant_id: str, since_days: int, progress,
             log.warning("sync failed tenant=%s item=%s: %s",
                         tenant_id, it["id"],
                         sync_base.redact_url_credentials(str(e)))
-        transitions.append({"name": it["institution_name"] or it["id"],
+        transitions.append({"id": it["id"],
+                            "name": it["institution_name"] or it["id"],
                             "old": it["status"], "new": new_status})
         # count it here, not after the loop: a denominator that sits at
         # 0 until every bank has answered and then jumps straight to the
@@ -699,7 +870,7 @@ def _sync_pass(conn, tenant_id: str, since_days: int, progress,
                 for iid, (name, new_st) in after.items():
                     old_st = before.get(iid, (None, None))[1]
                     transitions.append({
-                        "name": name or iid,
+                        "id": iid, "name": name or iid,
                         "old": old_st, "new": new_st})
     except Exception as e:                   # noqa: BLE001
         failures += 1
@@ -710,32 +881,116 @@ def _sync_pass(conn, tenant_id: str, since_days: int, progress,
         log.warning("mx sync failed tenant=%s: %s", tenant_id,
                     sync_base.redact_url_credentials(str(e)))
     _progress_mark(conn, None, {"done": len(items)})   # incl. the MX pass
-    if items and failures == 0:
-        alerts.heartbeat(conn, "sync", f"{len(items)} items")
+    # The heartbeat says the WORKER ran its sync pass, which is what
+    # Doctor's row asks. One connection that keeps failing (a restored
+    # shell waiting to be relinked, a bank wanting a fresh login) has its
+    # own status, sync_log row and link alert; it must not keep the row red
+    # while every other connection syncs. The failure count rides in the
+    # note. A pass where nothing synced at all is not stamped.
+    synced = sum(1 for v in results.values() if str(v).startswith("ok:"))
+    if synced or (items and failures == 0):
+        alerts.heartbeat(conn, "sync",
+                         f"{synced} ok, {failures} failed" if failures
+                         else f"{synced or len(items)} items")
     # proactive email the moment a connection breaks or recovers —
     # a mail failure must never break the sync
-    if transitions:
-        from ..notify import webhooks as _wh
-        _wh.emit(conn, "connection.changed", {
-            "connections": [{"name": t["name"], "from": t["old"],
-                             "to": t["new"]} for t in transitions]})
+    # The edge is judged against what was last ANNOUNCED for each item,
+    # not the status this pass read at its start: a webhook pull or a
+    # one-bank refresh writes the same status without announcing anything,
+    # and the sweep reading their write as "old" found no edge at all.
     try:
-        built = link_alert.build_alert(transitions)
+        edges = link_alert.announced_edges(conn, transitions)
+    except Exception as e:                   # noqa: BLE001
+        log.error("link-alert state unreadable tenant=%s: %s", tenant_id, e)
+        edges = transitions
+    # connection.changed fires on the same kind of edge as the email: a
+    # connection that broke or recovered, including through a pull that
+    # announced nothing itself — not every connection on every pass. It
+    # keeps its own announced state, stamped as soon as it is queued: the
+    # mail's edge stays pending while the relay refuses it, and judging the
+    # webhook by that edge posted the same break again on every retry pass.
+    # An item the webhook has no state for yet falls back to the mail's.
+    try:
+        hook_edges = link_alert.announced_edges(
+            conn, edges, prefix=link_alert.HOOK_ANNOUNCED)
+        # the mail's pending edge pins its own `old`; the receiver is told
+        # the status the connection really left, where the pass read one
+        hook_edges = [
+            dict(h, old=t["old"]) if (link_alert._is_link_issue(h.get("old"))
+                                      and link_alert._is_link_issue(
+                                          t.get("old"))) else h
+            for h, t in zip(hook_edges, transitions)]
+        broke, fixed = link_alert._transitions_split(hook_edges)
+        if broke or fixed:
+            from ..notify import webhooks as _wh
+            _wh.emit(conn, "connection.changed", {
+                "connections": [{"name": t["name"], "from": t["old"],
+                                 "to": t["new"]} for t in broke + fixed]})
+        link_alert.stamp_announced(conn, transitions,
+                                   prefix=link_alert.HOOK_ANNOUNCED)
+    except Exception as e:                   # noqa: BLE001
+        log.warning("connection.changed webhook failed tenant=%s: %s",
+                    tenant_id, e)
+    built = None
+    mail_failed = False
+    try:
+        built = link_alert.build_alert(edges)
         if built:
             from ..web import report as _report
-            sent = link_alert.notify(transitions,
-                                     _recipients(conn, tenant_id),
+            sent = link_alert.notify(edges,
+                                     _recipients(conn, tenant_id, "alerts"),
                                      smtp=_report.resolve_smtp(conn),
                                      unsubscribe=tenant_id)
-            if sent:
-                log.info("link-alert emailed tenant=%s: %s",
-                         tenant_id, sent)
-            # same transition edge as the email, so a steady-state
-            # outage pushes exactly once too
-            _push_alert(tenant_id, built[0],
-                        "Details on the Accounts page.")
+            if sent and not sent.get("delivered", True):
+                if link_alert.mail_retry_exhausted(conn):
+                    log.warning("link-alert not delivered to anyone "
+                                "tenant=%s; retries used up, announced "
+                                "without the mail", tenant_id)
+                else:
+                    mail_failed = True
+                    log.warning("link-alert not delivered to anyone "
+                                "tenant=%s; retrying next sweep", tenant_id)
+            elif sent:
+                log.info("link-alert emailed tenant=%s: %s", tenant_id, sent)
     except Exception as e:                   # noqa: BLE001
         log.error("link-alert failed tenant=%s: %s", tenant_id, e)
+    # Any pass that is not holding an unsent edge for retry ends the retry
+    # window — a delivered mail, but also an edge that went away before the
+    # relay came back (the bank recovered, the item was relinked) or an
+    # alert nobody was left to receive. Left in place, the window's first
+    # refusal would date from that old episode, and the next, unrelated
+    # alert's first transient refusal would count as retries used up.
+    if not mail_failed:
+        try:
+            link_alert.clear_mail_retry(conn)
+        except Exception as e:               # noqa: BLE001
+            log.error("link-alert retry state not cleared tenant=%s: %s",
+                      tenant_id, e)
+    # same transition edge as the email, so a steady-state outage pushes
+    # exactly once too — in its own guard, so a mail problem never costs
+    # the household the push (_push_alert never raises). A mail every
+    # recipient refused leaves the edge unstamped so the next sweep sends
+    # it again; the push waits for that same stamped edge, or it would
+    # repeat every hour of the outage. The retry is bounded
+    # (link_alert.mail_retry_exhausted): once used up, the edge is stamped
+    # and the push goes out, so it is neither lost nor re-sent forever.
+    if built and not mail_failed:
+        _push_alert(tenant_id, built[0], "Details on the Accounts page.")
+    try:
+        to_stamp = transitions
+        if mail_failed:
+            # pin the state from BEFORE the unsent edge, so the next pass
+            # still sees the edge (an item never announced would otherwise
+            # fall back to the status this pass just wrote, and find none)
+            broke, fixed = link_alert._transitions_split(edges)
+            pending = {t["id"] for t in broke + fixed}
+            to_stamp = [t for t in transitions if t.get("id") not in pending]
+            to_stamp += [dict(t, new="ok") for t in broke]
+            to_stamp += [dict(t, new=t["old"]) for t in fixed]
+        link_alert.stamp_announced(conn, to_stamp)
+    except Exception as e:                   # noqa: BLE001
+        log.error("link-alert state not recorded tenant=%s: %s",
+                  tenant_id, e)
     # a linked account's favorite source went down (its
     # backup is already serving) — tell the owner once per outage
     try:
@@ -833,6 +1088,11 @@ def _webhooks_after_sync(conn, results: dict, before_ids: set | None,
         # the payee as the ledger displays it (rename, merchant row), the
         # one definition every surface reads
         from ..engine import merchant_sql as _msql
+        # The rows every other read door counts: a card reached through two
+        # aggregators lands once, and an account the household hid
+        # contributes nothing — its charges are not sent out either.
+        from ..engine import links as _links
+        hidden = _links.shadow_ids(conn)
         new_rows = conn.execute(
             f"""SELECT t.id, t.date, t.amount,
                        {_msql.DISPLAY_MERCHANT} AS payee,
@@ -843,8 +1103,9 @@ def _webhooks_after_sync(conn, results: dict, before_ids: set | None,
                   {_msql.MC_JOIN}
                  WHERE t.date >= CURRENT_DATE - 45 AND t.removed = 0
                    AND NOT (t.id = ANY(%s))
+                   AND NOT (t.account_id = ANY(%s))
                  ORDER BY t.date DESC, ABS(t.amount) DESC""",
-            (list(before_ids),)).fetchall()
+            (list(before_ids), hidden)).fetchall()
         _wh.emit(conn, "sync.completed", {
             "connections": items, "new_transactions": len(new_rows),
             "ok": all(i["ok"] for i in items)})
@@ -1013,11 +1274,17 @@ def nightly_tenant(tenant_id: str) -> dict:
                      "drift_applied": 0, "superseded": 0, "due_advanced": 0,
                      "groups": 0, "error": "recurring detection failed"}
         # Plaid's own recurring streams as a cross-check on detection —
-        # proposals only, never auto-applied; off with plaid_recurring=false
+        # proposals only, never auto-applied; off with plaid_recurring=false.
+        # It is a separately billed aggregator product, like liabilities
+        # and investments, so the installed gate is asked first: the
+        # household's own setting can turn it off but never back on past
+        # the gate. With nothing installed tier_allows says yes.
         try:
             from ..engine import budget as _bcfg
             from ..sync import plaid as _plaid
-            if _bcfg.load_config(conn).get("plaid_recurring", True) is not False:
+            if ext.gate.tier_allows(conn, "plaid_recurring") and \
+                    _bcfg.load_config(conn).get("plaid_recurring",
+                                                True) is not False:
                 streams = []
                 # Healthy items only. The hourly sync deliberately retries
                 # broken ones — a re-auth or an outage clears by being
@@ -1050,8 +1317,16 @@ def nightly_tenant(tenant_id: str) -> dict:
         # what a person wrote on a retired row follows the live charge —
         # the backstop for every retirement path the sync hooks missed
         try:
+            from ..sync import adopt as _adopt
             from ..sync import reanchor as _ra
-            ra = _ra.reanchor_stranded(conn)
+            # a withdrawn row's pair waits the reconcile window for its
+            # re-numbered twin, then lets the surviving side go
+            ra = _ra.reanchor_stranded(
+                conn, release_after_days=_adopt.RECONCILE_DAYS)
+            if ra["released"]:
+                stats["withdrawn_pairs_released"] = ra["released"]
+            if ra.get("fronted_released"):
+                stats["withdrawn_fronted_released"] = ra["fronted_released"]
             if ra["moved"] or ra["ambiguous"]:
                 stats["reanchored"] = ra["moved"]
                 stats["reanchor_ambiguous"] = ra["ambiguous"]
@@ -1063,45 +1338,61 @@ def nightly_tenant(tenant_id: str) -> dict:
         from ..engine import merchant_dedup as _md
         # the Amazon chain (match + the LLM run's classify/summarize) shares
         # a single-flight lock with the hourly sync's categorize_new; the
-        # nightly WAITS rather than skips — it is the reconciliation pass
-        with _llm.amazon_chain_lock(conn, wait=True):
-            _am.run_match(conn)
-            _cm.run_match(conn)
-            _md.apply(conn)
-            # and converge any payee an earlier, unevenly-enriched sync
-            # split across two merchants. Bounded per run and journalled
-            # like a rename, so it cannot run long and cannot be
-            # irreversible; isolated because a repair failing must not cost
-            # the household the categorizer run behind it.
-            try:
-                from ..engine import merchant_split_repair as _msr
-                merged = _msr.repair(conn, apply=True)["merges"]
-                if merged:
-                    stats["merchant_splits_merged"] = len(merged)
-            except Exception as e:                   # noqa: BLE001
-                log.warning("merchant split repair failed tenant=%s: %s",
-                            tenant_id, e)
-            # and two live merchants sharing one name become one row
-            try:
-                from ..engine import merchant_identity as _mi
-                folded = _mi.fold_twins(conn)["folded"]
-                if folded:
-                    stats["merchant_twins_folded"] = folded
-            except Exception as e:                   # noqa: BLE001
-                log.warning("merchant twin fold failed tenant=%s: %s",
-                            tenant_id, e)
-            # merchants that look like one business are OFFERED to the
-            # person (bounded per night so a big ledger does not flood
-            # the Merchants page on the first run)
-            try:
-                from ..engine import merchant_merge as _mm
-                offered = _mm.run(conn)["inserted"]
-                if offered:
-                    stats["merchant_merges_offered"] = offered
-            except Exception as e:                   # noqa: BLE001
-                log.warning("merchant merge proposals failed tenant=%s: %s",
-                            tenant_id, e)
-            _llm.run(conn)
+        # nightly waits rather than skips — it is the reconciliation pass —
+        # but only so long: a sync whose model is slow can hold it past the
+        # wait, and then this household loses only tonight's chain (every
+        # step in it is pending-gated, so the next night catches up), never
+        # the receipt, retrain and savings steps after it
+        try:
+            with _llm.amazon_chain_lock(conn, wait=True):
+                _am.run_match(conn)
+                _cm.run_match(conn)
+                _md.apply(conn)
+                # and converge any payee an earlier, unevenly-enriched sync
+                # split across two merchants. Bounded per run and journalled
+                # like a rename, so it cannot run long and cannot be
+                # irreversible; isolated because a repair failing must not cost
+                # the household the categorizer run behind it.
+                try:
+                    from ..engine import merchant_split_repair as _msr
+                    merged = _msr.repair(conn, apply=True)["merges"]
+                    if merged:
+                        stats["merchant_splits_merged"] = len(merged)
+                except Exception as e:                   # noqa: BLE001
+                    log.warning("merchant split repair failed tenant=%s: %s",
+                                tenant_id, e)
+                # and two live merchants sharing one name become one row
+                try:
+                    from ..engine import merchant_identity as _mi
+                    folded = _mi.fold_twins(conn)["folded"]
+                    if folded:
+                        stats["merchant_twins_folded"] = folded
+                except Exception as e:                   # noqa: BLE001
+                    log.warning("merchant twin fold failed tenant=%s: %s",
+                                tenant_id, e)
+                # merchants that look like one business are OFFERED to the
+                # person (bounded per night so a big ledger does not flood
+                # the Merchants page on the first run)
+                try:
+                    from ..engine import merchant_merge as _mm
+                    offered = _mm.run(conn)["inserted"]
+                    if offered:
+                        stats["merchant_merges_offered"] = offered
+                except Exception as e:                   # noqa: BLE001
+                    log.warning("merchant merge proposals failed tenant=%s: %s",
+                                tenant_id, e)
+                # isolated like the steps before it: a model that is down or a
+                # reply that will not parse must not cost the household the
+                # receipt pass, the matching and the sweeps that follow
+                try:
+                    _llm.run(conn)
+                except Exception as e:                   # noqa: BLE001
+                    log.warning("categorizer run failed tenant=%s: %s",
+                                tenant_id, e)
+        except _llm.LockBusy:
+            log.warning("amazon chain skipped tonight tenant=%s: the lock "
+                        "is still held by another pass", tenant_id)
+            stats["amazon_chain_skipped"] = "busy"
         # parse any stored-but-unparsed receipts (no-op sans LLM)
         try:
             from ..engine import receipts as _receipts
@@ -1143,7 +1434,34 @@ def nightly_tenant(tenant_id: str) -> dict:
             cfg = _budget.load_config(conn)
             if _savings.goals(cfg):
                 msgs, new_state = _savings.check_milestones(conn, cfg)
-                if new_state != (cfg.get("savings_goal_state") or {}):
+                # the crossing is recorded only once its mail went out (or
+                # there was nobody / no relay to send it to): recorded
+                # first, a relay that refused every recipient lost the
+                # milestone for good, since the next night finds no edge
+                delivered = True
+                if msgs:
+                    from ..web import report as _report
+                    recipients = _recipients(conn, tenant_id, "alerts")
+                    if recipients:
+                        plain = "Savings goals:\n\n  " + "\n  ".join(msgs)
+                        import html as _html
+                        html = ("<p>Savings goals:</p><ul>"
+                                + "".join(f"<li>{_html.escape(m)}</li>"
+                                          for m in msgs) + "</ul>")
+                        smtp = _report.resolve_smtp(conn)
+                        sent = _report.send_each(
+                            "Oikonome: savings goal update", plain, html,
+                            recipients, smtp=smtp, unsubscribe=tenant_id)
+                        delivered = (
+                            not isinstance(smtp, dict)
+                            or smtp.get("configured") is False
+                            or any(r.get("ok") for r in sent or []))
+                        if not delivered:
+                            log.warning("savings milestone mail not "
+                                        "delivered to anyone tenant=%s; "
+                                        "retrying next night", tenant_id)
+                if delivered and new_state != (cfg.get("savings_goal_state")
+                                               or {}):
                     # `config_txn` exists for exactly this call site — "the
                     # settings page saving while the nightly worker seeds
                     # budgets" is the sentence in its own docstring. `cfg`
@@ -1154,23 +1472,18 @@ def nightly_tenant(tenant_id: str) -> dict:
                     # minutes.
                     with _budget.config_txn(conn) as live:
                         live["savings_goal_state"] = new_state
-                if msgs:
-                    from ..web import report as _report
-                    recipients = _recipients(conn, tenant_id)
-                    if recipients:
-                        plain = "Savings goals:\n\n  " + "\n  ".join(msgs)
-                        import html as _html
-                        html = ("<p>Savings goals:</p><ul>"
-                                + "".join(f"<li>{_html.escape(m)}</li>"
-                                          for m in msgs) + "</ul>")
-                        _report.send_each("Oikonome: savings goal update",
-                                          plain, html, recipients,
-                                          smtp=_report.resolve_smtp(conn),
-                                          unsubscribe=tenant_id)
         except Exception as e:                   # noqa: BLE001
             log.warning("savings milestone sweep failed: %s", e)
-        alerts.heartbeat(conn, "nightly-detect",
-                         f"+{stats['proposed_add']} proposals")
+        # the heartbeat is what Doctor reads as "nightly detection works":
+        # a night whose recurring detection failed leaves it unstamped, so
+        # a failure that repeats every night turns the row red instead of
+        # hiding behind a fresh "+0 proposals"
+        if stats.get("error"):
+            log.error("nightly detection not recorded as healthy tenant=%s: "
+                      "%s", tenant_id, stats["error"])
+        else:
+            alerts.heartbeat(conn, "nightly-detect",
+                             f"+{stats['proposed_add']} proposals")
         return stats
     finally:
         if locked:
@@ -1214,7 +1527,7 @@ def script_alert_tenant(tenant_id: str) -> dict:
                if r["alerts"] and r["alerted_at"] is None]
         if not due:
             return {"alerted": 0}
-        recipients = _recipients(conn, tenant_id)
+        recipients = _recipients(conn, tenant_id, "alerts")
         if not recipients:
             log.warning("stale collectors for tenant %s but no recipients",
                         tenant_id)
@@ -1237,8 +1550,20 @@ def script_alert_tenant(tenant_id: str) -> dict:
                 + "</ul><p>Check the host-side script's timer/journal. "
                   "You'll be emailed again only if it recovers and then "
                   "goes quiet again — details on the Doctor page.</p>")
-        report.send_each(subject, plain, html, recipients,
-                         smtp=report.resolve_smtp(conn), unsubscribe=tenant_id)
+        smtp = report.resolve_smtp(conn)
+        results = report.send_each(subject, plain, html, recipients,
+                                   smtp=smtp, unsubscribe=tenant_id)
+        # every recipient refused on a relay that is configured = nothing
+        # went out: leave the edge unstamped so the next sweep mails it
+        # again (a quiet collector never pushes, and only a push clears the
+        # stamp, so a stamp here would lose the alert for good). No relay
+        # at all is a setting, not a failure, so that edge is stamped. The
+        # push waits for the stamped edge, or it would repeat every sweep.
+        relay = isinstance(smtp, dict) and smtp.get("configured") is not False
+        if relay and not any(r.get("ok") for r in results or []):
+            log.warning("stale-collector alert not delivered to anyone "
+                        "tenant=%s; retrying next sweep", tenant_id)
+            return {"alerted": 0}
         _push_alert(tenant_id, subject,
                     lines[0] if len(due) == 1 else
                     "Details on the Doctor page.")
@@ -1307,8 +1632,8 @@ def _tz():
     return localtime.instance_tz()
 
 
-CADENCE_JOBS = {"daily": "daily-email", "weekly": "weekly-email",
-                "monthly": "monthly-email", "yearly": "yearly-email"}
+CADENCE_JOBS = {"daily": "daily-email", "monthly": "monthly-email",
+                "yearly": "yearly-email"}
 
 
 def _sched_entry(sched, cadence: str) -> dict:
@@ -1368,9 +1693,14 @@ def _stamp_fresh(conn, cfg: dict, now_utc: dt.datetime, job: str,
     return True
 
 
+# how many days after the 1st a missed monthly / yearly card is still sent
+CADENCE_CATCHUP_DAYS = 3
+
+
 def emails_due(conn, now_utc: dt.datetime) -> list[str]:
     """Which cadences should send THIS hour. email_schedule =
-    {daily:{on,hour}, weekly:{on,hour,weekday 0=Mon}, monthly:{on,hour}},
+    {daily:{on,hour}, monthly:{on,hour}, yearly:{on,hour}} (a stored
+    `weekly` entry is ignored: there is no weekly report any more),
     hours in the HOUSEHOLD's local time — its own `timezone` setting when it
     has one, the instance's (OIKONOME_TZ) otherwise. Absent schedule =
     notify.schedule.effective_email_schedule: daily at 07:00 local, the
@@ -1443,23 +1773,45 @@ def emails_due(conn, now_utc: dt.datetime) -> list[str]:
     h = slot(d, "daily")
     if h is not None and local.hour >= h and fresh("daily-email", day_start):
         due.append("daily")
-    w = _sched_entry(sched, "weekly")
-    h = slot(w, "weekly")
-    wd = _sched_int(w, "weekday", 0, 6)
-    if h is not None and wd is not None and local.weekday() == wd \
-            and local.hour >= h and fresh("weekly-email", day_start):
-        due.append("weekly")
+    # The monthly and yearly cards are due from the configured hour on
+    # the 1st, and keep being due for a few days after it until this
+    # period's send is stamped: a relay outage or a worker that was down
+    # from the send hour to midnight must not lose the month (or the year)
+    # for good. The catch-up is bounded so a card weeks late never arrives,
+    # and a household created after the period began is never sent a card
+    # for a period it was not here for.
+    month_start = dt.datetime.combine(
+        local.date().replace(day=1), dt.time.min,
+        local.tzinfo).astimezone(dt.timezone.utc)
+    born_before = not (owner and owner["c"] and owner["c"] >= month_start)
+
+    def period_due(job, hour, first_day):
+        if first_day:
+            return local.hour >= hour and fresh(job, day_start)
+        # a catch-up day still waits for the household's send hour: the
+        # first sweep after midnight must not text or mail at 00:05
+        if not born_before or local.day > CADENCE_CATCHUP_DAYS + 1 \
+                or local.hour < hour:
+            return False
+        # any stamp in the last few weeks is this period's send: the
+        # previous one is at least four weeks old (a zone change can
+        # move "midnight on the 1st" by a day either way)
+        hb = conn.execute("SELECT ran_at FROM job_runs WHERE job=%s",
+                          (job,)).fetchone()
+        return hb is None or \
+            hb["ran_at"] < month_start - dt.timedelta(days=2)
+
     m = _sched_entry(sched, "monthly")
     h = slot(m, "monthly")
-    if h is not None and local.day == 1 and local.hour >= h \
-            and fresh("monthly-email", day_start):
+    if h is not None and period_due("monthly-email", h, local.day == 1):
         due.append("monthly")
     # annual report card — Jan 1 (the once-per-local-day guard
-    # keeps it to one send; the month+day test keeps it to one per year)
+    # keeps it to one send; the month+day test keeps it to one per year),
+    # with the same bounded catch-up as the monthly card
     y = _sched_entry(sched, "yearly")
     h = slot(y, "yearly")
-    if h is not None and local.month == 1 and local.day == 1 \
-            and local.hour >= h and fresh("yearly-email", day_start):
+    if h is not None and local.month == 1 \
+            and period_due("yearly-email", h, local.day == 1):
         due.append("yearly")
     return due
 
@@ -1474,17 +1826,58 @@ def email_due(conn, now_utc: dt.datetime) -> bool:
 DAILY_HOOK_JOB = "daily-webhook"
 
 
+def _daily_hook_wanted(conn) -> bool:
+    """Whether an integration subscribed to the daily report event."""
+    try:
+        from ..notify import webhooks as _wh
+        return bool(_wh.wanted(conn, "report.daily"))
+    except Exception:                                      # noqa: BLE001
+        return False
+
+
 def _daily_hook_queued_today(conn, cfg: dict) -> bool:
     """Was today's report.daily already queued — today being the
     household's local day, read exactly as the daily email reads it
     (including the zone the stamp was written in, so moving the household
     east does not make the same day look new and post the report twice)."""
+    return _stamped_today(conn, cfg, DAILY_HOOK_JOB)
+
+
+def _stamped_today(conn, cfg: dict, job: str) -> bool:
+    """Has `job` stamped job_runs since the household's local midnight —
+    "today" read exactly as the cadence emails read it."""
     from .. import localtime
     now_utc = dt.datetime.now(dt.timezone.utc)
     local = now_utc.astimezone(localtime.tenant_tz(cfg))
     day_start = dt.datetime.combine(local.date(), dt.time.min,
                                     local.tzinfo).astimezone(dt.timezone.utc)
-    return not _stamp_fresh(conn, cfg, now_utc, DAILY_HOOK_JOB, day_start)
+    return not _stamp_fresh(conn, cfg, now_utc, job, day_start)
+
+
+def _stamped_this_period(conn, cfg: dict, job: str) -> bool:
+    """Has `job` stamped job_runs since this month began — the window the
+    monthly and yearly catch-up retries in. "Today" is the wrong window
+    there: the card stays due for a few days after the 1st while the mail
+    keeps failing, and the SMS/push half already sent on the 1st must not
+    go out again on each catch-up day. Same two-day allowance for a zone
+    change as emails_due's period test (the previous period's stamp is
+    always weeks older)."""
+    from .. import localtime
+    local = dt.datetime.now(dt.timezone.utc).astimezone(
+        localtime.tenant_tz(cfg))
+    month_start = dt.datetime.combine(
+        local.date().replace(day=1), dt.time.min,
+        local.tzinfo).astimezone(dt.timezone.utc)
+    row = conn.execute("SELECT ran_at FROM job_runs WHERE job=%s",
+                       (job,)).fetchone()
+    return bool(row) and row["ran_at"] >= month_start - dt.timedelta(days=2)
+
+
+# Heartbeat notes of a scheduled cadence the worker decided not to send:
+# the period's decision was made, not work still pending, so the cadence is
+# stamped done rather than coming due again every hour.
+NO_RECIPIENTS = "no recipients"
+NO_BUDGET = "no budget set"
 
 
 class NoRecipients(RuntimeError):
@@ -1522,7 +1915,7 @@ def _needs_you(conn, tenant_id: str, d: dict):
 def email_tenant(tenant_id: str, send_it: bool = True,
                  cadence: str = "daily", force_email: bool = False) -> str:
     """Build (and send) one cadence's email for one tenant. daily = the
-    verdict email; weekly/monthly = the lens report.
+    verdict email; monthly/yearly = the lens report.
     Recipients = tenant config `email_recipients`, else every user email
     on the tenant."""
     from ..web import lens_email, report
@@ -1552,12 +1945,63 @@ def email_tenant(tenant_id: str, send_it: bool = True,
         short = ""
         personal = None
         hooked = False
-        if cadence == "weekly":
-            subject, plain, html = lens_email.build_weekly(conn, today_local)
-            start = lenses_mod.monday_of(today_local - dt.timedelta(days=7))
-            short = _short.short_weekly(
-                lenses_mod.week_summary(conn, start, today=today_local), start)
-        elif cadence == "monthly":
+        # force_email (the manual "email me now" button): send the email,
+        # skip the other channels + the cadence heartbeat entirely
+        want_email = True if force_email else entry.get("on", True)
+        # SMS is a feature an installed add-on may withhold. tier_allows
+        # returns True when nothing is installed, so an instance with its
+        # own Twilio credentials is ungated; a refusal falls back to
+        # email/push.
+        sms_ok = ext.gate.tier_allows(conn, "sms")
+        want_push = bool(entry.get("push")) and not force_email
+        # a restore can plant any shape here; a non-dict must not crash the
+        # send (it is "no number", which is what the consent check reads)
+        phone = cfg.get("notify_phone")
+        if not isinstance(phone, dict):
+            phone = {}
+        # The scheduled verdict is the "summary" message program and carries
+        # its own opt-in — the cadence toggle says the user
+        # wants it, the consent says we are allowed to text it. Both required.
+        from ..notify import sms as _smsmod
+        want_sms = (bool(entry.get("sms")) and not force_email and sms_ok
+                    and _smsmod.consented(phone, "summary"))
+        # Re-deriving recipients from raw config here would skip the hosted
+        # filter, so an outsider address in email_recipients would receive a
+        # household's daily/monthly/yearly financial mail on a multi-tenant
+        # box. Route through _recipients() like every other send
+        # (link-alert, savings, collector-stale) so the tenant-membership
+        # filter always applies.
+        recipients, raw_recipients, opted_out = _recipients_detail(
+            conn, tenant_id, cadence if cadence in CADENCE_JOBS else None)
+        # whether there was ANYONE to mail, before the
+        # undeliverable ones were held back. The cadence heartbeat keys off
+        # this, not off `recipients`: a household whose only address is
+        # bouncing would otherwise never stamp "today's mail is done", so
+        # the job would come due again on every hourly sweep and re-decide
+        # not to send — 24 wake-ups and 24 warning lines a day instead of
+        # one. Held is a decision that was MADE, not work still pending.
+        had_recipients = bool(raw_recipients)
+        # Nobody to mail is also a decision made — everyone turned this
+        # kind off, or there is no address at all (a hosted owner who has
+        # not confirmed theirs, a household that muted scheduled mail).
+        # With no other channel wanting the cadence there is nothing to
+        # build, so the report is not rendered at all and the period is
+        # stamped done with a note saying why — else it would come due, be
+        # rebuilt over the whole ledger and send nothing, every hour (and
+        # every hour of the monthly and yearly catch-up days).
+        if (not raw_recipients and send_it and not force_email
+                and not (want_sms or want_push)
+                and not (cadence == "daily" and _daily_hook_wanted(conn))):
+            from ..notify import email_prefs as _prefs
+            alerts.heartbeat(conn, CADENCE_JOBS.get(cadence, "daily-email"),
+                             _prefs.NOBODY_OPTED_IN if opted_out
+                             else NO_RECIPIENTS,
+                             zone=localtime.tenant_tz_name(cfg))
+            log.info("tenant %s: %s email skipped — %s", tenant_id, cadence,
+                     "every recipient turned it off" if opted_out
+                     else "no confirmed, unmuted address")
+            return ""
+        if cadence == "monthly":
             subject, plain, html = lens_email.build_monthly(conn, today_local)
             prev_last = today_local.replace(day=1) - dt.timedelta(days=1)
             short = _short.short_monthly(
@@ -1580,6 +2024,12 @@ def email_tenant(tenant_id: str, send_it: bool = True,
             # nothing here becomes unreachable.
             if not force_email and not (cfg.get("food_monthly")
                                         or cfg.get("other_monthly")):
+                # the skip is the day's decision, so the day is stamped
+                # with it: unstamped, the cadence came due every hour and
+                # Doctor read the silence as a relay that never sent
+                if send_it:
+                    alerts.heartbeat(conn, "daily-email", NO_BUDGET,
+                                     zone=localtime.tenant_tz_name(cfg))
                 log.info("tenant %s: daily email skipped — no budget set",
                          tenant_id)
                 return ""
@@ -1614,42 +2064,16 @@ def email_tenant(tenant_id: str, send_it: bool = True,
                 except Exception as e:           # noqa: BLE001
                     log.warning("daily webhook failed tenant=%s: %s",
                                 tenant_id, e)
-        # force_email (the manual "email me now" button): send the email,
-        # skip the other channels + the cadence heartbeat entirely
-        want_email = True if force_email else entry.get("on", True)
-        # SMS is a feature an installed add-on may withhold. tier_allows
-        # returns True when nothing is installed, so an instance with its
-        # own Twilio credentials is ungated; a refusal falls back to
-        # email/push.
-        sms_ok = ext.gate.tier_allows(conn, "sms")
-        want_push = bool(entry.get("push")) and not force_email
-        # a restore can plant any shape here; a non-dict must not crash the
-        # send (it is "no number", which is what the consent check reads)
-        phone = cfg.get("notify_phone")
-        if not isinstance(phone, dict):
-            phone = {}
-        # The scheduled verdict is the "summary" message program and carries
-        # its own opt-in — the cadence toggle says the user
-        # wants it, the consent says we are allowed to text it. Both required.
-        from ..notify import sms as _smsmod
-        want_sms = (bool(entry.get("sms")) and not force_email and sms_ok
-                    and _smsmod.consented(phone, "summary"))
-        # Re-deriving recipients from raw config here would skip the hosted
-        # filter, so an outsider address in email_recipients would receive a
-        # household's daily/weekly/monthly financial mail on a multi-tenant
-        # box. Route through _recipients() like every other send
-        # (link-alert, savings, collector-stale) so the tenant-membership
-        # filter always applies.
-        recipients, raw_recipients = _recipients_and_raw(conn, tenant_id)
-        # whether there was ANYONE to mail, before the
-        # undeliverable ones were held back. The cadence heartbeat keys off
-        # this, not off `recipients`: a household whose only address is
-        # bouncing would otherwise never stamp "today's mail is done", so
-        # the job would come due again on every hourly sweep and re-decide
-        # not to send — 24 wake-ups and 24 warning lines a day instead of
-        # one. Held is a decision that was MADE, not work still pending.
-        had_recipients = bool(raw_recipients)
         smtp = report.resolve_smtp(conn)   # Settings-card config wins
+        # the SMS/push half of this cadence has its own once-a-day stamp,
+        # like the daily webhook: when every email fails, the cadence stays
+        # due and the sweep retries it each hour until the relay is back,
+        # and each retry must not text or push the household again
+        side_job = CADENCE_JOBS.get(cadence, "daily-email") + ":sms-push"
+        side_done = (send_it and not force_email and (want_sms or want_push)
+                     and (_stamped_this_period(conn, cfg, side_job)
+                          if cadence in ("monthly", "yearly")
+                          else _stamped_today(conn, cfg, side_job)))
     finally:
         conn.close()
     if send_it and want_email and force_email and not recipients:
@@ -1657,11 +2081,34 @@ def email_tenant(tenant_id: str, send_it: bool = True,
             "Nothing sent — every address on this household is held as "
             "undeliverable right now (Settings → Email shows which)."
             if had_recipients else
+            f"Nothing sent — everyone on this household has turned off the "
+            f"{cadence} email (Settings → Email → Who gets which email)."
+            if opted_out else
             "Nothing sent — household mail only goes to a confirmed address "
             "that hasn't muted it, and this household has none yet. Open the "
             "confirmation link in your welcome email (Settings → Email can "
             "resend it).")
-    if send_it and want_email and recipients:
+    # No relay at all means the email channel is off on this instance, the
+    # same reading _alert_failovers gives it — trying anyway only walks
+    # every recipient into a refused localhost connection and fails the
+    # cadence every hour. The manual button still tries, so the person who
+    # pressed it is told why nothing arrived.
+    email_failed = None
+    if send_it and want_email and recipients and (smtp.get("configured")
+                                                  or force_email):
+        # The list and the relay were read before the build, which can take
+        # minutes; an outbound pause committed since must hold this mail too.
+        try:
+            recipients, smtp = _live_mail_route(
+                tenant_id, recipients,
+                cadence if cadence in CADENCE_JOBS else None)
+        except Exception as e:                   # noqa: BLE001
+            log.warning("tenant %s: recipient re-read failed, %s email not "
+                        "sent: %s", tenant_id, cadence, e)
+            email_failed = RuntimeError(f"recipient re-read failed: {e}")
+            recipients = []
+    if send_it and want_email and recipients and (smtp.get("configured")
+                                                  or force_email):
         # One message per recipient. A Bcc blast reports success whenever
         # the relay accepts the envelope, so an address that silently never
         # receives the verdict looks identical to one that did, and a
@@ -1675,15 +2122,27 @@ def email_tenant(tenant_id: str, send_it: bool = True,
                         tenant_id, len(failed), len(outcome), ", ".join(failed))
         if failed and len(failed) == len(outcome):
             # every address failed — that is a broken relay, not a bad
-            # address, and it must NOT stamp the heartbeat as a good send
-            raise RuntimeError(
+            # address, and it must NOT stamp the heartbeat as a good send.
+            # Raised only after the other channels below: neither SMS nor
+            # push depends on the relay, so its outage must not hold them.
+            email_failed = RuntimeError(
                 f"email failed for every recipient: {outcome[0]['error']}")
     # the other channels — each a no-op unless configured AND
     # toggled AND (for SMS) the phone is verified; failures log, never raise
-    if send_it and short:
+    if send_it and short and not side_done:
         if want_sms and phone.get("verified") and phone.get("number"):
             from ..notify import sms as _sms
-            _sms.send(phone["number"], short)
+            # `phone` was read before the gather and the mail fan-out, which
+            # can take minutes. An owner closing a hijack in that window —
+            # a credential change that pauses the number, a clear, a
+            # recovery that drops it — must stop this text too, so the
+            # number is read again right before it is used.
+            live = _live_sms_number(tenant_id)
+            if live:
+                _sms.send(live, short)
+            else:
+                log.info("tenant %s: SMS skipped — the number was paused "
+                         "or removed during this send", tenant_id)
         if want_push:
             from ..db.tenancy import control_connect
             from ..notify import push as _push
@@ -1691,6 +2150,11 @@ def email_tenant(tenant_id: str, send_it: bool = True,
             try:
                 cc = control_connect()
                 try:
+                    # re-read right before the fan-out, like the mail and
+                    # the text: a suspension or erasure that landed while
+                    # the report was built must stop this too
+                    if not _household_active(cc, tenant_id):
+                        raise _HouseholdGone()
                     _push.send_tenant(cc, tenant_id, subject, short)
                     # the phones get a tickle on the same user-facing
                     # "push" preference; the daily one carries the verdict
@@ -1703,6 +2167,9 @@ def email_tenant(tenant_id: str, send_it: bool = True,
                     cc.commit()
                 finally:
                     cc.close()
+            except _HouseholdGone:
+                log.info("tenant %s: push skipped — the household is no "
+                         "longer active", tenant_id)
             except Exception as e:               # noqa: BLE001
                 log.warning("push fan-out failed for %s: %s", tenant_id, e)
     if send_it and not force_email and (had_recipients or want_sms
@@ -1710,10 +2177,17 @@ def email_tenant(tenant_id: str, send_it: bool = True,
         conn2 = tenancy.tenant_connect(tenant_id)
         try:
             from .. import localtime
-            alerts.heartbeat(conn2, CADENCE_JOBS.get(cadence, "daily-email"),
-                             subject[:80], zone=localtime.tenant_tz_name(cfg))
+            zone = localtime.tenant_tz_name(cfg)
+            if (want_sms or want_push) and short and not side_done:
+                alerts.heartbeat(conn2, side_job, subject[:80], zone=zone)
+            if email_failed is None:
+                alerts.heartbeat(conn2,
+                                 CADENCE_JOBS.get(cadence, "daily-email"),
+                                 subject[:80], zone=zone)
         finally:
             conn2.close()
+    if email_failed is not None:
+        raise email_failed
     return subject
 
 
@@ -1777,34 +2251,362 @@ async def sync_all(ctx):
     return await asyncio.to_thread(_sweep, sync_tenant, "sync", True, slot)
 
 
+# How long each nightly step may take before the run moves on to the next
+# one, in seconds. One arq job has one timeout and a cron job is never
+# retried, so without a budget per step a detection pass that ran long
+# (a sick institution holding Plaid calls to their client timeout, a big
+# model backlog) cancelled the job at its next await and every sweep
+# behind it — snapshot, reaper, freezes, the purge of lapsed deletions —
+# was skipped for every tenant. A step past its budget keeps running in its
+# thread (a thread cannot be cancelled); the run just stops waiting for it.
+# Module-level so a test can shrink a budget instead of sleeping through it.
+NIGHTLY_STEP_BUDGET = {
+    "nightly": 3 * 3600,
+    "networth-snapshot": 3600,
+    "script-alerts": 1800,
+    "plaid-reap": 3600,
+    "gate": 1800,
+    "unverified": 1800,
+    "purge": 3600,
+}
+# the job's own timeout: every budget plus a margin, so arq never cancels
+# the run from outside before the steps' own budgets have had their say
+NIGHTLY_TIMEOUT = sum(NIGHTLY_STEP_BUDGET.values()) + 600
+
+
+# How many nightly step THREADS are still running. A step past its budget
+# outlives the run that started it (the run stops waiting; the thread goes
+# on), so the in-flight run count alone would let the maintenance reboot
+# kill it mid-tenant. Raised and lowered inside the thread, under a lock.
+_STEP_THREADS = 0
+_STEP_THREADS_LOCK = threading.Lock()
+
+
+def _counted_step(fn, *args):
+    global _STEP_THREADS
+    with _STEP_THREADS_LOCK:
+        _STEP_THREADS += 1
+    try:
+        return fn(*args)
+    finally:
+        with _STEP_THREADS_LOCK:
+            _STEP_THREADS -= 1
+
+
+def _step_threads_running() -> int:
+    with _STEP_THREADS_LOCK:
+        return _STEP_THREADS
+
+
+async def _nightly_step(label: str, fn, *args):
+    """Run one nightly step in a thread under its own budget. A step that
+    raises or overruns is logged and reported in the result, never allowed
+    to stop the steps after it."""
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_counted_step, fn, *args),
+            NIGHTLY_STEP_BUDGET.get(label, 3600))
+    except TimeoutError:
+        log.error("nightly step %s overran its %ss budget — moving on; it "
+                  "keeps running in the background", label,
+                  NIGHTLY_STEP_BUDGET.get(label, 3600))
+        return "timeout"
+    except Exception as e:                       # noqa: BLE001
+        log.error("nightly step %s failed: %s", label, e)
+        return f"error:{type(e).__name__}"
+
+
+# how many nightly runs are in flight in this worker (the cron's and a
+# console run-now can overlap), so the maintenance reboot can wait for them.
+# Touched only from the event loop, so a plain counter is enough.
+_NIGHTLY_RUNS = 0
+
+
 async def nightly_all(ctx):
+    global _NIGHTLY_RUNS
+    _NIGHTLY_RUNS += 1
+    try:
+        return await _nightly_all_body()
+    finally:
+        _NIGHTLY_RUNS -= 1
+
+
+async def _nightly_all_body():
     """Recurring detection, then the net-worth snapshot, then the stale-
-    collector alert, then the Plaid zombie-Item reaper — independent
-    sweeps so one tenant's failure in one never skips the others."""
-    detect = await asyncio.to_thread(_sweep, nightly_tenant, "nightly")
-    snapshot = await asyncio.to_thread(_sweep, snapshot_tenant,
-                                       "networth-snapshot")
-    stale = await asyncio.to_thread(_sweep, script_alert_tenant,
-                                    "script-alerts")
+    collector alert, then the Plaid zombie-Item reaper, the gate's sweeps,
+    the never-confirmed freeze and the purge — independent steps, each with
+    its own budget and failure guard, so one tenant's failure (or one slow
+    sweep) never skips the others."""
+    detect = await _nightly_step("nightly", _sweep, nightly_tenant,
+                                 "nightly")
+    snapshot = await _nightly_step("networth-snapshot", _sweep,
+                                   snapshot_tenant, "networth-snapshot")
+    stale = await _nightly_step("script-alerts", _sweep, script_alert_tenant,
+                                "script-alerts")
     # release Items dead 30+ days (they bill monthly for
     # as long as they exist at Plaid) + reconcile Items already gone at
     # Plaid's side. jobs/reaper.py; OIKONOME_PLAID_REAP_DAYS=0 disables.
     from . import reaper as _reaper
-    reap = await asyncio.to_thread(_sweep, _reaper.reap_tenant, "plaid-reap")
+    reap = await _nightly_step("plaid-reap", _sweep, _reaper.reap_tenant,
+                               "plaid-reap")
     # the installed gate's own sweeps run BEFORE the purge below, so an
     # account the gate froze tonight gets its full grace window rather than
     # racing this same run
-    frozen = (await asyncio.to_thread(ext.gate.nightly)).get("frozen", [])
+    gated = await _nightly_step("gate", ext.gate.nightly)
+    frozen = gated.get("frozen", []) if isinstance(gated, dict) else gated
     # signups nobody ever confirmed: the day-7 reminder and the day-30
     # freeze (jobs/unverified.py; hosted only, OIKONOME_UNVERIFIED_REAP_DAYS=0
     # disables). Before the purge for the same reason as the gate's sweeps.
     from . import unverified as _unverified
-    stale_signups = await asyncio.to_thread(_unverified.sweep)
+    stale_signups = await _nightly_step("unverified", _unverified.sweep)
     # finish deletions whose grace window has lapsed
-    purged = await asyncio.to_thread(purge_scheduled_deletions)
+    purged = await _nightly_step("purge", purge_scheduled_deletions)
     return {"detect": detect, "snapshot": snapshot, "script_alerts": stale,
             "plaid_reap": reap, "frozen": frozen, "purged": purged,
             "unverified": stale_signups}
+
+
+def _gate_unavailable() -> bool:
+    """Is the instance running under the fail-closed stand-in for a gate
+    add-on that failed to load? `ext.gate` is a lazy proxy, or the
+    implementation itself where a test or an embedding process set one."""
+    impl = getattr(ext.gate, "_resolve", None)
+    return isinstance(impl() if impl else ext.gate, ext._FailClosedGate)
+
+
+# A purge holds its claim for as long as the vendor releases take, which is
+# minutes. A claim this old belongs to a worker that was killed mid-purge
+# (a redeploy, an out-of-memory kill), and nothing else will ever clear it.
+PURGE_CLAIM_STALE_HOURS = 6
+
+
+def purge_claim_is_stale_sql() -> str:
+    """The SQL condition, over a tenants row, for a claim old enough to be
+    treated as abandoned."""
+    return (f"purge_claimed_at < now() - interval "
+            f"'{int(PURGE_CLAIM_STALE_HOURS)} hours'")
+
+
+def archive_released_plaid_items(tid: str) -> int:
+    """Archive the household's Plaid Items that a purge already removed at
+    Plaid, for a household the purge gives back instead of erasing.
+
+    The release removes every Item at Plaid and stamps the Item ledger,
+    but leaves the local rows holding their tokens, because the erase
+    that normally follows takes the rows anyway. A household handed back
+    after that would look connected while every sync failed against an
+    Item that no longer exists. Archived as gone at Plaid, the Accounts
+    page and the alert strip ask for a reconnect instead, and the books
+    stay. An Item whose removal failed is still live at Plaid and keeps
+    its token. Returns the number archived; never raises."""
+    try:
+        conn = tenancy.tenant_connect(tid)
+    except Exception as e:                                 # noqa: BLE001
+        log.warning("could not open %s to archive released items: %s",
+                    tid, e)
+        return 0
+    try:
+        ids = [r["id"] for r in conn.execute(
+            "SELECT id FROM items WHERE aggregator='plaid' "
+            "AND access_token IS NOT NULL "
+            "AND COALESCE(status,'') != 'archived'").fetchall()]
+        if not ids:
+            return 0
+        admin = tenancy.admin_connect()
+        try:
+            gone = [r["item_id"] for r in admin.execute(
+                "SELECT item_id FROM plaid_item_ledger "
+                "WHERE item_id = ANY(%s) AND removed_at IS NOT NULL",
+                (ids,)).fetchall()]
+        finally:
+            admin.close()
+        if gone:
+            conn.execute(
+                "UPDATE items SET status='archived', "
+                "archived_reason='plaid-gone', archived_at=now(), "
+                "access_token=NULL WHERE id = ANY(%s)", (gone,))
+        return len(gone)
+    except Exception as e:                                 # noqa: BLE001
+        log.warning("could not archive released items of %s: %s", tid, e)
+        return 0
+    finally:
+        conn.close()
+
+
+def _purge_one(admin, tid: str, statuses: list[str], _audit):
+    """Erase one household whose grace window has lapsed. Returns None when
+    it no longer qualifies (restored since the scan, or claimed by a run
+    still in progress), else (owner,
+    owner_bounced, receipt_plain, receipt_html) for the deletion receipt.
+
+    Three phases, and no lock on the tenants row held across the vendor
+    calls in the middle. FOR UPDATE on that row conflicts with the
+    FOR KEY SHARE every insert into a table keyed to it takes — a
+    sign-in's session row, a device token — so held across Plaid, MX and
+    the billing add-on's release (minutes, at their timeouts) it would
+    park those requests, each on one of the few control-pool connections
+    every request on the instance shares.
+
+    1. CLAIM, committed at once: re-check eligibility under the row lock
+       and stamp `purge_claimed_at`. The status and status_before_delete
+       are left exactly as they were: together they say whether somebody
+       asked for this deletion, and the billing add-on reads them to
+       decide whether a payment or gift may lift the household, so a
+       lockout nobody asked for stays liftable while the purge runs. The
+       stamp is the claim's token, and the console's restore door refuses
+       while it is set.
+    2. RELEASE, with the tenant's writer locks held (session-scoped, until
+       the end): read the receipt while the rows exist, release what the
+       household holds outside, and commit the pending-release marker on
+       its own, so a failure after an irreversible release still leaves
+       the retry handle behind.
+    3. ERASE, in its own transaction: re-check under the row lock that the
+       household is still the one claimed — still frozen, still due, same
+       stamp — and that nothing only its owner could attach (a payment, a
+       gift) arrived for a household frozen without being asked. A
+       household that was lifted, rescheduled or became entitled is kept,
+       and the audit says what was released; otherwise every row goes.
+
+    Any failure after the claim clears the stamp, so the next night's run
+    and the restore door both see the household as it is."""
+    from .. import erasure as _erasure
+    with admin.transaction():
+        # A live claim belongs to the run that made it: two purges can
+        # overlap (the nightly sweep and one started from the console), and
+        # a second run that overwrote the stamp would make the first give
+        # the household up while taking its own money baseline after a
+        # payment that arrived mid-purge, so a household that paid would be
+        # erased. Only a stale claim, left by a worker killed mid-purge, is
+        # taken over.
+        locked = admin.execute(
+            "SELECT id, status FROM tenants WHERE id=%s "
+            "AND status = ANY(%s) AND delete_after <= now() "
+            "AND (purge_claimed_at IS NULL OR "
+            + purge_claim_is_stale_sql() + ") FOR UPDATE",
+            (tid, statuses)).fetchone()
+        if locked is None:
+            return None
+        claimed_status = locked["status"]
+        claim = admin.execute(
+            "UPDATE tenants SET purge_claimed_at = clock_timestamp() "
+            "WHERE id=%s RETURNING purge_claimed_at",
+            (tid,)).fetchone()["purge_claimed_at"]
+        # A freeze nobody asked for (an add-on's lockout, the unconfirmed
+        # signup freeze) is lifted by money arriving; a requested deletion
+        # is not. What was attached at the claim is the baseline, so only
+        # something new mid-purge counts.
+        asked_for = claimed_status == "pending_delete"
+        money_before = (True if asked_for
+                        else bool(ext.gate.money_attached(admin, tid)))
+
+    def still_claimed(lock: bool):
+        return admin.execute(
+            "SELECT status, COALESCE(status_before_delete,'active') AS prev "
+            "FROM tenants WHERE id=%s AND status = ANY(%s) "
+            "AND delete_after <= now() AND purge_claimed_at = %s"
+            + (" FOR UPDATE" if lock else ""),
+            (tid, statuses, claim)).fetchone()
+
+    def unclaim():
+        # best effort: the connection may be the thing that failed, and a
+        # stamp left behind is taken over once it is stale
+        try:
+            with admin.transaction():
+                admin.execute(
+                    "UPDATE tenants SET purge_claimed_at = NULL "
+                    "WHERE id=%s AND purge_claimed_at = %s", (tid, claim))
+        except Exception as e:                            # noqa: BLE001
+            log.warning("could not clear the purge claim on %s: %s", tid, e)
+
+    # Block on every background writer's lock: a sync in flight finishes
+    # first, and none can start until the erase has committed (the domain
+    # tables have no FK to tenants, so a writer racing the delete would
+    # upsert rows for a household that no longer exists).
+    try:
+        _erasure.hold_writers(admin, tid)
+    except BaseException:
+        unclaim()
+        raise
+    try:
+        # the receipt goes to the OWNER — the earliest user is usually
+        # them, but an owner who was re-invited after a member joined is
+        # not the earliest row
+        owner_addr = tenancy.owner_email(admin, tid)
+        owner = {"email": owner_addr} if owner_addr else None
+        # read BEFORE the purge takes the add-on's rows: its receipt
+        # paragraphs are the place a person is told about anything the
+        # erasure could not undo on their behalf, and some of that can
+        # only be read while the rows are still there. The self-serve door
+        # asks the same hook, so both receipts say the same things.
+        xp, xh = ext.gate.erasure_receipt(admin, tid, None)
+        # read BEFORE the purge scrubs the delivery table: an address the
+        # provider already bounces must not be mailed again after erasure,
+        # which would write a fresh bounce row for a household that no
+        # longer exists
+        from ..notify import delivery as _delivery
+        owner_bounced = bool(owner and _delivery.failing([owner["email"]]))
+        # the writer wait can be long: a household lifted meanwhile keeps
+        # its links rather than losing them to a purge that will not erase
+        if still_claimed(lock=False) is None:
+            unclaim()
+            return None
+        released = _erasure.release_external(tid)
+        retry_ids = _erasure.collect_retry_ids(tid)
+        _erasure.record_pending_release(admin, tid, released, retry_ids)
+        released_note = (f"plaid_items_released={released['plaid_items']} "
+                         f"released={released['released']} "
+                         f"mx={released['mx_user']}")
+        with admin.transaction():
+            # the writer locks again, transaction-scoped: re-entrant on this
+            # session, and released by the COMMIT itself, so no later
+            # change to the session unlock's place can open a gap between
+            # an unlock and the delete becoming visible
+            _erasure.hold_writers(admin, tid, xact=True)
+            still = still_claimed(lock=True)
+            if still is None:
+                admin.execute(
+                    "UPDATE tenants SET purge_claimed_at = NULL "
+                    "WHERE id=%s AND purge_claimed_at = %s", (tid, claim))
+                archived = archive_released_plaid_items(tid)
+                _audit(admin, "tenant_purge_abandoned", target=tid,
+                       detail="lifted or rescheduled while its links were "
+                              f"being released: {released_note} "
+                              f"archived={archived}",
+                       ip="worker")
+                return None
+            if not money_before and ext.gate.money_attached(admin, tid):
+                # paid for or gifted while the purge ran: put it back where
+                # the restore door would, and let the gate say whether
+                # 'active' is where its billing lands it
+                admin.execute(
+                    "UPDATE tenants SET status=%s, delete_after=NULL, "
+                    "status_before_delete=NULL, purge_claimed_at=NULL "
+                    "WHERE id=%s", (still["prev"], tid))
+                landed = still["prev"]
+                if landed == "active":
+                    landed = ext.gate.reactivate(admin, tid)
+                archived = archive_released_plaid_items(tid)
+                _audit(admin, "tenant_purge_abandoned", target=tid,
+                       detail=f"entitled while its links were being "
+                              f"released: restored_to={landed} "
+                              f"{released_note} archived={archived}",
+                       ip="worker")
+                return None
+            tenancy.delete_tenant_rows(admin, tid)
+            _audit(admin, "tenant_delete", target=tid,
+                   detail=f"owner={owner_addr or tid} "
+                          f"{released_note} "
+                          f"sms={released.get('sms')}"
+                          + (f" plaid_failed={released['plaid_failed']}"
+                             if released.get('plaid_failed') else ""),
+                   ip="worker")
+    except BaseException:
+        unclaim()
+        raise
+    finally:
+        # session-level, so it must not be left to the connection's close
+        _erasure.release_writers(admin, tid)
+    return owner, owner_bounced, xp, xh
 
 
 def purge_scheduled_deletions() -> list[str]:
@@ -1816,14 +2618,15 @@ def purge_scheduled_deletions() -> list[str]:
     console's purge path so external-service release + audit are
     identical. Returns the tenant ids purged.
 
-    Each tenant is purged under a row lock with the eligibility re-checked
-    inside the transaction (SELECT … FOR UPDATE), so a restore landing
-    mid-run cannot be half-wiped: whichever of purge/restore takes the
-    lock first wins, the other observes the result. A
-    purge that fails leaves the tenant in its current status (retried
-    next night) and writes an admin_audit row so a permanently-stuck
-    tenant is visible in the console, not silently frozen forever."""
-    from ..web.adminconsole import _audit, _frozen_statuses, _purge_tenant
+    Each tenant is claimed under a row lock with the eligibility re-checked
+    inside the transaction (SELECT … FOR UPDATE) and a claim stamp written,
+    so a restore landing mid-run cannot be half-wiped: a restore that takes
+    the lock first wins, and once the stamp is set the restore door
+    refuses until the purge finishes or gives the household up
+    (`_purge_one` has the phases). A purge that fails leaves the tenant frozen (retried next
+    night) and writes an admin_audit row so a permanently-stuck tenant is
+    visible in the console, not silently frozen forever."""
+    from ..web.adminconsole import _audit, _frozen_statuses
     admin = tenancy.admin_connect()
     try:
         # every status a purge may finish: the product's own grace
@@ -1838,50 +2641,22 @@ def purge_scheduled_deletions() -> list[str]:
             "AND delete_after IS NOT NULL AND delete_after <= now()",
             (statuses,)).fetchall()]
         done = []
+        if _gate_unavailable():
+            # Nothing can archive or release the billing add-on's record
+            # while it is not loaded, and the erasure would take the only
+            # copy of it. Nothing is claimed or released; tomorrow's run
+            # finishes once the add-on loads.
+            if candidates:
+                log.error("scheduled purge of %d household(s) held: the "
+                          "billing add-on is not loaded", len(candidates))
+            return done
         for tid in candidates:
             owner, owner_bounced = None, False
             try:
-                with admin.transaction():
-                    # re-assert under the row lock — a restore/reactivation
-                    # since the candidate scan flips status away
-                    locked = admin.execute(
-                        "SELECT id FROM tenants WHERE id=%s "
-                        "AND status = ANY(%s) "
-                        "AND delete_after <= now() FOR UPDATE",
-                        (tid, statuses)).fetchone()
-                    if locked is None:
-                        continue          # restored or already handled
-                    # Hold the tenant's writer locks (the sync, categorize
-                    # and nightly locks) until this transaction COMMITS. _purge_tenant takes (and releases) the same
-                    # lock session-scoped, but here its unlock lands before
-                    # the enclosing commit — a sync starting in that gap
-                    # would read the not-yet-deleted rows and resurrect
-                    # them after the commit. Same-session acquisition never
-                    # self-blocks, so stacking both scopes is safe.
-                    from .. import erasure as _erasure_locks
-                    _erasure_locks.hold_writers(admin, tid, xact=True)
-                    # the receipt goes to the OWNER — the earliest user is
-                    # usually them, but an owner who was re-invited after a
-                    # member joined is not the earliest row
-                    owner_addr = tenancy.owner_email(admin, tid)
-                    owner = {"email": owner_addr} if owner_addr else None
-                    # read BEFORE the purge takes the add-on's rows: its
-                    # receipt paragraphs are the place a person is told
-                    # about anything the erasure could not undo on their
-                    # behalf, and some of that can only be read while the
-                    # rows are still there. The self-serve door asks the
-                    # same hook, so both receipts say the same things.
-                    xp, xh = ext.gate.erasure_receipt(admin, tid, None)
-                    # read BEFORE the purge scrubs the delivery table: an
-                    # address the provider already bounces must not be
-                    # mailed again after erasure, which would write a fresh
-                    # bounce row for a household that no longer exists
-                    from ..notify import delivery as _delivery
-                    owner_bounced = bool(owner and _delivery.failing(
-                        [owner["email"]]))
-                    _purge_tenant(admin, tid,
-                                  owner["email"] if owner else tid,
-                                  ip="worker")
+                got = _purge_one(admin, tid, statuses, _audit)
+                if got is None:
+                    continue          # restored or already handled
+                owner, owner_bounced, xp, xh = got
             except Exception as e:                        # noqa: BLE001
                 log.error("scheduled purge failed for %s: %s", tid, e)
                 try:
@@ -1916,6 +2691,56 @@ def purge_scheduled_deletions() -> list[str]:
         admin.close()
 
 
+def _close_last_month(conn) -> bool:
+    """Re-freeze the month that just closed from the budget live now — the
+    budget it ended under.
+
+    The nightly upserts the current month's snapshot at one fixed hour of
+    the instance's clock, so for most households its last write of a month
+    lands before that month's final local day is over, so without a
+    re-freeze an edit made on the last evening (Today said "on budget")
+    would be missing from the closed month's verdict. This hourly pass re-freezes it at
+    local 00:xx on the 1st, so an edit made later on the 1st never reaches
+    back into the month before.
+
+    That hour can be missed: the worker down or redeploying at 00:05, the
+    previous sweep still holding this household's lock, or a zone whose
+    clocks skip local midnight on the 1st. A closed month whose snapshot
+    was taken before the month ended (captured_at earlier than the local
+    midnight that closed it) has never had this re-freeze, so the next
+    sweep that finds it so takes it then. Once re-frozen, captured_at is
+    past the close and it is never touched again. Either way it re-freezes
+    only from settings nobody has saved since the month ended."""
+    from ..engine import budget as _b
+    from .. import localtime
+    local = localtime.now_local(_b.load_config(conn))
+    closed = (local.replace(day=1) - dt.timedelta(days=1)).date()
+    # local midnight that opened this month, as an instant: in a zone
+    # whose midnight does not exist that day, zoneinfo resolves the wall
+    # time with the offset in force before the gap, which is the moment
+    # the old month ended
+    opened = local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if not (local.day == 1 and local.hour == 0):
+        row = conn.execute(
+            "SELECT captured_at FROM budget_snapshots "
+            "WHERE year=%s AND month=%s",
+            (closed.year, closed.month)).fetchone()
+        if row is None or row["captured_at"] >= opened:
+            # no snapshot means the budget was not in use when the month
+            # ran (the nightly skips a $0 plan); writing one now would
+            # judge it against today's numbers
+            return False
+    # The live settings are the ones the month ended under only while
+    # nobody has saved them since it ended. A late run (the catch-up), and
+    # even the on-time one when the owner edits in the first minutes of the
+    # 1st, would otherwise freeze a new-month edit into the closed month and
+    # flip its verdict. Such a run writes nothing, and the nightly's last
+    # snapshot of the month stands. A month whose re-freeze was skipped
+    # this way is asked again each hour, which costs one row read and stays
+    # a no-op once the settings have moved on.
+    return _b.snapshot_month(conn, closed, unchanged_since=opened)
+
+
 def _email_if_due(tenant_id: str) -> None:
     """The due-check and the job_runs heartbeat that suppresses it are two
     separate statements, so two overlapping hourly sweeps could both read
@@ -1938,9 +2763,29 @@ def _email_if_due(tenant_id: str) -> None:
                      tenant_id)
             return
         try:
+            # before the cadences: a monthly report set for the first hour
+            # must read the closed month's final snapshot
+            try:
+                _close_last_month(conn)
+            except Exception as e:               # noqa: BLE001
+                log.warning("month-close snapshot failed tenant=%s: %s",
+                            tenant_id, e)
             due = emails_due(conn, now)
+            # each cadence on its own: a failing daily must not stop the
+            # monthly (or, on Jan 1, the yearly) from being tried, since
+            # those come due on that one day only. The first
+            # failure is re-raised once every cadence has had its turn, so
+            # the sweep still records the tenant as failed.
+            first_error = None
             for cadence in due:
-                email_tenant(tenant_id, cadence=cadence)
+                try:
+                    email_tenant(tenant_id, cadence=cadence)
+                except Exception as e:           # noqa: BLE001
+                    log.error("%s report failed for tenant %s: %s",
+                              cadence, tenant_id, e)
+                    first_error = first_error or e
+            if first_error is not None:
+                raise first_error
         finally:
             tenancy.release_lock(conn, f"oikonome:email:{tenant_id}")
     finally:
@@ -1951,24 +2796,33 @@ def _webhook_tenants() -> list[str]:
     """Tenants with a delivery due — one admin query instead of a
     tenant-scoped connection per household per minute. Longest-waiting
     first, so a pass that runs out of minute does not always leave the
-    same households for last."""
+    same households for last.
+
+    Only live households: a suspended or pending-delete household is locked
+    out of every other door and sweep, so its queued deliveries must not
+    keep carrying ledger rows to an outside URL either. The rows stay
+    pending, so a reactivation resumes them."""
     admin = tenancy.admin_connect()
     try:
         return [str(r["tenant_id"]) for r in admin.execute(
-            "SELECT tenant_id FROM webhook_deliveries "
-            "WHERE state = 'pending' AND next_attempt_at <= now() "
-            "GROUP BY tenant_id ORDER BY min(next_attempt_at)").fetchall()]
+            "SELECT d.tenant_id FROM webhook_deliveries d "
+            "JOIN tenants t ON t.id = d.tenant_id "
+            "AND coalesce(t.status, 'active') = 'active' "
+            "WHERE d.state = 'pending' AND d.next_attempt_at <= now() "
+            "GROUP BY d.tenant_id "
+            "ORDER BY min(d.next_attempt_at)").fetchall()]
     finally:
         admin.close()
 
 
 def webhooks_drain_tenant(tenant_id: str) -> dict:
+    # a connection per database step, none while a receiver answers: the
+    # drain runs several households at once out of the pool every other
+    # sweep and webhook-triggered sync borrows from (deliver_pending says
+    # why that matters)
     from ..notify import webhooks as _wh
-    conn = tenancy.tenant_connect(tenant_id)
-    try:
-        return _wh.deliver_pending(conn)
-    finally:
-        conn.close()
+    return _wh.deliver_pending(
+        connect=lambda: tenancy.tenant_connect(tenant_id))
 
 
 # held for the length of one drain pass. arq's job timeout cancels the
@@ -1977,6 +2831,11 @@ def webhooks_drain_tenant(tenant_id: str) -> dict:
 # minute another thread would join the default executor that the sync,
 # email and nightly sweeps also run on
 _WEBHOOK_PASS = threading.Lock()
+# how many households one drain pass sends for at once, and how long a pass
+# keeps starting new ones: inside the minute, so the next pass is not
+# skipped behind it (a household already sending finishes its own budget)
+WEBHOOK_DRAIN_THREADS = 4
+WEBHOOK_PASS_BUDGET = 40.0
 
 
 def webhooks_drain() -> dict:
@@ -1988,13 +2847,38 @@ def webhooks_drain() -> dict:
         return {}
     try:
         out: dict[str, str] = {}
-        for tid in _webhook_tenants():
-            try:
-                r = webhooks_drain_tenant(tid)
-                out[tid] = f"sent:{r['sent']} failed:{r['failed']}"
-            except Exception as e:               # noqa: BLE001
-                out[tid] = f"error:{type(e).__name__}"
-                log.error("webhook drain failed for tenant %s: %s", tid, e)
+        due = iter(_webhook_tenants())
+        pick = threading.Lock()
+        started = time.monotonic()
+
+        def run() -> None:
+            # Each household's receivers answer in their own time, so the
+            # tenants are shared out over a few threads: one household's
+            # slow-but-successful receiver keeps one thread busy for its
+            # budget, not every other household waiting behind it. A
+            # household not started before the pass budget runs out stays
+            # due for the next minute, where longest-waiting goes first.
+            while True:
+                with pick:
+                    if time.monotonic() - started >= WEBHOOK_PASS_BUDGET:
+                        return
+                    tid = next(due, None)
+                if tid is None:
+                    return
+                try:
+                    r = webhooks_drain_tenant(tid)
+                    out[tid] = f"sent:{r['sent']} failed:{r['failed']}"
+                except Exception as e:           # noqa: BLE001
+                    out[tid] = f"error:{type(e).__name__}"
+                    log.error("webhook drain failed for tenant %s: %s",
+                              tid, e)
+        threads = [threading.Thread(target=run, name=f"webhook-drain-{i}",
+                                    daemon=True)
+                   for i in range(WEBHOOK_DRAIN_THREADS)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
         return out
     finally:
         _WEBHOOK_PASS.release()
@@ -2007,9 +2891,35 @@ async def webhooks_all(ctx):
     return await asyncio.to_thread(webhooks_drain)
 
 
+# How many email sweep threads are sending in this worker. A household's
+# send is several steps (each recipient's mail, then SMS and push, then the
+# stamp that says it went), and a restart between them sends it all again
+# after the restart; the maintenance reboot waits while this is above zero.
+# Counted inside the thread, so a sweep arq has stopped waiting for still
+# counts until it really ends.
+_EMAIL_THREADS = 0
+_EMAIL_THREADS_LOCK = threading.Lock()
+
+
+def _counted_email_sweep():
+    global _EMAIL_THREADS
+    with _EMAIL_THREADS_LOCK:
+        _EMAIL_THREADS += 1
+    try:
+        return _sweep(_email_if_due, "email")
+    finally:
+        with _EMAIL_THREADS_LOCK:
+            _EMAIL_THREADS -= 1
+
+
+def _email_threads_running() -> int:
+    with _EMAIL_THREADS_LOCK:
+        return _EMAIL_THREADS
+
+
 async def email_all(ctx):
     """Hourly sweep — each tenant sends at ITS configured hour, once/day."""
-    return await asyncio.to_thread(_sweep, _email_if_due, "email")
+    return await asyncio.to_thread(_counted_email_sweep)
 
 
 def _redis_settings():
@@ -2062,7 +2972,19 @@ def _sync_item_body(tenant_id: str, item_id: str) -> dict:
                            (item_id,)).fetchone()
         if row is None or row["status"] == "archived":
             return {"skipped": "archived" if row else "gone"}
-        r = plaid.sync(conn, item_id)
+        # Plaid's webhook is how most charges arrive where it is wired, so
+        # this pull announces what it landed exactly as the full sweep
+        # does; the sweep's own before-snapshot already holds these rows
+        # and would never name them.
+        before_ids = _recent_txn_ids(conn)
+        try:
+            r = plaid.sync(conn, item_id)
+        except Exception as e:
+            _webhooks_after_sync(conn, {item_id: f"error:{type(e).__name__}"},
+                                 before_ids, tenant_id)
+            raise
+        _webhooks_after_sync(conn, {item_id: f"ok:{(r or {}).get('added', 0)}"},
+                             before_ids, tenant_id)
         from ..sync import base as _sync_base
         with _sync_base.categorize_lock(conn, tenant_id) as _held:
             if _held:
@@ -2085,6 +3007,10 @@ def _sync_item_body(tenant_id: str, item_id: str) -> dict:
             # nobody holds on purpose.
             if tenancy.release_lock(conn, f"oikonome:sync:{tenant_id}"):
                 conn = None                      # type: ignore[assignment]
+            else:
+                # this pull covered one item; a full sync turned away
+                # while it ran asked for every other one
+                answer_sync_nudge(conn, tenant_id)
         if conn is not None:
             conn.close()
 
@@ -2108,6 +3034,109 @@ async def demo_reset_all(ctx):
     log.info("demo reset: seed=%s transactions=%s",
              r.get("seed"), r.get("transactions"))
     return f"reset seed={r.get('seed')}"
+
+
+class _HouseholdGone(Exception):
+    """The household stopped being active while a send was being built."""
+
+
+def _live_mail_route(tenant_id, recipients: list[str],
+                     kind: str | None) -> tuple[list[str], dict]:
+    """`recipients` cut to the addresses still deliverable NOW, and the
+    relay as resolved NOW, read on a fresh connection right before the
+    fan-out. An outbound pause (a hijacked recipient, a relay a hijacker
+    may have pointed) committed while the report was being built is
+    honoured; an address added since is not picked up, since the report
+    was not built for it.
+
+    FOR SHARE on the settings row first, for the reason `_live_sms_number`
+    gives: a pause still in flight is waited for, then read. The lock is
+    released before any mail is sent."""
+    from ..web import report
+    conn = tenancy.tenant_connect(tenant_id)
+    try:
+        with conn.transaction():
+            conn.execute("SELECT 1 FROM tenant_settings WHERE tenant_id=%s "
+                         "FOR SHARE", (tenant_id,))
+            live = set(_recipients_detail(conn, tenant_id, kind)[0])
+            smtp = report.resolve_smtp(conn)
+            # a household suspended or put up for erasure since the sweep
+            # listed it is mailed nothing
+            if not _household_active(conn, tenant_id):
+                log.info("tenant %s: mail skipped — the household is no "
+                         "longer active", tenant_id)
+                live = set()
+    finally:
+        conn.close()
+    return [r for r in recipients if r in live], smtp
+
+
+def _live_sms_number(tenant_id) -> str | None:
+    """The household's SMS number as stored NOW, or None unless it is still
+    verified and still consented to the scheduled summary. Read on a fresh
+    connection, right before a send, so a pause or removal committed after
+    the sweep loaded its config is honoured.
+
+    FOR SHARE, so a pause still IN FLIGHT is honoured too: a credential
+    rotation marks the number unverified inside its own transaction and
+    commits only when the rest of the rotation has, and a plain read in
+    that window still sees the number as verified. The share lock waits
+    for that commit and then reads the paused number. It is released
+    before the text is sent — held across the provider's answer, it would
+    keep the rotation, and the control-plane connection the rotation runs
+    on, waiting for it."""
+    from ..notify import sms as _smsmod
+    try:
+        conn = tenancy.tenant_connect(tenant_id)
+        try:
+            with conn.transaction():
+                row = conn.execute(
+                    "SELECT config->'notify_phone' AS p FROM tenant_settings "
+                    "WHERE tenant_id=%s FOR SHARE", (tenant_id,)).fetchone()
+                # nor is a household that is no longer active texted
+                active = _household_active(conn, tenant_id)
+        finally:
+            conn.close()
+    except Exception as e:                       # noqa: BLE001
+        log.warning("tenant %s: SMS number re-read failed: %s", tenant_id, e)
+        return None
+    if not active:
+        return None
+    p = row["p"] if row else None
+    if not (isinstance(p, dict) and p.get("verified") and p.get("number")
+            and _smsmod.consented(p, "summary")):
+        return None
+    return str(p["number"])
+
+
+# the host command runner's own ceiling on how long a run holds its lock;
+# a result still reading "running" past it is one a crash or a reboot
+# left behind, and must not defer the maintenance reboot forever
+_HOST_COMMAND_MAX_S = 6 * 3600
+
+
+def _host_command_running(base) -> bool:
+    """Whether the host command watcher has a console command queued or
+    in flight, as far as the container can see: a request still in the
+    drop-box, or a result file the watcher wrote as "running" within its
+    lock's lifetime. Unreadable files are skipped, not trusted."""
+    import json
+    if (base / "cmd" / "command-requested").exists():
+        return True
+    res = base / "ops" / "cmd-results"
+    if not res.is_dir():
+        return False
+    now = time.time()
+    for j in res.glob("*.json"):
+        try:
+            d = json.loads(j.read_text())
+            if (isinstance(d, dict) and d.get("state") == "running"
+                    and now - float(d.get("started") or 0)
+                    < _HOST_COMMAND_MAX_S):
+                return True
+        except (OSError, ValueError, TypeError):
+            continue
+    return False
 
 
 def _nightly_reboot_check() -> str:
@@ -2135,8 +3164,19 @@ def _nightly_reboot_check() -> str:
         return "bad-host-health"
     if not health.get("reboot_required"):
         return "not-needed"
-    if not cmd.is_dir() or not os.access(cmd, os.W_OK):
+    # the reboot watcher specifically: the command watcher alone also
+    # makes the drop-box writable, and then the countdown would be
+    # broadcast every night for a restart nothing performs
+    from . import host_watchers
+    if not host_watchers.ready("reboot"):
         return "no-cmd-dir"
+    # nor a console command the host is still running: a reboot under an
+    # upgrade kills it mid-build or mid-migrate, leaving the schema part
+    # upgraded under the old containers and the command "running" forever
+    if _host_command_running(base):
+        log.info("maintenance reboot deferred — a console command is "
+                 "running on the host")
+        return "host-command-running"
     from ..db import tenancy
     admin = tenancy.admin_connect()
     try:
@@ -2156,8 +3196,117 @@ def _nightly_reboot_check() -> str:
     return "reboot-requested"
 
 
+# the maintenance reboot's hour, UTC — what OIKONOME_AUTO_REBOOT's
+# documentation promises operators, whatever zone the instance runs in
+REBOOT_HOUR_UTC = 9
+
+
+def _utcnow() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
 async def nightly_reboot(ctx):
+    # the cron fires every hour at :37 in the instance's zone; only the
+    # firing that lands in the UTC hour does anything, so the reboot stays
+    # in the 09:00 UTC hour on every install and across DST changes
+    if _utcnow().hour != REBOOT_HOUR_UTC:
+        return "not-the-hour"
+    # the nightly runs at a LOCAL hour and the reboot at a UTC one, so in
+    # some zones the two meet; a reboot never cuts a nightly short (the
+    # pending reboot is still pending tomorrow)
+    if _NIGHTLY_RUNS > 0 or _step_threads_running() > 0:
+        log.info("maintenance reboot deferred — the nightly run is in "
+                 "progress")
+        return "nightly-running"
+    # nor a household's email half-sent: cut between its mail and the stamp
+    # that records it, the whole send (mail, SMS, push) goes out again
+    # after the restart
+    if _email_threads_running() > 0:
+        log.info("maintenance reboot deferred — the email sweep is sending")
+        return "email-sending"
     return await asyncio.to_thread(_nightly_reboot_check)
+
+
+def _cron_zone():
+    """The zone the cron hours are read in: the instance's, by NAME, so a
+    DST change moves the clock with it instead of shifting every job an
+    hour."""
+    from .. import localtime
+    return localtime.instance_tz()
+
+
+@dataclasses.dataclass
+class _ZonedCronJob(CronJob):
+    """A cron entry whose fields are wall-clock times in `zone` but whose
+    next run is an absolute UTC instant.
+
+    arq compares next_run with "now" as plain datetimes; given the same
+    named zone on both sides Python compares them as wall times and
+    ignores the fold, so on the night the clocks go back the next slot
+    after 01:55 (02:00, an hour and five minutes away in real time) looks
+    later than every repeated 01:xx and every cron stalls for the hour.
+    Here the worker's clock runs in UTC and the next run is found by
+    walking real instants forward and reading each one's local wall time,
+    so nothing stalls or doubles when the offset changes:
+      * fall-back: interval jobs keep firing through the repeated hour;
+        a job pinned to an hour runs only on the first pass through it.
+      * spring-forward: the skipped wall times simply never occur; a job
+        pinned to a skipped hour does not run that day."""
+    zone: dt.tzinfo | None = None
+
+    def calculate_next(self, prev_run: dt.datetime) -> None:
+        self.next_run = _next_zoned_run(self, prev_run)
+
+
+def _as_set(v):
+    return {v} if isinstance(v, int) else set(v)
+
+
+def _next_zoned_run(job, prev_run: dt.datetime) -> dt.datetime:
+    utc = dt.timezone.utc
+    zone = job.zone or utc
+    after = prev_run.astimezone(utc)
+    weekday = job.weekday
+    if isinstance(weekday, str):
+        from arq.typing import WEEKDAYS
+        weekday = WEEKDAYS.index(weekday.lower())
+    month = None if job.month is None else _as_set(job.month)
+    day = None if job.day is None else _as_set(job.day)
+    wday = None if weekday is None else _as_set(weekday)
+    hour = None if job.hour is None else _as_set(job.hour)
+    minute = None if job.minute is None else _as_set(job.minute)
+    seconds = (range(60) if job.second is None
+               else sorted(_as_set(job.second)))
+    t = after.replace(second=0, microsecond=0)
+    # a year and a bit of hour-steps bounds the walk for any satisfiable
+    # entry (the rarest, a fixed day of one month, recurs within a year)
+    for _ in range(24 * 400 + 120):
+        local = t.astimezone(zone)
+        if ((month is not None and local.month not in month)
+                or (day is not None and local.day not in day)
+                or (wday is not None and local.weekday() not in wday)
+                or (hour is not None
+                    and (local.hour not in hour or local.fold))):
+            # nothing in the rest of this local hour can match: jump to
+            # the next local :00
+            t += dt.timedelta(minutes=60 - local.minute)
+            continue
+        if minute is not None and local.minute not in minute:
+            t += dt.timedelta(minutes=1)
+            continue
+        for sec in seconds:
+            cand = t.replace(second=sec, microsecond=job.microsecond)
+            if cand > after:
+                return cand
+        t += dt.timedelta(minutes=1)
+    raise RuntimeError(f"cron {job.name} has no next run")
+
+
+def _in_zone(job: CronJob, zone) -> _ZonedCronJob:
+    """The same cron entry, read as wall times in `zone`."""
+    fields = {f.name: getattr(job, f.name)
+              for f in dataclasses.fields(CronJob)}
+    return _ZonedCronJob(**fields, zone=zone)
 
 
 async def smtp_probe(ctx):
@@ -2213,6 +3362,23 @@ async def blocklist_refresh(ctx):
         return await asyncio.to_thread(_blocklist_refresh_body)
     except Exception as e:                               # noqa: BLE001
         log.error("blocklist refresh failed: %s", e)
+        return f"error:{type(e).__name__}"
+
+
+async def staging_sweep(ctx):
+    """Hourly: drop every household's expired staged uploads. The sweep
+    inside the staging calls reaches only the household making the call,
+    and a staged file still carries the full account numbers the importers
+    cut down, so an abandoned one must not wait for its household to come
+    back. Runs here and never on a request: it reads every household's
+    rows on the owner connection."""
+    def _run():
+        from ..db import staging
+        return staging.sweep_all()
+    try:
+        return await asyncio.to_thread(_run)
+    except Exception as e:                               # noqa: BLE001
+        log.error("staging sweep failed: %s", e)
         return f"error:{type(e).__name__}"
 
 
@@ -2306,9 +3472,24 @@ async def _startup(ctx):
 
 class WorkerSettings:
     on_startup = _startup
-    functions = [sync_all, nightly_all, email_all, demo_reset_all, sync_one,
+    # The cron hours below are the instance's local time (OIKONOME_TZ), as
+    # its documentation says — the one exception is the maintenance reboot,
+    # which keeps its documented UTC hour itself (nightly_reboot). arq's
+    # own clock runs in UTC and each entry carries the named zone
+    # (_ZonedCronJob): a fixed offset captured at start slid every job an
+    # hour across a DST change, and handing arq the named zone stalled
+    # every cron for the repeated hour at fall-back.
+    timezone = dt.timezone.utc
+    # nightly_all is listed with its own timeout too: the console's run-now
+    # button enqueues it by name, and that path takes the function's
+    # timeout, not the cron entry's
+    functions = [sync_all, arq_func(nightly_all, timeout=NIGHTLY_TIMEOUT),
+                 email_all, demo_reset_all, sync_one,
                  sync_item, broadcast_sweep, nightly_reboot,
-                 blocklist_refresh, webhooks_all] + ext.job_functions()
+                 blocklist_refresh, webhooks_all,
+                 staging_sweep,
+                 arq_func(bulk_import_job.bulk_import_run,
+                          timeout=bulk_import_job.ARQ_TIMEOUT)] + ext.job_functions()
     cron_jobs = [
         # every 5 minutes, each firing serving one tenant hash-slot — every
         # tenant still syncs exactly hourly, just not all at :00 (see
@@ -2321,13 +3502,23 @@ class WorkerSettings:
         # lock and whoever loses skips the tenant; colliding by
         # construction every single night would mean the Plaid reaper
         # almost never ran for that slot's tenants.
-        cron(nightly_all, hour=4, minute=17),
+        cron(nightly_all, hour=4, minute=17, timeout=NIGHTLY_TIMEOUT),
         cron(blocklist_refresh, hour=3, minute=30),     # daily spam-list refresh
         cron(email_all, minute=5),                      # hourly; per-tenant hour
         cron(demo_reset_all, minute=0),                 # hourly pristine
+        cron(staging_sweep, minute=47),                 # abandoned uploads
+        cron(bulk_import_job.bulk_import_sweep,         # queued folder imports,
+             minute=set(range(60)),                     # and ones whose worker
+             timeout=bulk_import_job.ARQ_TIMEOUT),     # went quiet
         cron(broadcast_sweep,                           # stale reboot banners
              minute={2, 12, 22, 32, 42, 52}),
-        cron(nightly_reboot, hour=9, minute=4),         # graceful maint window
+        # graceful maint window, the 09:00 UTC hour: hourly here because the
+        # crons run in local time, and the job itself keeps the UTC hour.
+        # :37, clear of the email sweep at :05 (the host goes down about a
+        # minute after the flag, so that minute must not overlap an hourly
+        # email start) and between sync slots
+        cron(nightly_reboot, minute=37),
         cron(webhooks_all, minute=set(range(60))),      # the webhook outbox
     ] + ext.cron_jobs()
+    cron_jobs = [_in_zone(j, _cron_zone()) for j in cron_jobs]
     redis_settings = _redis_settings()

@@ -1,6 +1,6 @@
 """The unsubscribe link at the foot of every household email.
 
-Every scheduled mail — the daily verdict, the weekly report, the monthly
+Every scheduled mail — the daily verdict, the monthly
 report card, the year in review — and the alert mails that share their
 recipient list (link trouble, savings goals, a quiet collector) carries one
 link that stops ALL of them for the address it was sent to. It lands that
@@ -111,7 +111,7 @@ def footer(tenant_id, email: str) -> tuple[str, str, str]:
     who = _norm(email)
     if u:
         plain = (f"\n\n--\nSent to {who}. To stop every Oikonome email to this "
-                 f"address — daily, weekly, monthly and yearly — open:\n{u}\n"
+                 f"address — daily, monthly and yearly — open:\n{u}\n"
                  "The household owner can turn it back on under "
                  "Settings → Email.")
         html = (
@@ -120,7 +120,7 @@ def footer(tenant_id, email: str) -> tuple[str, str, str]:
             f'Sent to {_html.escape(who)}. '
             f'<a href="{_html.escape(u, quote=True)}" style="color:#8b98a3;'
             'text-decoration:underline">Unsubscribe</a> — stops every '
-            'Oikonome email to this address (daily, weekly, monthly and '
+            'Oikonome email to this address (daily, monthly and '
             'yearly). The household owner can turn it back on under '
             'Settings → Email.</p>')
     else:

@@ -40,22 +40,60 @@ def goal_mode(g: dict) -> str:
             else "monthly")
 
 
-def monthly_plan_total(cfg: dict, mode: str | None = None) -> float:
+def household_goals(conn, cfg: dict) -> list[dict]:
+    """The goals whose plan is HOUSEHOLD money: every goal except one on a
+    business-entity account (the owner rule _owner_scope applies to its
+    progress). A business saving toward equipment pays the transfer out
+    of its own checking, so its plan must not come out of the household
+    plan surplus, the household cash forecast or the household sweep line
+    — those all start from household-only balances. With the combined view
+    on (config combine_entities) the household figures include the
+    businesses, and so do these goals, the same way PERSONAL_ONLY_SQL
+    stands aside."""
+    gs = goals(cfg)
+    if not any(g.get("account_id") for g in gs):
+        return gs
+    business = {r["id"] for r in conn.execute(
+        """SELECT id FROM accounts WHERE entity_id IS NOT NULL
+             AND NOT COALESCE(NULLIF((SELECT current_setting(
+                 'app.combine_entities', true)), '') = 'true', false)"""
+    ).fetchall()}
+    return [g for g in gs if g.get("account_id") not in business]
+
+
+def monthly_plan_total(cfg: dict, mode: str | None = None,
+                       conn=None) -> float:
     """Sum of monthly plans, optionally restricted to one contribution
     mode — the plan surplus subtracts only the fixed ('monthly')
-    commitments, while the sweep line reports the 'sweep' total."""
-    return round(sum(float(g.get("monthly_plan") or 0) for g in goals(cfg)
+    commitments, while the sweep line reports the 'sweep' total. Given
+    `conn`, only the household's goals count (household_goals)."""
+    gs = household_goals(conn, cfg) if conn is not None else goals(cfg)
+    return round(sum(float(g.get("monthly_plan") or 0) for g in gs
                      if mode is None or goal_mode(g) == mode), 2)
 
 
 def is_plan_only(g: dict) -> bool:
-    """A goal with no destination account and no match tokens has
-    nothing to measure progress against — `_matched_net` unscoped would sum
-    EVERY transfer on the tenant (dashboard-wide phantom progress). The
-    balance planner saves exactly this shape ({name, monthly_plan}), so it's
-    common, not an edge: the plan reduces surplus and rides the forecast;
-    progress stays null until the user scopes it."""
-    return not g.get("account_id") and not any(
+    """A goal with no destination account is never measured.
+
+    With no account, `_matched_net` would sum EVERY transfer on the tenant
+    (dashboard-wide phantom progress), and match words do not rescue it:
+    they match both legs of a transfer, the money arriving in savings and
+    the money leaving checking, and with no destination no rule (sign,
+    subtype, pairing) can tell which side is the fund. Summed, a real
+    contribution nets to $0, a household that links only checking reads a
+    negative balance, and a withdrawal out of savings counts as the plan
+    paid. So the plan still reduces surplus and rides the forecast, and
+    progress stays null until the user picks the account. The balance
+    planner saves the account-less shape ({name, monthly_plan}) on
+    purpose, so this is common, not an edge."""
+    return not g.get("account_id")
+
+
+def needs_account(g: dict) -> bool:
+    """A goal the user gave match words but no account: it reads as
+    plan-only (see `is_plan_only`), and the clients prompt for the account
+    the money lands in rather than presenting it as a deliberate plan."""
+    return not g.get("account_id") and any(
         str(t).strip() for t in (g.get("tokens") or []))
 
 
@@ -71,6 +109,38 @@ def _like_token(tok: str) -> str:
     not depend on a server setting."""
     esc = tok.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return f"%{esc}%"
+
+
+def _owner_scope(conn, g: dict) -> tuple[str, list]:
+    """The money a goal may count, as (SQL fragment, params) on alias `t`.
+
+    A goal on a business-entity account belongs to that business: the
+    household-only predicate would drop every row in the very account the
+    person chose, and the goal would read $0 saved while the money sits
+    there. So the goal counts its OWNER's money — that entity's rows when
+    its account is an entity's, the household's otherwise."""
+    acc = g.get("account_id")
+    ent = None
+    if acc:
+        row = conn.execute("SELECT entity_id FROM accounts WHERE id=%s",
+                           (acc,)).fetchone()
+        ent = row["entity_id"] if row else None
+    if ent:
+        return ("""
+  AND (t.entity_id = %s OR (t.entity_id IS NULL AND t.account_id IN
+       (SELECT id FROM accounts WHERE entity_id = %s)))""", [ent, ent])
+    from . import budget as _b   # late: avoid a circular import at load
+    return _b.PERSONAL_ONLY_SQL, []
+
+
+def _goal_account(conn, g: dict) -> str | None:
+    """The account a goal reads, as of now: its pinned account, or the
+    effective primary of that account's link group. A goal pinned to one
+    source of a dual-sourced savings account would otherwise read $0 the
+    moment that source fails over and becomes the group's shadow, since
+    every query below drops shadow rows."""
+    from . import links
+    return links.effective_account(conn, g.get("account_id"))
 
 
 def _matched_net(conn, g: dict, since: dt.date | None = None,
@@ -93,9 +163,10 @@ def _matched_net(conn, g: dict, since: dt.date | None = None,
     if shadows:
         where.append("NOT (t.account_id = ANY(%s))")
         params.append(shadows)
-    if g.get("account_id"):
+    acc = _goal_account(conn, g)
+    if acc:
         where.append("t.account_id = %s")
-        params.append(g["account_id"])
+        params.append(acc)
     for tok in (g.get("tokens") or []):
         tok = str(tok).strip().lower()
         if tok:
@@ -109,11 +180,11 @@ def _matched_net(conn, g: dict, since: dt.date | None = None,
     if until is not None:
         where.append("t.date <= %s")
         params.append(until)
-    from . import budget as _b   # late: avoid a circular import at load
+    scope, scope_params = _owner_scope(conn, g)
     row = conn.execute(
         f"SELECT COALESCE(SUM(-t.amount), 0) AS net FROM transactions t "
-        f"WHERE {' AND '.join(where)}" + _b.PERSONAL_ONLY_SQL,
-        params).fetchone()
+        f"WHERE {' AND '.join(where)}" + scope,
+        params + scope_params).fetchone()
     return float(row["net"])
 
 
@@ -127,16 +198,17 @@ def matched_net(conn, cfg: dict, g: dict, since: dt.date | None = None,
     goes to the FIRST token-less goal in config order; later token-less
     siblings read 0 (first-claim partition — deterministic, never
     double-counts; give later goals tokens to scope them properly)."""
-    acc = g.get("account_id")
+    acc = _goal_account(conn, g)
     has_tokens = any(str(t).strip() for t in (g.get("tokens") or []))
     if not acc or has_tokens:
         return _matched_net(conn, g, since=since, until=until)
-    tokenless = [s for s in goals(cfg)
-                 if s.get("account_id") == acc
-                 and not any(str(t).strip() for t in (s.get("tokens") or []))]
-    tokened = [s for s in goals(cfg)
-               if s.get("account_id") == acc
-               and any(str(t).strip() for t in (s.get("tokens") or []))]
+    # siblings are goals reading the same account now: two goals pinned to
+    # the two sources of one linked account share it like any other pair
+    same = [s for s in goals(cfg) if _goal_account(conn, s) == acc]
+    tokenless = [s for s in same
+                 if not any(str(t).strip() for t in (s.get("tokens") or []))]
+    tokened = [s for s in same
+               if any(str(t).strip() for t in (s.get("tokens") or []))]
     if len(tokenless) <= 1 and not tokened:
         return _matched_net(conn, g, since=since, until=until)
     if tokenless and str(tokenless[0].get("name")) != str(g.get("name")):
@@ -169,9 +241,17 @@ def _checking_side_rows(conn, g: dict, plan: float,
     if shadows:
         where.append("NOT (t.account_id = ANY(%s))")
         params.append(shadows)
-    if g.get("account_id"):
-        where.append("t.account_id != %s")
-        params.append(g["account_id"])
+    acc = _goal_account(conn, g)
+    if not acc:
+        # with no destination there is no "other than the destination", so
+        # every matching outflow would read as this goal's checking leg,
+        # withdrawals out of savings included; callers gate on is_plan_only,
+        # and one that forgets counts nothing rather than everything
+        return []
+    # the destination and every source of it: a linked twin's legs are
+    # the destination's own rows seen twice, never a checking leg
+    where.append("NOT (t.account_id = ANY(%s))")
+    params.append(sorted({acc, g["account_id"]}))
     tokens = [str(t).strip().lower() for t in (g.get("tokens") or [])
               if str(t).strip()]
     for tok in tokens:
@@ -188,12 +268,14 @@ def _checking_side_rows(conn, g: dict, plan: float,
     if until is not None:
         where.append("t.date <= %s")
         params.append(until)
-    from . import budget as _b   # late: avoid a circular import at load
+    # the funding leg comes from the goal owner's own accounts: a business
+    # saving into its own savings pays from its own checking
+    scope, scope_params = _owner_scope(conn, g)
     rows = conn.execute(
         f"SELECT t.id AS id, t.amount AS amount FROM transactions t "
         f"LEFT JOIN accounts a ON a.id = t.account_id "
-        f"WHERE {' AND '.join(where)}" + _b.PERSONAL_ONLY_SQL,
-        params).fetchall()
+        f"WHERE {' AND '.join(where)}" + scope,
+        params + scope_params).fetchall()
     return [(str(r["id"]), float(r["amount"])) for r in rows]
 
 
@@ -217,12 +299,12 @@ def checking_side_out(conn, cfg: dict, g: dict, plan: float,
     are given tokens to scope them. Rows a TOKENED sibling already claims
     are removed by row id, so the tokened goal's own transfer cannot be
     inferred a second time by an amount-matching neighbour."""
-    acc = g.get("account_id")
+    acc = _goal_account(conn, g)
     has_tokens = any(str(t).strip() for t in (g.get("tokens") or []))
     if not acc or has_tokens:
         return round(sum(a for _, a in _checking_side_rows(
             conn, g, plan, since, until)), 2)
-    siblings = [s for s in goals(cfg) if s.get("account_id") == acc]
+    siblings = [s for s in goals(cfg) if _goal_account(conn, s) == acc]
     tokenless = [s for s in siblings
                  if not any(str(t).strip() for t in (s.get("tokens") or []))]
     tokened = [s for s in siblings
@@ -258,6 +340,10 @@ def posted_for_plan(conn, cfg: dict, g: dict, since: dt.date,
     the whole ledger. The caller that owns the request creates the dict and
     passes it to all three; nothing caches across requests, so a memo can
     never serve a number the ledger has since moved past."""
+    if is_plan_only(g):
+        # nothing to verify against (see is_plan_only): every reader gates on
+        # it already, and a future one that does not still counts nothing
+        return 0.0
     plan = float(g.get("monthly_plan") or 0)
     key = (str(g.get("name")), g.get("account_id"),
            tuple(str(t) for t in (g.get("tokens") or [])), plan, since, until)
@@ -275,12 +361,26 @@ def posted_for_plan(conn, cfg: dict, g: dict, since: dt.date,
     return out
 
 
+def month_saved(conn, cfg: dict, g: dict, since: dt.date, until: dt.date,
+                memo: dict | None = None) -> float:
+    """What one calendar month (or the elapsed part of it) put toward a
+    goal, as the Month and Year lenses and Today's this-month row show it:
+    `posted_for_plan` over that window, so the month row and the sweep line
+    beside it can never disagree."""
+    return posted_for_plan(conn, cfg, g, since=since, until=until, memo=memo)
+
+
 def progress(conn, cfg: dict, today: dt.date | None = None,
              memo: dict | None = None) -> list[dict]:
     """Per-goal progress + pace. Pace projects from the trailing 3 months
     of actual contributions; with a target_date it reports on/off pace,
     without one it estimates the arrival month. `memo` is the optional
-    request-scoped cache described on `posted_for_plan`."""
+    request-scoped cache described on `posted_for_plan`.
+
+    Saved is the goal's original measure, start_balance plus the
+    destination's ledger net, because every rule that also added inferred
+    checking legs into the total counted some household's unrelated
+    transfers, or a withdrawal, as money saved."""
     # "this month" and the pace window are calendar facts about where the
     # household lives, and cfg carries its zone — the container's own day
     # is often UTC on a server and flips a month early for half the world
@@ -297,6 +397,7 @@ def progress(conn, cfg: dict, today: dt.date | None = None,
                 "monthly_plan": round(float(g.get("monthly_plan") or 0), 2),
                 "saved": None, "rate_90d": None, "pct": None,
                 "eta": None, "on_pace": None, "plan_only": True,
+                "needs_account": needs_account(g),
                 "mode": mode, "swept_this_month": None,
                 "sweep_satisfied": None,
             })
@@ -349,6 +450,7 @@ def progress(conn, cfg: dict, today: dt.date | None = None,
             "pct": (round(min(100.0, 100 * saved / target), 1)
                     if target > 0 else None),
             "eta": eta, "on_pace": on_pace, "plan_only": False,
+            "needs_account": False,
             "mode": mode, "swept_this_month": swept,
             "sweep_satisfied": satisfied,
         })

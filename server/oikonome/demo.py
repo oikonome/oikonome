@@ -52,7 +52,10 @@ CLOUD = "PixelCloud Storage"
 # Every name, the EIN and the agent are FICTIONAL, like the rest of the
 # demo: this instance is public.
 BIZ_NAME = "Fernwood Studio LLC"
-BIZ_EIN = "88-0142596"                    # synthetic, not a real EIN
+# The IRS has never issued an EIN with the prefix 00, so this one is
+# well-formed for every screen that shows or masks it and can belong to no
+# real business; a plausible prefix would be someone's tax ID by chance.
+BIZ_EIN = "00-0142596"
 BIZ_AGENT = "Cascade Registered Agents LLC"
 BIZ_STATE = "OR"
 BIZ_CLIENTS = ["Harbor Point Media", "Lantern Health Group",
@@ -874,15 +877,25 @@ def refresh_demo_household(viewer_email: str, *, years: int = 10,
                              f"{DEMO_HOUSEHOLD_NAME!r} — refusing")
         tid = str(row["tenant_id"])
 
-        # Every item must be one of the generator's. This is the guard that
-        # makes the command safe to point at a live multi-tenant host: a
-        # household with a real Plaid item cannot pass it.
-        real = [r["id"] for r in admin.execute(
-            "SELECT id FROM items WHERE tenant_id = %s", (tid,)).fetchall()
-            if not str(r["id"]).startswith("demo-")]
-        if real:
-            raise SystemExit(f"tenant {tid} has non-synthetic items "
-                             f"({len(real)}) — refusing")
+        # No item may hold a live credential. This is the guard that makes
+        # the command safe to point at a live multi-tenant host: a household
+        # with a real Plaid item cannot pass it, and wiping one here would
+        # orphan the link upstream (still billed, never released).
+        #
+        # What a visitor adds by hand is NOT such an item: a manual account,
+        # or a file import, files its rows under a credential-free item
+        # ('manual', 'csv', ...). Those are household data like any other
+        # row and the wipe below takes them. Refusing on them would let one
+        # visitor's added account block every later refresh.
+        from .sync.base import LIVE_PULL_AGGREGATORS
+        live = [r["id"] for r in admin.execute(
+            "SELECT id, aggregator, access_token IS NOT NULL AS keyed "
+            "FROM items WHERE tenant_id = %s", (tid,)).fetchall()
+            if not str(r["id"]).startswith("demo-")
+            and (r["keyed"] or r["aggregator"] in LIVE_PULL_AGGREGATORS)]
+        if live:
+            raise SystemExit(f"tenant {tid} holds live connections "
+                             f"({len(live)}) — refusing")
 
         seed = seed if seed is not None else secrets.randbelow(1_000_000)
         rng = random.Random(seed)
@@ -923,6 +936,17 @@ def refresh_demo_household(viewer_email: str, *, years: int = 10,
             for t in ordered:
                 admin.execute(sql.SQL("DELETE FROM {} WHERE tenant_id = %s")
                               .format(sql.Identifier(t)), (tid,))
+            # Web-push subscriptions are control plane and stay, except
+            # those of the shared demonstration login: each of those is a
+            # channel to some past visitor's browser that every alert for
+            # this household would still be sent down, and the refresh is
+            # the point the household is handed to the next visitor. (The
+            # native app's device tokens stay: they are the sessions the
+            # keep-list above exists for, and they expire on their own.)
+            admin.execute(
+                "DELETE FROM push_subscriptions WHERE tenant_id = %s "
+                "AND user_id IN (SELECT id FROM users WHERE tenant_id = %s "
+                "AND second_factor_waived)", (tid, tid))
             # an add-on's rows are kept above so a crash here cannot lose
             # them, and re-stamped here so the household starts from the
             # state the gate wants, whatever the last run left behind

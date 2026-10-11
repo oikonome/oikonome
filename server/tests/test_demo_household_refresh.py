@@ -100,9 +100,12 @@ class DemoHouseholdRefreshTests(unittest.TestCase):
                 "FROM transactions").fetchone()
             # the current month is the whole point: opening the app must
             # not land on an empty Today and a zeroed Budget
+            # the refresh places rows by Python's local date; Postgres's
+            # current_date is UTC, which is already next month for a few
+            # hours on the last evening of a month, so compare on one clock
             this_month = admin.execute(
-                "SELECT count(*) AS n FROM transactions "
-                "WHERE date >= date_trunc('month', current_date)").fetchone()
+                "SELECT count(*) AS n FROM transactions WHERE date >= %s",
+                (dt.date.today().replace(day=1),)).fetchone()
         finally:
             admin.close()
         self.assertGreaterEqual(fresh["m"], dt.date.today()
@@ -119,7 +122,8 @@ class DemoHouseholdRefreshTests(unittest.TestCase):
         home-screen widget's token, the browser's push subscription, a
         support consent, the invitations sent out — is left exactly as it
         was, or the phone widget and the notifications quietly stop after a
-        scheduled refresh."""
+        scheduled refresh. (The push subscription here is the owner's; the
+        shared login's own are dropped, tested below.)"""
         import datetime as dt
 
         from oikonome import demo
@@ -129,6 +133,9 @@ class DemoHouseholdRefreshTests(unittest.TestCase):
             uid = admin.execute(
                 "SELECT id FROM users WHERE email = %s",
                 (self.VIEWER,)).fetchone()["id"]
+            owner = admin.execute(
+                "SELECT id FROM users WHERE email = 'owner@example.com'"
+            ).fetchone()["id"]
             later = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=5)
             admin.execute(
                 "INSERT INTO widget_tokens (token_hash, device_id, user_id, "
@@ -137,7 +144,8 @@ class DemoHouseholdRefreshTests(unittest.TestCase):
             admin.execute(
                 "INSERT INTO push_subscriptions (user_id, tenant_id, "
                 "endpoint, p256dh, auth) VALUES (%s, %s, "
-                "'https://push.example.com/x', 'p', 'a')", (uid, tid))
+                "'https://push.example.com/x', 'p', 'a') "
+                "ON CONFLICT (endpoint) DO NOTHING", (owner, tid))
             admin.execute(
                 "INSERT INTO support_consents (tenant_id, expires_at) "
                 "VALUES (%s, %s)", (tid, later))
@@ -160,6 +168,57 @@ class DemoHouseholdRefreshTests(unittest.TestCase):
             demo.refresh_demo_household(self.VIEWER, years=2, seed=7)
             self.assertEqual(counts(), before)
             self.assertTrue(all(before.values()), before)
+        finally:
+            admin.close()
+
+    def test_refresh_drops_the_shared_logins_push_subscriptions(self):
+        """A browser subscribed by the shared login belongs to whichever
+        visitor held it then; the household handed to the next visitor
+        must not keep sending its alerts to that browser."""
+        from oikonome import demo
+        tid = self._ensure_seeded()["tenant_id"]
+        admin = tenancy.admin_connect()
+        try:
+            uid = admin.execute(
+                "SELECT id FROM users WHERE email = %s",
+                (self.VIEWER,)).fetchone()["id"]
+            admin.execute(
+                "INSERT INTO push_subscriptions (user_id, tenant_id, "
+                "endpoint, p256dh, auth) VALUES (%s, %s, "
+                "'https://push.example.com/visitor', 'p', 'a')", (uid, tid))
+            admin.commit()
+            demo.refresh_demo_household(self.VIEWER, years=2, seed=7)
+            n = admin.execute(
+                "SELECT count(*) AS n FROM push_subscriptions "
+                "WHERE user_id = %s", (uid,)).fetchone()["n"]
+            self.assertEqual(n, 0)
+        finally:
+            admin.close()
+
+    def test_refresh_takes_what_a_visitor_added_by_hand(self):
+        """A manual account or a file import made on the shared login is
+        household data: the refresh replaces it like any other row, rather
+        than refusing and leaving the household stale for good."""
+        from oikonome import demo
+        tid = self._ensure_seeded()["tenant_id"]
+        admin = tenancy.admin_connect()
+        try:
+            for item, agg in (("manual", "manual"), ("csv:visitor", "csv")):
+                admin.execute(
+                    "INSERT INTO items (id, tenant_id, aggregator, "
+                    "institution_name, access_token) "
+                    "VALUES (%s, %s, %s, 'Visitor', NULL)", (item, tid, agg))
+            admin.execute(
+                "INSERT INTO accounts (id, tenant_id, item_id, name, type, "
+                "balance_current) VALUES ('manual:visitor', %s, 'manual', "
+                "'Visitor cash', 'depository', 12.5)", (tid,))
+            admin.commit()
+            out = demo.refresh_demo_household(self.VIEWER, years=2, seed=7)
+            self.assertTrue(out["refreshed"])
+            left = admin.execute(
+                "SELECT count(*) AS n FROM items WHERE tenant_id = %s "
+                "AND id NOT LIKE 'demo-%%'", (tid,)).fetchone()["n"]
+            self.assertEqual(left, 0)
         finally:
             admin.close()
 
@@ -211,6 +270,25 @@ class DemoHouseholdRefreshTests(unittest.TestCase):
                 "SELECT count(*) AS n FROM transactions").fetchone()["n"]
             self.assertGreater(n, 0)
             admin.execute("DELETE FROM items WHERE id = 'real-plaid-item'")
+            admin.commit()
+        finally:
+            admin.close()
+
+    def test_refresh_refuses_an_item_holding_a_credential(self):
+        """Whatever its aggregator, an item that holds a key is a live
+        link the wipe would orphan upstream."""
+        from oikonome import demo
+        admin = tenancy.admin_connect()
+        try:
+            tid = self._ensure_seeded()["tenant_id"]
+            admin.execute(
+                "INSERT INTO items (id, tenant_id, aggregator, "
+                "institution_name, access_token) VALUES ('coinbase-x', %s, "
+                "'coinbase', 'Coinbase', 'opaque-key-material')", (tid,))
+            admin.commit()
+            with self.assertRaises(SystemExit):
+                demo.refresh_demo_household(self.VIEWER, years=2)
+            admin.execute("DELETE FROM items WHERE id = 'coinbase-x'")
             admin.commit()
         finally:
             admin.close()

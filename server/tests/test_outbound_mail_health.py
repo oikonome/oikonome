@@ -170,7 +170,7 @@ class MailHealthTests(unittest.TestCase):
     def test_probe_without_smtp_is_a_skip(self):
         # no relay anywhere: neither the env nor any household's Settings
         with patch.dict(os.environ, {"OIKONOME_SMTP_HOST": ""}), \
-                patch.object(mailhealth, "_settings_relay", return_value=None):
+                patch.object(mailhealth, "_settings_relays", return_value=[]):
             self.assertIn("skipped", mailhealth.run_probe())
 
     def test_self_host_probes_the_settings_relay_that_sends_use(self):
@@ -209,6 +209,10 @@ class MailHealthTests(unittest.TestCase):
                 return False
             def ehlo(self):
                 pass
+            def starttls(self, context=None):
+                pass
+            def login(self, user, password):
+                pass
 
         env = {"OIKONOME_SMTP_HOST": "relay.env-side.example",
                "OIKONOME_SMTP_PORT": "2525", "OIKONOME_HOSTED": ""}
@@ -218,9 +222,148 @@ class MailHealthTests(unittest.TestCase):
                 patch.object(mailhealth.smtplib, "SMTP", _SMTP):
             self.assertTrue(mailhealth.configured())
             self.assertEqual(mailhealth.run_probe(), "ok")
-        self.assertEqual(dialled, [2526])
+        # the Settings relay is dialled (the env one too, when another
+        # household on the instance still sends through it)
+        self.assertIn(2526, dialled)
         st = mailhealth.status(self.admin)
         self.assertEqual(st["probe"]["host"], "relay.settings-side.example")
+
+    def test_every_households_relay_is_probed_not_only_the_oldest(self):
+        """Two households, two relays: a dead second relay must turn the
+        probe red — probing only the oldest household's relay reads green
+        while every send from the other household fails."""
+        from oikonome.web import netguard
+        from .util import make_db, write_config
+        tids = []
+        for host, port, created in (
+                ("relay.first.example", 2531, "1990-01-01"),
+                ("relay.second.example", 2532, "1991-01-01")):
+            conn = make_db()
+            self.addCleanup(conn.close)
+            tid = str(conn.execute(
+                "SELECT current_setting('app.tenant_id') AS t"
+            ).fetchone()["t"])
+            write_config(conn, smtp_host=host, smtp_port=port,
+                         smtp_starttls=False)
+            self.admin.execute("UPDATE tenants SET created_at=%s "
+                               "WHERE id=%s", (created, tid))
+            tids.append(tid)
+
+        def _retire():
+            admin = tenancy.admin_connect()
+            try:
+                admin.execute("UPDATE tenants SET status='deleting' "
+                              "WHERE id = ANY(%s)", (tids,))
+            finally:
+                admin.close()
+        self.addCleanup(_retire)
+        dialled = []
+
+        class _SMTP:
+            def __init__(self, host, port, timeout=None):
+                dialled.append(port)
+                if port == 2532:
+                    raise OSError("connection refused")
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def ehlo(self):
+                pass
+            def starttls(self, context=None):
+                pass
+            def login(self, user, password):
+                pass
+
+        env = {"OIKONOME_SMTP_HOST": "", "OIKONOME_HOSTED": ""}
+        with patch.dict(os.environ, env), \
+                patch.object(netguard, "check_host", lambda *a, **k: None), \
+                patch.object(netguard, "pinned_smtp_host", lambda h: h), \
+                patch.object(mailhealth.smtplib, "SMTP", _SMTP):
+            self.assertTrue(mailhealth.run_probe().startswith("FAIL"))
+        self.assertIn(2531, dialled)
+        self.assertIn(2532, dialled)
+        st = mailhealth.status(self.admin)
+        self.assertTrue(st["failing"])
+        self.assertEqual(st["probe"]["host"], "relay.second.example")
+        # other households on the shared test database may carry relays
+        # of their own, so the count is a floor
+        self.assertGreaterEqual(st["probe"]["relays"], 2)
+        self.assertEqual(st["probe"]["relays_failing"], 1)
+
+    def test_one_relay_shared_by_two_households_is_dialled_once(self):
+        from .util import make_db, write_config
+        tids = []
+        for _ in range(2):
+            conn = make_db()
+            self.addCleanup(conn.close)
+            tids.append(str(conn.execute(
+                "SELECT current_setting('app.tenant_id') AS t"
+            ).fetchone()["t"]))
+            write_config(conn, smtp_host="relay.shared.example",
+                         smtp_port=2533, smtp_starttls=False)
+
+        def _retire():
+            admin = tenancy.admin_connect()
+            try:
+                admin.execute("UPDATE tenants SET status='deleting' "
+                              "WHERE id = ANY(%s)", (tids,))
+            finally:
+                admin.close()
+        self.addCleanup(_retire)
+        with patch.dict(os.environ, {"OIKONOME_HOSTED": ""}):
+            hosts = [(s["host"], s["port"]) for s in mailhealth.relays()]
+        self.assertEqual(hosts.count(("relay.shared.example", 2533)), 1)
+
+    def test_env_relay_is_probed_even_when_every_household_has_its_own(self):
+        """Recovery mail (reset, unlock, factor-cleared) always goes through
+        the env relay when one is set, whatever the households saved in
+        Settings. So a dead env relay must turn the probe red even when
+        every household sends its reports through a working Settings relay
+        — otherwise every recovery link is lost while health reads green.
+        (No household on the instance sends reports through the env relay:
+        the test database is shared, so that is stated rather than built.)"""
+        from oikonome.web import netguard
+        settings = {"configured": True, "host": "relay.settings-only.example",
+                    "port": 2534, "user": None, "password": None,
+                    "starttls": False, "no_verify": False}
+        dialled = []
+
+        class _SMTP:
+            def __init__(self, host, port, timeout=None):
+                dialled.append(port)
+                if port == 2535:
+                    raise OSError("connection refused")
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def ehlo(self):
+                pass
+            def starttls(self, context=None):
+                pass
+            def login(self, user, password):
+                pass
+
+        env = {"OIKONOME_SMTP_HOST": "relay.env-dead.example",
+               "OIKONOME_SMTP_PORT": "2535", "OIKONOME_SMTP_STARTTLS": "0",
+               "OIKONOME_HOSTED": ""}
+        with patch.dict(os.environ, env), \
+                patch.object(mailhealth, "_settings_relays",
+                             return_value=[settings]), \
+                patch.object(mailhealth, "_env_relay_in_use", create=True,
+                             return_value=False), \
+                patch.object(netguard, "check_host", lambda *a, **k: None), \
+                patch.object(netguard, "pinned_smtp_host", lambda h: h), \
+                patch.object(mailhealth.smtplib, "SMTP", _SMTP):
+            hosts = [s["host"] for s in mailhealth.relays()]
+            self.assertIn("relay.env-dead.example", hosts)
+            self.assertTrue(mailhealth.run_probe().startswith("FAIL"))
+        self.assertIn(2534, dialled)
+        self.assertIn(2535, dialled)
+        st = mailhealth.status(self.admin)
+        self.assertTrue(st["failing"])
+        self.assertEqual(st["probe"]["host"], "relay.env-dead.example")
 
     def test_send_failure_is_recorded_by_report(self):
         from oikonome.web import report

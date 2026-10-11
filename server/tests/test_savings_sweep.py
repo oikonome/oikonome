@@ -418,5 +418,21 @@ class SweepModeApiTests(unittest.TestCase):
         self.assertEqual(r.status_code, 400)
 
 
+    def test_goal_match_words_of_the_wrong_shape_are_a_clear_400(self):
+        """An object, a number or a bare string where the list of match
+        words belongs is refused with a message naming the field, never a
+        500, and the goals already saved are left as they were."""
+        ok = {"name": "Kept", "target": 900, "monthly_plan": 50,
+              "account_id": "chk", "tokens": ["rainy"], "start_balance": 0}
+        self.assertEqual(self._save(ok).status_code, 200)
+        for bad in ({"a": 1}, 5, "rainy"):
+            r = self._save({"name": "X", "target": 100, "tokens": bad})
+            self.assertEqual(r.status_code, 400, f"{bad!r}: {r.text}")
+            self.assertIn("tokens", r.text)
+        self.assertEqual([g["name"] for g in self._goals()], ["Kept"])
+        r = self._save({"name": "X", "target": 100, "tokens": None})
+        self.assertEqual(r.status_code, 200, r.text)
+
+
 if __name__ == "__main__":
     unittest.main()

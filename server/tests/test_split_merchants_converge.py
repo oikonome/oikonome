@@ -74,10 +74,10 @@ class SplitMerchantRepairTests(unittest.TestCase):
 
         Which half reached the ledger first decides which merchant is the
         older row and which name the descriptor group meets first, so both
-        orders are worth protecting. Unenriched-first still splits under
-        the current resolver — an enriched group is keyed on the
-        aggregator's string and never consults the descriptor — while
-        enriched-first is the shape only a pre-repair ledger carries."""
+        orders are worth protecting. Neither order splits under the
+        current resolver (an enriched name about to mint asks the
+        descriptor first), so both halves are split by hand into the
+        shape a ledger resolved by an older resolver carries."""
         if enriched_first:
             add_txn(self.conn, "2026-07-01", 43.15, DESCRIPTOR,
                     merchant="example kite supply", txn_id="chg")
@@ -90,6 +90,19 @@ class SplitMerchantRepairTests(unittest.TestCase):
             add_txn(self.conn, "2026-07-02", 43.15, DESCRIPTOR,
                     merchant="example kite supply", txn_id="chg")
             merchant_identity.resolve(self.conn)
+            mid = self.conn.execute(
+                "INSERT INTO merchants (name, name_source) "
+                "VALUES ('Example Kite Supply','layer1') RETURNING id"
+            ).fetchone()["id"]
+            self.conn.execute(
+                "INSERT INTO merchant_canonical (raw_merchant, canonical, method, "
+                "                                as_of, merchant_id) "
+                "VALUES ('example kite supply','Example Kite Supply','layer1',"
+                "        now(),%s) "
+                "ON CONFLICT (tenant_id, raw_merchant) DO UPDATE SET "
+                "merchant_id=EXCLUDED.merchant_id", (mid,))
+            self.conn.execute("UPDATE transactions SET merchant_id=%s "
+                              " WHERE id='chg'", (mid,))
         a, b = self._merchant_of("chg"), self._merchant_of("ref")
         self.assertNotEqual(a["id"], b["id"],
                             "fixture did not produce a split")

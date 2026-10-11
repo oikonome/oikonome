@@ -19,10 +19,11 @@ from __future__ import annotations
 
 import datetime as dt
 import itertools
+import math
 import re
 from dataclasses import dataclass
 
-from .compat import as_date
+from .compat import MAX_AMOUNT, as_date
 
 
 @dataclass(frozen=True)
@@ -97,6 +98,14 @@ def _split_combo(cands: list[dict], want_cents: int,
     return None
 
 
+def _usable(amount) -> bool:
+    try:
+        return (amount is not None and math.isfinite(float(amount))
+                and abs(float(amount)) <= MAX_AMOUNT)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def run_match(conn, store: Store) -> dict:
     """Match the store's transactions against its purchase records."""
     prefix = f"{store.label} - "
@@ -129,6 +138,12 @@ def run_match(conn, store: Store) -> dict:
         (shadows,))]
     store_txns = [p for p in plaid_rows
                   if store.name_re.search(f"{p['name'] or ''} {p['merchant_name'] or ''}")]
+    # Matching is in cents. A stored amount that is no sum of money (NULL,
+    # or past any real charge, written before the doors bounded it)
+    # overflows that conversion, and one such row would fail this pass for
+    # the whole household on every run; it is skipped instead.
+    records = [r for r in records if _usable(r["amount"])]
+    store_txns = [t for t in store_txns if _usable(t["amount"])]
 
     # Index records by absolute cent amount for exact-amount candidates
     by_cents: dict[int, list[dict]] = {}

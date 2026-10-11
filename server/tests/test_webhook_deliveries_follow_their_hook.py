@@ -12,6 +12,8 @@ import unittest
 import uuid
 from unittest import mock
 
+from psycopg.types.json import Jsonb
+
 from oikonome.engine.compat import jsonb
 from oikonome.notify import webhooks
 
@@ -56,14 +58,16 @@ class DeliveriesFollowTheirHookTests(unittest.TestCase):
     def test_a_refused_delivery_does_not_undo_the_callers_transaction(self):
         """emit never raises, so a door calls it inside its own transaction.
         A payload the database refuses (a NUL in a label is valid JSON but
-        not valid jsonb) must fail on its own: left to abort the caller's
+        not valid jsonb; the app's own encoder drops it, so this one is
+        encoded raw) must fail on its own: left to abort the caller's
         transaction, the caller's COMMIT would roll back the change the
         event was announcing."""
         with self.conn.transaction():
             self.conn.execute(
                 "UPDATE webhooks SET name='renamed' WHERE id=%s", (self.hook,))
-            self.assertEqual(webhooks.emit(
-                self.conn, "test.ping", {"label": "a\x00b"}), 0)
+            with mock.patch.object(webhooks, "jsonb", Jsonb):
+                self.assertEqual(webhooks.emit(
+                    self.conn, "test.ping", {"label": "a\x00b"}), 0)
             self.assertFalse(webhooks.wanted(self.conn, "no.such.event"))
         self.assertEqual(self.conn.execute(
             "SELECT name FROM webhooks WHERE id=%s",

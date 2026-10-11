@@ -16,9 +16,9 @@ interface Turn { id: number; q: string; a: string | null;
 
 const EXAMPLES = [
   "What's my net worth?",
-  "Where did my money go last month?",
-  "What bills are coming up?",
-  "Can I afford $2,000 this month?",
+  "Where does my money go?",
+  "How much did I spend on groceries this year?",
+  "What are my recurring bills?",
 ];
 
 export default function Assistant() {
@@ -68,10 +68,14 @@ export default function Assistant() {
                   contentContainerStyle={{ padding: 12, gap: 10 }}>
         {turns.length === 0 && (
           <Text style={s.center}>
-            {status.data?.local === false && status.data.host
+            {/* "on this instance" only when the server says the model is
+                local; an operator-configured remote backend has no host
+                named, and the answer still leaves the box */}
+            {status.data?.local === false
               ? `Ask about your money — answered from your own ledger; `
                 + `your questions and the figures they return go to `
-                + `${status.data.host}.`
+                + `${status.data.host
+                    || "the model host this instance is configured with"}.`
               : "Ask about your money — everything is answered from your "
                 + "own ledger, on this instance."}
           </Text>

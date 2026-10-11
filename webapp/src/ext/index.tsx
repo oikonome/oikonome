@@ -41,7 +41,7 @@ export const ext = {
   // reports one; `full` when the add door is refusing
   allowanceNote: (used: number, cap: number, full: boolean): ReactNode => (
     <><b>{used} of {cap}</b> institutions connected.
-      {full ? " Disconnect one below to free a slot." : ""}</>
+      {full ? " A bank you disconnect keeps its slot for 30 days." : ""}</>
   ),
   // links the footer and consent copy show when the operator publishes them
   legal: { privacy: null as string | null, terms: null as string | null },

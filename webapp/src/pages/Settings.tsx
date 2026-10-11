@@ -4,12 +4,15 @@ import { Fragment, useEffect, useRef, useState,
 import { Link, NavLink, useNavigate, useParams } from "react-router";
 import { MxFlow, PlaidFlow, SimplefinFlow } from "../components/ConnectHub";
 import DemoLock from "../components/DemoLock";
-import { api, errText, mmdd, MOBILE_HOMES, WEB_HOMES,
+import { sharedLock } from "../sharedlogin";
+import { api, errText, mmdd, MOBILE_HOMES, NextCodeNeeded, WEB_HOMES,
          type ActivityPage, type ApiToken, type Invite, type Me, type Member,
          type MobileDevice, type NotifyStatus, type Session,
          type Settings as SettingsData, type TokenScope, type Webhook,
          type WebhookDelivery, type WebhookEvent } from "../api/client";
-import { patchQuery, removeFromList, saveSettings } from "../api/cache";
+import { patchQuery, removeFromList, saveSettings, SETTINGS_SAVES,
+         smsPauseNote, invalidateAfterRotation }
+  from "../api/cache";
 import ManageAccounts from "../components/ManageAccounts";
 import Doctor from "./Doctor";
 import Rules from "./Rules";
@@ -20,7 +23,13 @@ import { ext } from "../ext";
 // the add-on's account card, fixed for the life of the bundle
 const AccountCard = ext.account?.Card;
 import { deviceZone } from "../devicezone";
+import { EMAIL_KIND_LABEL, EMAIL_KINDS, kindOffNote, prefOn, withPref,
+         type EmailKind } from "../recipients";
+import { looksLikeMailbox, myDailyLine, NEED_BASE_URL, recipientDuplicate,
+         resendHeld }
+  from "../recipients";
 import { useNarrow } from "../narrow";
+import { localDayOf, rebaseKeyed } from "../moneymath";
 import { browserPushBlocked, disableBrowserPush, enableBrowserPush,
          ownPushEndpoint as ownPushEndpointShared } from "../push";
 
@@ -163,17 +172,81 @@ function NoHits() {
   );
 }
 
+interface Sched {
+  daily: { on: boolean; hour: number; sms: boolean; push: boolean;
+           summary: boolean };
+  monthly: { on: boolean; hour: number; sms: boolean; push: boolean };
+  yearly: { on: boolean; hour: number; sms: boolean; push: boolean };
+}
+// the stored schedule with every cadence and channel filled in
+const schedOf = (es: SettingsData["email_schedule"]): Sched => ({
+  daily: { on: es?.daily?.on ?? true, hour: es?.daily?.hour ?? 7,
+           sms: es?.daily?.sms ?? false, push: es?.daily?.push ?? false,
+           summary: es?.daily?.summary ?? false },
+  monthly: { on: es?.monthly?.on ?? false, hour: es?.monthly?.hour ?? 7,
+             sms: es?.monthly?.sms ?? false, push: es?.monthly?.push ?? false },
+  yearly: { on: es?.yearly?.on ?? false, hour: es?.yearly?.hour ?? 7,
+            sms: es?.yearly?.sms ?? false, push: es?.yearly?.push ?? false },
+});
+// The schedule saves whole and the form is a copy from when the page
+// opened, so a cadence edit is laid over the schedule stored NOW: only the
+// fields this edit changed move, and a change saved on another device
+// meanwhile is kept.
+const rebaseSched = (mine: Sched, base: Sched, live: Sched): Sched =>
+  rebaseKeyed<object>({ ...mine }, { ...base }, { ...live }) as unknown as Sched;
+
+// Settings switches whose save writes the whole stored view back. Two quick
+// taps (or two switches) could otherwise answer out of order, and the older
+// reply would put back a value the person had already changed — on screen,
+// or on the server when the second POST overtook the first. So the saves go
+// out one at a time in the same queue as the email grid and schedule, and
+// every tap not yet answered is drawn over whatever the cache holds, as the
+// email grid does. Once a key has nothing left in flight, `settled` hears
+// the stored value (to mirror it into other caches). Covers: Plaid's
+// recurring cross-check, merchant logos, feedback enabled.
+type SwitchKey = "plaid_recurring" | "merchant_logos" | "feedback_enabled";
+function useSettingSwitches(onError: (text: string) => void,
+                            settled?: (key: SwitchKey, on: boolean) => void) {
+  const qc = useQueryClient();
+  const pending = useRef<{ id: number; key: SwitchKey; on: boolean }[]>([]);
+  const [, redraw] = useState(0);
+  const nextId = useRef(0);
+  const save = useMutation({
+    mutationFn: (v: { key: SwitchKey; on: boolean }) =>
+      saveSettings(qc, { [v.key]: v.on }),
+    scope: SETTINGS_SAVES,
+    onMutate: (v) => {
+      const id = ++nextId.current;
+      pending.current = [...pending.current, { id, ...v }];
+      redraw((n) => n + 1);
+      return { id };
+    },
+    onError: (e) => {
+      onError(errText(e));
+      qc.invalidateQueries({ queryKey: ["settings"] });
+    },
+    onSettled: (_r, _e, v, ctx) => {
+      pending.current = pending.current.filter((x) => x.id !== ctx?.id);
+      redraw((n) => n + 1);
+      if (settled && !pending.current.some((x) => x.key === v.key)) {
+        const stored = qc.getQueryData<SettingsData>(["settings"])?.[v.key];
+        settled(v.key, stored !== false);
+      }
+    },
+  });
+  return {
+    /** what the switch shows: the newest unanswered tap, else the cache */
+    on: (key: SwitchKey, cached: boolean | null | undefined): boolean => {
+      const mine = pending.current.filter((x) => x.key === key).at(-1);
+      return mine ? mine.on : cached !== false;
+    },
+    set: (key: SwitchKey, on: boolean) => save.mutate({ key, on }),
+  };
+}
+
 export default function Settings() {
   const qc = useQueryClient();
   const q = useQuery({ queryKey: ["settings"], queryFn: api.settings });
-  interface Sched {
-    daily: { on: boolean; hour: number; sms: boolean; push: boolean;
-             summary: boolean };
-    weekly: { on: boolean; hour: number; weekday: number;
-              sms: boolean; push: boolean };
-    monthly: { on: boolean; hour: number; sms: boolean; push: boolean };
-    yearly: { on: boolean; hour: number; sms: boolean; push: boolean };
-  }
   const [form, setForm] = useState<{
     // a list, not a comma-joined string — the editor adds and
     // removes whole addresses, and the round trip through a joined string
@@ -188,6 +261,19 @@ export default function Settings() {
   const [notice, setNotice] = useState<{ text: string; bad?: boolean } | null>(
     null);
   const meQ = useQuery({ queryKey: ["me"], queryFn: api.me });
+  const switches = useSettingSwitches(
+    (text) => setNotice({ text, bad: true }),
+    (key, on) => {
+      // the avatars everywhere read the flag off ["me"], which has
+      // observers on every page, so it is patched rather than refetched
+      if (key === "merchant_logos")
+        patchQuery<Me>(qc, ["me"], { merchant_logos: on });
+      // the Feedback page keys its own gate off ["testing"]
+      if (key === "feedback_enabled") {
+        patchQuery(qc, ["testing"], { enabled: on });
+        qc.invalidateQueries({ queryKey: ["testing"] });
+      }
+    });
   // whether this household has the add-on's section (a hook of the add-on's,
   // fixed for the life of the bundle, so calling it here is unconditional)
   const useAccountSection = ext.account?.useEnabled ?? (() => false);
@@ -291,26 +377,7 @@ export default function Settings() {
         recipients: d.email_recipients ?? [],
         muted: d.email_muted ?? [],
         timezone: d.timezone ?? "",
-        sched: {
-          daily: { on: d.email_schedule?.daily?.on ?? true,
-                   hour: d.email_schedule?.daily?.hour ?? 7,
-                   sms: d.email_schedule?.daily?.sms ?? false,
-                   push: d.email_schedule?.daily?.push ?? false,
-                   summary: d.email_schedule?.daily?.summary ?? false },
-          weekly: { on: d.email_schedule?.weekly?.on ?? false,
-                    hour: d.email_schedule?.weekly?.hour ?? 7,
-                    weekday: d.email_schedule?.weekly?.weekday ?? 0,
-                    sms: d.email_schedule?.weekly?.sms ?? false,
-                    push: d.email_schedule?.weekly?.push ?? false },
-          monthly: { on: d.email_schedule?.monthly?.on ?? false,
-                     hour: d.email_schedule?.monthly?.hour ?? 7,
-                     sms: d.email_schedule?.monthly?.sms ?? false,
-                     push: d.email_schedule?.monthly?.push ?? false },
-          yearly: { on: d.email_schedule?.yearly?.on ?? false,
-                    hour: d.email_schedule?.yearly?.hour ?? 7,
-                    sms: d.email_schedule?.yearly?.sms ?? false,
-                    push: d.email_schedule?.yearly?.push ?? false },
-        },
+        sched: schedOf(d.email_schedule),
       });
     }
     // dataUpdatedAt is a dep because a rejected save refetches UNCHANGED
@@ -322,22 +389,30 @@ export default function Settings() {
   // (settingsSave bodies are partial anyway).
   // AUTO-SAVE: a change IS the save — adds, removes,
   // mutes and cadence toggles post as they happen; there is no Save
-  // button to remember. Every mutate carries the COMPLETE next form, so
-  // rapid changes are last-write-wins under the server's settings lock,
-  // and an error refetches so the controls snap back to server truth
-  // instead of showing a change that didn't take.
+  // button to remember. Each mutate posts ONLY the fields that edit
+  // changed. The form is seeded once and not re-seeded on a refetch, so
+  // every other field in it is a copy from when the page opened; posted
+  // along with an unrelated edit, the schedule or zone would put back a
+  // change made on another device, and the mute list would undo a
+  // member's own "turn off for me". An error refetches so the controls
+  // snap back to server truth instead of showing a change that didn't
+  // take. The mobile screen posts the same shapes (pure.recipientEditBody).
   type EmailForm = NonNullable<typeof form>;
+  // a schedule edit's form copy from just before it, by the body it posts
+  const schedBase = useRef(new WeakMap<object, Sched>());
   const saveEmail = useMutation({
     // saveSettings seeds ["settings"] with the view the server returns, so
     // the recipient badges flip on the response instead of a second fetch.
-    // The adds are named because the list is sent whole: the server keeps
-    // an address it has not seen before only when this edit added it, so
-    // a copy of the list older than a member's removal cannot put them
-    // back.
-    mutationFn: (f: EmailForm & { added?: string[] }) => saveSettings(qc, {
-      email_recipients: f.recipients, email_muted: f.muted,
-      email_recipients_added: f.added ?? [],
-      email_schedule: f.sched, timezone: f.timezone }),
+    mutationFn: async (body: Record<string, unknown>) => {
+      const base = schedBase.current.get(body);
+      if (!base) return saveSettings(qc, body);
+      const live = schedOf((await api.settings()).email_schedule);
+      return saveSettings(qc, { ...body, email_schedule:
+        rebaseSched(body.email_schedule as Sched, base, live) });
+    },
+    // one save at a time: each edit's read of the stored schedule must
+    // see the edit before it
+    scope: SETTINGS_SAVES,
     // what the schedule and zone were BEFORE the write, so success can
     // tell a recipient edit (moves nothing else) from a cadence or zone
     // change (moves the verdict and the calendar)
@@ -346,8 +421,22 @@ export default function Settings() {
       return { sched: JSON.stringify(s?.email_schedule ?? null),
                tz: s?.timezone ?? "" };
     },
-    onSuccess: (v, _f, prev) => {
+    onSuccess: (v, body, prev) => {
       setNotice({ text: "Saved." });
+      // the lists this save posted are now the server's: take them back
+      // from the reply, so the next edit starts from what is stored (the
+      // mute list especially, which may hold another member's opt-out)
+      const recips = "email_recipients_added" in body
+        || "email_recipients_removed" in body;
+      const mutes = "email_muted_add" in body || "email_muted_remove" in body;
+      if (mutes || recips)
+        setForm((f) => f && { ...f,
+          ...(recips ? { recipients: v.email_recipients ?? [] } : {}),
+          ...(mutes ? { muted: v.email_muted ?? [] } : {}) });
+      // show what was stored, keeping any edit made since this one went out
+      if (schedBase.current.has(body))
+        setForm((f) => f && { ...f, sched: rebaseSched(
+          f.sched, body.email_schedule as Sched, schedOf(v.email_schedule)) });
       if (JSON.stringify(v.email_schedule ?? null) !== prev?.sched
           || (v.timezone ?? "") !== prev?.tz) {
         qc.invalidateQueries({ queryKey: ["today"] });
@@ -364,10 +453,41 @@ export default function Settings() {
     // a newer edit supersedes a pending snap-back — its own save decides
     // again, so a stale refetch must not overwrite what was just typed
     emailResync.current = false;
-    const had = new Set((form?.recipients ?? []).map((r) => r.toLowerCase()));
-    const added = next.recipients.filter((r) => !had.has(r.toLowerCase()));
+    const prev = form;
     setForm(next);
-    saveEmail.mutate({ ...next, added });
+    if (!prev) return;
+    const low = (xs: string[]) => xs.map((x) => x.toLowerCase());
+    const same = (a: string[], b: string[]) =>
+      a.length === b.length && a.every((x, i) => x === b[i]);
+    const body: Record<string, unknown> = {};
+    if (!same(prev.recipients, next.recipients)) {
+      // only the addresses this edit added or took off, never the whole
+      // list: the form is a copy from when the page opened, and posted
+      // whole it would drop an address another device added since. The
+      // server applies these to the stored list.
+      const had = new Set(low(prev.recipients));
+      const has = new Set(low(next.recipients));
+      const on = next.recipients.filter((r) => !had.has(r.toLowerCase()));
+      const off = prev.recipients.filter((r) => !has.has(r.toLowerCase()));
+      if (on.length) body.email_recipients_added = on;
+      if (off.length) body.email_recipients_removed = off;
+    }
+    if (!same(low(prev.muted), low(next.muted))) {
+      // the toggle, applied to the freshest stored list rather than to the
+      // form's copy, so a mute set since the page opened survives
+      const was = new Set(low(prev.muted));
+      const now = new Set(low(next.muted));
+      const on = [...now].filter((m) => !was.has(m));
+      const off = [...was].filter((m) => !now.has(m));
+      if (on.length) body.email_muted_add = on;
+      if (off.length) body.email_muted_remove = off;
+    }
+    if (JSON.stringify(prev.sched) !== JSON.stringify(next.sched)) {
+      body.email_schedule = next.sched;
+      schedBase.current.set(body, prev.sched);
+    }
+    if (prev.timezone !== next.timezone) body.timezone = next.timezone;
+    if (Object.keys(body).length) saveEmail.mutate(body);
   };
   // Removing a member takes their address off the mail list server-side;
   // the email form must reload from that, or its next save would carry
@@ -396,7 +516,7 @@ export default function Settings() {
   const q2 = filter.trim().toLowerCase();
   const hit = (words: string) => q2 === "" || words.toLowerCase().includes(q2);
   const h = {
-    daily: hit("daily email verdict recipients schedule cadence weekly monthly report send email now"),
+    daily: hit("daily email verdict recipients schedule cadence monthly yearly report send email now"),
     smtp: hit("email delivery smtp host port password sender test"),
     conn: hit("connections providers plaid mx simplefin bank keys client "
               + "secret scripts manage accounts rename hide remove shared "
@@ -615,6 +735,13 @@ export default function Settings() {
           onClick={() => setFilter("")}>‹ All settings</Link>
   );
 
+  // The shared demonstration login (an owner whose password is handed out)
+  // is refused every change to the login itself and every grant that
+  // would outlive it. Those cards render switched off in place, each with
+  // the refusal's own sentence, rather than as buttons that can only 403.
+  const lockLogin = sharedLock(meQ.data, "login");
+  const lockGrant = sharedLock(meQ.data, "grant");
+
   if (viewer)
     return (
       <>
@@ -639,16 +766,22 @@ export default function Settings() {
               <MyEmailCard />
             </Sec>
             <Sec id="household" show={secOn("household")}>
-              <Show on={h.family}><FamilyCard /></Show>
+              <Show on={h.family}>
+                <DemoLock on={false} shared={lockGrant}><FamilyCard /></DemoLock>
+              </Show>
             </Sec>
             <Sec id="security" show={secOn("security")}>
+              <DemoLock on={false} shared={lockLogin}>
               <Show on={h.password}><PasswordCard /></Show>
               <Show on={h.totp}><TwoFactorCard /></Show>
               <Show on={h.passkeys}><PasskeysCard /></Show>
+              </DemoLock>
               {/* demo: the account is shared, so the session list is a roster
                   of strangers — hidden, and the API returns none either way */}
               {!meQ.data?.demo && <Show on={h.sessions}><SessionsCard /></Show>}
+              <DemoLock on={false} shared={lockLogin}>
               <LeaveHouseholdCard />
+              </DemoLock>
             </Sec>
             {searching && !ids.some((id) => secShow[id]) && <NoHits />}
           </div>)}
@@ -668,6 +801,12 @@ export default function Settings() {
   return (
     <>
       <h1>Settings</h1>
+      {q.data?.outbound_paused && (
+        <OutboundPausedBanner p={q.data.outbound_paused}
+          canResume={owner && !lockGrant} lock={owner ? lockGrant : null}
+          onResumed={() => qc.invalidateQueries({ queryKey: ["settings"] })}
+          onError={(text) => setNotice({ text, bad: true })} />
+      )}
       {demo && (
         <div className="note" style={{ borderColor: "var(--amber)",
               color: "var(--amber)" }}>
@@ -738,12 +877,18 @@ export default function Settings() {
             muted={form.muted}
             status={q.data.email_recipient_status ?? []}
             onChange={(recipients) => applyEmail({ ...form, recipients })}
-            onMutedChange={(muted) => applyEmail({ ...form, muted })} />
+            onMutedChange={(muted) => applyEmail({ ...form, muted })}
+            addLock={lockGrant} />
           <CadenceEditor sched={form.sched}
             onChange={(sched) => applyEmail({ ...form, sched })}
             timezone={form.timezone}
             onTimezone={(timezone) => applyEmail({ ...form, timezone })} />
         </div>
+        <EmailPrefsGrid status={q.data.email_recipient_status ?? []}
+          sending={{ daily: form.sched.daily.on,
+                     monthly: form.sched.monthly.on,
+                     yearly: form.sched.yearly.on }}
+          onError={(text) => setNotice({ text, bad: true })} />
         <div style={{ display: "flex", gap: ".5rem", flexWrap: "wrap",
                       marginTop: ".8rem", alignItems: "center" }}>
           {saveEmail.isPending && <span className="sub">saving…</span>}
@@ -762,7 +907,7 @@ export default function Settings() {
           it from. */}
       {!hosted && (
       <Show on={h.smtp}>
-      <DemoLock on={meQ.data?.demo}>
+      <DemoLock on={meQ.data?.demo} shared={lockGrant}>
       <SmtpCard data={q.data} onSaved={() => {
         setNotice({ text: "Email delivery settings saved." });
         // the card seeds ["settings"] from the save response itself; the
@@ -785,6 +930,9 @@ export default function Settings() {
       }} />
       </DemoLock>
       </Show>
+      {/* the plan may not include the cross-check; the server refuses the
+          setting then, so the box is not offered */}
+      {meQ.data?.features?.plaid_recurring !== false && (
       <Show on={h.conn}>
       <DemoLock on={meQ.data?.demo}>
       <div className="card" style={{ marginTop: "1rem" }}>
@@ -796,33 +944,21 @@ export default function Settings() {
           own — never applied without you.
         </div>
         <label className="check">
-          {/* the box is bound to the cached setting, so it flips the
-              moment it is clicked and the response re-seeds the view; a
-              rejected write says so, puts the old value back and refetches,
-              so the checkbox snaps back to server truth */}
-          <input type="checkbox" checked={q.data.plaid_recurring !== false}
-            onChange={(e) => {
-              const prev = q.data.plaid_recurring;
-              patchQuery<SettingsData>(qc, ["settings"],
-                                       { plaid_recurring: e.target.checked });
-              saveSettings(qc, { plaid_recurring: e.target.checked })
-                .catch((err) => {
-                  setNotice({ text: errText(err), bad: true });
-                  patchQuery<SettingsData>(qc, ["settings"],
-                                           { plaid_recurring: prev });
-                  qc.invalidateQueries({ queryKey: ["settings"] });
-                });
-            }} />
+          <input type="checkbox"
+            checked={switches.on("plaid_recurring", q.data.plaid_recurring)}
+            onChange={(e) => switches.set("plaid_recurring", e.target.checked)} />
           Cross-check bills against Plaid's recurring streams
         </label>
       </div>
       </DemoLock>
+      </Show>)}
+      <Show on={h.conn}>
       <DemoLock on={meQ.data?.demo}>
       <EnrichCard />
       </DemoLock>
       </Show>
       <Show on={h.tokens}>
-      <DemoLock on={meQ.data?.demo}>
+      <DemoLock on={meQ.data?.demo} shared={lockGrant}>
       <ScriptTokensCard />
       </DemoLock>
       </Show>
@@ -848,25 +984,12 @@ export default function Settings() {
           its details and where it has been seen.
         </div>
         <label className="check" style={{ marginTop: ".4rem" }}>
-          <input type="checkbox" checked={q.data.merchant_logos !== false}
+          <input type="checkbox"
+            checked={switches.on("merchant_logos", q.data.merchant_logos)}
             onChange={(e) => {
-              // flips at once in both caches — the avatars everywhere read
-              // the flag off ["me"], and that key has observers on every
-              // page, so it is patched rather than refetched
-              const on = e.target.checked;
-              const prev = q.data.merchant_logos;
-              patchQuery<SettingsData>(qc, ["settings"], { merchant_logos: on });
-              patchQuery<Me>(qc, ["me"], { merchant_logos: on });
-              saveSettings(qc, { merchant_logos: on })
-                .then((v) => patchQuery<Me>(qc, ["me"],
-                  { merchant_logos: v.merchant_logos !== false }))
-                .catch((err) => {
-                  setNotice({ text: errText(err), bad: true });
-                  patchQuery<SettingsData>(qc, ["settings"],
-                                           { merchant_logos: prev });
-                  patchQuery<Me>(qc, ["me"], { merchant_logos: prev !== false });
-                  qc.invalidateQueries({ queryKey: ["settings"] });
-                });
+              // the avatars flip on the tap too, not only the box
+              patchQuery<Me>(qc, ["me"], { merchant_logos: e.target.checked });
+              switches.set("merchant_logos", e.target.checked);
             }} />
           Show merchant logos <span className="mut">— on the ledger,
             merchants, spending and accounts; off for a plainer look
@@ -885,7 +1008,7 @@ export default function Settings() {
       <Show on={h.llm}>
       {/* the llm_* keys are demo-door keys — the server
           403s them, so show the card disabled-in-place like SMTP */}
-      <DemoLock on={meQ.data?.demo}>
+      <DemoLock on={meQ.data?.demo} shared={lockGrant}>
       <LlmCard data={q.data} hosted={hosted} onSaved={() => {
         // the card seeds ["settings"] from the save response itself
         setNotice({ text: "LLM settings saved." });
@@ -898,12 +1021,12 @@ export default function Settings() {
       <Sec id="integrations" show={secOn("integrations")}>
       {owner && (<>
       <Show on={h.webhooks}>
-      <DemoLock on={meQ.data?.demo}>
+      <DemoLock on={meQ.data?.demo} shared={lockGrant}>
       <WebhooksCard />
       </DemoLock>
       </Show>
       <Show on={h.readtokens}>
-      <DemoLock on={meQ.data?.demo}>
+      <DemoLock on={meQ.data?.demo} shared={lockGrant}>
       <ScriptTokensCard scope="read" />
       </DemoLock>
       </Show>
@@ -915,7 +1038,7 @@ export default function Settings() {
 
       <Sec id="household" show={secOn("household")}>
       <Show on={h.family}>
-      <DemoLock on={meQ.data?.demo}>
+      <DemoLock on={meQ.data?.demo} shared={lockGrant}>
       <FamilyCard onMemberRemoved={onMemberRemoved} />
       </DemoLock>
       </Show>
@@ -962,7 +1085,7 @@ export default function Settings() {
           the card would only invite confusion */}
       {!hosted && owner && (
       <Show on={h.move}>
-      <DemoLock on={meQ.data?.demo}>
+      <DemoLock on={meQ.data?.demo} shared={lockGrant}>
       <ConnectionsBackupCard onImported={() => {
         setNotice({ text: "Connections imported — run a sync to pull accounts." });
         // restores provider config and bank links, and nothing the ledger
@@ -984,24 +1107,9 @@ export default function Settings() {
           with the system-health bundle attached). Turn it off if you'd
           rather not see it.</p>
         <label className="check">
-          <input type="checkbox" checked={q.data.feedback_enabled !== false}
-            onChange={(e) => {
-              const on = e.target.checked;
-              const prev = q.data.feedback_enabled;
-              patchQuery<SettingsData>(qc, ["settings"], { feedback_enabled: on });
-              saveSettings(qc, { feedback_enabled: on })
-                .then(() => {
-                  // the Feedback page keys its own gate off ["testing"]
-                  patchQuery(qc, ["testing"], { enabled: on });
-                  qc.invalidateQueries({ queryKey: ["testing"] });
-                })
-                .catch((err) => {
-                  setNotice({ text: errText(err), bad: true });
-                  patchQuery<SettingsData>(qc, ["settings"],
-                                           { feedback_enabled: prev });
-                  qc.invalidateQueries({ queryKey: ["settings"] });
-                });
-            }} />
+          <input type="checkbox"
+            checked={switches.on("feedback_enabled", q.data.feedback_enabled)}
+            onChange={(e) => switches.set("feedback_enabled", e.target.checked)} />
           Feedback enabled on this instance
         </label>
       </div>
@@ -1042,7 +1150,7 @@ export default function Settings() {
 
       <Sec id="security" show={secOn("security")}>
       <Show on={h.email}>
-      <DemoLock on={meQ.data?.demo}>
+      <DemoLock on={meQ.data?.demo} shared={lockLogin}>
       <EmailCard current={meQ.data?.email} onChanged={() => {
         // the card patches ["me"] from the response; what a login
         // rotation ALSO empties are these lists, and they live on this
@@ -1052,21 +1160,22 @@ export default function Settings() {
         qc.invalidateQueries({ queryKey: ["devices"] });
         qc.invalidateQueries({ queryKey: ["tokens"] });
         qc.invalidateQueries({ queryKey: ["invites"] });
+        invalidateAfterRotation(qc);
       }} />
       </DemoLock>
       </Show>
       <Show on={h.password}>
-      <DemoLock on={meQ.data?.demo}>
+      <DemoLock on={meQ.data?.demo} shared={lockLogin}>
       <PasswordCard />
       </DemoLock>
       </Show>
       <Show on={h.totp}>
-      <DemoLock on={meQ.data?.demo}>
+      <DemoLock on={meQ.data?.demo} shared={lockLogin}>
       <TwoFactorCard />
       </DemoLock>
       </Show>
       <Show on={h.passkeys}>
-      <DemoLock on={meQ.data?.demo}>
+      <DemoLock on={meQ.data?.demo} shared={lockLogin}>
       <PasskeysCard />
       </DemoLock>
       </Show>
@@ -1079,20 +1188,24 @@ export default function Settings() {
       )}
       {meQ.data?.hosted && (
       <Show on={h.support}>
-      <DemoLock on={meQ.data?.demo}>
+      <DemoLock on={meQ.data?.demo} shared={lockGrant}>
       <SupportAccessCard owner={meQ.data?.role === "owner"} />
       </DemoLock>
       </Show>
       )}
       <Show on={h.deleteacct}>
-      <DemoLock on={meQ.data?.demo}>
+      <DemoLock on={meQ.data?.demo} shared={lockLogin}>
       <DeleteAccountCard owner={meQ.data?.role === "owner"} />
       </DemoLock>
       </Show>
       {/* the member's counterpart to Delete account: it removes THEIR
           login and nothing else. A viewer has always had it (their
           Settings renders it below); a member needs the same way out. */}
-      {!owner && <LeaveHouseholdCard />}
+      {!owner && (
+      <DemoLock on={false} shared={lockLogin}>
+      <LeaveHouseholdCard />
+      </DemoLock>
+      )}
       </Sec>
 
       {searching && !ids.some((id) => secShow[id]) && <NoHits />}
@@ -1641,18 +1754,55 @@ function EndpointsCard() {
 // a minute; the browser then navigates to it and saves the file. The
 // ticket is a FRESH-elevation route: the sheet asks again even inside an
 // open window, so the confirm here is only the are-you-sure.
+// how long the export card keeps asking for the ZIP's restore warnings
+const EXPORT_WARN_WAIT_MS = 120_000;
+
 function DataExportCard({ hosted }: { hosted: boolean }) {
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const [err, setErr] = useState<string | null>(null);
+  // what the server says a restore of the ZIP just saved would refuse
+  const [warn, setWarn] = useState<string[]>([]);
   const owner = me.data?.role === "owner";
+  // a newer click or leaving the page ends an earlier poll
+  const polls = useRef(0);
+  useEffect(() => () => { polls.current += 1; }, []);
   const get = useMutation({
-    mutationFn: (kind: "zip" | "dump") => {
+    mutationFn: async (kind: "zip" | "dump") => {
       if (!window.confirm("Download everything? This is your whole "
                           + "household's data leaving the instance."))
         throw new Error("cancelled");
-      return api.exportTicket(kind);
+      const r = await api.exportTicket(kind);
+      // A refusal at the download itself would replace this page with a
+      // bare error, so the same checks are asked first, here.
+      await api.exportPrecheck(kind, r.token);
+      // Both save straight from the navigation, so a large archive goes to
+      // disk instead of browser memory. The ZIP's restore warnings are read
+      // afterwards: the export before this one is noted first, so a newer
+      // record can be told apart without trusting this device's clock.
+      const before = kind === "zip" ? await api.exportLast() : null;
+      window.location.assign(r.url);
+      return before;
     },
-    onSuccess: (r) => { setErr(null); window.location.assign(r.url); },
+    onMutate: () => { setErr(null); setWarn([]); polls.current += 1; },
+    onSuccess: (before) => {
+      if (!before) return;
+      // The server records the warnings only once the whole archive is
+      // built, which for a large household with receipt images takes well
+      // past a few seconds, so the look backs off and keeps going for two
+      // minutes rather than reading a slow build as a clean one.
+      const run = polls.current;
+      const until = Date.now() + EXPORT_WARN_WAIT_MS;
+      let wait = 1500;
+      const look = async () => {
+        if (run !== polls.current) return;
+        const now = await api.exportLast();
+        if (run !== polls.current) return;
+        if (now?.at && now.at !== before.at) { setWarn(now.warnings); return; }
+        wait = Math.min(wait * 1.5, 15_000);
+        if (Date.now() + wait <= until) window.setTimeout(look, wait);
+      };
+      window.setTimeout(look, wait);
+    },
     onError: (e) => { if (!String(e).includes("cancelled")) setErr(errText(e)); },
   });
   const ready = !get.isPending;
@@ -1684,6 +1834,12 @@ function DataExportCard({ hosted }: { hosted: boolean }) {
           </button>
         )}
       </div>
+      {warn.length > 0 && (
+        <div className="note" style={{ display: "block", marginTop: ".6rem" }}>
+          <div><b>Downloaded, but a restore would refuse this file:</b></div>
+          {warn.map((w) => <div key={w}>{w}</div>)}
+        </div>
+      )}
       {err && <p style={{ color: "var(--red)", marginTop: ".6rem" }}>{err}</p>}
     </div>
   );
@@ -1717,7 +1873,12 @@ function ContinuityCard() {
     onError: (e) => setMsg({ text: errText(e), bad: true }),
   });
   const get = useMutation({
-    mutationFn: () => api.exportTicket("continuity"),
+    mutationFn: async () => {
+      const r = await api.exportTicket("continuity");
+      // asked first, so a refusal shows here rather than as a bare page
+      await api.exportPrecheck("continuity", r.token);
+      return r;
+    },
     onSuccess: (r) => { setMsg(null); window.location.assign(r.url); },
     onError: (e) => setMsg({ text: errText(e), bad: true }),
   });
@@ -1947,6 +2108,8 @@ function PasskeysCard() {
   // one-time recovery codes returned when a passkey is the FIRST strong
   // factor — shown once for lockout protection (mirrors the TOTP card)
   const [recovery, setRecovery] = useState<string[] | null>(null);
+  // a first passkey is a credential change, and can pause the text number
+  const [note, setNote] = useState<string | null>(null);
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const available = typeof window !== "undefined" && window.isSecureContext &&
     !!window.PublicKeyCredential;
@@ -1967,6 +2130,8 @@ function PasskeysCard() {
     onSuccess: (r) => { setErr(null);
                         if (r?.recovery_codes && r.recovery_codes.length)
                           setRecovery(r.recovery_codes);
+                        setNote((smsPauseNote(qc, r)
+                                 + membersRemovedNote(qc, r)).trim() || null);
                         // the response carries only the id, so the list is
                         // refetched; what ["me"] learns from a new factor
                         // is known here — the second-factor requirement is
@@ -1976,7 +2141,8 @@ function PasskeysCard() {
                           ...(r?.recovery_codes?.length
                             ? { recovery_codes_left: r.recovery_codes.length }
                             : {}) });
-                        qc.invalidateQueries({ queryKey: ["passkeys"] }); },
+                        qc.invalidateQueries({ queryKey: ["passkeys"] });
+                        invalidateAfterRotation(qc); },
     onError: (e) => {
       if (!String(e).includes("NotAllowedError")) setErr(errText(e));
     },
@@ -2022,6 +2188,8 @@ function PasskeysCard() {
       )}
       {err && <div className="note bad" style={{ marginBottom: ".6rem" }}
                    onClick={() => setErr(null)}>{err}</div>}
+      {note && <div className="note good" style={{ marginBottom: ".6rem" }}
+                    onClick={() => setNote(null)}>{note}</div>}
       {recovery && (
         <div className="note good" style={{ display: "block" }}>
           <b>Recovery codes</b> — save these somewhere safe. Each works once
@@ -2075,12 +2243,17 @@ function PasskeysCard() {
 // three cadences, local-time am/pm pickers (instance timezone)
 const HOURS12 = Array.from({ length: 24 }, (_, h) => ({
   h, label: `${h % 12 === 0 ? 12 : h % 12}:00 ${h < 12 ? "am" : "pm"}` }));
-const WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
-                  "Saturday", "Sunday"];
 // phone verification + this-browser push enrollment + channel
 // test buttons — rendered under the cadence matrix.
 function NotifyChannels({ status }: { status?: NotifyStatus }) {
   const qc = useQueryClient();
+  const meQ = useQuery({ queryKey: ["me"], queryFn: api.me });
+  // A browser subscription and an SMS number are new outbound
+  // destinations, which the server refuses the shared demonstration login
+  // (the number both set and cleared); checked here so the browser is never
+  // asked for a notification permission the server will not use, and no
+  // code goes out to a phone that could never be verified.
+  const grantLock = sharedLock(meQ.data, "grant");
   const [phone, setPhone] = useState("");
   const [code, setCode] = useState("");
   // {text,bad} so a failed verify/test reads as an error, not the same muted
@@ -2113,7 +2286,8 @@ function NotifyChannels({ status }: { status?: NotifyStatus }) {
     mutationFn: () => api.notifyPhone(""),
     onSuccess: () => { setMsg(null);
                        patch({ phone: null, phone_verified: false,
-                               phone_pending: null }); },
+                               phone_pending: null, phone_paused_at: null }); },
+    onError: err,
   });
   const test = useMutation({
     mutationFn: (channel: "sms" | "push") => api.notifyTest(channel),
@@ -2144,7 +2318,7 @@ function NotifyChannels({ status }: { status?: NotifyStatus }) {
 
   // the same door the setup wizard's delivery choice uses (push.ts)
   const enablePush = async () => {
-    if (!status?.vapid_public_key) return;
+    if (!status?.vapid_public_key || grantLock) return;
     setPushBusy(true); setMsg(null);
     try {
       const r = await enableBrowserPush(status.vapid_public_key);
@@ -2173,8 +2347,35 @@ function NotifyChannels({ status }: { status?: NotifyStatus }) {
             <button onClick={() => test.mutate("sms")}
                     disabled={test.isPending}>send test SMS</button>
             <button onClick={() => clearP.mutate()}
-                    disabled={clearP.isPending}>remove</button>
-          </>) : (<>
+                    disabled={clearP.isPending || !!grantLock}
+                    title={grantLock ?? ""}>remove</button>
+            {grantLock && (
+              <span style={{ fontSize: 12, color: "var(--amber)" }}>
+                {grantLock}</span>
+            )}
+          </>) : grantLock ? (
+            <span style={{ fontSize: 12, color: "var(--amber)" }}>
+              {grantLock}</span>
+          ) : (<>
+            {status.phone && (<>
+              {/* A password, login-address or two-factor change pauses the
+                  number until a fresh code sent to it is typed back, so a
+                  phone someone else verified stops receiving the summaries.
+                  No code goes out by itself: the owner retypes the number
+                  (it is only shown masked), or removes one they don't
+                  recognise. */}
+              <span style={{ fontSize: 12, color: "var(--amber)" }}>
+                Texts to {status.phone} are paused
+                {/* a timestamp in UTC: the local day it fell on, not
+                    the UTC one, which is already tomorrow in the evening
+                    west of Greenwich */}
+                {status.phone_paused_at
+                  ? ` since ${mmdd(localDayOf(status.phone_paused_at))}` : ""} until you
+                confirm the number again — type it below and press send
+                code.</span>
+              <button onClick={() => clearP.mutate()}
+                      disabled={clearP.isPending}>remove</button>
+            </>)}
             <input value={phone} placeholder="+12175551234"
                    aria-label="SMS phone number"
                    style={{ maxWidth: "11rem" }}
@@ -2195,7 +2396,7 @@ function NotifyChannels({ status }: { status?: NotifyStatus }) {
             </>)}
           </>)}
         </div>
-        {!status.phone_verified && (
+        {!status.phone_verified && !grantLock && (
           // Carrier-required SMS consent. Consent must be its OWN
           // affirmative action, specific to SMS, and NOT bundled with
           // Terms/Privacy acceptance: one paragraph reading "by verifying
@@ -2267,14 +2468,18 @@ function NotifyChannels({ status }: { status?: NotifyStatus }) {
         <div style={{ display: "flex", gap: ".5rem", flexWrap: "wrap",
                       alignItems: "center", marginTop: ".4rem" }}>
           <span className="mut">Push:</span>
-          <button disabled={pushBusy || pushBlockedByOrigin}
-                  title={pushBlockedByOrigin
+          <button disabled={pushBusy || pushBlockedByOrigin || !!grantLock}
+                  title={grantLock ?? (pushBlockedByOrigin
                     ? "Browsers only allow notifications on https://or localhost"
-                    : ""}
+                    : "")}
                   onClick={enablePush}>
             {status.push_subscribed ? "re-enable in this browser"
                                     : "enable in this browser"}</button>
-          {pushBlockedByOrigin && (
+          {grantLock && (
+            <span style={{ fontSize: 12, color: "var(--amber)" }}>
+              {grantLock}</span>
+          )}
+          {!grantLock && pushBlockedByOrigin && (
             // stated AT the control, not only in the note at the foot of the
             // card: a message that far from the button leaves the click
             // reading as "nothing happened"
@@ -2329,11 +2534,127 @@ function zoneLabel(z: string): string {
   return `${z.slice(i + 1).split("_").join(" ")} (${z.slice(0, i).split("_").join(" ")})`;
 }
 
+/** An owner's password, login-address or second-factor change also removes
+ *  the members who joined in the last days through the owner's own
+ *  invites. The reply names them; the owner hears it in the same sentence
+ *  as the rest of the change, and the roster and the settings banner that
+ *  records them are refetched after every such change. Empty when nobody
+ *  was removed. (The phone app says the same on its security screen.) */
+function membersRemovedNote(
+  qc: ReturnType<typeof useQueryClient>,
+  r: { members_removed?: { email: string }[] } | null | undefined,
+): string {
+  qc.invalidateQueries({ queryKey: ["members"] });
+  qc.invalidateQueries({ queryKey: ["invites"] });
+  qc.invalidateQueries({ queryKey: ["settings"] });
+  const gone = r?.members_removed ?? [];
+  if (!gone.length) return "";
+  return ` Removed ${gone.length} ${gone.length === 1 ? "member" : "members"}`
+    + ` who joined through your recent invites: `
+    + `${gone.map((m) => m.email).join(", ")} — invite back the ones that `
+    + "are yours.";
+}
+
+/** A credential rotation paused the household's own outbound settings —
+ *  the relay, extra recipients, the AI endpoint — until the owner says
+ *  they are theirs. The banner names each one, so a relay or an address
+ *  the owner does not recognise is caught here, at the one moment it
+ *  matters. */
+function OutboundPausedBanner({ p, canResume, lock, onResumed, onError }: {
+  p: NonNullable<SettingsData["outbound_paused"]>;
+  /** only the owner may resume (and not on the shared demonstration
+   *  login) — anyone else is told why the mail and the AI changed, with
+   *  no button that could only be refused */
+  canResume: boolean; lock: string | null;
+  onResumed: () => void; onError: (text: string) => void;
+}) {
+  // resuming re-opens destinations, so the server wants an elevated
+  // session; the request wrapper's sheet collects the proof when it is not
+  const resume = useMutation({
+    // the resume names the record it was shown, so a pause that changed
+    // since this page read it is refused rather than confirmed unseen
+    mutationFn: () => api.outboundResume(p.version),
+    onSuccess: onResumed,
+    onError: (e) => {
+      if (String(e instanceof Error ? e.message : e).startsWith("409")) {
+        onResumed();      // refetches the record
+        onError("The paused record changed since this page loaded — reload "
+                + "and check it again before resuming.");
+        return;
+      }
+      onError(errText(e));
+    },
+  });
+  const what: string[] = [];
+  if (p.smtp) what.push("the mail relay saved in Settings");
+  if (p.recipients.length)
+    what.push(`${p.recipients.length === 1 ? "the extra recipient" : "the extra recipients"} ${p.recipients.join(", ")}`);
+  if (p.llm) what.push("the AI endpoint");
+  // the household's own Plaid / MX keys are not in the paused list —
+  // they keep serving every sync of the banks already linked — but new
+  // links on them are HELD (a new link, a re-auth, the MX widget) until
+  // the owner confirms the keys or removes them; the owner is shown which
+  // client, anyone else only that links are held
+  const heldKeys = (p.aggregator_keys ?? []).map((k) =>
+    `${k.provider === "mx" ? "MX" : "Plaid"} client ${k.client_id} (${k.env}, `
+    + (k.saved_at ? `saved ${mmdd(localDayOf(k.saved_at))}` : "saved before this record")
+    + ")");
+  const byoKeys = !p.aggregator ? ""
+    : heldKeys.length
+    ? ` New bank links are held: ${heldKeys.join("; ")}.`
+    : " New bank links are held until the owner confirms the bank-connection keys saved in Settings (Plaid / MX).";
+  // an owner's recovery also removes members its recent invites created;
+  // a non-owner is told how many, not who
+  const removed = p.removed_members ?? [];
+  const removedCount = removed.length || (p.removed_members_count ?? 0);
+  // a password, login-email or second-factor change removes them too, and the
+  // record says which change it was
+  const withWhat = p.reason === "recovery" ? "with the recovery"
+    : "with the password, login-email or second-factor change";
+  const removedText = removed.length
+    ? ` Removed ${withWhat}, because they joined in the last days through the owner's invites: ${removed.map((m) => `${m.email} (${m.role}, joined ${mmdd(localDayOf(m.joined))})`).join(", ")}.`
+    : removedCount
+    ? ` ${removedCount} ${removedCount === 1 ? "member was" : "members were"} removed ${withWhat}, because they joined in the last days through the owner's invites.`
+    : "";
+  if (!canResume)
+    return (
+      <div className="note" style={{ borderColor: "var(--amber)", color: "var(--amber)" }}>
+        {what.length > 0 && <>
+          <b>Paused since {mmdd(localDayOf(p.at))} after
+            {p.reason === "recovery" ? " the owner's account was recovered" : " the owner's password, login email or second factor changed"}:</b>{" "}
+          {what.join("; ")}. Mail goes through the instance's own relay and the
+          AI runs on the instance's own backend until the owner confirms these
+          are theirs.</>}{byoKeys}{removedText}{lock ? ` ${lock}` : ""}
+      </div>
+    );
+  return (
+    <div className="note" style={{ borderColor: "var(--amber)", color: "var(--amber)" }}>
+      {what.length > 0 && <>
+        <b>Paused since {mmdd(localDayOf(p.at))} after
+          {p.reason === "recovery" ? " your account was recovered" : " your password, login email or second factor changed"}:</b>{" "}
+        {what.join("; ")}. Mail goes through the instance's own relay and the AI
+        runs on the instance's own backend until you confirm these are yours. If
+        you don't recognise one, change it below first.</>}
+      {byoKeys && `${byoKeys} If these are yours, resume; if not, disconnect those banks and remove the keys below.`}
+      {removed.length > 0 && <>
+        {" "}<b>Removed when {p.reason === "recovery"
+          ? "your account was recovered"
+          : "your password, login email or second factor changed"}</b>, because they
+        joined in the last days through your invites:{" "}
+        {removed.map((m) => `${m.email} (${m.role}, joined ${mmdd(localDayOf(m.joined))})`).join(", ")}.
+        Invite again the ones that are yours.</>}{" "}
+      <button onClick={() => resume.mutate()} disabled={resume.isPending}
+              style={{ marginLeft: ".4rem" }}>
+        {resume.isPending ? "resuming…"
+          : what.length || p.aggregator ? "These are mine — resume" : "Got it"}
+      </button>
+    </div>
+  );
+}
+
 function CadenceEditor({ sched, onChange, timezone, onTimezone }: {
   sched: { daily: { on: boolean; hour: number; sms: boolean; push: boolean;
                     summary: boolean };
-           weekly: { on: boolean; hour: number; weekday: number;
-                     sms: boolean; push: boolean };
            monthly: { on: boolean; hour: number; sms: boolean; push: boolean };
            yearly: { on: boolean; hour: number; sms: boolean; push: boolean } };
   onChange: (s: typeof sched) => void;
@@ -2354,12 +2675,17 @@ function CadenceEditor({ sched, onChange, timezone, onTimezone }: {
   const smsOk = !!notify.data?.sms_available && !!notify.data?.phone_verified;
   // push means browser push OR the mobile apps through the relay — a
   // household whose phones can receive it must be able to tick the box on
-  // an instance that never configured VAPID keys
-  const pushOk = !!notify.data?.push_available
-    || !!notify.data?.native_push_available
+  // an instance that never configured VAPID keys. The shared demonstration
+  // login cannot register a new device (the server refuses it a new outbound
+  // destination), so for it only a phone already registered can carry push.
+  const pushLock = sharedLock(me.data, "grant");
+  const pushOk = (!pushLock && (!!notify.data?.push_available
+                                || !!notify.data?.native_push_available))
     || (notify.data?.native_push_devices ?? 0) > 0;
   const smsWhy = !notify.data?.sms_available
     ? "SMS isn't configured on this instance"
+    : notify.data?.phone && !notify.data.phone_verified
+      ? "texts are paused until you confirm the number below"
     : !notify.data?.phone_verified
       ? "verify a phone number below first" : "";
   const [openCad, setOpenCad] = useState<string | null>(null);
@@ -2379,17 +2705,6 @@ function CadenceEditor({ sched, onChange, timezone, onTimezone }: {
       when: `every day at ${hourLabel(sched.daily.hour)}`,
       edit: <>at {hourSel(sched.daily.hour, (hour) =>
         onChange({ ...sched, daily: { ...sched.daily, hour } }))}</> },
-    { cad: "weekly", label: "Weekly report",
-      when: `every ${WEEKDAYS[sched.weekly.weekday]} at `
-            + hourLabel(sched.weekly.hour),
-      edit: <>every{" "}
-        <select value={sched.weekly.weekday}
-          onChange={(e) => onChange({ ...sched, weekly:
-            { ...sched.weekly, weekday: Number(e.target.value) } })}>
-          {WEEKDAYS.map((d, i) => <option key={d} value={i}>{d}</option>)}
-        </select>{" "}at{" "}
-        {hourSel(sched.weekly.hour, (hour) =>
-          onChange({ ...sched, weekly: { ...sched.weekly, hour } }))}</> },
     { cad: "monthly", label: "Monthly report card",
       when: `on the 1st at ${hourLabel(sched.monthly.hour)}`,
       edit: <>on the 1st at {hourSel(sched.monthly.hour, (hour) =>
@@ -3570,7 +3885,7 @@ function MaintenanceCard({ onDone }: { onDone: () => void }) {
 // A typed-but-not-added draft says so on screen — the silent-discard
 // failure mode, made visible instead of flushed.
 function RecipientsEditor({ recipients, muted, status, onChange,
-                            onMutedChange }: {
+                            onMutedChange, addLock = null }: {
   recipients: string[];
   // addresses opted out of the scheduled mail — the per-person off
   // switch, the owner included; an always-on owner would make
@@ -3579,6 +3894,9 @@ function RecipientsEditor({ recipients, muted, status, onChange,
   status: NonNullable<SettingsData["email_recipient_status"]>;
   onChange: (next: string[]) => void;
   onMutedChange: (next: string[]) => void;
+  // why adding a recipient is switched off (a new destination for the
+  // household's mail, refused to the shared demonstration login), or null
+  addLock?: string | null;
 }) {
   const isMuted = (e: string) =>
     muted.some((m) => m.toLowerCase() === e.toLowerCase());
@@ -3603,7 +3921,9 @@ function RecipientsEditor({ recipients, muted, status, onChange,
     mutationFn: (email: string) => api.recipientInviteResend(email),
     onMutate: (email) => { setResending(email); setResendMsg(null); },
     onSuccess: (r, email) => {
-      setResendMsg({ text: `Invitation re-sent to ${email}.`, bad: false });
+      const held = resendHeld(r, email);
+      setResendMsg(held ? { text: held, bad: true }
+        : { text: `Invitation re-sent to ${email}.`, bad: false });
       // the response carries the refreshed per-recipient status — the only
       // part of the settings view a resend can move
       patchQuery<SettingsData>(qc, ["settings"],
@@ -3614,21 +3934,23 @@ function RecipientsEditor({ recipients, muted, status, onChange,
   });
   const byEmail = new Map(status.map((s) => [s.email.toLowerCase(), s]));
   const owner = status.find((s) => s.owner);
+  // an added address is mailed only after it accepts an invitation, and a
+  // server with no public address cannot send one — adding would save an
+  // address that never receives anything
+  const notify = useQuery({ queryKey: ["notify"], queryFn: api.notifyStatus });
+  const needBaseUrl = !!notify.data?.invites_need_base_url;
   const add = () => {
     const v = draft.trim();
     if (!v) return;
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)) {
+    if (needBaseUrl) { setErr(NEED_BASE_URL); return; }
+    if (!looksLikeMailbox(v)) {
       setErr("That doesn't look like an email address."); return;
     }
-    const dupe = recipients.some((r) => r.toLowerCase() === v.toLowerCase())
-      || (owner && owner.email.toLowerCase() === v.toLowerCase());
+    const dupe = recipientDuplicate(v, recipients, owner?.email);
     if (dupe) {
       // not an error worth a red message — say why nothing happened and
       // clear the box, which is what the person meant anyway
-      setErr(owner && owner.email.toLowerCase() === v.toLowerCase()
-        ? "That's you — you're already on the list."
-        : "Already on the list.");
-      setDraft(""); return;
+      setErr(dupe); setDraft(""); return;
     }
     setErr(null); setDraft("");
     onChange([...recipients, v]);
@@ -3699,6 +4021,10 @@ function RecipientsEditor({ recipients, muted, status, onChange,
           );
         })}
       </div>
+      {addLock ? (
+        <p className="sub" style={{ marginTop: ".3rem",
+                                    color: "var(--amber)" }}>{addLock}</p>
+      ) : (<>
       <div style={{ display: "flex", gap: ".4rem", flexWrap: "wrap" }}>
         <input value={draft} type="email" placeholder="partner@example.com"
                aria-label="Add an email recipient"
@@ -3715,7 +4041,11 @@ function RecipientsEditor({ recipients, muted, status, onChange,
       {/* the failure mode to avoid is a typed address SILENTLY discarded;
           with auto-save there is no Save to flush it, so the truth goes on
           screen instead of a claim of success */}
-      {draft.trim() && !err && (
+      {needBaseUrl && !err && (
+        <p className="sub" style={{ marginTop: ".3rem",
+                                    color: "var(--amber)" }}>{NEED_BASE_URL}</p>
+      )}
+      {draft.trim() && !err && !needBaseUrl && (
         <p className="sub" style={{ marginTop: ".3rem" }}>
           Not added yet — press Add (or Enter) to save and invite.</p>
       )}
@@ -3729,6 +4059,105 @@ function RecipientsEditor({ recipients, muted, status, onChange,
         Adding someone emails them an invitation right away — they start
         receiving the summary once they accept.
       </p>
+      </>)}
+    </div>
+  );
+}
+
+// Which kinds of the household's mail each person on it receives. Each box
+// posts the one change it makes and the server applies it to the stored
+// choices, so two devices ticking two boxes never undo each other. A muted
+// address gets nothing whatever its boxes say, so its row is shown off.
+// A cadence the household does not send dims its column — the boxes keep
+// their answer for when it is turned on.
+function EmailPrefsGrid({ status, sending, onError }: {
+  status: NonNullable<SettingsData["email_recipient_status"]>;
+  // which cadences the household sends at all
+  sending: Partial<Record<string, boolean>>;
+  onError: (text: string) => void;
+}) {
+  const qc = useQueryClient();
+  // Taps not yet answered, oldest first. The saves go out one at a time
+  // (the scope), and each reply is the whole stored view, which cannot hold
+  // a tap still waiting its turn; drawing these over whatever the cache
+  // holds keeps a later box from flicking back when an earlier reply lands.
+  const [pending, setPending] = useState<
+    { id: number; email: string; kind: string; on: boolean }[]>([]);
+  const nextId = useRef(0);
+  const set = useMutation({
+    mutationFn: (v: { email: string; kind: string; on: boolean }) =>
+      saveSettings(qc, { email_prefs_set:
+        { address: v.email, kind: v.kind, on: v.on } }),
+    scope: SETTINGS_SAVES,
+    // the box moves on the tap; the reply (the full view) settles it
+    onMutate: (v) => {
+      const id = ++nextId.current;
+      setPending((p) => [...p, { id, ...v }]);
+      return { id };
+    },
+    onError: (e) => {
+      onError(errText(e));
+      qc.invalidateQueries({ queryKey: ["settings"] });
+    },
+    onSettled: (_r, _e, _v, ctx) =>
+      setPending((p) => p.filter((x) => x.id !== ctx?.id)),
+  });
+  const rows = pending.reduce(
+    (acc, x) => withPref(acc, x.email, x.kind, x.on), status);
+  if (!rows.length) return null;
+  const cell: React.CSSProperties = { padding: ".3rem .4rem",
+                                      textAlign: "center" };
+  return (
+    <div style={{ marginTop: ".8rem", overflowX: "auto" }}>
+      <label style={{ display: "block" }}>Who gets which email</label>
+      <table style={{ borderCollapse: "collapse", marginTop: ".35rem",
+                      fontSize: 13 }}>
+        <thead>
+          <tr>
+            <th style={{ ...cell, textAlign: "left" }} />
+            {EMAIL_KINDS.map((k) => {
+              const off = kindOffNote(k, sending);
+              return (
+                <th key={k} title={off ?? undefined}
+                    style={{ ...cell, fontWeight: 500,
+                             opacity: off ? 0.5 : 1 }}>
+                  {EMAIL_KIND_LABEL[k]}</th>);
+            })}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.email} style={{ opacity: r.muted ? 0.6 : 1 }}>
+              <td style={{ ...cell, textAlign: "left", maxWidth: "16rem",
+                           overflow: "hidden", textOverflow: "ellipsis",
+                           whiteSpace: "nowrap" }}>
+                {r.email}
+                {r.owner && <span className="sub"> · you</span>}
+                {r.muted && <span className="sub"
+                  title="Opted out of the scheduled email."> · not receiving
+                  </span>}
+              </td>
+              {EMAIL_KINDS.map((k) => {
+                const off = kindOffNote(k, sending);
+                return (
+                  <td key={k} style={{ ...cell, opacity: off ? 0.5 : 1 }}
+                      title={off ?? undefined}>
+                    <input type="checkbox" disabled={!!r.muted}
+                      checked={!r.muted && prefOn(r.prefs, k)}
+                      aria-label={`${r.email} receives ${
+                        EMAIL_KIND_LABEL[k].toLowerCase()} email`}
+                      onChange={(e) => set.mutate({ email: r.email, kind: k,
+                                                    on: e.target.checked })} />
+                  </td>);
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {EMAIL_KINDS.some((k) => kindOffNote(k, sending)) && (
+        <p className="sub" style={{ marginTop: ".3rem" }}>
+          {EMAIL_KINDS.map((k) => kindOffNote(k, sending)).filter(Boolean)
+            .join(" · ")}</p>)}
     </div>
   );
 }
@@ -3849,19 +4278,25 @@ function EmailCard({ current, onChanged }: {
       // It rides on the success message so it is impossible to miss and
       // impossible to be blocked by.
       const hint = r.hint ? ` Did you mean ${r.hint}?` : "";
-      const pkr = r as { ok: boolean; passkeys_removed?: number;
-                         passkeys_kept?: number };
-      const cost = pkr.passkeys_removed
-        ? ` ${pkr.passkeys_removed} passkey(s) were removed — re-add them.`
+      const cost = r.passkeys_removed
+        ? ` ${r.passkeys_removed} passkey(s) were removed — re-add them.`
         : "";
       // the key that proved this change survives when it is the account's
       // last second factor — the same rule the password card reports
-      const kept = pkr.passkeys_kept
-        ? ` ${pkr.passkeys_kept} passkey(s) kept — your only second factor.`
+      const kept = r.passkeys_kept
+        ? ` ${r.passkeys_kept} passkey(s) kept — your only second factor.`
         : "";
       setMsg({ text: (r.verify_sent
         ? "Email changed — check the new address for a verification link."
-        : "Email changed.") + cost + kept + hint, bad: false });
+        : "Email changed.") + cost + kept + hint + smsPauseNote(qc, r)
+        + membersRemovedNote(qc, r)
+        // the household's mail list named the old address, and it went
+        // with it
+        + (r.mail_list_entry_dropped
+            ? " Your old address was removed from the household's email "
+              + "list — ask the owner to add the new one."
+            : ""),
+        bad: false });
       setEmail("");
       // the heading reads the address off ["me"]; a hosted change also
       // un-verifies it until the new inbox clicks through
@@ -3927,7 +4362,8 @@ function PasswordCard() {
       // or phone that stops working right after is explained, not a mystery
       const c = r as { ok: boolean; passkeys_removed?: number;
                        passkeys_kept?: number;
-                       tokens_revoked?: number; devices_revoked?: number };
+                       tokens_revoked?: number; devices_revoked?: number;
+                       sms_number_needs_verify?: boolean };
       const cost = [
         c.passkeys_removed ? `${c.passkeys_removed} passkey(s) removed` : "",
         // the key that proved this change survives when it is the account's
@@ -3940,7 +4376,9 @@ function PasswordCard() {
         c.tokens_revoked ? `${c.tokens_revoked} script token(s) revoked` : "",
       ].filter(Boolean).join(", ");
       setMsg({ text: "Password changed — every other session was signed out"
-               + (cost ? `; ${cost}.` : "."), bad: false });
+               + (cost ? `; ${cost}.` : ".") + smsPauseNote(qc, c)
+               + membersRemovedNote(qc, r),
+               bad: false });
       setCurrent(""); setNext(""); setConfirm(""); setTotp("");
       setNeedTotp(false);
       // the rotation empties these lists, and they live on this same page
@@ -3948,6 +4386,7 @@ function PasswordCard() {
       qc.invalidateQueries({ queryKey: ["passkeys"] });
       qc.invalidateQueries({ queryKey: ["devices"] });
       qc.invalidateQueries({ queryKey: ["tokens"] });
+      invalidateAfterRotation(qc);
     },
     onError: (e) => {
       const m = String(e instanceof Error ? e.message : e);
@@ -3957,6 +4396,10 @@ function PasswordCard() {
                  bad: true });
       } else if (m.includes("wrong password")) {
         setMsg({ text: "Current password is wrong.", bad: true });
+      } else if (/code_used|already (been )?used/i.test(m)) {
+        setTotp("");
+        setMsg({ text: "That code was already used — enter the next one " +
+                       "from your app.", bad: true });
       } else if (m.includes("one-time code")) {
         setMsg({ text: "That code didn't match — check your app's clock.",
                  bad: true });
@@ -4039,7 +4482,16 @@ function TwoFactorCard() {
 
   const fail = (e: unknown) => {
     const m = String(e instanceof Error ? e.message : e);
-    if (m.includes("last_factor"))
+    if (e instanceof NextCodeNeeded) {
+      // the sheet may have spent the step the typed code belongs to
+      setCode("");
+      setMsg({ text: "Confirmed. Enter the next code from your app to " +
+                     "turn 2FA off.", bad: false });
+    } else if (/code_used|already (been )?used/i.test(m)) {
+      setCode("");
+      setMsg({ text: "That code was already used — enter the next one " +
+                     "from your app.", bad: true });
+    } else if (m.includes("last_factor"))
       setMsg({ text: "This is your only two-factor method — add a passkey " +
                      "before turning off your authenticator app.", bad: true });
     else if (m.includes("doesn't match") || m.includes("bad one-time code"))
@@ -4063,8 +4515,9 @@ function TwoFactorCard() {
       // first-factor enrolment returns one-time recovery codes
       if (r.recovery_codes && r.recovery_codes.length)
         setRecovery(r.recovery_codes);
-      setMsg({ text: "Two-factor is on — every other session was signed out.",
-               bad: false });
+      setMsg({ text: "Two-factor is on — every other session was signed out."
+                     + smsPauseNote(qc, r) + membersRemovedNote(qc, r),
+                bad: false });
       // the card's whole shape keys on ["me"].totp_enabled, and that key
       // has observers on every page — patch what the response proves
       // instead of refetching it
@@ -4072,6 +4525,7 @@ function TwoFactorCard() {
         ...(r.recovery_codes?.length
           ? { recovery_codes_left: r.recovery_codes.length } : {}) });
       qc.invalidateQueries({ queryKey: ["sessions"] });
+      invalidateAfterRotation(qc);
     },
     onError: fail,
   });
@@ -4100,9 +4554,10 @@ function TwoFactorCard() {
     // elevation-gated AND the route's own live code — a stolen signed-in
     // tab plus one glimpsed code must not strip the second factor
     mutationFn: () => api.totpDisable(code.trim()),
-    onSuccess: () => {
+    onSuccess: (r) => {
       setCode("");
-      setMsg({ text: "Two-factor is off.", bad: false });
+      setMsg({ text: "Two-factor is off." + smsPauseNote(qc, r)
+                     + membersRemovedNote(qc, r), bad: false });
       // flip the flag the card keys on now; whether a hosted account is
       // back to owing a second factor depends on its passkeys, which only
       // the server knows — hence the refetch too
@@ -4245,6 +4700,10 @@ function TwoFactorCard() {
 function MyEmailCard() {
   const qc = useQueryClient();
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
+  // who the worker actually mails: the saved list and each address's
+  // invitation, and whether this server can send invitations at all
+  const settings = useQuery({ queryKey: ["settings"], queryFn: api.settings });
+  const notify = useQuery({ queryKey: ["notify"], queryFn: api.notifyStatus });
   const d = me.data?.daily_email;
   const [err, setErr] = useState<string | null>(null);
   const set = useMutation({
@@ -4256,10 +4715,29 @@ function MyEmailCard() {
         ...old, daily_email: { ...old.daily_email, muted: r.muted } }); },
     onError: (e) => setErr(errText(e)),
   });
+  // one kind on or off for my own inbox; the box moves on the tap and the
+  // reply (my whole row) settles it
+  const pref = useMutation({
+    mutationFn: (v: { kind: EmailKind; on: boolean }) =>
+      api.meEmailPref(v.kind, v.on),
+    onMutate: (v) => qc.setQueryData<Me>(["me"], (old) =>
+      old && old.daily_email && { ...old, daily_email: { ...old.daily_email,
+        prefs: { ...old.daily_email.prefs, [v.kind]: v.on } } }),
+    onSuccess: (r) => { setErr(null);
+      qc.setQueryData<Me>(["me"], (old) => old && old.daily_email && {
+        ...old, daily_email: { ...old.daily_email, prefs: r.prefs } }); },
+    onError: (e) => { setErr(errText(e));
+      qc.invalidateQueries({ queryKey: ["me"] }); },
+  });
   if (!d) return null;
   const hourLabel = (h: number) =>
     h === 0 ? "12am" : h < 12 ? `${h}am` : h === 12 ? "12pm" : `${h - 12}pm`;
-  const receiving = d.on && !d.muted;
+  const line = myDailyLine({
+    me: me.data?.email ?? "", on: d.on, muted: d.muted, prefs: d.prefs,
+    verified: me.data?.verified, hosted: me.data?.hosted,
+    recipients: settings.data?.email_recipients,
+    status: settings.data?.email_recipient_status,
+    needBaseUrl: notify.data?.invites_need_base_url });
   return (
     <div className="card">
       <h2>Daily email</h2>
@@ -4271,15 +4749,32 @@ function MyEmailCard() {
       {!d.on && <p className="mut">The owner has the daily email turned off
         for the household right now.</p>}
       <p>
-        <b>{receiving ? "You receive it." : d.on ? "You've turned it off for yourself."
-                                          : "Off."}</b>{" "}
-        {d.on && (
+        <b>{line.text}</b>{" "}
+        {/* a mute stops every kind of household mail, not just the daily
+            one, so lifting it must stay reachable while the daily is off */}
+        {(d.on || d.muted) && (
           <button className={d.muted ? "pri" : ""} disabled={set.isPending}
                   onClick={() => set.mutate(!d.muted)}>
-            {d.muted ? "Turn on for me" : "Turn off for me"}
+            {d.muted ? "Unmute me" : "Turn off for me"}
           </button>
         )}
       </p>
+      {d.muted && <p className="mut">Unmute to choose which emails you get.</p>}
+      <div style={{ display: "flex", gap: ".9rem", flexWrap: "wrap",
+                    opacity: d.muted ? 0.6 : 1 }}>
+        {EMAIL_KINDS.map((k) => {
+          const off = kindOffNote(k, d.cadences);
+          return (
+            <label key={k} className="check" title={off ?? undefined}
+                   style={{ opacity: off ? 0.5 : 1 }}>
+              <input type="checkbox" disabled={d.muted || pref.isPending}
+                     checked={!d.muted && prefOn(d.prefs, k)}
+                     onChange={(e) => pref.mutate({ kind: k,
+                                                    on: e.target.checked })} />
+              {EMAIL_KIND_LABEL[k]}
+            </label>);
+        })}
+      </div>
       {err && <p className="mut">{err}</p>}
     </div>
   );

@@ -46,6 +46,9 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import math
+
+import psycopg
 
 log = logging.getLogger(__name__)
 
@@ -145,12 +148,40 @@ def _candidates(conn, institution_id, institution_name, new_item_id):
 
     An item that still holds a token is syncing (or fixable in place), and
     stealing its accounts would break a working connection to fix nothing.
+
+    Having no token proves a connection dead only where a live one holds
+    one, which is a Plaid Item. A SimpleFIN bank hangs off its bridge, and
+    the bridge holds the token; an MX member syncs through the household's
+    MX user. Both are tokenless while working, so adopting from them would
+    move a live feed onto the new link and archive it, and the second
+    source the household meant to add would replace the first instead. They
+    qualify only once they are archived or restored, or once the bridge or
+    the MX user that fed them is gone. Every other tokenless item (manual
+    accounts, file imports, collector pushes) is not a bank connection a
+    link could replace, and is never a donor.
     """
+    from ..engine import budget
+    cfg = budget.load_config(conn)
+    mx_live = bool(cfg.get("mx_user_guid") and cfg.get("mx_client_id")
+                   and cfg.get("mx_api_key"))
     return conn.execute(
         """SELECT a.id, a.mask, a.type, a.subtype, a.name, a.item_id
              FROM accounts a JOIN items i ON i.id = a.item_id
             WHERE COALESCE(i.access_token, '') = ''
               AND i.id <> %s
+              AND (i.aggregator = 'plaid'
+                   OR (i.aggregator IN ('simplefin-org', 'mx')
+                       AND (COALESCE(i.status, '') IN ('archived', 'restored')
+                            OR (i.aggregator = 'simplefin-org'
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM items b
+                                     WHERE b.aggregator = 'simplefin'
+                                       AND left(i.id, length(b.id) + 1)
+                                           = b.id || ':'
+                                       AND COALESCE(b.access_token, '') <> ''
+                                       AND COALESCE(b.status, '')
+                                           NOT IN ('archived', 'restored')))
+                            OR (i.aggregator = 'mx' AND NOT %s))))
               -- institution_id FIRST and on its own when we have one:
               -- names drift between what a restore carries and what Plaid
               -- returns for the same bank ('Acme' vs 'Acme Bank'), so a
@@ -163,7 +194,7 @@ def _candidates(conn, institution_id, institution_name, new_item_id):
                         ELSE lower(i.institution_name)
                              = lower(%s::text) END)
               AND a.user_removed_at IS NULL""",
-        (new_item_id, institution_id, institution_id,
+        (new_item_id, mx_live, institution_id, institution_id,
          institution_name)).fetchall()
 
 
@@ -356,6 +387,10 @@ def _rewrite_account_id(conn, old_id: str, new_id: str,
             conn.execute(
                 f"UPDATE {table} SET {col} = %s WHERE {col} = %s",
                 (new_id, old_id))
+        # a file row's note that a feed set its copy aside names the feed
+        # account by id inside raw, where no foreign key reaches
+        from .base import carry_stood_in_accounts
+        carry_stood_in_accounts(conn, old_id, new_id)
         conn.execute("DELETE FROM accounts WHERE id = %s", (old_id,))
         # the entity scope stamped at checkout still names the old id
         from ..db import tenancy
@@ -482,6 +517,111 @@ def _rewrite_txn_id(conn, old_id: str, new_id: str) -> bool:
     return True
 
 
+# How many times an adoption may find the settings row busy and start over
+# before it waits for the row up front instead. See `_adopt_one`.
+_SETTINGS_TRIES = 3
+
+
+def _settings_row_lock(conn, *, wait: bool) -> None:
+    """Lock the household's settings row for the rest of the transaction.
+
+    `wait=False` is a TRY: it raises LockNotAvailable rather than queue.
+    No row means no document naming an account, and then there is nothing
+    to lock — the rewrite's own `config_txn` seeds one if it needs to."""
+    conn.execute("SELECT 1 FROM tenant_settings FOR UPDATE"
+                 + ("" if wait else " NOWAIT"))
+
+
+def _adopt_one(conn, old: dict, new_id: str, item_id: str):
+    """Rename one restored account onto the incoming id, record it, and
+    carry the rename into the settings document — one transaction.
+
+    Returns (moved, cutoff, touched).
+
+    LOCK ORDER. Every door that writes both the settings document and an
+    account row takes the tenant_settings row FIRST and the accounts row
+    after (see `budget.config_txn`, where the order is written down). This
+    move needs the two the other way round in time — the account row at
+    the start, the document at the end — and it may not simply wait for
+    the settings row while holding the account: a classify or a business
+    assignment holding settings and waiting for this account is then a
+    deadlock, and whichever side PostgreSQL aborts loses (the door answers
+    500; a lost adoption leaves the duplicated history it exists to
+    prevent).
+
+    So it only ever TRIES the settings row out of order. A try never waits
+    and so can never close a cycle. When the row is busy the whole move
+    rolls back — releasing the account — waits for the settings writer to
+    finish with nothing held, and starts again. The last attempt takes the
+    settings row first, in the canonical order, so a household whose
+    settings are saved continuously still gets its adoption.
+
+    Why the document is not simply locked first every time: a lock taken
+    inside a transaction is held until it commits, so taken first it spans
+    the accounts DELETE, the pending sweep and the bookkeeping INSERT too.
+    Every settings writer in the household (the settings page, the wizard,
+    the budget seed) would queue behind row work that has nothing to do
+    with the document, once per adopted account, on the synchronous
+    link-exchange path. Taking it last keeps that wait to the
+    read-modify-write it protects.
+    """
+    from .reanchor import hold_pairing_lock
+    for attempt in range(_SETTINGS_TRIES):
+        in_order = attempt == _SETTINGS_TRIES - 1
+        touched: list[str] = []
+        try:
+            with conn.transaction():
+                # the pending sweep below retires rows; the pairing lock
+                # comes first, before the rename touches any of them (see
+                # reanchor.hold_pairing_lock)
+                hold_pairing_lock(conn)
+                if in_order:
+                    _settings_row_lock(conn, wait=True)
+                # The floor is where the FEED's own restored rows begin, not
+                # the oldest row of any source: file-imported history from
+                # years before the link says nothing about the months between
+                # it and the first feed row, and a floor taken from it would
+                # date-drop that whole gap as "certainly held". An account the
+                # restore holds ONLY as file rows is held by them, so there the
+                # oldest of those is the floor.
+                from .base import FILE_IMPORT_ID_PREFIXES
+                span = conn.execute(
+                    "SELECT max(date) AS hi, min(date) AS lo_any,"
+                    " min(date) FILTER (WHERE NOT (id LIKE ANY(%s))) AS lo"
+                    " FROM transactions WHERE account_id = %s AND removed = 0",
+                    ([pfx + "%" for pfx in FILE_IMPORT_ID_PREFIXES], old["id"])
+                ).fetchone()
+                cutoff = span["hi"]
+                history_from = span["lo"] or span["lo_any"]
+                moved = _rewrite_account_id(conn, old["id"], new_id, item_id)
+                if moved:
+                    _retire_orphaned_pending(conn, new_id)
+                    conn.execute(
+                        """INSERT INTO account_adoptions
+                               (account_id, old_account_id, item_id, cutoff_date,
+                                history_from)
+                           VALUES (%s,%s,%s,%s,%s)""",
+                        (new_id, old["id"], item_id, cutoff, history_from))
+                    # The FK-less half of the rename, in the same
+                    # transaction for the same reason as the rest: a
+                    # settings document still naming the deleted id is a
+                    # half-done rename that nothing ever revisits. Never
+                    # before the rename: the row may be gone by now
+                    # (`moved` False), and rewriting the config for a
+                    # rename that did not happen would point the budget at
+                    # an account this tenant does not have.
+                    if not in_order:
+                        _settings_row_lock(conn, wait=False)
+                    touched = _rewrite_account_id_in_config(
+                        conn, old["id"], new_id)
+            return moved, cutoff, touched
+        except psycopg.errors.LockNotAvailable:
+            # wait for the settings writer with nothing held, then retry
+            with conn.transaction():
+                _settings_row_lock(conn, wait=True)
+    raise AssertionError("unreachable: the last attempt waits in order")
+
+
 def adopt_accounts(conn, *, item_id: str, institution_id: str | None,
                    institution_name: str | None,
                    incoming: list[dict]) -> list[dict]:
@@ -539,48 +679,7 @@ def adopt_accounts(conn, *, item_id: str, institution_id: str | None,
         # insert two years of Plaid history alongside the restored copy of
         # it, under ids that collide with nothing. Committing them together
         # means the retry sees either both or neither.
-        touched: list[str] = []
-        with conn.transaction():
-            # the pending sweep below retires rows; the pairing lock comes
-            # first, before the rename touches any of them (see
-            # reanchor.hold_pairing_lock)
-            from .reanchor import hold_pairing_lock
-            hold_pairing_lock(conn)
-            cutoff = conn.execute(
-                "SELECT max(date) AS d FROM transactions "
-                "WHERE account_id = %s AND removed = 0", (old["id"],)
-            ).fetchone()["d"]
-            moved = _rewrite_account_id(conn, old["id"], new_id, item_id)
-            if moved:
-                _retire_orphaned_pending(conn, new_id)
-                conn.execute(
-                    """INSERT INTO account_adoptions
-                           (account_id, old_account_id, item_id, cutoff_date)
-                       VALUES (%s,%s,%s,%s)""",
-                    (new_id, old["id"], item_id, cutoff))
-                # The FK-less half of the rename, in the same transaction
-                # for the same reason as the rest: a settings document
-                # still naming the deleted id is a half-done rename that
-                # nothing ever revisits.
-                #
-                # LAST, and deliberately so. `config_txn` takes the
-                # tenant_settings ROW lock, and a lock taken inside a
-                # transaction is held until that transaction commits — so
-                # taken any earlier it also spans the accounts DELETE, the
-                # pending sweep and the bookkeeping INSERT above. That is
-                # every settings writer in the household (the settings
-                # page, the wizard, the budget seed) queued behind row work
-                # that has nothing to do with the document, once per
-                # adopted account, on the synchronous link-exchange path.
-                # Going last keeps the atomicity the lock is here for and
-                # narrows the wait to the read-modify-write it protects.
-                #
-                # Also never before the rename: the row may be gone by the
-                # time we get here (`moved` False), and rewriting the
-                # config for a rename that did not happen would point the
-                # budget at an account this tenant does not have.
-                touched = _rewrite_account_id_in_config(
-                    conn, old["id"], new_id)
+        moved, cutoff, touched = _adopt_one(conn, old, new_id, item_id)
         if touched:
             log.info("reconnect: carried %s onto the new account id in %s",
                      old["id"], ", ".join(touched))
@@ -705,84 +804,35 @@ def _retire_twin(conn, keep_id: str, lose_id: str) -> None:
 
 
 def _retire_twin_locked(conn, keep_id: str, lose_id: str) -> None:
-    # The category pin travels WITH the kind of hand that set it: a pin
-    # arriving without its kind reads as one nobody set, so the next store
-    # or bill pass is free to overwrite a person's answer. And a person's
-    # "use automatic" is an EMPTY pin wearing their kind, so a survivor
-    # holding one already has its own answer and must not have it filled in
-    # from the row being retired.
-    took = "k.category_override IS NULL AND k.override_source IS NULL"
-    conn.execute(
-        f"""UPDATE transactions k SET
-               category_override = CASE WHEN {took}
-                    THEN l.category_override ELSE k.category_override END,
-               override_source   = CASE WHEN {took}
-                    THEN l.override_source ELSE k.override_source END,
-               owner_override    = COALESCE(k.owner_override,    l.owner_override),
-               entity_id         = COALESCE(k.entity_id,         l.entity_id)
-           FROM transactions l
-          WHERE k.id = %s AND l.id = %s""", (keep_id, lose_id))
-    # The retired row then lets go of exactly what the survivor took, and
-    # keeps an answer the survivor refused — nulling that one would destroy
-    # it, not tidy up. A retired row still wearing an override every read
-    # hides is stranded work: the re-anchor sweep finds it every night and
-    # hunts a twin it can never move it onto, because the survivor already
-    # has its own answer.
-    gone = ("k.category_override IS NOT DISTINCT FROM l.category_override"
-            " AND k.override_source IS NOT DISTINCT FROM l.override_source")
-    conn.execute(
-        f"""UPDATE transactions l SET
-               category_override = CASE WHEN {gone}
-                    THEN NULL ELSE l.category_override END,
-               override_source   = CASE WHEN {gone}
-                    THEN NULL ELSE l.override_source END,
-               owner_override = CASE
-                    WHEN k.owner_override IS NOT DISTINCT FROM l.owner_override
-                    THEN NULL ELSE l.owner_override END,
-               entity_id = CASE
-                    WHEN k.entity_id IS NOT DISTINCT FROM l.entity_id
-                    THEN NULL ELSE l.entity_id END
-           FROM transactions k WHERE l.id = %s AND k.id = %s""",
-        (lose_id, keep_id))
-    conn.execute("UPDATE transactions SET removed = 1 WHERE id = %s", (lose_id,))
-    # notes: one row per transaction, so they cannot both keep theirs. If
-    # the survivor has no note, the retired row's moves over. If BOTH have
-    # a note, the retired one's text is appended to the survivor's rather
-    # than silently stranded on a removed=1 row that every read hides — a
-    # user's written words must survive a dedup. Either way the losing
-    # row's note is then deleted, like the flags below.
-    conn.execute(
-        """UPDATE transaction_notes k
-              SET note = k.note || E'\\n' || l.note, updated_at = now()
-             FROM transaction_notes l
-            WHERE k.txn_id = %s AND l.txn_id = %s""",
-        (keep_id, lose_id))
-    conn.execute(
-        """UPDATE transaction_notes SET txn_id = %s
-            WHERE txn_id = %s AND NOT EXISTS
-                  (SELECT 1 FROM transaction_notes WHERE txn_id = %s)""",
-        (keep_id, lose_id, keep_id))
-    conn.execute("DELETE FROM transaction_notes WHERE txn_id = %s",
+    # The losing row is retired first, because the move below only carries
+    # from a retired row onto a live one, and then everything a person put
+    # on it goes across through the same move the re-anchor sweep uses:
+    # overrides with the kind that set them, notes, receipts and the
+    # receipts they refused, flags, a hand split, store-order matches, the
+    # Schedule C class, equity movements and reimbursement pairings. Only
+    # an answer the survivor already holds differently stays behind.
+    #
+    # retired_at then makes the retirement a decision rather than the
+    # feed's state: the losing id usually belongs to a live feed lineage,
+    # which re-sends it inside its window, and the upsert brings back any
+    # row the feed re-reports unless it carries the stamp. The same stamp
+    # takes the row out of the re-anchor sweep, which is safe only because
+    # the full move has already run here — what is left is exactly what
+    # the sweep would leave too, since the survivor is the twin it finds.
+    from .reanchor import _move
+    was = conn.execute("SELECT removed FROM transactions WHERE id = %s",
+                       (lose_id,)).fetchone()
+    conn.execute("UPDATE transactions SET removed = 1 WHERE id = %s",
                  (lose_id,))
-    conn.execute("UPDATE receipts SET txn_id = %s WHERE txn_id = %s",
-                 (keep_id, lose_id))
-    # and a receipt a person took OFF the retired row stays off the charge
-    # it is the same as: the matcher knows a refusal only by id
-    from .base import carry_unmatch_memory
-    carry_unmatch_memory(conn, [lose_id], [keep_id])
-    for table in ("reimburse_flags", "business_flags"):
-        conn.execute(
-            f"""UPDATE {table} SET txn_id = %s
-                 WHERE txn_id = %s AND NOT EXISTS
-                       (SELECT 1 FROM {table} WHERE txn_id = %s)""",
-            (keep_id, lose_id, keep_id))
-        conn.execute(f"DELETE FROM {table} WHERE txn_id = %s", (lose_id,))
-    # a hand split moves whole or not at all, and never over the
-    # survivor's own; a copy of the survivor's parts is let go, a differing
-    # split stays on the retired row for the re-anchor sweep to count
-    # rather than being deleted here
-    from ..engine.splits import move_split
-    move_split(conn, lose_id, keep_id)
+    if _move(conn, lose_id, keep_id) is None:
+        # the survivor stopped being live after the scan chose it (a pull
+        # restated the account); retiring onto it would hide both copies
+        conn.execute("UPDATE transactions SET removed = %s WHERE id = %s",
+                     (was["removed"] if was else 0, lose_id))
+        return
+    conn.execute("UPDATE transactions SET"
+                 " retired_at = COALESCE(retired_at, now()) WHERE id = %s",
+                 (lose_id,))
 
 
 def _pick_survivor(a: dict, ta: set, b: dict, tb: set) -> tuple[dict, dict]:
@@ -799,6 +849,11 @@ def _pick_survivor(a: dict, ta: set, b: dict, tb: set) -> tuple[dict, dict]:
                 r["id"] < (b["id"] if r is a else a["id"]))   # stable tie-break
     sa, sb = score(a, ta), score(b, tb)
     return (a, b) if sa >= sb else (b, a)
+
+
+# archived_reason on a connection a new link adopted accounts from; every
+# door that would bring a disconnected connection back refuses it
+DONOR_RETIRED = "reconnected — accounts adopted by a new link"
 
 
 def _retire_donors(conn, item_ids: set) -> None:
@@ -821,14 +876,24 @@ def _retire_donors(conn, item_ids: set) -> None:
     absence of a token, not on status, so re-linking that bank later can
     still claim them.
     """
+    from .base import BRIDGE_DISCONNECT
     for iid in item_ids:
         conn.execute(
             """UPDATE items SET status = 'archived',
-                   archived_reason = 'reconnected — accounts adopted by a '
-                                     'new link',
+                   archived_reason = %s,
                    archived_at = now()
                WHERE id = %s AND COALESCE(status,'') != 'archived'""",
-            (iid,))
+            (DONOR_RETIRED, iid))
+        # A SimpleFIN bank that had already gone down with its bridge is
+        # archived, so the update above passes it by — but its mark says
+        # "came down with the bridge", and a new setup token or the
+        # reconnect door would bring it back. Its next pull would then
+        # re-create the accounts this link just adopted, every one a
+        # duplicate. The new link replaced it, so it is marked so.
+        conn.execute(
+            "UPDATE items SET archived_reason = %s "
+            "WHERE id = %s AND archived_reason = %s",
+            (DONOR_RETIRED, iid, BRIDGE_DISCONNECT))
         log.info("reconnect: retired donor item %s", iid)
 
 
@@ -864,7 +929,8 @@ def pending(conn, account_id: str) -> dict | None:
     """The live adoption for an account, if its backfill is still being
     reconciled."""
     return conn.execute(
-        """SELECT account_id, cutoff_date FROM account_adoptions
+        """SELECT account_id, cutoff_date, history_from
+             FROM account_adoptions
             WHERE account_id = %s AND reconciled_at IS NULL
               AND adopted_at > now() - make_interval(days => %s)
             ORDER BY adopted_at DESC LIMIT 1""",
@@ -986,6 +1052,9 @@ def filter_incoming(conn, account_id: str, txns: list) -> tuple[list, dict]:
     cutoff = adopt["cutoff_date"]
     if isinstance(cutoff, dt.datetime):
         cutoff = cutoff.date()
+    history_from = adopt.get("history_from")
+    if isinstance(history_from, dt.datetime):
+        history_from = history_from.date()
 
     def _f(t, name):
         return t.get(name) if isinstance(t, dict) else getattr(t, name, None)
@@ -1025,13 +1094,34 @@ def filter_incoming(conn, account_id: str, txns: list) -> tuple[list, dict]:
     # run through a duplicate matcher against the tenant's own live
     # history: two same-price coffees a few days apart, and the second is
     # claimed as a copy of the first.
+    #
+    # The deep drop has a FLOOR as well. "Certainly already held" is only
+    # true inside the span the restore covers, and that span can be far
+    # shorter than the backfill: a connection linked a few months before
+    # the backup carries a few months, while the fresh link replays up to
+    # two years. A row older than the oldest one the account brought with
+    # it has no copy here at all, and dropping it would lose it for good,
+    # since the cursor moves past it. So the date rule applies only from
+    # `history_from` (the oldest restored row) up to `deep_before`; rows
+    # within the matcher's reach of that floor are matched, and anything
+    # older is kept as it is. An adoption recorded without the floor keeps
+    # the old rule, which is the most it can prove.
+    from .base import is_file_import_id
     from .dedup import Deduper, WINDOW_DAYS, _tokens
     deep_before = cutoff - dt.timedelta(days=DEEP_BACKFILL_DAYS)
     seam_ends = cutoff + dt.timedelta(days=WINDOW_DAYS)
+    before_history = (history_from - dt.timedelta(days=WINDOW_DAYS)
+                      if history_from is not None else None)
     older, overlap, buckets = [], [], []
+    kept_before_history = 0
     for t in txns:
         d = _day(t)
-        if d is not None and d < deep_before:
+        if (d is not None and before_history is not None
+                and d < before_history):
+            kept_before_history += 1
+            buckets.append((t, d, "after"))     # older than the restore
+        elif (d is not None and d < deep_before
+                and (history_from is None or d >= history_from)):
             older.append(t)
             buckets.append((t, None, "older"))
         elif d is not None and d > seam_ends:
@@ -1046,6 +1136,10 @@ def filter_incoming(conn, account_id: str, txns: list) -> tuple[list, dict]:
     # token, each existing row absorbing at most one incoming.
     dates = [d for t, d, b in buckets if b == "overlap" and d is not None]
     kept, deduped, carried = [], 0, 0
+    # (date, amount) of every incoming row dropped as already held, and the
+    # file rows a carried id landed on: see _note_file_rows_relied_on
+    absorbed_by_held: list[tuple[dt.date, float]] = []
+    renamed_file_rows: list[str] = []
     absorbed = None                 # built on the first claim, not before
     m = None
     if overlap:
@@ -1087,18 +1181,68 @@ def filter_incoming(conn, account_id: str, txns: list) -> tuple[list, dict]:
                 try:
                     if old_id and _rewrite_txn_id(conn, old_id, new_id):
                         carried += 1
+                        if is_file_import_id(old_id):
+                            renamed_file_rows.append(new_id)
+                        continue
                 except Exception:                    # noqa: BLE001
                     log.warning("reconnect: could not carry %s onto %s",
                                 new_id, old_id, exc_info=True)
+            absorbed_by_held.append((d, float(amt)))
         else:
             kept.append(t)
+    for t in older:
+        d, amt = _day(t), _f(t, "amount")
+        if d is not None and amt is not None:
+            absorbed_by_held.append((d, float(amt)))
+    _note_file_rows_relied_on(conn, account_id, absorbed_by_held,
+                              renamed_file_rows)
     stats = {"dropped_before_cutoff": len(older), "deduped_overlap": deduped,
-             "carried_plaid_ids": carried, "cutoff": str(cutoff)}
+             "carried_plaid_ids": carried, "cutoff": str(cutoff),
+             "kept_before_history": kept_before_history}
     if older or deduped:
         log.info("reconnect: account %s — dropped %s pre-cutoff, %s "
                  "overlapping duplicates, carried %s ids",
                  account_id, len(older), deduped, carried)
     return passthrough + kept, stats
+
+
+def _note_file_rows_relied_on(conn, account_id: str,
+                              dropped: list[tuple[dt.date, float]],
+                              renamed: list[str]) -> None:
+    """Note, on the file-import rows of this account, that the feed now
+    relies on them (base.STOOD_IN_KEY) — the same note the import-overlap
+    guard leaves. The adoption guard dropped these incoming rows as already
+    held, and the feed's cursor moves past them; when what held them is an
+    imported row, undoing that import must keep it, or the charge is in
+    neither copy. Which held row absorbed a date-dropped row is not known,
+    so every live file row on the account with the same amount within the
+    matching window is noted: keeping a row too many on an undo is
+    recoverable, losing the only copy is not. A file row that a carried id
+    landed on is noted by that id."""
+    from .base import (FILE_IMPORT_ID_PREFIXES, _feed_sources,
+                       mark_stood_in)
+    from .dedup import WINDOW_DAYS
+    from ..engine.compat import MAX_AMOUNT
+    dropped = [(d, a) for d, a in dropped
+               if math.isfinite(a) and abs(a) <= MAX_AMOUNT]
+    if not dropped and not renamed:
+        return
+    ids = set(renamed)
+    if dropped:
+        ids |= {r["id"] for r in conn.execute(
+            """SELECT DISTINCT t.id FROM transactions t
+                 JOIN unnest(%s::date[], %s::bigint[]) AS c(d, cents)
+                   ON round(t.amount * 100) = c.cents
+                  AND t.date BETWEEN c.d - %s::int AND c.d + %s::int
+                WHERE t.account_id = %s AND t.removed = 0
+                  AND t.id LIKE ANY(%s)""",
+            ([d for d, _ in dropped], [round(a * 100) for _, a in dropped],
+             WINDOW_DAYS, WINDOW_DAYS, account_id,
+             [p + "%" for p in FILE_IMPORT_ID_PREFIXES])).fetchall()}
+    if not ids:
+        return
+    source = _feed_sources(conn, {account_id}).get(account_id, "feed")
+    mark_stood_in(conn, {i: [account_id] for i in ids}, source)
 
 
 def mark_reconciled(conn, item_id: str) -> int:

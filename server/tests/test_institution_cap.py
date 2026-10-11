@@ -129,6 +129,58 @@ class CapCheckTests(unittest.TestCase):
             _item(self.conn, f"p{i}", "plaid")
         sync_base.check_institution_cap(self.conn)   # no raise
 
+    def _id(self, name):
+        # the ledger is instance-wide (it outlives tenants), so its item ids
+        # are unique across every test run, not just this tenant
+        if not hasattr(self, "_sfx"):
+            self._sfx = uuid.uuid4().hex[:8]
+        return f"{name}-{self._sfx}"
+
+    def _ledger(self, item_id, *, removed_days_ago=None, created_days_ago=0,
+                source="platform"):
+        self.conn.execute(
+            """INSERT INTO plaid_item_ledger
+                   (item_id, credential_source, tenant, created_at,
+                    removed_at)
+               VALUES (%s, %s, current_setting('app.tenant_id'),
+                       now() - make_interval(days => %s),
+                       CASE WHEN %s::int IS NULL THEN NULL
+                            ELSE now() - make_interval(days => %s::int)
+                       END)""",
+            (item_id, source, created_days_ago, removed_days_ago,
+             removed_days_ago))
+
+    def test_link_disconnect_relink_churn_reaches_the_cap(self):
+        # one live bank, plus a bank linked and released twice this month:
+        # each release was a billed Item, so the third link is refused
+        _item(self.conn, self._id("p-live"), "plaid")
+        self._ledger(self._id("p-live"))
+        _item(self.conn, self._id("p-gone1"), "plaid", status="archived")
+        self._ledger(self._id("p-gone1"), removed_days_ago=3, created_days_ago=4)
+        self._ledger(self._id("p-gone2"), removed_days_ago=1, created_days_ago=2)
+        self.assertEqual(sync_base.institutions_held(self.conn), 3)
+        with self.assertRaises(ValueError):
+            sync_base.check_institution_cap(self.conn)
+
+    def test_a_release_frees_its_place_after_the_hold_window(self):
+        _item(self.conn, self._id("p-live"), "plaid")
+        self._ledger(self._id("p-live"), created_days_ago=90)
+        self._ledger(self._id("p-old"), removed_days_ago=sync_base.RELEASED_HOLD_DAYS + 1,
+                     created_days_ago=60)
+        self.assertEqual(sync_base.released_count(self.conn), 0)
+        sync_base.check_institution_cap(self.conn)   # no raise
+
+    def test_items_on_the_households_own_keys_are_not_held(self):
+        _item(self.conn, self._id("p-live"), "plaid")
+        self._ledger(self._id("p-byo"), removed_days_ago=1, source="byo")
+        sync_base.check_institution_cap(self.conn)   # no raise
+
+    def test_a_release_whose_stamp_never_landed_counts_from_creation(self):
+        _item(self.conn, self._id("p-live"), "plaid")
+        _item(self.conn, self._id("p-gone"), "plaid", status="archived")
+        self._ledger(self._id("p-gone"), created_days_ago=5)          # no removed_at
+        self.assertEqual(sync_base.released_count(self.conn), 1)
+
 
 class PlaidDoorTests(unittest.TestCase):
     """The /accounts/plaid/link door consults the cap before adding a

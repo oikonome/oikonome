@@ -34,7 +34,9 @@ import uuid
 import zipfile
 
 from . import base as _sync_base
-from ..engine.compat import as_date, jsonb
+from ..engine.entities import _hold_household_mark
+from ..engine.compat import MAX_AMOUNT, as_date, jsonb, strip_nul
+from ..engine import bills as _bills
 
 log = logging.getLogger(__name__)
 
@@ -103,7 +105,10 @@ def _rows(z: zipfile.ZipFile, name: str):
                         "a genuine Oikonome export")
                 if i and i % _TICK_EVERY == 0:
                     _tick(name, i)
-                yield {k: _unescape(v) for k, v in row.items()}
+                # U+0000 cannot be stored in text and means nothing in
+                # any cell; a jsonb cell's escaped one is dropped on write
+                yield {strip_nul(k): _unescape(strip_nul(v))
+                       for k, v in row.items()}
             _tick(name, i + 1, done=True)
         except csv.Error as e:
             # an over-wide cell (or a torn CSV) is a bad file, not a crash
@@ -136,6 +141,43 @@ def _f(v):
         raise ValueError(f"a number in this archive is not finite ({str(v)[:20]!r}) "
                          "— this doesn't look like a genuine Oikonome export")
     return f
+
+
+class _AmountOutOfRange(ValueError):
+    """One row's amount is larger than any real sum (see `_money`)."""
+
+
+def _money(v):
+    """A money cell: `_f`, and no larger than any real sum. 1e308 is
+    finite and survives _f, but every cents conversion of it overflows —
+    the matchers then fail the household's hourly and nightly passes on
+    every run. Older import doors accepted such values, so a genuine
+    archive can hold one: it raises _AmountOutOfRange, and the reader
+    skips that one row and counts it (see `_out_of_range_note`) rather
+    than refusing the whole archive."""
+    f = _f(v)
+    if f is not None and abs(f) > MAX_AMOUNT:
+        raise _AmountOutOfRange(str(v)[:20])
+    return f
+
+
+def _balance(v):
+    """An account balance cell: `_money`, except that one beyond any real
+    sum is left empty rather than the row skipped. The account has to land,
+    or every transaction and bill on it goes too; the next sync or a hand
+    edit fills the balance in again."""
+    try:
+        return _money(v)
+    except _AmountOutOfRange:
+        log.warning("restore: an account balance beyond any real sum "
+                    "(%s) was left empty", str(v)[:20])
+        return None
+
+
+def _out_of_range_note(n: int) -> str:
+    return (f"{n} row{'s' if n != 1 else ''} with an amount larger than "
+            f"any real sum (over {MAX_AMOUNT:,.0f}) "
+            f"{'were' if n != 1 else 'was'} left out")
 
 
 def _i(v, default=None):
@@ -194,9 +236,17 @@ _SECRET_SUBSTR = ("secret", "token", "password", "client_id",
 # destination's count always wins: an old export would otherwise hand back a
 # spent month, and a hand-edited negative count would lift the cap entirely,
 # billed to whoever owns the Plaid keys.
+# outbound_paused is the record a credential rotation writes: the mail
+# relay, recipients and AI endpoint stand down until the owner presses
+# Resume (notify/outbound_pause). It is this instance's decision about
+# this instance's settings, never data: an archive that carried it could
+# lift a pause by merging a record that names nothing (the Resume door
+# asks for a step-up; a restore must not be the way round it), or plant a
+# stale pause from the instance it was taken on.
 _POLICY_KEYS = ("demo_mode", "demo_login", "smtp_starttls",
                 "taxdocs_allow_remote_llm", "notify_phone",
-                "notify_phone_pending", "plaid_enrich_used")
+                "notify_phone_pending", "plaid_enrich_used",
+                "outbound_paused")
 
 # Settings that describe a CREDENTIAL rather than the household: which
 # aggregator environment a set of keys belongs to, and the user those keys
@@ -206,7 +256,231 @@ _POLICY_KEYS = ("demo_mode", "demo_login", "smtp_starttls",
 # made with this instance's keys against another client's user, or
 # production Plaid keys sent to the sandbox host. They stay with the keys
 # they describe: the destination's own value, or none.
-_CREDENTIAL_COMPANION_KEYS = ("plaid_env", "mx_env", "mx_user_guid")
+# The `<provider>_keys_saved_at` stamps are the same class: they date when
+# THIS instance's keys were saved, and the bank-link hold's banner shows
+# them so the owner can tell whether the held keys predate the pause. An
+# archive's stamp would date keys it never carried — held keys would read
+# as saved at a time they were not.
+_CREDENTIAL_COMPANION_KEYS = ("plaid_env", "mx_env", "mx_user_guid",
+                              "plaid_keys_saved_at", "mx_keys_saved_at")
+
+
+# What makes up the relay and the AI endpoint: a restore or bundle that
+# leaves all of these as they were brought no relay or endpoint in, so it
+# has nothing new to pause — whatever is there is the destination's own,
+# set (and, if it was saved after the pause, confirmed) by the owner here.
+_RELAY_KEYS = ("smtp_host", "smtp_user", "smtp_from")
+_LLM_KEYS = ("llm_url", "llm_roles", "llm_backends")
+
+
+def _owner_addresses(conn) -> set[str]:
+    """The current tenant's owner addresses, lowercased. The owner is
+    mailed by construction, so their own address is never a recipient a
+    pause holds back."""
+    if conn is None:
+        return set()
+    row = conn.execute(
+        "SELECT current_setting('app.tenant_id', true) AS tid").fetchone()
+    tid = row["tid"] if row else None
+    if not tid:
+        return set()
+    from ..web import mailguard
+    return mailguard.owner_addresses(tid)
+
+
+def widen_armed_pause(before: dict, after: dict, conn=None) -> None:
+    """While a credential rotation's pause is armed, whatever outbound
+    setting an import brings in is paused with the rest.
+
+    The pause names what was set when the credential rotated; a restore or
+    a connections bundle applied during it can bring a mail relay, extra
+    recipients or an AI endpoint the record never named, and those would
+    send at once while the settings the owner has yet to confirm stay
+    held. So the record is widened (never narrowed, as a second rotation
+    widens it) by what the import CHANGED: the relay when `after`'s relay
+    differs from `before`'s, the AI endpoint likewise, and every recipient
+    `before` did not already list — the ones already there were the
+    owner's own or confirmed since. A relay the owner saved here after the
+    pause is theirs, so an import that leaves it as it was must not stand
+    it down. The owner's own address is never held (`conn`, the tenant
+    connection, is how it is found). The record's time and reason are
+    kept, so the banner still names the rotation the owner has to answer.
+    Mutates `after`; nothing when no pause is armed in `before`."""
+    from ..notify import outbound_pause
+    prior = outbound_pause.paused(before)
+    if prior is None:
+        return
+    now = outbound_pause._what_is_set(after, "")
+    was = outbound_pause._what_is_set(before, "")
+    added = set(now["recipients"]) - set(was["recipients"])
+    if added:
+        added -= _owner_addresses(conn)
+    relay_changed = any(before.get(k) != after.get(k) for k in _RELAY_KEYS)
+    llm_changed = any(before.get(k) != after.get(k) for k in _LLM_KEYS)
+    after[outbound_pause.KEY] = {
+        **(before.get(outbound_pause.KEY) or {}),
+        "at": prior["at"], "reason": prior["reason"],
+        "smtp": prior["smtp"] or (now["smtp"] and relay_changed),
+        "recipients": sorted(set(prior["recipients"]) | added),
+        "llm": prior["llm"] or (now["llm"] and llm_changed)}
+
+
+# Who started this restore. A restore runs for minutes and applies the
+# settings LAST, long after the step-up that let it start; a credential
+# rotation in between ends the starter's session. If the session (or
+# device token) that started the restore is gone by the settings step,
+# whoever started it is no longer signed in, and what the archive brings in
+# for the mail relay, recipients or AI endpoint must not start sending: a
+# rotation with nothing outbound set leaves no pause record for
+# widen_armed_pause to widen, so this is the only place that can tell.
+# It must be the STARTING credential, not the household's sessions: a
+# password change keeps the changer's own session and leaves every other
+# member's alone, so "some session survives" is true through exactly the
+# rotation this exists for. The value is ("cred", fingerprint) whenever the
+# restore was started by a request that carried a credential, or
+# ("household", {session ids}) only when it was started outside one (a
+# command-line restore: every session gone still means the starter is
+# gone; a survivor proves less). A starter whose credential is already gone
+# when the restore begins stops it outright (StarterSignedOut) — never a
+# fall back to the household's sessions, whose survivor is the very
+# session a rotation keeps.
+_START_SESSIONS: contextvars.ContextVar = contextvars.ContextVar(
+    "restore_start_sessions", default=None)
+
+
+def _tenant_of(conn) -> str | None:
+    row = conn.execute(
+        "SELECT current_setting('app.tenant_id', true) AS tid").fetchone()
+    return (row["tid"] if row else None) or None
+
+
+def _live_sessions(conn) -> frozenset:
+    """Ids of the current tenant's unexpired sessions, read on the control
+    connection (sessions are control-plane). Empty when the tenant is not
+    pinned or the read fails, which disarms the check rather than pausing
+    a restore nobody signed in started (a CLI or test restore)."""
+    try:
+        tid = _tenant_of(conn)
+        if not tid:
+            return frozenset()
+        from ..db import tenancy
+        cc = tenancy.control_connect()
+        try:
+            return frozenset(str(r["id"]) for r in cc.execute(
+                "SELECT id FROM sessions WHERE tenant_id=%s "
+                "AND expires_at > now()", (uuid.UUID(str(tid)),)).fetchall())
+        finally:
+            cc.close()
+    except Exception:                                    # noqa: BLE001
+        log.warning("restore: could not read the household's sessions",
+                    exc_info=True)
+        return frozenset()
+
+
+def _live_credentials(conn, fingerprint: str) -> frozenset:
+    """Token hashes of this tenant's unexpired sessions and device tokens
+    whose hash begins with `fingerprint` (the request's credential
+    fingerprint is that prefix — see web.security.credential_fingerprint).
+    Empty when nothing matches or the read fails.
+
+    A rotation DELETEs sessions but only marks device tokens revoked (the
+    row stays for the audit trail, its expiry untouched), so a device
+    token counts only while unrevoked — the same rule its resolver
+    applies — or a restore started from the phone would never be paused."""
+    try:
+        tid = _tenant_of(conn)
+        if not tid or not fingerprint:
+            return frozenset()
+        from ..db import tenancy
+        cc = tenancy.control_connect()
+        try:
+            return frozenset(r["h"] for r in cc.execute(
+                "SELECT token_hash AS h FROM sessions WHERE tenant_id=%s"
+                " AND expires_at > now() AND left(token_hash, %s) = %s"
+                " UNION ALL "
+                "SELECT token_hash FROM device_tokens WHERE tenant_id=%s"
+                " AND revoked_at IS NULL"
+                " AND expires_at > now() AND left(token_hash, %s) = %s",
+                (uuid.UUID(str(tid)), len(fingerprint), fingerprint,
+                 uuid.UUID(str(tid)), len(fingerprint), fingerprint),
+            ).fetchall())
+        finally:
+            cc.close()
+    except Exception:                                    # noqa: BLE001
+        log.warning("restore: could not read the starter's credential",
+                    exc_info=True)
+        return frozenset()
+
+
+class StarterSignedOut(ValueError):
+    """The credential that started this restore was gone before the restore
+    began. A ValueError, so the job reports the sentence to the person."""
+
+    def __init__(self):
+        super().__init__(
+            "the restore did not start: you were signed out after uploading "
+            "(a password, login email or second-factor change ends other "
+            "sessions), so nothing was applied — sign in and upload the file "
+            "again")
+
+
+def _starter_watch(conn, starter: str | None):
+    """What pause_if_starter_signed_out watches for this restore (see
+    _START_SESSIONS). `starter` is the starting request's credential
+    fingerprint; None reads it from the request in flight.
+
+    A starter whose credential no longer resolves raises StarterSignedOut
+    before a row is written. The restore runs on a worker thread that
+    first waits for its connections and the household's sync lock, and a
+    rotation landing in that wait ends the starter's session while keeping
+    the rotating owner's own; looking past the starter to "any live
+    session" would read that survivor as the starter still being here."""
+    if starter is None:
+        try:
+            from ..web import security
+            starter = security.current_credential()
+        except Exception:                                # noqa: BLE001
+            starter = ""
+    if starter:
+        if not _live_credentials(conn, starter):
+            raise StarterSignedOut()
+        return ("cred", starter)
+    live = _live_sessions(conn)
+    return ("household", live) if live else None
+
+
+def pause_if_starter_signed_out(before: dict, after: dict, conn) -> None:
+    """Arm an outbound pause over what this restore brought in when every
+    session that started it has since gone (see _START_SESSIONS). Only
+    what the restore CHANGED is held, exactly as widen_armed_pause holds it
+    during an armed pause; the owner's own address is never held. Nothing
+    when a pause is already armed (widen_armed_pause covers it), when the
+    restore started with no session to watch, or when one survives."""
+    from ..notify import outbound_pause
+    watch = _START_SESSIONS.get()
+    if not watch or outbound_pause.paused(before) is not None:
+        return
+    kind, what = watch
+    if kind == "cred":
+        if _live_credentials(conn, what):
+            return
+    elif what & _live_sessions(conn):
+        return
+    now = outbound_pause._what_is_set(after, "")
+    was = outbound_pause._what_is_set(before, "")
+    added = set(now["recipients"]) - set(was["recipients"])
+    if added:
+        added -= _owner_addresses(conn)
+    smtp = bool(now["smtp"]) and any(
+        before.get(k) != after.get(k) for k in _RELAY_KEYS)
+    llm = bool(now["llm"]) and any(
+        before.get(k) != after.get(k) for k in _LLM_KEYS)
+    if not (smtp or added or llm):
+        return
+    after[outbound_pause.KEY] = {
+        "at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "reason": outbound_pause.ROTATION,
+        "smtp": smtp, "recipients": sorted(added), "llm": llm}
 
 
 def _secret_key(k) -> bool:
@@ -345,7 +619,7 @@ def carry_forward_secrets(dest, incoming):
 # back and which are kept for the person's records only, from this set.
 # `bills` is read under a variable (older archives call it recurring.csv),
 # so a source test that only scans literal `_rows(z, "…")` calls misses it.
-RESTORED_MEMBERS: frozenset[str] = frozenset(['account_links', 'accounts', 'amazon_matches', 'amazon_orders', 'amazon_summaries', 'bill_proposals', 'bills', 'budget_snapshots', 'business_entity', 'business_flags', 'business_txn_class', 'compliance_obligation', 'costco_matches', 'costco_receipts', 'crypto_holdings', 'entity_membership', 'equity_movement', 'holdings', 'import_batches', 'income_annual', 'income_documents', 'items', 'liabilities', 'manual_categories', 'merchant_canonical', 'merchant_categories', 'merchant_merge_proposals', 'merchant_renames', 'merchants', 'mileage_log', 'networth_recorded', 'networth_snapshot', 'receipt_items', 'receipts', 'recipient_invites', 'recurring', 'reimburse_flags', 'reimbursements', 'tenant_settings', 'transaction_notes', 'transaction_splits', 'transactions', 'vendor_1099', 'activity_log'])
+RESTORED_MEMBERS: frozenset[str] = frozenset(['account_adoptions', 'account_links', 'accounts', 'amazon_matches', 'amazon_orders', 'amazon_summaries', 'bill_proposals', 'bills', 'budget_snapshots', 'business_entity', 'business_flags', 'business_txn_class', 'compliance_obligation', 'costco_matches', 'costco_receipts', 'crypto_holdings', 'entity_membership', 'equity_movement', 'holdings', 'import_batches', 'income_annual', 'income_documents', 'items', 'liabilities', 'manual_categories', 'merchant_canonical', 'merchant_categories', 'merchant_merge_proposals', 'merchant_renames', 'merchants', 'mileage_log', 'networth_recorded', 'networth_snapshot', 'receipt_items', 'receipts', 'recipient_invites', 'recurring', 'reimburse_flags', 'reimbursements', 'tenant_settings', 'transaction_notes', 'transaction_splits', 'transactions', 'vendor_1099', 'activity_log'])
 
 
 # A restored activity-log row is held to the size of one the app writes. The
@@ -356,6 +630,14 @@ RESTORED_MEMBERS: frozenset[str] = frozenset(['account_links', 'accounts', 'amaz
 # the household's record and still lands — clipped, never refused.
 ACTIVITY_TARGET_MAX = 200
 ACTIVITY_DETAIL_MAX = 16 * 1024          # bytes of JSON
+
+
+# A restored account-id lineage row is read on every file import into its
+# account (sync/base FileImportIds), so a crafted archive gets a fixed
+# number of them, far above any household's reconnect history, and an id
+# no longer than an account id is ever sensibly written.
+_MAX_ADOPTION_LINEAGE = 1000
+_MAX_ACCOUNT_ID = 512
 
 
 # A crafted archive must not be able to fill a control-plane table. A live
@@ -472,6 +754,33 @@ def _receipt_parsed(v) -> dict:
     return parsed
 
 
+def _receipt_optimized(r) -> tuple[bytes | None, str | None]:
+    """The cleaned-up copy of a receipt photo from its archive row, or
+    (None, None). Only an upload makes one, so a restore that dropped it
+    would leave the receipt serving and re-reading the raw photo for good.
+    Held to what the optimizer itself writes — a JPEG, under the upload's
+    size cap — because the stored type is what the image door serves the
+    bytes back as; anything else is dropped and the original stands in, as
+    it does for a receipt that never had a copy."""
+    import base64
+
+    from ..engine import receipts as _receipts
+    cell = r.get("image_optimized")
+    if not cell or str(r.get("optimized_mime") or "").strip().lower() \
+            != "image/jpeg":
+        return None, None
+    if len(cell) > _receipts.MAX_IMAGE * 4 // 3 + 4:
+        return None, None
+    try:
+        data = base64.b64decode(cell, validate=True)
+    except Exception:                                   # noqa: BLE001
+        return None, None
+    if not data or len(data) > _receipts.MAX_IMAGE \
+            or not data.startswith(b"\xff\xd8\xff"):
+        return None, None
+    return data, "image/jpeg"
+
+
 def _receipt_ts(v):
     """_ts, or None (the column's default stands in) for a timestamp no
     receipt could carry: before 1900 or after next year."""
@@ -538,6 +847,7 @@ def scrub_transaction_raw(raw: dict) -> dict:
     from .csvimport import scrub_identifiers
     from .pdfimport import _mask_long_digits
     out = scrub_identifiers(raw) if _is_file_row(raw) else dict(raw)
+    _sync_base.stood_in_from_legacy_copies(out)
     acct = out.get("acct")
     if (isinstance(acct, (str, int, float)) and not isinstance(acct, bool)
             and len(str(acct)) > 4):
@@ -577,6 +887,76 @@ def clean_excluded_accounts(cfg: dict) -> None:
         cfg["excluded_accounts"] = ids
     else:
         cfg.pop("excluded_accounts", None)
+
+
+def _amount_or_none(v):
+    """A settings amount as the settings door accepts it: a real number
+    (a bool is not one), finite, and no larger than any real sum; None for
+    anything else. A numeric string passes, as the door parses one."""
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, str):
+        v = v.replace(",", "").replace("$", "").strip()
+        if not v:
+            return None
+    try:
+        n = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(n) or abs(n) > MAX_AMOUNT:
+        return None
+    return n
+
+
+def clean_budget_amounts(cfg: dict) -> list[str]:
+    """Bound and type-check the budget amounts in a restored config the way
+    the settings door does, and say what was dropped.
+
+    The settings blob goes in verbatim, and Today, Budget and the daily
+    email compare and sum these values directly: a string, a bool or a
+    non-finite number in one of them makes those pages answer 500, with no
+    door the household can use to take it back out. The per-month pools
+    are dropped when unusable (the instance then seeds them as for a new
+    household); a bucket keeps its name and rules and only loses an amount
+    that cannot be one."""
+    notes: list[str] = []
+    for k in ("food_monthly", "other_monthly"):
+        if k in cfg:
+            n = _amount_or_none(cfg[k])
+            if n is None:
+                cfg.pop(k)
+                notes.append(f"the {k.split('_')[0]} budget was not a usable "
+                             "amount and was left out")
+            else:
+                cfg[k] = max(0.0, n)
+    if "budgeted_income_monthly" in cfg:
+        n = _amount_or_none(cfg["budgeted_income_monthly"])
+        if n is None or n <= 0:
+            if n is None:
+                notes.append("the budgeted monthly income was not a usable "
+                             "amount and was left out")
+            cfg.pop("budgeted_income_monthly")
+        else:
+            cfg["budgeted_income_monthly"] = n
+    if "custom_buckets" in cfg:
+        buckets = cfg["custom_buckets"]
+        if not isinstance(buckets, list):
+            cfg.pop("custom_buckets")
+            notes.append("the budget categories were not a list and were "
+                         "left out")
+        else:
+            bad = 0
+            for e in buckets:
+                if isinstance(e, dict) and "monthly" in e:
+                    n = _amount_or_none(e["monthly"])
+                    if n is None and e["monthly"] not in (None, ""):
+                        bad += 1
+                    e["monthly"] = max(0.0, n or 0.0)
+            if bad:
+                notes.append(f"{bad} budget categor"
+                             f"{'ies' if bad != 1 else 'y'} had an amount "
+                             "that was not usable and now budget $0")
+    return notes
 
 
 # The comma-free name each comma id in the archive being restored takes,
@@ -654,9 +1034,14 @@ def clean_bill_raw(v) -> dict:
                 vals = rec[key] if isinstance(rec[key], (list, tuple)) else []
                 ints = []
                 for x in vals:
+                    # a parsed JSON number can be Infinity (int() raises
+                    # OverflowError) or a 400-digit integer (float() does),
+                    # and either must drop the field like any other bad
+                    # value rather than abort the whole restore — so every
+                    # cleaner here also catches OverflowError
                     try:
                         ints.append(int(x))
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError, OverflowError):
                         continue
                 if ints:
                     rec[key] = ints
@@ -672,7 +1057,7 @@ def clean_bill_raw(v) -> dict:
         if "interval" in rec:
             try:
                 rec["interval"] = max(1, min(240, int(rec["interval"])))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 rec.pop("interval", None)
         if "frequency" in rec and not isinstance(rec["frequency"], str):
             rec.pop("frequency", None)
@@ -680,7 +1065,7 @@ def clean_bill_raw(v) -> dict:
     if "envelope_months" in raw:
         try:
             raw["envelope_months"] = 12 if int(raw["envelope_months"]) >= 12 else 1
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raw.pop("envelope_months", None)
     if "companions" in raw and not isinstance(raw["companions"], list):
         raw.pop("companions", None)
@@ -694,9 +1079,10 @@ def clean_bill_raw(v) -> dict:
                 continue
             try:
                 amt = float(c.get("amount"))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
-            if isinstance(c.get("amount"), bool) or not math.isfinite(amt):
+            if (isinstance(c.get("amount"), bool) or not math.isfinite(amt)
+                    or abs(amt) > MAX_AMOUNT):
                 continue
             kept.append({**c, "amount": amt})
         raw["companions"] = kept
@@ -725,7 +1111,7 @@ def clean_liability_raw(v) -> dict:
         val = raw[key]
         try:
             num = float(val)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             num = None
         # bool is an int to float(); a True balance is not a number anyone
         # meant, and 'nan'/'inf' parse but poison the min()/max() walk
@@ -762,25 +1148,21 @@ def normalize_notify_shapes(cfg: dict) -> list[str]:
             sched = None
     if isinstance(sched, dict):
         clean: dict = {}
-        for cad in ("daily", "weekly", "monthly", "yearly"):
+        for cad in ("daily", "monthly", "yearly"):
             c = sched.get(cad)
             if not isinstance(c, dict):
                 continue
             try:
                 hour = int(c.get("hour", 7))
-                # weekday means something for the weekly cadence only; a
-                # stray one on another cadence is ignored, not a reason
-                # to drop the entry
-                weekday = int(c.get("weekday", 0)) if cad == "weekly" else 0
-            except (TypeError, ValueError):
-                hour, weekday = -1, -1
-            if not (0 <= hour <= 23 and 0 <= weekday <= 6):
+            except (TypeError, ValueError, OverflowError):
+                hour = -1
+            if not 0 <= hour <= 23:
                 notes.append(f"the {cad} email schedule in this export was "
                              "malformed and was not restored")
                 continue
+            # a stray field (an old weekly entry's weekday, say) is ignored,
+            # not a reason to drop the entry
             entry = {"on": bool(c.get("on")), "hour": hour}
-            if cad == "weekly":
-                entry["weekday"] = weekday
             for flag in ("sms", "push"):
                 if c.get(flag):
                     entry[flag] = True
@@ -795,7 +1177,7 @@ def normalize_notify_shapes(cfg: dict) -> list[str]:
         try:
             cfg["email_send_hour_utc"] = max(0, min(
                 23, int(cfg["email_send_hour_utc"])))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             cfg.pop("email_send_hour_utc", None)
     rec = cfg.get("email_recipients")
     if isinstance(rec, str):
@@ -846,21 +1228,49 @@ def _drop_sms_toggles_without_verified_phone(cfg: dict, dest: dict) -> None:
 MAX_MEMBER_BYTES = 128 * 1024 * 1024
 MAX_TOTAL_BYTES = 512 * 1024 * 1024
 
+# The members whose size follows the household's photos rather than its
+# ledger. Every receipt travels as base64 of its image and its optimised
+# copy, so a few dozen phone photos pass the per-file cap, and a household
+# that keeps receipts could not restore its own export. What these members
+# hold is already compressed (JPEG, PNG, WebP, PDF), so the honest member
+# expands to about a third more than it takes in the ZIP; a bomb expands a
+# thousandfold. They are bounded by that ratio instead of by size, each row
+# is still held to a live upload's limit as it streams in, and the rest of
+# the archive keeps the caps above.
+BLOB_MEMBERS = frozenset({"receipts.csv"})
+BLOB_MEMBER_MAX_RATIO = 4
 
-def _check_zip_sizes(z: zipfile.ZipFile) -> None:
+
+def zip_size_problem(infos) -> str | None:
+    """Why a restore would refuse an archive with these members, or None.
+    The one rule both sides read: the restore refuses on it, and the export
+    checks what it just wrote against it."""
     total = 0
-    for info in z.infolist():
+    for info in infos:
+        if info.filename in BLOB_MEMBERS:
+            if (info.file_size > MAX_MEMBER_BYTES
+                    and info.file_size > BLOB_MEMBER_MAX_RATIO
+                    * max(info.compress_size, 1)):
+                return (f"{info.filename} in this ZIP expands "
+                        f"{info.file_size // max(info.compress_size, 1)} "
+                        "times over — more than photos ever do")
+            continue
         if info.file_size > MAX_MEMBER_BYTES:
-            raise ValueError(
-                f"{info.filename} in this ZIP is too large to restore "
-                f"({info.file_size // (1024 * 1024)} MB — the per-file "
-                f"limit is {MAX_MEMBER_BYTES // (1024 * 1024)} MB)")
+            return (f"{info.filename} in this ZIP is too large to restore "
+                    f"({info.file_size // (1024 * 1024)} MB — the per-file "
+                    f"limit is {MAX_MEMBER_BYTES // (1024 * 1024)} MB)")
         total += info.file_size
     if total > MAX_TOTAL_BYTES:
-        raise ValueError(
-            f"this ZIP expands to {total // (1024 * 1024)} MB — more than "
-            f"the {MAX_TOTAL_BYTES // (1024 * 1024)} MB (512 MB) restore "
-            f"limit")
+        return (f"this ZIP expands to {total // (1024 * 1024)} MB — more "
+                f"than the {MAX_TOTAL_BYTES // (1024 * 1024)} MB restore "
+                "limit")
+    return None
+
+
+def _check_zip_sizes(z: zipfile.ZipFile) -> None:
+    problem = zip_size_problem(z.infolist())
+    if problem:
+        raise ValueError(problem)
 
 
 def _txn_exists(conn, txn_id) -> bool:
@@ -871,7 +1281,8 @@ def _txn_exists(conn, txn_id) -> bool:
     absent. That is normally impossible — transactions.csv is restored first
     — but a backup taken BEFORE 067 can legitimately contain orphans, and a
     restore is exactly the wrong moment to abort on one. Skip the dangling
-    row and carry on; it is counted in `skipped` like any other.
+    row and carry on; the caller counts it as orphaned, apart from the
+    rows that were simply already present.
     """
     if not txn_id:
         return False
@@ -1022,16 +1433,22 @@ def _merchant_name_cells(r) -> tuple:
 
 
 
-def restore_zip(conn, data: bytes, *, progress=None) -> dict:
+def restore_zip(conn, data: bytes, *, progress=None,
+                starter: str | None = None) -> dict:
     """Merge an export ZIP into this tenant. `progress`, when given, is
     called as (table, rows, done) while the members stream past — the
     background-job door uses it to keep a status row fresh so a large
-    restore reports where it is instead of looking hung."""
+    restore reports where it is instead of looking hung. `starter` is the
+    credential fingerprint of the request that started the restore (the
+    background job captures it before leaving the request); None reads the
+    request in flight."""
     token = _PROGRESS.set(progress) if progress is not None else None
     renames = _COMMA_RENAMES.set({})
+    sessions = _START_SESSIONS.set(_starter_watch(conn, starter))
     try:
         return _restore_zip(conn, data)
     finally:
+        _START_SESSIONS.reset(sessions)
         _COMMA_RENAMES.reset(renames)
         if token is not None:
             _PROGRESS.reset(token)
@@ -1138,10 +1555,13 @@ def _restore_recipient_invites(conn, z) -> dict:
     addresses in the archive, `rows` written, and how many of those addresses
     are `accepted`, `declined`, or still `pending` here — so the restore can
     say out loud who has to answer again."""
+    from ..web.mailguard import valid_address
     seen: dict[str, dict] = {}
     for r in _rows(z, "recipient_invites.csv"):
         email = (r.get("email") or "").strip().lower()
-        if not email:
+        # one bare mailbox, the test every door that stores an address
+        # applies: a row is a decision about exactly one person
+        if not email or not valid_address(email):
             continue
         # one mailbox is one recipient however many times the file names it
         seen[email] = r
@@ -1225,6 +1645,8 @@ def _restore_zip(conn, data) -> dict:
         planned.update(_plan_comma_renames(conn, z))
     counts: dict[str, int] = {}
     skipped = 0                  # rows already present (idempotent no-ops)
+    orphaned = 0                 # rows whose parent the archive did not carry
+    out_of_range = 0             # rows left out: amount beyond any real sum
 
     # Validate the incoming config FIRST — the connection is autocommit,
     # so a rejection after the row loops would still leave the ZIP's
@@ -1236,16 +1658,24 @@ def _restore_zip(conn, data) -> dict:
               if settings and settings[0].get("config") else None)
     notes: list[str] = []
     if isinstance(cfg_in, dict):
+        # The parsed cell can hold a NUL its CSV text spelled as an escape.
+        # Settled here, before any key check reads it: values lose theirs,
+        # and a key holding one refuses the file, so the spelling every
+        # validator sees is the one that would be stored.
+        cfg_in = strip_nul(cfg_in)
         notes = _check_config(cfg_in)
 
     # One transaction: a mid-restore failure (bad row deep in the ZIP,
     # connection drop) leaves nothing behind.
     with conn.transaction():
         for r in _rows(z, "items.csv"):
+            archived = (r.get("status") or "") == "archived"
             cur = conn.execute(
                 """INSERT INTO items (id, aggregator, institution_id,
-                       institution_name, status, raw, logo, brand_color, url)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                       institution_name, status, raw, logo, brand_color, url,
+                       archived_reason, archived_at, linked_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                           COALESCE(%s, now()))
                    ON CONFLICT (tenant_id, id) DO NOTHING""",
                 (r["id"], r.get("aggregator") or "manual",
                  r.get("institution_id") or None,
@@ -1255,11 +1685,26 @@ def _restore_zip(conn, data) -> dict:
                  # simplefin children) which stay archived: 'restored' would
                  # re-enter them into connection-freshness checks and the
                  # hourly pull loop they were deliberately kept out of
-                 ("archived" if (r.get("status") or "") == "archived"
-                  else "restored"),
+                 ("archived" if archived else "restored"),
                  jsonb(_raw_dict(_j(r.get("raw")))),
                  r.get("logo") or None, r.get("brand_color") or None,
-                 r.get("url") or None))
+                 r.get("url") or None,
+                 # Why and when a disconnected bank went. The reason is what
+                 # refuses a reconnect that would bring its accounts in
+                 # twice (a newer link adopted them) or bring back one the
+                 # owner deleted, and what lets a new bridge token revive
+                 # only the banks that went down with the bridge; the date
+                 # is where its catch-up pull starts. Dropped, every
+                 # disconnected bank restores as an ordinary one and those
+                 # refusals stop. Only a disconnected row carries them: a
+                 # live connection restores as a shell, and a stray reason
+                 # on it would mean nothing. resync_from stays behind on
+                 # purpose — it is this instance's own pull bookkeeping.
+                 (r.get("archived_reason") or None) if archived else None,
+                 _ts(r.get("archived_at")) if archived else None,
+                 # when the bank was linked is the household's history, not
+                 # this instance's; an archive without it restores as now
+                 _ts(r.get("linked_at"))))
             counts["items"] = counts.get("items", 0) + cur.rowcount
             skipped += 1 - cur.rowcount
 
@@ -1330,6 +1775,24 @@ def _restore_zip(conn, data) -> dict:
             counts["business_entity"] = counts.get("business_entity", 0) + cur.rowcount
             skipped += 1 - cur.rowcount
 
+        # An archive written table by table, each at its own moment, can hold
+        # a row whose parent it missed: an account opened after the
+        # connections were read, a business deleted after the ledger was. The
+        # export now reads one snapshot, but archives from before that
+        # exist, and one dangling pointer would roll back the whole restore.
+        # So parents are checked against what is here: a pointer to a
+        # missing business or connection is dropped (what deleting that
+        # parent does to it anyway), and a row that cannot exist without
+        # its missing parent is skipped.
+        known_entities = {str(r["id"]) for r in conn.execute(
+            "SELECT id FROM business_entity").fetchall()}
+        known_items = {r["id"] for r in conn.execute(
+            "SELECT id FROM items").fetchall()}
+
+        def _entity(v):
+            v = (v or "").strip().lower()
+            return v if v in known_entities else None
+
         # ids the archive spells with a comma, and the name each restores
         # under — the settings keys naming them are rewritten to match
         renamed: dict[str, str] = {}
@@ -1343,13 +1806,16 @@ def _restore_zip(conn, data) -> dict:
                        user_removed_at, type_user_set, balance_limit)
                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                    ON CONFLICT (tenant_id, id) DO NOTHING""",
-                (_account_id(r["id"]), r.get("item_id") or None, r.get("name"),
+                (_account_id(r["id"]),
+                 r.get("item_id") if r.get("item_id") in known_items else None,
+                 r.get("name"),
                  r.get("display_name") or None, r.get("official_name") or None,
                  r.get("type"), r.get("subtype") or None, r.get("mask") or None,
                  # _f, not truthiness — a non-string 0 must
                  # restore as 0, never NULL
-                 _f(r.get("balance_current")), _f(r.get("balance_available")),
-                 r.get("currency") or None, r.get("entity_id") or None,
+                 _balance(r.get("balance_current")),
+                 _balance(r.get("balance_available")),
+                 r.get("currency") or None, _entity(r.get("entity_id")),
                  # the account's default owner label ("yours/mine/ours"); an
                  # archive without the column restores as unattributed (None).
                  r.get("owner") or None,
@@ -1365,7 +1831,7 @@ def _restore_zip(conn, data) -> dict:
                  # balance_limit rides along: it is what credit-utilisation
                  # reads.
                  _b(r.get("type_user_set")),
-                 _f(r.get("balance_limit"))))
+                 _balance(r.get("balance_limit"))))
             counts["accounts"] = counts.get("accounts", 0) + cur.rowcount
             skipped += 1 - cur.rowcount
 
@@ -1373,6 +1839,22 @@ def _restore_zip(conn, data) -> dict:
         # scope was stamped at checkout, before they existed
         from ..db import tenancy as _tenancy
         _tenancy.set_entity_scope(conn)
+        # the accounts a restored stand-in note may name: those here now,
+        # under any id an adoption here moved them from
+        noted_accounts = {r["id"] for r in conn.execute(
+            "SELECT id FROM accounts").fetchall()} | {
+            r["old_account_id"] for r in conn.execute(
+                "SELECT old_account_id FROM account_adoptions").fetchall()}
+
+        def _txn_raw(r):
+            raw = scrub_transaction_raw(_raw_dict(_j(r.get("raw"))))
+            # an archive written before file rows' raw was masked still
+            # carries the full number in the cell the name was cut from
+            if _sync_base.is_file_import_id(r.get("id")):
+                raw = _sync_base.mask_file_raw(raw, r.get("name"),
+                                               r.get("merchant_name"))
+            return _sync_base.stood_in_for_restore(
+                raw, _account_id, noted_accounts)
         # Transactions are BATCHED. Every other member here is
         # bounded by user actions — accounts, bills, notes — but this one is
         # the ledger: a restore can be tens of thousands of rows, and a
@@ -1394,7 +1876,7 @@ def _restore_zip(conn, data) -> dict:
             return (r["id"], _account_id(r.get("account_id")) or None,
                     as_date(r["date"]),
                     as_date(r.get("authorized_date") or None),
-                    _f(r.get("amount")),      # 0 is a real amount
+                    _money(r.get("amount")),  # 0 is a real amount
                     t_name,
                     m_name,
                     r.get("category_primary") or None,
@@ -1415,7 +1897,7 @@ def _restore_zip(conn, data) -> dict:
                     r.get("pending_transaction_id") or None,
                     r.get("payment_channel") or None,
                     int(r.get("removed") or 0),
-                    r.get("entity_id") or None,   # per-txn override
+                    _entity(r.get("entity_id")),   # per-txn override
                     # per-transaction owner exception (effective owner is
                     # COALESCE(owner_override, account.owner)) and the
                     # statement-derived outlet brand (payee display/search,
@@ -1434,7 +1916,7 @@ def _restore_zip(conn, data) -> dict:
                     # not here is worse than no pointer: identity reads
                     # crash on it and the ledger shows nothing at all.
                     _known_merchant(r.get("merchant_id"), known_merchants),
-                    jsonb(scrub_transaction_raw(_raw_dict(_j(r.get("raw"))))),
+                    jsonb(_txn_raw(r)),
                     # migration 098: the aggregator's facts as columns
                     r.get("category_source") or None,
                     _descriptor(r.get("check_number")) or None,
@@ -1488,10 +1970,20 @@ def _restore_zip(conn, data) -> dict:
             skipped += len(batch) - inserted
             batch = []
 
+        known_accounts = {r["id"] for r in conn.execute(
+            "SELECT id FROM accounts").fetchall()}
         for r in _rows(z, "transactions.csv"):
             if not r.get("id") or not r.get("date"):
                 continue
-            batch.append(_txn_params(r))
+            aid = _account_id(r.get("account_id"))
+            if aid and aid not in known_accounts:
+                orphaned += 1       # its account is not in the archive
+                continue
+            try:
+                batch.append(_txn_params(r))
+            except _AmountOutOfRange:
+                out_of_range += 1
+                continue
             if len(batch) >= CHUNK:
                 _flush()
         _flush()
@@ -1500,6 +1992,16 @@ def _restore_zip(conn, data) -> dict:
         bills_member = ("bills.csv" if "bills.csv" in z.namelist()
                         else "recurring.csv")
         for r in _rows(z, bills_member):
+            try:
+                amount = _money(r.get("amount"))
+                monthly = _money(r.get("monthly_amount"))
+            except _AmountOutOfRange:
+                out_of_range += 1
+                continue
+            bill_raw = clean_bill_raw(_j(r.get("raw")))
+            # an archive made before the mean-year rate carries the old
+            # 52-week figure; restate it as migration 183 did for stored rows
+            monthly = _bills.restated_monthly(amount, monthly, bill_raw)
             cur = conn.execute(
                 """INSERT INTO bills (id, type, payee, amount, frequency,
                        monthly_amount, due_on, category, merchant, is_completed,
@@ -1507,13 +2009,13 @@ def _restore_zip(conn, data) -> dict:
                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s)
                    ON CONFLICT (tenant_id, id) DO NOTHING""",
                 (r["id"], r.get("type"), _descriptor(r.get("payee")),
-                 _f(r.get("amount")),          # same as above
+                 amount,
                  r.get("frequency") or None,
-                 _f(r.get("monthly_amount")),
+                 monthly,
                  as_date(r.get("due_on")) if r.get("due_on") else None,
                  r.get("category") or None, r.get("merchant") or None,
                  int(r.get("is_completed") or 0), int(r.get("active") or 1),
-                 jsonb(clean_bill_raw(_j(r.get("raw"))))))
+                 jsonb(bill_raw)))
             counts["bills"] = counts.get("bills", 0) + cur.rowcount
             skipped += 1 - cur.rowcount
 
@@ -1541,6 +2043,11 @@ def _restore_zip(conn, data) -> dict:
         for r in _rows(z, "bill_proposals.csv"):
             if not r.get("id") or not r.get("payee"):
                 continue
+            try:
+                amount = _money(r.get("amount"))
+            except _AmountOutOfRange:
+                out_of_range += 1
+                continue
             cur = conn.execute(
                 """INSERT INTO bill_proposals (id, kind, bill_type, payee,
                        amount, frequency, interval, next_due, evidence,
@@ -1550,7 +2057,7 @@ def _restore_zip(conn, data) -> dict:
                    ON CONFLICT (tenant_id, id) DO NOTHING""",
                 (r["id"], r.get("kind") or None,
                  r.get("bill_type") or "occurrence",
-                 _descriptor(r.get("payee")), _f(r.get("amount")),
+                 _descriptor(r.get("payee")), amount,
                  r.get("frequency") or None, _i(r.get("interval"), 1),
                  as_date(r["next_due"]) if r.get("next_due") else None,
                  # read with `.get` wherever it is used, so a cell carrying
@@ -1633,15 +2140,26 @@ def _restore_zip(conn, data) -> dict:
                     restored_pins.append(r["transaction_id"])
                 counts["overrides"] = counts.get("overrides", 0) + cur.rowcount
                 skipped += 1 - cur.rowcount
+            else:
+                orphaned += 1
         # an archive written before overrides carried their kind: classify
         # them from the manual_categories rows just restored and the store
         # prefixes, exactly as migration 127 did for live ledgers
         from ..engine import categories as _cats
         _cats.backfill_override_source(conn)
+        # an archive written before the feed's withdrawals were stamped:
+        # recognise them by the rule migration 157 applied to live ledgers
+        from .base import stamp_unstamped_feed_withdrawals
+        stamp_unstamped_feed_withdrawals(conn)
 
         for r in _rows(z, "reimbursements.csv"):
             if (_txn_exists(conn, r.get("expense_id"))
                     and _txn_exists(conn, r.get("reimburse_id"))):
+                try:
+                    amount = _money(r.get("amount"))
+                except _AmountOutOfRange:
+                    out_of_range += 1
+                    continue
                 # created_at is what an archive without the link mark is
                 # classified by (below). Without it the pair gets
                 # clock_timestamp(), later than the now() any undated pin
@@ -1655,24 +2173,32 @@ def _restore_zip(conn, data) -> dict:
                        ON CONFLICT (tenant_id, expense_id, reimburse_id)
                        DO NOTHING""",
                     (r["expense_id"], r["reimburse_id"],
-                     _i(r.get("partial"), 0) or 0, _f(r.get("amount")),
+                     _i(r.get("partial"), 0) or 0, amount,
                      _ts(r.get("created_at"))))
                 counts["reimbursements"] = counts.get("reimbursements", 0) + cur.rowcount
                 skipped += 1 - cur.rowcount
+            else:
+                orphaned += 1
         if link_marked is False and restored_pins:
             from ..web.data import classify_link_made_pins
             classify_link_made_pins(conn, restored_pins)
 
         for r in _rows(z, "reimburse_flags.csv"):
             if _txn_exists(conn, r.get("txn_id")):
+                try:
+                    expected = _money(r.get("expected"))
+                except _AmountOutOfRange:
+                    out_of_range += 1
+                    continue
                 cur = conn.execute(
                     """INSERT INTO reimburse_flags (txn_id, partial, expected)
                        VALUES (%s,%s,%s)
                        ON CONFLICT (tenant_id, txn_id) DO NOTHING""",
-                    (r["txn_id"], _i(r.get("partial"), 0) or 0,
-                     _f(r.get("expected"))))
+                    (r["txn_id"], _i(r.get("partial"), 0) or 0, expected))
                 counts["reimburse_flags"] = counts.get("reimburse_flags", 0) + cur.rowcount
                 skipped += 1 - cur.rowcount
+            else:
+                orphaned += 1
 
         # account_links IS the shadow set — without it a
         # round trip un-shadows every duplicate source (Plaid + SimpleFIN
@@ -1697,6 +2223,40 @@ def _restore_zip(conn, data) -> dict:
         if touched_groups:
             _renumber_home_ranks(conn, sorted(touched_groups))
 
+        # Which ids each account stood under before an adoption moved it.
+        # A file row keeps the id it was hashed under, so a statement
+        # re-imported after this restore finds its earlier rows only
+        # through this lineage (sync/base FileImportIds); without it every
+        # pre-feed line of the statement lands twice. Only the lineage is
+        # loaded: each row arrives reconciled with no cutoff, so the
+        # one-shot reconnect guard it once drove stays off here — this
+        # instance never held that backfill. Bounded, and only for an
+        # account the archive restored.
+        lineage = 0
+        for r in _rows(z, "account_adoptions.csv"):
+            new_id = _account_id(r.get("account_id"))
+            old_id = str(r.get("old_account_id") or "").strip()
+            if (not new_id or not old_id or old_id == new_id
+                    or lineage >= _MAX_ADOPTION_LINEAGE):
+                continue
+            cur = conn.execute(
+                """INSERT INTO account_adoptions
+                       (account_id, old_account_id, item_id, adopted_at,
+                        reconciled_at)
+                   SELECT a.id, %s, a.item_id, COALESCE(%s, now()), now()
+                     FROM accounts a
+                    WHERE a.id = %s
+                      AND NOT EXISTS (
+                          SELECT 1 FROM account_adoptions x
+                           WHERE x.account_id = a.id
+                             AND x.old_account_id = %s)
+                   ON CONFLICT DO NOTHING""",
+                (old_id[:_MAX_ACCOUNT_ID], _ts(r.get("adopted_at")), new_id,
+                 old_id[:_MAX_ACCOUNT_ID]))
+            lineage += cur.rowcount
+        if lineage:
+            counts["account_adoptions"] = lineage
+
         # Receipt images (base64 in the CSV) + tagged line
         # items — the Schedule-C expense-report input. Guarded on the
         # transaction / receipt existing, mirroring manual_categories.
@@ -1711,6 +2271,7 @@ def _restore_zip(conn, data) -> dict:
             # a transaction the archive does not carry is still skipped,
             # never turned into a waiting receipt the household did not have
             if r.get("txn_id") and not _txn_exists(conn, r.get("txn_id")):
+                orphaned += 1
                 continue
             # A ZIP cell must satisfy exactly what a live upload must
             # (receipts.add): a mime on the allowlist and the same size cap.
@@ -1750,12 +2311,14 @@ def _restore_zip(conn, data) -> dict:
             unmatched = ([str(x)[:200] for x in unmatched[:200]
                           if isinstance(x, (str, int))]
                          if isinstance(unmatched, list) else [])
+            opt, opt_mime = _receipt_optimized(r)
             cur = conn.execute(
                 """INSERT INTO receipts (id, txn_id, image, mime, kind,
                        status, parsed, error, created_at, parsed_at,
-                       matched_at, match_method, unmatched_txn_ids)
+                       matched_at, match_method, unmatched_txn_ids,
+                       image_optimized, optimized_mime)
                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,
-                           COALESCE(%s, now()), %s, %s, %s, %s)
+                           COALESCE(%s, now()), %s, %s, %s, %s, %s, %s)
                    ON CONFLICT (tenant_id, id) DO NOTHING""",
                 (r["id"], txn_id, img, mime,
                  kind, r.get("status") or "uploaded",
@@ -1765,12 +2328,17 @@ def _restore_zip(conn, data) -> dict:
                  _receipt_ts(r.get("parsed_at")),
                  (_receipt_ts(r.get("matched_at"))
                   if txn_id and method else None),
-                 method, unmatched))
+                 method, unmatched, opt, opt_mime))
             counts["receipts"] = counts.get("receipts", 0) + cur.rowcount
             skipped += 1 - cur.rowcount
 
         for r in _rows(z, "receipt_items.csv"):
             if not r.get("receipt_id"):
+                continue
+            try:
+                amount = _money(r.get("amount"))
+            except _AmountOutOfRange:
+                out_of_range += 1
                 continue
             cur = conn.execute(
                 """INSERT INTO receipt_items (receipt_id, line, description,
@@ -1780,7 +2348,7 @@ def _restore_zip(conn, data) -> dict:
                    ON CONFLICT (tenant_id, receipt_id, line) DO NOTHING""",
                 (r["receipt_id"], _i(r.get("line"), 0),
                  r.get("description") or "", _f(r.get("qty")),
-                 _f(r.get("amount")), r.get("tag") or "",
+                 amount, r.get("tag") or "",
                  r["receipt_id"]))
             counts["receipt_items"] = (counts.get("receipt_items", 0)
                                        + cur.rowcount)
@@ -1794,24 +2362,90 @@ def _restore_zip(conn, data) -> dict:
                     (r["txn_id"],))
                 counts["business_flags"] = counts.get("business_flags", 0) + cur.rowcount
                 skipped += 1 - cur.rowcount
+            else:
+                orphaned += 1
 
         # ---- business tables (entities restored above,
         # transactions above — these depend on both) ----
         for r in _rows(z, "entity_membership.csv"):
             if not r.get("id") or not r.get("entity_id"):
                 continue
+            if _entity(r["entity_id"]) is None:
+                orphaned += 1       # its business is not in the archive
+                continue
+            # The household mark comes back with the member: without it the
+            # estimate silently widens to every member's tax and the capital
+            # account loses the household's share. A business has at most one
+            # household member (the database enforces it), so a mark arrives
+            # only while its business has none — the destination's own mark,
+            # or the archive's first, is the one kept. A mark is taken under
+            # the same lock the Settings door marks under: the NOT EXISTS
+            # guard alone cannot see a mark another transaction has not
+            # committed, and the unique index would then refuse this insert
+            # and abort the whole restore.
+            if _b(r.get("is_household")):
+                _hold_household_mark(conn, r["entity_id"])
             cur = conn.execute(
                 """INSERT INTO entity_membership (id, entity_id, member_name,
-                       ownership_pct, is_manager)
-                   VALUES (%s,%s,%s,%s,%s)
+                       ownership_pct, is_manager, is_household)
+                   VALUES (%s,%s,%s,%s,%s,
+                           %s AND NOT EXISTS (
+                               SELECT 1 FROM entity_membership
+                                WHERE entity_id = %s AND is_household))
                    ON CONFLICT (tenant_id, id) DO NOTHING""",
                 (r["id"], r["entity_id"], r.get("member_name"),
-                 _f(r.get("ownership_pct")), _b(r.get("is_manager"))))
+                 _f(r.get("ownership_pct")), _b(r.get("is_manager")),
+                 _b(r.get("is_household")), r["entity_id"]))
             counts["entity_membership"] = counts.get("entity_membership", 0) + cur.rowcount
             skipped += 1 - cur.rowcount
 
-        for r in _rows(z, "equity_movement.csv"):
+        # One fronted movement (a contribution or a reimbursement) per
+        # transaction: the database refuses a second one on an install
+        # that has the index, and the engine refuses one everywhere. An
+        # archive from an install that predates the rule can carry two;
+        # the one kept is the one the upgrade keeps — the movement for the
+        # business the cost is booked to now (the transaction's own
+        # assignment, else its account's), and the earliest recorded only
+        # when neither matches — so the result does not depend on the
+        # archive's row order or on whether this install has the index yet.
+        fronted_kinds = ("contribution", "reimbursement")
+        movements = [r for r in _rows(z, "equity_movement.csv")]
+        booked = {r["id"]: str(r["ent"]) if r["ent"] else None
+                  for r in conn.execute(
+                      "SELECT t.id, COALESCE(t.entity_id, a.entity_id) AS ent"
+                      "  FROM transactions t"
+                      "  LEFT JOIN accounts a ON a.id = t.account_id"
+                      " WHERE t.id = ANY(%s)",
+                      ([m["txn_id"] for m in movements
+                        if m.get("txn_id")],)).fetchall()}
+
+        def _keep_first(r):
+            ent = (r.get("entity_id") or "").strip().lower() or None
+            return (booked.get(r.get("txn_id")) != ent,
+                    str(r.get("created_at") or ""), str(r.get("id") or ""))
+        movements.sort(key=_keep_first)
+        fronted_clash = 0
+        for r in movements:
             if not r.get("id") or not r.get("entity_id"):
+                continue
+            if _entity(r["entity_id"]) is None:
+                orphaned += 1       # its business is not in the archive
+                continue
+            try:
+                amount = _money(r.get("amount"))
+            except _AmountOutOfRange:
+                out_of_range += 1
+                continue
+            m_txn = (r.get("txn_id") if _txn_exists(conn, r.get("txn_id"))
+                     else None)
+            if (m_txn and r.get("kind") in fronted_kinds
+                    and conn.execute(
+                        "SELECT 1 FROM equity_movement WHERE txn_id = %s"
+                        " AND kind = ANY(%s) AND id::text <> %s",
+                        (m_txn, list(fronted_kinds), str(r["id"]))
+                    ).fetchone()):
+                fronted_clash += 1
+                skipped += 1
                 continue
             cur = conn.execute(
                 # bare ON CONFLICT: beyond (tenant_id, id) this table has a
@@ -1822,25 +2456,34 @@ def _restore_zip(conn, data) -> dict:
                 # back the entire all-or-nothing restore. Any unique match
                 # means "already present", which is exactly the skip the
                 # docstring promises.
+                # created_at too: it is what decides which of two fronted
+                # movements is the earlier one, here and on every upgrade
                 """INSERT INTO equity_movement (id, entity_id, kind, amount,
-                       date, member_id, txn_id, form, note)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                       date, member_id, txn_id, form, note, created_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s, COALESCE(%s, now()))
                    ON CONFLICT DO NOTHING""",
-                (r["id"], r["entity_id"], r.get("kind"), _f(r.get("amount")),
+                (r["id"], r["entity_id"], r.get("kind"), amount,
                  as_date(r["date"]) if r.get("date") else None,
                  r.get("member_id") or None,
                  # keep the movement even if its transaction is gone — the
                  # FK is ON DELETE SET NULL for exactly this reason
-                 (r.get("txn_id") if _txn_exists(conn, r.get("txn_id"))
-                  else None),
-                 r.get("form") or None, r.get("note") or None))
+                 m_txn,
+                 r.get("form") or None, r.get("note") or None,
+                 _ts(r.get("created_at"))))
             counts["equity_movement"] = counts.get("equity_movement", 0) + cur.rowcount
             skipped += 1 - cur.rowcount
+        if fronted_clash:
+            notes.append(
+                f"{fronted_clash} business movement"
+                f"{'s' if fronted_clash != 1 else ''} left out: each was a "
+                "second contribution or reimbursement for a transaction "
+                "that already has one (the one for the business the "
+                "charge is booked to is kept, else the earliest)")
 
         from ..engine.books import BUCKETS as _BUCKETS
         for r in _rows(z, "business_txn_class.csv"):
             if not _txn_exists(conn, r.get("txn_id")):
-                skipped += 1
+                orphaned += 1
                 continue
             # The bucket is an enum the app validates on write but the DB
             # does not constrain, so a hand-edited ZIP is the one way a
@@ -1864,6 +2507,9 @@ def _restore_zip(conn, data) -> dict:
         for r in _rows(z, "compliance_obligation.csv"):
             if not r.get("id") or not r.get("entity_id"):
                 continue
+            if _entity(r["entity_id"]) is None:
+                orphaned += 1       # its business is not in the archive
+                continue
             cur = conn.execute(
                 """INSERT INTO compliance_obligation (id, entity_id, title,
                        due_date, recurrence, fee, url, note)
@@ -1878,6 +2524,9 @@ def _restore_zip(conn, data) -> dict:
 
         for r in _rows(z, "mileage_log.csv"):
             if not r.get("id") or not r.get("entity_id"):
+                continue
+            if _entity(r["entity_id"]) is None:
+                orphaned += 1       # its business is not in the archive
                 continue
             cur = conn.execute(
                 """INSERT INTO mileage_log (id, entity_id, date, miles, purpose,
@@ -1894,23 +2543,37 @@ def _restore_zip(conn, data) -> dict:
         for r in _rows(z, "vendor_1099.csv"):
             if not r.get("id") or not r.get("entity_id"):
                 continue
+            if _entity(r["entity_id"]) is None:
+                orphaned += 1       # its business is not in the archive
+                continue
             cur = conn.execute(
                 # bare ON CONFLICT: vendor_1099 is also UNIQUE on
                 # (tenant_id, entity_id, merchant), so a destination that
                 # already marked this vendor under a different id must be a
                 # skip, not a UniqueViolation that aborts the whole restore.
+                # The mark follows its merchant (a rename must not drop a
+                # contractor off the year-end list), and merged_from is what
+                # undoing a merge puts back. A pointer to a merchant the
+                # archive does not carry is dropped; the name still finds it.
                 """INSERT INTO vendor_1099 (id, entity_id, merchant, reportable,
-                       tin_last4, note)
-                   VALUES (%s,%s,%s,%s,%s,%s)
+                       tin_last4, note, merchant_id, merged_from, created_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s, COALESCE(%s, now()))
                    ON CONFLICT DO NOTHING""",
                 (r["id"], r["entity_id"], r.get("merchant"),
                  _b(r.get("reportable")), r.get("tin_last4") or None,
-                 r.get("note") or None))
+                 r.get("note") or None,
+                 _known_merchant(r.get("merchant_id"), known_merchants),
+                 jsonb([n for n in _json_list(_j(r.get("merged_from")))
+                        if isinstance(n, dict)]),
+                 _ts(r.get("created_at"))))
             counts["vendor_1099"] = counts.get("vendor_1099", 0) + cur.rowcount
             skipped += 1 - cur.rowcount
 
         for r in _rows(z, "transaction_notes.csv"):
-            if not _txn_exists(conn, r.get("txn_id")) or not r.get("note"):
+            if not _txn_exists(conn, r.get("txn_id")):
+                orphaned += 1
+                continue
+            if not r.get("note"):
                 skipped += 1
                 continue
             cur = conn.execute(
@@ -2030,13 +2693,20 @@ def _restore_zip(conn, data) -> dict:
         for r in _rows(z, "holdings.csv"):
             if not r.get("account_id") or not r.get("symbol"):
                 continue
+            try:
+                quantity, price, value = (_money(r.get("quantity")),
+                                          _money(r.get("price")),
+                                          _money(r.get("value")))
+            except _AmountOutOfRange:
+                out_of_range += 1
+                continue
             cur = conn.execute(
                 """INSERT INTO holdings (account_id, symbol, name, quantity,
                        price, value, as_of, raw)
                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
                    ON CONFLICT (tenant_id, account_id, symbol) DO NOTHING""",
                 (_account_id(r["account_id"]), r["symbol"], r.get("name") or None,
-                 _f(r.get("quantity")), _f(r.get("price")), _f(r.get("value")),
+                 quantity, price, value,
                  _ts(r.get("as_of")), jsonb(_raw_dict(_j(r.get("raw"))))))
             counts["holdings"] = counts.get("holdings", 0) + cur.rowcount
             skipped += 1 - cur.rowcount
@@ -2044,13 +2714,19 @@ def _restore_zip(conn, data) -> dict:
         for r in _rows(z, "crypto_holdings.csv"):
             if not r.get("account_id") or not r.get("currency"):
                 continue
+            try:
+                quantity, native = (_money(r.get("quantity")),
+                                    _money(r.get("native_usd")))
+            except _AmountOutOfRange:
+                out_of_range += 1
+                continue
             cur = conn.execute(
                 """INSERT INTO crypto_holdings (account_id, currency, quantity,
                        native_usd, as_of, raw)
                    VALUES (%s,%s,%s,%s,%s,%s)
                    ON CONFLICT (tenant_id, account_id, currency) DO NOTHING""",
-                (_account_id(r["account_id"]), r["currency"], _f(r.get("quantity")),
-                 _f(r.get("native_usd")), _ts(r.get("as_of")),
+                (_account_id(r["account_id"]), r["currency"], quantity,
+                 native, _ts(r.get("as_of")),
                  jsonb(_raw_dict(_j(r.get("raw"))))))
             counts["crypto_holdings"] = counts.get("crypto_holdings", 0) + cur.rowcount
             skipped += 1 - cur.rowcount
@@ -2058,11 +2734,16 @@ def _restore_zip(conn, data) -> dict:
         for r in _rows(z, "networth_recorded.csv"):
             if not r.get("month") or r.get("total") in (None, ""):
                 continue
+            try:
+                total = _money(r["total"])
+            except _AmountOutOfRange:
+                out_of_range += 1
+                continue
             cur = conn.execute(
                 """INSERT INTO networth_recorded (month, total, source)
                    VALUES (%s,%s,%s)
                    ON CONFLICT (tenant_id, month) DO NOTHING""",
-                (r["month"], _f(r["total"]), r.get("source") or None))
+                (r["month"], total, r.get("source") or None))
             counts["networth_recorded"] = counts.get("networth_recorded", 0) + cur.rowcount
             skipped += 1 - cur.rowcount
 
@@ -2070,11 +2751,16 @@ def _restore_zip(conn, data) -> dict:
             if not r.get("date"):
                 continue
             by_class = _j(r.get("by_class"))
+            try:
+                total = _money(r.get("total"))
+            except _AmountOutOfRange:
+                out_of_range += 1
+                continue
             cur = conn.execute(
                 """INSERT INTO networth_snapshot (date, total, by_class)
                    VALUES (%s,%s,%s)
                    ON CONFLICT (tenant_id, date) DO NOTHING""",
-                (as_date(r["date"]), _f(r.get("total")),
+                (as_date(r["date"]), total,
                  jsonb(by_class) if by_class is not None else None))
             counts["networth_snapshot"] = counts.get("networth_snapshot", 0) + cur.rowcount
             skipped += 1 - cur.rowcount
@@ -2150,23 +2836,47 @@ def _restore_zip(conn, data) -> dict:
             if r.get("id") in (None, "") or r.get("year") in (None, ""):
                 continue
             amounts = _j(r.get("amounts"))
+            # `ein` is DELIBERATELY not restored. Taxdocs persists only
+            # ein_last4, but an older archive may still carry the full W-2
+            # EIN in this CSV, and reading it back would store it again.
+            # The last four are restored instead, which is what the live
+            # write path stores (preferring the column it writes, falling
+            # back to the last four OF a legacy plaintext value).
+            doc = (_i(r["year"]), r.get("form") or "",
+                   r.get("owner") or "primary", r.get("payer") or None,
+                   _ein_last4_for_restore(r), _f(r.get("primary_amount")),
+                   jsonb(amounts) if amounts is not None else None,
+                   r.get("notes") or None)
+            # A document's id is only a number within its household (each
+            # one counts 1, 2, 3...), so an archive's ids collide with the
+            # documents a populated household already has, and keying on
+            # them would drop the archive's different documents as present.
+            # Present means the same document; one that is not lands under
+            # the next free id, as the live write path allocates it.
+            if conn.execute(
+                    """SELECT 1 FROM income_documents
+                        WHERE year = %s AND form = %s
+                          AND COALESCE(owner, 'primary') = %s
+                          AND payer IS NOT DISTINCT FROM %s
+                          AND ein_last4 IS NOT DISTINCT FROM %s
+                          AND primary_amount IS NOT DISTINCT FROM %s
+                          AND amounts IS NOT DISTINCT FROM %s::jsonb
+                          AND notes IS NOT DISTINCT FROM %s""",
+                    doc).fetchone():
+                skipped += 1
+                continue
+            doc_id = _i(r["id"])
+            if conn.execute("SELECT 1 FROM income_documents WHERE id = %s",
+                            (doc_id,)).fetchone():
+                doc_id = conn.execute(
+                    "SELECT COALESCE(MAX(id), 0) + 1 AS id "
+                    "FROM income_documents").fetchone()["id"]
             cur = conn.execute(
-                # `ein` is DELIBERATELY not restored. Taxdocs persists only
-                # ein_last4, but an older archive may still carry the full
-                # W-2 EIN in this CSV, and reading it back would store it
-                # again. The last four are restored instead, which is what
-                # the live write path stores.
                 """INSERT INTO income_documents (id, year, form, owner, payer,
                        ein_last4, primary_amount, amounts, notes)
                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
                    ON CONFLICT (tenant_id, id) DO NOTHING""",
-                (_i(r["id"]), _i(r["year"]), r.get("form") or "",
-                 r.get("owner") or "primary", r.get("payer") or None,
-                 # prefer the column the live path writes; fall back to the
-                 # last four OF a legacy plaintext value, never the value
-                 _ein_last4_for_restore(r), _f(r.get("primary_amount")),
-                 jsonb(amounts) if amounts is not None else None,
-                 r.get("notes") or None))
+                (doc_id, *doc))
             counts["income_documents"] = counts.get("income_documents", 0) + cur.rowcount
             skipped += 1 - cur.rowcount
 
@@ -2243,41 +2953,48 @@ def _restore_zip(conn, data) -> dict:
             return (_sync_base.mask_long_digits(raw) if filed and not kept
                     else raw)
 
-        for r in _rows(z, "merchant_renames.csv"):
-            if not r.get("raw_merchant") or not r.get("to_canonical"):
-                continue
+        # The journal's ids come from ONE sequence every household shares,
+        # and an archive's ids are whatever the file says. Kept, and the
+        # sequence advanced past them, one archive could spend the shared
+        # counter to the edge of its range and every household's next
+        # rename would fail. Nothing points at a journal row by id; the id
+        # only orders the rows. So each row gets a fresh id here, inserted
+        # in the archive's id order, and the sequence moves only as far as
+        # these inserts take it. A row already in the journal (the same
+        # archive restored twice) is recognised by what it says, not by id.
+        def _order(r):
+            try:
+                return (0, int(_f(r.get("id")) or 0))
+            except (TypeError, ValueError, OverflowError):
+                return (1, 0)
+
+        for r in sorted((r for r in _rows(z, "merchant_renames.csv")
+                         if r.get("raw_merchant") and r.get("to_canonical")),
+                        key=_order):
+            at = _ts(r.get("at"))
+            # what the rename did to the category rules it moved, so undoing
+            # it on this instance can put them back; anything but the object
+            # the rename writes is no note at all
+            moved_rules = _j(r.get("rules"))
+            moved_rules = (jsonb(moved_rules)
+                           if isinstance(moved_rules, dict) else None)
             cur = conn.execute(
-                """INSERT INTO merchant_renames (id, raw_merchant,
-                       from_canonical, to_canonical, at)
-                   VALUES (%s,%s,%s,%s, COALESCE(%s, now()))
-                   ON CONFLICT (tenant_id, id) DO NOTHING""",
-                (_i(r["id"]), _renamed_key(r["raw_merchant"]),
-                 r.get("from_canonical") or None, r["to_canonical"],
-                 _ts(r.get("at"))))
+                """INSERT INTO merchant_renames (raw_merchant,
+                       from_canonical, to_canonical, at, rules)
+                   SELECT %s, %s, %s, COALESCE(%s, now()), %s
+                    WHERE NOT EXISTS (
+                          SELECT 1 FROM merchant_renames j
+                           WHERE j.raw_merchant = %s
+                             AND j.from_canonical IS NOT DISTINCT FROM %s
+                             AND j.to_canonical = %s
+                             AND j.at = %s)""",
+                (_renamed_key(r["raw_merchant"]),
+                 r.get("from_canonical") or None, r["to_canonical"], at,
+                 moved_rules,
+                 _renamed_key(r["raw_merchant"]),
+                 r.get("from_canonical") or None, r["to_canonical"], at))
             counts["merchant_renames"] = counts.get("merchant_renames", 0) + cur.rowcount
             skipped += 1 - cur.rowcount
-        # The journal's id is an identity column and the rows above carried
-        # their original ids, so advance the sequence past them — otherwise
-        # the next rename after a restore collides on the PK and DO NOTHING
-        # silently swallows the new journal row. The sequence is SHARED
-        # across tenants while MAX(id) here sees only this tenant's rows
-        # (RLS), so the sequence must only ever move FORWARD: anchoring on
-        # its own last_value stops a restore into a low-id tenant from
-        # dragging it backward under another tenant's ids, which would make
-        # THAT tenant's next rename collide and vanish the same way.
-        # (Reading last_value directly never needs nextval to have run,
-        # and the migration grants the app role SELECT on the sequence.)
-        conn.execute(
-            # The floor reads the sequence by its literal name while the
-            # target resolves it dynamically — the two must name the same
-            # sequence, and migration 095 grants the app role SELECT and
-            # UPDATE on exactly that name. Rename the sequence and both
-            # halves have to move together.
-            """SELECT setval(pg_get_serial_sequence('merchant_renames','id'),
-                      GREATEST((SELECT last_value
-                                  FROM merchant_renames_id_seq),
-                               (SELECT COALESCE(MAX(id), 0)
-                                  FROM merchant_renames), 1))""")
 
         for r in _rows(z, "merchant_categories.csv"):
             if not r.get("merchant") or not r.get("category_primary"):
@@ -2332,6 +3049,11 @@ def _restore_zip(conn, data) -> dict:
         for r in _rows(z, "amazon_orders.csv"):
             if not r.get("dedup_key") or not r.get("date"):
                 continue
+            try:
+                _money(r.get("amount"))
+            except _AmountOutOfRange:
+                out_of_range += 1
+                continue
             cur = conn.execute(
                 """INSERT INTO amazon_orders (dedup_key, account, date, amount,
                        payee, seller, memo, category, category_source,
@@ -2340,7 +3062,7 @@ def _restore_zip(conn, data) -> dict:
                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                    ON CONFLICT (tenant_id, dedup_key) DO NOTHING""",
                 (r["dedup_key"], r.get("account") or "", as_date(r["date"]),
-                 _f(r.get("amount")) or 0.0, r.get("payee") or "Amazon",
+                 _money(r.get("amount")) or 0.0, r.get("payee") or "Amazon",
                  r.get("seller") or "", r.get("memo") or "",
                  r.get("category") or "", r.get("category_source") or "rules",
                  r.get("order_number") or "", _i(r.get("is_refund"), 0),
@@ -2367,6 +3089,11 @@ def _restore_zip(conn, data) -> dict:
         for r in _rows(z, "costco_receipts.csv"):
             if not r.get("dedup_key") or not r.get("date"):
                 continue
+            try:
+                _money(r.get("amount"))
+            except _AmountOutOfRange:
+                out_of_range += 1
+                continue
             cur = conn.execute(
                 """INSERT INTO costco_receipts (dedup_key, account, date,
                        amount, receipt_type, warehouse, category,
@@ -2375,7 +3102,7 @@ def _restore_zip(conn, data) -> dict:
                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                    ON CONFLICT (tenant_id, dedup_key) DO NOTHING""",
                 (r["dedup_key"], r.get("account") or "main",
-                 as_date(r["date"]), _f(r.get("amount")) or 0.0,
+                 as_date(r["date"]), _money(r.get("amount")) or 0.0,
                  r.get("receipt_type") or "warehouse",
                  r.get("warehouse") or "", r.get("category") or "",
                  r.get("category_source") or "rules", r.get("summary") or "",
@@ -2424,6 +3151,7 @@ def _restore_zip(conn, data) -> dict:
                 cfg.pop(k, None)
             notes.extend(normalize_notify_shapes(cfg))
             clean_excluded_accounts(cfg)
+            notes.extend(clean_budget_amounts(cfg))
             _rename_account_keys(cfg, renamed)
             # The Enrich cap is the household's preference and restores, but
             # only inside the range the settings door accepts: above the
@@ -2500,6 +3228,12 @@ def _restore_zip(conn, data) -> dict:
             for k, v in cfg.items():
                 merged[k] = (carry_forward_secrets(dest[k], v)
                              if k in dest else v)
+            # the destination's pause record is kept as it was (the ZIP's
+            # never reaches here — scrub_config drops it), and while it is
+            # armed it also covers whatever outbound setting this restore
+            # brought in
+            widen_armed_pause(dest, merged, conn)
+            pause_if_starter_signed_out(dest, merged, conn)
             conn.execute(
                 """INSERT INTO tenant_settings (config) VALUES (%s)
                    ON CONFLICT (tenant_id) DO UPDATE
@@ -2547,6 +3281,19 @@ def _restore_zip(conn, data) -> dict:
     # Rows the tenant already had surface separately.
     if skipped:
         counts["already_present"] = skipped
+    if orphaned:
+        # not "already present": these rows were never here and are not
+        # now — the transaction, account or business they belong to is not
+        # in the archive (one written before the child tables had real
+        # foreign keys can carry them), so they were left out
+        counts["orphaned"] = orphaned
+        notes.append(f"{orphaned} row(s) referred to a transaction, account "
+                     f"or business the archive does not carry and were left "
+                     f"out — nothing of yours was dropped, the archive never "
+                     f"held their parent")
+    if out_of_range:
+        counts["out_of_range"] = out_of_range
+        notes.append(_out_of_range_note(out_of_range))
     # what the config check dropped, so the person restoring is told
     # rather than left to discover a missing AI backend later
     if notes:

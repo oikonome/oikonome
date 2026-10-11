@@ -264,6 +264,22 @@ class TestBuckets(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_default_spend_leaves_out_excluded_accounts(self):
+        """An account the household switched off on the Accounts page is
+        money it tracks but does not live on; every spend report drops it,
+        so the plan's starting spend must too."""
+        from .util import write_config
+        conn = make_db()
+        try:
+            add_txn(conn, dt.date.today() - dt.timedelta(days=30), 3000.0,
+                    "EXAMPLE STORE", account="chk")
+            add_txn(conn, dt.date.today() - dt.timedelta(days=30), 9000.0,
+                    "EXAMPLE STORE", account="card")
+            write_config(conn, excluded_accounts=["card"])
+            self.assertEqual(R.default_spend(conn, floor=0), 3000)
+        finally:
+            conn.close()
+
     def test_a_roth_employer_plan_is_roth_not_pre_tax(self):
         """Roth wins over the plan wrapper.
 

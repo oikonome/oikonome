@@ -20,14 +20,15 @@ class IncomeSeedTests(unittest.TestCase):
 
     def test_monthly_income_cadence_converted(self):
         # a biweekly $2,400 paycheck + a monthly $1,100 rental income —
-        # must equal save_bill's canonical monthly_amount (52/2/12 paydays),
-        # the same figure the Recurring page shows
+        # must equal save_bill's canonical monthly_amount (a mean year of
+        # 365.2425 days holds 26.09 biweekly paydays), the same figure the
+        # Recurring page shows
         bills.save_bill(self.conn, payee="EMPLOYER PAYROLL", amount=2400,
                             income=True, frequency="WEEKLY", interval=2)
         bills.save_bill(self.conn, payee="RENTAL", amount=1100,
                             income=True, frequency="MONTHLY", interval=1)
         mi = budget.monthly_income(self.conn)
-        expected = 2400 * 52 / 2 / 12 + 1100
+        expected = 2400 * (365.2425 / 14) / 12 + 1100
         self.assertAlmostEqual(mi, round(expected, 2), delta=0.01)
 
     def test_bills_do_not_count_as_income(self):
@@ -74,7 +75,7 @@ class IncomeSeedTests(unittest.TestCase):
         # pending proposal seeds step-3 expected-income prefill
         sug = budget.suggest_budgets(self.conn, TODAY)
         self.assertAlmostEqual(sug["suggestions"]["income_monthly"],
-                               2850 * 52 / 2 / 12, delta=0.5)
+                               2850 * (365.2425 / 14) / 12, delta=0.5)
 
     def test_income_amount_core_uses_recent_paycheck(self):
         # A pay rise: an older, smaller series would drag the all-history
@@ -111,7 +112,7 @@ class IncomeSeedTests(unittest.TestCase):
             (jsonb({"income": True}),))
         sug = budget.suggest_budgets(self.conn, TODAY)
         self.assertAlmostEqual(sug["suggestions"]["income_monthly"],
-                               2400 * 52 / 2 / 12, delta=0.01)
+                               2400 * (365.2425 / 14) / 12, delta=0.01)
 
     def test_suggest_budgets_includes_income(self):
         bills.save_bill(self.conn, payee="PAY", amount=3000,

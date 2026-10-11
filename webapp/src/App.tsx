@@ -5,7 +5,7 @@ import { Link, Navigate, NavLink, Route, Routes, useLocation,
   useNavigate, useNavigationType } from "react-router";
 import { WEB_HOMES, abortRequestEpoch, api, assistant as assistantApi, AuthError, errText, mmdd, type Me } from "./api/client";
 import { saveSettings } from "./api/cache";
-import { signOut } from "./push";
+import { rebindBrowserPush, signOut } from "./push";
 import { HOME_KEY, forgetLaunchHome } from "./launchhome";
 
 // "auto" follows the OS (no data-theme attribute); light/dark pin
@@ -14,7 +14,7 @@ function applyTheme(t: Theme) {
   if (t === "light" || t === "dark")
     document.documentElement.dataset.theme = t;
   else delete document.documentElement.dataset.theme;
-  localStorage.setItem("oiko-theme", t);
+  writeStore("local", "oiko-theme", t);
   // browser chrome color follows the effective theme
   const light = t === "light" || (t === "auto" &&
     matchMedia("(prefers-color-scheme: light)").matches);
@@ -26,6 +26,7 @@ import { LogosProvider } from "./components/MerchantAvatar";
 import { ext } from "./ext";
 import Home from "./pages/Home";
 import InviteClaim from "./pages/InviteClaim";
+import { readStore, writeStore } from "./safestorage";
 import { deviceZone } from "./devicezone";
 import { adoptsDeviceZone } from "./moneymath";
 import { hasLeftWizard } from "./wizardexit";
@@ -274,6 +275,7 @@ const ICON: Record<string, React.ReactNode> = {
 export default function App() {
   const qc = useQueryClient();
   const loc = useLocation();
+  const nav = useNavigate();
   const me = useQuery({ queryKey: ["me"], queryFn: api.me, retry: false });
   // A household with no zone of its own keeps its hours on the instance's
   // clock — fine for a self-hosted box, 2am mail for a hosted household
@@ -289,19 +291,37 @@ export default function App() {
     const device = deviceZone();
     if (!adoptsDeviceZone(m, device)) return;
     zoneOffered.current = true;
-    api.settingsSave({ timezone: device })
+    api.settingsSave({ timezone: device, timezone_adopted: true })
       .then(() => { qc.invalidateQueries({ queryKey: ["me"] });
                     qc.invalidateQueries({ queryKey: ["settings"] }); })
       .catch(() => {});
+  }, [me.data, qc]);
+  // A browser's push subscription ends with the session that registered
+  // it, so once signed in the browser's own subscription is re-sent to ride
+  // this session. Quiet when it works; when the old one has already lapsed
+  // the user is told once, with a way to turn it back on.
+  const pushRebound = useRef(false);
+  useEffect(() => {
+    if (!me.data || me.data.demo || pushRebound.current) return;
+    pushRebound.current = true;
+    rebindBrowserPush().then((r) => {
+      if (r === "ok") qc.invalidateQueries({ queryKey: ["notify"] });
+      if (r !== "lapsed" || readStore("session", "oiko-push-lapsed") === "1")
+        return;
+      writeStore("session", "oiko-push-lapsed", "1");
+      window.dispatchEvent(new CustomEvent("oiko-toast", { detail: {
+        text: "Push to this browser has stopped. Tap to turn it back on.",
+        to: "/settings/email" } }));
+    }).catch(() => {});
   }, [me.data, qc]);
   // the rail is icon-only until you hover it; PINNED keeps it open
   // and lets it take layout width instead of overlaying. Persisted because
   // it is a workspace preference, not a per-visit one — someone still
   // learning nine glyphs should not have to re-pin every session.
   const [railPinned, setRailPinned] = useState(
-    () => localStorage.getItem("oiko-rail-pinned") === "1");
+    () => readStore("local", "oiko-rail-pinned") === "1");
   useEffect(() => {
-    localStorage.setItem("oiko-rail-pinned", railPinned ? "1" : "0");
+    writeStore("local", "oiko-rail-pinned", railPinned ? "1" : "0");
   }, [railPinned]);
   // On a phone, hover is the rail's entire reveal mechanism and a touch
   // screen has no hover, so below the breakpoint the SAME <nav> becomes a
@@ -428,6 +448,31 @@ export default function App() {
     window.addEventListener("oiko-auth-lost", onLost);
     return () => window.removeEventListener("oiko-auth-lost", onLost);
   }, [qc]);
+  // A sign-in as another household in a second tab never reaches this tab
+  // as a 401: the cookie is valid, just someone else's. So pin the
+  // household this tab's cache was filled for, and when /api/me answers
+  // for a different one — on a refetch here, or the moment another tab
+  // records its own — drop everything and reload, so one household's
+  // cached rows are never shown as, or saved into, another's.
+  const tenantNow = me.data?.tenant_id;
+  const pinnedTenant = useRef<string | null>(null);
+  useEffect(() => {
+    const reset = () => {
+      abortRequestEpoch(); qc.clear(); forgetLaunchHome();
+      window.location.replace("/app/");
+    };
+    if (tenantNow) {
+      if (pinnedTenant.current === null) pinnedTenant.current = tenantNow;
+      else if (pinnedTenant.current !== tenantNow) { reset(); return; }
+      writeStore("local", IDENTITY_KEY, tenantNow);
+    }
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === IDENTITY_KEY && e.newValue && pinnedTenant.current
+          && e.newValue !== pinnedTenant.current) reset();
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, [qc, tenantNow]);
   // Keep the active destination visible when the drawer opens: ten items
   // plus the separators overflow a short phone in landscape, and opening a
   // nav scrolled to the top hides exactly the item that tells you where you
@@ -456,7 +501,7 @@ export default function App() {
   const perDeviceTheme = viewerNow || !!me.data?.demo;
   // default DARK — only an explicit "auto" follows the OS
   const [theme, setTheme] = useState<Theme>(
-    (localStorage.getItem("oiko-theme") as Theme) || "dark");
+    (readStore("local", "oiko-theme") as Theme) || "dark");
   const settingsQ = useQuery({ queryKey: ["settings"], queryFn: api.settings,
                                retry: false, staleTime: 300_000,
                                // header chrome: it waits for /api/me
@@ -473,7 +518,7 @@ export default function App() {
     if (!settingsQ.isSuccess) return;
     const home = settingsQ.data?.home_web;
     if (typeof home === "string" && home && home !== "/") {
-      try { localStorage.setItem(HOME_KEY, home); } catch { /* private mode */ }
+      writeStore("local", HOME_KEY, home);
     } else {
       forgetLaunchHome();
     }
@@ -506,8 +551,12 @@ export default function App() {
         // a claim starts a new session, so the whole cache is stale —
         // reset (not invalidate) so /me goes back to pending and the app
         // shows "loading…", instead of this page re-peeking the consumed
-        // invite into "not valid" while /me is still in its error state
-        return <InviteClaim onDone={() => qc.resetQueries()} />;
+        // invite into "not valid" while /me is still in its error state.
+        // Leave /invite first: signed in, that route is the "you're signed
+        // in as someone else" page, which would greet the new member as
+        // a stranger to their own account.
+        return <InviteClaim onDone={() => {
+          nav("/", { replace: true }); qc.resetQueries(); }} />;
       // post-erasure landing (the delete cleared the session, so this
       // renders pre-auth) — a clear confirmation, not a bare login form
       if (location.pathname.endsWith("/account-deleted"))
@@ -837,14 +886,14 @@ export default function App() {
       {me.data?.broadcast && (me.data.broadcast.deadline
         ? <RebootCountdown deadline={me.data.broadcast.deadline}
                            message={me.data.broadcast.message} />
-        : sessionStorage.getItem("bc-" + me.data.broadcast.message) === null && (
+        : readStore("session", "bc-" + me.data.broadcast.message) === null && (
         <div className={`note topnote ${me.data.broadcast.severity === "warn" ? "bad" : "info"}`}>
           <span style={{ flex: 1 }}>
             {me.data.broadcast.severity === "warn" ? "⚠" : "•"}{" "}
             {me.data.broadcast.message}</span>
           <button className="dismiss" title="dismiss"
                   onClick={(e) => {
-                    sessionStorage.setItem("bc-" + me.data!.broadcast!.message, "1");
+                    writeStore("session", "bc-" + me.data!.broadcast!.message, "1");
                     (e.currentTarget.parentElement as HTMLElement).style.display = "none";
                   }}>✕</button>
         </div>
@@ -1165,6 +1214,10 @@ let launchHome = (() => {
   const p = window.location.pathname.replace(/\/+$/, "");
   return (p === "/app" || p === "") && !window.location.search;
 })();
+
+// the household the most recently loaded tab is signed in to; other tabs
+// watch it to notice a sign-in as someone else
+const IDENTITY_KEY = "oiko-identity";
 
 // signOut() itself drops the remembered launch home, so every sign-out
 // door (this shell's and the two-factor gate's) forgets it the same way.

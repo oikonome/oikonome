@@ -9,7 +9,7 @@ import { Pressable, ScrollView, StyleSheet, Text, TextInput,
          View } from "react-native";
 
 import { Card, H } from "../components/ui";
-import { PickedFile } from "../lib/api";
+import { discardPicked, PickedFile } from "../lib/api";
 import { composeBugReport } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { C } from "../lib/theme";
@@ -30,8 +30,11 @@ export default function Feedback() {
     ? composeBugReport(happened, expected, where) : message.trim();
   const send = useMutation({
     mutationFn: () => client!.testingFeedback(text, shot, kind),
+    // the screenshot's picker copy goes once it is sent; a failed send
+    // keeps it for the retry
     onSuccess: () => { setMessage(""); setHappened(""); setExpected("");
-                       setWhere(""); setShot(null); },
+                       setWhere(""); void discardPicked(shot?.uri);
+                       setShot(null); },
   });
   const pickShot = async () => {
     const res = await ImagePicker.launchImageLibraryAsync(
@@ -64,7 +67,9 @@ export default function Feedback() {
             : "Something confusing, missing, or worth changing? Tell us. "}
           Goes straight to the instance operator. The report carries the
           app version, a system-health diagnostic bundle and recent log
-          lines — so what broke is diagnosable.
+          lines — so what broke is diagnosable. No transaction contents or
+          tokens; the bundle also leaves out hostnames, bank names and
+          collector labels.
           {testing.data?.feedback_to
             ? ` Delivered to ${testing.data.feedback_to}.` : ""}
         </Text>

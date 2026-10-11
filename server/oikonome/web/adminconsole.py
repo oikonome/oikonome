@@ -202,17 +202,70 @@ def _session(request: Request) -> dict | None:
     try:
         admin.execute("DELETE FROM admin_sessions WHERE expires_at <= now()")
         row = admin.execute(
-            """SELECT s.token_hash, s.credential_id, c.label
+            """SELECT s.token_hash, s.credential_id, s.token_fp, c.label
                FROM admin_sessions s
                LEFT JOIN admin_credentials c ON c.id = s.credential_id
                WHERE s.token_hash=%s AND s.expires_at > now()""",
             (_h(token),)).fetchone()
+        if row is not None and not row.get("credential_id") \
+                and not (_token_may_sign_in(admin)
+                         and _bound_to_token(row.get("token_fp"))):
+            # A token-minted session is worth no more than the token's
+            # right to sign in. Once the operator withdraws that right
+            # (passkeys made mandatory, or the instance turned hosted), a
+            # session the token opened earlier must stop too — otherwise a
+            # leaked token keeps its reach for the rest of the session's
+            # life after the door was shut. Rotating the token is the same
+            # withdrawal for the old value: every session it opened ends.
+            admin.execute("DELETE FROM admin_sessions WHERE token_hash=%s",
+                          (row["token_hash"],))
+            row = None
     finally:
         admin.close()
     if row is None:
         return None
     _ACTOR.set(_actor_name(row))
     return row
+
+
+def _token_fp() -> str:
+    """A fingerprint of the operator token configured now, kept on the
+    session row and never sent to the browser. A cookie that carried any
+    function of the token would let whoever copied it test guesses at the
+    token offline, turning a four-hour session into the long-lived
+    credential; on the row it is only ever compared by the server. Keyed
+    with the master key where one is set, so a copy of the table is not an
+    offline verifier either."""
+    import hmac
+    real = os.environ.get("OIKONOME_ADMIN_TOKEN", "")
+    key = (os.environ.get("OIKONOME_MASTER_KEY") or "").encode()
+    return hmac.new(key, b"admin-session-token:" + real.encode(),
+                    hashlib.sha256).hexdigest()
+
+
+def _bound_to_token(stored_fp: str | None) -> bool:
+    """Whether a token-opened session was opened under the token configured
+    now. A row with no fingerprint predates the binding and is ended like
+    a rotated one."""
+    if not stored_fp or not os.environ.get("OIKONOME_ADMIN_TOKEN"):
+        return False
+    return secrets.compare_digest(stored_fp, _token_fp())
+
+
+def _token_may_sign_in(admin) -> bool:
+    """The same rule `login` applies to the token, asked of a session the
+    token already opened."""
+    if not _token_login_enabled():
+        return False
+    if _require_passkey():
+        from ..auth import admin_passkeys
+        try:
+            return admin_passkeys.count(admin) == 0
+        except Exception:                                    # noqa: BLE001
+            # older database without the passkey tables: nothing can be
+            # enrolled, so the flag is ignored exactly as `login` does
+            return True
+    return True
 
 
 def _actor_name(row) -> str:
@@ -465,6 +518,7 @@ def _dashboard(request: Request, minted_link: str | None = None,
                    reboot_armed=reboot_armed, reboot_nonce=reboot_nonce,
                    command_results=_command_results(),
                    cmd_watcher_ready=_cmd_dir_writable(),
+                   reboot_watcher_ready=_reboot_watcher_ready(),
                    cmd_armed=cmd_armed, cmd_nonce=cmd_nonce,
                    # operator access
                    admin_creds=admin_creds,
@@ -1001,13 +1055,17 @@ def _issue_session(request: Request, resp, credential_id=None,
                    actor: str = "token"):
     """Shared tail of both sign-in paths: row + audit + cookie on `resp`."""
     cookie = secrets.token_urlsafe(32)
+    # a token-opened session records, on its row, which token opened it,
+    # so rotating the token ends it (see _bound_to_token); the cookie
+    # itself stays random
+    token_fp = _token_fp() if credential_id is None else None
     ip = client_ip(request)
     admin = tenancy.admin_connect()
     try:
         admin.execute(
             "INSERT INTO admin_sessions (token_hash, expires_at, ip, "
-            "credential_id) VALUES (%s, now() + %s, %s, %s)",
-            (_h(cookie), SESSION_TTL, ip, credential_id))
+            "credential_id, token_fp) VALUES (%s, now() + %s, %s, %s, %s)",
+            (_h(cookie), SESSION_TTL, ip, credential_id, token_fp))
         _audit(admin, "login", ip=ip, actor=actor)
     finally:
         admin.close()
@@ -1237,9 +1295,11 @@ def passkey_register(request: Request, body: dict = Body(...)):
     same position (`app.passkey_register` demands `_step_up` for exactly
     this reason).
 
-    Bootstrap is unaffected (`count == 0` needs no assertion), and losing
-    your only key is not a lockout: `oikonome admin-enrol` on the host
-    issues a ticket, which takes the `by_ticket` path above."""
+    With no key yet there is no assertion to ask for, so the first key
+    takes the operator token re-entered instead: the cookie alone is not
+    proof enough for a credential that outlives it. Losing your only key is
+    not a lockout: `oikonome admin-enrol` on the host issues a ticket,
+    which takes the `by_ticket` path above."""
     from ..auth import admin_passkeys
     sess = _session(request)
     ticket = str(body.get("ticket") or "")
@@ -1256,13 +1316,30 @@ def passkey_register(request: Request, body: dict = Body(...)):
             admin, ticket)
         if sess is None and not by_ticket:
             return _json_error(401, "not signed in")
-        if sess is not None and not by_ticket \
-                and admin_passkeys.count(admin) > 0 \
-                and not _stepup_ok(sess, admin, str(body.get("stepup") or "")):
-            return _json_error(
-                403, "confirm with a passkey you already have, then enrol "
-                     "the new one. If you have lost every key, run "
-                     "`oikonome admin-enrol` on the host for a link.")
+        if sess is not None and not by_ticket:
+            if admin_passkeys.count(admin) > 0:
+                if not _stepup_ok(sess, admin, str(body.get("stepup") or "")):
+                    return _json_error(
+                        403, "confirm with a passkey you already have, then "
+                             "enrol the new one. If you have lost every key, "
+                             "run `oikonome admin-enrol` on the host for a "
+                             "link.")
+            elif not _first_key_proof_ok(str(body.get("token") or "")):
+                # The FIRST key is the one with no assertion to ask for, and
+                # it outlives every session and every token rotation. A
+                # cookie alone would let a thief turn four hours into a
+                # credential of their own, so the operator token has to be
+                # re-entered here — the strongest factor that exists before
+                # any key does. Where the token cannot sign in at all, the
+                # host-issued link is the only way to a first key.
+                _audit(admin, "admin_passkey_enrol_refused",
+                       detail="first key without the operator token",
+                       ip=client_ip(request), actor=_actor_name(sess))
+                return _json_error(
+                    403, "enter the operator token to enrol the first "
+                         "passkey" if _token_login_enabled() else
+                         "run `oikonome admin-enrol` on the host for an "
+                         "enrolment link")
         try:
             out = admin_passkeys.register_verify(
                 admin, str(body.get("challenge_id") or ""),
@@ -1296,6 +1373,16 @@ def passkey_register(request: Request, body: dict = Body(...)):
     return out
 
 
+def _first_key_proof_ok(token: str) -> bool:
+    """The operator token, re-entered, under the same rule `login` applies
+    to it. Hashed on both sides so the compare is fixed-length, and never
+    reached with no token configured (`_h("")` equals `_h("")`)."""
+    if not _token_login_enabled() or not token:
+        return False
+    real = os.environ.get("OIKONOME_ADMIN_TOKEN", "")
+    return bool(real) and secrets.compare_digest(_h(token), _h(real))
+
+
 @router.post("/passkey/delete",
              dependencies=[Depends(limit("admin_passkey", 20, 3600))])
 def passkey_delete(request: Request, cred_id: str = Form(...),
@@ -1306,60 +1393,79 @@ def passkey_delete(request: Request, cred_id: str = Form(...),
     OIKONOME_ADMIN_REQUIRE_PASSKEY is set (that would brick the console)."""
     if (sess := _session(request)) is None:
         return RedirectResponse("/admin/console", status_code=303)
-    from ..auth import admin_passkeys
     admin = tenancy.admin_connect()
     try:
-        n = admin_passkeys.count(admin)
-        if (_require_passkey() or _passkey_only()) and n <= 1:
-            back = ("`oikonome admin-enrol` on the host" if _passkey_only()
-                    else "`oikonome admin-keys --reset` on the host")
-            return _dashboard(request, notice=(
-                "Not removed — this is the only operator passkey and this "
-                "console has no other way in, so removing it from here would "
-                f"lock it. Enrol the replacement first, or use {back}."))
-        if n and not _stepup_ok(sess, admin, stepup):
-            return _dashboard(request, notice="Not removed — confirm with "
-                              "your passkey and try again.")
-        # Revoking the CREDENTIAL must also kill every session it
-        # authenticated; otherwise those live on for the rest of
-        # SESSION_TTL. Where the console is passkey-only the passkey IS the
-        # credential, so "remove this key" has to mean the key can no longer
-        # act, not merely that it cannot sign in again — a stolen
-        # authenticator that had already signed in would otherwise keep full
-        # cross-tenant console access (and the console drives the root
-        # host-agent) for hours after being revoked.
-        #
-        # ORDER IS LOAD-BEARING. `admin_sessions.credential_id` is declared
-        # `REFERENCES admin_credentials(id) ON DELETE SET NULL`, so deleting
-        # the credential NULLs this exact column on every session it
-        # authenticated. Revoke first and the rows are found; revoke after
-        # `admin_passkeys.delete` and the WHERE clause matches nothing — code
-        # that reads correctly and protects nothing. A test cannot catch the
-        # wrong order by querying `credential_id` afterwards either, because
-        # once the FK has cleared it the query returns empty either way; only
-        # a fails-before run distinguishes them.
-        #
-        # Deleting the session AHEAD of admin_passkeys.delete also puts it
-        # ahead of that function's blanket except, which would otherwise
-        # absorb a malformed cred_id — an unparseable value reaches
-        # `%s::uuid` and 500s. Parse it here instead.
-        try:
-            key_uuid = str(_uuid.UUID(str(cred_id)))
-        except (ValueError, AttributeError, TypeError):
-            return _dashboard(request, notice="No such passkey.")
-        killed = admin.execute(
-            "DELETE FROM admin_sessions WHERE credential_id = %s::uuid",
-            (key_uuid,)).rowcount
-        if not admin_passkeys.delete(admin, key_uuid):
-            return _dashboard(request, notice="No such passkey.")
-        _audit(admin, "admin_passkey_removed", target=cred_id,
-               ip=client_ip(request))
-        if killed:
-            _audit(admin, "admin_sessions_revoked_with_passkey",
-                   target=cred_id, ip=client_ip(request))
+        # The last-key guard is a count followed by a delete, so the two
+        # must be one step: two removals racing each other would otherwise
+        # both read "two keys" and both delete, leaving a console that
+        # needs a passkey with none. Every removal takes the same
+        # transaction-scoped lock before it counts.
+        with admin.transaction():
+            admin.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                          ("oikonome:admin-credentials",))
+            notice = _remove_passkey_locked(request, admin, sess, cred_id,
+                                            stepup)
     finally:
         admin.close()
+    if notice is not None:
+        return _dashboard(request, notice=notice)
     return RedirectResponse("/admin/console#ops", status_code=303)
+
+
+def _remove_passkey_locked(request, admin, sess, cred_id,
+                           stepup) -> str | None:
+    """The body of `passkey_delete`, run under its lock. Returns the notice
+    to show, or None once the key is gone."""
+    from ..auth import admin_passkeys
+    n = admin_passkeys.count(admin)
+    if (_require_passkey() or _passkey_only()) and n <= 1:
+        back = ("`oikonome admin-enrol` on the host" if _passkey_only()
+                else "`oikonome admin-keys --reset` on the host")
+        return ("Not removed — this is the only operator passkey and this "
+                "console has no other way in, so removing it from here "
+                "would lock it. Enrol the replacement first, or use "
+                f"{back}.")
+    if n and not _stepup_ok(sess, admin, stepup):
+        return "Not removed — confirm with your passkey and try again."
+    # Revoking the CREDENTIAL must also kill every session it
+    # authenticated; otherwise those live on for the rest of
+    # SESSION_TTL. Where the console is passkey-only the passkey IS the
+    # credential, so "remove this key" has to mean the key can no longer
+    # act, not merely that it cannot sign in again — a stolen
+    # authenticator that had already signed in would otherwise keep full
+    # cross-tenant console access (and the console drives the root
+    # host-agent) for hours after being revoked.
+    #
+    # ORDER IS LOAD-BEARING. `admin_sessions.credential_id` is declared
+    # `REFERENCES admin_credentials(id) ON DELETE SET NULL`, so deleting
+    # the credential NULLs this exact column on every session it
+    # authenticated. Revoke first and the rows are found; revoke after
+    # `admin_passkeys.delete` and the WHERE clause matches nothing — code
+    # that reads correctly and protects nothing. A test cannot catch the
+    # wrong order by querying `credential_id` afterwards either, because
+    # once the FK has cleared it the query returns empty either way; only
+    # a fails-before run distinguishes them.
+    #
+    # Deleting the session AHEAD of admin_passkeys.delete also puts it
+    # ahead of that function's blanket except, which would otherwise
+    # absorb a malformed cred_id — an unparseable value reaches
+    # `%s::uuid` and 500s (and, inside this transaction, would abort it).
+    # Parse it here instead.
+    try:
+        key_uuid = str(_uuid.UUID(str(cred_id)))
+    except (ValueError, AttributeError, TypeError):
+        return "No such passkey."
+    killed = admin.execute(
+        "DELETE FROM admin_sessions WHERE credential_id = %s::uuid",
+        (key_uuid,)).rowcount
+    if not admin_passkeys.delete(admin, key_uuid):
+        return "No such passkey."
+    _audit(admin, "admin_passkey_removed", target=cred_id,
+           ip=client_ip(request))
+    if killed:
+        _audit(admin, "admin_sessions_revoked_with_passkey",
+               target=cred_id, ip=client_ip(request))
+    return None
 
 
 @router.post("/passkey/login/options",
@@ -1525,28 +1631,36 @@ def _mint_invite(request: Request, *, email: str = "", days: int = 14,
                 "SELECT count(*) AS n FROM signup_invites "
                 "WHERE used_at IS NULL AND expires_at > now() "
                 "AND email <> %s", (email,)).fetchone()["n"]
+            refused = None
             if ext.gate.at_cap(accounts + promised):
                 cap = ext.gate.intake_cap()
                 _audit(admin, "invite_refused", target=email,
                        detail=(f"at capacity: {accounts} accounts + "
                                f"{promised} open invites / {cap}"),
                        ip=client_ip(request))
-                # the finally below closes the connection; _dashboard
-                # opens its own
-                return _dashboard(request, notice=(
-                    f"Invite NOT minted — intake is at capacity "
-                    f"({accounts} accounts plus {promised} open "
-                    f"invites, of {cap}). Raise the intake cap to admit "
-                    f"more accounts."))
-            token = signup_invites.mint(admin, email, days=days,
-                                        note=note or None, options=options)
-            _audit(admin, "invite", target=email,
-                   detail=(f"days={days}"
-                           + (f" note={note}" if note else "")
-                           + "".join(f" {k}={v}" for k, v in options.items())),
-                   ip=client_ip(request))
+                refused = (f"Invite NOT minted — intake is at capacity "
+                           f"({accounts} accounts plus {promised} open "
+                           f"invites, of {cap}). Raise the intake cap to "
+                           f"admit more accounts.")
+            else:
+                token = signup_invites.mint(admin, email, days=days,
+                                            note=note or None,
+                                            options=options)
+                _audit(admin, "invite", target=email,
+                       detail=(f"days={days}"
+                               + (f" note={note}" if note else "")
+                               + "".join(f" {k}={v}"
+                                         for k, v in options.items())),
+                       ip=client_ip(request))
     finally:
         admin.close()
+    if refused is not None:
+        # Rendered only now, with the transaction committed and the
+        # connection closed: the dashboard is a page of fleet-wide reads,
+        # and every signup waits on the instance-wide intake lock while it
+        # is held. Committed first, the refusal's own audit row is on the
+        # page too.
+        return _dashboard(request, notice=refused)
     path = f"/signup?invite={token}&email={quote(email)}"
     base = os.environ.get("OIKONOME_BASE_URL", "").rstrip("/")
     link = f"{base}{path}" if base else path
@@ -1697,12 +1811,22 @@ def clear_second_factor(request: Request, user_id: str = Form(...),
                     "Second factor NOT cleared — this needs a fresh "
                     "passkey confirmation. Try again and confirm with your "
                     "passkey when asked."))
+        # An owner's clear also deletes the members who joined through that
+        # owner's recent invites (the same eviction an emailed reset makes,
+        # since a stolen session could have planted them). The operator is
+        # the one person who knowingly triggers it, so the notice and the
+        # audit row name the rows the eviction itself deleted — not a
+        # before/after roster diff, which would also count a member who
+        # left, or miss one who joined, while it ran.
         removed = factor_reset.clear_second_factor(admin, u["id"])
         admin.commit()
+        gone = removed["members"]
         _audit(admin, "clear_second_factor", target=u["email"],
                detail=(f"totp={'yes' if removed['totp'] else 'no'} "
                        f"passkeys={removed['passkeys']} "
-                       f"sessions_evicted={removed['sessions']}"),
+                       f"sessions_evicted={removed['sessions']} "
+                       f"members_removed={len(gone)}"
+                       + (f" ({', '.join(gone)})" if gone else "")),
                ip=client_ip(request))
     finally:
         admin.close()
@@ -1715,7 +1839,11 @@ def clear_second_factor(request: Request, user_id: str = Form(...),
                          f"{removed['passkeys']} passkey(s) and every "
                          f"recovery code removed, {removed['sessions']} "
                          f"session(s) signed out. They were emailed. Hand "
-                         f"them a reset link next if they need a password."))
+                         f"them a reset link next if they need a password."
+                         + (f" {len(gone)} household member login(s) who "
+                            f"joined through this owner's recent invites "
+                            f"were removed: {', '.join(gone)}. Invite them "
+                            f"again if they are genuine." if gone else "")))
 
 
 @router.post("/tenant-status",
@@ -1746,6 +1874,7 @@ def tenant_status(request: Request, tenant_id: str = Form(...),
     verb = "suspend" if to == "suspended" else "reactivate"
     admin = tenancy.admin_connect()
     try:
+      try:
         with admin.transaction():
             row = admin.execute(
                 "SELECT coalesce(status,'active') AS status FROM tenants "
@@ -1775,6 +1904,13 @@ def tenant_status(request: Request, tenant_id: str = Form(...),
                 notice = (f"Tenant {to}." if landed == to else
                           f"Tenant reactivated into {landed} — its trial "
                           f"ended while it was suspended.")
+      except ext.GateUnavailable as e:
+        # Only the billing add-on can say where a suspended household
+        # lands, and it is not loaded: the transaction rolled back, the
+        # household stays as it was, and the operator retries once the
+        # add-on is back.
+        notice = f"NOT reactivated — {e}. Nothing was changed; try again " \
+                 f"once it loads."
     finally:
         admin.close()
     return _dashboard(request, notice=notice)
@@ -2041,6 +2177,13 @@ def tenant_detail(request: Request, tenant_id: str, msg: str = ""):
                                 # template tests membership rather than
                                 # naming any of them
                                 frozen_statuses=_frozen_statuses(),
+                                # the gated forms ask for a passkey
+                                # assertion exactly where the server will
+                                # demand one: with no key enrolled the
+                                # ceremony has nothing to sign with and
+                                # would block a form the server accepts
+                                passkeys_enrolled=_passkey_count(),
+                                grace_days=_grace_days(),
                                 msg=msg[:300], **extra))
 
 
@@ -2195,24 +2338,60 @@ def tenant_restore(request: Request, tenant_id: str = Form(...)):
         # restores to active. FOR UPDATE + the same predicate serialize
         # against the worker purge: whichever grabs the row lock first
         # wins, and the loser sees the other's outcome.
+        # A household the nightly purge has claimed is having its bank
+        # links and billing released outside the row lock; handing it back
+        # now would revive an account whose connections are already gone,
+        # so the door refuses until the purge finishes or gives it up.
+        # A claim far older than any purge takes was left by a worker that
+        # was killed mid-purge; nothing else would ever clear it, so it is
+        # treated as given up. What that purge had already removed at Plaid
+        # is archived once the household is back, so it is not handed back
+        # looking connected.
+        from ..jobs import worker as _worker
+        busy = stale = False
         with admin.transaction():
             row = admin.execute(
-                "SELECT COALESCE(status_before_delete,'active') AS prev "
+                "SELECT COALESCE(status_before_delete,'active') AS prev, "
+                "purge_claimed_at IS NOT NULL AS claimed, "
+                f"COALESCE({_worker.purge_claim_is_stale_sql()}, false) "
+                "AS stale "
                 "FROM tenants WHERE id=%s "
                 "AND status = ANY(%s) "
                 "FOR UPDATE", (tenant_id, _frozen_statuses())).fetchone()
-            if row is None:
-                return _dashboard(request,
-                                  notice="Not scheduled for deletion and "
-                                         "not frozen — nothing to restore.")
-            admin.execute(
-                "UPDATE tenants SET status=%s, delete_after=NULL, "
-                "status_before_delete=NULL WHERE id=%s",
-                (row["prev"], tenant_id))
-            _audit(admin, "tenant_delete_restored", target=tenant_id,
-                   detail=f"restored_to={row['prev']}", ip=client_ip(request))
+            if row is not None and row["claimed"] and row["stale"]:
+                stale = True
+                log.warning("restore of %s: clearing a purge claim older "
+                            "than %d h, left by a purge that never finished",
+                            tenant_id, _worker.PURGE_CLAIM_STALE_HOURS)
+                admin.execute("UPDATE tenants SET purge_claimed_at = NULL "
+                              "WHERE id=%s", (tenant_id,))
+            elif row is not None and row["claimed"]:
+                busy, row = True, None
+            if row is not None:
+                admin.execute(
+                    "UPDATE tenants SET status=%s, delete_after=NULL, "
+                    "status_before_delete=NULL WHERE id=%s",
+                    (row["prev"], tenant_id))
+                _audit(admin, "tenant_delete_restored", target=tenant_id,
+                       detail=f"restored_to={row['prev']}"
+                              + (" stale_purge_claim_cleared" if stale
+                                 else ""),
+                       ip=client_ip(request))
     finally:
         admin.close()
+    if stale and row is not None:
+        _worker.archive_released_plaid_items(tenant_id)
+    if busy:
+        resp = _dashboard(request,
+                          notice="Deletion in progress — its links are being "
+                                 "released, so it cannot be restored now.")
+        resp.status_code = 409
+        return resp
+    if row is None:
+        # the page is rendered with the transaction closed, never inside it
+        return _dashboard(request,
+                          notice="Not scheduled for deletion and "
+                                 "not frozen — nothing to restore.")
     # Tell the installed gate the deletion was called off, so the pause
     # the scheduling put on its rails comes back off. Outside the
     # transaction: a round trip to an outside service must not be held
@@ -2245,10 +2424,17 @@ def tenant_restore(request: Request, tenant_id: str = Form(...)):
 
 @router.post("/tenant-export",
              dependencies=[Depends(limit("admin_export", 10, 3600))])
-def tenant_export(request: Request, tenant_id: str = Form(...)):
+def tenant_export(request: Request, tenant_id: str = Form(...),
+                  stepup: str = Form("")):
     """Portable data export (CCPA/GDPR portability). Always audited; the
     audit records whether the tenant had a live support consent on
-    file."""
+    file.
+
+    Takes a fresh operator passkey assertion whenever a key is enrolled,
+    like an immediate purge: a copy of a household's data that has left
+    the instance cannot be called back, so a stolen console cookie must not
+    be enough to take one. The household's own export door asks for a
+    fresh elevation for the same reason."""
     if (bounce := _require(request)) is not None:
         return bounce
     from .. import tenant_export as _exp
@@ -2275,6 +2461,15 @@ def tenant_export(request: Request, tenant_id: str = Form(...)):
                        "support access. Ask them to grant it in Settings → "
                        "Support access; they can also export their own data "
                        "there without you.")
+        if _passkey_count():
+            if not _stepup_ok(_session(request), admin, stepup):
+                _audit(admin, "tenant_export_refused", target=tenant_id,
+                       detail="no fresh passkey assertion",
+                       ip=client_ip(request))
+                return _dashboard(request, notice=(
+                    "Export refused — this needs a fresh passkey "
+                    "confirmation. Try again and confirm with your passkey "
+                    "when asked."))
         _audit(admin, "tenant_export", target=tenant_id,
                detail=f"consent_on_file={consented}", ip=client_ip(request))
     finally:
@@ -2353,8 +2548,13 @@ def host_reboot(request: Request, stage: str = Form("arm"),
                 "confirmation. Start again and confirm with your passkey "
                 "when asked."))
     from pathlib import Path
+
+    from ..jobs import host_watchers
     cmd = Path(os.environ.get("OIKONOME_STATE_DIR", "/state")) / "cmd"
-    if not cmd.is_dir() or not os.access(cmd, os.W_OK):
+    # the reboot watcher's own readiness, not the shared drop-box's: the
+    # command watcher alone makes the drop-box writable too, and a flag
+    # nothing reads would broadcast a countdown to a restart that never comes
+    if not host_watchers.ready("reboot"):
         return _dashboard(request,
                           notice="Not configured — the host reboot watcher "
                                  "isn't installed (see scripts/"
@@ -2394,7 +2594,7 @@ _CMD_ALLOW = ("backup", "status", "logs", "upgrade",
 # not be able to do that any more than it can restore or reset.
 _CMD_DESTRUCTIVE = {"restore", "reset", "uninstall", "upgrade"}
 _CMD_LABELS = {"backup": "Back up now", "status": "Status",
-               "logs": "Recent logs", "upgrade": "Rebuild / restart",
+               "logs": "Recent logs", "upgrade": "Upgrade to the latest release",
                "restore": "Restore a backup", "reset": "Reset (wipe data)",
                "uninstall": "Uninstall"}
 # nonce -> (command it was armed for, expiry). The command is half the key:
@@ -2406,10 +2606,16 @@ _CMD_LABELS = {"backup": "Back up now", "status": "Status",
 _CMD_NONCES: dict[str, tuple[str, float]] = {}
 
 
+def _reboot_watcher_ready() -> bool:
+    from ..jobs import host_watchers
+    return host_watchers.ready("reboot")
+
+
 def _cmd_dir_writable() -> bool:
-    from pathlib import Path
-    cmd = Path(os.environ.get("OIKONOME_STATE_DIR", "/state")) / "cmd"
-    return cmd.is_dir() and os.access(cmd, os.W_OK)
+    """The host-command runner is ready — its own watcher, not merely the
+    drop-box the reboot watcher shares (see jobs/host_watchers)."""
+    from ..jobs import host_watchers
+    return host_watchers.ready("command")
 
 
 def _command_results(limit_n: int = 8) -> list[dict]:
@@ -2600,44 +2806,49 @@ async def create_instance(request: Request, email: str = Form(...)):
         # a stale form or a curl must not mint what /signup will refuse
         return _dashboard(request, notice=_SINGLE_HOUSEHOLD_NOTICE)
 
-    from ..auth import passwords, reset as reset_mod
+    from ..auth import passwords
     email = email.strip().lower()
     from .mailguard import valid_address
     if not valid_address(email):
         return _dashboard(request, notice="That doesn't look like an email.")
+    # unusable random password_hash → the owner MUST set one via the
+    # returned link; verified (operator-provisioned). Hashed before the
+    # lock below, so the slow part never holds up a signup for the address.
+    unusable = passwords.hash_password(secrets.token_urlsafe(32))
     admin = tenancy.admin_connect()
     try:
-        if admin.execute("SELECT 1 FROM users WHERE email=%s",
-                         (email,)).fetchone():
-            return _dashboard(request, notice=f"{email} already has an "
-                                              "account.")
-        tid = tenancy.create_tenant(admin, email)
-        # unusable random password_hash → the owner MUST set one via the
-        # returned link; verified (operator-provisioned)
-        import secrets as _secrets
-        uid = admin.execute(
-            """INSERT INTO users (tenant_id, email, password_hash, verified_at)
-               VALUES (%s, %s, %s, now()) RETURNING id""",
-            (tid, email,
-             passwords.hash_password(_secrets.token_urlsafe(32)))).fetchone()["id"]
-        # WELCOME mechanics, not reset — a fresh user gets 7 days, and
-        # the email says "your account is ready", not "someone requested a
-        # password reset", which reads like phishing to someone who was
-        # expecting an invitation
-        token = reset_mod.create_reset(admin, uid, ttl=reset_mod.WELCOME_TTL)
-        # what the account is born with is the installed gate's business:
-        # it reads the operator's choices off this form and writes
-        # whatever standing it dictates, exactly as it does for a
-        # self-signup
-        options = ext.gate.invite_options(extra, operator_created=True)
-        ext.gate.provision(admin, tid, invite={"options": options},
-                           ref=None, verified=True, reclaim=False)
-        _audit(admin, "create_instance",
-               target=email + "".join(f" ({k}:{v})"
-                                      for k, v in options.items()),
-               ip=client_ip(request))
+        # The check and the inserts are one claim on the address, made
+        # under the same per-email lock self-signup takes. Without it a
+        # double submit (or the person signing up at the same moment) has
+        # both requests pass the check, and the loser commits a tenant
+        # before tripping the address's unique index: a 500 and a household
+        # with no owner that every sweep goes on visiting. One transaction
+        # also means a failure part-way leaves nothing behind to block a
+        # retry with "already has an account".
+        try:
+            with admin.transaction():
+                admin.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                              ("oikonome:signup:" + email,))
+                taken = admin.execute("SELECT 1 FROM users WHERE email=%s",
+                                      (email,)).fetchone()
+                if not taken:
+                    token, options = _provision_instance(
+                        admin, email, unusable, extra, request)
+        except ext.GateUnavailable as e:
+            # the billing add-on is not loaded, so the household would be
+            # born with no billing record; the transaction has rolled the
+            # whole creation back
+            log.error("create instance for %s refused: %s", email, e)
+            resp = _dashboard(request,
+                              notice="The billing add-on is not loaded, so "
+                                     "no instance was created — try again "
+                                     "once it loads.")
+            resp.status_code = 503
+            return resp
     finally:
         admin.close()
+    if taken:
+        return _dashboard(request, notice=f"{email} already has an account.")
     base = os.environ.get("OIKONOME_BASE_URL", "").rstrip("/")
     link = f"{base}/reset?token={token}" if base else f"/reset?token={token}"
     # deliver the welcome link by email too (best-effort), like invites
@@ -2648,3 +2859,33 @@ async def create_instance(request: Request, email: str = Form(...)):
     return _dashboard(request, minted_link=link,
                       notice=f"Instance created for {email}{tail} — send them "
                              "the set-password link (also emailed).")
+
+
+def _provision_instance(admin, email: str, password_hash: str, extra: dict,
+                        request: Request) -> tuple[str, dict]:
+    """Tenant, owner, welcome link and the gate's standing for a new
+    instance, inside the caller's transaction and per-email lock. Returns
+    (welcome token, the gate's options)."""
+    from ..auth import reset as reset_mod
+    tid = tenancy.create_tenant(admin, email)
+    uid = admin.execute(
+        """INSERT INTO users (tenant_id, email, password_hash, verified_at)
+           VALUES (%s, %s, %s, now()) RETURNING id""",
+        (tid, email, password_hash)).fetchone()["id"]
+    # WELCOME mechanics, not reset — a fresh user gets 7 days, and
+    # the email says "your account is ready", not "someone requested a
+    # password reset", which reads like phishing to someone who was
+    # expecting an invitation
+    token = reset_mod.create_reset(admin, uid, ttl=reset_mod.WELCOME_TTL)
+    # what the account is born with is the installed gate's business:
+    # it reads the operator's choices off this form and writes
+    # whatever standing it dictates, exactly as it does for a
+    # self-signup
+    options = ext.gate.invite_options(extra, operator_created=True)
+    ext.gate.provision(admin, tid, invite={"options": options},
+                       ref=None, verified=True, reclaim=False)
+    _audit(admin, "create_instance",
+           target=email + "".join(f" ({k}:{v})"
+                                  for k, v in options.items()),
+           ip=client_ip(request))
+    return token, options

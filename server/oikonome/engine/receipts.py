@@ -72,6 +72,11 @@ _DECODE_GATE = threading.BoundedSemaphore(
     int(env_num("OIKONOME_RECEIPT_PARSE_CONCURRENCY", "2")))
 _DECODE_WAIT_S = float(env_num("OIKONOME_RECEIPT_PARSE_WAIT_S", "120"))
 BUSY_ERROR = "server is busy reading receipts — try again in a minute"
+# A receipt that failed only because the gate was busy is taken up again by
+# the nightly sweep while it is younger than this. The bound is what stops
+# one that can never get a turn from queueing for ever: a handful of nights,
+# then it waits for a person's retry like any other failure.
+BUSY_RETRY_DAYS = 7
 
 
 class ProseAnswer(ValueError):
@@ -145,16 +150,24 @@ def add(conn, txn_id: str | None, image: bytes, mime: str,
         raise ValueError("images or PDF only")
     if kind not in KINDS:
         raise ValueError("kind must be 'receipt' or 'check'")
-    if txn_id is None:
-        if kind != "receipt":
-            raise ValueError("a check image is attached to its transaction")
-    elif conn.execute("SELECT 1 FROM transactions WHERE id = %s AND removed=0",
-                      (txn_id,)).fetchone() is None:
-        raise ValueError("no such transaction")
-    row = conn.execute(
-        """INSERT INTO receipts (txn_id, image, mime, kind)
-           VALUES (%s,%s,%s,%s) RETURNING id""",
-        (txn_id, image, mime, kind)).fetchone()
+    if txn_id is None and kind != "receipt":
+        raise ValueError("a check image is attached to its transaction")
+    # The check and the insert are one step under the pairing lock the
+    # pending-to-posted settlement holds from its carry to its retire, and a
+    # hold that has already posted hands the receipt to its posted charge
+    # (entities.live_txn_id). Checked and inserted separately, a receipt
+    # snapped while its charge settled could land on the retired hold after
+    # the carry had run — shown as attached, then on no screen at all.
+    with conn.transaction():
+        if txn_id is not None:
+            from .entities import live_txn_id
+            txn_id = live_txn_id(conn, txn_id)
+            if txn_id is None:
+                raise ValueError("no such transaction")
+        row = conn.execute(
+            """INSERT INTO receipts (txn_id, image, mime, kind)
+               VALUES (%s,%s,%s,%s) RETURNING id""",
+            (txn_id, image, mime, kind)).fetchone()
     rid = str(row["id"])
     # store a cleaned-up optimized copy next to the original
     # (best-effort — never block the upload if optimization fails).
@@ -168,8 +181,8 @@ def add(conn, txn_id: str | None, image: bytes, mime: str,
 
 def for_txn(conn, txn_id: str) -> list[dict]:
     receipts = conn.execute(
-        """SELECT id, mime, kind, status, parsed, error, created_at,
-                  matched_at, match_method,
+        f"""SELECT id, mime, kind, status, parsed, error, created_at,
+                  matched_at, match_method, {PARSE_STATE_SQL},
                   (image_optimized IS NOT NULL) AS has_optimized
            FROM receipts WHERE txn_id = %s ORDER BY created_at""",
         (txn_id,)).fetchall()
@@ -230,6 +243,16 @@ def set_tag(conn, receipt_id: str, line: int, tag: str) -> int:
 STALE_PARSE = "10 minutes"
 
 
+# A receipt's parse state for the clients, as SELECT columns: when the
+# attempt in progress began (null unless the receipt is being read), and
+# whether that attempt is past the reclaim window — by the server's clock and
+# claim()'s own rule, so the retry it offers is one claim() will accept.
+PARSE_STATE_SQL = (
+    "CASE WHEN status = 'parsing' THEN parsed_at END AS parse_started_at, "
+    "COALESCE(status = 'parsing' AND parsed_at < now() - interval "
+    f"'{STALE_PARSE}', false) AS parse_stale")
+
+
 # A receipt whose total and date a person typed in. The AI never writes
 # over it: claim() refuses it, and every write a parse makes carries this
 # guard, so a parse already in flight when the person saved finds the row
@@ -241,6 +264,24 @@ _NOT_MANUAL = "COALESCE(parsed->>'source', '') <> 'manual'"
 class _TakenByHand(Exception):
     """Raised inside the parse's write transaction to roll it back when
     a person entered the details while the model was reading."""
+
+
+class _AlreadyRead(Exception):
+    """Raised inside the parse's write transaction to roll it back when
+    another attempt on the same receipt has already landed its result."""
+
+
+# One live parse can outlast STALE_PARSE (a wait at the decode gate, then a
+# slow model), so the sweep or the retry door can reclaim a row whose first
+# attempt is still running, and two attempts then race to write. A success
+# lands while the row is still 'parsing', or 'failed' by the other attempt (a
+# good reading beats a failed one); once one reading is in, a second has
+# nothing to add. A FAILURE lands only for the attempt that
+# holds the current claim — the row still 'parsing' under the parsed_at its
+# claim stamped — so an attempt that failed after being superseded, or after
+# the other attempt already succeeded, never buries a good reading under
+# 'failed' (a waiting receipt marked failed is never offered a charge).
+_ATTEMPT = "status = 'parsing' AND parsed_at = %s"
 
 
 def is_manual(conn, receipt_id: str) -> bool:
@@ -258,14 +299,21 @@ def claim(conn, receipt_id: str) -> bool:
     items on a double-click or upload+retry. Whoever loses this UPDATE
     simply doesn't parse. parsed_at doubles as attempt-started-at while
     status='parsing', so a stale claim (died thread) is reclaimable."""
-    return conn.execute(
+    return _claim(conn, receipt_id) is not None
+
+
+def _claim(conn, receipt_id: str):
+    """claim(), returning the attempt's token (the parsed_at it stamped)
+    or None when the claim was lost."""
+    row = conn.execute(
         f"""UPDATE receipts SET status='parsing', error=NULL,
-                parsed_at=now()
+                parsed_at=clock_timestamp()
             WHERE id = %s::uuid
               AND {_NOT_MANUAL}
               AND (status <> 'parsing'
                    OR parsed_at < now() - interval '{STALE_PARSE}')
-            RETURNING id""", (receipt_id,)).fetchone() is not None
+            RETURNING parsed_at""", (receipt_id,)).fetchone()
+    return row["parsed_at"] if row else None
 
 # Longest side sent to the vision model. A 3072×4080 phone photo costs
 # ~4,000 image tokens — alone it blows ollama's default 4,096 context and
@@ -459,6 +507,15 @@ def _pdf_first_page_png(pdf_bytes: bytes) -> bytes:
     import io
 
     import pypdfium2 as pdfium
+
+    from ..sync import pdfimport
+    # measured with pypdf's capped decoders first: pdfium inflates a page's
+    # content with no cap of its own, so a tiny flate bomb attached as a
+    # receipt would otherwise be decompressed in full inside the renderer
+    try:
+        pdfimport.first_page_within_budget(pdf_bytes)
+    except ValueError as e:
+        raise ReceiptRefusal(f"{e} — try re-exporting it, or upload an image")
     try:
         doc = pdfium.PdfDocument(pdf_bytes)
     except Exception as e:                        # noqa: BLE001 — see above
@@ -636,8 +693,17 @@ def parse_one(conn, receipt_id: str, transport=None,
                 "WHERE id=%s AND status IN ('uploaded', 'parsing')",
                 (str(e)[:400], r["id"]))
             raise
-    if not claimed and not claim(conn, receipt_id):
-        return {"status": "parsing"}      # someone else is mid-parse
+    if claimed:
+        # the caller's claim() was the last write to the row, so the
+        # parsed_at it stamped is this attempt's token
+        cur = conn.execute(
+            "SELECT parsed_at FROM receipts WHERE id=%s"
+            " AND status='parsing'", (r["id"],)).fetchone()
+        attempt = cur["parsed_at"] if cur else None
+    else:
+        attempt = _claim(conn, receipt_id)
+        if attempt is None:
+            return {"status": "parsing"}  # someone else is mid-parse
     try:
         # the vision model reads the ENHANCED copy when one exists —
         # cropped/deskewed/contrast-boosted text OCRs better than the raw
@@ -677,8 +743,8 @@ def parse_one(conn, receipt_id: str, transport=None,
     except Exception as e:                        # noqa: BLE001
         conn.execute(
             "UPDATE receipts SET status='failed', error=%s WHERE id=%s"
-            f" AND {_NOT_MANUAL}",
-            (_friendly_error(e, bool(vision)), r["id"]))
+            f" AND {_NOT_MANUAL} AND {_ATTEMPT}",
+            (_friendly_error(e, bool(vision)), r["id"], attempt))
         return {"status": "failed", "error": str(e)}
     # bound everything the model returned BEFORE any write: a line whose
     # amount is not a finite number is dropped, a qty that is not becomes
@@ -715,6 +781,11 @@ def parse_one(conn, receipt_id: str, transport=None,
                     f" AND {_NOT_MANUAL} FOR UPDATE",
                     (r["id"],)).fetchone() is None:
                 raise _TakenByHand
+            if conn.execute(
+                    "SELECT 1 FROM receipts WHERE id=%s"
+                    " AND status IN ('parsing', 'failed')",
+                    (r["id"],)).fetchone() is None:
+                raise _AlreadyRead
             conn.execute("DELETE FROM receipt_items WHERE receipt_id = %s",
                          (r["id"],))
             for row in clean_rows:
@@ -727,11 +798,13 @@ def parse_one(conn, receipt_id: str, transport=None,
                 "parsed_at=now() WHERE id=%s", (jsonb(meta), r["id"]))
     except _TakenByHand:
         return {"status": "parsed", "kept": MANUAL}
+    except _AlreadyRead:
+        return {"status": "parsed", "kept": "earlier-attempt"}
     except Exception as e:                        # noqa: BLE001
         conn.execute(
             "UPDATE receipts SET status='failed', error=%s WHERE id=%s"
-            f" AND {_NOT_MANUAL}",
-            (_friendly_error(e, bool(vision)), r["id"]))
+            f" AND {_NOT_MANUAL} AND {_ATTEMPT}",
+            (_friendly_error(e, bool(vision)), r["id"], attempt))
         return {"status": "failed", "error": str(e)}
     if r["txn_id"] is None and not is_check:
         # a receipt snapped before its charge: now that its total, date and
@@ -943,7 +1016,8 @@ def parse_pending(conn, limit: int = 10, transport=None) -> dict:
     """Nightly sweep: parse stored-but-unparsed receipts (PDFs included —
     they rasterize) when an LLM is configured. Silent no-op otherwise
     (attachment-only mode). Also reclaims receipts stuck 'parsing' for
-    over 10 minutes (a died worker/thread mid-parse)."""
+    over 10 minutes (a died worker/thread mid-parse), and receipts that
+    failed only because the decode gate was busy (see BUSY_RETRY_DAYS)."""
     from . import llm_categorize as llm
     if not llm.configured(conn, role="vision"):
         return {"parsed": 0, "failed": 0, "skipped": "no-llm"}
@@ -955,8 +1029,10 @@ def parse_pending(conn, limit: int = 10, transport=None) -> dict:
         f"""SELECT id FROM receipts WHERE status = 'uploaded'
            OR (status = 'parsing'
                AND parsed_at < now() - interval '{STALE_PARSE}')
+           OR (status = 'failed' AND error = %s
+               AND created_at > now() - make_interval(days => %s))
            ORDER BY (error IS NOT NULL), created_at LIMIT %s""",
-        (limit,)).fetchall()
+        (BUSY_ERROR, BUSY_RETRY_DAYS, limit)).fetchall()
     parsed = failed = 0
     for r in rows:
         try:
@@ -965,6 +1041,11 @@ def parse_pending(conn, limit: int = 10, transport=None) -> dict:
                 parsed += 1
             else:
                 failed += 1
+                if out.get("error") == BUSY_ERROR:
+                    # the gate is still full: every later row would wait
+                    # out the same timeout and fail the same way, so the
+                    # rest wait for the next sweep
+                    break
         except ValueError:
             failed += 1
     return {"parsed": parsed, "failed": failed}
@@ -996,7 +1077,8 @@ def report(conn, tag: str, year: int, month: int) -> dict:
                   AND (r.txn_id IS NULL OR t.removed = 0)) x
            WHERE x.date >= %s AND x.date < %s
            ORDER BY x.date, x.receipt_id, x.line""",
-        (_waiting_store_names(conn), tag.strip(), start, end)).fetchall()
+        (_waiting_store_names(conn), _household_zone(conn), tag.strip(),
+         start, end)).fetchall()
     total = round(sum(r["amount"] or 0 for r in rows), 2)
     return {"tag": tag, "year": year, "month": month,
             "total": total, "count": len(rows), "rows": rows}
@@ -1028,20 +1110,35 @@ UNKNOWN_STORE = "Unknown store"
 _ITEM_PAYEE = (f"COALESCE({DISPLAY_MERCHANT}, wm.store, "
                "NULLIF(r.parsed->>'merchant', ''))")
 _WM_JOIN = ("LEFT JOIN jsonb_each_text(%s::jsonb) AS wm(printed, store)"
-            " ON r.txn_id IS NULL AND wm.printed = r.parsed->>'merchant'")
+            " ON r.txn_id IS NULL AND wm.printed = r.parsed->>'merchant'"
+            # the household's zone rides along with the store map (one
+            # more parameter, straight after it): the snap DAY below is a
+            # calendar day where the household lives, and the session's
+            # own zone is UTC
+            " CROSS JOIN (SELECT %s::text AS tz) hz")
 # the printed date is cast only when it is one: a stored string that is
 # not a date must hide one row's date, never fail the whole page. And it
 # is believed only inside the window the matcher believes (a year before
 # the snap to a day after, receipt_match.facts): a misread year would file
 # the purchase under a month it never happened in, so the snap day stands
 # in, as it does for the matcher. The window check sits in its own CASE so
-# the cast only ever runs on a string already proven to be a date.
+# the cast only ever runs on a string already proven to be a date. The snap
+# day is the household's (hz.tz, from _WM_JOIN), the same day _snap_day and
+# the matcher read: a receipt snapped at 7pm Pacific is not tomorrow's.
+_SNAP_DATE = "(r.created_at AT TIME ZONE hz.tz)::date"
 _ITEM_DATE = ("COALESCE(t.date, CASE WHEN r.parsed->>'date' ~ "
               "'^[0-9]{4}-[0-9]{2}-[0-9]{2}$' AND "
               "pg_input_is_valid(r.parsed->>'date', 'date') "
               "THEN CASE WHEN (r.parsed->>'date')::date BETWEEN "
-              "r.created_at::date - 366 AND r.created_at::date + 1 "
-              "THEN (r.parsed->>'date')::date END END, r.created_at::date)")
+              f"{_SNAP_DATE} - 366 AND {_SNAP_DATE} + 1 "
+              f"THEN (r.parsed->>'date')::date END END, {_SNAP_DATE})")
+
+
+def _household_zone(conn) -> str:
+    from .. import localtime
+    from . import budget
+    return localtime.tenant_tz_name(budget.load_config(conn))
+
 def _store_key(name) -> str:
     from .merchant_dedup import canonical_merchant
     name = str(name or "").strip()
@@ -1122,7 +1219,7 @@ def search_items(conn, q: str = "", group: str = "item",
         # not widen the match, and it is bounded like any search box
         where += " AND ri.description ILIKE %s ESCAPE '\\'"
         params.append(f"%{_like_literal(q.strip()[:100])}%")
-    names = _waiting_store_names(conn)
+    names = [_waiting_store_names(conn), _household_zone(conn)]
     rows = conn.execute(
         f"""SELECT ri.receipt_id::text AS receipt_id, ri.line,
                    ri.description, ri.qty, ri.amount, ri.tag,
@@ -1135,7 +1232,7 @@ def search_items(conn, q: str = "", group: str = "item",
             {_WM_JOIN}
             WHERE {where}
             ORDER BY 8 DESC, ri.receipt_id, ri.line
-            LIMIT %s""", [names] + params + [limit + 1]).fetchall()
+            LIMIT %s""", names + params + [limit + 1]).fetchall()
     truncated = len(rows) > limit
     key = _GROUP_KEYS.get(group, _GROUP_KEYS["item"])
     groups = conn.execute(
@@ -1149,5 +1246,5 @@ def search_items(conn, q: str = "", group: str = "item",
             {_WM_JOIN}
             WHERE {where}
             GROUP BY key ORDER BY total DESC LIMIT 150""",
-        [names] + params).fetchall()
+        names + params).fetchall()
     return {"rows": rows[:limit], "groups": groups, "truncated": truncated}

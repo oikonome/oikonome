@@ -174,6 +174,16 @@ def new_number() -> str:
             f"-{secrets.token_hex(2)}")
 
 
+# What the bundle's own note adds when the log lines ride beside it: the
+# bundle withholds names, the log ring only strips secret shapes (_REDACTIONS),
+# and a reader deciding whether the package is fit for a public issue has
+# to be told the difference in the package itself.
+LOGS_NOTE = ("The app-logs.txt beside this bundle is the app's recent log "
+             "lines: tokens, passwords, sign-in links and email addresses "
+             "are stripped from them, but host names and bank names are "
+             "not, so read it before attaching it anywhere public.")
+
+
 def build_package(conn, tenant_id: str, number: str, message: str,
                   screenshot: tuple[str, bytes] | None = None,
                   kind: str = "feedback") -> bytes:
@@ -190,8 +200,12 @@ def build_package(conn, tenant_id: str, number: str, message: str,
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr(f"{number}/feedback.md", "\n".join(md))
+        bundle = doctor.bundle(tenant_id)
+        with_logs = _single_tenant_instance()
+        if with_logs:
+            bundle["redacted"] = f"{bundle['redacted']} {LOGS_NOTE}"
         z.writestr(f"{number}/doctor-bundle.json",
-                   json.dumps(doctor.bundle(tenant_id), indent=2, default=str))
+                   json.dumps(bundle, indent=2, default=str))
         # The log ring is process-wide, so on a MULTI-TENANT box it carries
         # other households' log lines (emails, ids, error payloads) — PII
         # not tenant-scoped even though secret SHAPES are redacted.
@@ -203,7 +217,7 @@ def build_package(conn, tenant_id: str, number: str, message: str,
         # on what actually matters: the real tenant count. Unknown (query
         # fails) is treated as multi — withholding logs degrades a support
         # bundle, leaking them exposes another household.
-        if _single_tenant_instance():
+        if with_logs:
             z.writestr(f"{number}/app-logs.txt", recent_logs())
         if screenshot:
             name, data = screenshot

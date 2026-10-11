@@ -233,9 +233,14 @@ def claim_matured(conn, user_id) -> str | None:
     return str(row["id"]) if row else None
 
 
-def clear_second_factor(conn, user_id) -> dict:
+def clear_second_factor(conn, user_id, expect_members=None) -> dict:
     """The operator door: void every factor and every foothold, keep the
-    password. Returns what was removed so the audit row can say it.
+    password. Returns what was removed so the audit row can say it —
+    `members` is the household logins the eviction itself deleted (an
+    owner's recovery removes those who joined through its recent invites),
+    never a before/after roster diff, which would also count anyone who
+    left or joined meanwhile. `expect_members`: see
+    `reset.revoke_everything`.
 
     Uses the same eviction as a password reset — `reset.revoke_everything`
     — because the reasoning is the same: a factor that survives is a
@@ -250,11 +255,13 @@ def clear_second_factor(conn, user_id) -> dict:
     if before is None:
         raise LookupError("no such user")
     with conn.transaction():
-        reset_mod.revoke_everything(conn, user_id)
+        members = reset_mod.revoke_everything(
+            conn, user_id, expect_members=expect_members)
     reset_mod.drop_recovery_codes(user_id)
     # a pending cooling-off request is moot once the operator has cleared
     # the factors by hand — leaving it live would let it land later, after
     # the person had already re-enrolled
     cancel_for_user(conn, user_id, reason="operator")
     return {"totp": bool(before["totp"]), "passkeys": int(before["passkeys"]),
-            "sessions": int(before["sessions"])}
+            "sessions": int(before["sessions"]),
+            "members": sorted(m["email"] for m in members)}

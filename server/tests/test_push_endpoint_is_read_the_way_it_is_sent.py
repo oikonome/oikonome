@@ -72,6 +72,39 @@ class SubscribeAndSendTests(unittest.TestCase):
     def setUp(self):
         from oikonome.web import security
         security._limiter._hits.clear()
+        # The instance signing key is a singleton in the shared test
+        # database; a suite that ran with a master key leaves it encrypted
+        # under a key this module never sees. Start each test without one
+        # (and without a master key) so the outcome does not depend on
+        # which suites ran first.
+        self._prev_mk = os.environ.pop("OIKONOME_MASTER_KEY", None)
+        admin = tenancy.admin_connect()
+        try:
+            admin.execute("DELETE FROM push_vapid")
+        finally:
+            admin.close()
+
+    def tearDown(self):
+        if self._prev_mk is not None:
+            os.environ["OIKONOME_MASTER_KEY"] = self._prev_mk
+
+    def _tenant_with_subscription(self, endpoint):
+        email = f"pushep-{uuid.uuid4().hex[:10]}@example.dev"
+        admin = tenancy.admin_connect()
+        try:
+            tid = tenancy.create_tenant(admin, email)
+            from oikonome.auth import passwords
+            uid = admin.execute(
+                "INSERT INTO users (tenant_id, email, password_hash) "
+                "VALUES (%s, %s, %s) RETURNING id",
+                (tid, email, passwords.hash_password(PW))).fetchone()["id"]
+            admin.execute(
+                "INSERT INTO push_subscriptions (user_id, tenant_id, "
+                "endpoint, p256dh, auth) VALUES (%s, %s, %s, 'k', 'a')",
+                (uid, tid, endpoint))
+        finally:
+            admin.close()
+        return tid
 
     def test_subscribe_refuses_a_smuggled_endpoint(self):
         c = TestClient(self.app)
@@ -84,22 +117,74 @@ class SubscribeAndSendTests(unittest.TestCase):
 
     def test_a_stored_smuggled_endpoint_is_never_posted_to(self):
         from oikonome.notify import push
-        email = f"pushep-{uuid.uuid4().hex[:10]}@example.dev"
+        ep = SMUGGLED[0] + uuid.uuid4().hex
+        tid = self._tenant_with_subscription(ep)
+        conn = tenancy.control_connect()
+        try:
+            with mock.patch("pywebpush.webpush") as wp, \
+                    mock.patch.object(push, "available", return_value=True):
+                self.assertEqual(push.send_tenant(conn, str(tid), "t", "b"),
+                                 0)
+            wp.assert_not_called()
+            dead = conn.execute(
+                "SELECT dead_at FROM push_subscriptions WHERE endpoint=%s",
+                (ep,)).fetchone()["dead_at"]
+            self.assertIsNotNone(dead)
+        finally:
+            conn.close()
+
+    def _store_key_under_a_master_key_we_no_longer_have(self):
+        """The instance signing key as the startup sweep leaves it, then
+        the master key removed: a ciphertext nobody here can read."""
+        from cryptography.fernet import Fernet
+
+        from oikonome.db import crypto
+        from oikonome.notify import push
+        os.environ["OIKONOME_MASTER_KEY"] = Fernet.generate_key().decode()
+        try:
+            priv, pub = push._generate_keypair()
+            stored = crypto.encrypt_cp(priv)
+        finally:
+            del os.environ["OIKONOME_MASTER_KEY"]
         admin = tenancy.admin_connect()
         try:
-            tid = tenancy.create_tenant(admin, email)
-            from oikonome.auth import passwords
-            uid = admin.execute(
-                "INSERT INTO users (tenant_id, email, password_hash) "
-                "VALUES (%s, %s, %s) RETURNING id",
-                (tid, email, passwords.hash_password(PW))).fetchone()["id"]
-            ep = SMUGGLED[0] + uuid.uuid4().hex
-            admin.execute(
-                "INSERT INTO push_subscriptions (user_id, tenant_id, "
-                "endpoint, p256dh, auth) VALUES (%s, %s, %s, 'k', 'a')",
-                (uid, tid, ep))
+            admin.execute("INSERT INTO push_vapid (id, private_key, "
+                          "public_key) VALUES (1, %s, %s)", (stored, pub))
         finally:
             admin.close()
+        return stored
+
+    def test_an_unreadable_signing_key_skips_web_push_without_raising(self):
+        """A key encrypted under a master key the process no longer has
+        must not crash the send (the caller's other channels share its
+        try block), must be named in the log, and must be left in place —
+        every existing browser subscription is bound to it."""
+        from oikonome.notify import push
+        stored = self._store_key_under_a_master_key_we_no_longer_have()
+        tid = self._tenant_with_subscription(GENUINE[0] + uuid.uuid4().hex)
+        conn = tenancy.control_connect()
+        try:
+            with mock.patch("pywebpush.webpush") as wp, \
+                    mock.patch.object(push, "available", return_value=True), \
+                    self.assertLogs(push.log, "ERROR") as logs:
+                self.assertEqual(push.send_tenant(conn, str(tid), "t", "b"),
+                                 0)
+            wp.assert_not_called()
+            self.assertIn("OIKONOME_MASTER_KEY", "\n".join(logs.output))
+            row = conn.execute("SELECT private_key FROM push_vapid "
+                               "WHERE id=1").fetchone()
+            self.assertEqual(row["private_key"], stored)
+        finally:
+            conn.close()
+
+    def test_a_smuggled_endpoint_is_retired_even_when_the_key_is_unreadable(
+            self):
+        """Retiring a disallowed row needs no signing key, so it happens
+        whatever state the key is in."""
+        from oikonome.notify import push
+        self._store_key_under_a_master_key_we_no_longer_have()
+        ep = SMUGGLED[0] + uuid.uuid4().hex
+        tid = self._tenant_with_subscription(ep)
         conn = tenancy.control_connect()
         try:
             with mock.patch("pywebpush.webpush") as wp, \

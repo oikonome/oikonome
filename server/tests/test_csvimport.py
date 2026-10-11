@@ -171,5 +171,167 @@ class CsvImportTests(unittest.TestCase):
         self.assertEqual(row["amount"], 42.50)   # kept as-is
 
 
+class DebitCreditColumnSignTests(unittest.TestCase):
+    """With separate Debit and Credit columns the column decides the
+    direction; a sign printed inside the column must not flip the row."""
+
+    MAPPING = {"date": "Date", "name": "Description",
+               "debit": "Debit", "credit": "Credit"}
+
+    def setUp(self):
+        self.conn = make_db()
+        write_config(self.conn)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _amounts(self):
+        return {r["name"]: r["amount"] for r in self.conn.execute(
+            "SELECT name, amount FROM transactions WHERE id LIKE 'csv:%'")}
+
+    def test_negative_credit_is_money_in(self):
+        text = ("Date,Description,Debit,Credit\n"
+                "2026-07-10,HARDWARE STORE,63.20,\n"
+                "2026-07-11,REFUND HARDWARE STORE,,-150.00\n"
+                "2026-07-12,ONLINE PAYMENT THANK YOU,,(410.00)\n")
+        csvimport.import_csv(self.conn, "chk", text, self.MAPPING)
+        rows = self._amounts()
+        self.assertEqual(rows["HARDWARE STORE"], 63.20)
+        self.assertEqual(rows["REFUND HARDWARE STORE"], -150.00)
+        self.assertEqual(rows["ONLINE PAYMENT THANK YOU"], -410.00)
+
+    def test_negative_debit_is_money_out(self):
+        text = ("Date,Description,Debit,Credit\n"
+                "2026-07-10,CORNER GROCER,-27.35,\n"
+                "2026-07-11,PAYROLL DEPOSIT,,1800.00\n")
+        csvimport.import_csv(self.conn, "chk", text, self.MAPPING)
+        rows = self._amounts()
+        self.assertEqual(rows["CORNER GROCER"], 27.35)
+        self.assertEqual(rows["PAYROLL DEPOSIT"], -1800.00)
+
+
+class ReimportAfterTheColumnSignRuleTests(unittest.TestCase):
+    """A Debit/Credit file imported while a sign printed inside a column
+    still flipped the row (amount = debit - credit) holds rows under ids
+    hashed from that sign. Importing it again must correct those rows in
+    place, under the new id, carrying what a person put on them — never
+    add the corrected row beside the old one, which counts the money once
+    each way."""
+
+    MAPPING = {"date": "Date", "name": "Description",
+               "debit": "Debit", "credit": "Credit"}
+    TEXT = ("Date,Description,Debit,Credit\n"
+            "2026-07-10,HARDWARE STORE,60.00,\n"
+            "2026-07-11,REFUND HARDWARE STORE,,-150.00\n"
+            "2026-07-12,CORNER GROCER,-30.00,\n")
+    # the old rule's reading of each line, in file order
+    OLD = ((dt.date(2026, 7, 10), 60.00, "HARDWARE STORE"),
+           (dt.date(2026, 7, 11), 150.00, "REFUND HARDWARE STORE"),
+           (dt.date(2026, 7, 12), -30.00, "CORNER GROCER"))
+    NEW = (60.00, -150.00, 30.00)
+
+    def setUp(self):
+        self.conn = make_db()
+        write_config(self.conn)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _ids(self):
+        from oikonome.sync.base import FileImportIds
+        new, old = FileImportIds("csv", "chk"), FileImportIds("csv", "chk")
+        return ([new.id_for(d, a, n) for (d, _, n), a
+                 in zip(self.OLD, self.NEW)],
+                [old.id_for(d, a, n) for d, a, n in self.OLD])
+
+    def _store_the_old_reading(self, *, keep_new_too=False):
+        """Rows as the earlier rule stored them: the refund and the
+        grocer under their old-sign ids and amounts."""
+        csvimport.import_csv(self.conn, "chk", self.TEXT, self.MAPPING)
+        new, old = self._ids()
+        for i in (1, 2):
+            amount = self.OLD[i][1]
+            if keep_new_too:
+                self.conn.execute(
+                    "INSERT INTO transactions (id, account_id, date, amount,"
+                    " name, merchant_name, removed, raw)"
+                    " SELECT %s, account_id, date, %s, name, merchant_name,"
+                    "        0, raw FROM transactions WHERE id = %s",
+                    (old[i], amount, new[i]))
+            else:
+                self.conn.execute(
+                    "UPDATE transactions SET id=%s, amount=%s WHERE id=%s",
+                    (old[i], amount, new[i]))
+            self.conn.execute(
+                "INSERT INTO transaction_notes (txn_id, note) VALUES (%s,%s)",
+                (old[i], f"note {i}"))
+        return new, old
+
+    def _live(self):
+        return sorted((r["name"], float(r["amount"])) for r in
+                      self.conn.execute(
+                          "SELECT name, amount FROM transactions"
+                          " WHERE account_id='chk' AND removed=0"))
+
+    def test_reimport_corrects_a_row_stored_under_the_printed_sign(self):
+        new, old = self._store_the_old_reading()
+        r = csvimport.import_csv(self.conn, "chk", self.TEXT, self.MAPPING)
+        self.assertEqual(self._live(), [("CORNER GROCER", 30.0),
+                                        ("HARDWARE STORE", 60.0),
+                                        ("REFUND HARDWARE STORE", -150.0)])
+        self.assertEqual(r["corrected"], 2)
+        have = {x["id"] for x in self.conn.execute(
+            "SELECT id FROM transactions WHERE account_id='chk'")}
+        self.assertEqual(have, set(new))
+        notes = {x["txn_id"]: x["note"] for x in self.conn.execute(
+            "SELECT txn_id, note FROM transaction_notes")}
+        self.assertEqual(notes, {new[1]: "note 1", new[2]: "note 2"})
+
+    def test_reimport_retires_an_opposite_signed_twin_of_the_same_cells(self):
+        new, old = self._store_the_old_reading(keep_new_too=True)
+        csvimport.import_csv(self.conn, "chk", self.TEXT, self.MAPPING)
+        self.assertEqual(self._live(), [("CORNER GROCER", 30.0),
+                                        ("HARDWARE STORE", 60.0),
+                                        ("REFUND HARDWARE STORE", -150.0)])
+        gone = self.conn.execute(
+            "SELECT removed, retired_at FROM transactions WHERE id=%s",
+            (old[1],)).fetchone()
+        self.assertEqual(gone["removed"], 1)
+        self.assertIsNotNone(gone["retired_at"])
+        notes = {x["txn_id"]: x["note"] for x in self.conn.execute(
+            "SELECT txn_id, note FROM transaction_notes")}
+        self.assertEqual(notes.get(new[1]), "note 1")
+
+    def test_corrected_row_frees_its_old_id_for_a_real_charge(self):
+        self._store_the_old_reading()
+        csvimport.import_csv(self.conn, "chk", self.TEXT, self.MAPPING)
+        # a later file holds a real charge of the same amount, the same day
+        csvimport.import_csv(
+            self.conn, "chk",
+            "Date,Description,Debit,Credit\n"
+            "2026-07-11,REFUND HARDWARE STORE,150.00,\n", self.MAPPING)
+        refunds = sorted(a for n, a in self._live()
+                         if n == "REFUND HARDWARE STORE")
+        self.assertEqual(refunds, [-150.0, 150.0])
+
+    def test_a_different_line_at_the_old_rule_id_is_never_taken(self):
+        # the old-rule id of the refund is the id of a real debit of the
+        # same amount, stored from another file's Debit cell
+        csvimport.import_csv(
+            self.conn, "chk",
+            "Date,Description,Debit,Credit\n"
+            "2026-07-11,REFUND HARDWARE STORE,150.00,\n", self.MAPPING)
+        csvimport.import_csv(self.conn, "chk", self.TEXT, self.MAPPING)
+        refunds = sorted(a for n, a in self._live()
+                         if n == "REFUND HARDWARE STORE")
+        self.assertEqual(refunds, [-150.0, 150.0])
+
+    def test_reimport_of_a_file_the_sign_rule_never_changed_is_idempotent(self):
+        csvimport.import_csv(self.conn, "chk", self.TEXT, self.MAPPING)
+        r = csvimport.import_csv(self.conn, "chk", self.TEXT, self.MAPPING)
+        self.assertEqual(r["corrected"], 0)
+        self.assertEqual(len(self._live()), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

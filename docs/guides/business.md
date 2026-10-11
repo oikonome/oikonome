@@ -30,9 +30,15 @@ prop, S-corp), state, EIN, formation date, and the date it began
 operating. The **EIN is encrypted at rest** — only its last four digits
 are ever shown back. You can run more than one entity. Under its
 **Settings** tab you can also list **members** (name, ownership %,
-manager), and under **Tax** set an **income-tax rate %** and
+manager, and **this is us** on the member this household is — the
+estimated tax and the capital account then also show that member's
+share, by their ownership %; the mark applies once every member has a
+share and the shares total 100%, and a business has at most one such
+member), and under **Tax** set an **income-tax rate %** and
 **home-office sq ft** that feed the estimates below; the API additionally
-accepts a registered agent and a fiscal year end.
+accepts a registered agent and a fiscal year end (`MM-DD`). Both are
+printed in the continuity packet; the books themselves are kept by
+calendar year.
 
 ## Hard separation — the point
 
@@ -114,7 +120,13 @@ The **P&L** shows revenue versus categorized expenses, the equity
 summary, and a CSV export your CPA can consume. A refund from a vendor
 reduces that vendor's expense rather than counting as revenue, and the
 CSVs carry the net amounts. A charge a client or the household paid back
-through a reimbursement link counts only for what was not repaid. These figures are
+through a reimbursement link counts only for what was not repaid.
+Income and self-employment tax paid out of a business account (and a
+refund of it) is the **owner's**, not a business expense, so it stays
+off the P&L and out of the 1099 list; the P&L reports it separately as
+**estimated tax paid** toward the year (a January payment counts toward
+the year before, since the fourth estimate falls due then). Give such a
+payment a Schedule C line yourself if it really is a business tax. These figures are
 informational — Oikonome categorizes and exports; your CPA decides the
 tax treatment.
 
@@ -135,12 +147,20 @@ is known for — kept lean:
   year's estimate beside the cash that covers it and says **Covered by**
   or **Short by**. An account hidden on the Accounts page, or the second
   copy of a linked account, is left out of business cash. Measured against all business cash it answers "is the
-  money there"; nominate a **Tax reserve** account (a business checking
+  money there"; with a member marked **this is us**, the card shows your
+  share of that cash, and the payments and the rate are measured on your
+  share of the profit; nominate a **Tax reserve** account (a business checking
   or savings, under the entity's **Settings**) and it measures that
-  account instead, answering "is it ring-fenced".
-- **Year-end package** — one **Download package** button on the Tax tab
-  zips the P&L, the ledger with Schedule C lines, the balance sheet, the
-  1099 vendor totals and the mileage log for your accountant.
+  account instead, answering "is it ring-fenced". Once the business has
+  paid estimates this year, the card shows how much is **paid** and how
+  much is **still to pay**, and measures the cash against what is still
+  to pay. A prior-year balance paid in April can't be told apart from
+  that day's first estimate, so it counts as paid here.
+- **Year-end package** — pick the tax year beside the heading, then one
+  **Download package** button on the Tax tab zips the P&L, the ledger with Schedule C lines, the balance sheet, the
+  1099 vendor totals and the mileage log for your accountant. From
+  January through April the year picker opens on last year, the return
+  being filed; the 1099 list below follows the same year.
 - **Mileage** — log trips; the IRS standard rate in force on each trip's
   date turns them into a Schedule C car-expense deduction (2026 has two
   rates, 72.5¢ through June 30 and 76¢ from July 1, so a year's summary
@@ -151,9 +171,16 @@ is known for — kept lean:
 - **1099 contractors** — mark who's a contractor; anyone you paid at least
   that year's IRS reporting threshold gets flagged as needing a 1099-NEC —
   $600 for payments made through 2025, $2,000 from 2026 (the panel states
-  the figure it used). The panel lists the top payees by
-  amount; `vendors-1099.csv` inside the year-end package has every vendor
-  with its total.
+  the figure it used). Payments made by card don't count toward it: the
+  card processor reports those on a 1099-K. Everything paid from a credit
+  card counts as a card payment; from a checking account only a payment
+  the bank marks as made **in store** (a debit card at the counter) does
+  — an online or ACH payment from checking stays in the 1099 figure,
+  since that is exactly what a 1099-NEC reports. The panel lists the top
+  payees by amount, with any card payments shown beside the 1099 figure
+  ("+$X by card"); `vendors-1099.csv` inside the year-end package has
+  every vendor with **Total paid**, **Paid by card (not 1099-NEC)** and
+  **1099-NEC amount** columns.
 
 All of these are **estimates to help you set money aside and file** — not tax
 advice. Oikonome doesn't do payroll, invoicing, inventory, or sales-tax

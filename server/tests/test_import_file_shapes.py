@@ -20,7 +20,6 @@ import unittest
 from oikonome.engine import taxdocs
 from oikonome.sync import base, csvimport, pdfimport, qifimport, rowcap
 from oikonome.sync.base import Transaction
-from oikonome.web import bulk_import
 
 from .util import make_db, seed_accounts, write_config
 
@@ -206,8 +205,10 @@ class BulkDecisionTests(unittest.TestCase):
             from oikonome.db import staging
             token = staging.put(conn, "bulk", [("a.csv", b"Date,Name,Amount\n")],
                                 {})
-            out = bulk_import.run(conn, token, [None, "x", {"index": None},
-                                                {"index": "q", "action": "import"}])
+            from .bulk_job_util import submit_and_run
+            out = submit_and_run(conn, token, [None, "x", {"index": None},
+                                               {"index": "q",
+                                                "action": "import"}])
             self.assertEqual(out, [])
         finally:
             conn.close()

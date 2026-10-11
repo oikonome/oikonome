@@ -9,12 +9,25 @@ proxy that says so (below) — so a plain-HTTP LAN install still signs in.
 Or skip hand-rolling entirely: `./oikonome.sh https <domain>`
 stands up a Caddy container for you (see the quickstart).
 
+## Upload size and time limits
+
+The app takes uploads up to 64 MB (receipts, statements, a folder of
+files), and up to 512 MB on the restore door (`/api/import`, `/import`)
+for an export ZIP. A tax document read by the AI can take up to 10
+minutes before it answers. The proxy has to allow both, or the upload
+fails at the proxy with its own `413` or `504` page before the app sees
+it. Caddy has neither limit by default; nginx and Traefik need the
+settings shown below.
+
 ## Caddy (easiest)
 ```
 budget.example.com {
     reverse_proxy 127.0.0.1:8042
 }
 ```
+Caddy sets no body cap and no response timeout by default, so this is
+enough. If you add a `request_body` limit, keep it at `max_size 512MB` or
+more.
 
 ## nginx
 ```
@@ -22,6 +35,12 @@ server {
     listen 443 ssl;
     server_name budget.example.com;
     # ... your ssl_certificate lines ...
+    # nginx caps request bodies at 1 MB and waits 60 s for a reply by
+    # default; uploads need 512 MB (an export restore) and a tax document
+    # read can take up to 10 minutes
+    client_max_body_size 512m;
+    proxy_read_timeout 600s;
+    proxy_send_timeout 600s;
     location / {
         proxy_pass http://127.0.0.1:8042;
         proxy_set_header Host $host;
@@ -288,4 +307,15 @@ labels:
   # 8080 is the port INSIDE the container (traefik talks to the container
   # directly, not the published host port)
   - traefik.http.services.oikonome.loadbalancer.server.port=8080
+```
+Traefik sets no body cap unless you add a `buffering` middleware (keep its
+`maxRequestBodyBytes` at 536870912 or more). Its entrypoint read timeout
+is 60 s by default in v3, which a large restore over a slow link can
+outlast; raise it in the static configuration:
+```yaml
+entryPoints:
+  websecure:
+    transport:
+      respondingTimeouts:
+        readTimeout: 600s
 ```

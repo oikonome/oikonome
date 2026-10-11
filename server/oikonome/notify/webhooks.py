@@ -36,6 +36,7 @@ on a hosted instance a webhook cannot point at the box's own network.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import functools
 import hashlib
@@ -632,12 +633,19 @@ def _claim(conn, now: dt.datetime, limit: int) -> list:
     a pass that starts while this one is still sending (the next minute's
     cron, a second worker) finds none of them due; SKIP LOCKED keeps two
     claims racing inside one instant off the same row. `due_at` is when
-    the row was due, for handing back the ones this pass does not try."""
+    the row was due, for handing back the ones this pass does not try.
+
+    Only an active household's rows are claimed: the drain listed the
+    households when its pass began, and one suspended or put up for
+    erasure since must have nothing more carried to an outside URL. Its
+    rows stay pending, so a reactivation resumes them."""
     rows = conn.execute(
         """WITH due AS (
                SELECT d.id, d.next_attempt_at AS due_at
                  FROM webhook_deliveries d
                  JOIN webhooks w ON w.id = d.webhook_id
+                 JOIN tenants t ON t.id = d.tenant_id
+                                AND coalesce(t.status, 'active') = 'active'
                 WHERE d.state = 'pending' AND d.next_attempt_at <= %s
                   AND w.enabled
                 ORDER BY d.next_attempt_at, d.created_at
@@ -661,48 +669,87 @@ def _release(conn, rows) -> None:
             (r["due_at"], r["id"], r["attempts"]))
 
 
-def deliver_pending(conn, *, now: dt.datetime | None = None,
-                    limit: int = BATCH) -> dict:
+def deliver_pending(conn=None, *, now: dt.datetime | None = None,
+                    limit: int = BATCH, connect=None) -> dict:
     """Send every due delivery for the connection's tenant, within
     TENANT_BUDGET. Returns {sent, failed}. One attempt per row; rows are
     claimed before anything is sent, and each row's hook is read again
     just before its send, so a hook switched off mid-batch — by its owner,
-    or by the failure that crossed DISABLE_AFTER — gets nothing more."""
+    or by the failure that crossed DISABLE_AFTER — gets nothing more, and
+    neither does a household suspended or put up for erasure mid-batch
+    (its untried rows are handed back, pending).
+
+    `connect`, when given, opens a tenant connection; the pass then holds
+    one only for its database work and NONE while a receiver answers, the
+    way `ping_send` already runs. A send may take DEADLINE, a household's
+    batch TENANT_BUDGET, and the worker drains several households at once
+    from the same pool its sync, email and nightly sweeps borrow from — a
+    connection held across the sends is one those households cannot have,
+    for as long as a slow or dead receiver takes. The claim's lease keeps
+    every claimed row out of another pass between the steps. With `conn`
+    alone it is used throughout, for a caller that already holds one."""
+    if connect is None and conn is None:
+        raise TypeError("deliver_pending needs a connection or `connect`")
+
+    @contextlib.contextmanager
+    def db():
+        if connect is None:
+            yield conn
+            return
+        c = connect()
+        try:
+            yield c
+        finally:
+            c.close()
+
     now = now or dt.datetime.now(dt.timezone.utc)
     started = time.monotonic()
     # a hook the owner switched off keeps its queue (switching it back
     # on resumes it) but must not fill the batch with rows nobody will
     # send — so the filter is in the claim, not only in the loop
-    rows = _claim(conn, now, limit)
+    with db() as c:
+        rows = _claim(c, now, limit)
     out = {"sent": 0, "failed": 0}
     secrets_by_hook: dict[tuple[str, str], str] = {}
     for i, row in enumerate(rows):
         if time.monotonic() - started >= TENANT_BUDGET:
             # one slow receiver must not keep the pass on this household;
             # the rest go to the next pass, due as they were
-            _release(conn, rows[i:])
+            with db() as c:
+                _release(c, rows[i:])
             break
-        hook = conn.execute(
-            "SELECT url, secret, enabled FROM webhooks WHERE id = %s",
-            (row["webhook_id"],)).fetchone()
-        if hook is None or not hook["enabled"]:
-            _release(conn, [row])
-            continue
-        key = (str(row["webhook_id"]), hook["secret"])
-        if key not in secrets_by_hook:
-            try:
-                secrets_by_hook[key] = crypto.decrypt(conn, hook["secret"])
-            except Exception as e:                           # noqa: BLE001
-                # an undecryptable secret (a restore under another key)
-                # is a permanent failure for this hook
-                _settle(conn, row, False, None,
-                        f"secret unreadable: {type(e).__name__}", now)
-                out["failed"] += 1
+        with db() as c:
+            # the household's status with the hook, re-read before every
+            # post: the claimed payloads are already in memory, and a
+            # suspension or an erasure landing mid-batch (the erasure flips
+            # the status before it waits for anything) must stop the rest
+            hook = c.execute(
+                "SELECT w.url, w.secret, w.enabled, "
+                "coalesce(t.status, 'active') = 'active' AS live "
+                "FROM webhooks w JOIN tenants t ON t.id = w.tenant_id "
+                "WHERE w.id = %s", (row["webhook_id"],)).fetchone()
+            if hook is not None and not hook["live"]:
+                _release(c, rows[i:])
+                break
+            if hook is None or not hook["enabled"]:
+                _release(c, [row])
                 continue
+            key = (str(row["webhook_id"]), hook["secret"])
+            if key not in secrets_by_hook:
+                try:
+                    secrets_by_hook[key] = crypto.decrypt(c, hook["secret"])
+                except Exception as e:                       # noqa: BLE001
+                    # an undecryptable secret (a restore under another
+                    # key) is a permanent failure for this hook
+                    _settle(c, row, False, None,
+                            f"secret unreadable: {type(e).__name__}", now)
+                    out["failed"] += 1
+                    continue
         status, error = _send(hook["url"], secrets_by_hook[key],
                               row["event"], str(row["id"]), _envelope(row))
         ok = error is None
-        _settle(conn, row, ok, status, error, now)
+        with db() as c:
+            _settle(c, row, ok, status, error, now)
         out["sent" if ok else "failed"] += 1
     return out
 

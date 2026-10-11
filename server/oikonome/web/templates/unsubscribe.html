@@ -10,9 +10,9 @@
 <div class="card" style="max-width:30rem">
   {% if state == 'confirm' %}
   <p>Stop every Oikonome email to <b>{{ email }}</b>?</p>
-  <p class="sub" style="margin-top:0">That is the daily verdict, the weekly
-    report, the monthly report card, the year in review, and the household
-    alerts. Sign-in and security emails are not affected.</p>
+  <p class="sub" style="margin-top:0">That is the daily verdict, the monthly
+    report card, the year in review, and the household alerts. Sign-in and
+    security emails are not affected.</p>
   <form method="post" action="/unsubscribe" style="margin-top:1rem">
     <input type="hidden" name="token" value="{{ token }}">
     <button class="pri" name="answer" value="unsubscribe">Unsubscribe

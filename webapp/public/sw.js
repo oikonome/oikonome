@@ -18,10 +18,16 @@ self.addEventListener("push", (event) => {
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   const url = (event.notification.data && event.notification.data.url) || "/app/";
+  // An open tab is reused, but a push that names a page (an alert, a
+  // report's period) must still land there — focusing alone would leave
+  // the person wherever the tab already was. navigate() is refused for a
+  // tab this worker does not control; that tab is then just focused.
   event.waitUntil(clients.matchAll({ type: "window", includeUncontrolled: true })
     .then((tabs) => {
       for (const t of tabs)
-        if (t.url.includes("/app") && "focus" in t) return t.focus();
+        if (t.url.includes("/app") && "focus" in t)
+          return t.focus().then((c) => url === "/app/" || !c.navigate ? c
+            : c.navigate(url).catch(() => c));
       return clients.openWindow(url);
     }));
 });

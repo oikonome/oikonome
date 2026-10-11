@@ -125,7 +125,8 @@ same rows its tile does.
 Every category and bill name on Today — the Food / Everything else
 tiles, the money map's rows, the Why's category lines, the pinned bills
 — opens the rows behind its number: the category's transactions for
-this month, or the bill's history. Plain text at rest, a button on hover
+this month, or the bill's history. The money map's **Bills** row opens
+the month's bill payments and envelope swipes. Plain text at rest, a button on hover
 or a press on the phone.
 
 ## The plan, in one line
@@ -137,6 +138,12 @@ carve-outs, the savings plan). The "saved" step appears only when you
 have a fixed savings plan; a sweep-mode goal sits beside the chain as
 its own short sentence ("sweep up to $X — $Y available so far this
 month").
+
+In detail mode the **Savings goals** card — on the page, in the app and
+in the daily email's detail face — shows each goal's progress and pace.
+A goal with no account is a plan only and shows just its plan; one with
+match words but no account says "match words need an account — pick one
+on the Budget page", because without an account it cannot be measured.
 
 ## Monthly budget
 
@@ -205,8 +212,9 @@ bar. The wider size adds the per-bucket chips. Tap it to open Today.
   page or the daily email.
 - **Refreshes on the phone's clock** — about every half hour, and again
   whenever you open the app. When the last refresh is more than an hour
-  old the widget turns grey and shows the time it was fetched, rather
-  than a verdict that may no longer hold.
+  old, or was fetched before today began, the widget turns grey and
+  shows the time it was fetched, rather than a verdict that may no
+  longer hold.
 - **Its own credential.** The widget never touches the token behind
   your biometric lock. It gets a lesser one that can read only this
   glance (no balances, no transactions, no account names) and that dies

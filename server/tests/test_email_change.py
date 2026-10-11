@@ -75,6 +75,29 @@ class EmailChangeTests(unittest.TestCase):
                    data={"new_email": "x@y.dev", "password": "nope-nope-nope"})
         self.assertEqual(r.status_code, 401)
 
+    def test_changing_to_an_address_keeps_its_spam_complaint(self):
+        """Renaming a login to an address someone complained from must not
+        erase the complaint; only a bounce record is stale enough to drop."""
+        from oikonome.notify import delivery
+        c, _ = self._fresh()
+        complained = f"cmp-{uuid.uuid4().hex[:8]}@example.dev"
+        bounced = f"bnc-{uuid.uuid4().hex[:8]}@example.dev"
+        delivery.record_failure(complained, state="complained",
+                                bounce_type="SpamComplaint")
+        delivery.record_failure(bounced, state="bouncing",
+                                bounce_type="HardBounce")
+        r = c.post("/api/email/change",
+                   data={"new_email": complained, "password": PW})
+        self.assertEqual(r.status_code, 200, r.text)
+        row = delivery.state_for(complained)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["state"], "complained")
+        c2, _ = self._fresh()
+        r = c2.post("/api/email/change",
+                    data={"new_email": bounced, "password": PW})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIsNone(delivery.state_for(bounced))
+
     def test_taken_email_409(self):
         c1, taken = self._fresh()
         c2, _ = self._fresh()

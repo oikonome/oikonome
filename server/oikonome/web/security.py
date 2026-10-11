@@ -171,6 +171,10 @@ UPLOAD_BODY_LIMIT = 64 * 1024 * 1024   # multipart: MAX_UPLOAD (50MB) + headroom
 # let each receipt door spool 500 MB per request.
 RESTORE_BODY_LIMIT = 512 * 1024 * 1024
 RESTORE_PATHS = frozenset({"/import", "/api/import"})
+# A folder analyze is NOT widened: its handler holds every file of the
+# batch in memory while staging it, so the upload ceiling is the batch
+# limit (bulk_import.MAX_BATCH_BYTES sits just under it).
+BULK_ANALYZE_PATH = "/api/import/bulk/analyze"
 
 
 def _is_upload(content_type: str) -> bool:
@@ -536,6 +540,14 @@ class BodySizeLimitMiddleware:
     async def _too_large(self, scope, send, limit):
         _sec_event("body_too_large", "-", path=scope.get("path"), limit=limit)
         body = b'{"detail":"request body too large"}'
+        if scope.get("path") == BULK_ANALYZE_PATH:
+            # A folder is one body, so its size is the batch's: say what to
+            # do about it rather than the generic refusal.
+            # The edge cannot see the file names, so it names the restore
+            # door too: a single export ZIP this large belongs there.
+            from .bulk_import import BATCH_TOO_LARGE, RESTORE_DOOR
+            body = json.dumps({"detail": BATCH_TOO_LARGE,
+                               "restore_door": RESTORE_DOOR}).encode()
         await send({"type": "http.response.start", "status": 413,
                     "headers": [(b"content-type", b"application/json"),
                                 (b"content-length",
@@ -733,6 +745,30 @@ class RateLimiter:
     def clear(self, key: tuple) -> None:
         with self._lock:
             self._hits.pop(key, None)
+
+    def reserve(self, key: tuple, limit: int, window_s: float):
+        """`check` that hands back the entry it added (a token for
+        `release`), or False when over the limit."""
+        now = time.monotonic()
+        with self._lock:
+            q = self._bucket(key, window_s, now)
+            while q and q[0] < now - window_s:
+                q.popleft()
+            if len(q) >= limit:
+                return False
+            q.append(now)
+            return now
+
+    def release(self, key: tuple, token) -> None:
+        """Take back one entry `reserve` added."""
+        with self._lock:
+            q = self._hits.get(key)
+            if q is None:
+                return
+            try:
+                q.remove(token)
+            except ValueError:
+                pass
 
     # temporary hard-block primitives (auto-ban) — a marker with its own TTL,
     # independent of the sliding-window buckets above.
@@ -1004,6 +1040,27 @@ class RedisRateLimiter:
             return True
         except redis.RedisError:
             return None
+
+    def reserve(self, key: tuple, limit: int, window_s: float):
+        """`check` that hands back the member it added (a token for
+        `release`), False when over the limit, None when unreachable."""
+        import redis
+        now = time.time()
+        member = f"{now:.6f}:{os.urandom(4).hex()}"
+        try:
+            ok = self._r.eval(_WINDOW_SCRIPT, 1, self._k(key),
+                              now - window_s, limit, now,
+                              int(window_s) + 1, member)
+        except redis.RedisError:
+            return None
+        return member if ok else False
+
+    def release(self, key: tuple, token) -> None:
+        import redis
+        try:
+            self._r.zrem(self._k(key), token)
+        except redis.RedisError:
+            pass
 
     # hard-block marker with a native key TTL (own namespace so it can't
     # collide with the sliding-window sorted sets).
@@ -1346,6 +1403,36 @@ def clear_login_failures(email: str) -> None:
     _dual_clear("clear", key)
 
 
+def reserve_login_guess(email: str):
+    """Spend one of this account's second-factor guesses BEFORE the guess
+    is verified at a door outside any session (sign-in, the coded reset);
+    None when none are left. The same reasoning as
+    `reserve_step_up_guess`: checking the lock and adding the miss only
+    after the slow verify lets a concurrent burst of wrong codes all be
+    verified. A right answer hands the slot back through
+    `release_login_guess`; a wrong one keeps it, and that kept slot IS the
+    recorded failure."""
+    return _reserve_guess(_acct_key(email), _ACCT_FAIL_MAX,
+                          _ACCT_FAIL_WINDOW)
+
+
+def release_login_guess(slot) -> None:
+    """Give back a slot `reserve_login_guess` took."""
+    release_step_up_guess(slot)
+
+
+def _reserve_guess(key: tuple, limit: int, window_s: float):
+    """One slot of a guess budget, taken atomically: a (store, key, token)
+    to release, or None when the budget is spent."""
+    store = _shared_store()
+    if store is not None:
+        token = store.reserve(key, limit, window_s)
+        if token is not None:
+            return (store, key, token) if token is not False else None
+    token = _limiter.reserve(key, limit, window_s)
+    return (_limiter, key, token) if token is not False else None
+
+
 # ---- session-scoped step-up lock --------------------------------------------
 # The posture doors a signed-in session reaches — elevation, re-binding the
 # authenticator, the per-request legacy step-up, the passkey precheck —
@@ -1383,6 +1470,28 @@ def step_up_locked(user_id) -> bool:
 
 def record_step_up_failure(user_id) -> None:
     _dual("add", _step_up_key(user_id), _STEP_UP_FAIL_WINDOW)
+
+
+def reserve_step_up_guess(user_id):
+    """Spend one of this credential's step-up guesses BEFORE the guess is
+    verified; None when none are left.
+
+    Counting a miss only after the (slow) verify is check-then-act: a burst
+    of concurrent wrong guesses all read a count under the limit before any
+    of them adds to it, so every one of them is verified. Taking the slot
+    first, with the same atomic sliding-window step `limit` uses, means at
+    most the limit can be in flight or spent. A right answer hands its slot
+    back through `release_step_up_guess`; a wrong one simply keeps it."""
+    return _reserve_guess(_step_up_key(user_id), _STEP_UP_FAIL_MAX,
+                          _STEP_UP_FAIL_WINDOW)
+
+
+def release_step_up_guess(slot) -> None:
+    """Give back a slot `reserve_step_up_guess` took — the guess was right,
+    or it was no guess at all."""
+    if slot is not None:
+        store, key, token = slot
+        store.release(key, token)
 
 
 # ---- risk signal for the human check (risk-based gating) -----------

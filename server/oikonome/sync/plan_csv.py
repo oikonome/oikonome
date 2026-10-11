@@ -39,10 +39,11 @@ import datetime as dt
 import hashlib
 import io
 import json
+import math
 import re
 from collections import defaultdict
 
-from ..engine.compat import as_date, jsonb
+from ..engine.compat import MAX_AMOUNT, as_date, jsonb, strip_nul
 from . import heartbeat
 from .base import MERCHANT_NAME_ON_CONFLICT
 
@@ -136,11 +137,25 @@ def _ensure_item_account(conn, provider: str, institution: str, plan: str,
     return aid
 
 
-def _num(x):
+# Share counts past this are no real plan position; bounding them (with
+# amounts and prices held to MAX_AMOUNT) keeps shares × price finite, so a
+# holdings value or balance can never become Infinity — which no API
+# response can serialize.
+MAX_SHARES = 1e9
+
+
+def _num(x, limit: float = MAX_AMOUNT):
+    """A cell as a number; None when empty or not a number. A number that
+    is not finite or exceeds `limit` refuses the whole CSV (ValueError →
+    400): this door writes its own INSERTs, so it holds the same bound
+    the shared transaction funnel enforces."""
     try:
-        return float(str(x).replace(",", "").strip())
+        v = float(str(x).replace(",", "").strip())
     except (ValueError, TypeError):
         return None
+    if not math.isfinite(v) or abs(v) > limit:
+        raise ValueError(f"value out of range: {str(x).strip()[:32]!r}")
+    return v
 
 
 def _parse(text: str) -> list[dict]:
@@ -167,7 +182,7 @@ def _parse(text: str) -> list[dict]:
             "symbol": (cell.get("symbol") or "").strip(),
             "type": (cell.get("type") or "").strip(),
             "amount": _num(cell.get("amount")), "price": _num(cell.get("price")),
-            "shares": _num(cell.get("shares")),
+            "shares": _num(cell.get("shares"), MAX_SHARES),
         })
     return rows
 
@@ -219,6 +234,10 @@ def _recompute_holdings(conn, provider: str, plan: str) -> float:
             continue
         px = last_px.get(sym, (None, None))[1]
         val = round(shares * px, 2) if px is not None else None
+        # rows stored before the bound above could still multiply past it
+        if val is not None and (not math.isfinite(val)
+                                or abs(val) > MAX_AMOUNT):
+            val = None
         if val:
             total += val
         conn.execute(
@@ -244,6 +263,8 @@ def import_csv(conn, plan: str, text: str, balance: float | None = None,
     plan can be linked to it — see _ensure_item_account. `provider` names
     the plan administrator (the item and id namespace), `institution` how
     it is shown."""
+    # U+0000 cannot be stored and means nothing in a fund or activity name
+    text = strip_nul(text)
     plan = plan.upper()
     if plan not in PLAN_CODES:
         raise ValueError(f"Unknown plan '{plan}'. Use one of {', '.join(PLAN_CODES)}")
@@ -320,7 +341,12 @@ def import_csv(conn, plan: str, text: str, balance: float | None = None,
                        category_primary=EXCLUDED.category_primary,
                category_source=EXCLUDED.category_source,
                        category_detailed=EXCLUDED.category_detailed,
-                       pending=0, removed=0, raw=EXCLUDED.raw""",
+                       pending=0,
+                       -- a re-imported row comes back unless it was
+                       -- retired by a decision (see upsert_transactions)
+                       removed=CASE WHEN transactions.retired_at IS NOT NULL
+                                    THEN 1 ELSE 0 END,
+                       raw=EXCLUDED.raw""",
                 (tid, aid, as_date(r["date"]), -amt, name, institution,
                  cat, "PLAN_" + r["type"].upper().replace(" ", "_"),
                  jsonb(r)))

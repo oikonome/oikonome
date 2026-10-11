@@ -27,6 +27,15 @@ DOORS = [
     ("post", "/tokens/revoke", "/api/tokens/revoke", {"id": str(uuid.uuid4())}),
     ("post", "/business/entities/{entity_id}/delete-forever",
      f"/api/business/entities/{_EID}/delete-forever", {"confirm": "x"}),
+    # adding, correcting or removing a business member: the shares split
+    # a multi-member estimate's profit
+    ("post", "/business/entities/{entity_id}/members",
+     f"/api/business/entities/{_EID}/members",
+     {"member_name": "x", "ownership_pct": 100, "is_manager": True}),
+    # (correcting and removing share one template, both verbs)
+    ("patch", "/business/entities/{entity_id}/members/{member_id}",
+     f"/api/business/entities/{_EID}/members/{uuid.uuid4()}",
+     {"member_name": "x"}),
     ("get", "/import/enrich", "/api/import/enrich", None),
     ("post", "/import/enrich", "/api/import/enrich", {"limit": 10}),
     ("post", "/notify/phone", "/api/notify/phone", {"number": "+15555550100"}),

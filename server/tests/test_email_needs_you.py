@@ -296,6 +296,70 @@ class RouteTests(_Routes):
         r = self.client.post("/act", data={"token": tok})
         self.assertIn("already", r.text.lower())
 
+    def test_a_tap_racing_an_in_app_edit_never_overwrites_it(self):
+        """The tap checks the charge is still uncategorized, then files it.
+        A person filing the same charge in the app between the two is the
+        later decision: it must be what the charge ends up under."""
+        import threading
+        tok = mailact.parse(self._tok(self.owner, "cat", self.txn,
+                                      "FOOD_AND_DRINK"))
+        real = mailact._cat_moot
+        done = threading.Event()
+
+        def in_app():
+            other = tenancy.tenant_connect(self.tid)
+            try:
+                from oikonome.web import data
+                data.set_category(other, self.txn, "SHOPPING", scope="one")
+            finally:
+                other.close()
+                done.set()
+
+        def moot_then_race(conn, t, r, *rest):
+            out = real(conn, t, r, *rest)
+            threading.Thread(target=in_app, daemon=True).start()
+            done.wait(1.0)            # an unserialized edit lands right here
+            return out
+        with mock.patch.object(mailact, "_cat_moot", moot_then_race):
+            mailact.apply(tok)
+        self.assertTrue(done.wait(10), "the in-app edit never finished")
+        row = self.conn.execute(
+            "SELECT category_override FROM transactions WHERE id=%s",
+            (self.txn,)).fetchone()
+        self.assertEqual(row["category_override"], "SHOPPING")
+
+    def test_a_tap_on_a_settled_hold_files_the_posted_charge(self):
+        """A mailed pending hold that has since posted is filed through its
+        posted row, as the in-app door does, not answered 'unknown'."""
+        self.conn.execute("UPDATE transactions SET pending=1 WHERE id=%s",
+                          (self.txn,))
+        post = add_txn(self.conn, TODAY, 21.00, "CORNER STAND", primary=None,
+                       txn_id=f"p-{uuid.uuid4().hex[:8]}")
+        self.conn.execute(
+            "UPDATE transactions SET raw = jsonb_build_object("
+            "'pending_transaction_id', %s::text) WHERE id=%s",
+            (self.txn, post))
+        self.conn.execute("UPDATE transactions SET removed=1 WHERE id=%s",
+                          (self.txn,))
+        tok = mailact.parse(self._tok(self.owner, "cat", self.txn,
+                                      "FOOD_AND_DRINK"))
+        self.assertEqual(mailact.describe(tok)["state"], "confirm")
+        self.assertEqual(mailact.apply(tok)["state"], "done")
+        row = self.conn.execute(
+            "SELECT category_override FROM transactions WHERE id=%s",
+            (post,)).fetchone()
+        self.assertEqual(row["category_override"], "FOOD_AND_DRINK")
+
+    def test_a_tap_after_an_in_app_edit_says_so(self):
+        from oikonome.web import data
+        data.set_category(self.conn, self.txn, "SHOPPING", scope="one")
+        out = mailact.apply(mailact.parse(self._tok(
+            self.owner, "cat", self.txn, "FOOD_AND_DRINK")))
+        self.assertEqual(out["state"], "already")
+        self.assertEqual(self.conn.execute(
+            "SELECT category FROM manual_categories WHERE transaction_id=%s",
+            (self.txn,)).fetchone()["category"], "SHOPPING")
+
     def test_post_mutes_the_alert(self):
         a = self._alert()
         tok = self._tok(self.owner, "mute", a["kind"], a["message"])

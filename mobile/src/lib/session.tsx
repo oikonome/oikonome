@@ -15,16 +15,30 @@ import { router } from "expo-router";
 import { ext } from "../ext";
 import { createContext, useCallback, useContext, useEffect, useMemo,
          useRef, useState } from "react";
-import { Alert, AppState, Platform } from "react-native";
+import { Alert, AppState, Platform, TurboModuleRegistry,
+         type TurboModule } from "react-native";
 
 import { Client, makeClient, PINNED_SERVER_URL, revokeDeviceToken,
          SHARE_GRACE_S, sweepDownloads } from "./api";
 import { lockQueryCache, unlockQueryCache, wipeQueryCache, warmQueryStore } from "./query";
+import { queueUnrevoked } from "./pure";
 import { canBindTokenToBiometrics, clearCredentials, loadCredentialShape,
          loadGateOff, loadCaptureAllowed, saveCaptureAllowed, readBioToken, readPlainToken, saveGateOff,
-         saveServerUrl, saveToken, TokenMode } from "./storage";
+         saveServerUrl, saveToken, TokenMode, loadUnrevoked,
+         updateUnrevoked } from "./storage";
 
 type Phase = "loading" | "setup" | "locked" | "ready";
+
+// The platform cookie jar the native fetch shares. The app signs in with a
+// device token, but a login's session cookie still lands there on Android
+// (plain storage in the app's data directory), so a sign-out empties it.
+function clearCookieJar() {
+  try {
+    TurboModuleRegistry.get<TurboModule & {
+      clearCookies?: (cb: (ok: boolean) => void) => void }>("Networking")
+      ?.clearCookies?.(() => {});
+  } catch { /* no jar to clear */ }
+}
 
 // Iteration escape hatch: EXPO_PUBLIC_SKIP_LOCK=1 at BUILD time skips the
 // biometric gate. The value is inlined when the bundle is built — a store
@@ -75,6 +89,10 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     // exports, dumps, receipts and the connections bundle left in the
     // cache for the share sheet belong to the account that just left
     await sweepDownloads(0);
+    clearCookieJar();
+    // receipt thumbnails and bank and merchant logos the image view kept
+    import("expo-image").then(({ Image }) => Promise.all([
+      Image.clearDiskCache(), Image.clearMemoryCache()])).catch(() => {});
     tokenMode.current = null;
     setToken(null);
     setPhase("setup");
@@ -93,10 +111,32 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     setPhase("ready");
   }, []);
 
+  // A sign-out whose revoke never reached the server left its device
+  // token live there; try those again until each lands. Run at launch and
+  // whenever the app comes back to the front.
+  const revoking = useRef(false);
+  const retryRevokes = useCallback(async () => {
+    if (revoking.current) return;
+    revoking.current = true;
+    try {
+      const list = await loadUnrevoked();
+      if (!list.length) return;
+      const done = new Set<string>();
+      for (const x of list)
+        if (await revokeDeviceToken(x.url, x.token)) done.add(x.token);
+      // only what landed comes off: a sign-out may have queued another
+      // token while these requests were out
+      await updateUnrevoked((cur) => queueUnrevoked(
+        cur.filter((x) => !done.has(x.token)), null, Date.now()));
+    } catch { /* the next launch tries again */ }
+    finally { revoking.current = false; }
+  }, []);
+
   useEffect(() => {
     // the last session's final download was never swept by a next one —
     // clear it now that its share has long been read
     void sweepDownloads(SHARE_GRACE_S);
+    void retryRevokes();
     warmQueryStore();
     (async () => {
       const [{ serverUrl: u, tokenMode: mode }, off, capOk] =
@@ -129,7 +169,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
         setPhase("locked");
       }
     })();
-  }, [credentialsLost, goReady]);
+  }, [credentialsLost, goReady, retryRevokes]);
 
   // Leaving the app re-arms the gate — but the decision is made on
   // RETURN, from time spent away, never on the background event itself.
@@ -145,6 +185,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     const sub = AppState.addEventListener("change", (st) => {
       if (st === "background") backgroundAt.current = Date.now();
       if (st === "active") {
+        void retryRevokes();
         const away = backgroundAt.current
           ? Date.now() - backgroundAt.current : 0;
         backgroundAt.current = null;
@@ -154,7 +195,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
       }
     });
     return () => sub.remove();
-  }, []);
+  }, [retryRevokes]);
 
   // locking drops the bearer from JS and freezes the cache (the thaw is
   // the other way round — it runs before "ready", see goReady)
@@ -211,11 +252,29 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     await goReady(t);
   }, [credentialsLost, goReady]);
 
+  // Lowering a local protection (the unlock gate, the screenshot block)
+  // needs the person, not just an unlocked phone in someone's hand: where
+  // the token is bound to biometrics, reading it is the proof; elsewhere
+  // the device's own check. A device with no lock method has none to ask.
+  // Raising one again needs nothing.
+  const provePresence = useCallback(async (prompt: string) => {
+    if (SKIP_LOCK) return true;
+    try {
+      if (tokenMode.current === "bio") return !!(await readBioToken());
+      const level = await LocalAuthentication.getEnrolledLevelAsync();
+      if (level === LocalAuthentication.SecurityLevel.NONE) return true;
+      return (await LocalAuthentication.authenticateAsync(
+        { promptMessage: prompt })).success;
+    } catch { return false; }
+  }, []);
+
   // The person's gate choice. Off means the token must be readable
   // without a prompt, so it moves to the plain home; on moves it back
   // where the device allows. Only reachable from Settings, i.e. with the
   // token in memory.
   const setGateOff = useCallback(async (off: boolean) => {
+    if (off && !gateOffRef.current
+        && !(await provePresence("Turn off biometric unlock"))) return;
     await saveGateOff(off);
     setGateOffState(off);
     gateOffRef.current = off;
@@ -230,7 +289,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
         tokenMode.current = "bio";
       }
     } catch { /* the next unlock repeats the move */ }
-  }, [token]);
+  }, [token, provePresence]);
 
   // a credential change is a data boundary: cached queries from the
   // previous account must not survive into (or beside) the next one —
@@ -269,7 +328,20 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     let t = token;
     if (!t && tokenMode.current === "plain")
       t = await readPlainToken().catch(() => null);
-    if (u && t) await revokeDeviceToken(u, t);
+    if (u && t && !(await revokeDeviceToken(u, t))) {
+      // the server still honours this token and still pushes to this
+      // phone: drop the platform's push token now so nothing the old row
+      // sends can arrive. A plain-home token is kept to revoke later. A
+      // biometric-bound one is not: the retry list is readable without a
+      // prompt, so copying it there would leave a live bearer weaker than
+      // it was while signed in. It is left to expire or to be revoked from
+      // another device, like the one behind a prompt that cannot be passed.
+      if (tokenMode.current === "plain")
+        await updateUnrevoked((cur) => queueUnrevoked(cur,
+          { url: u, token: t!, at: Date.now() }, Date.now())).catch(() => {});
+      await import("./push").then(({ unregisterPushLocally }) =>
+        unregisterPushLocally()).catch(() => {});
+    }
     await credentialsLost();
   }, [credentialsLost, serverUrl, token]);
 
@@ -311,9 +383,10 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
   }, [phase, client, serverUrl]);
 
   const setCaptureAllowed = useCallback(async (ok: boolean) => {
+    if (ok && !(await provePresence("Allow screenshots"))) return;
     await saveCaptureAllowed(ok);
     setCaptureAllowedState(ok);
-  }, []);
+  }, [provePresence]);
 
   const value = useMemo(() => ({
     phase, serverUrl, client, gateOff, setGateOff, captureAllowed,

@@ -21,9 +21,45 @@ Changing the password is treated as a full credential rotation:
   again) — the device you made the change from is spared, like the
   browser session you're using.
 - **All script tokens you minted are revoked** (re-mint after).
+- **Unspent reset links and pending invitations are cancelled**, and
+  (owners only) **members your invitations brought in during the last 7
+  days are removed** — see *Household members* below.
 - **Webhooks you created are paused** — Settings shows why; switch
   yours back on once you have checked each address is one you set up.
-- Pending family invites you created are cancelled.
+- **The household's own outbound settings are paused** (owners only):
+  the mail relay saved in Settings, any extra email recipients, and the
+  AI endpoint. Until you press **These are mine — resume** on the banner
+  at the top of Settings, mail goes through the instance's own relay,
+  the paused recipients are left off every send, and the AI runs on the
+  instance's own backend. Nothing is deleted. The banner names each one,
+  so a relay or an address you don't recognise is caught there — change
+  it first, then resume. Resuming asks for your password or second
+  factor, like setting a new relay would; members and viewers see the
+  banner without the button. An emailed reset or a cleared set of
+  factors does the same. Reset and unlock emails themselves always go
+  through the instance's own relay when it has one, so a relay saved in
+  Settings never carries them.
+- **New bank links are held on your own Plaid or MX keys** (self-hosted
+  instances where the household saved its own aggregator keys; owners
+  only). Those keys decide who receives the bank login you type when you
+  link a bank, so until you confirm them, linking a new bank, signing in
+  to a bank again (re-auth) and opening the MX widget are refused with a
+  message saying why. The banks already linked keep syncing with those
+  keys — nothing about your bank feeds stops. The banner names the held
+  client (its id, environment and when it was saved). If it is yours,
+  press **These are mine — resume**. If not, disconnect the banks linked
+  through it (this releases them at that client) and remove the keys on
+  the Connections card; the hold lifts as soon as the keys are gone. Keys
+  you save after the change are yours and are not held. An emailed reset
+  or a cleared set of factors holds them the same way.
+- **Browser notifications stop in every other browser** — the browser
+  you made the change from can keep its own; turn them back on elsewhere.
+- **The household's text-message number is paused** (owners only — a
+  member's change leaves it alone). Texts stop until the number is
+  confirmed again with a fresh code; the SMS number on the Settings →
+  Email & Push card shows it as paused, where you can confirm it again or
+  remove it. A number someone else verified with a stolen session stops
+  receiving the household's summaries the moment you change the password.
 
 That's deliberate: if you're changing the password because something was
 stolen, nothing enrolled by the thief survives the change. The response
@@ -32,8 +68,13 @@ the change removed, so a passkey that stops working is never a mystery.
 
 Changing the account **email** is the same rotation: the email is your
 login identifier, so every other session, passkey, signed-in device,
-script token and pending family invite goes with it. Plan to re-add
-passkeys and sign phones back in right after.
+script token, unspent reset link, other browser's notifications and
+pending family invite goes with it, and an owner's change removes the
+members its recent invitations brought in, pauses the text-message
+number and the household's own outbound settings (the Settings mail
+relay, extra email recipients, the AI endpoint) and holds new bank links
+on the household's own Plaid or MX keys the same way. Plan to re-add passkeys
+and sign phones back in right after.
 
 ## The step-up rule
 
@@ -46,8 +87,9 @@ access to the operator, downloading the full export, database dump or
 connections bundle, restoring a connections bundle or a data archive,
 pointing the mail relay, the AI endpoint or its key somewhere new,
 letting tax documents go to a remote AI, adding a daily-email recipient,
-changing a webhook's URL or switching a webhook back on, deleting the
-account — demands proof beyond a signed-in browser. Someone who steals a signed-in tab holds the
+setting the household's text-message number, turning on notifications
+in a browser the account has not used before, changing a webhook's URL
+or switching a webhook back on, deleting the account — demands proof beyond a signed-in browser. Someone who steals a signed-in tab holds the
 cookie, not your credentials.
 
 You prove it **once**, not per change: the first protected action opens
@@ -91,6 +133,15 @@ in-place re-enroll button.
 **Turning 2FA off requires both** your password and a live code — it's a
 downgrade, so it's held to the strictest proof — and also signs out
 every other session.
+
+Turning 2FA on or off (and adding your first passkey) is a credential
+rotation too: other signed-in phones are signed out, script tokens are
+revoked, unspent reset links and pending invitations are cancelled,
+webhooks are paused, browser notifications stop, and an owner's change
+removes the members its invitations brought in during the last 7 days,
+pauses the household's text-message number until it is confirmed again,
+and pauses its outbound settings and holds new bank links on its own
+Plaid or MX keys until **These are mine — resume** is pressed.
 
 ## Recovery codes
 
@@ -275,7 +326,8 @@ A member's login is theirs, not a shared one:
   on first sign-in exactly as the owner is; membership is not a way
   around the requirement.
 - **They control their own copy of the email.** A member's Email card
-  turns *their* address on or off in the household's scheduled summaries.
+  turns *their* address on or off in the household's scheduled summaries,
+  and picks which kinds they get (Daily, Monthly, Yearly, Alerts).
   The schedule itself — the hour, the shape, who else is on it — stays
   the owner's.
 - **They can leave.** **Delete my login** removes that person's sign-in
@@ -285,6 +337,24 @@ A member's login is theirs, not a shared one:
   Either way the person comes off the household's email lists, invites
   they sent that nobody has claimed are cancelled, their script tokens
   end and the webhooks they created are paused.
+- **An owner's recovery or credential change removes members the
+  owner's recent invites created.** An emailed reset, a cleared set of
+  factors, or the owner changing the password or login email, turning an
+  authenticator on or off, or adding a first passkey, removes every
+  member or viewer who joined in the last 7 days through an invite the
+  owner sent, the same way the owner's removal does. Someone holding the
+  owner's stolen session could otherwise invite an address of their own
+  and keep a login of their own after the owner shuts them out; nothing
+  tells a routine change from one made to close a hijack, so every one
+  of these does it. The banner at the top of Settings (and the phone's
+  Security & household screen) names each one to the owner, with their
+  role and the day they joined — other members see only how many were
+  removed — the household list refreshes, and their addresses come off
+  the household's email lists, so resuming the paused settings never
+  mails them. If one of them is a person you invited, invite them again.
+  A self-hosted instance sets the window in days with
+  `OIKONOME_RECOVERY_MEMBER_WINDOW_DAYS` (`0` turns it off). A member's
+  own reset or credential change removes nobody.
 - An invite link opened in a browser where **another account is already
   signed in** offers **sign out and accept the invite**, rather than
   quietly landing in the session that was open.
@@ -372,6 +442,18 @@ before the rows go. Export your data first
   and revokes all script tokens** on purpose — plan to re-enroll and re-mint
   right after. An **email change** does exactly the same (passkeys
   included) — the address is the login identifier.
+- An owner's password, email or 2FA change also **pauses the household's
+  text messages** until the number is confirmed again. Removing a paused
+  number needs no code.
+- On a self-hosted instance with the household's own Plaid or MX keys,
+  the same changes (and an emailed reset or a cleared set of factors)
+  **hold new bank links** on those keys until the owner presses **These
+  are mine — resume** or removes the keys; existing banks keep syncing.
+- The same changes, an emailed reset and a cleared set of factors pause
+  the Settings mail relay, extra email recipients and the AI endpoint
+  until the owner presses **These are mine — resume** in Settings. Only
+  the owner can resume, and it takes a password or second factor; until
+  then those emails don't reach the paused recipients.
 - Recovery codes appear exactly once. If they're gone and TOTP is on,
   regenerate — the old set is voided the moment a new one is issued.
 - A rejected 6-digit code usually means the authenticator app's clock

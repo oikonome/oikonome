@@ -28,6 +28,7 @@ server/oikonome/version_history.tsv
 
 # maintenance lock taken by oikonome.sh / scripts/backup.sh
 .maintenance.lock
+.maintenance.lock.holder
 
 # generated from the running server; never tracked
 webapp/openapi.json

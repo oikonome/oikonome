@@ -397,6 +397,11 @@ class CashflowTests(unittest.TestCase):
         self.conn.close()
 
     def test_savings_by_year(self):
+        # the checking feed covers all of 2025 (income is known only for
+        # months on or after its first row), opened by a transfer that is
+        # neither spend nor income
+        add_txn(self.conn, dt.date(2025, 1, 2), 25, "FEED OPENED",
+                account="chk", primary="TRANSFER_OUT", txn_id="feed-open")
         cf = reporting.compute_cashflow(self.conn)
         rows = {r[0]: r for r in cf["savings_by_year"]}
         # 2023: card spend but no bank data → income unknown, not $0
@@ -410,6 +415,11 @@ class CashflowTests(unittest.TestCase):
         # the merchant "GENERAL_SERVICES", and a user rule reaches the
         # inflow row too — it stops being a transfer
         # to the effective-category test, but it is still not income.
+        # the checking feed covers all of 2025 (income is known only for
+        # months on or after its first row), opened by a transfer that is
+        # neither spend nor income
+        add_txn(self.conn, dt.date(2025, 1, 2), 25, "FEED OPENED",
+                account="chk", primary="TRANSFER_OUT", txn_id="feed-open")
         self.conn.execute(
             """INSERT INTO transactions (id, account_id, date, amount, name,
                    merchant_name, category_primary, category_plaid,
@@ -427,11 +437,19 @@ class CashflowTests(unittest.TestCase):
         rows = {r[0]: r for r in cf["savings_by_year"]}
         self.assertEqual(rows["2025"][1], 10050.0)
 
-    def test_monthly_by_year_only_income_months(self):
-        cf = reporting.compute_cashflow(self.conn)
+    def test_monthly_by_year_covers_every_known_month(self):
+        """Every month whose income is known gets a bar, deposit or not: a
+        covered month with no pay is a measured $0 of income, and dropping
+        it would leave the bars summing to more than the year's Saved
+        figure. Months before the bank feed starts (the card-only year)
+        stay out, because their income is unknown, not $0."""
+        cf = reporting.compute_cashflow(self.conn, today=dt.date(2026, 10, 9))
         self.assertNotIn("2023", cf["monthly_by_year"])
         pts = dict(cf["monthly_by_year"]["2025"])
-        self.assertEqual(pts, {"Mar": 5900.0, "Sep": 4000.0})
+        self.assertEqual(pts, {"Mar": 5900.0, "Apr": 0.0, "May": 0.0,
+                               "Jun": 0.0, "Jul": 0.0, "Aug": 0.0,
+                               "Sep": 4000.0, "Oct": 0.0, "Nov": 0.0,
+                               "Dec": 0.0})
 
     def test_investment_funding_bank_side_plus_plan_contributions(self):
         cf = reporting.compute_cashflow(self.conn)

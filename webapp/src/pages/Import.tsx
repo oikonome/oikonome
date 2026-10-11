@@ -1,10 +1,22 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { api, errText, type Batch, type TaxdocPlan, type TaxdocRow, mmdd, type ImportOutcome } from "../api/client";
+import { api, errText, type Batch, type TaxdocPlan, type TaxdocRow, mmdd, type ImportOutcome, bulkJobLive, type BulkJob, type BulkJobStatus, type ColumnMappingNeeded, type MappingNeeded, type YnabAccountsNeeded, type YnabDestination } from "../api/client";
 import { parseMoneyDraft } from "../moneymath";
 import { removeFromList } from "../api/cache";
 import DemoLock from "../components/DemoLock";
+import { keptRowsNote, keptRowsQuestion } from "../components/RemoveAccountPanel";
+import { sharedLock } from "../sharedlogin";
 import { isOwner, isViewer } from "../role";
+import { useElevate } from "../elevation";
+
+// What an undo says beyond "done": the overlap warning, and the rows it
+// kept because the bank feed relies on them. A server that folds the
+// kept-rows note into the warning is not repeated.
+const undoNote = (r: { warning: string | null; note?: string | null }) => {
+  const parts = r.warning ? [r.warning] : [];
+  if (r.note && !(r.warning ?? "").includes(r.note)) parts.push(r.note);
+  return parts.length ? parts.join(" ") : null;
+};
 
 const SIGNS: [string, string][] = [
   ["bank", "bank CSV (negative = money out — most banks)"],
@@ -66,54 +78,170 @@ function RestoreProgressCard({ onDone }: { onDone: () => void }) {
   );
 }
 
-function PlanReview({ files, onNeedsMapping }: {
+// A folder import runs as a background job on the server: the submit
+// answers at once and this card follows the job file by file until it
+// settles. Mounted unconditionally, like the restore card: the job
+// outlives the page, and a reload or a second tab picks it up again from
+// /jobs/current.
+const STOPPED_WHY: Record<string, string> = {
+  signed_out: "whoever started it was signed out",
+  role_changed: "whoever started it may no longer import",
+  household_deleted: "this household is being deleted",
+  locked_out: "this account is locked right now",
+  read_only: "this account is read-only right now",
+  second_factor: "the account needs a second factor first",
+  unchecked: "the account's standing could not be checked",
+  expired: "it waited too long for the server",
+};
+
+function BulkJobCard({ onSettled }: { onSettled: (j: BulkJob) => void }) {
+  const qc = useQueryClient();
+  // jobs this page watched while they ran: only their settling refreshes
+  // the ledger and hands a stuck CSV to the mapping step — an outcome
+  // read back on a later visit has nothing left to hand over
+  const watched = useRef(new Set<string>());
+  const q = useQuery<BulkJobStatus>({
+    queryKey: ["bulk-import-job"],
+    queryFn: api.bulkJobCurrent,
+    refetchInterval: (query) => bulkJobLive(query.state.data) ? 2000 : false,
+  });
+  const cancel = useMutation({
+    mutationFn: (id: string) => api.bulkCancel(id),
+    onSuccess: (j) => qc.setQueryData(["bulk-import-job"], j),
+  });
+  const job = q.data && q.data.state !== "idle" ? q.data as BulkJob : null;
+  useEffect(() => {
+    if (!job) return;
+    if (bulkJobLive(job)) { watched.current.add(job.job_id); return; }
+    if (watched.current.delete(job.job_id)) onSettled(job);
+  }, [job, onSettled]);
+  if (!job) return null;
+  const live = bulkJobLive(job);
+  const ok = job.files.filter((f) => f.ok).length;
+  const shown = job.files.filter((f) => f.state !== "pending");
+  const plural = (n: number) => `${n} file${n === 1 ? "" : "s"}`;
+  const headline = live
+    ? `Importing — ${job.done} of ${plural(job.total)} done`
+    : job.state === "cancelled"
+      ? `Cancelled — ${ok} of ${plural(job.total)} imported.`
+      : job.state === "stopped"
+        ? `Stopped — ${STOPPED_WHY[job.stop_reason ?? ""]
+            ?? "the import could not go on"}. ${ok} of `
+          + `${plural(job.total)} imported; drop the rest again.`
+        : job.state === "error"
+          ? `The import stopped unexpectedly — ${ok} of `
+            + `${plural(job.total)} imported; drop the rest again.`
+          : `${ok}/${job.total} imported.`;
+  return (
+    <div className="card">
+      <b>{headline}</b>
+      {live && <div className="mut" style={{ marginTop: ".3rem" }}>
+        {job.waiting ? "Waiting for the server to pick it up… "
+                     : ""}It keeps going even if you leave this page.</div>}
+      {shown.length > 0 && (
+        <ul style={{ margin: ".4rem 0 0", paddingLeft: "1.2rem" }}>
+          {shown.map((f) => (
+            <li key={f.index}
+                style={f.ok || f.state === "running"
+                  ? undefined : { color: "var(--red)" }}>
+              {f.name}: {f.state === "running" ? "importing…"
+                : f.ok ? (f.restore_started ? "restoring…"
+                          : `${f.imported ?? 0} transactions`
+                            + (f.corrected
+                              ? ` · corrected ${f.corrected} an earlier `
+                                + "import read differently (sign or year)"
+                              : ""))
+                  : f.error}
+              {f.ok && (f.warnings ?? []).length > 0 && (
+                <ul style={{ margin: ".2rem 0 0", paddingLeft: "1.2rem" }}>
+                  {f.warnings!.map((w, i) => <li key={i}>{w}</li>)}
+                </ul>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      {live && (
+        <button style={{ marginTop: ".6rem" }}
+          disabled={cancel.isPending || job.state === "cancelling"}
+          onClick={() => cancel.mutate(job.job_id)}>
+          {job.state === "cancelling" ? "stopping after this file…"
+            : "Cancel the rest"}</button>
+      )}
+      {cancel.isError && <p style={{ color: "var(--red)" }}>
+        {errText(cancel.error)}</p>}
+      {!live && <p className="mut">Wrong file? Every import is a batch —
+        undo it under Recent imports below.</p>}
+    </div>
+  );
+}
+
+// An export ZIP the analyze step could not read in full (the server then
+// names the restore door on its row) still restores — on its own.
+const isRestoreRow = (f: { kind: string; oversized?: boolean;
+                           restore_door?: string }) =>
+  f.kind === "Oikonome export ZIP" && (!!f.oversized || !!f.restore_door);
+
+type BulkPlanFile = Awaited<ReturnType<typeof api.bulkAnalyze>>["files"][number];
+
+function PlanReview({ files, onSubmitted, onTaxDocs, onRestore }: {
   files: File[];
-  onNeedsMapping: (f: File, accountId: string, sign: string,
-                   newName: string) => void;
+  // the plan as it was submitted, with the job the server made of it
+  onSubmitted: (job: BulkJob, decided: BulkPlanFile[]) => void;
+  // rows the server recognised as a tax document, or an archive it says
+  // belongs on the restore door, are handed back to their own pipelines
+  onTaxDocs: (fs: File[]) => void;
+  onRestore?: (f: File) => void;
 }) {
   const qc = useQueryClient();
   const accounts = useQuery({ queryKey: ["accounts"], queryFn: api.accounts });
   const [plan, setPlan] = useState<Awaited<
     ReturnType<typeof api.bulkAnalyze>> | null>(null);
-  const [results, setResults] = useState<Awaited<
-    ReturnType<typeof api.bulkRun>>["results"] | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
   const analyze = useMutation({
     mutationFn: (files: File[]) => api.bulkAnalyze(files),
-    onSuccess: (p) => { setPlan(p); setResults(null); setErr(null); },
-    onError: (e) => setErr(errText(e)),
+    onSuccess: (p) => {
+      setErr(null);
+      const tax = p.files.filter((f) => f.kind === "tax document"
+                                        && files[f.index]);
+      if (tax.length) onTaxDocs(tax.map((f) => files[f.index]));
+      // the run takes the whole plan back, so a handed-off row stays in
+      // it as a skip rather than being dropped
+      const rest = p.files.filter((f) => !tax.includes(f));
+      // a batch that is one export ZIP and nothing else carries the
+      // restore door at the top: that door takes it, whatever its size
+      const big = rest.length === 1 && files[rest[0].index]
+        && (!!p.restore_door || isRestoreRow(rest[0]))
+        ? files[rest[0].index] : null;
+      if (big && onRestore) { setPlan(null); onRestore(big); return; }
+      setPlan(rest.length ? { ...p, files: p.files.map((f) => (
+        tax.includes(f) ? { ...f, action: "skip" as const } : f)) } : null);
+    },
+    onError: (e) => {
+      // one archive too large for this door: the refusal names the
+      // restore door, which streams it to disk under a far larger cap
+      if ((e as { restoreDoor?: string }).restoreDoor && files.length === 1
+          && onRestore) {
+        setPlan(null); onRestore(files[0]); return;
+      }
+      setErr(errText(e));
+    },
   });
   const run = useMutation({
     mutationFn: () => api.bulkRun(plan!.token, plan!.files),
-    onSuccess: (r, _v, _c) => {
-      // A CSV whose columns the detector can't read comes back "import it
-      // alone to map them" — carry it straight into the mapping step.
-      const stuck = r.results.find((x) => !x.ok
-        && String(x.error).includes("map them"));
-      const decided = stuck && plan?.files.find((f) => f.index === stuck.index);
-      if (stuck && decided && files[stuck.index]) {
-        onNeedsMapping(files[stuck.index], decided.account_id ?? "",
-                       decided.amount_sign, decided.new_account_name ?? "");
-      }
-      setResults(r.results); setPlan(null);
-      // an import writes ledger rows and maybe accounts: the things that
-      // read them, not every query in the app — but that includes every
-      // page derived from the ledger (lenses, reports, bills, merchants,
-      // reimbursements, business books, budget snapshots), which a
-      // 30s-fresh cache would otherwise keep showing pre-import numbers.
-      // Prefix invalidates cost nothing while those pages are unmounted.
-      for (const k of ["batches", "today", "txns", "accounts", "calendar",
-                       "onboarding", "lens-month", "lens-year", "report",
-                       "bills", "merchants", "reimb", "biz",
-                       "budget-snapshots"])
-        qc.invalidateQueries({ queryKey: [k] });
+    onSuccess: (job) => {
+      // the files import in the background from here: the job card takes
+      // over, and the plan's decisions go with it for the mapping step
+      qc.setQueryData(["bulk-import-job"], job);
+      onSubmitted(job, plan?.files ?? []);
+      setPlan(null);
     },
     onError: (e) => setErr(errText(e)),
   });
   // analyze whatever the drop zone handed over, and re-analyze if it changes
   useEffect(() => {
-    if (files.length) { setResults(null); analyze.mutate(files); }
+    if (files.length) analyze.mutate(files);
     // analyze is a stable mutation object; files identity IS the trigger
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [files]);
@@ -122,7 +250,9 @@ function PlanReview({ files, onNeedsMapping }: {
       files: plan.files.map((f) => (f.index === i ? { ...f, ...p } : f)) });
 
   const importable = plan?.files.filter((f) => f.action === "import") ?? [];
-  if (!files.length && !plan && !results && !analyze.isPending) return null;
+  // once submitted, the job card shows the outcome; this one has only an
+  // analyze in flight, a plan to review, or an error to say
+  if (!plan && !analyze.isPending && !err) return null;
   return (
     <div className="card">
       {analyze.isPending && <p className="mut" style={{ margin: 0 }}>
@@ -197,7 +327,11 @@ function PlanReview({ files, onNeedsMapping }: {
                       {!f.sign_certain && <span title="unsure — verify"
                         style={{ color: "var(--amber)" }}> ⚠</span>}
                     </td>
-                    <td className="mut">{f.note}</td>
+                    <td className="mut">{f.note}
+                      {isRestoreRow(f) && onRestore && files[f.index] && <>
+                        {" "}<button type="button"
+                          onClick={() => onRestore(files[f.index])}>
+                          restore it on its own</button></>}</td>
                   </tr>
                 ))}
               </tbody>
@@ -206,27 +340,10 @@ function PlanReview({ files, onNeedsMapping }: {
           <button className="pri" style={{ marginTop: ".6rem" }}
             disabled={run.isPending || !importable.length}
             onClick={() => run.mutate()}>
-            {run.isPending ? "importing…"
+            {run.isPending ? "starting…"
               : `Import ${importable.length} file${importable.length === 1 ? "" : "s"}`}
           </button>
         </>
-      )}
-      {results && (
-        <div style={{ marginTop: ".8rem" }}>
-          <b>{results.filter((r) => r.ok).length}/{results.length} imported.</b>
-          <ul style={{ margin: ".4rem 0 0", paddingLeft: "1.2rem" }}>
-            {results.map((r) => (
-              <li key={r.index} className={r.ok ? "" : ""}
-                  style={r.ok ? undefined : { color: "var(--red)" }}>
-                {r.name}: {r.ok
-                  ? (r.restore_started ? "restoring…" : `${r.imported} transactions`)
-                  : r.error}
-              </li>
-            ))}
-          </ul>
-          <p className="mut">Wrong file? Every import is a batch — undo it
-            under Recent imports below.</p>
-        </div>
       )}
     </div>
   );
@@ -236,7 +353,17 @@ function PlanReview({ files, onNeedsMapping }: {
 // statements, a single CSV, an export ZIP to restore, or a W-2. The list of
 // what it accepts lives INSIDE it — that is exactly the information you want
 // at the moment you are looking for where to put the file.
-const TAXDOC_RE = /\b(w-?2|1099|1040|ssa|earnings|transcript)\b/i;
+// The name test treats "_" as a separator, as file names do ("W2_2023.pdf",
+// "2023_TaxReturn.pdf"). An XML file is always an income record: the
+// statement importer reads none, and ssa.gov hands earnings out as XML.
+const TAXDOC_RE =
+  /(?:^|[^a-z0-9])(w-?2|1099(?:-?[a-z]+)?|1040|ssa|earnings|transcript|tax[-_ ]?return)(?=[^a-z0-9]|$)/i;
+const isTaxDoc = (f: File) =>
+  TAXDOC_RE.test(f.name) || /\.xml$/i.test(f.name) || /\bxml\b/i.test(f.type);
+// A single export ZIP goes straight to the restore door, which streams it
+// to disk under the restore cap; the plan's analyze step reads each file
+// into memory under the much smaller statement cap.
+const isArchive = (f: File) => /\.zip$/i.test(f.name);
 
 function DropZone({ onFiles, busy, mayRestore = true }: {
   onFiles: (files: File[]) => void; busy: boolean; mayRestore?: boolean;
@@ -309,9 +436,8 @@ export default function Import({ heading = "Import transactions",
   const batches = useQuery({ queryKey: ["batches"], queryFn: api.importBatches });
   // What the one door handed over, and where it routed it.
   const [staged, setStaged] = useState<File[]>([]);
-  const [taxDoc, setTaxDoc] = useState<File | null>(null);
-  const [mapping, setMapping] =
-    useState<NonNullable<ImportOutcome["mapping_needed"]> | null>(null);
+  const [taxDocs, setTaxDocs] = useState<File[]>([]);
+  const [mapping, setMapping] = useState<MappingNeeded | null>(null);
   const [outcome, setOutcome] = useState<ImportOutcome | null>(null);
 
   const refresh = () => {
@@ -322,17 +448,45 @@ export default function Import({ heading = "Import transactions",
     qc.invalidateQueries({ queryKey: ["calendar"] });
   };
 
+  // restoring an export is the owner's — and never the shared demonstration
+  // login's, which may not point the archive's mail relay and AI endpoints
+  // anywhere new, so the drop zone does not offer it one
+  const mayRestore = isOwner(me) && !sharedLock(me.data, "grant");
+
   // Route each drop to its pipeline so the person never has to pick one.
   // A tax/income document is its own pipeline (it builds the
   // income spine, not the ledger); everything else goes through the plan.
   const route = (files: File[]) => {
     setOutcome(null); setMapping(null);
-    if (files.length === 1 && TAXDOC_RE.test(files[0].name)) {
-      setStaged([]); setTaxDoc(files[0]);
-    } else {
-      setTaxDoc(null); setStaged(files);
+    if (files.length === 1 && isArchive(files[0]) && mayRestore) {
+      setStaged([]); setTaxDocs([]); restore.mutate(files[0]);
+      return;
     }
+    setTaxDocs(files.filter(isTaxDoc));
+    setStaged(files.filter((f) => !isTaxDoc(f)));
   };
+
+  // The restore door is step-up gated. Open the window before sending the
+  // archive, so a large file is not uploaded once only to be refused.
+  const elevate = useElevate();
+  const restore = useMutation({
+    mutationFn: async (f: File) => {
+      const st = await api.elevation().catch(() => null);
+      if (st && !st.elevated) await elevate(false);
+      return api.importFile(f, "", "bank");
+    },
+    onSuccess: (r) => {
+      setOutcome(r.result?.restore_started ? null : r);
+      qc.invalidateQueries({ queryKey: ["restore-progress"] });
+      refresh();
+    },
+    onError: (e) => setOutcome({ result: { error:
+      /^413\b/.test(e instanceof Error ? e.message : "")
+        ? "This export is larger than the instance accepts — restores take "
+          + "up to 500 MB, and a proxy in front of the instance may cap "
+          + "uploads lower."
+        : errText(e) }, mapping_needed: null }),
+  });
 
   // A CSV the detector can't read needs its columns mapped by hand. The
   // plan already decided its destination and convention, so re-submit it
@@ -348,6 +502,44 @@ export default function Import({ heading = "Import transactions",
     onError: (e) => setOutcome({ result: { error: errText(e) },
                                  mapping_needed: null }),
   });
+
+  // The folder this page submitted, kept until its job settles: a CSV
+  // whose columns the detector could not read comes back "import it alone
+  // to map them", and the plan already decided its destination and
+  // convention, so it goes straight to the mapping step with those.
+  const submitted = useRef<{ jobId: string; decided: BulkPlanFile[];
+                             files: File[] } | null>(null);
+  const onNeedsMapping = (f: File, accountId: string, sign: string,
+                          newName: string) =>
+    escalate.mutate({ f, accountId, sign, newName });
+  const bulkSettled = (job: BulkJob) => {
+    const mine = submitted.current?.jobId === job.job_id
+      ? submitted.current : null;
+    submitted.current = null;
+    // a CSV whose columns need mapping, or a YNAB register of several
+    // accounts: both are finished one file at a time, on their own card
+    const stuck = job.files.find((x) => !x.ok
+      && (String(x.error).includes("map them")
+          || YNAB_SEVERAL.test(String(x.error))));
+    const decided = stuck && mine?.decided.find((f) => f.index === stuck.index);
+    const file = stuck && mine?.files[stuck.index];
+    if (decided && file)
+      onNeedsMapping(file, decided.account_id ?? "", decided.amount_sign,
+                     decided.new_account_name ?? "");
+    // an import writes ledger rows and maybe accounts: the things that
+    // read them, not every query in the app — but that includes every
+    // page derived from the ledger (lenses, reports, bills, merchants,
+    // reimbursements, business books, budget snapshots), which a
+    // 30s-fresh cache would otherwise keep showing pre-import numbers.
+    // Prefix invalidates cost nothing while those pages are unmounted.
+    for (const k of ["batches", "today", "txns", "accounts", "calendar",
+                     "onboarding", "lens-month", "lens-year", "report",
+                     "bills", "merchants", "reimb", "biz",
+                     "budget-snapshots"])
+      qc.invalidateQueries({ queryKey: [k] });
+    if (job.restore_started)
+      qc.invalidateQueries({ queryKey: ["restore-progress"] });
+  };
 
   if (accounts.isPending)
     return <div className="centered"><span className="mut">loading…</span></div>;
@@ -382,14 +574,14 @@ export default function Import({ heading = "Import transactions",
             <p className="sub" style={{ marginTop: 0 }}>
               History from anywhere — a statement, an export from another
               app, or a whole folder of them.</p>
-            <DropZone onFiles={route} busy={escalate.isPending}
-                      mayRestore={isOwner(me)} />
+            <DropZone onFiles={route} busy={escalate.isPending || restore.isPending}
+                      mayRestore={mayRestore} />
             {manual}
           </div>
         </div>
       ) : (
-        <DropZone onFiles={route} busy={escalate.isPending}
-                  mayRestore={isOwner(me)} />
+        <DropZone onFiles={route} busy={escalate.isPending || restore.isPending}
+                  mayRestore={mayRestore} />
       )}
 
       {res?.error && <div className="note bad">{res.error}</div>}
@@ -399,8 +591,24 @@ export default function Import({ heading = "Import transactions",
           Imported <b>{res.imported}</b> transactions
           {res.skipped_duplicates
             ? ` · skipped ${res.skipped_duplicates} already covered`
+            : ""}
+          {res.corrected
+            ? ` · corrected ${res.corrected} an earlier import read `
+              + "differently (sign or year)"
             : ""}.
           {res.note && <div style={{ marginTop: ".3rem" }}>{res.note}</div>}
+          {!!res.kept_annotated && (
+            <div style={{ marginTop: ".3rem" }}>
+              Kept {res.kept_annotated} earlier row{res.kept_annotated === 1
+                ? "" : "s"} on the picked account: you had added notes,
+              receipts or other changes to {res.kept_annotated === 1
+                ? "it" : "them"}.</div>)}
+          {!!res.foreign_left && (
+            <div style={{ marginTop: ".3rem" }}>
+              Left {res.foreign_left} row{res.foreign_left === 1 ? "" : "s"} on
+              the picked account that name one of these YNAB accounts but came
+              from another export — undo that import below if they do not
+              belong there.</div>)}
           {res.split_accounts && (
             <ul style={{ margin: ".4rem 0 0 1.2rem" }}>
               {Object.entries(res.split_accounts).map(([name, n]) => (
@@ -417,7 +625,16 @@ export default function Import({ heading = "Import transactions",
       )}
 
       {/* the mapping step appears ONLY when a file actually needs it */}
-      {mapping && (
+      {mapping && mapping.kind === "ynab_accounts" && (
+        <YnabAccountsCard key={mapping.token} need={mapping}
+                          onDone={(r) => {
+                            // the same refusal contract as the column card
+                            if (!r.error || r.expired) setMapping(null);
+                            setOutcome({ result: r, mapping_needed: null });
+                            refresh();
+                          }} />
+      )}
+      {mapping && mapping.kind !== "ynab_accounts" && (
         <MappingCard key={mapping.token} need={mapping}
                      onDone={(r) => {
                        // A refusal normally keeps the card up so the person
@@ -443,11 +660,26 @@ export default function Import({ heading = "Import transactions",
           job is idle, so there is nothing to gate. */}
       <RestoreProgressCard onDone={refresh} />
 
-      <PlanReview files={staged}
-                  onNeedsMapping={(f, accountId, sign, newName) =>
-                    escalate.mutate({ f, accountId, sign, newName })} />
+      <BulkJobCard onSettled={bulkSettled} />
 
-      <TaxDocsCard file={taxDoc} />
+      <PlanReview files={staged}
+                  onSubmitted={(job, decided) => {
+                    submitted.current = { jobId: job.job_id, decided,
+                                          files: staged };
+                    if (job.restore_started)
+                      qc.invalidateQueries({ queryKey: ["restore-progress"] });
+                    // a plan with nothing left to run (an archive alone)
+                    // is settled in the submit's own answer
+                    if (!bulkJobLive(job)) bulkSettled(job);
+                  }}
+                  onTaxDocs={(fs) => setTaxDocs((t) => [...t, ...fs])}
+                  onRestore={mayRestore ? (f) => {
+                    setStaged([]); restore.mutate(f);
+                  } : undefined} />
+
+      {taxDocs.map((f, i) => (
+        <TaxDocsCard key={`${i}:${f.name}:${f.size}`} file={f} />
+      ))}
 
       <BatchList rows={batches.data?.batches ?? []} onChanged={refresh} />
       </DemoLock>
@@ -599,7 +831,7 @@ function TaxDocsCard({ file }: { file: File | null }) {
 }
 
 function MappingCard({ need, onDone }: {
-  need: NonNullable<ImportOutcome["mapping_needed"]>;
+  need: ColumnMappingNeeded;
   onDone: (result: NonNullable<ImportOutcome["result"]>) => void;
 }) {
   const [cols, setCols] = useState<Record<string, string>>({
@@ -621,14 +853,20 @@ function MappingCard({ need, onDone }: {
     },
     onError: (e) => onDone({ error: errText(e) }),
   });
+  // A column is named by its POSITION ("#3"), not its header text:
+  // duplicate column names are common in bank exports, and by name the two
+  // would be one choice — the preview reading the first while the import
+  // read the last. The server reads "#n" as the n-th cell.
+  const dup = (h: string) =>
+    need.header.indexOf(h) !== need.header.lastIndexOf(h);
   const sel = (key: string, label: string, required: boolean) => (
     <label>{label}
       <select required={required} value={cols[key]}
               onChange={(e) => setCols({ ...cols, [key]: e.target.value })}>
         <option value="">{required ? "— pick —" : "— none —"}</option>
-        {/* index-qualified key — duplicate column names (common in
-            bank exports) otherwise collide React keys and drop options */}
-        {need.header.map((h, i) => <option key={`${i}-${h}`} value={h}>{h}</option>)}
+        {need.header.map((h, i) => (
+          <option key={i} value={`#${i}`}>
+            {h}{dup(h) ? ` (column ${i + 1})` : ""}</option>))}
       </select>
     </label>
   );
@@ -672,7 +910,7 @@ function MappingCard({ need, onDone }: {
             <tbody>
               {need.sample!.map((row, i) => {
                 const at = (col: string) => {
-                  const j = need.header.indexOf(col);
+                  const j = col.startsWith("#") ? Number(col.slice(1)) : -1;
                   return j >= 0 ? (row[j] ?? "") : "";
                 };
                 const amt = cols.amount_col ? at(cols.amount_col)
@@ -699,6 +937,130 @@ function MappingCard({ need, onDone }: {
   );
 }
 
+// The refusal a folder import gives a YNAB register of several accounts:
+// it is finished on its own, on the card below.
+const YNAB_SEVERAL = /covers \d+ YNAB accounts/;
+
+// Every YNAB account answered: an account, a new account with a name, or
+// skip — and not everything skipped. The server refuses the same cases.
+const ynabAllAnswered = (names: string[], dest: Record<string, string>,
+                         newName: Record<string, string>) =>
+  names.every((n) => !!dest[n]
+              && (dest[n] !== "__new__" || !!(newName[n] ?? "").trim()))
+  && names.some((n) => dest[n] && dest[n] !== "skip");
+
+// A YNAB register names several YNAB accounts — a checking account and a
+// card in one file. Each goes where the person says: an account here, a
+// new one, or nowhere. Nothing is matched by name, because a card's lines
+// put on checking count twice.
+function YnabAccountsCard({ need, onDone }: {
+  need: YnabAccountsNeeded;
+  onDone: (result: NonNullable<ImportOutcome["result"]>) => void;
+}) {
+  const accounts = useQuery({ queryKey: ["accounts"], queryFn: api.accounts });
+  // a correctable refusal re-parks the file under a new token
+  const [token, setToken] = useState(need.token);
+  // "" = not answered yet, "skip", "__new__", or an account id
+  const [dest, setDest] = useState<Record<string, string>>({});
+  const [newName, setNewName] = useState<Record<string, string>>(() =>
+    Object.fromEntries(need.accounts.map((a) => [a.name, a.name])));
+  // removing what an earlier import left on the picked account is the
+  // default when there is something to remove; the person can keep it
+  const [remove, setRemove] = useState<Record<string, boolean>>(() =>
+    Object.fromEntries(need.accounts.map((a) => [a.name,
+                                                 a.stored_on_pick > 0])));
+  const names = need.accounts.map((a) => a.name);
+  const pickName = accounts.data?.accounts.find((a) => a.id === need.pick)
+    ?.name ?? "the picked account";
+  const finish = useMutation({
+    mutationFn: () => {
+      const answers: Record<string, YnabDestination> = {};
+      const removing: Record<string, boolean> = {};
+      for (const n of names) {
+        answers[n] = dest[n] === "__new__"
+          ? { new: (newName[n] ?? "").trim() } : dest[n];
+        removing[n] = !!remove[n] && dest[n] !== need.pick;
+      }
+      return api.importYnabAccounts(token, answers, removing);
+    },
+    onSuccess: (r) => {
+      if (r.result.token) setToken(r.result.token);
+      onDone(r.result);
+    },
+    onError: (e) => onDone({ error: errText(e) }),
+  });
+  const ready = ynabAllAnswered(names, dest, newName);
+  return (
+    <div className="card">
+      <h2>Where does each YNAB account go?</h2>
+      <p className="mut"><b>{need.filename}</b> holds {need.accounts.length}{" "}
+        YNAB accounts. Choose an account for each, or skip it — nothing is
+        imported until every one has an answer.</p>
+      <div style={{ overflowX: "auto" }}>
+        <table style={{ fontSize: 13 }}>
+          <thead><tr><th>YNAB account</th><th className="num">Rows</th>
+            <th>Dates</th><th>Into</th></tr></thead>
+          <tbody>
+            {need.accounts.map((a) => (
+              <tr key={a.name}>
+                <td>{a.label}</td>
+                <td className="num">{a.rows}</td>
+                <td className="mut">{mmdd(a.first_date)}–{mmdd(a.last_date)}</td>
+                <td>
+                  <select value={dest[a.name] ?? ""}
+                    onChange={(e) => setDest({ ...dest,
+                                               [a.name]: e.target.value })}>
+                    <option value="">— choose —</option>
+                    {(accounts.data?.accounts ?? []).map((x) => (
+                      <option key={x.id} value={x.id}>
+                        {x.name}{x.mask ? ` …${x.mask}` : ""}</option>
+                    ))}
+                    <option value="__new__">new account…</option>
+                    <option value="skip">skip — don't import</option>
+                  </select>
+                  {dest[a.name] === "__new__" && (
+                    <input value={newName[a.name] ?? ""}
+                      placeholder="new account name"
+                      onChange={(e) => setNewName({ ...newName,
+                                                    [a.name]: e.target.value })}
+                      style={{ marginLeft: 4, width: "10rem" }} />
+                  )}
+                  {a.stored_on_pick > 0 && !!dest[a.name]
+                    && dest[a.name] !== need.pick && (
+                    <label style={{ display: "block", marginTop: ".3rem" }}>
+                      <input type="checkbox" checked={!!remove[a.name]}
+                        onChange={(e) => setRemove({ ...remove,
+                          [a.name]: e.target.checked })} />{" "}
+                      remove the {a.stored_on_pick} row
+                      {a.stored_on_pick === 1 ? "" : "s"} an earlier import
+                      of this file put on {pickName}
+                    </label>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {names.some((n) => remove[n] && dest[n] && dest[n] !== need.pick
+                  && need.accounts.find((a) => a.name === n)!.stored_on_pick > 0) && (
+        <p className="mut" style={{ marginTop: ".5rem" }}>Rows you have added
+          notes, receipts or other changes to are kept. Undoing this import
+          later does not bring removed rows back.</p>
+      )}
+      <button className="pri" style={{ marginTop: ".7rem" }}
+              disabled={!ready || finish.isPending}
+              onClick={() => finish.mutate()}>
+        Import these accounts
+      </button>
+    </div>
+  );
+}
+
+// the owner said no to the kept-rows question: nothing happened, so
+// nothing is reported
+const UNDO_CANCELLED = "undo cancelled";
+
 function BatchList({ rows, onChanged }: {
   rows: { id: string; created_at: string; filename: string | null;
           source: string; row_count: number | null;
@@ -706,15 +1068,42 @@ function BatchList({ rows, onChanged }: {
   onChanged: () => void;
 }) {
   const qc = useQueryClient();
+  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
+  const owner = isOwner(me);
   const [warning, setWarning] = useState<string | null>(null);
   const undo = useMutation({
-    mutationFn: (batch_id: string) => api.importRollback(batch_id),
+    mutationFn: async (batch_id: string) => {
+      try {
+        return await api.importRollback(batch_id);
+      } catch (e) {
+        // rows only a note naming no feed account would keep: the server
+        // asks the owner before deleting them (otherwise the undo would
+        // strip their batch and leave them for good), and the answer
+        // re-sends the undo. Deleting them anyway is the owner's alone.
+        const q = owner ? keptRowsQuestion(e) : null;
+        if (!q) throw e;
+        if (!window.confirm(`${q}\n\nUndo anyway?`))
+          throw new Error(UNDO_CANCELLED);
+        return await api.importRollback(batch_id, true);
+      }
+    },
     onSuccess: (r, batch_id) => {
       // the undone batch leaves the table now; the refetch that follows
       // only re-proves what the server has already committed
       removeFromList<{ batches: Batch[] }, Batch>(qc, ["batches"], "batches",
                                                   (b) => b.id === batch_id);
-      setWarning(r.warning); onChanged();
+      setWarning(undoNote(r)); onChanged();
+    },
+    // a refusal (a sync running, a batch already gone) says why in place
+    // of a button that silently re-enables
+    onError: (e) => {
+      if (e instanceof Error && e.message === UNDO_CANCELLED) return;
+      // a member's undo that would leave kept rows: the server's note says
+      // why, in place, with nothing to override it
+      const note = keptRowsNote(e) ?? keptRowsQuestion(e);
+      if (note) { setWarning(`Not undone. ${note}`); return; }
+      window.dispatchEvent(new CustomEvent("oiko-toast",
+        { detail: `Couldn't undo the import — ${errText(e)}` }));
     },
   });
   if (rows.length === 0) return null;

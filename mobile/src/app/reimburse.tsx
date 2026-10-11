@@ -81,7 +81,7 @@ export default function Reimburse() {
     },
     // a failed undo must not read as done — the row stays and says why
     // (the web surfaces the same error through its notice line)
-    onError: (e) => Alert.alert("Couldn't undo the match", String(e)),
+    onError: (e) => Alert.alert("Couldn't undo the match", errText(e)),
   });
   const candidates = useQuery({
     queryKey: ["reimb-candidates", pairing?.id, candSearch],

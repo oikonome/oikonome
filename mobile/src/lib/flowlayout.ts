@@ -19,11 +19,13 @@ export const FLOW_COLORS = {
 export interface FlowNode { key: string; label: string; value: number; color: string }
 
 export function flowLayout(f: FlowPeriod) {
-  const saved = f.saved;
+  // unknown income (no bank feed covers the window) draws no income
+  // side and no saved/overspent node — nothing to balance against
+  const saved = f.saved ?? 0;
   const sources: FlowNode[] = [
-    { key: "paychecks", label: "Paychecks", value: f.in.paychecks, color: FLOW_COLORS.paychecks },
-    { key: "interest", label: "Interest & dividends", value: f.in.interest, color: FLOW_COLORS.interest },
-    { key: "other", label: "Other income", value: f.in.other, color: FLOW_COLORS.other },
+    { key: "paychecks", label: "Paychecks", value: f.in.paychecks ?? 0, color: FLOW_COLORS.paychecks },
+    { key: "interest", label: "Interest & dividends", value: f.in.interest ?? 0, color: FLOW_COLORS.interest },
+    { key: "other", label: "Other income", value: f.in.other ?? 0, color: FLOW_COLORS.other },
   ];
   if (saved < 0) sources.push({ key: "overspent", label: "Overspent by",
                                 value: -saved, color: FLOW_COLORS.overspent });
@@ -33,7 +35,7 @@ export function flowLayout(f: FlowPeriod) {
   ];
   if (saved > 0) sinks.push({ key: "saved", label: "Invested & saved",
                               value: saved, color: FLOW_COLORS.saved });
-  const L = Math.max(f.in.total, f.out.total, 0);
+  const L = Math.max(f.in.total ?? 0, f.out.total, 0);
   return { sources: sources.filter((n) => n.value > 0),
            sinks: sinks.filter((n) => n.value > 0), L };
 }

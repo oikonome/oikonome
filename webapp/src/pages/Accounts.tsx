@@ -5,6 +5,8 @@
 // Also SimpleFIN connect, Plaid hosted link and manual accounts.
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { openPlaidHostedLink, plaidLinkOutcome } from "../components/ConnectHub";
+import DemoLock from "../components/DemoLock";
+import { sharedLock } from "../sharedlogin";
 import ImportPage from "./Import";
 import { Fragment, useEffect, useState } from "react";
 import { ext } from "../ext";
@@ -533,10 +535,16 @@ function OwnerImport({ onDone }: { onDone: DoneFn }) {
                     ? "Connect accounts and import transactions"
                     : "Import transactions"}
                   connect={isOwner(me)
-                    ? <ConnectCard onDone={onDone}
-                        hosted={!!me.data?.hosted}
-                        used={me.data?.features?.institutions_used}
-                        cap={me.data?.features?.institution_cap} />
+                    /* both doors on the card (the bank link and the
+                       SimpleFIN token) plant a credential that outlives the
+                       shared demonstration login, which is refused them */
+                    ? <DemoLock on={false}
+                        shared={sharedLock(me.data, "credential")}>
+                        <ConnectCard onDone={onDone}
+                          hosted={!!me.data?.hosted}
+                          used={me.data?.features?.institutions_used}
+                          cap={me.data?.features?.institution_cap} />
+                      </DemoLock>
                     : null}
                   manual={<ManualAccountRow onDone={onDone} />} />
     </div>
@@ -556,11 +564,16 @@ function GroupRows({ g, archived, hidden, mayEdit, owner, primary, excluded,
   // one Link session per click: the bank tab takes a while to come back,
   // and a second click in the meantime opened a second session
   const [linking, setLinking] = useState(false);
-  const openLink = (itemId?: string) => {
+  // every Link session plants or renews a bank credential, which the
+  // shared demonstration login is refused: its fix/grant/reconnect buttons
+  // are shown switched off, the refusal's sentence on hover
+  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
+  const credLock = sharedLock(me.data, "credential");
+  const openLink = (itemId?: string, manageAccounts = false) => {
     setLinking(true);
     // a closed window or a refused re-auth resolves too — only a real
     // update (or a fresh link, for a reaped connection) is "reconnected"
-    void openPlaidHostedLink(itemId)
+    void openPlaidHostedLink(itemId, { manageAccounts })
       .then((s) => onDone(plaidLinkOutcome(s, itemId ? "fix" : "add").text))
       .catch((e) => onDone(errText(e)))
       .finally(() => setLinking(false));
@@ -657,11 +670,13 @@ function GroupRows({ g, archived, hidden, mayEdit, owner, primary, excluded,
               : kind === "reauth" ? "sign-in expired"
               : "needs attention"}</span>
           {" "}<button className="pri" style={{ padding: ".05rem .45rem", fontSize: 12 }}
-                disabled={linking}
-                title={newAccounts
+                disabled={linking || !!credLock}
+                title={credLock ?? (newAccounts
                   ? "choose which new accounts to share with Oikonome"
-                  : "re-authenticate this connection"}
-                onClick={() => openLink(g.itemId)}>
+                  : "re-authenticate this connection")}
+                // update mode offers newly opened accounts only with its
+                // account checklist switched on
+                onClick={() => openLink(g.itemId, newAccounts)}>
             {newAccounts ? "share ↗" : "fix ↗"}</button>
         </>
       )}
@@ -717,8 +732,8 @@ function GroupRows({ g, archived, hidden, mayEdit, owner, primary, excluded,
               {owner && !needsFix && (
                 <>{" "}<button className="pri"
                     style={{ padding: ".05rem .45rem", fontSize: 12 }}
-                    disabled={linking}
-                    title={`re-link this connection to grant ${what}`}
+                    disabled={linking || !!credLock}
+                    title={credLock ?? `re-link this connection to grant ${what}`}
                     onClick={() => openLink(g.itemId)}>grant ↗</button></>
               )}
             </span>
@@ -740,8 +755,8 @@ function GroupRows({ g, archived, hidden, mayEdit, owner, primary, excluded,
             /* the removed Item's token is gone — reconnect = a FRESH link
                (no item_id), not update mode */
             <>{" "}<button className="pri" style={{ padding: ".05rem .45rem", fontSize: 12 }}
-                    disabled={linking}
-                    title="link this bank again"
+                    disabled={linking || !!credLock}
+                    title={credLock ?? "link this bank again"}
                     onClick={() => openLink()}>
               reconnect ↗</button>
             </>
@@ -1090,10 +1105,13 @@ function EditRow({ a, owner, primary, excluded, onDone, onCancel }: {
     mutationFn: async () => {
       if (nextName !== a.name)
         await api.accountRename(a.id, wantsRevert ? "" : trimmed);
-      // the classify door always rewrites the kind and the anchor — only
-      // knock when one of them actually changed
-      if (kind !== a.kind || isPrimary !== (a.id === primary))
-        await api.accountClassify(a.id, kind, isPrimary);
+      // only knock when the kind or the anchor changed, and carry the
+      // anchor only when its switch moved: a kind-only save must not
+      // re-send a pin another device may have moved since this cache
+      const pinMoved = isPrimary !== (a.id === primary);
+      if (kind !== a.kind || pinMoved)
+        await api.accountClassify(a.id, kind,
+                                  pinMoved ? isPrimary : undefined);
       if (isExcl !== excluded) await api.accountExclude(a.id, isExcl);
       if (ownerLbl.trim() !== (a.owner ?? ""))
         await api.setAccountOwner(a.id, ownerLbl.trim());
@@ -1149,7 +1167,26 @@ function EditRow({ a, owner, primary, excluded, onDone, onCancel }: {
     },
     onError: (e) => onDone(errText(e)),
   });
+  // A disconnected MX bank is still alive at MX, so it comes back on the
+  // owner's word rather than through a new link; the server marks how far
+  // back the next sync has to reach.
+  const reconnect = useMutation({
+    mutationFn: () => api.connectionReconnect(a.item_id),
+    onSuccess: () => {
+      patchList<AccountsData, Account>(qc, ["accounts"], "accounts",
+        (x) => x.item_id === a.item_id, { status: "ok" });
+      onDone(`${a.institution_name || "The bank"} is reconnected — the `
+             + "next sync also brings in what arrived while it was "
+             + "disconnected.", ["accounts", "connections", "me"]);
+    },
+    onError: (e) => onDone(errText(e)),
+  });
   const [linking, setLinking] = useState(false);
+  // the shared demonstration login is refused Link's update mode, and
+  // reconnecting or disconnecting a bank too: each restarts or ends a
+  // connection (and its billing) that outlives the login
+  const meQ = useQuery({ queryKey: ["me"], queryFn: api.me });
+  const credLock = sharedLock(meQ.data, "credential");
 
   return (
     <tr className="editrow">
@@ -1228,8 +1265,9 @@ function EditRow({ a, owner, primary, excluded, onDone, onCancel }: {
               completes. Lives here in the editor, not inline on the
               row. */}
           {owner && a.aggregator === "plaid" && liveConn && (
-            <button type="button" className="btn" disabled={linking}
-                    title={"choose which accounts "
+            <button type="button" className="btn"
+                    disabled={linking || !!credLock}
+                    title={credLock ?? "choose which accounts "
                            + (a.institution_name || "this bank")
                            + " shares with Oikonome — unshared accounts "
                            + "stop syncing and stop counting toward Plaid "
@@ -1244,6 +1282,16 @@ function EditRow({ a, owner, primary, excluded, onDone, onCancel }: {
                       .finally(() => setLinking(false));
                     }}>
               edit connected accounts ↗</button>
+          )}
+          {owner && (a.aggregator === "mx" || a.aggregator === "simplefin-org")
+            && a.status === "archived" && (
+            <button type="button" className="btn"
+                    disabled={reconnect.isPending || !!credLock}
+                    title={credLock ?? "sync " + (a.institution_name || "this bank")
+                           + " again — history is kept, and the next sync "
+                           + "fills in the time it was disconnected"}
+                    onClick={() => reconnect.mutate()}>
+              {reconnect.isPending ? "…" : "reconnect"}</button>
           )}
           {owner && (
           <button type="button" className="btn"

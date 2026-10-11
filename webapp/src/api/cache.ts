@@ -28,6 +28,15 @@ export function patchQueries<T extends object>(
   qc.setQueriesData<T>({ queryKey: prefix }, (old) => old && fn(old));
 }
 
+/** A write that moves a transaction's category (or whether it counts at
+ *  all) changes every per-category rollup: the Spending and Cash Flow
+ *  reports and both lenses. Each is keyed under its own prefix, so the
+ *  ledger lists refetching is not enough to move their totals. */
+export function invalidateRollups(qc: QueryClient): void {
+  for (const k of ["report", "lens-month", "lens-year"])
+    qc.invalidateQueries({ queryKey: [k] });
+}
+
 /** Patch the rows of a list field inside a cached object that satisfy
  *  `pred`. `{alerts: [...]}`, `{bills: [...]}`, `{rows: [...]}` — the field
  *  name is the argument, so one helper fits every list page. */
@@ -64,6 +73,11 @@ export function removeFromList<T extends object, R>(
  *  so every card bound to ["settings"] flips at once — instead of the
  *  toggle snapping back until a refetch lands. The caller still decides
  *  which OTHER keys (today, calendar, …) the change can have moved. */
+/** The one queue settings saves that write the whole stored view back go
+ *  through, so their replies land in the order they were sent and the last
+ *  one to land holds every change before it. */
+export const SETTINGS_SAVES = { id: "settings-email" };
+
 export function saveSettings(
   qc: QueryClient, body: Record<string, unknown>,
 ): Promise<Settings> {
@@ -71,4 +85,28 @@ export function saveSettings(
     qc.setQueryData<Settings>(["settings"], v);
     return v;
   });
+}
+
+/** A password, login-address or second-factor change pauses the
+ *  household's text number until a fresh code sent to it is typed back, so
+ *  a phone someone else verified stops getting the summaries. The reply
+ *  says when that happened; the owner hears it in the same sentence as the
+ *  rest of the change, and the notify card refetches so it shows the pause
+ *  instead of a stale "verified". Empty when nothing was paused. */
+export function smsPauseNote(
+  qc: QueryClient, r: { sms_number_needs_verify?: boolean } | null | undefined,
+): string {
+  if (!r?.sms_number_needs_verify) return "";
+  qc.invalidateQueries({ queryKey: ["notify"] });
+  return " Texts to the household's number are paused until you confirm "
+    + "it again (Settings → Daily email).";
+}
+
+/** A credential rotation (password, login address, a first second factor)
+ *  also ends every support-access grant this person made and can pause
+ *  outbound mail to the household's extra recipients — both shown on the
+ *  Settings screens, so both are refetched with the lists it empties. */
+export function invalidateAfterRotation(qc: QueryClient): void {
+  qc.invalidateQueries({ queryKey: ["support-access"] });
+  qc.invalidateQueries({ queryKey: ["settings"] });
 }
