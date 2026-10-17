@@ -20,20 +20,35 @@ inference), with per-account counts in the result.
 
 from __future__ import annotations
 
-import csv
 import datetime as dt
-import io
 
 from ..engine.compat import as_date
 from . import flowmap
 from .base import (FileImportIds, Transaction, ensure_split_account,
-                   upsert_transactions)
-from .csvimport import date_order, scrub_identifiers
+                   drop_before_history, upsert_transactions)
+from .csvimport import bounded_dict_reader, date_order, scrub_identifiers
 from .rowcap import capped
 from .dedup import Deduper
 
 MINT_COLUMNS = {"date", "description", "amount", "transaction type",
                 "category", "account name"}
+
+
+# The register's own columns number about a dozen. Every row becomes a
+# dict over the header (twice, with the lower-cased copy) and its raw
+# copy, so the row cap alone does not bound the memory: a header of a
+# thousand empty columns over the capped row count is a few MB of file
+# and gigabytes of dicts, in the process every household shares. A
+# header past this is refused before a row is read.
+MAX_COLUMNS = 40
+
+
+def _check_width(fieldnames) -> None:
+    if fieldnames is not None and len(fieldnames) > MAX_COLUMNS:
+        raise ValueError(
+            f"this file has {len(fieldnames):,} columns (max "
+            f"{MAX_COLUMNS}) — export the register as it comes, without "
+            f"added columns")
 
 CATEGORY_MAP = {
     "Groceries": "FOOD_AND_DRINK", "Restaurants": "FOOD_AND_DRINK",
@@ -126,7 +141,8 @@ def _date(s: str, order: str = "mdy") -> dt.date:
 
 def import_mint(conn, account_id: str, text: str,
                 batch_id: str | None = None) -> dict:
-    reader = csv.DictReader(io.StringIO(text))
+    reader = bounded_dict_reader(text)
+    _check_width(reader.fieldnames)
     parsed: list[tuple] = []
     # day-first or month-first is decided per FILE (csvimport.date_order)
     # overflow cells past the header arrive under the key None (a trailing
@@ -203,9 +219,13 @@ def _import_into(conn, account_id: str, parsed: list[tuple], *,
             category_primary=primary, category_detailed=detailed,
             raw={**raw, "_mint_category": cat_raw}))
     txns = ids.resolve(conn, txns)
+    # the household's history window (Settings → how far back): rows
+    # dated before it are left out and counted, never written
+    txns, skipped_older = drop_before_history(conn, txns)
     if batch_id:
         from . import batches
         batches.tag(conn, txns, batch_id)
     added = upsert_transactions(conn, txns)
     return {"imported": added, "rows": len(txns),
-            "skipped_duplicates": skipped_dupes}
+            "skipped_duplicates": skipped_dupes,
+            "skipped_older": skipped_older}

@@ -374,11 +374,13 @@ def _remove_members(conn, members: list[dict]) -> list[dict]:
     tokens are revoked, their unclaimed invites deleted and their webhooks
     paused before the row goes (the SET NULL keys would otherwise erase who
     made them), and their sessions, passkeys and device tokens cascade with
-    it. Their mail-list entries were taken off by
+    it. Their questions stay in the assistant's log without their name.
+    Their mail-list entries were taken off by
     `outbound_pause.note_removed_members` earlier in the same transaction.
     Returns the members whose row this deleted."""
     if not members:
         return []
+    from ..engine import assistant as _assistant
     from ..notify import webhooks
     gone = []
     for m in members:
@@ -401,6 +403,9 @@ def _remove_members(conn, members: list[dict]) -> list[dict]:
                 "DELETE FROM users WHERE id = %s AND tenant_id = %s "
                 "AND role <> 'owner' RETURNING id",
                 (m["id"], m["tenant_id"])).fetchone() is not None:
+            # the assistant's log keeps their questions but not their name,
+            # as every other removal leaves it
+            _assistant.forget_asker(conn, m["tenant_id"], m["id"])
             gone.append(m)
     log.warning("an owner's recovery or credential rotation removed %d "
                 "member(s) who joined through the owner's recent invites",

@@ -437,8 +437,10 @@ def _cat_moot(conn, tok: dict, r: dict,
     # `txn_id` is the row the tap now writes: the mailed charge, or the
     # posted row a mailed pending hold settled into
     txn_id = txn_id or tok["target"]
+    # a PERSON's split: a store's parts are its matcher's reading of the
+    # receipt, and the category its match wrote is caught just below
     if conn.execute("SELECT 1 FROM transaction_splits WHERE txn_id=%s "
-                    "LIMIT 1", (txn_id,)).fetchone():
+                    "AND source = 'user' LIMIT 1", (txn_id,)).fetchone():
         return {"state": "already",
                 "sentence": f"{r['payee']} was split since the email went "
                             "out, and its parts carry their own categories. "

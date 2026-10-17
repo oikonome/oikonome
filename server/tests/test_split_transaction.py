@@ -173,6 +173,19 @@ class RollupTests(unittest.TestCase):
         self.assertAlmostEqual(st["buckets"]["food"]["actual"], 110.0)
         self.assertAlmostEqual(st["buckets"]["other"]["actual"], 60.0)
 
+    def test_a_split_charge_is_one_transaction_in_its_year(self):
+        """Spend by year counts purchases: a three-way split is one charge,
+        not three."""
+        before = {y[0]: y[2] for y in
+                  reporting.compute_spending(self.conn, TODAY)["by_year"]}
+        splits.set_split(self.conn, self.big, [
+            {"category": FOOD, "amount": 40}, {"category": OTHER, "amount": 40},
+            {"category": HOME, "amount": 40}])
+        after = {y[0]: y[2] for y in
+                 reporting.compute_spending(self.conn, TODAY)["by_year"]}
+        self.assertEqual(after, before)
+        self.assertEqual(after[str(TODAY.year)], 3)
+
     def test_the_spending_reports_count_each_part_under_its_category(self):
         self._split()
         sp = reporting.compute_spending(self.conn, TODAY)

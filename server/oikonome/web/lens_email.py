@@ -254,9 +254,18 @@ def month_mail_context(d: dict, year: dict, y: int, m: int,
         sentence = f"You lost money this month: {_money(-net)} more out than in."
     flow = {"net_text": _signed(net) if net is not None else "—",
             "tone": _tone_of(net), "sentence": sentence, "net": net}
-    variable_line = _variable_line(d.get("variable_actual") or 0,
-                                   d.get("variable_budget") or 0,
-                                   variance, tolerance, final=status == "final")
+    if d.get("budget_set") is False:
+        # the household never saved a budget: there is nothing to judge
+        # the month against, so the line says so instead of a $0 verdict
+        variable_line = (f"Variable spend {_money(d.get('variable_actual') or 0)} "
+                         "— no budget was set for this month, so there is no "
+                         "verdict. Set one on the Budget page and next month's "
+                         "card will judge it.")
+    else:
+        variable_line = _variable_line(d.get("variable_actual") or 0,
+                                       d.get("variable_budget") or 0,
+                                       variance, tolerance,
+                                       final=status == "final")
     notes = []
     if status == "final" and d.get("budget_source") == "live":
         notes.append("No budget snapshot exists for this month — the verdict "
@@ -391,8 +400,11 @@ def build_monthly(conn, today: dt.date) -> tuple[str, str, str]:
     year = lenses.year_summary(conn, y, today=today)
     ctx = month_mail_context(d, year, y, m)
     verdict, variance = d["verdict"], d["variance"]
-    subject = (f"{ctx['label']} report card: {verdict_phrase(verdict)} "
-               f"({'+' if variance >= 0 else ''}{_money(variance)})")
+    if d.get("budget_set") is False or not verdict:
+        subject = f"{ctx['label']} report card: no budget set"
+    else:
+        subject = (f"{ctx['label']} report card: {verdict_phrase(verdict)} "
+                   f"({'+' if variance >= 0 else ''}{_money(variance)})")
     if ctx["flow"]["net"] is not None:
         subject += f" · net {ctx['flow']['net_text']}"
     html = _render(f"{ctx['label']} — report card", ctx)

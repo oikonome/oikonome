@@ -17,9 +17,11 @@ import { Card, H, HelpLink, KV, Pill, SharedLock } from "../../components/ui";
 import { Account, AccountRemoveMode, countsInTotals, errText,
          linkCardVisible } from "../../lib/api";
 import { patchList, patchQuery, removeFromList } from "../../lib/cache";
-import { plaidHostedLink } from "../../lib/plaid";
+import { plaidHostedLink, useFirstSyncLanding } from "../../lib/plaid";
 import { ago } from "../../lib/dates";
-import { accountRemoveMoved, accountRemoveNote, hueOf, keptRowsQuestion, institutionAllowance, lastSyncPhrase,
+import { CONFIRM_TO_CONNECT, VerifyEmailCard }
+  from "../../components/verify-email-card";
+import { firstSyncPending, linkedLine, accountRemoveMoved, accountRemoveNote, bankAwaitsConfirm, hueOf, keptRowsQuestion, institutionAllowance, lastSyncPhrase,
          listPhase, monogram, purgeKeptRows, signedBalance, classifyChange }
   from "../../lib/pure";
 import { useLogosOn } from "../../components/merchant-avatar";
@@ -178,6 +180,12 @@ export default function Accounts() {
   const instUsed = me.data?.features?.institutions_used;
   const { known: instCapKnown, full: instFull } =
     institutionAllowance(instCap, instUsed);
+  // a free trial whose owner has not confirmed has an allowance of zero
+  // (the server says so on /api/me): the bank door
+  // closes with the confirm card above it, before the tap the server
+  // refuses; the manual account and its imports stay open (the web
+  // Accounts ConnectCard)
+  const confirmFirst = bankAwaitsConfirm(me.data);
   // Plaid: add / fix / reconnect all funnel through the hosted link
   const [plaidBusy, setPlaidBusy] = useState(false);
   const conns = useQuery({
@@ -191,8 +199,13 @@ export default function Accounts() {
     // already refreshes on completion. An idle timer would run all day on
     // every tab, each tick re-serializing the whole persisted cache
     // (accounts incl. base64 logos, every transactions page) into MMKV.
-    refetchInterval: plaidBusy ? 3000 : syncing ? 5000 : false,
+    // ...and a just-linked bank's first sync, queued on the worker, polls
+    // until it lands (then its accounts are refreshed, below)
+    refetchInterval: (q) => plaidBusy ? 3000 : syncing ? 5000
+      : (q.state.data?.connections ?? []).some(firstSyncPending) ? 5000
+      : false,
   });
+  useFirstSyncLanding(conns.data?.connections);
   // both move only after a sync, and the running→done edge invalidates
   const holdings = useQuery({
     queryKey: ["holdings"],
@@ -220,7 +233,7 @@ export default function Accounts() {
       } else if (s0.kind === "add_failed" || s0.kind === "update_failed")
         setNotice(`Link failed: ${s0.error ?? "unknown"}`, true);
       else if (s0.kind === "update") setNotice("Reconnected.");
-      else { setNotice(`Linked ${s0.institution || "bank"} ✓`); added = true; }
+      else { setNotice(linkedLine(s0.institution, s0.first_sync)); added = true; }
     } catch (e) { setNotice(errText(e), true); }
     setPlaidBusy(false);
     if (!changed) return;
@@ -637,6 +650,8 @@ export default function Accounts() {
       {/* one row, two small doors: the bank sign-in (Plaid) and a manual
           account, with no introductory paragraph — the button says where
           it goes. */}
+      {!viewer && owner && confirmFirst && (
+        <VerifyEmailCard me={me.data} note={CONFIRM_TO_CONNECT} />)}
       {!viewer && (
         <View style={s.syncRow}>
           {owner && (
@@ -644,9 +659,12 @@ export default function Accounts() {
             // server refuses past it anyway, but on the hosted link path
             // that refusal can land after the bank was authorized
             <SharedLock note={credentialLock}>
-              <Pressable style={[s.syncBtn, (plaidBusy || instFull)
+              <Pressable style={[s.syncBtn, (plaidBusy || instFull
+                                             || confirmFirst)
                                             && { opacity: 0.5 }]}
-                         disabled={plaidBusy || instFull}
+                         disabled={plaidBusy || instFull || confirmFirst}
+                         accessibilityHint={confirmFirst ? CONFIRM_TO_CONNECT
+                                                         : undefined}
                          onPress={() => plaid()}>
                 <Text style={s.syncText}>
                   {plaidBusy ? "Connecting…" : "＋ Connect account ↗"}
@@ -672,7 +690,7 @@ export default function Accounts() {
       )}
       {/* both figures from the server — the cap has a per-tenant
           override an operator can raise */}
-      {owner && instCapKnown && instFull && (
+      {owner && instCapKnown && instFull && !confirmFirst && (
         <Text style={[s.mut, { marginHorizontal: 12, marginTop: 4 }]}>
           {ext.allowanceNote(instUsed, instCap, instFull)}
         </Text>
@@ -756,8 +774,17 @@ export default function Accounts() {
                       ? "new accounts to share"
                       : "sync failing"}
               </Text>
-              <Pressable style={[s.btn, plaidBusy && { opacity: 0.5 }]}
-                         disabled={plaidBusy}
+              <Pressable style={[s.btn, (plaidBusy || (c.status === "reaped"
+                                                      && confirmFirst))
+                                        && { opacity: 0.5 }]}
+                         // a fresh link is a new connection, closed to a
+                         // trial still waiting on confirmation (the card
+                         // above says why); fixing a live one stays open
+                         disabled={plaidBusy
+                                   || (c.status === "reaped" && confirmFirst)}
+                         accessibilityHint={c.status === "reaped"
+                                            && confirmFirst
+                           ? CONFIRM_TO_CONNECT : undefined}
                          onPress={() =>
                            // a reaped Item's token is gone — reconnect
                            // must be a FRESH link, not update mode

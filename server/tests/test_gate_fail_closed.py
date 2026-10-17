@@ -92,6 +92,13 @@ class EveryAnswerFailsClosedTests(unittest.TestCase):
         "mail_kinds", "console_context", "tenant_context", "health",
         "on_tenant_restored", "accounts_used", "accounts_used_guarded",
         "capacity_message",
+        # a verification stamp is never refused: the person proved their
+        # mailbox, and a broken add-on must not strand them unverified
+        "on_email_verified",
+        # only says WHY the cap is 0; the fail-closed cap of 0 already
+        # closes every add-a-bank door, and "confirm your email" would be
+        # the wrong reason to give
+        "bank_awaits_confirm",
     }
 
     def setUp(self):
@@ -136,6 +143,8 @@ class EveryAnswerFailsClosedTests(unittest.TestCase):
             self.g.release_tenant("any-tenant")
         with self.assertRaises(ext.GateUnavailable):
             self.g.on_tenant_purge(None, "any-tenant")
+        with self.assertRaises(ext.GateUnavailable):
+            self.g.on_login_email_moved(None, "t", "u", "a@x", "b@x")
 
     def test_the_lockout_lookup_falls_to_the_gate_for_an_unnamed_status(self):
         known = {"suspended": (403, "suspended", ())}

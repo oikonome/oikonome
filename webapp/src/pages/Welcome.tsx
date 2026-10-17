@@ -1,40 +1,91 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type CSSProperties, type ReactNode, useEffect, useRef, useState }
   from "react";
-import { useNavigate } from "react-router";
-import { api, errText, kindIs, type Onboarding, type WizardStep } from "../api/client";
-import { saveSettings } from "../api/cache";
+import { Link, useNavigate } from "react-router";
+import { api, errText, kindIs, money, type Onboarding, type SetupMode,
+         type Settings, type WizardStep } from "../api/client";
+import { saveSettings, SETTINGS_SAVES } from "../api/cache";
 import { browserPushBlocked, enableBrowserPush } from "../push";
 import { leftWizard } from "../wizardexit";
 import BudgetPlanner from "../components/BudgetPlanner";
-import ConnectHub from "../components/ConnectHub";
-import Bills from "./Bills";
-import { isOwner } from "../role";
+import ConnectHub, { FIRST_SYNC_RUNNING } from "../components/ConnectHub";
+import HistoryChoice, { historyLabel } from "../components/HistoryChoice";
+import ManualBudgets from "../components/ManualBudgets";
+import { chooseTheme, type Theme } from "../components/themeChoice";
+import { VerifyEmailCard } from "../components/VerifyEmailCard";
+import { AutoBillsPane, ManualBillsPane, SetupQuestion }
+  from "../components/WizardBills";
+import { isOwner, isViewer } from "../role";
+import { looksLikeMailbox, NEED_BASE_URL, recipientDuplicate }
+  from "../recipients";
+import { readStore } from "../safestorage";
 import { sharedLock } from "../sharedlogin";
 
 /** strict linear guided setup. One step at a time, one clear
  *  primary action per step; the dots are a passive progress indicator.
- *  Steps: Connect → Bills → Budgets → Finish (recap). Self-host inserts
- *  optional SMTP before Finish. There are deliberately no sync or
- *  older-history steps: the Plaid link already pulls data, and file import
- *  lives under Connect / Accounts.
+ *  Steps: Appearance → Connect → Bills & budgets (a question, then the
+ *  finder's proposals or a hand-entry form) → Budgets → Email & push →
+ *  Done (summary). The same six on every instance: what differs between a
+ *  hosted and a self-hosted one (bank linking, the outbound mail account)
+ *  differs inside a step, never in the step list, so a resume mark always
+ *  means the same step.
  *  Step completion is an explicit user action (done/skipped marks in
  *  tenant config via wizard_steps); the resume pill re-enters at the
  *  first unfinished step. */
 
-// self-hosted gets an optional SMTP step before Finish; hosted deploys
-// have operator mail and skip it
-const stepKeys = (hosted: boolean): WizardStep[] => hosted
-  ? ["connect", "bills", "budgets", "finish"]
-  : ["connect", "bills", "budgets", "email", "finish"];
+const STEP_KEYS: WizardStep[] =
+  ["appearance", "connect", "bills", "budgets", "email", "finish"];
 
 // prominent forward/primary button in the wizard footer
 const fwdBtn: CSSProperties = {
   padding: ".55rem 1.15rem", fontSize: 15, fontWeight: 600,
 };
 
-function BudgetsStep({ onSaved }: { onSaved: () => void }) {
-  return <BudgetPlanner onSaved={onSaved} />;
+// "7:00 am" — the wording of the send-hour picker and the closing summary
+const hourLabel = (h: number) =>
+  `${h % 12 === 0 ? 12 : h % 12}:00 ${h < 12 ? "am" : "pm"}`;
+
+const THEMES: { t: Theme; title: string; sw: string; preview: string;
+                caption: string }[] = [
+  { t: "auto", title: "Auto", sw: "auto", preview: "follows the system",
+    caption: "Matches your device's light/dark setting. Default." },
+  { t: "light", title: "Light", sw: "light", preview: "Today · $1,240 left",
+    caption: "Always light, on every device you sign in on." },
+  { t: "dark", title: "Dark", sw: "dark", preview: "Today · $1,240 left",
+    caption: "Always dark, on every device you sign in on." },
+];
+
+/** The theme this login is using: a viewer or the demo keeps it on the
+ *  device, everyone else on the household (absent = auto). */
+function useThemeNow(): Theme {
+  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
+  const s = useQuery({ queryKey: ["settings"], queryFn: api.settings });
+  const perDevice = isViewer(me) || !!me.data?.demo;
+  const stored = readStore("local", "oiko-theme");
+  const local: Theme = stored === "light" || stored === "dark" ? stored : "auto";
+  return perDevice ? local : (s.data?.theme ?? "auto");
+}
+
+/** Step 1. A tap applies at once and is saved by the shell (which knows
+ *  whether this login keeps it per device). */
+function AppearanceStep() {
+  const now = useThemeNow();
+  const [picked, setPicked] = useState<Theme | null>(null);
+  const cur = picked ?? now;
+  return (
+    <div className="wiz-choice three" role="radiogroup" aria-label="Appearance">
+      {THEMES.map((o) => (
+        <button key={o.t} type="button" role="radio" aria-checked={cur === o.t}
+                className={"wiz-opt" + (cur === o.t ? " sel" : "")}
+                onClick={() => { setPicked(o.t); chooseTheme(o.t); }}>
+          {cur === o.t && <span className="wiz-opt-pick">SELECTED</span>}
+          <b>{o.title}</b>
+          <span className={"wiz-swatch " + o.sw} aria-hidden>{o.preview}</span>
+          <small>{o.caption}</small>
+        </button>
+      ))}
+    </div>
+  );
 }
 
 /** Imported and manual accounts start at $0, which poisons the cash
@@ -156,13 +207,16 @@ function BackfillGate({ children }: { children: ReactNode }) {
   // The poll is read-only. Kicking a quiet backfill is a write, so it is
   // an owner-only POST — a self-host without a public webhook URL (and
   // Plaid Sandbox, whose HISTORICAL_UPDATE webhook does not arrive) would
-  // otherwise wait for the hourly cron. Once on mount was not enough: the
-  // link-time pull is too recent at that moment, so the server
-  // rightly declines to start another, and nothing pulls again — the bar
-  // sits at its first fill looking stuck.
+  // otherwise wait for the hourly cron. A new bank's first pull is not
+  // made at link time: it is queued on the worker, and a queued first sync
+  // counts as syncing, so the nudge only asks the worker and never starts
+  // a second pull beside it. Once on mount was not enough: while a pull
+  // is queued or just ran the server rightly declines to start another,
+  // and nothing pulls again — the bar sits at its first fill looking stuck.
   // So it repeats every 30 s while the wait lasts; the server keeps its
-  // guards (no pull in the last 45 s, no sync running), so a re-nudge
-  // costs nothing while history is flowing and rescues the quiet case.
+  // guards (no pull in the last 45 s, no sync running, no first sync queued, at most one queued pull per bank a minute), so a
+  // re-nudge costs nothing while history is flowing and rescues the quiet
+  // case.
   // A viewer's 403 is expected and ignored.
   const waiting = !!q.data && !q.data.all_ready;
   useEffect(() => {
@@ -235,6 +289,8 @@ function BackfillGate({ children }: { children: ReactNode }) {
             ) : (
               <span style={{ color: "var(--blue, #58a6ff)", fontSize: 13 }}>
                 {it.active ? "pulling from your bank…"
+                  // nothing has landed yet: the first sync is queued
+                  : it.transactions === 0 ? FIRST_SYNC_RUNNING
                   : "waiting for the bank to send more…"}</span>
             )}
             <BackfillBar frac={it.stalled ? 1 : it.progress}
@@ -259,16 +315,123 @@ export function deliveryOf(on: boolean, push: boolean): Delivery {
 export function flagsOf(d: Delivery): { on: boolean; push: boolean } {
   return { on: d === "email" || d === "both", push: d === "push" || d === "both" };
 }
+const DELIVERY_WORDS: Record<Delivery, string> = {
+  email: "Email", push: "Push", both: "Email and push", off: "Off" };
 
-/** Closing recap + the daily verdict's delivery: email, push, both or
- *  off, the hour, and the email's face. Reflects what is ALREADY set —
- *  with no schedule saved the daily email is on by default (the worker's
- *  behaviour), so a lone "Enable" button would be both redundant and, once
- *  pressed, irreversible from here — which reads as an enable/disable that
- *  does not work. Choosing push here also registers THIS browser, the same
- *  door Settings → Email & Push opens, so the choice is not a promise the
+/** Who the scheduled mail reaches: the owner (always), then every other
+ *  address on the settings view with its own on/off. The Email & push step
+ *  lists them; the closing summary counts them. */
+function recipientRows(st: Settings | undefined) {
+  const muted = new Set((st?.email_muted ?? []).map((m) => m.toLowerCase()));
+  const rows = (st?.email_recipient_status ?? []).map((r) => ({
+    ...r, off: !r.owner && (!!r.muted || muted.has(r.email.toLowerCase())) }));
+  return [...rows.filter((r) => r.owner), ...rows.filter((r) => !r.owner)];
+}
+
+/** "Who gets the email": the household's addresses with their on/off and
+ *  an add box. The same doors Settings → Email & Push uses — the mute
+ *  lists and email_recipients_added — so an address added here is invited
+ *  exactly as one added there. The owner's own row has no switch here:
+ *  turning yourself off belongs in Settings, not in a first run. */
+function RecipientsBlock() {
+  const qc = useQueryClient();
+  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
+  const s = useQuery({ queryKey: ["settings"], queryFn: api.settings });
+  const notify = useQuery({ queryKey: ["notify"], queryFn: api.notifyStatus });
+  const [draft, setDraft] = useState("");
+  const [note, setNote] = useState<{ text: string; bad?: boolean } | null>(null);
+  const save = useMutation({
+    mutationFn: (body: Record<string, unknown>) => saveSettings(qc, body),
+    // one settings write at a time, in order, with the other email saves
+    scope: SETTINGS_SAVES,
+    onError: (e) => {
+      setNote({ text: errText(e), bad: true });
+      qc.invalidateQueries({ queryKey: ["settings"] });
+    },
+  });
+  const rows = recipientRows(s.data);
+  const owner = rows.find((r) => r.owner);
+  const addLock = sharedLock(me.data, "grant");
+  const add = () => {
+    const v = draft.trim();
+    if (!v) return;
+    if (notify.data?.invites_need_base_url) {
+      setNote({ text: NEED_BASE_URL, bad: true }); return;
+    }
+    if (!looksLikeMailbox(v)) {
+      setNote({ text: "That doesn't look like an email address.", bad: true });
+      return;
+    }
+    const dupe = recipientDuplicate(v, s.data?.email_recipients ?? [],
+                                    owner?.email ?? me.data?.email);
+    if (dupe) { setNote({ text: dupe }); setDraft(""); return; }
+    setNote(null); setDraft("");
+    save.mutate({ email_recipients_added: [v] }, {
+      onSuccess: () => setNote({ text: `Invitation sent to ${v}.` }) });
+  };
+  const toggle = (email: string, off: boolean) =>
+    save.mutate(off ? { email_muted_remove: [email.toLowerCase()] }
+                    : { email_muted_add: [email.toLowerCase()] });
+  const role = (r: (typeof rows)[number]) =>
+    r.owner ? "owner" : r.member ? "member"
+      : r.invite === "accepted" ? "accepted"
+      : r.invite === "invited" ? "invitation sent"
+      : r.invite ? `invitation ${r.invite}` : "added";
+  return (
+    <div className="wiz-sub">
+      <b>Who gets the email</b>
+      <div className="wiz-rows">
+        {rows.length === 0 && me.data?.email && (
+          <div className="wiz-row"><div className="wiz-row-main">
+            <span className="wiz-addr">{me.data.email}{" "}
+              <small className="mut">· owner</small></span>
+            <span className="pill g">on</span></div></div>)}
+        {rows.map((r) => (
+          <div key={r.email} className="wiz-row"><div className="wiz-row-main">
+            <span className="wiz-addr">{r.email}{" "}
+              <small className="mut">· {role(r)}</small></span>
+            {r.owner ? <span className="pill g">on</span> : (
+              <button type="button" role="switch" aria-checked={!r.off}
+                      aria-label={`${r.email} receives the email`}
+                      className={"wiz-pill" + (r.off ? "" : " sel")}
+                      disabled={save.isPending}
+                      onClick={() => toggle(r.email, r.off)}>
+                {r.off ? "off" : "on"}</button>)}
+          </div></div>
+        ))}
+      </div>
+      {addLock ? (
+        <p className="mut" style={{ color: "var(--amber)", fontSize: 13 }}>
+          {addLock}</p>
+      ) : (
+        <div className="wiz-addrow">
+          <input type="email" placeholder="Add another address" value={draft}
+                 aria-label="Add another address"
+                 onChange={(e) => setDraft(e.target.value)}
+                 onKeyDown={(e) => { if (e.key === "Enter") add(); }} />
+          <button type="button" disabled={save.isPending || !draft.trim()}
+                  onClick={add}>Add</button>
+        </div>
+      )}
+      {note && <p className={note.bad ? "neg" : "mut"}
+                  style={{ fontSize: 13, margin: ".3rem 0 0" }}>{note.text}</p>}
+      <p className="mut" style={{ fontSize: 12, margin: ".3rem 0 0" }}>
+        A new address gets one confirmation email first and can unsubscribe
+        from any message. Members can also turn their own copy off in
+        Settings.</p>
+    </div>
+  );
+}
+
+/** Step 5: how the daily verdict reaches the household — email, push,
+ *  both or off, the hour, the email's face, this device's push — and who
+ *  gets it. Reflects what is ALREADY set: with no schedule saved the daily
+ *  email is on by default (the worker's behaviour), so a lone "Enable"
+ *  button would be both redundant and, once pressed, irreversible from
+ *  here. Choosing push also registers THIS browser, the same door
+ *  Settings → Email & Push opens, so the choice is not a promise the
  *  browser has not agreed to. */
-function FinishStep({ d }: { d: Onboarding | undefined }) {
+function EmailPushStep() {
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const s = useQuery({ queryKey: ["settings"], queryFn: api.settings });
   const notify = useQuery({ queryKey: ["notify"], queryFn: api.notifyStatus });
@@ -298,6 +461,7 @@ function FinishStep({ d }: { d: Onboarding | undefined }) {
                    hour: next.hour, summary: next.summary },
         },
       }),
+    scope: SETTINGS_SAVES,
     onError: () => setDeliveryOv(null),     // failed write ≠ new truth
   });
   const commit = (patch: Partial<{ on: boolean; push: boolean; hour: number;
@@ -312,86 +476,96 @@ function FinishStep({ d }: { d: Onboarding | undefined }) {
   const pushReady = webPush || !!notify.data?.native_push_available;
   const pushHere = !!notify.data?.push_subscribed;
   const phones = notify.data?.native_push_devices ?? 0;
+  const enableHere = async () => {
+    if (!notify.data?.vapid_public_key) return;
+    // the shared demonstration login may choose push for the schedule
+    // (phones already registered still get it) but may not plant this
+    // browser as a new destination: the server refuses the subscription,
+    // so stop before the browser asks for permission it can't use
+    const grantLock = sharedLock(me.data, "grant");
+    if (grantLock) { setPushNote({ bad: true, text: grantLock }); return; }
+    if (browserPushBlocked()) {
+      setPushNote({ bad: true, text: "This browser cannot receive push on "
+        + "http:// — the phone app can, or open the instance over https." });
+      return;
+    }
+    try {
+      const r = await enableBrowserPush(notify.data.vapid_public_key);
+      setPushNote(r.ok ? { text: "This browser will receive it." }
+                       : { bad: true, text: r.reason });
+      if (r.ok) qc.invalidateQueries({ queryKey: ["notify"] });
+    } catch (e) { setPushNote({ bad: true, text: errText(e) }); }
+  };
   const choose = async (next: Delivery) => {
     setDeliveryOv(next); setPushNote(null);
     commit(flagsOf(next));
     // the browser's own subscription rides along with the choice: a
     // schedule that says "push" to a browser that never agreed sends to
     // nobody, and the person would only learn that tomorrow morning
-    if ((next === "push" || next === "both") && pushReady && !pushHere
-        && notify.data?.vapid_public_key) {
-      // the shared demonstration login may choose push for the schedule
-      // (phones already registered still get it) but may not plant this
-      // browser as a new destination: the server refuses the subscription,
-      // so stop before the browser asks for permission it can't use
-      const grantLock = sharedLock(me.data, "grant");
-      if (grantLock) { setPushNote({ bad: true, text: grantLock }); return; }
-      if (browserPushBlocked()) {
-        setPushNote({ bad: true, text: "This browser cannot receive push on "
-          + "http:// — the phone app can, or open the instance over https." });
-        return;
-      }
-      try {
-        const r = await enableBrowserPush(notify.data.vapid_public_key);
-        setPushNote(r.ok ? { text: "This browser will receive it." }
-                         : { bad: true, text: r.reason });
-        if (r.ok) qc.invalidateQueries({ queryKey: ["notify"] });
-      } catch (e) { setPushNote({ bad: true, text: errText(e) }); }
-    }
+    if ((next === "push" || next === "both") && webPush && !pushHere)
+      await enableHere();
   };
-  const smtpSet = !!(s.data?.smtp_host || s.data?.smtp_password_set)
-    || !!me.data?.hosted;
-  const money = (v: number | null | undefined) =>
-    v && v > 0 ? `$${Math.round(v).toLocaleString()}` : null;
-  const budgets = [money(s.data?.food_monthly) &&
-                   `${money(s.data?.food_monthly)} food`,
-                   money(s.data?.other_monthly) &&
-                   `${money(s.data?.other_monthly)} everything-else`]
-    .filter(Boolean).join(" / ");
-  const hourLabel = (h: number) =>
-    h === 0 ? "12am" : h < 12 ? `${h}am` : h === 12 ? "12pm" : `${h - 12}pm`;
+  const hosted = !!me.data?.hosted;
+  const smtpSet = !!(s.data?.smtp_host || s.data?.smtp_password_set);
   return (
     <div>
-      <h2 style={{ marginTop: 0 }}>You're set up ✓</h2>
-      <ul style={{ margin: ".3rem 0 .8rem", paddingLeft: "1.3rem" }}>
-        <li><b>{d?.accounts ?? 0}</b> account{(d?.accounts ?? 0) === 1 ? "" : "s"} ·{" "}
-          <b>{(d?.transactions ?? 0).toLocaleString()}</b>{" "}
-          transaction{(d?.transactions ?? 0) === 1 ? "" : "s"}</li>
-        <li><b>{d?.bills ?? 0}</b> recurring bill{(d?.bills ?? 0) === 1 ? "" : "s"} & paychecks tracked</li>
-        <li>{budgets ? <>budgets: <b>{budgets}</b></>
-          : <span className="mut">no budgets set (Settings any time)</span>}</li>
-      </ul>
-      <BalanceNudge />
-      <h3 style={{ marginBottom: ".3rem" }}>Daily verdict</h3>
-      <p className="mut" style={{ marginTop: 0 }}>
-        Each morning: on budget or not, and the number to hit. Where it
-        goes:
-        {!smtpSet && on && " (Email needs SMTP in Settings → Email & Push before it can send.)"}
-      </p>
-      <div style={{ display: "flex", gap: ".5rem", flexWrap: "wrap",
-                    marginBottom: ".5rem" }}>
-        {([["email", "Email"], ["push", "Push notification"],
-           ["both", "Both"], ["off", "Off"]] as [Delivery, string][]).map(
-          ([v, label]) => (
-            <button key={v} className={delivery === v ? "pri" : ""}
-                    disabled={save.isPending
-                              || ((v === "push" || v === "both") && !pushReady)}
-                    title={(v === "push" || v === "both") && !pushReady
-                      ? "Push is not configured on this instance" : ""}
-                    onClick={() => choose(v)}>{label}</button>
-          ))}
-        {(on || push) && (
-          <label style={{ alignSelf: "center" }}>at{" "}
-            <select value={hourVal}
-              onChange={(e) => { setHour(+e.target.value);
-                                 commit({ hour: +e.target.value }); }}>
-              {Array.from({ length: 24 }, (_, h) => (
-                <option key={h} value={h}>{hourLabel(h)}</option>))}
-            </select>
-          </label>
-        )}
+      <div className="wiz-field">
+        <span><b>Daily verdict</b></span>
+        <span className="wiz-pills" role="radiogroup" aria-label="Daily verdict">
+          {(["email", "push", "both", "off"] as Delivery[]).map((v) => {
+            const noPush = (v === "push" || v === "both") && !pushReady;
+            return (
+              <button key={v} type="button" role="radio"
+                      aria-checked={delivery === v}
+                      className={"wiz-pill" + (delivery === v ? " sel" : "")}
+                      disabled={save.isPending || noPush}
+                      title={noPush ? "Push is not configured on this instance" : ""}
+                      onClick={() => choose(v)}>
+                {v === "both" ? "Both" : DELIVERY_WORDS[v]}</button>
+            );
+          })}
+        </span>
       </div>
-      {push && (
+      {/* hosted mail goes to confirmed addresses only: a fresh signup
+          choosing Email here would otherwise wait for a morning that
+          never comes, with the way to a fresh link three days off */}
+      {on && (
+        <VerifyEmailCard me={me.data} inline>
+          Email delivery starts once your address is confirmed.
+        </VerifyEmailCard>)}
+      {(on || push) && (
+        <div className="wiz-field">
+          <span>Send at</span>
+          <select value={hourVal} aria-label="Send at"
+            onChange={(e) => { setHour(+e.target.value);
+                               commit({ hour: +e.target.value }); }}>
+            {Array.from({ length: 24 }, (_, h) => (
+              <option key={h} value={h}>{hourLabel(h)}</option>))}
+          </select>
+        </div>
+      )}
+      {on && (
+        <label className="wiz-field">
+          <span>Short summary instead of the full report{" "}
+            <small className="mut">— just the verdict card: on budget or
+              not, left to spend, pinned bills</small></span>
+          <input type="checkbox" checked={summaryVal}
+                 onChange={(e) => { setSummary(e.target.checked);
+                                    commit({ summary: e.target.checked }); }} />
+        </label>
+      )}
+      {webPush && (
+        <div className="wiz-field">
+          <span>Push to this device{" "}
+            <small className="mut">(asks the browser or phone for
+              permission)</small></span>
+          {pushHere ? <span className="pill g">on</span>
+            : <button type="button" onClick={() => { setPushNote(null);
+                                                     void enableHere(); }}>
+                Turn on</button>}
+        </div>
+      )}
+      {(push || pushNote) && (
         <p className="mut" style={{ margin: "0 0 .5rem", fontSize: 13 }}>
           {pushNote ? <span className={pushNote.bad ? "neg" : ""}>{pushNote.text}</span>
             : pushHere ? "This browser will receive it."
@@ -401,173 +575,83 @@ function FinishStep({ d }: { d: Onboarding | undefined }) {
           {phones > 0 && ` ${phones} phone${phones === 1 ? "" : "s"} registered via the mobile app.`}
         </p>
       )}
-      {on && (
-        <div style={{ display: "flex", flexDirection: "column", gap: ".3rem",
-                      marginBottom: ".6rem" }}>
-          <label style={{ display: "flex", gap: ".5rem",
-                          alignItems: "baseline" }}>
-            <input type="radio" name="daily-shape" checked={!summaryVal}
-              onChange={() => { setSummary(false); commit({ summary: false }); }} />
-            <span><b>Full report</b>{" "}
-              <span className="mut">— the verdict plus the whole Today
-                page: spending buckets, recent transactions, upcoming
-                bills.</span></span>
-          </label>
-          <label style={{ display: "flex", gap: ".5rem",
-                          alignItems: "baseline" }}>
-            <input type="radio" name="daily-shape" checked={summaryVal}
-              onChange={() => { setSummary(true); commit({ summary: true }); }} />
-            <span><b>Verdict only</b>{" "}
-              <span className="mut">— just the card: on budget or not,
-                left to spend, pinned bills.</span></span>
-          </label>
-        </div>
+      {save.isError && <p className="neg">{errText(save.error)}</p>}
+      <RecipientsBlock />
+      {/* a self-hosted instance sends through its own outbound account;
+          a hosted one has the operator's, so the line never appears there */}
+      {!hosted && (
+        <p className="wiz-sub" style={{ fontSize: 14 }}>
+          Outbound mail account —{" "}
+          <b>{smtpSet ? "set up" : "not set up yet"}</b> ·{" "}
+          <Link to="/settings/email">Open email settings</Link></p>
       )}
-      {/* no recipient line and no household link here: the link would
-          lead OUT of the wizard, and the household is added later from
-          Settings */}
-      {save.isError && <p className="mut">{String(save.error)}</p>}
     </div>
   );
 }
 
-const SMTP_PROVIDERS: { name: string; host: string; port: number;
-                        note: ReactNode }[] = [
-  { name: "Gmail", host: "smtp.gmail.com", port: 587,
-    note: <>Turn on 2-step verification, then create an <b>app password</b>{" "}
-      at <a href="https://myaccount.google.com/apppasswords" target="_blank"
-      rel="noreferrer">myaccount.google.com/apppasswords</a>. User = your
-      full Gmail address; password = the 16-character app password (your
-      normal password won't work).</> },
-  { name: "Outlook / Hotmail", host: "smtp-mail.outlook.com", port: 587,
-    note: <>At <a href="https://account.microsoft.com/security"
-      target="_blank" rel="noreferrer">account.microsoft.com/security</a>{" "}
-      enable two-step verification, then add an <b>app password</b>. User =
-      your full address; password = the app password.</> },
-  { name: "Yahoo", host: "smtp.mail.yahoo.com", port: 587,
-    note: <>Yahoo Account Security → <b>Generate app password</b>. User =
-      your full Yahoo address; password = the app password.</> },
-  { name: "iCloud", host: "smtp.mail.me.com", port: 587,
-    note: <>At <a href="https://appleid.apple.com" target="_blank"
-      rel="noreferrer">appleid.apple.com</a> → Sign-In & Security →{" "}
-      <b>App-specific passwords</b>. User = your full iCloud address.</> },
-  { name: "Fastmail", host: "smtp.fastmail.com", port: 587,
-    note: <>Settings → Privacy & Security → <b>New app password</b>{" "}
-      (scope: SMTP). User = your full Fastmail address.</> },
-  { name: "Proton Mail", host: "smtp.protonmail.ch", port: 587,
-    note: <>Needs a paid plan with a custom domain: Settings →{" "}
-      <b>IMAP/SMTP</b> → generate an <b>SMTP token</b>. User = your full
-      address; password = the token. (Proton Bridge users: point host/port
-      at the Bridge's local SMTP instead, keep STARTTLS on, and set{" "}
-      <code>OIKONOME_SMTP_NO_VERIFY=1</code> in the server's{" "}
-      <code>.env</code> — the Bridge's certificate is self-signed.)</> },
-];
-
-/** Optional SMTP step (self-hosted only): the daily verdict email needs an
- *  outbound mail account. Provider quick-guides prefill host/port; the
- * password is stored encrypted, write-only. */
-function EmailStep() {
-  const qc = useQueryClient();
+/** Step 6: what the walk set up, one line per step, read back from the
+ *  server — so a resumed wizard summarises what is stored, not what this
+ *  tab happens to remember. */
+function DoneStep({ d }: { d: Onboarding | undefined }) {
   const s = useQuery({ queryKey: ["settings"], queryFn: api.settings });
-  const [host, setHost] = useState<string | null>(null);
-  const [port, setPort] = useState<string | null>(null);
-  const [user, setUser] = useState<string | null>(null);
-  const [pw, setPw] = useState("");
-  const [from, setFrom] = useState<string | null>(null);
-  const [tls, setTls] = useState<boolean | null>(null);
-  const hostVal = host ?? s.data?.smtp_host ?? "";
-  const portVal = port ?? String(s.data?.smtp_port ?? 587);
-  const userVal = user ?? s.data?.smtp_user ?? "";
-  const fromVal = from ?? s.data?.smtp_from ?? "";
-  const tlsVal = tls ?? s.data?.smtp_starttls !== false;
-  const save = useMutation({
-    mutationFn: () => api.settingsSave({
-      smtp_host: hostVal.trim(), smtp_port: portVal,
-      smtp_user: userVal.trim(), smtp_password: pw,
-      smtp_from: (fromVal || userVal).trim(), smtp_starttls: tlsVal }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["settings"] }),
-  });
-  const test = useMutation({ mutationFn: api.smtpTest });
-  // a LAN relay may take mail with no login at all, so a stored host is
-  // all the server needs to send — the account and password are optional
-  const saved = !!s.data?.smtp_host;
-  const inp = (val: string, set: (v: string) => void, ph: string,
-               type = "text", width = "14rem") => (
-    <input type={type} value={val} placeholder={ph}
-      onChange={(e) => set(e.target.value)}
-      style={{ width, padding: ".5rem", background: "var(--hover)",
-               border: "1px solid var(--line)", borderRadius: "var(--rs)",
-               color: "var(--ink)" }} />
-  );
+  const bills = useQuery({ queryKey: ["bills"], queryFn: () => api.bills() });
+  const theme = useThemeNow();
+  const tracked = (bills.data?.bills ?? []).filter((b) => !b.disabled);
+  const nInc = tracked.filter((b) => b.income).length;
+  const nBills = tracked.length - nInc;
+  const daily = s.data?.email_schedule?.daily;
+  const delivery = deliveryOf(daily?.on ?? true, !!daily?.push);
+  const nRecip = Math.max(1, recipientRows(s.data).filter((r) => !r.off).length);
+  const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
+  const conns = d?.connections ?? 0;
+  const reach = d && d.history_months !== undefined ? d.history_months
+    : s.data?.history_months;
+  const accounts = conns > 0 ? `${conns} connected`
+    : (d?.accounts ?? 0) > 0 ? `${plural(d?.accounts ?? 0, "account")} from files`
+    : "none yet";
+  // the figures only when the household set a budget (onboarding's
+  // budgets_set, the verdict's own gate): under a month of history the
+  // settings carry a provisional seed nobody chose, and the summary would
+  // otherwise call the app's guess the person's budget
+  const budgets = d?.budgets_set
+    ? `Food ${money(s.data?.food_monthly ?? 0)} · Everything else `
+      + money(s.data?.other_monthly ?? 0)
+    : "not set yet (Budget page any time)";
+  const rows: [string, string][] = [
+    ["Appearance", theme.charAt(0).toUpperCase() + theme.slice(1)],
+    ["Accounts", `${accounts} · ${historyLabel(reach)}`],
+    ["Bills & income",
+      `${plural(nBills, "bill")}, ${plural(nInc, "paycheck")} approved`],
+    ["Budgets", budgets],
+    ["Email & push", `${DELIVERY_WORDS[delivery]}`
+      + (delivery === "off" ? "" : ` at ${hourLabel(daily?.hour ?? 7)}`)
+      + ` · ${plural(nRecip, "recipient")}`],
+  ];
   return (
     <div>
-      <p className="mut" style={{ marginTop: 0 }}>
-        The daily verdict lands by email — that needs an outbound (SMTP)
-        account. Any provider works; the quick guides below cover the
-        common ones. Totally optional: skip it and set it up later in
-        Settings → Email & Push.</p>
-      <div style={{ marginBottom: ".6rem" }}>
-        {SMTP_PROVIDERS.map((p) => (
-          <details key={p.name} style={{ margin: ".25rem 0" }}>
-            <summary style={{ cursor: "pointer" }}>{p.name}</summary>
-            <div className="mut" style={{ margin: ".35rem 0 .35rem 1rem" }}>
-              {p.note}{" "}
-              <button className="linklike" style={{ background: "none",
-                  border: "none", cursor: "pointer", padding: 0,
-                  textDecoration: "underline" }}
-                onClick={() => { setHost(p.host); setPort(String(p.port)); }}>
-                use {p.host}:{p.port}</button>
-            </div>
-          </details>
+      <div className="wiz-rows">
+        {rows.map(([k, v]) => (
+          <div key={k} className="wiz-row"><div className="wiz-row-main">
+            <span>{k}</span><small className="mut">{v}</small>
+          </div></div>
         ))}
       </div>
-      <div style={{ display: "flex", gap: ".5rem", flexWrap: "wrap" }}>
-        <label>SMTP host<br />{inp(hostVal, setHost, "smtp.gmail.com")}</label>
-        <label>Port<br />{inp(portVal, setPort, "587", "text", "5rem")}</label>
-      </div>
-      <div style={{ display: "flex", gap: ".5rem", flexWrap: "wrap",
-                    marginTop: ".5rem" }}>
-        <label>User<br />{inp(userVal, setUser, "you@example.com")}</label>
-        <label>Password{" "}
-          {s.data?.smtp_password_set && !pw &&
-            <span className="mut">(saved)</span>}<br />
-          {inp(pw, setPw, s.data?.smtp_password_set
-            ? "unchanged" : "app password", "password")}</label>
-      </div>
-      <div style={{ marginTop: ".5rem" }}>
-        <label>From address <span className="mut">(defaults to user)</span>
-          <br />{inp(fromVal, setFrom, userVal || "money@example.com")}</label>
-      </div>
-      <label style={{ display: "flex", alignItems: "center", gap: ".4rem",
-                      marginTop: ".5rem" }}>
-        <input type="checkbox" checked={tlsVal}
-               onChange={(e) => setTls(e.target.checked)} />
-        Use STARTTLS
-        <span className="sub">— turn off only for a plain relay on your own
-          network that doesn't offer it</span>
-      </label>
-      <div style={{ display: "flex", gap: ".5rem", marginTop: ".7rem",
-                    alignItems: "center" }}>
-        <button className="pri" disabled={save.isPending || !hostVal.trim()}
-          onClick={() => save.mutate()}>
-          {save.isPending ? "saving…" : "Save"}</button>
-        <button disabled={!saved || test.isPending}
-          title={saved ? "" : "save settings first"}
-          onClick={() => test.mutate()}>
-          {test.isPending ? "sending…" : "Send a test email"}</button>
-        {test.isSuccess && (
-          test.data.failed?.length
-            ? <span className="pill b">
-                {test.data.failed.map((f) => f.email).join(", ")} failed</span>
-            : <span className="pill g">
-                sent to {test.data.sent_to.join(", ")} ✓</span>)}
-      </div>
-      {(save.isError || test.isError) && (
-        <p style={{ color: "var(--red)" }}>
-          {String(save.error || test.error)}</p>)}
+      <BalanceNudge />
     </div>
   );
 }
+
+type StepView = {
+  key: WizardStep;
+  // the progress row's words; the heading when `title` is absent
+  label: string; title?: string; blurb: string;
+  primary: { label: string; disabled?: boolean; hint?: string;
+             onClick?: () => void } | null;
+  skippable: boolean; body: ReactNode;
+  // Back inside the step (the bills step's two panes); absent = the
+  // previous step
+  onBack?: () => void;
+};
 
 export default function Welcome() {
   const nav = useNavigate();
@@ -576,19 +660,25 @@ export default function Welcome() {
   const ob = useQuery({ queryKey: ["onboarding"], queryFn: api.onboarding,
                         refetchInterval: 5000 });
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
+  const st = useQuery({ queryKey: ["settings"], queryFn: api.settings });
   const d = ob.data;
-  const keys = stepKeys(!!me.data?.hosted);
+  const keys = STEP_KEYS;
   const [step, setStep] = useState<number | null>(null);
-  // resume at the first step with no done/skipped mark (wait for `me` so
-  // the hosted/self-host step list is settled before indexing into it)
+  // the bills step opens on its question; Continue there shows the pane
+  // the answer picked, inside the same step
+  const [billsPane, setBillsPane] = useState<"ask" | "work">("ask");
+  const [modeOv, setModeOv] = useState<SetupMode | null>(null);
+  const mode: SetupMode = modeOv ?? st.data?.setup_mode ?? d?.setup_mode
+    ?? "auto";
+  // resume at the first step with no done/skipped mark
   useEffect(() => {
     if (step === null && d && !me.isPending) {
       const first = keys.findIndex((k) => !d.wizard_steps?.[k]);
       // a FINISHED wizard has nothing to resume — arriving here anyway
       // (React Router keeps the pre-login path, so a sign-in that starts
       // on /welcome lands back on /welcome: stale bookmark, old /setup
-      // redirect, a seeded demo instance) would park on a dead "step 7 of
-      // 7 — Done" screen. Bounce to Today instead. Mid-walk states (all steps
+      // redirect, a seeded demo instance) would park on a dead "step 6 of
+      // 6 — Done" screen. Bounce to Today instead. Mid-walk states (all steps
       // marked but Finish not clicked) still render so the user can
       // finish deliberately.
       if (first === -1 && d.wizard_done) {
@@ -613,9 +703,50 @@ export default function Welcome() {
       nav("/");
     },
   });
-  // step 2's footer is gated by the SAME readiness BackfillGate reads
-  // (shared query key, so this is one poll, not two): while the backfill
-  // is still pulling history there is no Continue and no Skip — a
+  // The answer to the bills question is saved on the tap: manual also
+  // turns the household's finder off, which the Bills page and the next
+  // step's prefill read. Writes go one at a time on the settings queue, so
+  // two quick taps cannot land out of order and store the earlier answer;
+  // a tap made while one is in flight is only remembered, and the queued
+  // write sends the newest answer — the last tap wins. The cards show the
+  // tap until the last write settles, then the stored answer.
+  const modeWant = useRef<SetupMode | null>(null);
+  const modeInFlight = useRef(0);
+  const pickMode = useMutation({
+    scope: SETTINGS_SAVES,
+    mutationFn: async () => {
+      const m = modeWant.current;
+      // an earlier queued write already sent the newest answer
+      if (!m) return null;
+      modeWant.current = null;
+      // "auto" says so explicitly: the server does not turn the finder
+      // back on by itself when the mode flips back from manual
+      return saveSettings(qc, { setup_mode: m,
+                                bill_detection_auto: m === "auto" });
+    },
+    onSuccess: (r) => {
+      if (!r) return;
+      qc.invalidateQueries({ queryKey: ["onboarding"] });
+      qc.invalidateQueries({ queryKey: ["budgets-suggest"] });
+    },
+    onError: (e) => window.alert(errText(e)),
+    onSettled: () => {
+      modeInFlight.current -= 1;
+      if (modeInFlight.current <= 0) {
+        modeInFlight.current = 0;
+        setModeOv(null);
+      }
+    },
+  });
+  const chooseMode = (m: SetupMode, then?: () => void) => {
+    setModeOv(m);
+    modeWant.current = m;
+    modeInFlight.current += 1;
+    pickMode.mutate(undefined, then ? { onSuccess: () => then() } : undefined);
+  };
+  // the bills step's auto pane is gated by the SAME readiness BackfillGate
+  // reads (shared query key, so this is one poll, not two): while the
+  // backfill is still pulling history there is no Continue and no Skip — a
   // second tab or an impatient click on the 30-day sliver would seed
   // income, bills and the budget from an incomplete ledger, which is
   // exactly what the gate exists to stop. Fails open with the gate
@@ -628,7 +759,7 @@ export default function Welcome() {
   });
   const backfillReady = backfill.isError
     || !!(backfill.data && backfill.data.all_ready);
-  // The wizard connects a bank and configures the instance's mail, both
+  // The wizard connects a bank and configures the household's mail, both
   // of which are the owner's — so a member landing here (deep link, stale
   // bookmark) gets the same note a viewer does. Editing budgets, which is
   // theirs, lives on the Budget page.
@@ -642,22 +773,74 @@ export default function Welcome() {
     );
 
   const idx = step ?? 0;
+  const goTo = (i: number) => {
+    // walking forward into the bills step opens its question; Back from
+    // budgets returns to the pane that was left
+    if (keys[i] === "bills" && i > idx) setBillsPane("ask");
+    setStep(i);
+  };
   const advance = (state: "done" | "skipped") => {
     mark.mutate({ key: keys[idx], state });
-    setStep(Math.min(idx + 1, keys.length - 1));
+    goTo(Math.min(idx + 1, keys.length - 1));
   };
-  // the Finish step's recap reads budgets from ["settings"]; without this
+  // the Done step's summary reads budgets from ["settings"]; without this
   // it shows the pre-save seed over the numbers just saved
   const refreshBadges = () => {
     qc.invalidateQueries({ queryKey: ["onboarding"] });
     qc.invalidateQueries({ queryKey: ["settings"] });
   };
+  const daily = st.data?.email_schedule?.daily;
+  const delivery = deliveryOf(daily?.on ?? true, !!daily?.push);
+  const firstSend = delivery === "off" ? ""
+    : `; the first ${delivery === "push" ? "notification" : "email"} `
+      + `arrives tomorrow at ${hourLabel(daily?.hour ?? 7)}`;
 
-  const steps: { title: string; blurb: string;
-                 primary: { label: string; disabled?: boolean;
-                            hint?: string } | null;
-                 skippable: boolean; body: ReactNode }[] = [
-    { title: "Connect your accounts",
+  const billsStep: StepView = billsPane === "ask" ? {
+    key: "bills", label: "Bills & budgets",
+    title: "Bills & budgets — how do you want to set them up?",
+    blurb: "Your history is in. Oikonome can read it and propose your " +
+           "recurring bills, paychecks and a starting budget — or you can " +
+           "enter them yourself.",
+    primary: { label: "Continue →", disabled: pickMode.isPending,
+               onClick: () => {
+                 // the pre-selected answer was never tapped: save it now,
+                 // before the pane that depends on it opens
+                 if (st.data?.setup_mode === mode) { setBillsPane("work"); return; }
+                 chooseMode(mode, () => setBillsPane("work"));
+               } },
+    skippable: true,
+    body: <SetupQuestion mode={mode} onPick={(m) => chooseMode(m)} />,
+  } : mode === "manual" ? {
+    key: "bills", label: "Enter bills & income",
+    blurb: "Add the bills and paychecks you know. Each one matches its " +
+           "charges in your ledger by merchant from here on, so renames and " +
+           "price drift keep working. You can switch to automatic detection " +
+           "any time from Bills.",
+    primary: { label: "Continue →" }, skippable: true,
+    onBack: () => setBillsPane("ask"),
+    body: <ManualBillsPane />,
+  } : {
+    key: "bills", label: "Confirm bills & income",
+    blurb: "The finder scanned your ledger for recurring bills and " +
+           "paychecks. Approve what's right, dismiss what isn't — approved " +
+           "(and still-pending) income seeds the next step's budget. " +
+           "Continue any time and revisit later.",
+    // detection AND the footer wait for the full bank backfill — see
+    // BackfillGate and backfillReady above
+    primary: backfillReady ? { label: "Continue →" } : null,
+    skippable: backfillReady,
+    onBack: () => setBillsPane("ask"),
+    body: <BackfillGate><AutoBillsPane /></BackfillGate>,
+  };
+
+  const steps: StepView[] = [
+    { key: "appearance", label: "Appearance",
+      blurb: "Oikonome follows your phone or computer by default — light " +
+             "by day, dark at night, whatever the system says. Pin one if " +
+             "you prefer. You can change this any time in Settings.",
+      primary: { label: "Continue →" }, skippable: false,
+      body: <AppearanceStep /> },
+    { key: "connect", label: "Connect your accounts",
       blurb: "Link every bank you use — the grid shows what's already " +
              "connected. When you've added everything you plan to, say so " +
              "below. (File imports alone work completely too.)",
@@ -670,65 +853,66 @@ export default function Welcome() {
                        && (d?.transactions ?? 0) === 0
                    ? "connect at least one source, or skip" : undefined },
       skippable: true,
-      body: <ConnectHub /> },
-    { title: "Confirm bills & income",
-      blurb: "The finder already scanned your ledger for recurring bills " +
-             "and paychecks. Approve what's right, dismiss what isn't — " +
-             "approved (and still-pending) income seeds the next step's " +
-             "budget. Continue any time and revisit later.",
-      // detection AND the footer wait for the full Plaid backfill — see
-      // BackfillGate and backfillReady above
-      primary: backfillReady ? { label: "Continue →" } : null,
-      skippable: backfillReady,
-      body: <BackfillGate><Bills autoDetect /></BackfillGate> },
-    { title: "Set your budgets",
-      blurb: "Your monthly plan, pre-filled from your real data: income " +
-             "and bills from the last step, spending budgets from your " +
-             "history, and what's left as savings. The daily verdict only " +
-             "judges the variable spending.",
+      body: (
+        <>
+          <ConnectHub />
+          <p style={{ margin: ".6rem 0 0" }}>
+            <Link to="/import">Import a file instead</Link></p>
+          <div className="wiz-sub"><HistoryChoice /></div>
+        </>
+      ) },
+    billsStep,
+    { key: "budgets", label: "Set your budgets",
+      blurb: mode === "manual"
+        ? "Your monthly plan: income and bills from the last step, a " +
+          "number for each kind of spending, and what's left as savings. " +
+          "The figures start blank — tap a suggestion from your history to " +
+          "use it. The daily verdict only judges the variable spending."
+        : "Your monthly plan, pre-filled from your real data: income " +
+          "and bills from the last step, spending budgets from your " +
+          "history, and what's left as savings. The daily verdict only " +
+          "judges the variable spending.",
       primary: { label: "Continue →", disabled: !d?.budgets_set,
                  hint: d?.budgets_set ? undefined : "save budgets first" },
       skippable: true,
-      body: <BudgetsStep onSaved={refreshBadges} /> },
-    // self-hosted only — hosted deploys send mail via the operator account
-    // (this MUST mirror stepKeys(): same condition, same position)
-    ...(me.data?.hosted ? [] : [{
-      title: "Daily email delivery",
-      blurb: "Optional: give Oikonome an outbound email (SMTP) account so " +
-             "the daily verdict and alerts can reach your inbox. Guides " +
-             "below for the common providers.",
-      primary: { label: "Continue →" } as { label: string;
-                 disabled?: boolean; hint?: string } | null,
-      skippable: true,
-      body: <EmailStep /> as ReactNode }]),
-    { title: "Done",
+      body: mode === "manual" ? <ManualBudgets onSaved={refreshBadges} />
+        : <BudgetPlanner onSaved={refreshBadges} /> },
+    { key: "email", label: "Email & push",
+      blurb: "One message a day with your verdict, and alerts when " +
+             "something needs you. Choose how it reaches you, when, and who " +
+             "else in the household gets it.",
+      primary: { label: "Continue →" }, skippable: true,
+      body: <EmailPushStep /> },
+    { key: "finish", label: "Done",
       blurb: "That's everything. The Today page carries your daily verdict " +
-             "from here on.",
+             `from here on${firstSend}.`,
       primary: null, skippable: false,
-      body: <FinishStep d={d} /> },
+      body: <DoneStep d={d} /> },
   ];
   const s = steps[idx];
   const last = idx === steps.length - 1;
 
   return (
     <>
-      <div className="card" style={{ marginBottom: "1rem" }}>
+      <div className="card wiz-card" style={{ marginBottom: "1rem" }}>
         {/* one progress row: dots · where you are · the way out. A
             full-width h1, an exit sentence dressed as a button and a
             separate dots line would be three rows of chrome above a form
             whose own title then repeats itself. */}
         <div className="wiz">
-          {steps.map((x, i) => {
-            const done = !!d?.wizard_steps?.[keys[i]];
-            return (
-              <i key={x.title} title={`${i + 1}. ${x.title}`}
-                 className={i === idx ? "on" : done ? "done" : ""} />
-            );
-          })}
-          <span style={{ marginLeft: ".4rem" }}>
-            Step {idx + 1} of {steps.length} · <b>{s.title}</b></span>
-          <button className="linklike mut"
-            style={{ marginLeft: "auto", background: "none", border: "none",
+          <span className="wiz-dots">
+            {steps.map((x, i) => {
+              const done = !!d?.wizard_steps?.[x.key];
+              return (
+                <i key={x.key} title={`${i + 1}. ${x.label}`}
+                   className={i === idx ? "on" : done ? "done" : ""} />
+              );
+            })}
+          </span>
+          <span className="wiz-where">
+            Step {idx + 1} of {steps.length} · <b>{s.label}</b></span>
+          <button className="linklike mut wiz-later"
+            style={{ background: "none", border: "none",
                      cursor: "pointer", fontSize: 12 }}
             onClick={() => { leftWizard(me.data?.tenant_id); nav("/"); }}
             title="your answers so far are saved; the nav keeps a
@@ -736,7 +920,7 @@ export default function Welcome() {
             save &amp; finish later</button>
         </div>
         <h2 style={{ margin: ".1rem 0 .3rem", fontSize: "1.1rem" }}>
-          {s.title}</h2>
+          {s.title ?? s.label}</h2>
         <p className="mut" style={{ margin: ".7rem 0 0" }}>{s.blurb}</p>
         {/* the step's content lives INSIDE the wizard pane — one big card */}
         <div style={{ marginTop: "1rem", paddingTop: "1rem",
@@ -744,23 +928,21 @@ export default function Welcome() {
           {s.body}
         </div>
         {/* nav at the very bottom right: Skip · Back · Continue */}
-        <div style={{ display: "flex", justifyContent: "flex-end",
-                      alignItems: "center", gap: ".8rem",
-                      marginTop: "1.2rem", paddingTop: ".9rem",
-                      borderTop: "1px solid var(--line)" }}>
+        <div className="wiz-nav">
           {s.skippable && (
-            <button className="linklike mut" style={{ background: "none",
+            <button className="linklike mut wiz-skip" style={{ background: "none",
                 border: "none", cursor: "pointer", fontSize: 13 }}
               onClick={() => advance("skipped")}>
               Skip this step</button>
           )}
-          <button disabled={idx === 0} onClick={() => setStep(idx - 1)}>
+          <button disabled={idx === 0 && !s.onBack}
+                  onClick={() => s.onBack ? s.onBack() : goTo(idx - 1)}>
             ← Back</button>
           {s.primary && (
             <span title={s.primary.hint || ""}>
               <button className="pri" style={fwdBtn}
                 disabled={s.primary.disabled}
-                onClick={() => advance("done")}>
+                onClick={s.primary.onClick ?? (() => advance("done"))}>
                 {s.primary.label}</button>
             </span>
           )}

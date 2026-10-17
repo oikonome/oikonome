@@ -666,5 +666,182 @@ class LinkTokenWebhookWiringTests(unittest.TestCase):
         self.assertNotIn("webhook", body)
 
 
+class DatabaseWorkStaysOffTheLoopTests(WebhookBase):
+    """The web server is one event loop: a blocking connect or row lock run
+    inline stops every other request for as long as it waits. Each webhook
+    branch's database work runs in a worker thread, the admin connection
+    bounds its connect, and its row locks wait only so long."""
+
+    @staticmethod
+    def _on_loop() -> bool:
+        import asyncio
+        try:
+            asyncio.get_running_loop()
+            return True
+        except RuntimeError:
+            return False
+
+    def _post_event(self, event: dict):
+        body = json.dumps(event).encode()
+        return self.post(body, self.signer.jwt(body))
+
+    def test_every_branch_runs_its_lookups_in_a_thread(self):
+        seen = {}
+
+        def record(name, result):
+            def fake(*a):
+                seen[name] = self._on_loop()
+                return result
+            return fake
+
+        async def fake_enqueue(*a):
+            return True
+        with mock.patch.object(plaid_webhook, "_tenant_for_item",
+                               record("tenant", "t")), \
+                mock.patch.object(plaid_webhook, "_record_item_status",
+                                  record("record", True)), \
+                mock.patch.object(plaid_webhook, "_clear_item_status",
+                                  record("clear", True)), \
+                mock.patch.object(plaid_webhook, "_enqueue_sync",
+                                  fake_enqueue):
+            self._post_event({"webhook_type": "TRANSACTIONS",
+                              "webhook_code": "SYNC_UPDATES_AVAILABLE",
+                              "item_id": "itm"})
+            self._post_event({"webhook_type": "ITEM",
+                              "webhook_code": "PENDING_EXPIRATION",
+                              "item_id": "itm"})
+            self._post_event({"webhook_type": "ITEM",
+                              "webhook_code": "LOGIN_REPAIRED",
+                              "item_id": "itm"})
+        self.assertEqual(seen, {"tenant": False, "record": False,
+                                "clear": False})
+
+    def test_webhook_connection_waits_on_row_locks_only_briefly(self):
+        make_db().close()
+        admin = plaid_webhook._admin()
+        try:
+            got = admin.execute("SHOW lock_timeout").fetchone()
+        finally:
+            admin.close()
+        self.assertEqual(list(got.values())[0], plaid_webhook._LOCK_TIMEOUT)
+
+
+class AnEventThatCannotBeQueuedIsDeliveredAgainTests(WebhookBase):
+    """Plaid delivers a webhook again only when the answer is not a 200, so
+    an event acted on but not queued (Redis down) must answer 503 — a 200
+    dropped a new bank's first-sync trigger for good. And the queue is
+    reached over one pool kept for the process, not a Redis connection
+    opened and closed for every event."""
+
+    def setUp(self):
+        super().setUp()
+        self.conn = make_db()
+        self.tenant_id = self.conn.execute(
+            "SELECT current_setting('app.tenant_id') AS t").fetchone()["t"]
+        self.item_id = f"pl-wh-{uuid.uuid4().hex[:10]}"
+        sync_base.upsert_item(self.conn, self.item_id, "plaid", "Demo Bank",
+                              "access-tok")
+        from oikonome.jobs import worker
+        worker._ASYNC_POOLS.clear()
+        self.addCleanup(worker._ASYNC_POOLS.clear)
+
+    def tearDown(self):
+        self.conn.close()
+        super().tearDown()
+
+    def _post_event(self, event: dict):
+        body = json.dumps(event).encode()
+        return self.post(body, self.signer.jwt(body))
+
+    def test_a_queue_that_is_down_answers_503(self):
+        with mock.patch("arq.create_pool",
+                        mock.AsyncMock(side_effect=OSError("down"))), \
+                self.assertLogs("oikonome", level="WARNING"):
+            r = self._post_event({"webhook_type": "TRANSACTIONS",
+                                  "webhook_code": "INITIAL_UPDATE",
+                                  "item_id": self.item_id})
+        self.assertEqual(r.status_code, 503, r.text)
+        self.assertIn("retry-after", {k.lower() for k in r.headers})
+
+    def test_a_link_finish_that_cannot_be_queued_answers_503(self):
+        async def down(*a):
+            return False
+        with mock.patch.object(plaid_webhook, "_enqueue_link_finish", down), \
+                mock.patch("oikonome.jobs.plaid_links.tenant_for_link",
+                           lambda lt: self.tenant_id):
+            r = self._post_event({"webhook_type": "LINK",
+                                  "webhook_code": "ITEM_ADD_RESULT",
+                                  "link_token": "lt-x"})
+        self.assertEqual(r.status_code, 503, r.text)
+
+    def test_events_share_one_pool(self):
+        import asyncio
+
+        from oikonome.jobs import worker
+        pool = mock.AsyncMock()
+        create = mock.AsyncMock(return_value=pool)
+
+        async def two():
+            await worker.enqueue_job("sync_item", "t", "i1")
+            await worker.enqueue_job("sync_item", "t", "i2")
+        with mock.patch("arq.create_pool", create):
+            asyncio.run(two())
+        self.assertEqual(create.await_count, 1)
+        self.assertEqual(pool.enqueue_job.await_count, 2)
+        pool.close.assert_not_awaited()
+
+    def test_a_broken_pool_is_rebuilt_by_the_next_event(self):
+        import asyncio
+
+        from oikonome.jobs import worker
+        bad, good = mock.AsyncMock(), mock.AsyncMock()
+        bad.enqueue_job.side_effect = ConnectionError("gone")
+        create = mock.AsyncMock(side_effect=[bad, good])
+
+        async def two():
+            first = await worker.enqueue_job("sync_item", "t", "i1")
+            second = await worker.enqueue_job("sync_item", "t", "i2")
+            return first, second
+        with mock.patch("arq.create_pool", create), \
+                self.assertLogs("oikonome", level="WARNING"):
+            self.assertEqual(asyncio.run(two()), (False, True))
+        bad.close.assert_awaited()
+        good.enqueue_job.assert_awaited_once_with("sync_item", "t", "i2")
+
+    def test_a_late_failure_on_an_old_pool_leaves_the_rebuilt_one_alone(self):
+        import asyncio
+
+        from oikonome.jobs import worker
+        old, fresh = mock.AsyncMock(), mock.AsyncMock()
+        create = mock.AsyncMock(side_effect=[old, fresh])
+
+        async def scenario():
+            stuck = asyncio.Event()
+
+            async def old_enqueue(job, *args, **kw):
+                if args[1] == "slow":
+                    await stuck.wait()
+                raise ConnectionError("gone")
+            old.enqueue_job.side_effect = old_enqueue
+            # B starts on the old pool and is still waiting on it...
+            b = asyncio.create_task(
+                worker.enqueue_job("sync_item", "t", "slow"))
+            await asyncio.sleep(0)
+            # ...A fails on it, and the next event rebuilds the pool
+            self.assertFalse(await worker.enqueue_job("sync_item", "t", "a"))
+            self.assertTrue(await worker.enqueue_job("sync_item", "t", "c"))
+            # B's failure arrives late: it must not close the rebuilt pool
+            stuck.set()
+            self.assertFalse(await b)
+            self.assertTrue(await worker.enqueue_job("sync_item", "t", "d"))
+        with mock.patch("arq.create_pool", create), \
+                self.assertLogs("oikonome", level="WARNING"):
+            asyncio.run(scenario())
+        old.close.assert_awaited_once()
+        fresh.close.assert_not_awaited()
+        self.assertEqual(create.await_count, 2)
+        self.assertEqual(fresh.enqueue_job.await_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

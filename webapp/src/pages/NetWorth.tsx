@@ -92,10 +92,18 @@ export default function NetWorth() {
   const mortgage = nw.property_items
     .filter((p) => p.kind === "mortgage")
     .reduce((s, p) => s + p.value, 0);
-  // the hero's "this month" — derived from the trend already in the payload,
-  // so it costs no new query and cannot disagree with the chart beside it
   const t = nw.trend ?? [];
-  const delta = t.length >= 2 ? t[t.length - 1][1] - t[t.length - 2][1] : null;
+  // "this month" from series already in the payload. The hero's change is
+  // measured on the base of the total it sits beside (property included):
+  // the financial `trend` alone reads a mortgage payment as a full loss,
+  // since the cash leaves while the loan's fall lives in the property
+  // layer. The financial-only change sits on the Financial accounts tile.
+  // No fallback from one to the other — an older server without
+  // full_trend shows no hero change rather than the wrong one.
+  const monthChange = (s?: [string, number][]) =>
+    s && s.length >= 2 ? s[s.length - 1][1] - s[s.length - 2][1] : null;
+  const delta = monthChange(nw.full_trend);
+  const finDelta = monthChange(t);
 
   return (
     <>
@@ -118,6 +126,10 @@ export default function NetWorth() {
           <div className="tile">
             <div className="sub">Financial accounts</div>
             <div className="kpi sm">{money(nw.current_total)}</div>
+            {finDelta !== null && (
+              <div className={`sub ${finDelta >= 0 ? "pos" : "neg"}`}>
+                {finDelta >= 0 ? "+" : "−"}{money(Math.abs(finDelta))} this month
+              </div>)}
             <div className="sub">cash + investments − card debt · live
               {" · "}<Link to="/debt">payoff plan</Link></div>
           </div>

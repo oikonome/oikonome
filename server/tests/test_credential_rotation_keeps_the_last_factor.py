@@ -374,8 +374,16 @@ class RotationKeepsTheProvingPasskey(unittest.TestCase):
         self._signed_in()
         self._elevate_with_passkey(proving)
         moved = f"moved-{uuid.uuid4().hex[:8]}@x.dev"
-        self.assertEqual(self.client.post(
-            "/api/email/change", data={"new_email": moved}).status_code, 200)
+        sent = []
+        with mock.patch.object(self.appmod, "_deliver_email_change_confirm",
+                               lambda *a: sent.append(a)):
+            self.assertEqual(self.client.post(
+                "/api/email/change",
+                data={"new_email": moved}).status_code, 200)
+        # on hosted the account moves when the new mailbox confirms
+        self.assertEqual(TestClient(self.appmod.app).post(
+            "/account/email-change",
+            data={"token": sent[0][1]}).status_code, 200)
         from oikonome.web import security
         security._limiter._hits.clear()
         r = TestClient(self.appmod.app).post(

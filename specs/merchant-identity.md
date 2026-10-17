@@ -32,14 +32,50 @@ wrong merchant, and a rename of that business drags the row back out.
 An aggregator's merchant name with no entity id behind it is a guess, and
 it can guess differently for the same terminal on different days. When a
 charge comes back named something its bank line does not say, and that line
-has a **habit** — `ESTABLISHED_ROWS` rows under exactly that line where the
-aggregator named the payee and the line names that name too, all resolved
-to one ordinary merchant — the line wins and the charge joins that
-merchant. No alias is written for the name: it was one charge's guess, and
+has already **agreed** with the aggregator — a row under exactly that line
+(a settled hold counts) where the aggregator named the payee and the line
+names that name too, all such rows resolved to one ordinary merchant — the
+line wins and the charge joins that merchant. One agreeing row is enough:
+the line is the bank's own word for the terminal, and a name it contains
+outranks a name it does not, however confident the aggregator is. (A
+higher threshold would only set how many charges become twin merchants
+before the rule applies, and a line whose posted charges all carry a
+wallet prefix might never reach it.) No alias is written for the name: it
+is one charge's guess, and
 a real business of that name under its own line must still get its own
 merchant. The **line** is aliased instead, because that is the key the
 charge carries from then on; where the line is already mapped, that
 mapping is the answer and the charge is filed under it.
+
+A name the string clean reduces to a word the line does contain ("Harbor
+Kite" under a "HARBOR KITE SPRINGF…" line) is not doubted at all — it is the
+line's payee wearing noise — and is read as the line's payee under that
+same clean form, so it cannot fall between the two rules and mint a
+merchant named after the noise-stripped word.
+
+### A posted charge that repeats the hold's guess
+
+The feed links a posted charge to the hold it settles, and often guesses
+the same stray name for both. The hold's line has already answered for
+the name (it is set aside on the hold); the posted charge carrying that
+very name is the same purchase, so it is filed the way the hold was — its
+name set aside, its own line (usually the hold's line behind a wallet
+prefix) aliased to the merchant — rather than judged afresh under a line
+that has no history of its own.
+
+That is decided per ROW, and on the exact name the feed repeated (never
+its clean form). One sync can carry the posted charge beside an unrelated
+charge the feed gave the same stray name under a line of its own; the two
+share a key, but the hold vouches only for its own charge. The unrelated
+charge keeps its name and its own merchant, its line is never aliased to
+the hold's merchant, and the answer does not depend on which of the two
+arrives first.
+
+A row whose aggregator name is the processor itself — the feed listing
+that name as a payment-app or terminal counterparty — is never a line
+agreeing with the aggregator about a payee: a processor's line reads as
+the processor's name, and counting it would fold every payee the
+processor carries into one merchant.
 
 ### Why AGREEMENT, and not merely rows under the line
 
@@ -61,16 +97,23 @@ reached. Both passes then see the same evidence.
 
 ### The evidence is the ledger, not the pass
 
-How many bank lines carry a key, which line that is, and whether the key is
-an outlet are all asked of every live row carrying the key — never of the
-rows one pass happens to be holding. A sync resolves what it just
-delivered, so of two charges sharing a stray name it can hold only the one
-whose line has the habit: asked of that batch the name is a one-off of that
-line and the charge is moved, while a single pass over the ledger sees the
-name under two lines, reads it as a payee the aggregator knows, and leaves
-both alone. Nothing brings the row back to be asked again — a resolved row
-is not revisited — so the two passes would disagree about one ledger
-forever.
+Whether a line overrules a stray name is asked once per (name, line) pair,
+of that line's own history — never of how many lines the name has been seen
+under. That count is a fact about the rows still keyed on the name, and
+which rows those are depends on how the syncs bundled them: a charge an
+earlier sync moved is no longer keyed on the name, so the next charge of the
+name saw one line alone, while the same two charges delivered together saw
+two and both kept the name. Judged per line, each charge lands where its own
+line puts it in every order. A name the aggregator uses under a line that has
+never agreed with it is still a payee it knows there: those rows keep the
+name, so a name under two lines neither of which overrules it stays one
+merchant. For the same reason the resolver's own earlier filing of the name
+(its layer-1 alias) does not shield a later row — only a person's rename or a
+reviewed merge has answered for a name.
+
+The other facts about a key — which line, and whether it is an outlet — are
+asked of every live row carrying the key, never of the rows one pass happens
+to be holding.
 
 A charge already moved is absent from its old key, because it carries its
 line now. So a second charge of that name turning up later under another

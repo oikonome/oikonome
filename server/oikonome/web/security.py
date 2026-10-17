@@ -367,6 +367,7 @@ _ingest_by_ip: dict[str, int] = {}
 
 def _take_ingest_slot(ip: str = "") -> bool:
     global _ingest_inflight
+    ip = rate_key(ip)
     with _ingest_lock:
         if _ingest_inflight >= UPLOAD_INGEST_CONCURRENCY:
             return False
@@ -379,6 +380,7 @@ def _take_ingest_slot(ip: str = "") -> bool:
 
 def _free_ingest_slot(ip: str = "") -> None:
     global _ingest_inflight
+    ip = rate_key(ip)
     with _ingest_lock:
         _ingest_inflight = max(0, _ingest_inflight - 1)
         held = _ingest_by_ip.get(ip, 0) - 1
@@ -435,9 +437,12 @@ class BodySizeLimitMiddleware:
         ip = ""
         if upload:
             ip = client_ip(Request(scope))
-            if not _dual("check", ("upload_ingest", ip),
+            # Like every other 429 (see `limit`), going over the upload
+            # budget is not an auto-ban strike: the budget is per address,
+            # and a carrier address shared by many phones sending receipt
+            # photos would otherwise ban itself. `_refuse` still logs it.
+            if not _dual("check", ("upload_ingest", rate_key(ip)),
                          UPLOAD_INGEST_LIMIT, UPLOAD_INGEST_WINDOW):
-                record_strike(ip, route="upload_ingest", event="ratelimited")
                 return await self._refuse(
                     scope, send, 429,
                     "too many uploads — try again later", ip=ip,
@@ -555,6 +560,18 @@ class BodySizeLimitMiddleware:
         await send({"type": "http.response.body", "body": body})
 
 
+def claim_netloc(claim: str) -> str | None:
+    """The host[:port] an Origin or Referer value names, or None when it
+    does not parse. urlsplit raises on a malformed bracketed host
+    ('http://[x'), and that value comes from any client: unguarded, it
+    turns a same-origin check into a 500. Callers treat None as a claim
+    that is not this host."""
+    try:
+        return urlsplit(claim).netloc
+    except ValueError:
+        return None
+
+
 class OriginCheckMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         if request.method in _WRITE:
@@ -562,14 +579,15 @@ class OriginCheckMiddleware(BaseHTTPMiddleware):
             referer = request.headers.get("referer") or ""
             claim = origin or referer
             if claim:
-                host = urlsplit(claim).netloc
+                host = claim_netloc(claim)
                 # A present-but-opaque Origin (the literal "null" a
                 # browser sends for sandboxed iframes / data: / file: /
                 # some cross-origin redirects) has no netloc, and an
                 # attacker-controlled opaque context must not be able to
                 # POST. A claim that IS present but doesn't parse to THIS
                 # host is cross-origin, full stop; only a genuinely absent
-                # claim (non-browser client) stays allowed.
+                # claim (non-browser client) stays allowed. One that does
+                # not parse at all (None) is not this host either.
                 if host != request.headers.get("host", ""):
                     from starlette.responses import JSONResponse
                     return JSONResponse({"detail": "cross-origin write blocked"},
@@ -931,6 +949,31 @@ def client_ip(request: Request) -> str:
     return peer
 
 
+def rate_key(ip: str) -> str:
+    """The source a per-address budget is charged to.
+
+    Every per-IP limit, auto-ban strike and human-check risk mark keys on
+    this, never on the raw address. IPv6 is folded to its /64: that is the
+    smallest block a provider hands one customer (a VPS, a home line, one
+    phone on a carrier), and a host that owns a /64 can answer from any of
+    its 2^64 addresses — keyed per address, it would spend one failure per
+    address and never meet a cap, a ban or a challenge. IPv4 stays as it
+    is, and an IPv4-mapped IPv6 spelling (::ffff:203.0.113.9) is folded to
+    the plain v4 address first so the two spellings share one budget.
+    Anything that does not parse (the test client, "-") is returned as is.
+    """
+    try:
+        addr = ipaddress.ip_address((ip or "").strip())
+    except ValueError:
+        return ip
+    if addr.version == 6:
+        mapped = addr.ipv4_mapped
+        if mapped is not None:
+            return str(mapped)
+        return str(ipaddress.ip_network(f"{addr}/64", strict=False))
+    return str(addr)
+
+
 def request_scheme(request: Request) -> str:
     """Effective scheme for security-sensitive decisions (HSTS header,
     Secure cookie flag). X-Forwarded-Proto is only believed when the socket
@@ -1158,22 +1201,48 @@ def _account_limit(key: tuple, limit_n: int, window_s: float) -> bool:
     return _dual("check", key, limit_n, window_s)
 
 
+def wait_phrase(window_s: float) -> str:
+    """How long a refused caller should wait, in words, for a sliding window
+    of this size — "a few minutes" is only true of a short one."""
+    if window_s <= 600:
+        return "try again in a few minutes"
+    if window_s <= 3600:
+        return "try again within the hour"
+    return "try again later today"
+
+
+def account_limit_or_429(key: tuple, limit_n: int, window_s: float,
+                         what: str = "too many requests") -> None:
+    """`_account_limit` as a refusal: a 429 that says the real wait."""
+    if not _account_limit(key, limit_n, window_s):
+        _sec_event("ratelimited", current_ip() or "-", route=str(key[0]))
+        raise HTTPException(429, f"{what} — {wait_phrase(window_s)}")
+
+
 def limit(route: str, limit_n: int, window_s: float):
     """FastAPI dependency: per-client-IP sliding-window rate limit."""
     def dep(request: Request):
         ip = client_ip(request)
-        key = (route, ip)
+        key = (route, rate_key(ip))
         if not _dual("check", key, limit_n, window_s):
-            # tripping a limit is a strike toward an auto-ban (a bot hammering
-            # ANY throttled route accrues them); a single human never will.
-            record_strike(ip, route=route, event="ratelimited")
-            raise HTTPException(429, "too many requests — try again later")
+            # A 429 here is NOT an auto-ban strike. The limit already refuses
+            # the excess, cheaply, and a per-IP bucket is shared by everyone
+            # behind one address: a carrier's CGNAT puts a crowd of phones on
+            # one public IP, so a burst of honest signups trips the limit;
+            # counting those 429s as strikes would ban the whole carrier
+            # address. Strikes come from evidence of abuse — failed
+            # sign-ins and the like — never from being one of many. The event
+            # is still logged so a hammering source stays visible.
+            _sec_event("ratelimited", ip, route=route)
+            raise HTTPException(
+                429, f"too many requests — {wait_phrase(window_s)}")
     return dep
 
 
 # ---- auto-ban: repeat offenders get a short, self-expiring hard block -------
-# A client IP that keeps tripping rate limits (or failing auth) is almost
-# always a bot or scanner. Once it piles up strikes we reject it FAST at the
+# A client IP that keeps failing auth (or otherwise records strikes) is
+# almost always a bot or scanner. A rate-limit 429 is not a strike — see
+# `limit`. Once it piles up strikes we reject it FAST at the
 # middleware, before any route or DB work — that sheds load on a small box and
 # is the topology-independent complement to a Cloudflare edge rule: the ban
 # keys on the app's RESOLVED client IP, so it works behind Cloudflare and for
@@ -1202,9 +1271,10 @@ def autoban_enabled() -> bool:
 
 def _bannable(ip: str) -> bool:
     """Only public IPs are eligible — never loopback/LAN/link-local, and never
-    an unparseable host like the test client's 'testclient' or a bare '?'."""
+    an unparseable host like the test client's 'testclient' or a bare '?'.
+    Takes either a raw address or a `rate_key` (an IPv6 /64)."""
     try:
-        addr = ipaddress.ip_address(ip)
+        addr = ipaddress.ip_network(ip, strict=False).network_address
     except ValueError:
         return False
     # a proxy/socket path can hand us the IPv4-mapped IPv6 spelling of a
@@ -1216,6 +1286,7 @@ def _bannable(ip: str) -> bool:
 
 def blocked_seconds(ip: str) -> float | None:
     """Remaining auto-ban time for this resolved client IP, else None."""
+    ip = rate_key(ip)
     if not _bannable(ip):
         return None
     return _dual("blocked", ("ip", ip))
@@ -1225,10 +1296,14 @@ def record_strike(ip: str, route: str | None = None,
                    event: str = "strike") -> None:
     """Add one strike for this IP; ban it once strikes cross the threshold.
     Safe to call on any suspicious event. `event` labels the log line —
-    "ratelimited" (a 429), "auth_fail" (a bad login), etc."""
-    if not autoban_enabled() or not _bannable(ip):
+    "auth_fail" (a bad login), etc. Strikes and the ban land on the
+    address's `rate_key`, so an IPv6 host is judged as its whole /64."""
+    if not autoban_enabled():
         return
     _sec_event(event, ip, route=route)
+    ip = rate_key(ip)
+    if not _bannable(ip):
+        return
     skey = ("strike", ip)
     store = _shared_store()
     # record the strike, then read the running count from the same store
@@ -1269,6 +1344,7 @@ def record_strike(ip: str, route: str | None = None,
 
 def autoban_clear(ip: str) -> None:
     """Operator override — lift a ban and wipe the strike/history buckets."""
+    ip = rate_key(ip)
     _dual_clear("unblock", ("ip", ip))
     for k in (("strike", ip), ("banhist", ip)):
         _dual_clear("clear", k)
@@ -1530,8 +1606,42 @@ def release_step_up_guess(slot) -> None:
 # env knob — it is the one bucket that challenges people who did nothing
 # wrong, so moving it should be a code change with a test, not a config
 # edit on a production box.
+#
+# The site-wide bucket measures BREADTH, not one source's depth. A source
+# (an address's `rate_key`: an IPv4 address, or an IPv6 /64) adds to it only
+# while that source is still under its own `_RISK_IP_MAX`; once the source is
+# challenged, its further failures are its own bucket's business and do not
+# also count toward challenging everybody else. Without that, one host could
+# arm the site alone — and keep it armed — which puts a challenge in front of
+# every sign-in, including the native apps, which cannot render one and are
+# sent to the emailed unlock instead. So arming the site now takes failures
+# from at least `_RISK_SITE_MAX / _RISK_IP_MAX` distinct sources (17), which
+# is the distributed attack the bucket exists for, and no single host can do
+# it. A real botnet can still arm it; that is the trade the comment above
+# already makes, and the emailed unlock remains the way through.
+#
+# For this one bucket an IPv6 source is its /48, not its /64 (see
+# `_risk_site_source`). A /64 is the smallest block one customer gets, not
+# the largest: a free tunnel broker hands out a /48 and many ISPs and VPS
+# providers a /56, so one host can answer from 256 to 65,536 /64s — plenty
+# to be 17 "distinct" sources alone. Charging the site per /48 puts all of
+# them in one source. The per-address limits, strikes, bans and the
+# per-source challenge stay on the /64: those budgets only ever refuse the
+# source that spent them, and a /48 can be a whole office or carrier pool
+# that must not be challenged or banned for one of its customers.
+#
+# That leaves one gap the two rules above open between them: a host rotating
+# /64s inside its /48 spends `_RISK_IP_MAX - 1` failures per /64, never meets
+# the per-/64 challenge, and gives the site only its first `_RISK_IP_MAX` —
+# tens of thousands of unchallenged guesses per window from one machine. So
+# an IPv6 /48 is also a challenge source of its own, on a threshold set well
+# above what a few customers sharing it mistype. Crossing it shows a
+# checkbox to that /48 only — never a ban, never anyone outside it — which
+# is the cost a shared office or carrier pool can bear when one of its
+# members is spraying.
 _RISK_WINDOW = 900          # 15 minutes, matching the account-lock window
 _RISK_IP_MAX = 3            # failures from one IP before it must prove humanity
+_RISK_IP48_MAX = 15         # failures from one IPv6 /48 before ditto
 _RISK_ACCT_MAX = 5          # failures against one account before ditto
 _RISK_SITE_MAX = 50         # failures across the whole instance → challenge all
 _RISK_SITE_KEY = ("risk-site",)
@@ -1541,7 +1651,13 @@ def _risk_keys(ip: str, email: str = "") -> list[tuple]:
     """The buckets a single attempt touches. The site-wide one is always in."""
     keys = [(_RISK_SITE_KEY, _RISK_SITE_MAX)]
     if ip:
-        keys.append((("risk-ip", ip), _RISK_IP_MAX))
+        keys.append((("risk-ip", rate_key(ip)), _RISK_IP_MAX))
+        wide = _risk_wide_source(ip)
+        if wide is not None:
+            # kept in the "risk-ip" namespace so the limiter's eviction
+            # protects it like the /64 bucket; the "/48" in the value means it
+            # can never collide with a /64 or IPv4 key
+            keys.append((("risk-ip", wide), _RISK_IP48_MAX))
     if email:
         keys.append((("risk-acct", email.strip().lower()), _RISK_ACCT_MAX))
     return keys
@@ -1551,9 +1667,42 @@ def _risk_count(key: tuple) -> int:
     return _dual("count", key, _RISK_WINDOW) or 0
 
 
+def _risk_wide_source(ip: str) -> str | None:
+    """An IPv6 address's /48, the wider challenge source; None for IPv4 and
+    anything unparseable, where the per-address bucket already is the whole
+    source."""
+    wide = _risk_site_source(ip)
+    return wide if wide != rate_key(ip) else None
+
+
+def _risk_site_source(ip: str) -> str:
+    """The source the site-wide bucket charges a failure to: an IPv4
+    address, or an IPv6 address's /48 (the breadth rule above
+    `_RISK_WINDOW` says why it is wider than `rate_key`)."""
+    key = rate_key(ip)
+    try:
+        net = ipaddress.ip_network(key, strict=False)
+    except ValueError:
+        return key
+    if net.version == 6:
+        return str(net.supernet(new_prefix=48))
+    return key
+
+
 def record_challenge_risk(ip: str, email: str = "") -> None:
-    """Mark one failed sign-in against this IP and this account."""
+    """Mark one failed sign-in against this IP and this account — and against
+    the site, unless this source (its /48, for IPv6) has already given the
+    site its `_RISK_IP_MAX` (see the breadth rule above `_RISK_WINDOW`)."""
+    site_src = None
+    if ip:
+        # kept in the "risk-site" namespace, so it is protected from the
+        # limiter's eviction exactly as the site bucket is
+        site_src = (_RISK_SITE_KEY[0], "src", _risk_site_source(ip))
     for key, _max in _risk_keys(ip, email):
+        if key == _RISK_SITE_KEY and site_src is not None:
+            if _risk_count(site_src) >= _RISK_IP_MAX:
+                continue
+            _dual("add", site_src, _RISK_WINDOW)
         _dual("add", key, _RISK_WINDOW)
 
 

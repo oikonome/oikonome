@@ -50,7 +50,7 @@ class ScopeInvariantTests(unittest.TestCase):
         self.conn = make_db()
         write_config(self.conn)
         # the merchant under test, and three neighbours a loose match grabs:
-        # a substring ("maple" in "maplewood"), a shared word, a shared token
+        # a substring ("maple" in "maplehurst"), a shared word, a shared token
         self.target = [
             add_txn(self.conn, TODAY, 64.0, "MAPLE ONLINE 555-0147",
                     merchant="Maple", primary="GENERAL_SERVICES"),
@@ -60,8 +60,8 @@ class ScopeInvariantTests(unittest.TestCase):
         self.others = [
             add_txn(self.conn, TODAY, -4200.00, "ACME PAYROLL DEPOSIT",
                     merchant="Acme Payroll", primary="INCOME"),
-            add_txn(self.conn, TODAY, 65.0, "MAPLEWOOD CYCLE SHOP",
-                    merchant="Maplewood Cycle Shop",
+            add_txn(self.conn, TODAY, 65.0, "MAPLEHURST CYCLE SHOP",
+                    merchant="Maplehurst Cycle Shop",
                     primary="GENERAL_MERCHANDISE"),
             add_txn(self.conn, TODAY, 95.0, "MAPLEWORKS SOFTWARE AUTOPAY",
                     merchant="MAPLEWORKS SOFTWARE AUTOPAY",

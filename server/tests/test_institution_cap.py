@@ -18,8 +18,9 @@ from .util import _admin_dsn, _ensure_db, make_db, TEST_DB
 
 def _item(conn, item_id, aggregator, status="ok"):
     conn.execute(
-        """INSERT INTO items (id, aggregator, institution_name, status)
-           VALUES (%s, %s, %s, %s)""",
+        """INSERT INTO items (id, aggregator, institution_name, status,
+                              linked_at)
+           VALUES (%s, %s, %s, %s, now() - interval '30 days')""",
         (item_id, aggregator, item_id, status))
 
 

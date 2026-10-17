@@ -24,10 +24,13 @@ import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-
 import PullRefresh from "../components/pull-refresh";
 
 import { Card, SharedLock } from "../components/ui";
+import { CONFIRM_TO_CONNECT, VerifyEmailCard }
+  from "../components/verify-email-card";
 import type { Account, Entity } from "../lib/api";
 import { patchList, patchQuery, saveSettings, bizKeys, personalKeys, invalidateAll } from "../lib/cache";
 import { plaidHostedLink } from "../lib/plaid";
-import { bizSetupEntity, bizWizardEntryStep } from "../lib/pure";
+import { bankAwaitsConfirm, bizSetupEntity, bizWizardEntryStep }
+  from "../lib/pure";
 import { useSession } from "../lib/session";
 import { C } from "../lib/theme";
 import { useMe, useOwner, useSharedLock } from "../lib/viewer";
@@ -243,6 +246,11 @@ function BusinessWizard({ resume, owner, flagged }: {
   // the shared demonstration login is refused the bank link (it plants a
   // credential that outlives the login), so the button says so in place
   const credentialLock = useSharedLock("credential");
+  // a free trial whose owner has not confirmed connects no bank: this door
+  // closes with the reason, like every other add-a-bank door (web twin:
+  // BusinessWizard), rather than open a sign-in the server refuses
+  const me = useMe();
+  const confirmFirst = bankAwaitsConfirm(me.data);
   // the real bank first — a manual account is a container with no feed
   const connect = useMutation({
     mutationFn: () => plaidHostedLink(client!, ""),
@@ -407,9 +415,14 @@ function BusinessWizard({ resume, owner, flagged }: {
             </Text>
             {owner ? (
               <>
+                {confirmFirst && (
+                  <VerifyEmailCard me={me.data} note={CONFIRM_TO_CONNECT} />)}
                 <SharedLock note={credentialLock}>
-                <Pressable style={[s.btn, busy && { opacity: 0.5 }]}
-                           disabled={busy || !!credentialLock}
+                <Pressable style={[s.btn, (busy || confirmFirst)
+                                          && { opacity: 0.5 }]}
+                           disabled={busy || !!credentialLock || confirmFirst}
+                           accessibilityHint={confirmFirst ? CONFIRM_TO_CONNECT
+                                                           : undefined}
                            onPress={() => connect.mutate()}>
                   <Text style={s.btnText}>
                     {connect.isPending ? "waiting for your bank…"

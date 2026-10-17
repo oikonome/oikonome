@@ -7,6 +7,7 @@ import { api, money, type YearLensData, catLabel } from "../api/client";
 import MoneyMap from "../components/MoneyMap";
 import { planRows } from "../components/PlanBars";
 import { VERDICT } from "./Today";
+import { isPlanSavingsGoal } from "../moneymath";
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -25,7 +26,7 @@ export default function YearLens({ y, onMonth }: {
   if (q.isLoadingError) return <div className="note bad">Couldn't load: {String(q.error)}</div>;
   const d: YearLensData = q.data;
   const goal = (today.data?.savings_goals ?? [])
-    .find((g) => g.name === "Savings");
+    .find((g) => isPlanSavingsGoal(g.name));
   const t = d.totals, pt = d.prev_totals;
 
   return (

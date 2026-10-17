@@ -79,5 +79,30 @@ class LedgerSplitFilterTests(unittest.TestCase):
         self.assertIn("Garden", data.all_categories(self.conn))
 
 
+    def test_a_filtered_split_row_carries_its_share_into_the_day(self):
+        """Under a category filter a split row's spend_amount is the
+        matching part's share — the figure spend_sum totals — so the day
+        header the client sums from it agrees with the hero beside it,
+        never the whole charge."""
+        three = add_txn(self.conn, TODAY.replace(day=7), 90.0, "HARBOR GOODS",
+                        primary=FOOD, account="chk")
+        splits.set_split(self.conn, three, [
+            {"category": OTHER, "amount": 20},
+            {"category": HOME, "amount": 30},
+            {"category": "Garden", "amount": 40}])
+        rows, _t, _s, _a, spend, _h = data.search_transactions(
+            self.conn, "", category=HOME)
+        by_id = {r["id"]: r for r in rows}
+        self.assertAlmostEqual(float(by_id[three]["spend_amount"]), 30.0)
+        self.assertAlmostEqual(float(by_id[self.big]["spend_amount"]), 200.0)
+        day = sum(float(r["spend_amount"]) for r in rows
+                  if r["date"] == by_id[three]["date"])
+        self.assertAlmostEqual(day, 30.0)
+        self.assertAlmostEqual(sum(float(r["spend_amount"]) for r in rows),
+                               spend["sum"])
+        # unfiltered, the row is the whole charge again
+        rows, *_ = data.search_transactions(self.conn, "HARBOR")
+        self.assertAlmostEqual(float(rows[0]["spend_amount"]), 90.0)
+
 if __name__ == "__main__":
     unittest.main()

@@ -113,5 +113,81 @@ class WatcherMarkerTests(unittest.TestCase):
             self.assertIn("watcher_mark \"$ROOT\"", src, name)
 
 
+class AMarkerlessCommandWatcherKeepsItsTrueRevision(unittest.TestCase):
+    """The reboot installer marks a command watcher it finds enabled with no
+    marker. Such a checker was installed before markers existed, so unless
+    the checker itself names a revision the marker must not claim one: a
+    marker saying "revision 2" over an older checker hides the console's
+    notice that a restore from a moved backup folder will fail."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        base = pathlib.Path(self.td.name)
+        self.root = base / "oikonome"
+        (self.root / "state" / "cmd").mkdir(parents=True)
+        self.bin = base / "bin"
+        self.bin.mkdir()
+        (self.bin / "systemctl").write_text(
+            "#!/bin/sh\nfor u; do :; done\n"
+            '[ "$u" = oikonome-command-watcher-oikonome.path ] && exit 0\n'
+            "exit 1\n")
+        (self.bin / "systemctl").chmod(0o755)
+        self.checker = base / "oikonome-command-run"
+        self.view = base / "view"
+        self.view.mkdir()
+        (self.view / "cmd").symlink_to(self.root / "state" / "cmd")
+        (self.view / "ops").symlink_to(self.root / "ops-state")
+
+    def _reboot_install(self, checker_text: str | None):
+        if checker_text is not None:
+            self.checker.write_text(checker_text)
+        env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
+                   WATCHER_COMMAND_RUN=str(self.checker))
+        subprocess.run(
+            ["sh", "-c", f'. "{HELPER}"; watcher_mark "$0" reboot oikonome',
+             str(self.root)], check=True, env=env, capture_output=True)
+
+    def _console(self):
+        from oikonome.web import adminconsole
+        env = {"OIKONOME_STATE_DIR": str(self.view),
+               "OIKONOME_BACKUP_DIR": "/srv/dumps"}
+        with mock.patch.dict(os.environ, env):
+            return (adminconsole.command_watcher_revision(),
+                    adminconsole.command_watcher_behind())
+
+    def test_a_checker_that_names_no_revision_reads_as_behind(self):
+        self._reboot_install("#!/bin/sh\nset -u\n")
+        rev, behind = self._console()
+        self.assertEqual(rev, 1)
+        self.assertIn("install-host-command-watcher.sh", behind)
+
+    def test_an_unreadable_checker_reads_as_behind(self):
+        self._reboot_install(None)
+        rev, behind = self._console()
+        self.assertEqual(rev, 1)
+        self.assertNotEqual(behind, "")
+
+    def test_a_checker_that_names_its_revision_is_believed(self):
+        self._reboot_install(
+            "#!/bin/sh\n# oikonome-command-run revision=2\nset -u\n")
+        self.assertEqual(self._console(), (2, ""))
+
+    def test_the_generated_checker_names_the_revision_the_marker_does(self):
+        import re
+        from oikonome.web import adminconsole
+        src = (REPO / "scripts/install-host-command-watcher.sh").read_text()
+        body = src.split("cat > /usr/local/bin/oikonome-command-run "
+                         "<<SCRIPT\n", 1)[1]
+        m = re.match(r"#!/bin/sh\n# oikonome-command-run revision=(\d+)\n",
+                     body)
+        self.assertIsNotNone(m, "the checker does not name its revision")
+        self.assertEqual(int(m.group(1)),
+                         adminconsole.COMMAND_WATCHER_REVISION)
+        marker = re.search(r'echo "revision=(\d+)" >> "\$ROOT/ops-state/'
+                           r'watchers/command"', src)
+        self.assertEqual(int(marker.group(1)), int(m.group(1)))
+
+
 if __name__ == "__main__":
     unittest.main()

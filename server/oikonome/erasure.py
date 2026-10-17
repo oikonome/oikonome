@@ -7,6 +7,14 @@ tenant at a third party once the instance's own rows are gone:
 
 - **Plaid** — ``/item/remove`` on every Item, live and archived
   (``sync/plaid.release_tenant_items``). Also what stops per-Item billing.
+  An Item whose removal fails is queued with its access token (encrypted
+  under the master key) in ``plaid_release_queue`` before the rows go, and
+  the nightly ``jobs.reaper.retry_queued_releases`` keeps trying — the
+  token dies with the rows otherwise, and nothing could remove the Item.
+  Before that, every bank link still open is finished and the Items it
+  made are handed straight back
+  (``jobs/plaid_links.hand_back_open_sessions``): the session rows go with
+  the household, and an Item nobody exchanged would bill unremovably.
 - **MX** — delete the platform-side MX *user* (MX cascades its members/
   accounts/transactions — real financial data held at MX)
   (``sync/mx.release_tenant_user``).
@@ -184,7 +192,19 @@ def release_external(tenant_id) -> dict:
     rows go. Never raises."""
     from . import ext
     from .sync import mx, plaid
+    from .jobs import plaid_links
     results: dict = {}
+    # first, the bank links still open: an Item the person finished at
+    # Plaid but nobody exchanged yet would outlive the session rows the
+    # wipe deletes, with nothing able to remove it
+    try:
+        open_links = plaid_links.hand_back_open_sessions(tenant_id)
+        if any(w in ("busy", "error") for w in open_links.values()):
+            log.warning("erasure: open bank links of %s not all handed "
+                        "back: %s", tenant_id, sorted(open_links.values()))
+    except Exception as e:                                 # noqa: BLE001
+        log.warning("erasure: open bank links of %s not handed back: %s",
+                    tenant_id, e)
     try:
         n = plaid.release_tenant_items(tenant_id)
         results["plaid_items"] = int(n)
@@ -225,8 +245,9 @@ def release_external(tenant_id) -> dict:
 # and (b) when a vendor release failed, leave a queryable PENDING marker
 # carrying the non-secret identifiers an operator/retry needs — before the
 # rows (the only copy) are gone. (Plaid access tokens are secrets that die
-# with the tenant; Plaid retry is dashboard-side, per the erasure contract —
-# the marker records the item ids for that lookup, and names the ones that
+# with the tenant rows, so the release queues an encrypted copy of each
+# failed Item's token in plaid_release_queue for the nightly retry; the
+# marker records the item ids for the operator, and names the ones that
 # actually failed when the release was partial.)
 
 
@@ -299,10 +320,12 @@ def _write_pending_marker(admin, tenant_id, results: dict,
             (str(tenant_id), _json.dumps(
                 {"failed": failed, "results": results,
                  "retry": {**(retry_ids or {}),
-                           # the Items that did not release, by id — what an
-                           # operator removes from the Plaid dashboard (the
-                           # access tokens die with the rows, so nothing
-                           # server-side can call /item/remove for them)
+                           # the Items that did not release, by id. The
+                           # release queued each one it held a token for
+                           # (plaid_release_queue) and the nightly retry
+                           # removes them; an id the queue does not hold
+                           # (no token could be read) is one an operator
+                           # has to follow up at Plaid
                            "plaid_failed_item_ids":
                                _plaid_failed_ids(results, retry_ids)}})))
         log.warning("erasure: external release incomplete for %s (%s) — "

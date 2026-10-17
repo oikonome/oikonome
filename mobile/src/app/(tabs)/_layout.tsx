@@ -11,7 +11,8 @@ import { ext } from "../../ext";
 import { seedSettings } from "../../lib/cache";
 import { useSession } from "../../lib/session";
 import { deviceZone } from "../../lib/zone";
-import { accountTheme, retriesZoneAdopt, zoneToAdopt } from "../../lib/pure";
+import { accountTheme, retriesZoneAdopt, SIGN_IN_AGAIN, twoFactorRecheck,
+         zoneToAdopt } from "../../lib/pure";
 import { C, getThemeMode, mmddyy, setThemeMode } from "../../lib/theme";
 import { ApiError, errText, type Me } from "../../lib/api";
 
@@ -168,6 +169,8 @@ export default function TabsLayout() {
   // keep following their configured zone). (web: App.tsx, same rule)
   // It runs on a network answer only (zoneToAdopt says why); a failed
   // attempt is retried on a later fresh answer unless the server refused.
+  // An account still enrolling its second factor is not asked at all (the
+  // server would refuse the write): the fresh answer after enrolment is.
   const zoneOffered = useRef(false);
   const zoneTries = useRef(0);
   useEffect(() => {
@@ -187,6 +190,24 @@ export default function TabsLayout() {
           zoneOffered.current = false;
       });
   }, [me.dataUpdatedAt, client, qc]);
+  // This phone's push registration and its widget credential are sent
+  // once per sign-in (session.tsx). An account still enrolling its second
+  // factor is refused both, so the lockout clearing sends them again. That
+  // happens when the factor is set up on THIS phone (More → Security): the
+  // server keeps the enrolling device signed in. A factor set up on the
+  // web signs this phone out instead, and the next sign-in sends them.
+  const awaited2fa = useRef(false);
+  useEffect(() => {
+    if (!client || !me.data) return;
+    if (me.data.needs_2fa) { awaited2fa.current = true; return; }
+    if (!awaited2fa.current) return;
+    awaited2fa.current = false;
+    import("../../lib/push").then(({ registerNativePush }) =>
+      registerNativePush(client, { recheck: true })).catch(() => {});
+    if (serverUrl)
+      import("../../lib/glance").then(({ ensureWidgetToken }) =>
+        ensureWidgetToken(client, serverUrl)).catch(() => {});
+  }, [me.data, client, serverUrl]);
   // the verify banner's resend: one mail per tap, not one per tap while
   // the first is still in flight
   const [resending, setResending] = useState(false);
@@ -233,14 +254,42 @@ export default function TabsLayout() {
   });
   const unread = (alerts.data?.alerts ?? [])
     .filter((a) => a.active && !a.dismissed).length;
-  // hosted instances can require 2FA; enrolment is a web flow, so the
-  // app blocks here the way the web shell does instead of letting the
-  // account through
+  // hosted instances can require 2FA. The web shell blocks the same way
+  // (TwoFactorGate). An authenticator can be set up on this phone, under
+  // Security, and the server keeps the enrolling device signed in — so that
+  // is the way offered. Setting it up on the web instead signs every other
+  // device out, this phone included: the button asks the server first, so
+  // that case is said in words rather than a silent drop to the login
+  // screen (the api layer has already cleared the dead token by then).
   if (me.data?.needs_2fa) {
     return (
-      <Lockout title="Two-factor setup required"
-        body={"This server requires two-factor authentication. Sign in "
-              + "on the web app to set it up, then come back."}
+      <Lockout title="Secure your account"
+        body={"Oikonome protects your financial data — before you "
+              + "continue, add a second factor so a stolen password alone "
+              + "can't reach your account. Set up an authenticator app "
+              + "here, under Security. Set it up on the web app instead? "
+              + "That signs this phone out — sign in again here after."}
+        action={{ label: me.isFetching ? "Checking…"
+                                       : "Set up an authenticator app",
+                  onPress: () => {
+          if (me.isFetching) return;
+          me.refetch().then((r) => {
+            const next = twoFactorRecheck({
+              me: r.data && !r.isError ? r.data : null,
+              errorStatus: r.isError
+                ? (r.error instanceof ApiError ? r.error.status : 0)
+                : null });
+            if (next === "sign-in-again")
+              Alert.alert(SIGN_IN_AGAIN, "This phone was signed out — "
+                + "setting up a second factor on the web signs every "
+                + "other device out.");
+            else if (next === "set-up-here")
+              router.push("/security" as never);
+            else if (next === "unreachable")
+              Alert.alert("Couldn't reach the server",
+                          r.error ? errText(r.error) : "Try again.");
+          });
+        } }}
         onOut={signOut} />
     );
   }

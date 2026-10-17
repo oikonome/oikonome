@@ -22,6 +22,13 @@ Rules, enforced here and nowhere else:
 The split is an overlay. The row's own category_override / category_primary
 are untouched, so the sync, the bill pass and the store matchers need know
 nothing; removing the split hands the row back to them whole.
+
+Not every split is a person's. A store matcher writes the parts a matched
+receipt's items name (source = 'amazon' / 'costco', see store_match) and
+recomputes them on every run; a hand split (source = 'user') outranks them
+and is never touched by that recompute. The door here always writes the
+person's; a person removing a store's split pins the row's category, so the
+next run reads the row as answered and leaves it whole.
 """
 from __future__ import annotations
 
@@ -163,15 +170,37 @@ def set_split(conn, txn_id: str, parts: list) -> list[dict]:
                      (txn_id,))
         for i, p in enumerate(clean, 1):
             conn.execute(
-                "INSERT INTO transaction_splits (txn_id, line, category, amount)"
-                " VALUES (%s, %s, %s, %s)",
+                "INSERT INTO transaction_splits (txn_id, line, category, amount,"
+                " source) VALUES (%s, %s, %s, %s, 'user')",
                 (txn_id, i, p["category"], p["amount"]))
     return clean
 
 
-def clear_split(conn, txn_id: str) -> int:
-    return conn.execute("DELETE FROM transaction_splits WHERE txn_id = %s",
-                        (txn_id,)).rowcount
+def source_of(conn, txn_id: str) -> str | None:
+    """Who wrote the row's split: 'user', a store's kind, or None when the
+    row is not split. Every part of one split carries the same source."""
+    row = conn.execute(
+        "SELECT source FROM transaction_splits WHERE txn_id = %s "
+        "ORDER BY line LIMIT 1", (txn_id,)).fetchone()
+    return row["source"] if row else None
+
+
+def clear_split(conn, txn_id: str) -> str | None:
+    """Drop the row's split. Returns the source of the split that was there,
+    None when the row had none — the caller decides whether a person
+    removing a machine's parts also has to pin the row (api.clear_split).
+
+    The charge's row is locked first, as set_split and the store matcher
+    lock it before they write parts: taking the parts first would hold the
+    two in the opposite order, and a removal racing one of them could
+    deadlock instead of waiting its turn."""
+    with conn.transaction():
+        conn.execute("SELECT 1 FROM transactions WHERE id = %s FOR UPDATE",
+                     (txn_id,))
+        src = source_of(conn, txn_id)
+        conn.execute("DELETE FROM transaction_splits WHERE txn_id = %s",
+                     (txn_id,))
+    return src
 
 
 def move_split(conn, old_id: str, new_id: str) -> int:
@@ -184,7 +213,22 @@ def move_split(conn, old_id: str, new_id: str) -> int:
     split `new_id` holds; a differing one is somebody's answer and stays
     put for the re-anchor sweep to count, not to destroy. A move onto a
     row of another amount is left to `drop_stale`, which judges the parts
-    against the row that counts."""
+    against the row that counts.
+
+    Rank decides first: a person's split (source 'user') outranks a
+    store's, which is only its matcher's reading of a receipt and is
+    recomputed on every run. When the retired row carries the person's
+    parts, the live row's store parts give way to them — left blocking,
+    the person's answer would stay stranded on a row no rollup reads.
+    A store's parts never displace a person's, and two splits of the same
+    rank are never mixed. Callers lock the rows (`transactions`) before
+    reaching here, the order every split writer keeps."""
+    conn.execute(
+        """DELETE FROM transaction_splits
+            WHERE txn_id = %s AND source <> 'user' AND EXISTS
+                  (SELECT 1 FROM transaction_splits
+                    WHERE txn_id = %s AND source = 'user')""",
+        (new_id, old_id))
     n = conn.execute(
         """UPDATE transaction_splits SET txn_id = %s
             WHERE txn_id = %s AND NOT EXISTS

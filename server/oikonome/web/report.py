@@ -130,7 +130,8 @@ def bills_remaining_month(conn, cfg: dict, day: dt.date,
     return round(total, 2)
 
 
-def gather(conn, today: dt.date, *, live: bool = True) -> dict:
+def gather(conn, today: dt.date, *, live: bool = True,
+           memo: dict | None = None) -> dict:
     """live=False: `today` is a PAST day the user navigated to (Today page
     back-nav). The verdict/plan/bucket math is untouched — same month_status,
     same as-of date — but the NOW-facts are suppressed: cash forecast,
@@ -155,7 +156,10 @@ def gather(conn, today: dt.date, *, live: bool = True) -> dict:
     # evidence, and each derivation is a pair of unindexable LIKE scans
     # over the whole ledger. They share this dict so the work happens
     # once; it dies with the call, so it can never serve a stale number.
-    memo: dict = {}
+    # A caller that reads the same books again in the same request (the
+    # integrations summary asks for the week's bills straight after) may
+    # pass its own request-scoped dict to share the loads.
+    memo = {} if memo is None else memo
     # One config load per gather: month_status accepts the dict, and the
     # today_view read below reuses it — this runs on every Today request
     # and once per tenant per email sweep, so a second identical
@@ -283,7 +287,8 @@ def gather(conn, today: dt.date, *, live: bool = True) -> dict:
     if not live:
         status["runway"] = None
     else:
-        checking_bal = forecast._checking_balance(conn, cfg)
+        checking_bal, _avail, checking_unset = forecast._checking_start(
+            conn, cfg)
         # forecast.build's own card-scope predicate, spliced rather than
         # restated: its card_debt and this tile's render side by side on
         # Today and in the nightly email, and a second copy of the rule is
@@ -332,14 +337,23 @@ def gather(conn, today: dt.date, *, live: bool = True) -> dict:
             if nxt <= horizon:
                 due_total += plan
         due_total = round(due_total, 2)
-        # a files-only install has manual accounts whose balance nobody
-        # ever set — checking reads $0 and every cash signal screams "out of
-        # money" at a brand-new user. When the $0 comes from manual accounts
-        # only (no aggregator-fed depository) and transactions exist, flag the
-        # balance as unreliable so the surfaces show a "set your balance" nudge
-        # instead of the alarm.
-        balance_unreliable = False
-        if not checking_bal:
+        # a checking row nobody has given a balance (every file import
+        # creates one) is an unknown, not $0 — read as $0 every cash signal
+        # screams "out of money". The start pick says so from the row
+        # itself, whatever else the household has linked: a linked savings
+        # account, or a linked checking it excluded, does not make the
+        # imported row's balance real. Surfaces show "set your balance"
+        # instead of the alarm. A manual-only install still at the $0 a
+        # manual account is created with reads the same way while
+        # transactions exist and nothing aggregator-fed backs it.
+        balance_unreliable = bool(checking_unset)
+        # no checking account at all (a card-only or savings-only
+        # household) is not a $0 balance: checking stays None, so headroom
+        # and every cash alarm go quiet, and the surfaces ask for the
+        # account instead (`no_checking`)
+        no_checking = checking_bal is None
+        if checking_bal is not None and not checking_bal \
+                and not balance_unreliable:
             dep = conn.execute(
                 """SELECT COUNT(*) FILTER (WHERE item_id != 'manual') AS live,
                           COUNT(*) AS total
@@ -350,6 +364,7 @@ def gather(conn, today: dt.date, *, live: bool = True) -> dict:
         status["runway"] = {
             "checking": checking_bal,
             "balance_unreliable": balance_unreliable,
+            "no_checking": no_checking,
             "card_debt": card_debt,
             "cards": [(c["bank"], c["mask"], max(0.0, c["bal"] or 0.0))
                       for c in cards if (c["bal"] or 0) > 0.5],
@@ -474,7 +489,11 @@ def build(d: dict, *, summary: bool = False) -> tuple:
 
     var_budget_total = (d["buckets"]["food"]["month_budget"]
                         + d["buckets"]["other"]["month_budget"])
-    remaining = var_budget_total - d["variable_actual"]
+    # the hero's "$X of $Y left": the month's paced share and what is left
+    # of it (month_status), the remainder the tiles hand out a day at a time
+    hero_budget = d.get("variable_budget_paced", var_budget_total)
+    remaining = d.get("month_remaining_paced",
+                      var_budget_total - d["variable_actual"])
 
     # cash: quiet until it matters — plain-text mirror of the
     # HTML block's three states. autopay-statement is the
@@ -487,7 +506,7 @@ def build(d: dict, *, summary: bool = False) -> tuple:
     # number seeded from a lie. The plain-text mirror cannot show a caveat,
     # so it suppresses the same way; the set-your-balance
     # nudge in the verdict still tells them why it is quiet.
-    if rw.get("balance_unreliable"):
+    if rw.get("balance_unreliable") or rw.get("no_checking"):
         fc = None
     pc = fc["pace_stmt"] if fc else None
     if rw.get("checking") is not None and not rw.get("balance_unreliable"):
@@ -513,7 +532,15 @@ def build(d: dict, *, summary: bool = False) -> tuple:
     slow_txt = (f", or slow spending to {_money(slow_to)}/day"
                 if slow_to is not None else "")
     cash_line = None
-    if cash_critical:
+    # the two "we can't see your cash yet" nudges — the same sentences the
+    # HTML card carries in place of a cash alarm
+    if rw.get("balance_unreliable"):
+        cash_line = ("Cash forecast is waiting on your balance — set "
+                     "today's checking balance on the Accounts page.")
+    elif rw.get("no_checking"):
+        cash_line = ("No checking account linked — link your checking "
+                     "account on the Accounts page to see cash ahead.")
+    elif cash_critical:
         if spare is not None and spare < 0:
             cash_line = (f"!! CASH: short {_money(-spare)} today — checking "
                          f"doesn't cover cards & bills before the next "
@@ -531,7 +558,13 @@ def build(d: dict, *, summary: bool = False) -> tuple:
             cash_line = (f"Cash is tight — {_money(spare)} left after cards "
                          f"& bills before the next paycheck.")
 
-    month_bills = d["buckets"]["fixed"]["month_budget"]
+    # the plan chain and the heavy/light judgement read the month's bill
+    # SCHEDULE, the figure the variable scale subtracted — the cash-basis
+    # fixed total moves with an early autopay of next month's bill, and the
+    # chain in -> bills due -> to spend would stop adding up. The fixed
+    # line below keeps the cash basis and says so.
+    month_bills = d.get("scheduled_month",
+                        d["buckets"]["fixed"]["month_budget"])
     weight = month_bills - d["avg_bills"]
     weight_txt = (f"heavy month, +{_money(weight)} vs average" if weight > 100
                   else f"light month, −{_money(-weight)} vs average" if weight < -100
@@ -587,7 +620,7 @@ def build(d: dict, *, summary: bool = False) -> tuple:
     plain += [f"{state} — {day_ctx['pace_line']} · "
               f"{_money(abs(remaining))} "
               f"{'over the' if remaining < 0 else 'of'} "
-              f"{_money(var_budget_total)}"
+              f"{_money(hero_budget)}"
               f"{'' if remaining < 0 else ' left'} · "
               f"{day_ctx['days_left']} "
               f"day{'' if day_ctx['days_left'] == 1 else 's'}",
@@ -631,7 +664,7 @@ def build(d: dict, *, summary: bool = False) -> tuple:
             plain += ["", day_ctx["sweep_line"]]
     plan_flow = (f"Plan: "
                  f"{_money(d['income']) if d.get('income') is not None else '·'} in -> "
-                 f"{_money(month_bills)} bills "
+                 f"{_money(month_bills)} bills due "
                  f"(avg {_money(d['avg_bills'])}; {weight_txt}) -> "
                  f"{_money(var_budget_total)} to spend")
     # the surplus subtracts the savings plan, so without this leg the chain
@@ -730,7 +763,7 @@ def build(d: dict, *, summary: bool = False) -> tuple:
     fx = d["buckets"]["fixed"]
     plain.append(f"{'Fixed bills (info)':<20} posted {_money(fx['actual']):>10}  "
                  f"awaiting {_money(fx.get('unpaid_due', 0)):>10}  "
-                 f"month {_money(fx['month_budget'])}")
+                 f"month cash {_money(fx['month_budget'])}")
     # a charge the bank feed withdrew is not a bill that never posted —
     # it gets its own line, as on the Today page
     late = [o for o in budget.overdue_entries(d) if not o[3]]
@@ -1172,19 +1205,51 @@ def _smtp_tls_context(s: dict):
     return ctx
 
 
+# Refusals smtplib raises from send_message before the relay took the
+# message: nothing was delivered, so a caller may safely try another mail.
+# Any other failure inside send_message (a timeout or a dropped line during
+# DATA) leaves it unknown whether the relay already accepted it.
+_REFUSED_BEFORE_DELIVERY = (smtplib.SMTPSenderRefused,
+                            smtplib.SMTPRecipientsRefused,
+                            smtplib.SMTPDataError)
+
+
 def _smtp_deliver(msg, s: dict, host: str, connect_host: str, port: int,
                   user, password) -> None:
+    """Hand `msg` to the relay. Raises only when it was not delivered.
+
+    An exception that may have followed delivery carries
+    `maybe_delivered = True`, so a caller deciding whether to send a second
+    mail in its place does not send the same news twice."""
     implicit = int(port) == IMPLICIT_TLS_PORT
     opener = (_PinnedSMTPSSL(host, connect_host, port, timeout=30,
                              context=_smtp_tls_context(s)) if implicit
               else smtplib.SMTP(connect_host, port, timeout=30))
-    with opener as smtp_conn:
-        # smtplib verifies the STARTTLS certificate against the host it
-        # connected to — restore the real name so pinning doesn't turn
-        # verification into an IP mismatch
-        smtp_conn._host = host
-        if s["starttls"] and not implicit:
-            smtp_conn.starttls(context=_smtp_tls_context(s))
-        if user and password:
-            smtp_conn.login(user, password)
-        smtp_conn.send_message(msg)
+    delivered = False
+    try:
+        with opener as smtp_conn:
+            # smtplib verifies the STARTTLS certificate against the host it
+            # connected to — restore the real name so pinning doesn't turn
+            # verification into an IP mismatch
+            smtp_conn._host = host
+            if s["starttls"] and not implicit:
+                smtp_conn.starttls(context=_smtp_tls_context(s))
+            if user and password:
+                smtp_conn.login(user, password)
+            try:
+                smtp_conn.send_message(msg)
+            except _REFUSED_BEFORE_DELIVERY:
+                raise
+            except Exception as e:                         # noqa: BLE001
+                e.maybe_delivered = True
+                raise
+            delivered = True
+    except Exception:
+        # Once send_message has returned the relay owns the message; a bad
+        # reply to the QUIT that closing the session sends (smtplib raises
+        # it from __exit__) does not undo that, and reporting it as a
+        # failure would make callers retry or send a fallback mail.
+        if not delivered:
+            raise
+        log.debug("SMTP session to %s ended badly after the message was "
+                  "accepted", host, exc_info=True)

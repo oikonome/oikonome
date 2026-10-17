@@ -39,6 +39,26 @@ rounded to $10, with outlier months more than twice the median dropped
 median of the months it did. You approve each suggestion; nothing
 applies itself.
 
+A ledger shorter than a month (a new account, a first file import) has
+no complete month to take a median of, so its suggestions are the
+spending of the finished days seen so far, scaled to a whole month, and
+the planner says so: "Based on 9 days of history — scaled to a month".
+Under a week it adds that the figure will move and to revisit it after
+your first full month; with not one finished day yet it offers nothing
+and says to come back tomorrow. Until you save a budget, those figures
+are only suggestions: no page, lens or email judges a month against
+them.
+
+A month whose ledger begins partway through is paced from its first
+day, not from the 1st: the days before your first transaction were not
+days of no spending, they are days the app never saw. That month may
+spend the budget's share for the days from the first transaction to
+month end, and the verdict, the Today tiles, the hero's "$X of $Y left",
+and the forecast all read that same window, so spending exactly what
+the tiles hand out never reads as over. (The Month lens's per-category
+rows still show each category's whole-month budget.) From the next month
+on, the whole budget applies again.
+
 ## Fixed vs variable
 
 Every transaction lands in exactly one of:
@@ -54,7 +74,10 @@ Every transaction lands in exactly one of:
   balance; the card's own payoff covers it.
 - **Food** — the **FOOD AND DRINK** category, plus rows recategorized to
   **Amazon - Food & Drink** or **Costco - Food & Drink** by receipt
-  matching (your recategorizations move rows in or out).
+  matching (your recategorizations move rows in or out). A matched
+  receipt with items of several kinds is split by those items, so only
+  the groceries half of a mixed warehouse run lands here — see
+  [splits from a receipt](transactions.md#splits-from-a-receipt).
 - **Everything else** — all other variable spend.
 
 Custom categories are display carve-outs of Food/Everything else: the

@@ -2,11 +2,58 @@
 
 import hashlib
 import os
+import threading
 
 from argon2 import PasswordHasher
-from argon2.exceptions import VerifyMismatchError
+from argon2.exceptions import (InvalidHashError, VerificationError,
+                                VerifyMismatchError)
 
 _ph = PasswordHasher()
+
+
+# ---- concurrency gate ------------------------------------------------------
+# Every argon2 call holds the hasher's memory cost (64 MiB at the library
+# defaults) for its whole duration, and the library releases the GIL, so the
+# web server's thread pool (40 threads) can run that many at once: ten
+# parallel sign-ins are ~650 MiB, past a 768 MiB container limit, and the
+# kernel kills the whole server. One process-wide semaphore bounds the
+# concurrent hashes; the rest queue for a bounded time and then refuse with
+# HasherBusy, which the web layer answers as a 503 with Retry-After — a
+# visible "try again" instead of an out-of-memory restart for everyone.
+# Queuing costs nothing in throughput: on a small box the CPU, not the gate,
+# is what limits how many hashes finish per second.
+
+class HasherBusy(Exception):
+    """Too many password hashes in flight; the caller should back off."""
+
+
+def _gate_size() -> int:
+    from ..envnum import env_num
+    try:
+        n = int(env_num("OIKONOME_ARGON2_CONCURRENCY", "3"))
+    except ValueError:
+        n = 3
+    return max(1, n)
+
+
+def _gate_wait() -> float:
+    from ..envnum import env_num
+    try:
+        return max(0.0, float(env_num("OIKONOME_ARGON2_WAIT", "5")))
+    except ValueError:
+        return 5.0
+
+
+_GATE = threading.BoundedSemaphore(_gate_size())
+
+
+def _gated(fn, *args):
+    if not _GATE.acquire(timeout=_gate_wait()):
+        raise HasherBusy("password hashing is at capacity")
+    try:
+        return fn(*args)
+    finally:
+        _GATE.release()
 
 # a floor for strength, a ceiling because argon2 hashes whatever it
 # is handed — an unbounded password is a free CPU/memory burn per attempt.
@@ -72,13 +119,17 @@ def password_error(password: str) -> str | None:
 
 
 def hash_password(password: str) -> str:
-    return _ph.hash(password)
+    return _gated(_ph.hash, password)
 
 
 def verify_password(hashed: str, password: str) -> bool:
+    """False for a wrong password AND for a stored value that is not an
+    argon2 hash at all (a placeholder an operator wrote by hand): nothing
+    verifies against it, and a sign-in or signup that meets one must answer
+    as for any other mismatch, not with a server error."""
     try:
-        return _ph.verify(hashed, password)
-    except VerifyMismatchError:
+        return _gated(_ph.verify, hashed, password)
+    except (VerifyMismatchError, VerificationError, InvalidHashError):
         return False
 
 

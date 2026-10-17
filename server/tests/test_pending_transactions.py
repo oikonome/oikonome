@@ -24,7 +24,8 @@ import unittest
 from oikonome.engine import budget
 from oikonome.web import data, todayview
 
-from .util import TODAY, add_bill, add_txn, make_db, write_config
+from .util import (TODAY, add_bill, add_ledger_history, add_txn, make_db,
+                   write_config)
 
 DAYS_LEFT = 17   # TODAY = 2026-07-15, July has 31 days
 
@@ -32,6 +33,9 @@ DAYS_LEFT = 17   # TODAY = 2026-07-15, July has 31 days
 class PendingTransactionTests(unittest.TestCase):
     def setUp(self):
         self.conn = make_db()
+        # an established household: the tiles spread the whole month's
+        # budget only for a ledger that predates the month
+        add_ledger_history(self.conn, TODAY)
         write_config(self.conn)
 
     def tearDown(self):

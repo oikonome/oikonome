@@ -1,4 +1,12 @@
 import type { Glance } from "./glance-pure";
+import type { AnswerBlock, HistoryCursor } from "./answer-pure";
+
+export interface AssistantTurn {
+  id: string; asked_at: string; asked_by: string; question: string;
+  answer: string; blocks: AnswerBlock[]; tools_used: string[];
+  /** the conversation this turn belongs to; absent on an older server */
+  thread_id?: string | null;
+}
 import type { Txn } from "./ledger-row.generated";
 import { downloadsToSweep, isPickerScratch, isReauthReply, isSharedDownload,
          PICKER_SCRATCH } from "./pure.ts";
@@ -55,8 +63,19 @@ export interface TodayFull {
   simple: { left_today: number;
             chips: { text: string; tone: string }[] };
   variable_actual: number; variable_budget: number;
+  // the hero's "$X of $Y left": the month's spendable share (the whole
+  // month unless the ledger began inside it) and what is left of it —
+  // one server figure, equal to the tiles times the days left
+  month_share?: number; variable_budget_paced?: number;
+  month_remaining_paced?: number;
   income: number | null; plan_surplus: number | null;
   savings_plan?: number;
+  // the bills this month is SCHEDULED to owe — the plan chain's middle
+  // figure, so in → bills due → to spend adds up even when an early
+  // autopay of next month's bill already left as cash (that stays in
+  // buckets.fixed.month_budget, the fixed bar's basis). Absent from older
+  // servers; fall back to the fixed bucket then.
+  scheduled_month?: number;
   // sweep goals: plan cap, month-to-date availability, and the
   // server-composed sentence (identical wording in the daily email)
   sweep_plan?: number;
@@ -67,12 +86,15 @@ export interface TodayFull {
   // food/other may carry the custom-bucket decomposition: children carve
   // spend out of the parent for display; display_* / remaining_budget are
   // the parent AFTER the carve-outs
+  // paced_*: the budget share the month may spend (less than the whole
+  // when the ledger began inside the month) — what the rows measure against
   buckets: Record<string, {
     actual: number; expected: number; month_budget: number;
+    paced_budget?: number;
     children?: { name: string; actual: number; expected: number;
-                 month_budget: number }[];
+                 month_budget: number; paced_budget?: number }[];
     display_actual?: number; display_expected?: number;
-    remaining_budget?: number;
+    remaining_budget?: number; paced_remaining_budget?: number;
   }>;
   fixed_unpaid_due?: number;
   irregular_bills?: { payee: string; amount: number; label: string }[];
@@ -96,8 +118,10 @@ export interface TodayFull {
                 sub: string; frac: number; pace_frac: number;
                 status: string | null; status_tone: "neg" | "pos" | "warn" | null }[];
   days_left: number; headroom: number | null;
-  runway: { checking: number; card_debt: number; due_total: number;
-            balance_unreliable?: boolean } | null;
+  /** checking is null (and no_checking true) when the household has no
+   *  checking account: an unknown balance, never a $0 one */
+  runway: { checking: number | null; card_debt: number; due_total: number;
+            balance_unreliable?: boolean; no_checking?: boolean } | null;
   next_paycheck: string | null;
   recent: Txn[];
   allow_kids: { name: string; rate: number; plan: number;
@@ -113,6 +137,9 @@ export interface TodayFull {
   savings_goals: SavingsGoalProgress[];
   alerts: Alert[];
   forecast: { days: number; checking: number; card_debt: number;
+              /** no checking account: the walk starts from nothing, so its
+               *  balances and lows are not a forecast of anything */
+              no_checking?: boolean;
               pace_now: Series; pace_stmt: Series;
               /** [date, amount, card name] — dated card autopays the cash
                *  chart draws as lines; amount is negative (money leaving) */
@@ -273,6 +300,10 @@ export interface Me {
   // when the nightly sweep freezes a never-confirmed household (ISO);
   // null unless hosted, unverified and nobody here ever confirmed
   verify_deadline?: string | null;
+  // a requested sign-in address waiting for its mailbox's confirm button
+  // (hosted); the sign-in email stays `email` until then
+  pending_email?: string | null;
+  pending_email_expires_at?: string | null;
   recovery_codes_left?: number;
   // when a factor-clearing recovery someone asked for lands (ISO), or null;
   // the security screen offers the cancel, since an open session is no
@@ -287,7 +318,11 @@ export interface Me {
                institutions_used?: number; sms?: boolean;
                // false when the plan does not include Plaid's recurring
                // cross-check
-               plaid_recurring?: boolean };
+               plaid_recurring?: boolean;
+               // true when no bank can be connected until an owner
+               // confirms their email address — the server's own reason
+               // for an allowance of 0; absent from an older server
+               bank_awaits_confirm?: boolean };
   // merchant logos on ledger/merchants/spending (Settings; default on)
   merchant_logos?: boolean;
   needs_2fa?: boolean;
@@ -405,9 +440,33 @@ export interface Proposal {
   payee: string; amount: number;
   cadence: string; summary: string; income?: boolean;
   next_due?: string | null; llm_tag?: string | null;
+  /** the cadence's raw pieces (MONTHLY + 1) — what the Adjust form's
+   *  cadence picker starts on, in the bill forms' FREQ:interval values */
+  frequency?: string | null; interval?: number | null;
   /** an "attach" (fee) or "merchant" proposal: the bill it would join */
   bill_payee?: string | null;
 }
+/** The Adjust form's changes to a proposal, sent with its approve. */
+export type ProposalAdjust = { name?: string; amount?: number;
+                               cadence?: string; due_day?: number };
+
+/** GET /api/onboarding — the wizard's counts, step marks and the three
+ *  first-run choices it asks for. */
+export interface Onboarding {
+  accounts: number; transactions: number; bills: number;
+  connections: number; pending_proposals: number;
+  budgets_set: boolean; primary_checking_set: boolean;
+  wizard_done: boolean;
+  // per-step done/skipped marks — where the wizard resumes
+  wizard_steps: Record<string, string>;
+  // how far back a new link or import reaches (null = everything)
+  history_months?: 1 | 3 | 6 | 12 | null;
+  // how bills & budgets are set up: proposed from the ledger, or typed
+  setup_mode?: "auto" | "manual";
+  // whether the finder may scan on its own (manual turns it off)
+  bill_detection_auto?: boolean;
+}
+
 export interface Bill {
   // the fees that ride with the payment ("incl. $1 fee")
   companions?: Companion[]; fee_total?: number;
@@ -454,6 +513,8 @@ export interface BillsData {
               synced_at?: string | null }[];
   totals?: { bills_monthly: number; income_monthly: number;
              week_total: number; week_count: number; attention: number };
+  // the cadence picker's options, FREQ:interval value + words
+  cadences?: [string, string][];
 }
 
 export interface PLRow {
@@ -468,6 +529,9 @@ export interface NetWorthReport {
   by_institution: [string, number][];
   by_asset_class: [string, number][];
   trend: [string, number][];
+  // the same months with the property layer added, ending at full_total
+  // (absent from an older server)
+  full_trend?: [string, number][];
   coinbase_pl: PLRow[];
   retirement_combined: {
     groups?: { provider: string; accounts: PLRow[]; invested: number;
@@ -879,6 +943,8 @@ export interface ImportResult {
   // person had added something to them, or left because nothing proves
   // they came from this file
   removed_earlier?: number; kept_annotated?: number; foreign_left?: number;
+  // rows dated before the household's history window, left out
+  skipped_older?: number;
 }
 // A CSV whose columns could not be read: the person maps them.
 export interface ColumnMappingNeeded {
@@ -1080,6 +1146,13 @@ export interface SavingsGoal {
 // the slice of /api/settings the budget screens read/write
 /** GET /api/settings — and what every settings write returns. */
 export type SettingsView = BudgetSettings & Record<string, unknown> & {
+  // the household's pinned look; absent = never chosen, which the
+  // clients read as auto
+  theme?: "auto" | "light" | "dark" | null;
+  // the wizard's three first-run choices (see Onboarding)
+  history_months?: 1 | 3 | 6 | 12 | null;
+  setup_mode?: "auto" | "manual";
+  bill_detection_auto?: boolean;
   // what a credential rotation paused until the owner confirms it
   // (null = nothing): the Settings relay, extra recipients, the AI endpoint
   outbound_paused?: { at: string; reason: "rotation" | "recovery";
@@ -1128,6 +1201,12 @@ export interface BudgetSuggestions {
   bucket_candidates?: { name: string; category: string;
                         monthly: number }[];
   avg_bills_monthly?: number; bills_count?: number;
+  // the history behind the suggestions: days of ledger in the window,
+  // whether every figure is a partial month scaled up, and the fewest
+  // days the scaling ever stretches (the planner's history line)
+  history_days?: number; history_scaled?: boolean; min_rate_days?: number;
+  // no finished day of ledger yet: no suggestion is offered
+  not_enough_history?: boolean;
 }
 
 export interface Series {
@@ -1166,8 +1245,12 @@ export interface LensTxn {
 export interface MonthLensData {
   y: number; m: number; status: string; as_of: string;
   days_in_month?: number;
-  verdict: string; variance: number; tolerance?: number;
-  variable_actual: number; variable_budget: number;
+  // verdict null (and budget_set false): no budget the household saved
+  // stands behind the month — the lens shows no verdict
+  verdict: string | null; variance: number; tolerance?: number;
+  budget_set?: boolean;
+  // null when unjudged (budget_set false): no spendable to measure against
+  variable_actual: number; variable_budget: number | null;
   variable_scale?: { factor: number; static_total: number } | null;
   projection: { pace_total: number; variance: number;
                 tolerance?: number; verdict: string } | null;
@@ -1376,6 +1459,13 @@ export class ApiError extends Error {
    *  session from the login that just succeeded, still good on the
    *  server, so the retry spends them instead of signing in again */
   mintGrant?: MintGrant;
+  /** the server's Retry-After header, when it sent one (a 503 shed) */
+  retryAfter?: string | null;
+  /** a 502/503/504 the reverse proxy answered because the app was not
+   *  there to (a deploy, a restart): `detail` then holds the restarting
+   *  sentence, since the proxy's page and status line say nothing a
+   *  person can act on */
+  restarting?: boolean;
   constructor(status: number, detail: string, body?: unknown) {
     super(`${status}: ${detail}`);
     this.status = status;
@@ -1599,8 +1689,22 @@ export function downloadRefusal(body: string): string {
 async function parseError(r: Response): Promise<ApiError> {
   let detail = r.statusText;
   let structured: unknown;
+  const ct = r.headers.get("content-type") ?? "";
+  const text = await r.text().catch(() => "");
+  const retryAfter = r.headers.get("Retry-After");
+  // A gateway status whose body is not the app's own JSON comes from the
+  // proxy in front of it while the app restarts: its "back in a moment"
+  // HTML page, or nothing at all. The status line is no better — it reads
+  // "Service Unavailable", or is empty over HTTP/2 — so say what is
+  // happening, with the web's words.
+  if (GATEWAY.has(r.status) && !appJson(ct, text)) {
+    const err = new ApiError(r.status, restartingText(retryAfter));
+    err.retryAfter = retryAfter;
+    err.restarting = true;
+    return err;
+  }
   try {
-    const body = await r.json();
+    const body = JSON.parse(text);
     if (typeof body?.detail === "string") {
       detail = body.detail;
       // a refusal can carry flags beside its sentence (an add over an
@@ -1617,7 +1721,55 @@ async function parseError(r: Response): Promise<ApiError> {
         structured = { ...body.detail, error: body.error };
     }
   } catch { /* non-JSON error body — keep the status text */ }
-  return new ApiError(r.status, detail, structured);
+  const err = new ApiError(r.status, detail, structured);
+  err.retryAfter = retryAfter;
+  return err;
+}
+
+const GATEWAY = new Set([502, 503, 504]);
+
+/** Whether an error body is the app's own JSON. The proxy labels its page
+ *  text/html, but an edge in front can rewrite the content-type, so a
+ *  body that opens like markup, or is empty, counts as the proxy too. */
+function appJson(ct: string, text: string): boolean {
+  if (/html/i.test(ct)) return false;
+  const t = text.trimStart();
+  if (!t || t.startsWith("<")) return false;
+  try { JSON.parse(t); return true; } catch { return false; }
+}
+
+/** "a moment." or "N seconds." — the wait both sentences below share */
+function inWait(retryAfter?: string | null): string {
+  const secs = parseInt(retryAfter ?? "", 10);
+  return secs > 0 && secs <= 120
+    ? `${secs} second${secs === 1 ? "" : "s"}.`
+    : "a moment.";
+}
+
+/** "The server is busy — try again in a moment.", or in N seconds when
+ *  the server's Retry-After named a short wait. Same words as the web. */
+export function busyText(retryAfter?: string | null): string {
+  return "The server is busy — try again in " + inWait(retryAfter);
+}
+
+/** The same shape for the proxy's answer while the app restarts: it is
+ *  not overloaded, it is coming back, so it says that. Same words as the
+ *  web. */
+export function restartingText(retryAfter?: string | null): string {
+  return "The server is restarting — try again in " + inWait(retryAfter);
+}
+
+/** The sign-in screen's sentence for a failure: a 503 is the server
+ *  shedding load (sign-ins hashing at once, or the database full) — never
+ *  a wrong password and never a raw status — so it says "busy", with the
+ *  server's own wait when it named a short one. A restart the proxy
+ *  answered for is neither, and keeps its own sentence. */
+export function signInErrText(e: unknown): string {
+  if (e instanceof ApiError && e.restarting)
+    return restartingText(e.retryAfter);
+  if (e instanceof ApiError && e.status === 503)
+    return busyText(e.retryAfter);
+  return errText(e);
 }
 
 // last time the read-only (402) notice fired — module-level (the web
@@ -1825,13 +1977,7 @@ export function makeClient(baseUrl: string, token: string,
     todayFull: (date?: string) =>
       req<TodayFull>("/api/today/full"
         + (date ? `?date=${encodeURIComponent(date)}` : "")),
-    onboarding: () =>
-      req<{ accounts: number; transactions: number; bills: number;
-            connections: number; pending_proposals: number;
-            budgets_set: boolean; primary_checking_set: boolean;
-            wizard_done: boolean;
-            // per-step done/skipped marks — where the wizard resumes
-            wizard_steps: Record<string, string> }>("/api/onboarding"),
+    onboarding: () => req<Onboarding>("/api/onboarding"),
     // where each bank connection stands in its one-time history backfill;
     // polling it also nudges the server to keep pulling (same door the
     // web's wizard step 2 waits on)
@@ -1944,8 +2090,11 @@ export function makeClient(baseUrl: string, token: string,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ current_password, new_password }),
       }),
+    // on hosted the address does not move yet: `email` is still the
+    // sign-in address and `pending_email` the one awaiting its button
     emailChange: (new_email: string) =>
-      req<{ ok: boolean; email: string; verify_sent?: boolean;
+      req<{ ok: boolean; email: string; pending_email?: string | null;
+            verify_sent?: boolean;
             hint?: string | null; passkeys_removed?: number;
             passkeys_kept?: number; mail_list_entry_dropped?: boolean;
             sms_number_needs_verify?: boolean;
@@ -1987,6 +2136,10 @@ export function makeClient(baseUrl: string, token: string,
       }),
     // stop a factor-clearing recovery on this account (no step-up:
     // cancelling is the safe direction)
+    // withdraw a pending sign-in address change
+    emailChangeCancel: () =>
+      req<{ ok: boolean; cancelled: boolean }>(
+        "/api/email/change/cancel", { method: "POST" }),
     cancelPendingRecovery: () =>
       req<{ ok: boolean; cancelled: number }>(
         "/api/recovery/cancel-pending", { method: "POST" }),
@@ -2282,13 +2435,22 @@ export function makeClient(baseUrl: string, token: string,
     // every pending proposal in one click (the wizard's bills step)
     billsApproveAll: () =>
       req<{ ok: boolean; approved: number; payees: string[];
-            failed: { pid: string; error: string }[] }>(
+            failed: { pid: string; error: string }[];
+            notes?: { payee: string; note: string }[] }>(
         "/api/bills/proposals/approve-all", { method: "POST" }),
-    billsProposal: (pid: string, action: "approve" | "reject") =>
-      req<{ ok: boolean; payee: string; superseded?: boolean }>("/api/bills/proposal", {
+    // `note` is present when the approve changed something the person set
+    // (a pinned amount cleared) and must be shown to them
+    // `adjust` (approve only) is what the person changed in the wizard's
+    // Adjust form before approving — only the fields they moved; the
+    // finder's evidence stays attached to the bill it creates
+    billsProposal: (pid: string, action: "approve" | "reject",
+                    adjust?: ProposalAdjust) =>
+      req<{ ok: boolean; payee: string; superseded?: boolean; note?: string }>("/api/bills/proposal", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pid, action }),
+        body: JSON.stringify(adjust && action === "approve"
+          && Object.keys(adjust).length ? { pid, action, adjust }
+                                        : { pid, action }),
       }),
     lensMonth: (y: number, m: number) =>
       req<MonthLensData>(`/api/lens/month?y=${y}&m=${m}`),
@@ -2596,8 +2758,9 @@ export function makeClient(baseUrl: string, token: string,
         suggested_line: string | null;
         suggested_bucket: string }[]; total?: number }>(
         `/api/business/entities/${encodeURIComponent(id)}/suggestions`),
+    // `sched_c_line` null clears the line; leaving it out keeps the stored one
     bizClassify: (id: string, txnId: string,
-                  body: { bucket: string; sched_c_line?: string }) =>
+                  body: { bucket: string; sched_c_line?: string | null }) =>
       req<{ ok: boolean }>(
         `/api/business/entities/${encodeURIComponent(id)}/transactions/${
           encodeURIComponent(txnId)}/class`, {
@@ -2841,7 +3004,9 @@ export function makeClient(baseUrl: string, token: string,
       req<{ done: boolean;
             kind?: "add" | "add_failed" | "update" | "update_failed" | "busy"
                  | "exited";
-            institution?: string; error?: string }>(
+            institution?: string; error?: string;
+            // "pending": saved, its first pull queued on the worker
+            first_sync?: "pending" | "ok" }>(
         `/accounts/plaid/link/${encodeURIComponent(linkToken)}/status`),
     simplefinConnect: (sfToken: string) =>
       req<{ ok: boolean; accounts: number; transactions: number }>(
@@ -3395,12 +3560,67 @@ export function makeClient(baseUrl: string, token: string,
     assistantStatus: () =>
       req<{ available: boolean; local: boolean; host?: string | null }>(
         "/api/assistant"),
-    assistantAsk: (question: string) =>
-      req<{ answer: string; tools_used: string[] }>("/api/assistant", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question }),
-      }),
+    // `answer` is the prose alone; `blocks` the ordered text + chart /
+    // table pieces the screen draws (components/answer-blocks); absent
+    // on an older server
+    // the household's answered questions, newest first — the same log
+    // the web shows, so a question asked there is here too
+    // the log pages by (asked_at, id): `next` is the cursor for the page
+    // after this one, and both halves go back on the next read
+    assistantHistory: (cursor?: HistoryCursor | null) =>
+      req<{ turns: AssistantTurn[]; more: boolean; next?: HistoryCursor | null }>(
+        "/api/assistant/history"
+        + (cursor ? `?before=${encodeURIComponent(cursor.before)}`
+           + (cursor.before_id
+             ? `&before_id=${encodeURIComponent(cursor.before_id)}` : "") : "")),
+    // drops one conversation — every turn of the thread (a 404 when
+    // nothing was left to drop: someone removed it first)
+    assistantForgetThread: (threadId: string) =>
+      req<{ ok: boolean; deleted: number }>(
+        `/api/assistant/threads/${encodeURIComponent(threadId)}`, { method: "DELETE" }),
+    // drops one turn: a server that predates conversations has only this
+    // door, and there a conversation's id is its one turn's id
+    assistantForgetTurn: (turnId: string) =>
+      req<{ ok: boolean; deleted: number }>(
+        `/api/assistant/history/${encodeURIComponent(turnId)}`, { method: "DELETE" }),
+    assistantClear: () =>
+      req<{ ok: boolean; deleted: number }>(
+        "/api/assistant/history", { method: "DELETE" }),
+    // a follow-up names the conversation it continues (`threadId`); the
+    // model then sees that thread's earlier turns and nothing else. A 404
+    // means that conversation no longer exists; `saved: false` or
+    // `removed: true` means the answer was kept in no conversation
+    assistantAsk: (question: string, threadId?: string | null) =>
+      req<{ answer: string; blocks?: AnswerBlock[]; tools_used: string[];
+            id?: string | null; thread_id?: string | null;
+            saved?: boolean; removed?: boolean }>(
+        "/api/assistant", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(threadId ? { question, thread_id: threadId } : { question }),
+        }),
+    // one answer as a self-contained HTML page (the server re-validates
+    // the blocks and draws the charts), written to the cache and handed
+    // to the share sheet like every other download — swept later, not
+    // deleted under the target app
+    assistantReport: async (question: string, blocks: AnswerBlock[]) => {
+      const r = await fetch(baseUrl + "/api/assistant/report", {
+        method: "POST", signal: epochSignal(),
+        headers: { Authorization: `Bearer ${token}`,
+                   "Content-Type": "application/json" },
+        body: JSON.stringify({ question, blocks }),
+      });
+      await checkAuth(r, "POST");
+      if (!r.ok) throw await parseError(r);
+      const page = await r.text();
+      const FileSystem = await import("expo-file-system/legacy");
+      const Sharing = await import("expo-sharing");
+      const m0 = /filename="?([^";]+)/.exec(r.headers.get("content-disposition") ?? "");
+      await sweepDownloads(SHARE_GRACE_S);
+      const dest = FileSystem.cacheDirectory + (m0?.[1] ?? "oikonome-answer.html");
+      await FileSystem.writeAsStringAsync(dest, page);
+      await Sharing.shareAsync(dest, { mimeType: "text/html", UTI: "public.html" });
+    },
   };
 }
 

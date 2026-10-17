@@ -33,6 +33,10 @@ def create(conn, source: str, account_id: str | None,
     # insert and the import with it
     if filename:
         filename = filename.replace("\x00", "")
+    # banks name exports after the full account number, and this record
+    # rides /export and the portability archive: keep the last four only
+    from .base import mask_long_digits
+    filename = mask_long_digits(filename)
     conn.execute(
         "INSERT INTO import_batches (id, source, account_id, filename) "
         "VALUES (%s,%s,%s,%s)", (bid, source, account_id, filename))

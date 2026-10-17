@@ -238,6 +238,14 @@ NO_RLS_APP_WRITES = {
     # admin-only: a parked password hash and the token that hands an
     # address to whoever clicks it — the app role reads nothing here
     "signup_reclaims":        ("", ()),
+    "email_change_reverts":   ("", ()),
+    # admin-only; the app role reads the pending address and its
+    # timestamps through a column SELECT grant, which writes nothing
+    "email_change_requests":  ("", ()),
+    # Plaid link sessions and the release retry queue: admin connection
+    # only (the queue holds encrypted access tokens)
+    "plaid_link_sessions":    ("", ()),
+    "plaid_release_queue":    ("", ()),
     "spam_addresses_blocked": ("", ()),
     "spam_domains_blocked":   ("", ()),
     "spam_domains_public":    ("", ()),

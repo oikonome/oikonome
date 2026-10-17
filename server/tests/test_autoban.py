@@ -102,14 +102,69 @@ class AutoBanTests(unittest.TestCase):
                 security.record_strike(PUB, route="login")
             self.assertIsNone(security.blocked_seconds(PUB))
 
-    def test_limit_429_records_a_strike(self):
+    def test_a_rate_limit_429_is_not_a_strike(self):
+        """The limit refuses the excess itself; a crowd behind one carrier
+        address (CGNAT) trips it honestly, and counting those 429s as
+        strikes banned the whole address."""
         from fastapi import HTTPException
         dep = security.limit(f"ab-{id(self)}", 1, 60)
         dep(_req(peer=PUB))                       # 1st ok
-        with self.assertRaises(HTTPException):
-            dep(_req(peer=PUB))                   # 2nd → 429 → strike
+        for _ in range(security._STRIKE_MAX + 5):
+            with self.assertRaises(HTTPException) as cm:
+                dep(_req(peer=PUB))               # 429, no strike
+        self.assertEqual(cm.exception.status_code, 429)
+        self.assertIn("few minutes", cm.exception.detail)
+        self.assertEqual(
+            security._limiter.count(("strike", PUB), security._STRIKE_WINDOW), 0)
+        self.assertIsNone(security.blocked_seconds(PUB))
+
+    def test_failed_sign_ins_still_strike(self):
+        security.record_auth_failure(PUB, route="login")
         self.assertEqual(
             security._limiter.count(("strike", PUB), security._STRIKE_WINDOW), 1)
+
+
+class CarrierAddressBurstTests(unittest.TestCase):
+    """The per-IP backstops on the credential doors fit a carrier address.
+
+    A broadcast mention sends a crowd to sign up within minutes, many of
+    them phones behind one CGNAT address. Turnstile is the bot gate; the
+    per-IP limits only bound raw volume, so twenty signups (and their
+    sign-ins) from one address must all get through, and none of them
+    may move the address toward an auto-ban."""
+
+    def setUp(self):
+        security._limiter._hits.clear()
+        security._limiter._blocks.clear()
+        self._p = mock.patch.object(security, "_redis_limiter", False)
+        self._p.start()
+        self._env = mock.patch.dict(
+            os.environ, {"OIKONOME_TRUSTED_PROXIES": "", "OIKONOME_AUTOBAN": "1"})
+        self._env.start()
+
+    def tearDown(self):
+        self._p.stop()
+        self._env.stop()
+        security._limiter._hits.clear()
+
+    def test_the_door_limits(self):
+        from oikonome.web import app as appmod
+        self.assertEqual(appmod._SIGNUP_PER_IP, (30, 3600))
+        self.assertEqual(appmod._LOGIN_PER_IP, (40, 300))
+
+    def test_twenty_signups_and_sign_ins_from_one_address_pass(self):
+        from fastapi import HTTPException
+        from oikonome.web import app as appmod
+        signup = security.limit(f"su-{id(self)}", *appmod._SIGNUP_PER_IP)
+        login = security.limit(f"li-{id(self)}", *appmod._LOGIN_PER_IP)
+        for _ in range(20):
+            signup(_req(peer=PUB))
+            login(_req(peer=PUB))
+        for _ in range(appmod._SIGNUP_PER_IP[0] - 20):
+            signup(_req(peer=PUB))
+        with self.assertRaises(HTTPException):
+            signup(_req(peer=PUB))
+        self.assertIsNone(security.blocked_seconds(PUB))
 
 
 class BanEscalationSingleCrossingTests(unittest.TestCase):
@@ -233,6 +288,145 @@ class PwnedPasswordTests(unittest.TestCase):
              mock.patch.object(passwords, "pwned_count") as pc:
             self.assertIn("at least", passwords.password_error("short"))
             pc.assert_not_called()               # never reach the network
+
+
+class OneIPv6HostIsOneSourceTests(unittest.TestCase):
+    """A host that owns an IPv6 /64 can answer from any of its addresses.
+    Every per-address budget — the limits, the strikes and ban, the
+    human-check risk mark — counts the /64 as one source, or the host steps
+    past all of them one fresh address at a time. And one host must not be
+    able to arm the site-wide check alone: that puts a challenge in front
+    of every sign-in, which the phone apps cannot show."""
+
+    NET = "2a00:1450:4001:800"          # a global /64
+
+    def setUp(self):
+        security._limiter._hits.clear()
+        security._limiter._blocks.clear()
+        for p in (mock.patch.object(security, "_redis_limiter", False),
+                  mock.patch.dict(os.environ, {"OIKONOME_TRUSTED_PROXIES": "",
+                                               "OIKONOME_AUTOBAN": "1"})):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _addr(self, i):
+        return f"{self.NET}::{i + 1:x}"
+
+    def test_the_key_folds_ipv6_to_its_64_and_mapped_ipv4_to_plain(self):
+        self.assertEqual(security.rate_key(self._addr(0)),
+                         security.rate_key(f"{self.NET}:ffff:1:2:3"))
+        self.assertNotEqual(security.rate_key(self._addr(0)),
+                            security.rate_key("2a00:1450:4001:801::1"))
+        self.assertEqual(security.rate_key("::ffff:8.8.8.8"), "8.8.8.8")
+        self.assertEqual(security.rate_key("8.8.8.8"), "8.8.8.8")
+        self.assertEqual(security.rate_key("testclient"), "testclient")
+
+    def test_sixty_addresses_in_one_64_arm_the_64_but_not_the_site(self):
+        for i in range(60):
+            security.record_auth_failure(self._addr(i))
+        fresh = self._addr(1000)
+        self.assertTrue(security.challenge_warranted(fresh),
+                        "the /64 is one source and has failed enough")
+        self.assertIsNotNone(security.blocked_seconds(fresh),
+                             "and its strikes ban the whole /64")
+        self.assertEqual(security._risk_count(security._RISK_SITE_KEY),
+                         security._RISK_IP_MAX)
+        self.assertFalse(security.challenge_warranted("9.9.9.9"),
+                         "a stranger elsewhere is never challenged for it")
+
+    def test_sixty_64s_of_one_48_arm_nothing_site_wide(self):
+        """One host routed a /48 (a tunnel broker's) or a /56 answers from
+        hundreds of /64s; the site counts it as one source all the same."""
+        for i in range(60):
+            for _ in range(security._RISK_IP_MAX):
+                security.record_challenge_risk(f"2a00:1450:4001:{i:x}::1")
+        self.assertEqual(security._risk_count(security._RISK_SITE_KEY),
+                         security._RISK_IP_MAX)
+        self.assertFalse(security.challenge_warranted("9.9.9.9"),
+                         "a stranger elsewhere is never challenged for it")
+        self.assertTrue(
+            security.challenge_warranted("2a00:1450:4001:0::99"),
+            "each /64 is still challenged for its own failures")
+        self.assertTrue(
+            security.challenge_warranted("2a00:1450:4001:ff::1"),
+            "and so is a fresh /64 of that /48: the /48 is one challenge "
+            "source too, or rotating /64s would never meet the check")
+        self.assertFalse(
+            security.challenge_warranted("2a00:1450:4002:ff::1"),
+            "but a /64 of a neighbouring /48 is not")
+
+    def test_failures_spread_across_many_sources_still_arm_the_site(self):
+        n = -(-security._RISK_SITE_MAX // security._RISK_IP_MAX)
+        for i in range(n):
+            for _ in range(security._RISK_IP_MAX):
+                security.record_challenge_risk(f"2a00:1450:{i + 1:x}::1")
+        self.assertTrue(security.challenge_warranted("9.9.9.9"))
+
+    def test_a_per_address_limit_counts_the_whole_64(self):
+        dep = security.limit("probe", 3, 60)
+        for i in range(3):
+            dep(_req(peer=self._addr(i)))
+        from fastapi import HTTPException
+        with self.assertRaises(HTTPException) as e:
+            dep(_req(peer=self._addr(99)))
+        self.assertEqual(e.exception.status_code, 429)
+        dep(_req(peer="2a00:1450:4001:801::1"))     # the next /64 is its own
+
+
+class GoingOverTheUploadBudgetNeverBansTests(unittest.TestCase):
+    """A 429 is not a strike, the upload budget's included: a carrier
+    address shared by many phones sending receipt photos goes over it
+    honestly, and must not ban itself."""
+
+    def setUp(self):
+        security._limiter._hits.clear()
+        security._limiter._blocks.clear()
+        security._reset_ingest_slots()
+        for p in (mock.patch.object(security, "_redis_limiter", False),
+                  mock.patch.dict(os.environ, {"OIKONOME_AUTOBAN": "1"}),
+                  mock.patch.object(security, "_accepts_upload",
+                                    return_value=True),
+                  mock.patch.object(security, "client_ip",
+                                    return_value=PUB)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_eighty_uploads_from_one_address_are_refused_not_banned(self):
+        import asyncio
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({"type": "http.response.start", "status": 200,
+                        "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        mw = security.BodySizeLimitMiddleware(app)
+        statuses = []
+
+        async def one():
+            sent = []
+
+            async def receive():
+                return {"type": "http.request", "body": b"x",
+                        "more_body": False}
+
+            async def send(msg):
+                sent.append(msg)
+            scope = {"type": "http", "method": "POST", "path": "/api/import",
+                     "headers": [(b"content-type",
+                                  b"multipart/form-data; boundary=b"),
+                                 (b"content-length", b"1")],
+                     "client": (PUB, 1234)}
+            await mw(scope, receive, send)
+            statuses.append(next(m["status"] for m in sent
+                                 if m["type"] == "http.response.start"))
+
+        async def run():
+            for _ in range(security.UPLOAD_INGEST_LIMIT + 20):
+                await one()
+        asyncio.run(run())
+        self.assertIn(429, statuses)
+        self.assertIsNone(security.blocked_seconds(PUB))
 
 
 if __name__ == "__main__":

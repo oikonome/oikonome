@@ -22,7 +22,8 @@ import { useSession } from "../lib/session";
 import { useDemo, useViewer } from "../lib/viewer";
 import { C, mmddyy, money } from "../lib/theme";
 import MerchantAvatar from "../components/merchant-avatar";
-import { cadenceChoices, cadenceWords, catLabel, filterCategories, missedBillPill,
+import { ADD_CADENCES, CUSTOM_UNITS, cadenceChoices, cadenceWords, catLabel,
+         customCadence, customMax, filterCategories, missedBillPill,
          proposalSuperseded, RANGE_LABEL, TREND_RANGES, type TrendRange } from "../lib/pure";
 
 // the web page's health pill wording
@@ -41,11 +42,6 @@ const HEALTH_LABEL: Record<string, { text: string;
 const healthPill = (h: string) =>
   HEALTH_LABEL[h] ?? { text: "off-ledger" as const, tone: undefined };
 
-const SIMPLE_CADENCES: [string, string][] = [
-  ["DAILY:1", "daily"], ["WEEKLY:1", "weekly"], ["MONTHLY:1", "monthly"],
-  ["YEARLY:1", "yearly"], ["ENVELOPE:1", "envelope (monthly pool)"],
-  ["ENVELOPE:12", "envelope (annual pool)"],
-];
 
 export default function BillHistory() {
   const { payee } = useLocalSearchParams<{ payee: string }>();
@@ -114,6 +110,8 @@ export default function BillHistory() {
       const gone = proposalSuperseded(r);
       if (gone) Alert.alert("Already tracked",
         `${r.payee} is already tracked — the offer was withdrawn.`);
+      // the approve changed something the person set (a pin cleared)
+      else if (r.note) Alert.alert("Approved", `${r.payee} — ${r.note}`);
       removeFromList<BillsHistoryData, Proposal>(qc, histKey,
         "proposals", (p) => p.id === v.pid);
       removeFromList<BillsData, Proposal>(qc, ["bills"], "proposals",
@@ -567,12 +565,11 @@ function AddAsBill({ payee, fit, inflow, onDone }: {
   const [cadence, setCadence] = useState(fit?.cadence ?? "MONTHLY:1");
   const [nextDue, setNextDue] = useState(fit?.next_due ?? "");
   const [customN, setCustomN] = useState("2");
-  const [customUnit, setCustomUnit] = useState<"MONTHLY" | "YEARLY">("YEARLY");
+  const [customUnit, setCustomUnit] = useState("YEARLY");
   const [suggested, setSuggested] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const effCadence = cadence === "CUSTOM"
-    ? `${customUnit}:${Math.max(1, parseInt(customN, 10) || 1)}`
-    : cadence;
+    ? customCadence(customUnit, customN) : cadence;
   const add = useMutation({
     mutationFn: () => client!.billsSave({
       payee, amount, cadence: effCadence, next_due: nextDue || undefined,
@@ -583,7 +580,7 @@ function AddAsBill({ payee, fit, inflow, onDone }: {
   // a ledger suggestion may be an unusual cadence not in the short list —
   // keep it selectable/visible rather than silently mis-showing
   const options: [string, string][] = [
-    ...cadenceChoices(SIMPLE_CADENCES, [fit?.cadence]),
+    ...cadenceChoices(ADD_CADENCES, [fit?.cadence]),
     ["CUSTOM", "custom interval…"],
   ];
   return (
@@ -604,17 +601,22 @@ function AddAsBill({ payee, fit, inflow, onDone }: {
         ))}
       </View>
       {cadence === "CUSTOM" && (
-        <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 6,
+                       flexWrap: "wrap" }}>
           <Text style={s.mut}>every</Text>
-          <TextInput style={[s.input, { minWidth: 52, flex: 0 }]}
-                     keyboardType="number-pad" value={customN}
-                     onChangeText={setCustomN} />
-          {(["MONTHLY", "YEARLY"] as const).map((u) => (
+          {/* the cap depends on the unit (about 20 years of it), so the
+              field clamps as it is typed rather than at a fixed length */}
+          <TextInput style={[s.input, { minWidth: 60, flex: 0 }]}
+                     keyboardType="number-pad" value={customN} maxLength={4}
+                     onChangeText={(t) => setCustomN(
+                       Number(t) > customMax(customUnit)
+                         ? String(customMax(customUnit)) : t)} />
+          {CUSTOM_UNITS.map(([u, label]) => (
             <Pressable key={u} style={[s.chip, customUnit === u && s.chipOn]}
                        onPress={() => setCustomUnit(u)}>
               <Text style={{ color: customUnit === u ? C.text : C.mut,
                              fontSize: 12 }}>
-                {u === "MONTHLY" ? "month(s)" : "year(s)"}
+                {label}
               </Text>
             </Pressable>
           ))}

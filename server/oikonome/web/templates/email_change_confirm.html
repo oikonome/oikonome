@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block body %}
+<h1>Confirm your new sign-in email</h1>
+<div class="card" style="max-width:28rem">
+  {% if error %}<div class="note" style="margin-bottom:.8rem;background:rgba(224,105,93,.10);border-color:rgba(224,105,93,.4);color:var(--red)">{{ error }}</div>{% endif %}
+  {% if state == "confirm" %}
+  <p style="margin-top:0">Make <b>{{ new_email }}</b> the sign-in email of the Oikonome
+    account that now signs in as <b>{{ shown }}</b>?</p>
+  <p class="sub">Only confirm if you asked for this change yourself. If you did not,
+    close this page — nothing changes, and the link stops working on its own.</p>
+  <form method="post" action="/account/email-change">
+    <input type="hidden" name="token" value="{{ token }}">
+    <button class="pri">Confirm the new email</button>
+  </form>
+  {% elif state == "done" %}
+  <div class="note" style="background:rgba(92,181,107,.10);border-color:rgba(92,181,107,.4);color:var(--green)">Done — the account now signs in as {{ new_email }}.</div>
+  <p class="sub" style="margin-top:.8rem"><a href="/login">Sign in</a></p>
+  {% elif state == "taken" %}
+  <p style="margin-top:0">Another account uses <b>{{ new_email }}</b> now, so this
+    account cannot move to it. Its sign-in email has not changed.</p>
+  <p class="sub"><a href="/login">Back to sign in</a></p>
+  {% else %}
+  <p class="sub"><a href="/login">Back to sign in</a></p>
+  {% endif %}
+</div>
+{% endblock %}

@@ -265,8 +265,17 @@ def match(merchant: str | None) -> str | None:
 # from the LLM, never flow-classified.
 
 _CARD_PAYMENT_RE = re.compile(
-    r"\b(CREDIT CARD|CREDIT CRD|CARD PAYMENT|CARDMEMBER SERV\w*|"
+    r"\b(CREDIT CARD|CREDIT CRD|CARD PAYMENT|CC PAYMENT|CARDMEMBER SERV\w*|"
     r"PAYMENT THANK YOU|E-?PAYMENT)\b")
+# loan servicing — "STD LN PMT", "STUDENT LOAN", "AUTO LOAN PMT". Money
+# out of the household, so it stays in spend, but in the loan-payments
+# bucket: a categorizer reading only the servicer's name files it under
+# whatever that name suggests (utilities, services), and every student-loan
+# payment would then read as "services".
+_STUDENT_LOAN_RE = re.compile(
+    r"\b(STUDENT LOANS?|STD(ENT|NT)? (LN|LOAN)|STUDENT LN)\b")
+_LOAN_PAYMENT_RE = re.compile(
+    r"\b(LN|LOAN) (PMT|PYMT|PAYMENT|PAYMNT)\b")
 _TRANSFER_RE = re.compile(
     r"\b(TRANSFER|XFER|WITHDRAWAL|ATM WITHDRAWAL|CASH WITHDRAWAL)\b")
 # strings that are ONLY mechanics (no merchant to categorize) — never sent
@@ -286,8 +295,28 @@ def flow_match(merchant: str | None) -> tuple[str, str | None] | None:
     up = merchant.upper()
     if _CARD_PAYMENT_RE.search(up):
         return ("LOAN_PAYMENTS", "LOAN_PAYMENTS_CREDIT_CARD_PAYMENT")
+    loan = loan_match(up)
+    if loan:
+        return loan
     if _TRANSFER_RE.search(up):
         return ("TRANSFER_OUT", None)
+    return None
+
+
+def loan_match(descriptor: str | None) -> tuple[str, str | None] | None:
+    """The loan-servicing subset of flow_match, for a RAW statement line.
+    An importer that cleans "ACME DES:STD LN PMT ID:…" down to the
+    merchant "Acme" hides the only words that say what the money was —
+    so flow_classify screens the raw line with this (and only this: a
+    raw line's "withdrawal" is how some banks spell any payment, and a
+    transfer read from it would hide real spend)."""
+    if not descriptor:
+        return None
+    up = descriptor.upper()
+    if _STUDENT_LOAN_RE.search(up):
+        return ("LOAN_PAYMENTS", "LOAN_PAYMENTS_STUDENT_LOAN_PAYMENT")
+    if _LOAN_PAYMENT_RE.search(up):
+        return ("LOAN_PAYMENTS", "LOAN_PAYMENTS_OTHER_PAYMENT")
     return None
 
 

@@ -66,6 +66,9 @@ services:
       OIKONOME_HOSTED_FREEFORM_RECIPIENTS: ${OIKONOME_HOSTED_FREEFORM_RECIPIENTS:-}
       # lift invite-only signup (docs/deployment-modes.md)
       OIKONOME_OPEN_SIGNUP: ${OIKONOME_OPEN_SIGNUP:-}
+      # where testers get this instance's Android build; the sign-in page
+      # shows a small link when it is set (see .env.example)
+      OIKONOME_ANDROID_TEST_URL: ${OIKONOME_ANDROID_TEST_URL:-}
       # where a locked-out or turned-away person is told to write (unset:
       # the app names no address)
       OIKONOME_SUPPORT_EMAIL: ${OIKONOME_SUPPORT_EMAIL:-}
@@ -198,6 +201,13 @@ services:
       OIKONOME_CONTROL_POOL_MAX: ${OIKONOME_CONTROL_POOL_MAX:-}
       OIKONOME_TENANT_POOL_TIMEOUT: ${OIKONOME_TENANT_POOL_TIMEOUT:-}
       OIKONOME_CONTROL_POOL_TIMEOUT: ${OIKONOME_CONTROL_POOL_TIMEOUT:-}
+      # Password-hash concurrency (argon2 holds 64 MiB per hash; the cap
+      # keeps a burst of sign-ins inside the container's memory) and the
+      # worker's thread count — same rule: forwarded or they do nothing.
+      OIKONOME_ARGON2_CONCURRENCY: ${OIKONOME_ARGON2_CONCURRENCY:-}
+      OIKONOME_ARGON2_WAIT: ${OIKONOME_ARGON2_WAIT:-}
+      OIKONOME_WORKER_THREADS: ${OIKONOME_WORKER_THREADS:-}
+      OIKONOME_FIRST_SYNC_CONCURRENCY: ${OIKONOME_FIRST_SYNC_CONCURRENCY:-}
       OIKONOME_CONTROL_LOCK_TIMEOUT_MS: ${OIKONOME_CONTROL_LOCK_TIMEOUT_MS:-}
       OIKONOME_CONTROL_IDLE_TXN_TIMEOUT_MS: ${OIKONOME_CONTROL_IDLE_TXN_TIMEOUT_MS:-}
       OIKONOME_CONTROL_STATEMENT_TIMEOUT_MS: ${OIKONOME_CONTROL_STATEMENT_TIMEOUT_MS:-}
@@ -209,11 +219,15 @@ services:
       OIKONOME_SPAM_SAFELIST_EXTRA: ${OIKONOME_SPAM_SAFELIST_EXTRA:-}
       OIKONOME_SMTP_NO_VERIFY: ${OIKONOME_SMTP_NO_VERIFY:-}
       OIKONOME_RECOVERY_MEMBER_WINDOW_DAYS: ${OIKONOME_RECOVERY_MEMBER_WINDOW_DAYS:-}
+      # host folder behind /state/backups, named on the console's backup card
+      OIKONOME_BACKUP_DIR: ${OIKONOME_BACKUP_DIR:-}
     # Read-only visibility for the admin console's backup and
     # host-health cards (install.sh pre-creates both dirs; ops-state is
     # written by the optional scripts/host-health.sh timer on the host)
     volumes:
-      - ../backups:/state/backups:ro,z
+      # OIKONOME_BACKUP_DIR moves it (relative = against this folder); the
+      # same setting tells oikonome.sh and the console's Restore where to look
+      - ${OIKONOME_BACKUP_DIR:-../backups}:/state/backups:ro,z
       - ../ops-state:/state/ops:ro,z
       # writable: console→host commands (reboot request); a root path-unit
       # on the host validates + executes (scripts/host-reboot-watcher)
@@ -328,10 +342,20 @@ services:
       # app, so they must be forwarded explicitly — otherwise setting them
       # does nothing, including the managed-PG step-up procedure that tells
       # the operator to raise them. Empty == the code's own default.
-      OIKONOME_POOL_MAX: ${OIKONOME_POOL_MAX:-}
-      OIKONOME_CONTROL_POOL_MAX: ${OIKONOME_CONTROL_POOL_MAX:-}
+      # The worker sizes its pools apart from the web process: each of its
+      # running jobs holds a connection (a new bank's first pull for
+      # minutes), so its own knobs win and the shared ones are the fallback.
+      OIKONOME_POOL_MAX: ${OIKONOME_WORKER_POOL_MAX:-${OIKONOME_POOL_MAX:-}}
+      OIKONOME_CONTROL_POOL_MAX: ${OIKONOME_WORKER_CONTROL_POOL_MAX:-${OIKONOME_CONTROL_POOL_MAX:-}}
       OIKONOME_TENANT_POOL_TIMEOUT: ${OIKONOME_TENANT_POOL_TIMEOUT:-}
       OIKONOME_CONTROL_POOL_TIMEOUT: ${OIKONOME_CONTROL_POOL_TIMEOUT:-}
+      # Password-hash concurrency (argon2 holds 64 MiB per hash; the cap
+      # keeps a burst of sign-ins inside the container's memory) and the
+      # worker's thread count — same rule: forwarded or they do nothing.
+      OIKONOME_ARGON2_CONCURRENCY: ${OIKONOME_ARGON2_CONCURRENCY:-}
+      OIKONOME_ARGON2_WAIT: ${OIKONOME_ARGON2_WAIT:-}
+      OIKONOME_WORKER_THREADS: ${OIKONOME_WORKER_THREADS:-}
+      OIKONOME_FIRST_SYNC_CONCURRENCY: ${OIKONOME_FIRST_SYNC_CONCURRENCY:-}
       OIKONOME_CONTROL_LOCK_TIMEOUT_MS: ${OIKONOME_CONTROL_LOCK_TIMEOUT_MS:-}
       OIKONOME_CONTROL_IDLE_TXN_TIMEOUT_MS: ${OIKONOME_CONTROL_IDLE_TXN_TIMEOUT_MS:-}
       OIKONOME_CONTROL_STATEMENT_TIMEOUT_MS: ${OIKONOME_CONTROL_STATEMENT_TIMEOUT_MS:-}

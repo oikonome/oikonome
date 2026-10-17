@@ -8,7 +8,7 @@
 // the web locks them out: the credentials are shared.
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "expo-router";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Alert, Linking, Pressable, RefreshControl, ScrollView, StyleSheet,
          Text, TextInput, View } from "react-native";
 import PullRefresh from "../components/pull-refresh";
@@ -17,14 +17,66 @@ import StaleBanner from "../components/stale-banner";
 import { Card, H, Pill, SharedLock } from "../components/ui";
 import { patchQuery } from "../lib/cache";
 import { ago } from "../lib/dates";
-import { plaidHostedLink } from "../lib/plaid";
-import { bankLinkHoldNote, institutionAllowance, showsProviderDoor,
-         type BankLinkHoldView } from "../lib/pure";
+import { PLAID_LINK_WAIT_MS, plaidHostedLink, type PlaidLinkOutcome,
+         useFirstSyncLanding } from "../lib/plaid";
+import { bankAwaitsConfirm, bankLinkHoldNote, FIRST_SYNC_RUNNING,
+         institutionAllowance, linkedLine, linkPollMayRetry, showsProviderDoor, type BankLinkHoldView } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { ext } from "../ext";
 import { C } from "../lib/theme";
 import { useOwner, useSharedLock } from "../lib/viewer";
-import { errText } from "../lib/api";
+import { errText, type Me } from "../lib/api";
+import { CONFIRM_TO_CONNECT, VerifyEmailCard }
+  from "../components/verify-email-card";
+
+
+/** Pick up this household's bank links still able to finish — ones the
+ *  app stopped watching because Android dropped it during the bank's OAuth
+ *  hop, or the person closed the screen — and hand each outcome to
+ *  `onDone`. The server finishes the link either way (the LINK webhook
+ *  and the worker's sweep); this is how the person learns that it did.
+ *  Owner-only, like the server door; a refusal means nothing to resume. */
+export function usePlaidLinkResume(onDone: (r: PlaidLinkOutcome) => void) {
+  const { client } = useSession();
+  const owner = useOwner();
+  const done = useRef(onDone);
+  done.current = onDone;
+  useEffect(() => {
+    if (!client || !owner) return;
+    let live = true;
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const watch = async (token: string) => {
+      const deadline = Date.now() + PLAID_LINK_WAIT_MS;
+      let wait = 2500;
+      while (live && Date.now() < deadline) {
+        await sleep(wait);
+        if (!live) return;
+        try {
+          // resume=1: a session picked up here is watched for its answer
+          // only, and the server does not keep it counted under the
+          // institution cap — the screen resumes on every visit, so an
+          // abandoned link would otherwise hold the household's last slot
+          const s = await client.req<{ done: boolean } & PlaidLinkOutcome>(
+            `/accounts/plaid/link/${encodeURIComponent(token)}`
+            + "/status?resume=1");
+          wait = 2500;
+          if (s.done) {
+            if (live) done.current(s);
+            return;
+          }
+        } catch (e) {
+          if (!linkPollMayRetry(e)) return;
+          wait = Math.min(wait * 2, 30_000);
+        }
+      }
+    };
+    client.req<{ sessions?: { link_token: string }[] }>(
+      "/accounts/plaid/links/open")
+      .then((r) => { for (const s of r.sessions ?? []) void watch(s.link_token); })
+      .catch(() => { /* nothing to resume */ });
+    return () => { live = false; };
+  }, [client, owner]);
+}
 
 const ROWS: { key: string; name: string; cost: string; effort: string;
               richness: string; hostedCost?: string;
@@ -91,7 +143,7 @@ export default function ConnectHub() {
   // as the web's hosted ConnectHub. Self-host keeps the grid below —
   // BYO keys legitimately need the comparison.
   if (hosted)
-    return <HostedHub bankLink={!!me.data?.bank_link}
+    return <HostedHub bankLink={!!me.data?.bank_link} me={me.data}
                       cap={me.data?.features?.institution_cap}
                       used={me.data?.features?.institutions_used} />;
 
@@ -163,8 +215,8 @@ export default function ConnectHub() {
 /** The hosted door: one button that links any institution, the banks it
  *  has linked so far, and the bring-your-own lane underneath. Wording,
  *  order and the "account" (not "bank") button label are the web's. */
-function HostedHub({ bankLink, cap, used }: {
-  bankLink: boolean; cap?: number | null; used?: number;
+function HostedHub({ bankLink, me, cap, used }: {
+  bankLink: boolean; me: Me | undefined; cap?: number | null; used?: number;
 }) {
   const { client } = useSession();
   const router = useRouter();
@@ -174,6 +226,8 @@ function HostedHub({ bankLink, cap, used }: {
   const conns = useQuery({ queryKey: ["connections"],
     queryFn: () => client!.connections(), enabled: !!client,
     refetchOnMount: "always", refetchInterval: 5000 });
+  // a first sync landing refreshes the accounts and the wizard it fills
+  useFirstSyncLanding(conns.data?.connections);
   const [msg, setMsg] = useState<string | null>(null);
   // the pull-to-refresh spinner tracks the PULL, not the query: sharing
   // isRefetching with the 5s poll above would flash it every tick
@@ -181,23 +235,27 @@ function HostedHub({ bankLink, cap, used }: {
   // a bank link plants a credential that outlives the shared demonstration
   // login, so the server refuses it that door; the button says so in place
   const credentialLock = useSharedLock("credential");
+  const onLinked = (r: PlaidLinkOutcome) => {
+    setMsg(
+      r.kind === "add" ? linkedLine(r.institution, r.first_sync)
+      : r.kind === "exited" || r.kind === "cancelled"
+        ? "No bank was linked — the sign-in window was closed. Connect "
+          + "again whenever you're ready."
+        : String(r.error ?? "link failed"));
+    if (r.kind === "add") {
+      // a new bank moves the roster, the accounts it feeds, the
+      // wizard's progress and its backfill wait — not every query
+      for (const k of ["connections", "me", "accounts", "onboarding",
+                       "onboarding-backfill"])
+        qc.invalidateQueries({ queryKey: [k] });
+    }
+  };
+  // a link the app stopped watching (killed mid-OAuth, screen closed)
+  // reports here when the screen comes back
+  usePlaidLinkResume(onLinked);
   const link = useMutation({
     mutationFn: () => plaidHostedLink(client!, ""),
-    onSuccess: (r) => {
-      setMsg(
-        r.kind === "add" ? `Linked ${r.institution || "bank"} ✓`
-        : r.kind === "exited" || r.kind === "cancelled"
-          ? "No bank was linked — the sign-in window was closed. Connect "
-            + "again whenever you're ready."
-          : String(r.error ?? "link failed"));
-      if (r.kind === "add") {
-        // a new bank moves the roster, the accounts it feeds, the
-        // wizard's progress and its backfill wait — not every query
-        for (const k of ["connections", "me", "accounts", "onboarding",
-                         "onboarding-backfill"])
-          qc.invalidateQueries({ queryKey: [k] });
-      }
-    },
+    onSuccess: onLinked,
     onError: (e) => setMsg(errText(e)),
   });
   const disc = useMutation({
@@ -220,6 +278,11 @@ function HostedHub({ bankLink, cap, used }: {
     .filter((c) => c.aggregator !== "simplefin");
   const accounts = linked.reduce((t, c) => t + (c.accounts ?? 0), 0);
   const { known: capKnown, full } = institutionAllowance(cap, used);
+  // a free trial whose owner has not confirmed has an allowance of zero
+  // (the server says so on /api/me): the door is closed here,
+  // with the reason on the card above it, before the tap the server
+  // refuses (the web's hosted ConnectHub)
+  const confirmFirst = bankAwaitsConfirm(me);
   return (
     <ScrollView style={s.wrap} contentContainerStyle={{ paddingBottom: 24 }}
       refreshControl={<RefreshControl tintColor={C.accent} colors={[C.accent]}
@@ -230,6 +293,8 @@ function HostedHub({ bankLink, cap, used }: {
                                           .finally(() => setPulling(false));
                                       }} />}>
       <StaleBanner query={conns} />
+      {bankLink && confirmFirst && (
+        <VerifyEmailCard me={me} note={CONFIRM_TO_CONNECT} />)}
       <Card>
         <H>Connect your accounts</H>
         {bankLink ? (
@@ -244,15 +309,19 @@ function HostedHub({ bankLink, cap, used }: {
                 written into this copy would be wrong for exactly the
                 accounts that were given more. The wording is the web
                 ConnectCard's. */}
-            {capKnown && (
+            {/* "0 of 0" while the address waits says nothing true */}
+            {capKnown && !confirmFirst && (
               <Text style={[s.mut, { marginTop: 4 }]}>
                 {ext.allowanceNote(used, cap, full)}
               </Text>
             )}
             <SharedLock note={credentialLock}>
-            <Pressable style={[s.btn, (link.isPending || full)
+            <Pressable style={[s.btn, (link.isPending || full || confirmFirst)
                                       && { opacity: 0.5 }]}
-                       disabled={link.isPending || full || !!credentialLock}
+                       disabled={link.isPending || full || confirmFirst
+                                 || !!credentialLock}
+                       accessibilityHint={confirmFirst ? CONFIRM_TO_CONNECT
+                                                       : undefined}
                        onPress={() => { setMsg(null); link.mutate(); }}>
               {/* "account", not "bank" — a card, a brokerage and a bank
                   are all accounts; once one is in, the button invites
@@ -309,7 +378,7 @@ function HostedHub({ bankLink, cap, used }: {
                         : ""}
                       {bad ? "needs attention"
                         : c.last_ok ? `synced ${ago(c.last_ok)}`
-                                    : "first sync pending"}
+                                    : FIRST_SYNC_RUNNING}
                       {/* the bank's own clock: sync reads Plaid's copy,
                           and the bank refreshes that copy on its own
                           schedule — this is the number that explains a
@@ -423,7 +492,7 @@ function PlaidFlow({ d }: { d?: Record<string, unknown> }) {
     mutationFn: () => plaidHostedLink(client!, ""),
     onSuccess: (r) => {
       setMsg(
-        r.kind === "add" ? `Linked ${r.institution || "bank"} ✓`
+        r.kind === "add" ? linkedLine(r.institution, r.first_sync)
         : r.kind === "exited" || r.kind === "cancelled"
           ? "No change — the sign-in window was closed."
           : String(r.error ?? "link failed"));

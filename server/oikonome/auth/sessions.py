@@ -54,7 +54,13 @@ def lookup_session(conn, token: str) -> dict | None:
                   u.second_factor_waived
            FROM sessions s JOIN users u ON u.id = s.user_id
                 JOIN tenants t ON t.id = s.tenant_id
-           WHERE s.token_hash = %s AND s.expires_at > now()""",
+           WHERE s.token_hash = %s AND s.expires_at > now()
+                 -- a session speaks for the household it was opened in,
+                 -- and only while its person still belongs to it. Every
+                 -- path that moves users.tenant_id revokes sessions today;
+                 -- this keeps a moved person from carrying the old
+                 -- household's tenant with them if one ever forgets.
+                 AND u.tenant_id = s.tenant_id""",
         (_h(token),)).fetchone()
     if row is not None:
         # coarse activity stamp + SLIDING idle renewal (never past the

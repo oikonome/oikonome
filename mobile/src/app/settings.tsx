@@ -24,7 +24,10 @@ import { patchQuery, removeFromList, saveSettings, SETTINGS_SAVES }
 import { EMAIL_KIND_LABEL, EMAIL_KINDS, kindOffNote, localDayOf, myDailyLine,
          prefOn, signOutAction }
   from "../lib/pure";
-import { llmBackendsSeed, storedEnrichCap } from "../lib/settings-pure";
+import { INVEST_STALE_STATUS, investChanges, investFormOf, investSeenOf,
+         llmBackendsSeed, storedEnrichCap,
+         type BasisRow, type FeeRow, type InvestForm, type InvestSeen }
+  from "../lib/settings-pure";
 import { cadenceOf } from "../lib/schedule";
 import { registerNativePush } from "../lib/push";
 import { useSession } from "../lib/session";
@@ -153,17 +156,23 @@ function ContinuityCard() {
   const noteNow = note ?? d?.note ?? "";
   const whoNow = who ?? d?.prepared_for ?? "";
   const dirty = !!d && (noteNow !== d.note || whoNow !== d.prepared_for);
+  // The PDF and the email are printed from the SAVED note, so an edit
+  // still in the box is saved first — otherwise the packet handed to
+  // someone would carry the old words while the screen shows the new ones.
+  const persist = async () => {
+    const r = await client!.continuitySave({ note: noteNow,
+                                             prepared_for: whoNow });
+    qc.setQueryData<Continuity>(["continuity"], (o) => o && { ...o, ...r });
+    setNote(null); setWho(null);
+  };
   const save = useMutation({
-    mutationFn: () => client!.continuitySave({ note: noteNow,
-                                               prepared_for: whoNow }),
-    onSuccess: (r) => {
-      qc.setQueryData<Continuity>(["continuity"], (o) => o && { ...o, ...r });
-      setNote(null); setWho(null); setMsg({ text: "Saved." });
-    },
+    mutationFn: persist,
+    onSuccess: () => setMsg({ text: "Saved." }),
     onError: (e) => setMsg({ text: stepUpMsg(e), bad: true }),
   });
   const get = useMutation({
     mutationFn: async () => {
+      if (dirty) await persist();
       const t = await client!.exportTicket("continuity");
       await client!.download(t.url, "oikonome-continuity.pdf");
     },
@@ -171,7 +180,10 @@ function ContinuityCard() {
     onError: (e) => setMsg({ text: stepUpMsg(e), bad: true }),
   });
   const mail = useMutation({
-    mutationFn: () => client!.continuityEmail(to.trim()),
+    mutationFn: async () => {
+      if (dirty) await persist();
+      return client!.continuityEmail(to.trim());
+    },
     onSuccess: (r) => setMsg({ text: `Sent to ${r.to}.` }),
     onError: (e) => setMsg({ text: stepUpMsg(e), bad: true }),
   });
@@ -219,6 +231,10 @@ function ContinuityCard() {
             {get.isPending ? "preparing…" : "Download PDF"}</Text>
         </Pressable>
       </View>
+      {dirty && (
+        <Text style={[s.hintL2, { marginTop: 6 }]}>
+          Your edits are saved before the PDF or email goes out.</Text>
+      )}
       {d && (
         <View style={{ marginTop: 12 }}>
           <Text style={s.hintL2}>
@@ -344,6 +360,8 @@ export default function Settings() {
     conn: hit("connections providers plaid mx simplefin bank keys "
       + "scripts manage accounts rename hide remove add link reconnect"),
     tokens: hit("script tokens api bearer collectors community push import"),
+    invest: hit("investment fees basis advisory fee robo advisor net worth "
+      + "money in cost basis self-directed exempt brokerage"),
     webhooks: hit("webhooks webhook events post url signature home assistant "
       + "automation matrix integrations outbound"),
     readtokens: hit("integration tokens read token api bearer prometheus "
@@ -535,7 +553,7 @@ export default function Settings() {
         <TextInput style={s.search} placeholder="Search settings…"
                    placeholderTextColor={C.mut} autoCapitalize="none"
                    value={filter} onChangeText={setFilter} />
-        {owner && (hits.conn || hits.tokens || hits.move) && (
+        {owner && (hits.conn || hits.tokens || hits.move || hits.invest) && (
           <SectionHead>Connections</SectionHead>
         )}
         {owner && hits.conn && (<>
@@ -553,6 +571,9 @@ export default function Settings() {
             && <PlaidRecurringCard />}
           {!me.data.demo && <EnrichCard />}
         </>)}
+        {/* the web's Investment fees & basis card, under Connections like
+            the web */}
+        {owner && hits.invest && <InvestmentFeesCard />}
         {/* hosted included — the web renders script tokens everywhere */}
         {owner && hits.tokens && (
           <SharedLock note={lockGrant}><ScriptTokensCard /></SharedLock>)}
@@ -922,13 +943,14 @@ function LlmCard({ hosted }: { hosted: boolean }) {
                      placeholderTextColor={C.mut} value={b.name}
                      onChangeText={(v) => patch(b.id, { name: v })} />
           <TextInput style={s.input}
-                     placeholder={hosted ? "https://api.openai.com/v1"
+                     placeholder={hosted ? "https://api.anthropic.com"
                        : "http://localhost:11434/v1"}
                      placeholderTextColor={C.mut} autoCapitalize="none"
                      value={b.url}
                      onChangeText={(v) => patch(b.id, { url: v })} />
           <TextInput style={s.input}
-                     placeholder={hosted ? "gpt-4o-mini" : "llama3.1:8b"}
+                     placeholder={hosted ? "a model id from that provider"
+                       : "llama3.1:8b"}
                      placeholderTextColor={C.mut} autoCapitalize="none"
                      value={b.model}
                      onChangeText={(v) => patch(b.id, { model: v })} />
@@ -1410,6 +1432,188 @@ function EnrichCard() {
   );
 }
 
+
+function InvestmentFeesCard() {
+  // the web's "Investment fees & basis" card: the Net Worth page's fee
+  // estimate for robo-advisors (no fee rows in their exports, so a stated
+  // rate is the only honest number) and money-in anchors where the feed's
+  // cost basis is near zero for shares transferred in. Same keys, same
+  // labels, same validation (settings-pure.investBody). Owner-only, as the
+  // server is: it refuses these keys from a member's save.
+  const { client } = useSession();
+  const qc = useQueryClient();
+  const q = useQuery({ queryKey: ["settings"],
+    queryFn: () => client!.settingsFull(), enabled: !!client });
+  // null = untouched, so the rows follow the server until someone edits;
+  // from the first edit the draft keeps the view it started from, so Save
+  // can tell which sections were edited. `seen` is the stored sections
+  // that view held, which Save sends as the base so a section another
+  // device changed since is refused, not lost.
+  const [draft, setDraft] = useState<{ base: InvestForm; form: InvestForm;
+                                       seen: InvestSeen } | null>(null);
+  const form = draft?.form ?? investFormOf(q.data);
+  const [note, setNote] = useState<{ text: string; bad?: boolean } | null>(
+    null);
+  const save = useMutation({
+    mutationFn: (body: Record<string, unknown>) =>
+      saveSettings(qc, client!, body),
+    scope: SETTINGS_SAVES,
+    onSuccess: () => {
+      // saveSettings seeded ["settings"], so dropping the draft shows what
+      // the server stored; the reports reading these keys are what moved
+      setDraft(null);
+      setNote({ text: "Saved — the Net Worth page now uses these." });
+      qc.invalidateQueries({ queryKey: ["report"] });
+    },
+    onError: (e) => {
+      // another device changed a section this phone edited: drop the
+      // draft so the rows follow the server again, and fetch the current
+      // ones for the person to redo the change on
+      if (e instanceof ApiError && e.status === INVEST_STALE_STATUS) {
+        setDraft(null);
+        qc.invalidateQueries({ queryKey: ["settings"] });
+      }
+      setNote({ text: errText(e), bad: true });
+    },
+  });
+  const edit = (f: (o: InvestForm) => InvestForm) => setDraft((d) => ({
+    base: d?.base ?? investFormOf(q.data),
+    seen: d?.seen ?? investSeenOf(q.data),
+    form: f(d?.form ?? investFormOf(q.data)) }));
+  const setFee = (i: number, p: Partial<FeeRow>) => edit((o) => ({
+    ...o, fees: o.fees.map((r, j) => j === i ? { ...r, ...p } : r) }));
+  const setBasis = (i: number, p: Partial<BasisRow>) => edit((o) => ({
+    ...o, basis: o.basis.map((r, j) => j === i ? { ...r, ...p } : r) }));
+  const submit = () => {
+    // only the sections edited since the form opened: each one replaces
+    // its stored key whole, so an untouched one would put back this
+    // phone's copy over anything saved elsewhere since
+    const r = investChanges(draft?.base ?? form, form,
+                            draft?.seen ?? investSeenOf(q.data));
+    if (!r.ok) { setNote({ text: r.error, bad: true }); return; }
+    if (!Object.keys(r.body).length) {
+      setDraft(null);
+      setNote({ text: "Nothing to save — no changes." });
+      return;
+    }
+    setNote(null);
+    save.mutate(r.body);
+  };
+  const sub = { color: C.mut, fontSize: 12, marginTop: 2 } as const;
+  const h3 = { color: C.text, fontSize: 13, fontWeight: "600" as const,
+               marginTop: 12 };
+  const row = { flexDirection: "row" as const, alignItems: "center" as const,
+                gap: 8, marginTop: 6 };
+  return (
+    <Card>
+      <Text style={{ color: C.text, fontSize: 14, fontWeight: "600" }}>
+        Investment fees &amp; basis
+      </Text>
+      <Text style={sub}>
+        Used by the Net Worth page. Robo-advisors take their fee out of the
+        balance without a fee row, so name the institution and its yearly
+        rate and the fee is estimated from the managed balance.
+      </Text>
+      {/* until the stored settings are here the form would be blank, and
+          saving a blank form clears what the household typed in */}
+      {!q.data ? (
+        q.isError ? (
+          <View style={row}>
+            <Text style={[sub, { color: C.bad }]}>
+              Couldn&apos;t load these settings.
+            </Text>
+            <Pressable onPress={() => q.refetch()}>
+              <Text style={{ color: C.mut, fontSize: 12 }}>retry</Text>
+            </Pressable>
+          </View>
+        ) : (
+          <Text style={[sub, { marginTop: 8 }]}>Loading…</Text>
+        )
+      ) : (<>
+      <Text style={h3}>Advisory fees</Text>
+      {form.fees.map((r, i) => (
+        <View key={i} style={row}>
+          <TextInput style={[s.input, { marginTop: 0, flex: 1 }]}
+                     placeholder="Institution name contains"
+                     placeholderTextColor={C.mut} autoCapitalize="none"
+                     value={r.inst}
+                     onChangeText={(t) => setFee(i, { inst: t })} />
+          <TextInput style={[s.input, { marginTop: 0, width: 72 }]}
+                     placeholder="0.25" placeholderTextColor={C.mut}
+                     keyboardType="decimal-pad" value={r.pct}
+                     accessibilityLabel="Yearly fee %"
+                     onChangeText={(t) => setFee(i, { pct: t })} />
+          <Text style={sub}>%</Text>
+          <Pressable onPress={() => edit((o) => ({
+                       ...o, fees: o.fees.filter((_r, j) => j !== i) }))}>
+            <Text style={{ color: C.mut, fontSize: 12 }}>remove</Text>
+          </Pressable>
+        </View>
+      ))}
+      <Pressable style={[s.btn, s.btnQuiet, { alignSelf: "flex-start",
+                                              marginTop: 6 }]}
+                 onPress={() => edit((o) => ({
+                   ...o, fees: [...o.fees, { inst: "", pct: "" }] }))}>
+        <Text style={s.btnText}>+ Add institution</Text>
+      </Pressable>
+      <Text style={[sub, { marginTop: 10 }]}>
+        Fee-free accounts (last characters, comma-separated)
+      </Text>
+      {/* a plain keyboard: some banks' masks carry letters, and a
+          number pad cannot type them */}
+      <TextInput style={s.input} placeholder="1234, 5678"
+                 placeholderTextColor={C.mut} keyboardType="default"
+                 autoCapitalize="characters" autoCorrect={false}
+                 value={form.exempt}
+                 onChangeText={(t) => edit((o) => ({ ...o, exempt: t }))} />
+      <Text style={sub}>
+        Self-directed accounts at those institutions that pay no advisory
+        fee.
+      </Text>
+      <Text style={h3}>Money-in overrides</Text>
+      <Text style={sub}>
+        Where the feed&apos;s cost basis is wrong — shares transferred in
+        arrive with almost none — state the dollars actually put into the
+        account.
+      </Text>
+      {form.basis.map((r, i) => (
+        <View key={i} style={row}>
+          <TextInput style={[s.input, { marginTop: 0, width: 110 }]}
+                     placeholder="Account last characters"
+                     placeholderTextColor={C.mut} keyboardType="default"
+                     autoCapitalize="characters" autoCorrect={false}
+                     value={r.mask}
+                     onChangeText={(t) => setBasis(i, { mask: t })} />
+          <Text style={sub}>Money in $</Text>
+          <TextInput style={[s.input, { marginTop: 0, flex: 1 }]}
+                     placeholder="0" placeholderTextColor={C.mut}
+                     keyboardType="decimal-pad" value={r.amount}
+                     onChangeText={(t) => setBasis(i, { amount: t })} />
+          <Pressable onPress={() => edit((o) => ({
+                       ...o, basis: o.basis.filter((_r, j) => j !== i) }))}>
+            <Text style={{ color: C.mut, fontSize: 12 }}>remove</Text>
+          </Pressable>
+        </View>
+      ))}
+      <Pressable style={[s.btn, s.btnQuiet, { alignSelf: "flex-start",
+                                              marginTop: 6 }]}
+                 onPress={() => edit((o) => ({
+                   ...o, basis: [...o.basis, { mask: "", amount: "" }] }))}>
+        <Text style={s.btnText}>+ Add account</Text>
+      </Pressable>
+      <Pressable style={[s.btn, { alignSelf: "flex-start", marginTop: 12,
+                                  opacity: save.isPending ? 0.5 : 1 }]}
+                 disabled={save.isPending} onPress={submit}>
+        <Text style={s.btnText}>{save.isPending ? "saving…" : "Save"}</Text>
+      </Pressable>
+      </>)}
+      {note ? (
+        <Text style={[sub, { marginTop: 6 },
+                      note.bad ? { color: C.bad } : null]}>{note.text}</Text>
+      ) : null}
+    </Card>
+  );
+}
 
 // A Switch bound to cached settings has to move the moment it is tapped,
 // and each save writes the whole stored view back. Two quick taps (or two

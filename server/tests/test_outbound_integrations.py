@@ -1317,6 +1317,10 @@ class EmitterTests(Base):
                 "INSERT INTO items (id, aggregator, institution_name,"
                 " access_token, status) VALUES ('pl-w','plaid','Example Bank',"
                 "'enc-tok','ok') ON CONFLICT (tenant_id, id) DO NOTHING")
+            # pulled before: a webhook pull of a new Item is its first,
+            # which announces nothing
+            conn.execute("INSERT INTO sync_log (item_id, added) "
+                         "VALUES ('pl-w', 0)")
         finally:
             conn.close()
         landed = {}
@@ -1351,6 +1355,9 @@ class EmitterTests(Base):
                 "INSERT INTO items (id, aggregator, institution_name,"
                 " access_token, status) VALUES ('pl-m','plaid','Example Bank',"
                 "'enc-tok','ok') ON CONFLICT (tenant_id, id) DO NOTHING")
+            # pulled before: a bank's first pull is the worker's job
+            conn.execute("INSERT INTO sync_log (item_id, added) "
+                         "VALUES ('pl-m', 0)")
         finally:
             conn.close()
         landed = {}
@@ -1397,8 +1404,9 @@ class EmitterTests(Base):
         try:
             conn.execute(
                 "INSERT INTO items (id, aggregator, institution_name,"
-                " access_token, status) VALUES ('pl-c','plaid','Example Bank',"
-                "'enc-tok','error:ITEM_LOGIN_REQUIRED')"
+                " access_token, status, linked_at) VALUES ('pl-c','plaid',"
+                "'Example Bank','enc-tok','error:ITEM_LOGIN_REQUIRED',"
+                " now() - interval '30 days')"
                 " ON CONFLICT (tenant_id, id) DO NOTHING")
             link_alert.stamp_announced(conn, [{"id": "pl-c", "new": "ok"}])
         finally:

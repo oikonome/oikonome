@@ -41,6 +41,9 @@ HOST_SIDE = {
     "OIKONOME_BIND_ADDRESS",
     "OIKONOME_DATA_DIR", "OIKONOME_BEHIND_CLOUDFLARE",
     "OIKONOME_EMAIL_FROM",
+    # compose maps these onto the worker's OIKONOME_POOL_MAX /
+    # OIKONOME_CONTROL_POOL_MAX; no process reads them by these names
+    "OIKONOME_WORKER_POOL_MAX", "OIKONOME_WORKER_CONTROL_POOL_MAX",
     # NOT OIKONOME_POSTMARK_TOKEN: delivery.py reads it INSIDE the container
     # (the bounce/suppression lookups), and compose forwards it to both app
     # and worker. Listing it here would exempt the exact forward that has to

@@ -132,6 +132,12 @@ class MemberRoleTests(unittest.TestCase):
         r = viewer.post("/api/assistant", json={"question": "how am I doing?"})
         self.assertNotEqual(403, r.status_code, r.text)
         self.assertNotIn("view-only", r.text)
+        # saving an answer as a report is the same read in a file
+        r = viewer.post("/api/assistant/report", json={
+            "question": "how am I doing?",
+            "blocks": [{"kind": "text", "text": "fine"}]})
+        self.assertNotEqual(403, r.status_code, r.text)
+        self.assertNotIn("view-only", r.text)
         # and the role still means something: a genuine write is refused
         self.assertEqual(
             viewer.post("/api/rules/set",
@@ -219,6 +225,95 @@ class MemberRoleTests(unittest.TestCase):
         self.assertEqual(after.get("smtp_host"), "mail.example.dev")
         self.assertEqual(after.get("email_recipients"),
                          before.get("email_recipients"))
+
+    def test_only_the_owner_changes_how_far_back_the_history_reaches(self):
+        """The window sets what the next bank link asks the aggregator for,
+        and a Plaid link's backfill cannot be widened after it is made, so
+        a member may not narrow it for the owner's next link. A changed
+        value is refused outright (the client must not show it saved);
+        the stored value echoed back by a whole-document save is not a
+        change, and the member's other edits in that save still land."""
+        self.assertEqual(self.owner.post(
+            "/api/settings", json={"history_months": 12}).status_code, 200)
+        for v in (1, None):
+            r = self.member.post("/api/settings",
+                                 json={"food_monthly": 61,
+                                       "history_months": v})
+            self.assertEqual(r.status_code, 403, (v, r.text))
+            self.assertEqual(self._config()["history_months"], 12)
+            self.assertNotEqual(self._config()["food_monthly"], 61)
+        r = self.member.post("/api/settings",
+                             json={"food_monthly": 62, "history_months": 12})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self._config()["food_monthly"], 62)
+        r = self.member.post("/api/settings", json={"history_months": 1})
+        self.assertEqual(r.json(), {"detail": (
+            "only the household's owner can change how far back its "
+            "history reaches")})
+        self.owner.post("/api/settings", json={"history_months": None})
+
+    def test_only_the_owner_changes_how_the_bills_are_found(self):
+        """Choosing manual setup, or turning detection off, stops the
+        nightly finder and the bank's stream offering new bills and income
+        to the whole household — the owner's call, refused (not dropped)
+        for a member the same way as the history window. Echoing the stored
+        choices back in a whole-document save still goes through."""
+        self.assertEqual(self.owner.post(
+            "/api/settings", json={"setup_mode": "auto",
+                                   "bill_detection_auto": True}
+        ).status_code, 200)
+        refusals = {
+            "setup_mode": ("manual", "only the household's owner can "
+                           "change how the household's bills are set up"),
+            "bill_detection_auto": (False, "only the household's owner can "
+                                    "change whether new bills and income "
+                                    "are found automatically"),
+        }
+        for key, (v, why) in refusals.items():
+            r = self.member.post("/api/settings",
+                                 json={"food_monthly": 71, key: v})
+            self.assertEqual(r.status_code, 403, (key, r.text))
+            self.assertEqual(r.json(), {"detail": why})
+            self.assertNotEqual(self._config()["food_monthly"], 71)
+        cfg = self._config()
+        self.assertNotEqual(cfg.get("setup_mode"), "manual")
+        self.assertIsNot(cfg.get("bill_detection_auto"), False)
+        # the stored choices echoed back (absent setup_mode reads as auto)
+        r = self.member.post("/api/settings",
+                             json={"food_monthly": 72, "setup_mode": "auto",
+                                   "bill_detection_auto": True})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self._config()["food_monthly"], 72)
+        r = self.member.post("/api/settings",
+                             json={"food_monthly": 73, "setup_mode": None})
+        self.assertEqual(r.status_code, 200, r.text)
+        # the owner still decides
+        r = self.owner.post("/api/settings",
+                            json={"setup_mode": "manual"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIs(self._config()["bill_detection_auto"], False)
+        # ...and a member echoing manual back does not turn detection off
+        # again once the owner turned it back on
+        self.owner.post("/api/settings", json={"bill_detection_auto": True})
+        r = self.member.post("/api/settings",
+                             json={"food_monthly": 74, "setup_mode": "manual",
+                                   "bill_detection_auto": True})
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.member.post("/api/settings",
+                             json={"food_monthly": 75, "setup_mode": "manual"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIs(self._config()["bill_detection_auto"], True)
+        self.owner.post("/api/settings",
+                        json={"setup_mode": "auto",
+                              "bill_detection_auto": True})
+
+    def test_the_refused_settings_are_the_clients_owner_only_keys(self):
+        """The clients render these owner-only on the strength of this set;
+        a key leaving it would turn a member's 403 into a silent change."""
+        from oikonome.web import permissions
+        self.assertEqual(set(permissions.OWNER_REFUSED_SETTINGS),
+                         {"history_months", "setup_mode",
+                          "bill_detection_auto"})
 
     def test_a_member_cannot_send_sensitive_documents_off_box(self):
         """The AI card — which backend serves each role, the vision model,

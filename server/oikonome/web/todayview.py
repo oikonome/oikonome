@@ -26,6 +26,7 @@ from jinja2 import (ChoiceLoader, Environment, FileSystemLoader,
 
 from .. import ext as _ext
 
+from ..engine import budget
 from ..engine.compat import as_date
 from ..envnum import env_flag
 from . import charts
@@ -58,6 +59,18 @@ _env.globals.update(hosted=lambda: env_flag("OIKONOME_HOSTED"))
 # signup_open() — hosted self-service signup (OIKONOME_OPEN_SIGNUP); the
 # login page offers "Create an account" only then.
 _env.globals.update(signup_open=lambda: env_flag("OIKONOME_OPEN_SIGNUP"))
+
+
+def android_test_url() -> str | None:
+    """OIKONOME_ANDROID_TEST_URL when it is an https link, else None: where a
+    tester gets THIS instance's Android build (a Play internal-testing link,
+    an App Tester invite). Unset on an instance with no test build, and the
+    sign-in page then shows nothing. Shared by the template and /api/access."""
+    u = (os.environ.get("OIKONOME_ANDROID_TEST_URL") or "").strip()
+    return u if u.startswith("https://") and len(u) <= 300 else None
+
+
+_env.globals.update(android_test_url=android_test_url)
 # site_url() / privacy_url() — the operator's own site and privacy policy,
 # linked from the sign-in page only when they publish them.
 _env.globals.update(
@@ -121,10 +134,29 @@ _MAP_AMBER_DIM = "#77632a"
 _MAP_RED_DEEP = "#8f382f"
 
 
+def _pace(st: dict) -> dict:
+    """The month's pace window as the status read it (budget.pace_window,
+    specs/short-ledger-pacing.md); a status built by hand, without a
+    ledger, paces from the 1st."""
+    return st.get("pace") or budget.pace_window_for(None, st["today"])
+
+
+def paced_budget(st: dict, month_budget: float) -> float:
+    """What the month may spend of a bucket's budget: its share from the
+    pace start to month end — the whole budget unless the ledger began
+    inside the month. The tiles hand this out a day at a time and the hero
+    adds it up, so every row that says "$X left" measures this, never the
+    whole month's budget."""
+    return month_budget * _pace(st)["share"]
+
+
 def _plan_rows(st: dict) -> list[dict]:
     """planRows() (webapp/src/components/PlanBars.tsx) ported: the plan's
     rows in the wizard's order — categories (Food first, then carve-outs),
-    Everything else, Bills, Savings, Excess. Keep the two in lockstep."""
+    Everything else, Bills, Savings, Excess. Keep the two in lockstep.
+
+    A judged row's budget is its paced share (paced_budget), the money its
+    tile hands out; Bills, Savings and Excess are not paced."""
     rows = []
     food, other = st["buckets"]["food"], st["buckets"]["other"]
     kids = food.get("children") or []
@@ -132,23 +164,25 @@ def _plan_rows(st: dict) -> list[dict]:
                  "actual": food["display_actual"] if kids else food["actual"],
                  "expected": (food["display_expected"] if kids
                               else food["expected"]),
-                 "budget": (food["remaining_budget"] if kids
-                            else food["month_budget"])})
+                 "budget": paced_budget(st, food["remaining_budget"] if kids
+                                        else food["month_budget"])})
     for c in kids:
         rows.append({"label": c["name"], "actual": c["actual"],
-                     "expected": c["expected"], "budget": c["month_budget"],
+                     "expected": c["expected"],
+                     "budget": paced_budget(st, c["month_budget"]),
                      "judged": True, "to": _ledger(st, c["name"])})
     okids = other.get("children") or []
     for c in okids:
         rows.append({"label": c["name"], "actual": c["actual"],
-                     "expected": c["expected"], "budget": c["month_budget"],
+                     "expected": c["expected"],
+                     "budget": paced_budget(st, c["month_budget"]),
                      "judged": True, "to": _ledger(st, c["name"])})
     row = {"label": "Everything else", "judged": True, "to": _ledger(st, "other"),
            "actual": other["display_actual"] if okids else other["actual"],
            "expected": (other["display_expected"] if okids
                         else other["expected"]),
-           "budget": (other["remaining_budget"] if okids
-                      else other["month_budget"])}
+           "budget": paced_budget(st, other["remaining_budget"] if okids
+                                  else other["month_budget"])}
     if okids:
         row["caption"] = "unallocated — spending outside the categories"
     rows.append(row)
@@ -162,8 +196,9 @@ def _plan_rows(st: dict) -> list[dict]:
                  "expected": fixed["expected"],
                  "budget": fixed["month_budget"], "pending": pend,
                  "to": _ledger(st, "fixed")})
+    from ..engine.savings import is_plan_savings_goal
     goal = next((g for g in st.get("savings_goals") or []
-                 if g["name"] == "Savings"), None)
+                 if is_plan_savings_goal(g)), None)
     if goal and ((goal["monthly_plan"] or 0) > 0
                  or (goal.get("rate_90d") or 0) > 0):
         plan_only = goal.get("rate_90d") is None
@@ -342,8 +377,10 @@ def money_map(st: dict) -> dict:
                  "actual": sum(r["actual"] for r in judged),
                  "expected": sum(r["expected"] for r in judged),
                  "budget": sum(r["budget"] for r in judged)}
-    var_budget = (st["buckets"]["food"]["month_budget"]
-                  + st["buckets"]["other"]["month_budget"])
+    # the hero's track is the month's spendable share, the "$X of $Y
+    # left" the card prints beside it
+    var_budget = paced_budget(st, st["buckets"]["food"]["month_budget"]
+                              + st["buckets"]["other"]["month_budget"])
     # hero bar for the verdict card: the SAME number the pill judges —
     # expected = actual − the engine's own variance, one source
     hero = _prep_row({"label": "", "judged": True,
@@ -408,15 +445,32 @@ def allowances(st: dict) -> tuple[dict, list, list]:
     One function because THREE surfaces render it — SPA, email HTML, email
     plain text — and a second derivation would let them drift.
     """
-    days_left = max(1, st["days_in_month"] - st["today"].day + 1)
+    dim = st["days_in_month"]
+    # The verdict's own window (budget.pace_window): the month may spend
+    # the budget's share from the pace start — the later of the 1st and
+    # the ledger's first day — to month end. Spreading the WHOLE month's
+    # budget over the days left would hand out money the verdict never
+    # expects to see spent, and following the tiles would turn it over.
+    # (a status built by hand, without a ledger, paces from the 1st)
+    pace = _pace(st)
+    days_left = max(1, pace["days_left"])
+    paced_days = pace["paced_days"]
 
     def _allow(month_budget, actual, rows):
+        spendable = paced_budget(st, month_budget)
         spent = sum(r["amount"] for r in rows
                     if as_date(r["date"]) == st["today"])
-        start_remaining = max(0.0, month_budget - (actual - spent))
-        allowance = start_remaining / days_left
-        rate = max(0.0, (month_budget - actual) / days_left)
-        plan = month_budget / st["days_in_month"] if st["days_in_month"] else 0.0
+        # one rule for the rate and the days it covers (budget.daily_rate):
+        # the Why's "keeps it green", its recovery cap and the push/SMS
+        # read the same numbers. Once today has spend, today is charged at
+        # the larger of its allowance and the spend, so a $1 coffee never
+        # "raises" the daily and left_today + rate x rate_days is exactly
+        # what is left of the month.
+        dr = budget.daily_rate(spendable, actual, spent, days_left)
+        allowance = dr["allowance"]
+        rate_days = dr["rate_days"]
+        rate = dr["rate"]
+        plan = month_budget / dim if dim else 0.0
         # the plan-vs-now daily, said IN the tile: what
         # this category's daily budget was, and what the month's spending
         # has moved it to for every remaining day. Composed here once so
@@ -424,7 +478,11 @@ def allowances(st: dict) -> tuple[dict, list, list]:
         note = None
         tone = None
         p_, r_ = round(plan), round(rate)
-        if month_budget > 0 and p_ != r_:
+        # on the month's last day the rate is simply what is left of
+        # today — there is no later day for a daily to be reduced on or
+        # recovered over, so the plan-vs-now note has nothing to say
+        last_day = days_left <= 1
+        if month_budget > 0 and p_ != r_ and not last_day:
             note = (f"daily {'reduced' if r_ < p_ else 'raised'} "
                     f"from ${p_:,.0f} to ${r_:,.0f}")
             # a reduced daily is bad news, a raised one good — carried as
@@ -436,8 +494,9 @@ def allowances(st: dict) -> tuple[dict, list, list]:
         recover = None
         recover_note = None
         if tone == "neg":
-            recover = recover_days(month_budget, actual, days_left,
-                                   st["days_in_month"])
+            # over the paced days, so its plan is still month_budget / dim
+            recover = recover_days(spendable, dr["spread_actual"],
+                                   rate_days, paced_days)
             if recover is None:
                 recover_note = f"can't get back to ${p_:,.0f} this month"
             elif recover == 1:
@@ -447,6 +506,10 @@ def allowances(st: dict) -> tuple[dict, list, list]:
                 recover_note = (f"skip {recover} days of spending and the "
                                 f"daily is back to ${p_:,.0f}")
         return {"rate": rate,
+                # how many days `rate` covers: what is left of today (when
+                # not over) plus rate x rate_days is the remainder the hero
+                # shows
+                "rate_days": rate_days,
                 "plan": plan,
                 "spent_today": round(spent, 2),
                 "today_allowance": round(allowance, 2),
@@ -594,9 +657,12 @@ def build_context(st: dict, *, email: bool = False) -> dict:
     bill_cards = _bill_cards(st)
     rw = st.get("runway") or {}
     # an unset manual-account balance reads $0 — headroom computed
-    # from it would panic a brand-new files-only user (email included)
+    # from it would panic a brand-new files-only user (email included).
+    # No checking account at all arrives as checking None and stays quiet
+    # the same way (`no_checking` is the explicit flag).
     headroom = (rw["checking"] - rw["card_debt"] - rw["due_total"]
                 if rw.get("checking") is not None
+                and not rw.get("no_checking")
                 and not rw.get("balance_unreliable") else None)
     # MTD by category, Amazon subcategories clustered under one parent
     by_cat: dict[str, float] = {}
@@ -702,7 +768,11 @@ def build_context(st: dict, *, email: bool = False) -> dict:
     # every forecast number is seeded from a lie — suppress the whole
     # forecast (SPA card, email card, cash notice) rather than present
     # $0 as truth. The verdict card's set-your-balance nudge remains.
-    if (st.get("runway") or {}).get("balance_unreliable"):
+    # A household with no checking account is the same unknown: its walk
+    # starts from $0 minus the cards, so it is suppressed too, and the
+    # verdict card asks for the account instead.
+    if (rw.get("balance_unreliable") or rw.get("no_checking")
+            or (fc or {}).get("no_checking")):
         fc = None
     fc_chart = ""
     fc_rows = []

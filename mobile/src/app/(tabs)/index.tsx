@@ -21,7 +21,8 @@ import { errText, setHandedOffTxn, type Alert, type AlertRow, type Txn,
 import { patchList, patchQuery, removeFromList,
          saveSettings } from "../../lib/cache";
 import { shiftYmd, ymd } from "../../lib/dates";
-import { autopayMarks, resolveFace } from "../../lib/pure";
+import { autopayMarks, isPlanSavingsGoal, noCheckingLinked,
+         resolveFace } from "../../lib/pure";
 import { useRefetchWhenShown } from "../../lib/focus";
 
 const TODAY_KEY = ["today"];
@@ -143,6 +144,10 @@ export default function Today() {
   const adv = resolveFace({ override: faceOverride, perDevice,
                             saved: d?.today_view, demo, viewer }) === "detail"
     || (!!d && !d.simple);
+  // the hero's month figure (web: Today.tsx heroBudget/remaining)
+  const heroBudget = d ? d.variable_budget_paced ?? d.variable_budget : 0;
+  const heroRemaining = d ? d.month_remaining_paced
+    ?? d.variable_budget - d.variable_actual : 0;
   const setFace = (f: "summary" | "detail") => {
     setFaceOverride(f);                       // instant; the write follows
     if (demo) {
@@ -231,9 +236,10 @@ export default function Today() {
     if (next >= today) setViewDate(null);
     else if (!d.min_date || next >= d.min_date) setViewDate(next);
   };
-  // setup incomplete → the checklist card. OWNER only — every step is
-  // a 403 for a viewer (web gates the same way)
-  const setupOpen = !viewer && ob.data && (!ob.data.budgets_set
+  // setup incomplete → the checklist card. OWNER only — the wizard
+  // connects banks and configures the household, so a member's button
+  // would lead to a page that turns them away (web: useSetupPending)
+  const setupOpen = owner && ob.data && (!ob.data.budgets_set
     || ob.data.transactions === 0 || ob.data.accounts === 0
     || ob.data.bills === 0);
 
@@ -278,17 +284,21 @@ export default function Today() {
 
   // ---- cash: quiet until it matters — the web hero's three states,
   // same math (autopay-statement is the realistic trajectory) ----
-  const fc = d?.forecast ?? null;
+  // no checking account: cash ahead is unknown, not $0 — the forecast's
+  // walk starts from nothing, so it is not shown and no alarm is drawn
+  // from it (the web's rule, and the email's)
+  const noChecking = !!d && noCheckingLinked(d.runway, d.forecast);
+  const fc = noChecking ? null : d?.forecast ?? null;
   const p0 = fc?.pace_stmt ?? null;
   const negIn = p0?.negative_date && d
     ? Math.round((new Date(p0.negative_date).getTime()
                   - new Date(d.date).getTime()) / 86400000)
     : null;
   const paycheckish = d?.income ? d.income / 2 : 1000;
-  const cashCritical = !!d
+  const cashCritical = !!d && !noChecking
     && ((d.headroom !== null && d.headroom < 0)
         || (negIn !== null && negIn <= 14));
-  const cashTight = !!d && !cashCritical
+  const cashTight = !!d && !noChecking && !cashCritical
     && ((d.headroom !== null && d.headroom < paycheckish)
         || negIn !== null || !!(p0 && p0.min < 0));
   // the shortfall beside negative_date is the balance ON that day —
@@ -546,15 +556,17 @@ export default function Today() {
               </Text>
             ) : null}
             <Text style={s.mut}>
-              {/* whole dollars, like the web hero and the daily email */}
-              <Text style={d.variable_budget - d.variable_actual < 0
+              {/* whole dollars, like the web hero and the daily email;
+                  the month's spendable share and what is left of it,
+                  composed once on the server (an older payload falls
+                  back to the whole month) */}
+              <Text style={heroRemaining < 0
                              ? { color: C.bad } : undefined}>
-                {money(Math.abs(d.variable_budget - d.variable_actual),
-                       false)}
+                {money(Math.abs(heroRemaining), false)}
               </Text>
-              {d.variable_budget - d.variable_actual < 0
-                ? ` over the ${money(d.variable_budget, false)}`
-                : ` of ${money(d.variable_budget, false)} left`}
+              {heroRemaining < 0
+                ? ` over the ${money(heroBudget, false)}`
+                : ` of ${money(heroBudget, false)} left`}
               {" · "}{d.days_left} day{d.days_left === 1 ? "" : "s"}
             </Text>
 
@@ -709,6 +721,19 @@ export default function Today() {
                 </Text>
                 {" and everything here comes alive."}
               </Text>
+            ) : noChecking ? (
+              <Text style={[s.watch, { color: C.text }]}>
+                <Text style={{ fontWeight: "700" }}>
+                  No checking account linked
+                </Text>
+                {" — cash ahead starts from your checking balance, so "
+                  + "there is nothing to forecast yet. "}
+                <Text style={{ color: C.accent }}
+                      onPress={() => router.push("/accounts" as never)}>
+                  Link your checking account on Accounts
+                </Text>
+                {" to see cash ahead."}
+              </Text>
             ) : cashCritical ? (
               <Text style={[s.watch, { color: C.bad }]}>
                 {d.headroom !== null && d.headroom < 0
@@ -790,7 +815,9 @@ export default function Today() {
                                      borderTopWidth: StyleSheet.hairlineWidth,
                                      paddingTop: 8 }]}>
                 Plan: <B>{money(d.income ?? 0, false)}</B> in →{" "}
-                <B>{money(d.buckets.fixed?.month_budget ?? 0, false)}</B> bills →{" "}
+                {/* scheduled bills, not the fixed bar's cash basis, so
+                    the chain balances (same figure and words as web) */}
+                <B>{money(d.scheduled_month ?? d.buckets.fixed?.month_budget ?? 0, false)}</B> bills due →{" "}
                 <B>{money(d.variable_budget, false)}</B> to spend →{" "}
                 {(d.savings_plan ?? 0) > 0.005 ? (
                   <>
@@ -886,7 +913,7 @@ export default function Today() {
             // the month's posted contribution when the server sends it;
             // otherwise the goal's 90-day average, labelled as one
             const g = (d.savings_goals ?? [])
-              .find((x) => x.name === "Savings");
+              .find((x) => isPlanSavingsGoal(x.name));
             const sav = g ? monthSavings(g) : null;
             return (
             <View style={s.card}>
@@ -969,7 +996,7 @@ export default function Today() {
                                gap: 14 }}>
                   <Kpi label="checking now" value={fc.checking} />
                   <Kpi label="card debt" value={fc.card_debt} plain />
-                  {d.runway
+                  {d.runway && d.runway.checking !== null
                     && typeof d.bills_remaining_month === "number" && (
                     <View>
                       <Kpi label="after cards & bills"
@@ -1088,9 +1115,12 @@ export default function Today() {
                                   && { color: C.good }]}>
                     {money(r.amount, false)}
                   </Text>
-                  <Text style={[s.tlBal, r.bal_stmt !== null
+                  {/* without checking the walk's balances start from
+                      nothing — the events stand, their balances do not */}
+                  <Text style={[s.tlBal, !noChecking && r.bal_stmt !== null
                                   && r.bal_stmt < 0 && { color: C.bad }]}>
-                    {r.bal_stmt !== null ? money(r.bal_stmt, false) : "·"}
+                    {!noChecking && r.bal_stmt !== null
+                      ? money(r.bal_stmt, false) : "·"}
                   </Text>
                 </View>
               ))}

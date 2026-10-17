@@ -1256,6 +1256,89 @@ h2.ssec{margin:0 0 .2rem;padding-left:.55rem;border-left:3px solid var(--blue);
   display:inline-block}
 .wiz i.on{background:var(--blue)}
 .wiz i.done{background:var(--green)}
+.wiz-dots{display:inline-flex;gap:.4rem;align-items:center}
+.wiz-where{margin-left:.4rem}
+.wiz-later{margin-left:auto}
+.wiz-nav{display:flex;justify-content:flex-end;align-items:center;gap:.8rem;
+  flex-wrap:wrap;margin-top:1.2rem;padding-top:.9rem;
+  border-top:1px solid var(--line)}
+/* a block inside a step that answers its own question (history reach,
+   who gets the email, the outbound mail line) */
+.wiz-sub{margin-top:1rem;padding-top:.8rem;border-top:1px dashed var(--line)}
+/* option cards: the theme, the bills question. A whole card is the
+   button, so the tap target is the card */
+.wiz-choice{display:grid;gap:.7rem}
+.wiz-choice.two{grid-template-columns:repeat(2,minmax(0,1fr))}
+.wiz-choice.three{grid-template-columns:repeat(3,minmax(0,1fr))}
+.wiz-opt{display:flex;flex-direction:column;gap:.2rem;
+  text-align:left;border:1px solid var(--line);border-radius:12px;
+  padding:.8rem .9rem;background:var(--bg);color:var(--ink);cursor:pointer;
+  min-width:0}
+.wiz-opt:hover{background:var(--hover)}
+.wiz-opt.sel{border-color:var(--blue);box-shadow:0 0 0 1px var(--blue) inset}
+.wiz-opt small{color:var(--mut);font-size:13px;line-height:1.45}
+.wiz-opt-pick{order:-1;align-self:flex-end;margin-bottom:-.35rem;
+  font-size:11px;font-weight:700;color:var(--blue);letter-spacing:.03em}
+/* the theme previews are pictures of each theme, so their colours are
+   fixed — they must not follow the theme they are previewing */
+.wiz-swatch{height:54px;border-radius:8px;margin:.35rem 0 .3rem;
+  border:1px solid #2a323d;display:flex;align-items:center;padding:0 .6rem;
+  font-size:11px}
+.wiz-swatch.dark{background:#0f141a;color:#dbe3ea}
+.wiz-swatch.light{background:#f2f5f7;color:#1f2933;border-color:#d8dfe6}
+.wiz-swatch.auto{background:linear-gradient(100deg,#0f141a 50%,#f2f5f7 50%);
+  color:#8b98a3}
+/* pill choices: history reach, delivery, a recipient's on/off */
+.wiz-pills{display:flex;flex-wrap:wrap;gap:.45rem;margin:.4rem 0}
+.wiz-pill{border:1px solid var(--line);border-radius:999px;
+  padding:.3rem .8rem;font-size:13px;background:var(--bg);color:var(--ink)}
+.wiz-pill.sel{border-color:var(--blue);color:var(--blue);font-weight:700}
+/* list rows: proposals, bills added, recipients, the closing summary */
+.wiz-rows{margin:.3rem 0}
+.wiz-row{padding:.5rem 0;border-top:1px solid var(--line)}
+.wiz-row:first-child{border-top:none}
+.wiz-row.adjusting{border-left:3px solid var(--blue);padding-left:.6rem}
+.wiz-row-main{display:flex;justify-content:space-between;align-items:center;
+  gap:.8rem}
+.wiz-row-act{display:flex;gap:.4rem;flex-shrink:0}
+.wiz-addr{min-width:0;overflow:hidden;text-overflow:ellipsis}
+.wiz-adjust-fields{display:grid;grid-template-columns:1.4fr 1fr 1fr 1fr;
+  gap:.5rem;margin:.5rem 0 .2rem}
+.wiz-adjust-fields>*{min-width:0}
+.wiz-adjust-act{display:flex;gap:.5rem;justify-content:flex-end;
+  margin-top:.3rem}
+/* label | control rows (hand entry, budgets, delivery) */
+.wiz-field{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.6rem;
+  align-items:center;padding:.35rem 0}
+.wiz-field input:not([type=checkbox]){width:9rem}
+.wiz-addform .wiz-field{grid-template-columns:minmax(0,1fr) auto}
+.wiz-addform .wiz-field input{width:100%}
+.wiz-chip{font-size:11.5px;padding:.08rem .5rem;border-radius:999px;
+  border:1px solid var(--line);background:none;color:var(--mut);
+  cursor:pointer}
+.wiz-chip:hover{color:var(--blue);border-color:var(--blue);background:none}
+.wiz-addrow{display:flex;gap:.5rem;margin-top:.4rem}
+.wiz-addrow input{flex:1;min-width:0}
+/* phone width: one column, cards stacked, every control a thumb's size,
+   and nothing wider than the screen */
+@media (max-width:600px){
+  .wiz-card{overflow-wrap:anywhere}
+  .wiz-choice.two,.wiz-choice.three{grid-template-columns:1fr}
+  .wiz-where{margin-left:0;flex-basis:100%;order:2}
+  .wiz-later{order:1}
+  .wiz-field,.wiz-addform .wiz-field{grid-template-columns:1fr}
+  .wiz-field input:not([type=checkbox]),.wiz-field select{width:100%}
+  .wiz-adjust-fields{grid-template-columns:1fr}
+  .wiz-row-main{flex-wrap:wrap}
+  .wiz-row-act{width:100%;justify-content:flex-end;flex-wrap:wrap}
+  .wiz-card button:not(.wiz-chip),.wiz-card select,
+  .wiz-card input:not([type=checkbox]):not([type=radio]){min-height:44px}
+  .wiz-card input[type=checkbox]{width:24px;height:24px}
+  .wiz-pill{padding:.45rem .9rem}
+  .wiz-nav>span{flex:1 1 auto}
+  .wiz-nav>span>button{width:100%}
+  .wiz-card .bf-bar{max-width:100%}
+}
 
 /* One door instead of three, and the list of what it takes
    lives inside it — the answer to "what can I drop?" where you look for it */

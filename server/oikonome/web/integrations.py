@@ -93,8 +93,12 @@ def summary(conn, today: dt.date | None = None, *, st: dict | None = None) -> di
     email's sweep passes its own so the event and the mail agree)."""
     from . import report, todayview
     today = today or _today(conn)
+    # one request-scoped memo for the gather and the bill forecast below,
+    # which load the same schedule and the same month's rows
+    memo: dict | None = None
     if st is None:
-        st = report.gather(conn, today)
+        memo = {}
+        st = report.gather(conn, today, memo=memo)
     ctx = todayview.build_context(st)
     day = ctx["day"]
     b = st["buckets"]
@@ -107,7 +111,7 @@ def summary(conn, today: dt.date | None = None, *, st: dict | None = None) -> di
     # balances: the Accounts page's rows, minus what the page hides
     accounts = []
     shadow = set(links.shadow_ids(conn))
-    for a in data.accounts_detail(conn):
+    for a in data.accounts_detail(conn, counts=False):
         if a.get("user_removed_at"):
             continue
         typ, _, sub = (a.get("kind") or "/").partition("/")
@@ -126,7 +130,8 @@ def summary(conn, today: dt.date | None = None, *, st: dict | None = None) -> di
     due = []
     due_ok = True
     try:
-        for o in budget.upcoming_bill_occurrences(conn, cfg, today, end):
+        for o in budget.upcoming_bill_occurrences(conn, cfg, today, end,
+                                                  memo=memo):
             due.append({"payee": o["payee"], "amount": _r2(o["planned"]),
                         "due": o["due"].isoformat()})
     except Exception:                                        # noqa: BLE001

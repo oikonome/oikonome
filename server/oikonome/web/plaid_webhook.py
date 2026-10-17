@@ -24,6 +24,14 @@ Handled events:
     and the future zombie-Item reaper. A later clean sync clears it,
     as does LOGIN_REPAIRED, which is Plaid saying the Item healed
     without the person doing anything.
+  * LINK / SESSION_FINISHED, ITEM_ADD_RESULT → a Hosted Link add session
+    the person finished. Resolve the link token to the household through
+    its recorded session (jobs/plaid_links) and enqueue
+    `plaid_link_finish`, which exchanges the public token on the worker —
+    so a bank linked with no client left polling still arrives. The token
+    in the payload is not used: the worker asks /link/token/get, the same
+    answer the poll reads. Unknown or finished sessions are acknowledged
+    and dropped; the worker's sweep is the floor under a lost webhook.
 
 Like the other webhooks: per-IP rate limited and body-size capped before
 buffering (unauthenticated endpoint, memory-DoS hygiene)."""
@@ -237,10 +245,29 @@ async def verify(header_jwt: str, body: bytes) -> bool:
 # ---- event handling --------------------------------------------------------
 
 
+# How long a webhook write waits on an items row another transaction holds
+# (a sync mid-write). Past it the write fails and Plaid redelivers, rather
+# than a request thread waiting out whatever the holder is doing.
+_LOCK_TIMEOUT = "5s"
+
+
+def _admin():
+    """The tenantless admin connection the webhook works on, with a bounded
+    connect (tenancy) and a bounded wait on row locks."""
+    admin = tenancy.admin_connect()
+    try:
+        admin.execute("SELECT set_config('lock_timeout', %s, false)",
+                      (_LOCK_TIMEOUT,))
+    except Exception:
+        admin.close()
+        raise
+    return admin
+
+
 def _tenant_for_item(item_id: str) -> str | None:
     """items rows are per-tenant (RLS); the webhook is tenantless, so the
     lookup runs on the admin connection."""
-    admin = tenancy.admin_connect()
+    admin = _admin()
     try:
         # suspended tenants don't sync (suspension is total — the hourly
         # sweep also skips them); a webhook must not sneak one in. Archived
@@ -275,21 +302,43 @@ def _live_tenant(admin, item_id: str, *, active_only: bool = False) -> str | Non
 
 async def _enqueue_sync(tenant_id: str, item_id: str) -> bool:
     """Queue the scoped sync through arq — the webhook request must never
-    run a sync inline. False (logged) when Redis is unreachable; the
-    hourly poll remains the reconcile floor."""
-    try:
-        from arq import create_pool
+    run a sync inline — on the one pool the process keeps for its event
+    loop. False (logged) when Redis is unreachable: the handler then
+    answers 503 so Plaid delivers the event again.
 
-        from ..jobs.worker import _redis_settings
-        pool = await create_pool(_redis_settings())
-        try:
-            await pool.enqueue_job("sync_item", tenant_id, item_id)
-        finally:
-            await pool.close()
-        return True
-    except Exception as e:                                 # noqa: BLE001
-        log.warning("plaid webhook: enqueue failed item=%s: %s", item_id, e)
-        return False
+    The job is a plain pull; one that reaches an Item no pull has touched
+    yet does that Item's first pull instead (worker._sync_item_body), so a
+    TRANSACTIONS webhook that beats the queued first-sync job neither
+    announces the new bank's history as new charges nor leaves its
+    holdings and liabilities behind."""
+    from ..jobs import worker
+    ok = await worker.enqueue_job("sync_item", tenant_id, item_id)
+    if not ok:
+        log.warning("plaid webhook: enqueue failed item=%s", item_id)
+    return ok
+
+
+# LINK webhook codes that mean an add session may have a token to exchange
+_LINK_FINISHED = ("SESSION_FINISHED", "ITEM_ADD_RESULT")
+
+
+async def _enqueue_link_finish(tenant_id: str, link_token: str) -> bool:
+    """Queue the server-side finish of a link session on the worker. False
+    (logged) when Redis is unreachable; the handler answers 503 so Plaid
+    tries again, and the sweep remains the floor."""
+    from ..jobs import worker
+    ok = await worker.enqueue_job("plaid_link_finish", tenant_id, link_token)
+    if not ok:
+        log.warning("plaid webhook: link finish enqueue failed")
+    return ok
+
+
+def _queue_down() -> HTTPException:
+    """An event this instance acted on but could not queue: a 503 asks
+    Plaid to deliver it again, where a 200 would have dropped it for good
+    (Plaid retries only an answer that is not a 200)."""
+    return HTTPException(503, "queue unavailable — try again",
+                         headers={"Retry-After": "30"})
 
 
 def _error_code(evt: dict) -> str:
@@ -339,7 +388,7 @@ def _clear_item_status(item_id: str) -> bool:
     at the moment Plaid says it should rather than an hour later.
     'archived' still wins: a disconnect must not be undone by a late
     webhook about the connection it released."""
-    admin = tenancy.admin_connect()
+    admin = _admin()
     try:
         tenant_id = _live_tenant(admin, item_id)
         if tenant_id is None:
@@ -381,7 +430,7 @@ def _record_item_status(item_id: str, status: str) -> bool:
     * An expiry warning while new accounts wait changes nothing: the
       update session the offer opens renews consent too.
     """
-    admin = tenancy.admin_connect()
+    admin = _admin()
     try:
         tenant_id = _live_tenant(admin, item_id)
         if tenant_id is None:
@@ -450,17 +499,32 @@ async def plaid_webhook(request: Request):
     if wtype == "TRANSACTIONS" and wcode in (
             "SYNC_UPDATES_AVAILABLE", "INITIAL_UPDATE",
             "HISTORICAL_UPDATE") and item_id:
-        tenant_id = _tenant_for_item(item_id)
+        tenant_id = await asyncio.to_thread(_tenant_for_item, item_id)
         if tenant_id:
-            queued = await _enqueue_sync(tenant_id, item_id)
-            disposition = "sync-enqueued" if queued else "enqueue-failed"
+            if not await _enqueue_sync(tenant_id, item_id):
+                raise _queue_down()
+            disposition = "sync-enqueued"
         else:
             disposition = "unknown-item"
     elif wtype == "ITEM" and wcode in _ITEM_STATUS and item_id:
         status = _ITEM_STATUS[wcode](event)
-        disposition = ("status-recorded" if _record_item_status(
-            item_id, status) else "unknown-item")
+        recorded = await asyncio.to_thread(_record_item_status, item_id,
+                                           status)
+        disposition = "status-recorded" if recorded else "unknown-item"
+    elif wtype == "LINK" and wcode in _LINK_FINISHED:
+        link_token = event.get("link_token")
+        tenant_id = None
+        if isinstance(link_token, str) and 0 < len(link_token) <= 512:
+            from ..jobs import plaid_links
+            tenant_id = await asyncio.to_thread(plaid_links.tenant_for_link,
+                                                link_token)
+        if tenant_id:
+            if not await _enqueue_link_finish(tenant_id, link_token):
+                raise _queue_down()
+            disposition = "link-finish-enqueued"
+        else:
+            disposition = "unknown-link"
     elif wtype == "ITEM" and wcode in _ITEM_CLEARED and item_id:
-        disposition = ("status-cleared" if _clear_item_status(item_id)
-                       else "unknown-item")
+        cleared = await asyncio.to_thread(_clear_item_status, item_id)
+        disposition = "status-cleared" if cleared else "unknown-item"
     return {"received": True, "disposition": disposition}

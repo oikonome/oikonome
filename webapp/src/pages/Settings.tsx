@@ -4,6 +4,7 @@ import { Fragment, useEffect, useRef, useState,
 import { Link, NavLink, useNavigate, useParams } from "react-router";
 import { MxFlow, PlaidFlow, SimplefinFlow } from "../components/ConnectHub";
 import DemoLock from "../components/DemoLock";
+import { VerifyEmailCard } from "../components/VerifyEmailCard";
 import { sharedLock } from "../sharedlogin";
 import { api, errText, mmdd, MOBILE_HOMES, NextCodeNeeded, WEB_HOMES,
          type ActivityPage, type ApiToken, type Invite, type Me, type Member,
@@ -29,6 +30,9 @@ import { looksLikeMailbox, myDailyLine, NEED_BASE_URL, recipientDuplicate,
          resendHeld }
   from "../recipients";
 import { useNarrow } from "../narrow";
+import { INVEST_STALE_STATUS, investChanges, investFormOf, investSeenOf,
+         type BasisRow, type FeeRow, type InvestForm,
+         type InvestSeen } from "../investsettings";
 import { localDayOf, rebaseKeyed } from "../moneymath";
 import { browserPushBlocked, disableBrowserPush, enableBrowserPush,
          ownPushEndpoint as ownPushEndpointShared } from "../push";
@@ -522,6 +526,8 @@ export default function Settings() {
               + "secret scripts manage accounts rename hide remove shared "
               + "add link reconnect recurring streams enrich"),
     tokens: hit("script tokens api bearer collectors community push import"),
+    invest: hit("investment fees basis advisory fee robo advisor net worth "
+                + "money in cost basis self-directed exempt brokerage"),
     webhooks: hit("webhooks webhook events post url signature home assistant "
                   + "automation matrix integrations outbound"),
     readtokens: hit("integration tokens read token api bearer prometheus "
@@ -570,7 +576,7 @@ export default function Settings() {
     billing: billingOn && h.billing,
     email: h.daily || h.smtp,
     integrations: h.webhooks || h.readtokens || h.endpoints,
-    connections: h.conn || h.tokens,
+    connections: h.conn || h.tokens || h.invest,
     categorize: h.rules,
     merchants: h.merchants,
     ai: h.llm,
@@ -763,6 +769,9 @@ export default function Settings() {
             {/* a member's own delivery: on/off for THEIR inbox; the
                 schedule is the owner's */}
             <Sec id="email" show={secOn("email")}>
+              <VerifyEmailCard me={meQ.data}>
+                Household email reaches you once the address is confirmed.
+              </VerifyEmailCard>
               <MyEmailCard />
             </Sec>
             <Sec id="household" show={secOn("household")}>
@@ -771,6 +780,7 @@ export default function Settings() {
               </Show>
             </Sec>
             <Sec id="security" show={secOn("security")}>
+              <VerifyEmailCard me={meQ.data} />
               <DemoLock on={false} shared={lockLogin}>
               <Show on={h.password}><PasswordCard /></Show>
               <Show on={h.totp}><TwoFactorCard /></Show>
@@ -852,6 +862,13 @@ export default function Settings() {
       {meQ.data?.email_delivery && (
         <DeliveryProblemCard state={meQ.data.email_delivery}
                              email={meQ.data.email} />)}
+      {/* a fresh signup's address is unconfirmed, and hosted mail goes to
+          confirmed addresses only — the way to a fresh link sits with the
+          schedule it holds up, from day one (the top banner waits) */}
+      {!meQ.data?.email_delivery && (
+        <VerifyEmailCard me={meQ.data}>
+          Household email reaches you once the address is confirmed.
+        </VerifyEmailCard>)}
       {/* WHO the household's mail goes to, and when, is the owner's —
           the recipient list is a door out of the instance. A member sets
           their own delivery on or off, exactly as a viewer does. */}
@@ -957,6 +974,11 @@ export default function Settings() {
       <EnrichCard />
       </DemoLock>
       </Show>
+      <Show on={h.invest}>
+      <DemoLock on={meQ.data?.demo}>
+      <InvestmentFeesCard data={q.data} />
+      </DemoLock>
+      </Show>
       <Show on={h.tokens}>
       <DemoLock on={meQ.data?.demo} shared={lockGrant}>
       <ScriptTokensCard />
@@ -1043,9 +1065,13 @@ export default function Settings() {
       </DemoLock>
       </Show>
       <Show on={h.activity}><ActivityCard /></Show>
-      {ext.householdCards.map((Card, i) => (
+      {/* cards an add-on mounts in the household section belong to the
+          owner: the server refuses anyone else, so a member or viewer
+          shown one would only ever get an error — mobile also mounts them
+          for the owner only */}
+      {owner && ext.householdCards.map((Card, i) => (
       <Show key={i} on={h.billing || h.family}>
-      <DemoLock on={meQ.data?.demo}>
+      <DemoLock on={meQ.data?.demo} shared={lockGrant}>
       <Card />
       </DemoLock>
       </Show>
@@ -1149,9 +1175,13 @@ export default function Settings() {
       )}
 
       <Sec id="security" show={secOn("security")}>
+      <VerifyEmailCard me={meQ.data} />
       <Show on={h.email}>
       <DemoLock on={meQ.data?.demo} shared={lockLogin}>
-      <EmailCard current={meQ.data?.email} onChanged={() => {
+      <EmailCard current={meQ.data?.email}
+                 pending={meQ.data?.pending_email ?? null}
+                 pendingUntil={meQ.data?.pending_email_expires_at ?? null}
+                 onChanged={() => {
         // the card patches ["me"] from the response; what a login
         // rotation ALSO empties are these lists, and they live on this
         // same page
@@ -1294,6 +1324,152 @@ function EnrichCard() {
   );
 }
 
+
+function InvestmentFeesCard({ data }: { data: SettingsData }) {
+  // The Net Worth page's fee estimate and money-in anchors. A robo-advisor
+  // takes its fee out of the balance and exports no fee rows, so the only
+  // honest number is an estimate from a rate the household states; and a
+  // feed's cost basis is near zero for lots transferred in-kind, so the
+  // money actually put in is stated here too. Accounts are named by their
+  // last digits because that is all an aggregator reports. Owner-only, as
+  // the server is: it refuses these keys from a member's save.
+  const qc = useQueryClient();
+  // null = untouched, so the rows follow the settings view (a refetch, or
+  // another device's save) until someone edits; from the first edit the
+  // draft keeps the view it started from, so a refetch cannot throw away
+  // rows being typed into and Save can tell which sections were edited.
+  // `seen` is the stored sections that view held, which Save sends as the
+  // base so a section another device changed since is refused, not lost.
+  const [draft, setDraft] = useState<{ base: InvestForm; form: InvestForm;
+                                       seen: InvestSeen } | null>(null);
+  const form = draft?.form ?? investFormOf(data);
+  const setForm = (f: (o: InvestForm) => InvestForm) => setDraft((d) => ({
+    base: d?.base ?? investFormOf(data), seen: d?.seen ?? investSeenOf(data),
+    form: f(d?.form ?? investFormOf(data)) }));
+  const [note, setNote] = useState<{ text: string; bad?: boolean } | null>(
+    null);
+  const save = useMutation({
+    mutationFn: (body: Record<string, unknown>) => saveSettings(qc, body),
+    scope: SETTINGS_SAVES,
+    onSuccess: () => {
+      // saveSettings seeded ["settings"], so dropping the draft shows what
+      // the server stored (it lowercases names and rounds amounts); the
+      // reports that read these keys — fees and the invested-vs-value
+      // panels — are the only other things that moved
+      setDraft(null);
+      setNote({ text: "Saved — the Net Worth page now uses these." });
+      qc.invalidateQueries({ queryKey: ["report"] });
+    },
+    onError: (e) => {
+      // another device changed a section this tab edited: drop the draft
+      // so the rows follow the settings view again, and fetch the current
+      // ones for the person to redo the change on
+      if (String(e instanceof Error ? e.message : e)
+            .startsWith(`${INVEST_STALE_STATUS}`)) {
+        setDraft(null);
+        qc.invalidateQueries({ queryKey: ["settings"] });
+      }
+      setNote({ text: errText(e), bad: true });
+    },
+  });
+  const submit = () => {
+    // only the sections edited since the form opened: each one replaces
+    // its stored key whole, so an untouched one would put back this tab's
+    // copy over anything saved elsewhere since
+    const r = investChanges(draft?.base ?? form, form,
+                            draft?.seen ?? investSeenOf(data));
+    if (!r.ok) { setNote({ text: r.error, bad: true }); return; }
+    if (!Object.keys(r.body).length) {
+      setDraft(null);
+      setNote({ text: "Nothing to save — no changes." });
+      return;
+    }
+    setNote(null);
+    save.mutate(r.body);
+  };
+  const setFee = (i: number, p: Partial<FeeRow>) =>
+    setForm((f) => ({ ...f, fees: f.fees.map((r, j) => j === i ? { ...r, ...p } : r) }));
+  const setBasis = (i: number, p: Partial<BasisRow>) =>
+    setForm((f) => ({ ...f, basis: f.basis.map((r, j) => j === i ? { ...r, ...p } : r) }));
+  return (
+    <div className="card" style={{ marginTop: "1rem" }}>
+      <b>Investment fees &amp; basis</b>
+      <div className="sub" style={{ margin: ".2rem 0 .5rem" }}>
+        Used by the Net Worth page. Robo-advisors take their fee out of the
+        balance without a fee row, so name the institution and its yearly
+        rate and the fee is estimated from the managed balance.
+      </div>
+      <h3 style={{ margin: ".6rem 0 .3rem" }}>Advisory fees</h3>
+      {form.fees.map((r, i) => (
+        <div key={i} style={{ display: "flex", gap: ".4rem", flexWrap: "wrap",
+                              marginBottom: ".3rem" }}>
+          <input placeholder="Institution name contains" value={r.inst}
+                 aria-label="Institution name contains"
+                 onChange={(e) => setFee(i, { inst: e.target.value })}
+                 style={{ flex: "1 1 12rem" }} />
+          <label className="sub">Yearly fee %{" "}
+            <input inputMode="decimal" placeholder="0.25" value={r.pct}
+                   onChange={(e) => setFee(i, { pct: e.target.value })}
+                   style={{ width: "5rem" }} /></label>
+          <button title="Remove this fee"
+                  onClick={() => setForm((f) => ({
+                    ...f, fees: f.fees.filter((_r, j) => j !== i) }))}>
+            remove</button>
+        </div>
+      ))}
+      <button onClick={() => setForm((f) => ({
+                ...f, fees: [...f.fees, { inst: "", pct: "" }] }))}>
+        + Add institution</button>
+      <div className="sub" style={{ marginTop: ".7rem" }}>
+        <label>Fee-free accounts (last characters, comma-separated){" "}
+          {/* a numeric pad has no comma or space key, so a phone could
+              never type a second account */}
+          <input inputMode="text" autoComplete="off" value={form.exempt}
+                 placeholder="1234, 5678"
+                 onChange={(e) => setForm((f) => ({ ...f, exempt: e.target.value }))}
+                 style={{ width: "12rem" }} /></label>
+        <div>Self-directed accounts at those institutions that pay no
+          advisory fee.</div>
+      </div>
+      <h3 style={{ margin: "1rem 0 .3rem" }}>Money-in overrides</h3>
+      <div className="sub" style={{ marginBottom: ".4rem" }}>
+        Where the feed's cost basis is wrong — shares transferred in arrive
+        with almost none — state the dollars actually put into the account.
+      </div>
+      {form.basis.map((r, i) => (
+        <div key={i} style={{ display: "flex", gap: ".4rem", flexWrap: "wrap",
+                              marginBottom: ".3rem" }}>
+          {/* text, not a number pad: some banks' masks carry letters */}
+          <input placeholder="Account last characters" value={r.mask}
+                 aria-label="Account last characters" inputMode="text"
+                 autoComplete="off"
+                 onChange={(e) => setBasis(i, { mask: e.target.value })}
+                 style={{ width: "9rem" }} />
+          <label className="sub">Money in ${" "}
+            <input inputMode="decimal" placeholder="0" value={r.amount}
+                   onChange={(e) => setBasis(i, { amount: e.target.value })}
+                   style={{ width: "8rem" }} /></label>
+          <button title="Remove this override"
+                  onClick={() => setForm((f) => ({
+                    ...f, basis: f.basis.filter((_r, j) => j !== i) }))}>
+            remove</button>
+        </div>
+      ))}
+      <button onClick={() => setForm((f) => ({
+                ...f, basis: [...f.basis, { mask: "", amount: "" }] }))}>
+        + Add account</button>
+      <div style={{ marginTop: ".8rem" }}>
+        <button className="pri" disabled={save.isPending} onClick={submit}>
+          {save.isPending ? "saving…" : "Save"}</button>
+      </div>
+      {note && (
+        <div className="sub" style={{ marginTop: ".4rem",
+                                      color: note.bad ? "var(--red)" : undefined }}>
+          {note.text}</div>
+      )}
+    </div>
+  );
+}
 
 // One card, two scopes. Connections renders the push half (a collector's
 // credential); Integrations renders the read half (a scraper's, a sensor's,
@@ -1864,16 +2040,22 @@ function ContinuityCard() {
   const noteNow = note ?? d?.note ?? "";
   const whoNow = who ?? d?.prepared_for ?? "";
   const dirty = !!d && (noteNow !== d.note || whoNow !== d.prepared_for);
+  // The PDF and the email are printed from the SAVED note, so an edit
+  // still in the box is saved first — otherwise the packet handed to
+  // someone would carry the old words while the screen shows the new ones.
+  const persist = async () => {
+    const r = await api.continuitySave({ note: noteNow, prepared_for: whoNow });
+    qc.setQueryData<typeof d>(["continuity"], (o) => o && { ...o, ...r });
+    setNote(null); setWho(null);
+  };
   const save = useMutation({
-    mutationFn: () => api.continuitySave({ note: noteNow, prepared_for: whoNow }),
-    onSuccess: (r) => {
-      qc.setQueryData<typeof d>(["continuity"], (o) => o && { ...o, ...r });
-      setNote(null); setWho(null); setMsg({ text: "Saved." });
-    },
+    mutationFn: persist,
+    onSuccess: () => setMsg({ text: "Saved." }),
     onError: (e) => setMsg({ text: errText(e), bad: true }),
   });
   const get = useMutation({
     mutationFn: async () => {
+      if (dirty) await persist();
       const r = await api.exportTicket("continuity");
       // asked first, so a refusal shows here rather than as a bare page
       await api.exportPrecheck("continuity", r.token);
@@ -1883,10 +2065,11 @@ function ContinuityCard() {
     onError: (e) => setMsg({ text: errText(e), bad: true }),
   });
   const mail = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
       if (!window.confirm(`Email the continuity packet to ${to}? It is the `
                           + "whole shape of the household's money."))
         throw new Error("cancelled");
+      if (dirty) await persist();
       return api.continuityEmail(to);
     },
     onSuccess: (r) => setMsg({ text: `Sent to ${r.to}.` }),
@@ -1936,6 +2119,8 @@ function ContinuityCard() {
           onClick={() => get.mutate()}>
           {get.isPending ? "preparing…" : "Download PDF"}
         </button>
+        {dirty && <span className="mut" style={{ fontSize: 13 }}>
+          Your edits are saved before the PDF or email goes out.</span>}
       </div>
       {d && (
         <div style={{ marginTop: ".9rem" }}>
@@ -2151,16 +2336,28 @@ function PasskeysCard() {
     // identity is the elevation sheet's job; a plain confirm here keeps one
     // stray click from stripping a sign-in method
     mutationFn: (id: string) => {
-      if (!window.confirm("Remove this passkey?"))
+      // the page does not know which key signed this session in, so the
+      // warning covers the case where removing it ends the session too
+      if (!window.confirm("Remove this passkey? If this is the passkey you "
+                          + "signed in with, you will be signed out."))
         throw new Error("cancelled");
       return api.passkeyDelete(id);
     },
     // the removed key leaves the list on the response; the refetch confirms
-    onSuccess: (_r, id) => { setErr(null);
-                       removeFromList<{ passkeys: { id: string }[] },
-                                      { id: string }>(
-                         qc, ["passkeys"], "passkeys", (p) => p.id === id);
-                       qc.invalidateQueries({ queryKey: ["passkeys"] }); },
+    onSuccess: (r, id) => {
+      // The key had signed this session in, so the server ended the
+      // session with it: say why before the sign-in page, instead of
+      // letting the refetch meet a bare 401.
+      if ((r as { signed_out?: boolean }).signed_out) {
+        window.alert("That passkey signed you in, so you were signed out.");
+        window.location.href = "/login";
+        return;
+      }
+      setErr(null);
+      removeFromList<{ passkeys: { id: string }[] }, { id: string }>(
+        qc, ["passkeys"], "passkeys", (p) => p.id === id);
+      qc.invalidateQueries({ queryKey: ["passkeys"] });
+    },
     onError: (e) => {
       const m = String(e instanceof Error ? e.message : e);
       if (m.includes("cancelled")) return;
@@ -3663,17 +3860,21 @@ function LlmBackendForm({ initial, hosted, onDone, onCancel }: {
       </label></p>
       <p><label>Endpoint URL<br />
         {field(url, setUrl,
-          hosted ? "https://api.openai.com/v1" : "http://localhost:11434/v1")}
+          hosted ? "https://api.anthropic.com" : "http://localhost:11434/v1")}
+        <span className="sub">Anthropic (api.anthropic.com), OpenAI, or any
+          OpenAI-compatible server; a trailing /v1 is fine</span>
       </label></p>
       <p><label>Model<br />
-        {field(model, setModel, hosted ? "gpt-4o-mini" : "llama3.1:8b")}
+        {field(model, setModel,
+               hosted ? "a model id from that provider" : "llama3.1:8b")}
       </label></p>
       <p><label>Vision model <span className="sub">(optional — reads
         receipt images/PDFs{hosted
           ? "; use a vision-capable model from the same API"
           : <>{" "}; bundled Ollama: <code>./oikonome.sh llm vision</code>{" "}
             pulls qwen2.5vl:3b</>})</span><br />
-        {field(vision, setVision, hosted ? "gpt-4o-mini" : "qwen2.5vl:3b")}
+        {field(vision, setVision,
+               hosted ? "same id, if it reads images" : "qwen2.5vl:3b")}
       </label></p>
       <p><label>API key <span className="sub">
         {clearKey
@@ -4258,10 +4459,13 @@ function DeliveryProblemCard({ state, email }: {
   );
 }
 
-// Change the login email/username (hosted: re-verifies). Re-auth like
-// PasswordCard — the /api/email/change door does password + TOTP.
-function EmailCard({ current, onChanged }: {
-  current?: string; onChanged: () => void;
+// Change the login email/username. Re-auth like PasswordCard — the
+// /api/email/change door does password + TOTP. On hosted the address
+// moves only when the new mailbox presses the button in its confirm mail;
+// until then it is shown as pending here, with a way to withdraw it.
+function EmailCard({ current, pending, pendingUntil, onChanged }: {
+  current?: string; pending: string | null; pendingUntil: string | null;
+  onChanged: () => void;
 }) {
   const qc = useQueryClient();
   const [email, setEmail] = useState("");
@@ -4286,8 +4490,9 @@ function EmailCard({ current, onChanged }: {
       const kept = r.passkeys_kept
         ? ` ${r.passkeys_kept} passkey(s) kept — your only second factor.`
         : "";
-      setMsg({ text: (r.verify_sent
-        ? "Email changed — check the new address for a verification link."
+      setMsg({ text: (r.pending_email
+        ? `Confirmation sent to ${r.pending_email} — your sign-in email `
+          + "changes when you press the button in that mail."
         : "Email changed.") + cost + kept + hint + smsPauseNote(qc, r)
         + membersRemovedNote(qc, r)
         // the household's mail list named the old address, and it went
@@ -4298,12 +4503,13 @@ function EmailCard({ current, onChanged }: {
             : ""),
         bad: false });
       setEmail("");
-      // the heading reads the address off ["me"]; a hosted change also
-      // un-verifies it until the new inbox clicks through
-      patchQuery<Me>(qc, ["me"], { email: r.email,
-        ...(r.verify_sent ? { verified: false } : {}) });
-      // the patch covers the address; the old inbox's bounce state and the
-      // hosted verify banner are the server's to recompute
+      // the heading reads the address off ["me"]. A pending change moved
+      // nothing — the sign-in address and its verified state stand — so
+      // only the pending line is patched; a completed one moves the address
+      patchQuery<Me>(qc, ["me"], r.pending_email
+        ? { pending_email: r.pending_email } : { email: r.email });
+      // the patch covers the address; the pending expiry, the old inbox's
+      // bounce state and the verify banner are the server's to recompute
       qc.invalidateQueries({ queryKey: ["me"] });
       onChanged();
     },
@@ -4316,6 +4522,17 @@ function EmailCard({ current, onChanged }: {
         : errText(e), bad: true });
     },
   });
+  // only takes something away, so no step-up
+  const withdraw = useMutation({
+    mutationFn: () => api.emailChangeCancel(),
+    onSuccess: () => {
+      setMsg({ text: `The change to ${pending} was withdrawn.`, bad: false });
+      patchQuery<Me>(qc, ["me"], { pending_email: null,
+                                   pending_email_expires_at: null });
+      qc.invalidateQueries({ queryKey: ["me"] });
+    },
+    onError: (e) => setMsg({ text: errText(e), bad: true }),
+  });
   return (
     <div className="card">
       <h2>Email / username</h2>
@@ -4325,6 +4542,14 @@ function EmailCard({ current, onChanged }: {
         other session is signed out, and every passkey, signed-in phone,
         script token and pending family invite is removed — re-add them
         after.</p>
+      {pending && (
+        <p>Waiting for confirmation: <b>{pending}</b>
+          {pendingUntil && <span className="mut"> (the link works until{" "}
+            {mmdd(localDayOf(pendingUntil))})</span>}{" "}
+          <button disabled={withdraw.isPending}
+                  onClick={() => withdraw.mutate()}>
+            {withdraw.isPending ? "withdrawing…" : "Withdraw"}</button>
+        </p>)}
       {msg && <div className={`note ${msg.bad ? "bad" : "good"}`}
                    onClick={() => setMsg(null)}>{msg.text}</div>}
       <div className="field-grid" style={{ maxWidth: "26rem" }}>
@@ -4479,6 +4704,9 @@ function TwoFactorCard() {
   // to bolt 2FA on and sign the real owner out, nor strip it) — the
   // request wrapper's sheet collects the proof; no password boxes here
   const [msg, setMsg] = useState<{ text: string; bad: boolean } | null>(null);
+  // read before the mutations so confirm's success message can tell a
+  // replacement from a first enrolment
+  const enabled = !!me.data?.totp_enabled;
 
   const fail = (e: unknown) => {
     const m = String(e instanceof Error ? e.message : e);
@@ -4515,7 +4743,9 @@ function TwoFactorCard() {
       // first-factor enrolment returns one-time recovery codes
       if (r.recovery_codes && r.recovery_codes.length)
         setRecovery(r.recovery_codes);
-      setMsg({ text: "Two-factor is on — every other session was signed out."
+      setMsg({ text: (enabled ? "Your new authenticator is set up — the old "
+                       + "one no longer works"
+                     : "Two-factor is on") + " — every other session was signed out."
                      + smsPauseNote(qc, r) + membersRemovedNote(qc, r),
                 bad: false });
       // the card's whole shape keys on ["me"].totp_enabled, and that key
@@ -4568,7 +4798,6 @@ function TwoFactorCard() {
   });
 
   if (me.isPending || me.isLoadingError) return null;
-  const enabled = me.data.totp_enabled;
   const busy = start.isPending || confirm.isPending || disable.isPending;
 
   return (
@@ -4627,24 +4856,7 @@ function TwoFactorCard() {
             {regen.isPending ? "generating…" : "regenerate"}</button>
         </p>
       )}
-      {enabled ? (
-        <>
-          <p><span className="pill g">enabled</span>{" "}
-            <span className="mut">Signing in requires your password and a
-            6-digit code.</span></p>
-          <div className="field-grid">
-            <label>Current 6-digit code <span className="mut">(to turn 2FA off)</span>
-              <input inputMode="numeric" autoComplete="one-time-code"
-                     value={code} onChange={(e) => setCode(e.target.value)} />
-            </label>
-          </div>
-          <button style={{ marginTop: ".5rem" }}
-                  disabled={busy || !code.trim()}
-                  onClick={() => disable.mutate()}>
-            {disable.isPending ? "turning off…" : "Turn off 2FA"}
-          </button>
-        </>
-      ) : enroll ? (
+      {enroll ? (
         <>
           <p className="mut">Scan this QR with your authenticator app (or type
             the secret in manually), then enter the 6-digit code it shows to
@@ -4666,13 +4878,44 @@ function TwoFactorCard() {
           <div style={{ marginTop: ".5rem", display: "flex", gap: ".5rem" }}>
             <button className="pri" disabled={busy || !code.trim()}
                     onClick={() => confirm.mutate()}>
-              {confirm.isPending ? "confirming…" : "Confirm and enable"}
+              {confirm.isPending ? "confirming…"
+                : enabled ? "Confirm and replace" : "Confirm and enable"}
             </button>
             <button disabled={busy}
                     onClick={() => { setEnroll(null); setCode(""); setMsg(null); }}>
               cancel
             </button>
           </div>
+        </>
+      ) : enabled ? (
+        <>
+          <p><span className="pill g">enabled</span>{" "}
+            <span className="mut">Signing in requires your password and a
+            6-digit code.</span></p>
+          <div className="field-grid">
+            <label>Current 6-digit code <span className="mut">(to turn 2FA off)</span>
+              <input inputMode="numeric" autoComplete="one-time-code"
+                     value={code} onChange={(e) => setCode(e.target.value)} />
+            </label>
+          </div>
+          <button style={{ marginTop: ".5rem" }}
+                  disabled={busy || !code.trim()}
+                  onClick={() => disable.mutate()}>
+            {disable.isPending ? "turning off…" : "Turn off 2FA"}
+          </button>
+          {/* Turning off needs a code from the authenticator, so someone
+              who LOST it has no way out from here. Replacing goes through
+              the confirm-it's-you sheet instead, where "Lost your
+              authenticator?" takes the password and a recovery code. */}
+          <p className="mut" style={{ fontSize: 13, marginTop: ".6rem" }}>
+            New phone or lost your authenticator?{" "}
+            <button disabled={busy}
+              style={{ background: "none", border: "none", padding: 0,
+                color: "var(--blue)", cursor: "pointer", font: "inherit",
+                textDecoration: "underline" }}
+              onClick={() => { setCode(""); start.mutate(); }}>
+              {start.isPending ? "starting…" : "Replace authenticator"}</button>
+          </p>
         </>
       ) : (
         <>

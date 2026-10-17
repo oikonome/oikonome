@@ -34,7 +34,9 @@ export default function BudgetFineTune({ data, onSaved, onDirtyChange }: {
     onSuccess: setSugg,
     onError: (e) => setErr(errText(e)),
   });
-  const [dynamic, setDynamic] = useState(!!data.dynamic_variable_budget);
+  // absent means on, the way the budget engine reads it: an unchecked box
+  // here would be posted back as false by the next bucket save
+  const [dynamic, setDynamic] = useState(data.dynamic_variable_budget !== false);
   const [buckets, setBuckets] = useState<BucketRow[]>(
     (data.custom_buckets ?? []).map((b) => ({
       name: b.name, parent: b.parent,

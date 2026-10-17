@@ -251,3 +251,41 @@ class UnpaidNextMonthOccurrenceIsNotThisMonths(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LatePaymentOfLastMonthsBillCountsOnBothPages(unittest.TestCase):
+    """A bill due the 30th that posts three days late, on the 3rd, belongs
+    to LAST month's occurrence — and its cash left in THIS month, so it is
+    this month's fixed spend. Today counts it that way; the Bills page must
+    show the same payment as paid and add the same dollars, or the page
+    reports less paid than Today's fixed total for one ledger.
+    """
+
+    TODAY = dt.date(2026, 7, 15)
+
+    def setUp(self):
+        self.conn = make_db()
+        write_config(self.conn)
+        add_bill(self.conn, "Gym", 80.0, frequency="MONTHLY",
+                 next_due=dt.date(2026, 7, 30), last_seen=dt.date(2026, 5, 30))
+        add_txn(self.conn, dt.date(2026, 5, 30), 80.0, "GYM")
+        add_txn(self.conn, dt.date(2026, 7, 3), 80.0, "GYM")
+        self.cfg = budget.load_config(self.conn)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_the_late_payment_is_paid_and_counted(self):
+        page = _month_bill_stats(self.conn, self.cfg, self.TODAY)["Gym"]
+        self.assertEqual(page["paid"], 1)
+        self.assertAlmostEqual(page["paid_amount"], 80.0, places=2)
+        # this month's own occurrence (the 30th) is still to come
+        self.assertEqual(page["next_unpaid"], "2026-07-30")
+
+    def test_the_page_total_equals_the_verdicts_fixed_actual(self):
+        st = budget.month_status(self.conn, self.TODAY)
+        page = _month_bill_stats(self.conn, self.cfg, self.TODAY)
+        total = sum(e["paid_amount"] for e in page.values())
+        self.assertAlmostEqual(total, st["buckets"]["fixed"]["actual"],
+                               places=2)
+        self.assertAlmostEqual(total, 80.0, places=2)

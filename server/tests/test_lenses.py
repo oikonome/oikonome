@@ -14,7 +14,8 @@ import uuid
 from oikonome.engine import budget
 from oikonome.web import lenses
 
-from .util import TODAY, add_bill, add_txn, make_db, seed_accounts, write_config
+from .util import (TODAY, add_bill, add_ledger_history, add_txn, make_db,
+                   seed_accounts, write_config)
 
 
 def snapshot_months(conn, year: int, *months: int) -> None:
@@ -40,6 +41,8 @@ class TestMonthFinality(LensBase):
     def test_past_month_is_final_full_month(self):
         """A past month's card judges the FULL month (frac=1): expected =
         the whole budget, verdict final, spend after month end excluded."""
+        # an established household: the ledger predates June
+        add_ledger_history(self.conn, dt.date(2026, 6, 1))
         add_txn(self.conn, dt.date(2026, 6, 10), 2000.0, "JUNE SPEND")
         add_txn(self.conn, dt.date(2026, 7, 2), 9000.0, "JULY SPEND")
         r = lenses.month_summary(self.conn, 2026, 6, today=TODAY)
@@ -72,16 +75,21 @@ class TestMonthFinality(LensBase):
         r = lenses.month_summary(self.conn, 2026, 7, today=TODAY)
         self.assertEqual(r["status"], "in_progress")
         p = r["projection"]
-        # day 15: fourteen days have elapsed; today is not over
-        self.assertAlmostEqual(p["pace_total"], 1500.0 / 14 * 31, 2)
-        self.assertAlmostEqual(p["variance"], p["pace_total"] - 6100.0, 2)
+        # day 15, ledger from the 5th: ten days have finished since it
+        # began (the days before it are no data; today is not over), and
+        # the month runs 27 days from it — judged against the budget's
+        # share of those 27 days
+        spendable = 6100.0 * 27 / 31
+        self.assertAlmostEqual(p["pace_total"], 1500.0 / 10 * 27, 2)
+        self.assertAlmostEqual(p["variance"], p["pace_total"] - spendable, 2)
         self.assertEqual(p["verdict"], "UNDER BUDGET")
-        self.assertAlmostEqual(p["tolerance"], 6100.0 * 0.05, 2)
+        self.assertAlmostEqual(p["tolerance"], spendable * 0.05, 2)
 
     def test_an_on_pace_morning_projects_on_budget_like_the_verdict(self):
         """Exactly fourteen days' worth of budget spent before day 15, and
         nothing yet today: the verdict says ON BUDGET, and the projection
         must agree — counting today as a finished $0 day read UNDER."""
+        add_ledger_history(self.conn, TODAY)
         add_txn(self.conn, TODAY.replace(day=5), round(6100.0 * 14 / 31, 2),
                 "PLAIN SPEND")
         r = lenses.month_summary(self.conn, 2026, 7, today=TODAY)
@@ -145,6 +153,7 @@ class TestYearGrid(LensBase):
     def test_grid_final_projected_future(self):
         """TODAY = 2026-07-15: months 1–6 final (each has a budget
         snapshot), 7 projected, 8–12 blank."""
+        add_ledger_history(self.conn, dt.date(2026, 1, 1))
         snapshot_months(self.conn, 2026, 1, 2, 3, 4, 5, 6)
         # tolerance at month end = max($50, 5% × $6,100) = $305 → clear it
         add_txn(self.conn, dt.date(2026, 3, 10), 6600.0, "MARCH BLOWOUT")

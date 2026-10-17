@@ -78,11 +78,15 @@ def released_count(conn) -> int:
     billed Item every pass while the live count never moves. A release
     whose stamp never landed counts from the day the Item was created.
     Live Items are left out — institution_count already has them — and an
-    Item on the household's own keys is their bill, not the instance's."""
+    Item on the household's own keys is their bill, not the instance's.
+    So is an Item handed back as a repeat of a login the household already
+    holds (sync.plaid.REPEAT_LEDGER_REASON): the household reached for no
+    new institution, and the repeats are bounded by their own limit."""
     row = conn.execute(
         """SELECT COUNT(*) AS n FROM plaid_item_ledger l
            WHERE l.tenant = current_setting('app.tenant_id', true)
              AND l.credential_source = 'platform'
+             AND l.removed_reason IS DISTINCT FROM 'repeat'
              AND COALESCE(l.removed_at, l.created_at)
                  >= now() - make_interval(days => %s)
              AND NOT EXISTS (
@@ -1266,6 +1270,115 @@ def _comma_spellings(aid: str, limit: int = 6) -> list[str]:
     return out
 
 
+# How far back a household asked its ledger to reach, in whole months
+# (Settings and the setup wizard). Absent means everything a source has.
+# The same answer shortens a bank link's backfill (sync/plaid) and trims a
+# file import, so a person who asked for three months does not get three
+# months from the bank and five years from the statement they dropped in.
+HISTORY_MONTHS = (1, 3, 6, 12)
+
+
+def history_months_of(cfg: dict | None) -> int | None:
+    """The stored history window, or None for "everything". A value
+    outside the offered choices reads as None: a restored or hand-edited
+    config must widen the window, never silently narrow it."""
+    v = (cfg or {}).get("history_months")
+    if isinstance(v, bool):
+        return None
+    try:
+        n = int(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return n if n in HISTORY_MONTHS and n == v else None
+
+
+def months_before(day: dt.date, months: int) -> dt.date:
+    """The same day of the month `months` calendar months earlier, clamped
+    to the end of a shorter month (May 31 less three months is Feb 28/29)."""
+    import calendar
+    y, m = divmod(day.year * 12 + (day.month - 1) - months, 12)
+    m += 1
+    return dt.date(y, m, min(day.day, calendar.monthrange(y, m)[1]))
+
+
+def history_cutoff(conn) -> dt.date | None:
+    """The first day a file import may land, or None when the household
+    keeps everything. Counted from the day it is where the household lives,
+    so the window does not move a day early in the evening."""
+    row = conn.execute(
+        "SELECT config->'history_months' AS months,"
+        "       config->>'timezone' AS timezone"
+        "  FROM tenant_settings").fetchone()
+    if row is None:
+        return None
+    n = history_months_of({"history_months": row["months"]})
+    if n is None:
+        return None
+    from .. import localtime
+    today = localtime.now_local({"timezone": row["timezone"]}).date()
+    return months_before(today, n)
+
+
+# How far back a routine refresh of a linked bank reaches (MX's and the
+# SimpleFIN worker's 30-day window). A history window never narrows it.
+ROUTINE_PULL_DAYS = 30
+
+
+def bound_first_pull(conn, start: dt.date | None) -> dt.date | None:
+    """A bank link's deep first pull start date, moved up to the
+    household's history window when it reaches further back (None, no
+    limit, reaches furthest). Plaid asks for the window at link time
+    (plaid.days_requested); MX and SimpleFIN ask by start date on every
+    pull, so the bound is applied where that date is chosen. It never
+    starts later than a routine refresh would: a short window must not
+    stop late-posting rows near its edge from being refreshed."""
+    cutoff = history_cutoff(conn)
+    if cutoff is None:
+        return start
+    floor = min(cutoff,
+                dt.date.today() - dt.timedelta(days=ROUTINE_PULL_DAYS))
+    return floor if start is None or start < floor else start
+
+
+def drop_before_history(conn, txns: list[Transaction]
+                        ) -> tuple[list[Transaction], int]:
+    """A file import's rows less those dated before the household's history
+    window, and how many were left out. Applied just before the write, after
+    the importer's own duplicate and re-import bookkeeping has run over the
+    whole file: an earlier import of the same statement can still be
+    recognised and corrected, and only rows that would otherwise have been
+    added are counted as skipped.
+
+    A row whose id already stands on its account is kept whatever its date.
+    It is not a new old row but the household's own row coming in again,
+    and the write is what carries a correction to it: the re-import
+    bookkeeping only moves a row onto the id its corrected reading hashes
+    to, with its old amount and date, and the write then sets the new
+    ones. Dropped here, a sign or year fix made before the window was set
+    would be reported as corrected, left wrong, and re-dropped by every
+    later import of the file."""
+    cutoff = history_cutoff(conn)
+    if cutoff is None:
+        return txns, 0
+    from ..engine.compat import as_date
+
+    def inside(t):
+        try:
+            d = as_date(t.date)
+        except (TypeError, ValueError):
+            return True        # the write refuses a bad date with its own words
+        return d is None or d >= cutoff
+    older = [t for t in txns if not inside(t)]
+    if not older:
+        return txns, 0
+    have = {(r["id"], r["account_id"]) for r in conn.execute(
+        "SELECT id, account_id FROM transactions WHERE id = ANY(%s)",
+        (list({t.id for t in older}),)).fetchall()}
+    kept = [t for t in txns
+            if inside(t) or (t.id, t.account_id) in have]
+    return kept, len(txns) - len(kept)
+
+
 def is_file_import_id(txn_id) -> bool:
     return isinstance(txn_id, str) and txn_id.startswith(
         FILE_IMPORT_ID_PREFIXES)
@@ -1543,6 +1656,16 @@ def _settle_pendings(conn, links: list[tuple[str, str]]) -> None:
             pairs = list(dict.fromkeys(links))     # a replayed page repeats pairs
             new_ids = [p[0] for p in pairs]
             old_ids = [p[1] for p in pairs]
+            # Both rows of every pair are locked, in id order, before any
+            # child moves: a split writer (splits.set_split, a person's
+            # category edit, the store matcher) takes the charge's row
+            # before its parts, and the carries below touch the pending
+            # row's parts before the pending row itself is retired at the
+            # end — without the row lock first, a person splitting or
+            # filing the hold during the settlement could deadlock it.
+            conn.execute("SELECT 1 FROM transactions WHERE id = ANY(%s)"
+                         " ORDER BY id FOR UPDATE",
+                         (sorted(set(new_ids) | set(old_ids)),))
             # The posted row's own id is the upsert key, so it appears once per
             # page: one target row per pair, and the COALESCE below reads the
             # pending twin exactly as the per-row UPDATE did.
@@ -1598,10 +1721,12 @@ def _settle_pendings(conn, links: list[tuple[str, str]]) -> None:
                 c_new.append(new_id)
                 c_old.append(old_id)
 
-            def _carry(sql: str) -> None:
+            def _carry(*sqls: str) -> None:
+                # several statements carry as one: all of them or none
                 try:
                     with conn.transaction():
-                        conn.execute(sql, (c_new, c_old))
+                        for sql in sqls:
+                            conn.execute(sql, (c_new, c_old))
                 except Exception:                            # noqa: BLE001
                     log.warning("pending→posted child carry failed for %s",
                                 list(zip(c_old, c_new)), exc_info=True)
@@ -1672,7 +1797,17 @@ def _settle_pendings(conn, links: list[tuple[str, str]]) -> None:
             # sweep then drops them against the POSTED amount — left on the
             # retired row they would still add up and nothing would notice
             # they had stopped counting.
-            _carry("UPDATE transaction_splits s SET txn_id=v.new_id"
+            # A person's split outranks a store's (its matcher's reading of
+            # a receipt, recomputed every run): when the hold carries the
+            # person's parts, the posted row's store parts give way first —
+            # left there, they would strand the person's answer on the
+            # retired row. A store's parts never displace a person's.
+            _carry("DELETE FROM transaction_splits s"
+                   " USING unnest(%s::text[], %s::text[]) AS v(new_id, old_id)"
+                   " WHERE s.txn_id=v.new_id AND s.source <> 'user' AND EXISTS"
+                   "  (SELECT 1 FROM transaction_splits x"
+                   "   WHERE x.txn_id=v.old_id AND x.source = 'user')",
+                   "UPDATE transaction_splits s SET txn_id=v.new_id"
                    " FROM unnest(%s::text[], %s::text[]) AS v(new_id, old_id)"
                    " WHERE s.txn_id=v.old_id AND NOT EXISTS"
                    "  (SELECT 1 FROM transaction_splits x WHERE x.txn_id=v.new_id)")
@@ -2724,13 +2859,33 @@ def reconcile_vanished_pendings(conn, account_ids: list[str],
 # encryption the token is deliberately stored under. Redact userinfo at the
 # sink so every syncer, present and future, is covered rather than only the
 # ones anyone remembered.
-_URL_CREDS = re.compile(r"(\w+://)[^\s/@]+@")
+# A match may start only where a word run begins: `\w+://` restarting at
+# every position inside a long run of word characters with no `://` is
+# quadratic, and this runs over error text a third-party server wrote. Both
+# runs are possessive — neither can give a character back that the next
+# part could use (`:` is not a word character, `@` is outside the class) —
+# so a failed attempt never backtracks into them. And the text is held to
+# its head before it is scanned: it only ever reaches a log line or an
+# error cell, and a reply of megabytes should cost what a short one does.
+REDACT_SCAN_CHARS = 4096
+_URL_CREDS = re.compile(r"(?<!\w)(\w++://)[^\s/@]++@")
 
 
 def redact_url_credentials(text: str | None) -> str | None:
     if not text:
         return text
-    return _URL_CREDS.sub(r"\1***@", text)
+    if len(text) <= REDACT_SCAN_CHARS:
+        return _URL_CREDS.sub(r"\1***@", text)
+    head = text[:REDACT_SCAN_CHARS]
+    # The cut may fall inside a URL before its `@`, where the pattern can
+    # no longer see the credential as one — so the last unbroken run of
+    # the head is dropped whole rather than half-kept. A credential never
+    # holds whitespace, so whatever stays before it is complete.
+    if not head[-1].isspace() and not text[REDACT_SCAN_CHARS].isspace():
+        last = head.rsplit(None, 1)
+        head = head[:len(head) - len(last[-1])] if last else ""
+    return (_URL_CREDS.sub(r"\1***@", head)
+            + f"… [{len(text) - len(head):,} more characters not shown]")
 
 
 def log_sync(conn, item_id: str, added: int, error: str | None = None,

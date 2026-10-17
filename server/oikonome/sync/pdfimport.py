@@ -75,7 +75,7 @@ import re
 from ..engine.compat import as_date
 from . import flowmap, reimport
 from .base import (FileImportIds, Transaction, mask_long_digits,
-                   upsert_transactions)
+                   drop_before_history, upsert_transactions)
 from .dedup import WINDOW_DAYS as DEDUP_WINDOW_DAYS  # noqa: F401 (re-export)
 from .dedup import Deduper
 from .rowcap import check_len
@@ -1391,12 +1391,16 @@ def import_pdf(conn, account_id: str, data: bytes, *,
         corrected += _retire_absorbed(
             conn, account_id, txns, scanned, gone, prior_all, flipped_all,
             redated_all)
+    # the household's history window (Settings → how far back): rows
+    # dated before it are left out and counted, never written
+    txns, skipped_older = drop_before_history(conn, txns)
     if batch_id:
         from . import batches
         batches.tag(conn, txns, batch_id)
     added = upsert_transactions(conn, txns)
     return {"imported": added, "rows": len(txns),
             "skipped_duplicates": skipped_dupes,
+            "skipped_older": skipped_older,
             "corrected": corrected,
             "confidence": parsed["confidence"],
             "warnings": parsed["warnings"],

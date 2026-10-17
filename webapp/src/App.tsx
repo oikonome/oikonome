@@ -7,9 +7,9 @@ import { WEB_HOMES, abortRequestEpoch, api, assistant as assistantApi, AuthError
 import { saveSettings } from "./api/cache";
 import { rebindBrowserPush, signOut } from "./push";
 import { HOME_KEY, forgetLaunchHome } from "./launchhome";
+import { THEME_EVENT, type Theme } from "./components/themeChoice";
 
 // "auto" follows the OS (no data-theme attribute); light/dark pin
-type Theme = "auto" | "light" | "dark";
 function applyTheme(t: Theme) {
   if (t === "light" || t === "dark")
     document.documentElement.dataset.theme = t;
@@ -283,26 +283,37 @@ export default function App() {
   // with the household still on the instance default and the browser
   // somewhere else, that zone is adopted, once; Settings → Email & Push
   // names it and can change it. adoptsDeviceZone holds the rest of the
-  // rule (self-hosted instances keep following their configured zone).
+  // rule (self-hosted instances keep following their configured zone),
+  // including waiting out the second-factor enrolment: a brand-new hosted
+  // owner lands here before enrolling, when every settings write is
+  // refused, and the enrolment gate refreshes /api/me without reloading.
+  // The flag guards only the request in flight — a failed save leaves the
+  // next /api/me answer free to try again, a few times per page load.
   const zoneOffered = useRef(false);
+  const zoneTries = useRef(0);
   useEffect(() => {
     const m = me.data;
-    if (zoneOffered.current) return;
+    if (zoneOffered.current || zoneTries.current >= 3) return;
     const device = deviceZone();
     if (!adoptsDeviceZone(m, device)) return;
     zoneOffered.current = true;
+    zoneTries.current += 1;
     api.settingsSave({ timezone: device, timezone_adopted: true })
       .then(() => { qc.invalidateQueries({ queryKey: ["me"] });
                     qc.invalidateQueries({ queryKey: ["settings"] }); })
-      .catch(() => {});
+      .catch(() => { zoneOffered.current = false; });
   }, [me.data, qc]);
   // A browser's push subscription ends with the session that registered
   // it, so once signed in the browser's own subscription is re-sent to ride
   // this session. Quiet when it works; when the old one has already lapsed
   // the user is told once, with a way to turn it back on.
+  // Not while a second factor is still to be enrolled: the server refuses
+  // the rebind then, and the gate clears without a reload, so waiting for
+  // the /api/me that follows enrolment is what makes the rebind happen.
   const pushRebound = useRef(false);
   useEffect(() => {
-    if (!me.data || me.data.demo || pushRebound.current) return;
+    if (!me.data || me.data.demo || me.data.needs_2fa
+        || pushRebound.current) return;
     pushRebound.current = true;
     rebindBrowserPush().then((r) => {
       if (r === "ok") qc.invalidateQueries({ queryKey: ["notify"] });
@@ -499,9 +510,10 @@ export default function App() {
   // below the next time /api/settings is refetched — the control would work
   // for a few minutes and then undo itself.
   const perDeviceTheme = viewerNow || !!me.data?.demo;
-  // default DARK — only an explicit "auto" follows the OS
+  // default AUTO — a household that never chose follows the OS; only an
+  // explicit light/dark pins
   const [theme, setTheme] = useState<Theme>(
-    (readStore("local", "oiko-theme") as Theme) || "dark");
+    (readStore("local", "oiko-theme") as Theme) || "auto");
   const settingsQ = useQuery({ queryKey: ["settings"], queryFn: api.settings,
                                retry: false, staleTime: 300_000,
                                // header chrome: it waits for /api/me
@@ -524,16 +536,25 @@ export default function App() {
     }
   }, [settingsQ.isSuccess, settingsQ.data?.home_web]);
   useEffect(() => (me.data ? warmEveryRoute() : undefined), [me.data]);
+  // The pre-paint script pins dark when this browser has stored no
+  // choice, so "nothing stored" has to be applied here even when the value
+  // matches state — otherwise an auto household stays dark on a new device
+  // until someone touches the toggle.
   useEffect(() => {
-    if (!me.data || perDeviceTheme) return;   // per-device choice stands
-    // no server-pinned theme → the dark default (not OS-follow)
-    const server: Theme = settingsQ.data?.theme ?? "dark";
-    if (settingsQ.data && server !== theme) { setTheme(server); applyTheme(server); }
+    if (!me.data) return;
+    const stored = readStore("local", "oiko-theme");
+    if (perDeviceTheme) {                     // per-device choice stands
+      if (stored === null) applyTheme(theme);
+      return;
+    }
+    // no server-pinned theme → follow the OS
+    const server: Theme = settingsQ.data?.theme ?? "auto";
+    if (settingsQ.data && (server !== theme || stored !== server)) {
+      setTheme(server); applyTheme(server);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settingsQ.data?.theme, me.data, perDeviceTheme]);
-  const cycleTheme = () => {
-    const next: Theme = theme === "auto" ? "light"
-      : theme === "light" ? "dark" : "auto";
+  const pickTheme = (next: Theme) => {
     setTheme(next);
     applyTheme(next);
     if (perDeviceTheme) return;         // localStorage IS the persistence
@@ -541,6 +562,19 @@ export default function App() {
     // refetching to learn the value just written
     saveSettings(qc, { theme: next }).catch(() => {});
   };
+  const cycleTheme = () => pickTheme(theme === "auto" ? "light"
+    : theme === "light" ? "dark" : "auto");
+  // a page's own theme picker (the setup wizard) goes through the same
+  // door, so the per-device rule and the nav control stay in one place
+  useEffect(() => {
+    const on = (e: Event) => {
+      const t = (e as CustomEvent<Theme>).detail;
+      if (t === "auto" || t === "light" || t === "dark") pickTheme(t);
+    };
+    window.addEventListener(THEME_EVENT, on);
+    return () => window.removeEventListener(THEME_EVENT, on);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [perDeviceTheme]);
 
   if (me.isPending)
     return <div className="centered"><span className="mut">loading…</span></div>;

@@ -152,7 +152,13 @@ class RenamedFeedNameTests(unittest.TestCase):
 
     # -- the limits ----------------------------------------------------------
     def test_a_name_the_line_does_not_spell_gets_its_own_merchant(self):
-        _h, p = self.l.month(5)
+        """A line answers for a new name only when it NAMES the payee it
+        has carried. Here it never did: the feed called the earlier charge
+        something the line does not spell either, so the line is a
+        witness to nothing, and the second name keeps its own merchant.
+        (A line that does name its earlier payee outranks a name it does
+        not contain — the overrule's tests.)"""
+        _h, p = self.l.month(5, name="Granite Supply Co")
         other = self.l.row("x1", "2025-06-03", 40, HOLD, "Corner Market",
                            pending=1)
         self.l.resolve()

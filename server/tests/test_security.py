@@ -82,13 +82,17 @@ class WebSecurityTests(unittest.TestCase):
     def test_login_rate_limit(self):
         from oikonome.web import security
         # burn the window with failed logins from one IP
-        for i in range(12):
+        security._limiter._hits.clear()          # an empty window
+        # a fresh address each time, so the per-address lockout never
+        # answers first: this is the per-IP backstop
+        for i in range(45):
             r = self.client.post("/api/login",
-                                 data={"email": "nobody@example.dev",
+                                 data={"email": f"nobody{i}@example.dev",
                                        "password": "wrong-wrong-wrong"})
             if r.status_code == 429:
                 break
         self.assertEqual(r.status_code, 429)
+        self.assertEqual(i, 40)                  # 40 per 5 minutes per IP
         security._limiter._hits.clear()          # don't poison other tests
 
     def test_alerts_dismiss_and_restore_routes(self):

@@ -20,16 +20,15 @@ Copilot additionally carries a `type` column ("internal transfer") and an
 
 from __future__ import annotations
 
-import csv
 import datetime as dt
-import io
 from typing import Callable
 
 from ..engine.compat import as_date
 from . import flowmap
 from .base import (FileImportIds, Transaction, ensure_split_account,
-                   upsert_transactions)
-from .csvimport import date_order, scrub_identifiers
+                   drop_before_history, upsert_transactions)
+from .csvimport import (bounded_dict_reader, check_width, date_order,
+                        scrub_identifiers)
 from .rowcap import capped
 from .dedup import Deduper
 
@@ -38,6 +37,8 @@ MONARCH_COLUMNS = {"date", "merchant", "category", "account",
 COPILOT_COLUMNS = {"date", "name", "amount", "status", "category",
                    "account"}
 SIMPLIFI_COLUMNS = {"date", "payee", "amount", "account", "category"}
+# the widest header any of these exports is accepted with (see _generic)
+REGISTER_MAX_COLUMNS = 40
 
 
 def _low(header: list[str]) -> set[str]:
@@ -100,7 +101,11 @@ def _generic(conn, account_id: str, text: str, *, prefix: str,
              name_col: str, merchant_col: str | None, flip: bool,
              batch_id: str | None,
              categorize: Callable = _vendor_category) -> dict:
-    reader = csv.DictReader(io.StringIO(text))
+    reader = bounded_dict_reader(text)
+    # each row is a dict over the whole header, twice (the lower-cased
+    # copy), so the width is bounded before a row is read — these exports
+    # carry about a dozen columns, the same register shape as Mint/YNAB
+    check_width(reader.fieldnames, REGISTER_MAX_COLUMNS)
     parsed: list[tuple] = []
     # day-first or month-first is decided per FILE (csvimport.date_order)
     # overflow cells past the header arrive under the key None (a trailing
@@ -175,12 +180,16 @@ def _import_into(conn, account_id: str, parsed: list[tuple], *, prefix: str,
             # verbatim in raw, which rides /export unredacted
             raw=scrub_identifiers(raw)))
     txns = ids.resolve(conn, txns)
+    # the household's history window (Settings → how far back): rows
+    # dated before it are left out and counted, never written
+    txns, skipped_older = drop_before_history(conn, txns)
     if batch_id:
         from . import batches
         batches.tag(conn, txns, batch_id)
     added = upsert_transactions(conn, txns)
     return {"imported": added, "rows": len(txns),
-            "skipped_duplicates": skipped_dupes}
+            "skipped_duplicates": skipped_dupes,
+            "skipped_older": skipped_older}
 
 
 def import_monarch(conn, account_id: str, text: str,

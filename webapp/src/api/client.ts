@@ -1,5 +1,6 @@
 import type { Txn } from "./ledger-row.generated";
 import type { EmailKind } from "../recipients";
+import type { AnswerBlock } from "../components/AssistantBlocks";
 // Thin typed API client. Session cookie rides automatically (same-origin);
 // every 401 funnels to the login screen via the AuthError sentinel.
 
@@ -115,9 +116,90 @@ async function settle<T>(r: Response): Promise<T> {
     // carry the server detail: callers distinguish "totp_required" /
     // "wrong password" from a plain signed-out 401
     throw new AuthError(await r.text().catch(() => "not signed in"));
-  if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
   const ct = r.headers.get("content-type") ?? "";
-  return (ct.includes("json") ? r.json() : r.text()) as Promise<T>;
+  if (r.ok) return (ct.includes("json") ? r.json() : r.text()) as Promise<T>;
+  const body = await r.text().catch(() => "");
+  const retryAfter = r.headers.get("Retry-After");
+  // A gateway status whose body is not the app's own JSON comes from the
+  // proxy in front of it: the app is restarting (a deploy, more capacity)
+  // or down, and the proxy answers with its "back in a moment" HTML page.
+  // That page is for a browser tab, not for an error sentence.
+  // An empty gateway answer is the same thing from a proxy with no page.
+  if (GATEWAY.has(r.status) && (!body.trim() || !appBody(ct, body)))
+    throw new BusyError(restartingText(retryAfter), retryAfter, r.status, true);
+  if (r.status === 503) throw new BusyError(body, retryAfter);
+  // any other refusal a proxy wrote as a page (a CDN's 520, an edge's
+  // 413) keeps its status for the callers that branch on it, in words
+  if (!appBody(ct, body))
+    throw new Error(`${r.status}: ${pageText(r.status, body)}`);
+  throw new Error(`${r.status}: ${body}`);
+}
+
+const GATEWAY = new Set([502, 503, 504]);
+
+/** Whether a refusal's body is the app's own words — JSON, or plain text
+ *  that is not a markup document. The proxy labels its page text/html;
+ *  the content-type alone is not trusted, because an edge in front can
+ *  rewrite it, so a body that opens like markup counts as a page too. */
+function appBody(ct: string, body: string): boolean {
+  if (/html/i.test(ct)) return false;
+  const t = body.trimStart();
+  if (t.startsWith("{") || t.startsWith("[")) {
+    try { JSON.parse(t); return true; } catch { return false; }
+  }
+  return !t.startsWith("<");
+}
+
+/** The sentence for a refusal that arrived as an error page rather than
+ *  in the app's words: a gateway status means the server is restarting,
+ *  anything else names the status — empty bodies keep what little they
+ *  had, which is nothing worse than the status itself. */
+function pageText(status: number, body: string): string {
+  if (GATEWAY.has(status)) return restartingText(null);
+  if (!body.trim()) return "";
+  return `The server answered with an error page (${status}) — try again.`;
+}
+
+/** A 503: the server is shedding load (sign-ins hashing at once, the
+ *  database full) — not a wrong answer and not an outage. The message
+ *  keeps the "503: body" shape every other refusal has; `retryAfter` is
+ *  the server's Retry-After header when it sent one.
+ *
+ *  `restarting` marks the other kind: a 502/503/504 the proxy answered
+ *  because the app itself was not there to. Its body was an HTML page, so
+ *  the message carries the sentence for it instead, under its own status
+ *  (a 502 stays a 502 for anyone reading the prefix). */
+export class BusyError extends Error {
+  retryAfter: string | null;
+  status: number;
+  restarting: boolean;
+  constructor(body: string, retryAfter: string | null,
+              status = 503, restarting = false) {
+    super(`${status}: ${body}`);
+    this.retryAfter = retryAfter;
+    this.status = status;
+    this.restarting = restarting;
+  }
+}
+
+function inWait(retryAfter?: string | null): string {
+  const secs = parseInt(retryAfter ?? "", 10);
+  return secs > 0 && secs <= 120
+    ? `${secs} second${secs === 1 ? "" : "s"}.`
+    : "a moment.";
+}
+
+/** "The server is busy — try again in a moment.", or in N seconds when
+ *  the server named a short wait. The sign-in page (pages.js) and the
+ *  app say the same words. */
+export function busyText(retryAfter?: string | null): string {
+  return "The server is busy — try again in " + inWait(retryAfter);
+}
+
+/** The same shape for the proxy's "back in a moment" answer: the app is
+ *  restarting, not overloaded, so it says that. */
+export function restartingText(retryAfter?: string | null): string {
+  return "The server is restarting — try again in " + inWait(retryAfter);
 }
 
 /** Say something from anywhere on the page. The toast is fixed to the
@@ -144,6 +226,14 @@ export function errText(e: unknown): string {
     if (typeof d === "string" && d) return d;
     if (Array.isArray(d) && d[0]?.msg) return String(d[0].msg);
   } catch { /* not JSON — the body IS the message */ }
+  // settle() already words a page it was handed; this catches a markup
+  // body that reached an Error some other way (an add-on door, a caller
+  // wrapping a raw response), so no document is ever read out as a
+  // sentence
+  if (body.startsWith("<")) {
+    const status = m ? Number(m[1]) : 0;
+    return status ? pageText(status, body) : restartingText(null);
+  }
   return body || raw;
 }
 
@@ -213,6 +303,11 @@ export interface Me {
     institutions_used?: number;
     // false when the plan does not include Plaid's recurring cross-check
     plaid_recurring?: boolean;
+    // true when no bank can be connected until an owner confirms their
+    // email address — the server's own reason for an allowance of 0, so
+    // a paying but unconfirmed household is never shown a closed door.
+    // Absent from an older server (bankAwaitsConfirm then falls back).
+    bank_awaits_confirm?: boolean;
   };
   // true once the tenant has set up a business. Drives whether the
   // Business TAB is shown at all — the /business route stays reachable.
@@ -241,6 +336,10 @@ export interface Me {
   // when the nightly sweep freezes a never-confirmed household (ISO);
   // null unless hosted, unverified and nobody here ever confirmed
   verify_deadline: string | null;
+  // a requested sign-in address waiting for its mailbox's confirm button
+  // (hosted); the sign-in email stays `email` until then
+  pending_email?: string | null;
+  pending_email_expires_at?: string | null;
   // hosted account must enroll a second factor before use;
   // recovery_codes_left drives the Settings low-codes nudge
   needs_2fa: boolean;
@@ -328,8 +427,19 @@ export interface TodayFull {
   simple: { left_today: number;
             chips: { text: string; tone: string }[] };
   variable_actual: number; variable_budget: number;
+  // the hero's "$X of $Y left": the month's spendable share (the whole
+  // month unless the ledger began inside it) and what is left of it —
+  // one server figure, equal to the tiles times the days left
+  month_share?: number; variable_budget_paced?: number;
+  month_remaining_paced?: number;
   income: number | null; plan_surplus: number | null; avg_bills: number;
   savings_plan?: number;
+  // the bills this month is SCHEDULED to owe — the plan chain's middle
+  // figure, so in → bills due → to spend adds up even when an early
+  // autopay of next month's bill already left as cash (that stays in
+  // buckets.fixed.month_budget, the fixed bar's basis). Absent from older
+  // servers; fall back to the fixed bucket then.
+  scheduled_month?: number;
   // sweep goals: plan cap, month-to-date availability, and the
   // server-composed sentence (identical wording in the daily email)
   sweep_plan?: number;
@@ -380,12 +490,15 @@ export interface TodayFull {
   // food/other additionally carry the custom-bucket decomposition:
   // children carve spend out of the parent for display; display_* is the
   // parent AFTER the carve-outs (equal to actual/expected when no children)
+  // paced_*: the budget share the month may spend (less than the whole
+  // when the ledger began inside the month) — what the rows measure against
   buckets: Record<string, {
     actual: number; expected: number; month_budget: number;
+    paced_budget?: number;
     children?: { name: string; actual: number; expected: number;
-                 month_budget: number }[];
+                 month_budget: number; paced_budget?: number }[];
     display_actual?: number; display_expected?: number;
-    remaining_budget?: number;
+    remaining_budget?: number; paced_remaining_budget?: number;
   }>;
   fixed_unpaid_due: number;
   reasons: { bucket: string; variance: number; pace: string; detail: string[] }[];
@@ -405,8 +518,10 @@ export interface TodayFull {
                      top: { payee: string; amount: number;
                             count: number }[] }[] } | null;
   alerts: Alert[];
-  runway: { checking: number; card_debt: number; due_total: number;
-            balance_unreliable?: boolean } | null;
+  /** checking is null (and no_checking true) when the household has no
+   *  checking account: an unknown balance, never a $0 one */
+  runway: { checking: number | null; card_debt: number; due_total: number;
+            balance_unreliable?: boolean; no_checking?: boolean } | null;
   // unpaid bill occurrences through month end; null on past days
   bills_remaining_month: number | null;
   next_paycheck: string | null;
@@ -417,6 +532,9 @@ export interface TodayFull {
   // autopay statement balance (the realistic default; the engine's
   // full-balance-at-due-dates series is no longer exposed)
   forecast: { days: number; checking: number; card_debt: number;
+              /** no checking account: the walk starts from nothing, so its
+               *  balances and lows are not a forecast of anything */
+              no_checking?: boolean;
               pace_now: Series; pace_stmt: Series;
               /** [date, amount, card name] — dated card autopays the cash
                *  chart draws as lines; amount is negative (money leaving) */
@@ -445,10 +563,14 @@ export interface WeekBucket {
 export interface MonthLensData {
   y: number; m: number; status: LensStatus; as_of: string;
   days_in_month: number;
-  verdict: string; variance: number; tolerance: number;
+  // verdict null (and budget_set false): no budget the household saved
+  // stands behind the month — the lens shows no verdict
+  verdict: string | null; variance: number; tolerance: number;
+  budget_set?: boolean;
   projection: { pace_total: number; variance: number; tolerance: number;
                 verdict: string } | null;
-  variable_actual: number; variable_budget: number;
+  // null when unjudged (budget_set false): no spendable to measure against
+  variable_actual: number; variable_budget: number | null;
   buckets: Record<string, {
     actual: number; expected: number; month_budget: number;
     children?: { name: string; actual: number; expected: number;
@@ -694,6 +816,9 @@ export interface NetWorthReport {
   by_institution: [string, number][];
   by_asset_class: [string, number][];
   trend: [string, number][];
+  // the same months with the property layer added, ending at full_total
+  // (absent from an older server)
+  full_trend?: [string, number][];
   coinbase_pl: PLRow[];
   retirement_combined: {
     groups?: { provider: string; accounts: PLRow[]; invested: number;
@@ -952,6 +1077,8 @@ export interface ImportResult {
   // person had added something to them, or left because nothing proves
   // they came from this file
   removed_earlier?: number; kept_annotated?: number; foreign_left?: number;
+  // rows dated before the household's history window, left out
+  skipped_older?: number;
 }
 export interface RestoreProgress {
   state: "idle" | "running" | "done" | "error";
@@ -972,6 +1099,8 @@ export interface BulkJobFile {
   // was read from their wording), and how many rows an earlier import read
   // differently it corrected — the single upload's warnings and corrected
   warnings?: string[]; corrected?: number;
+  // rows the history window left out of this file
+  skipped_older?: number;
   // an export ZIP in the folder restores on its own background job;
   // RestoreProgress reports how that ends
   restore_started?: boolean;
@@ -1037,7 +1166,7 @@ export interface CalendarData {
 }
 
 export type WizardStep =
-  "connect" | "bills" | "budgets" | "email" | "finish"
+  "appearance" | "connect" | "bills" | "budgets" | "email" | "finish"
   // legacy marks still accepted by the API if present in old configs
   | "sync" | "import";
 // script tokens — plaintext appears only in the mint response.
@@ -1072,6 +1201,24 @@ export interface Onboarding {
   budgets_set: boolean; primary_checking_set: boolean;
   wizard_done: boolean;
   wizard_steps: Partial<Record<WizardStep, "done" | "skipped">>;
+  // the setup choices the wizard made, read back so a resumed wizard and
+  // its closing summary show what was chosen (absent from older servers)
+  history_months?: HistoryMonths;
+  setup_mode?: SetupMode | null;
+  bill_detection_auto?: boolean | null;
+}
+/** How far back a new bank link (and a file import) reaches, in months;
+ *  null = everything the source offers. */
+export type HistoryMonths = 1 | 3 | 6 | 12 | null;
+/** How bills and budgets are set up: "auto" = the finder proposes and the
+ *  person approves; "manual" = typed in by hand, and the finder stays off
+ *  (bill_detection_auto false) until turned on from Bills. */
+export type SetupMode = "auto" | "manual";
+/** What an Adjust changes on a proposal before approving it. cadence is
+ *  the FREQ:interval wire format the bill editor sends; due_day is the
+ *  day of the month (1-31). */
+export interface ProposalAdjust {
+  name?: string; amount?: number; cadence?: string; due_day?: number;
 }
 // live progress of the background sync the wizard starts
 export interface SyncProgressItem {
@@ -1517,6 +1664,12 @@ export interface BudgetSuggestions {
   bucket_candidates?: { name: string; category: string; monthly: number }[];
   avg_bills_monthly?: number;
   bills_count?: number;
+  // the history behind the suggestions: days of ledger in the window,
+  // whether every figure is a partial month scaled up, and the fewest
+  // days the scaling ever stretches (the planner's history line)
+  history_days?: number; history_scaled?: boolean; min_rate_days?: number;
+  // no finished day of ledger yet: no suggestion is offered
+  not_enough_history?: boolean;
 }
 export interface Settings {
   food_monthly: number | null; other_monthly: number | null;
@@ -1577,6 +1730,12 @@ export interface Settings {
   disabled_bills: string[] | null;
   dismissed_hints: Record<string, unknown> | null;
   manual_assets: ManualAsset[] | null;
+  // the Net Worth page's investment fee estimate and money-in anchors:
+  // {institution-name fragment: yearly rate as a FRACTION}, the masks of
+  // fee-free accounts there, {account mask: dollars put in}
+  advisory_fees?: Record<string, number> | null;
+  advisory_fee_exempt_masks?: string[] | null;
+  investment_basis_override?: Record<string, number> | null;
   // smart-categorization LLM backend (key is write-only: presence flag)
   llm_url: string | null; llm_model: string | null;
   /** named AI backends (several at once, local or cloud); keys are
@@ -1603,9 +1762,14 @@ export interface Settings {
    *  REMOTE llm_url. Off by default; no effect for a local model. */
   taxdocs_allow_remote_llm?: string | null;
   llm_api_key_set: boolean;
-  // the owner's UI theme; "auto" follows the OS, null/absent = the dark
-  // default (never chosen)
+  // the owner's UI theme; "auto" follows the OS, and so does null/absent
+  // (never chosen)
   theme: "auto" | "light" | "dark" | null;
+  // setup choices (the wizard writes them; Import writes history_months
+  // too): see HistoryMonths / SetupMode
+  history_months?: HistoryMonths;
+  setup_mode?: SetupMode | null;
+  bill_detection_auto?: boolean | null;
   /** the household's IANA zone; null = follow the instance (OIKONOME_TZ) */
   timezone: string | null;
   // feedback pipeline on/off (null/absent = on)
@@ -1749,7 +1913,8 @@ export const api = {
   // on this instance — public, read before any login
   access: () => req<{ hosted: boolean; signup_path: string | null;
                       site_url: string | null;
-                      support_email: string | null }>("/api/access"),
+                      support_email: string | null;
+                      android_test_url?: string | null }>("/api/access"),
   demoLogin: () =>
     req<{ demo: boolean; email?: string; password?: string }>("/api/demo-login"),
   login: (email: string, password: string, totp?: string) =>
@@ -2031,9 +2196,11 @@ export const api = {
   // (Form endpoint, like totp/disable — NOT the json() helper)
   emailChange: (new_email: string, keep_push_endpoint?: string) =>
     // `hint` is the address they probably meant when the domain
-    // looks like a typo of a major provider. Advisory — the change has
-    // already been applied by the time it is returned.
-    req<{ ok: boolean; email: string; verify_sent?: boolean;
+    // looks like a typo of a major provider. Advisory. On hosted the
+    // address does not move yet: `email` is still the sign-in address and
+    // `pending_email` the one waiting for its confirm button.
+    req<{ ok: boolean; email: string; pending_email?: string | null;
+          verify_sent?: boolean;
           hint?: string | null; passkeys_removed?: number;
           passkeys_kept?: number; mail_list_entry_dropped?: boolean;
           sms_number_needs_verify?: boolean;
@@ -2041,6 +2208,10 @@ export const api = {
       "/api/email/change",
       form({ new_email,
              ...(keep_push_endpoint ? { keep_push_endpoint } : {}) })),
+  // withdraw a pending sign-in address change (no step-up: it only
+  // takes something away)
+  emailChangeCancel: () =>
+    json<{ ok: boolean; cancelled: boolean }>("/api/email/change/cancel", {}),
   // a household member removes their OWN login (owner + data untouched)
   accountLeave: () =>
     req<{ ok: boolean }>("/api/account/leave", form({})),
@@ -2222,7 +2393,9 @@ export const api = {
         }).toString(),
       }),
   plaidLinkStatus: (link_token: string) =>
-    req<{ done: boolean; kind?: string; institution?: string; error?: string }>(
+    req<{ done: boolean; kind?: string; institution?: string; error?: string;
+          // "pending": saved, its first pull queued on the worker
+          first_sync?: "pending" | "ok" }>(
       `/accounts/plaid/link/${encodeURIComponent(link_token)}/status`),
   plaidKeys: (client_id: string, secret: string, env: string) =>
     json<{ ok: boolean; env: string }>("/api/accounts/plaid/keys",
@@ -2347,7 +2520,7 @@ export const api = {
                       created_at: string; last_used: string | null }[] }>(
       "/api/passkeys"),
   passkeyDelete: (id: string) =>
-    req<{ ok: boolean }>(`/api/passkeys/${id}`, {
+    req<{ ok: boolean; signed_out?: boolean }>(`/api/passkeys/${id}`, {
       method: "DELETE",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({}),
@@ -2383,7 +2556,7 @@ export const api = {
   inviteRevoke: (tokenHash: string) =>
     req<{ ok: boolean }>(`/api/invites/${tokenHash}`, { method: "DELETE" }),
   invitePeek: (token: string) =>
-    req<{ role: string; label: string }>(
+    req<{ role: string; label: string; email?: string }>(
       `/api/invite/peek?token=${encodeURIComponent(token)}`),
   inviteClaim: (token: string, email: string, password: string) =>
     json("/api/invite/claim", { token, email, password }),
@@ -2639,8 +2812,9 @@ export const api = {
           offset?: number }>(
       `/api/business/entities/${encodeURIComponent(id)}/transactions` +
       `?limit=${limit}&offset=${offset}` + (year ? `&year=${year}` : "")),
+  // `sched_c_line` null clears the line; leaving it out keeps the stored one
   bizClassify: (id: string, txnId: string, body: { bucket: string;
-                sched_c_line?: string }) =>
+                sched_c_line?: string | null }) =>
     json(`/api/business/entities/${encodeURIComponent(id)}/transactions/` +
       `${encodeURIComponent(txnId)}/class`, body),
   entityPnl: (id: string, year?: number) =>
@@ -2760,16 +2934,23 @@ export const api = {
     req<{ proposed_add: number; proposed_income?: number;
           drift_applied: number }>(
       "/api/bills/detect", { method: "POST" }),
-  billsProposal: (pid: string, action: "approve" | "reject") =>
-    req<{ ok: boolean; payee: string; superseded?: boolean }>("/api/bills/proposal", {
+  // `adjust` (approve only) changes the name, amount, cadence or due day
+  // before the bill is created; the finder's evidence stays attached
+  billsProposal: (pid: string, action: "approve" | "reject",
+                  adjust?: ProposalAdjust) =>
+    // `note` is present when the approve changed something the person set
+    // (a pinned amount cleared) and must be shown to them
+    req<{ ok: boolean; payee: string; superseded?: boolean; note?: string }>("/api/bills/proposal", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ pid, action }),
+      body: JSON.stringify(adjust && action === "approve"
+        ? { pid, action, adjust } : { pid, action }),
     }),
   // every pending proposal in one click (the wizard's bills step)
   billsApproveAll: () =>
     req<{ ok: boolean; approved: number; payees: string[];
-          failed: { pid: string; error: string }[] }>(
+          failed: { pid: string; error: string }[];
+          notes?: { payee: string; note: string }[] }>(
       "/api/bills/proposals/approve-all", { method: "POST" }),
   // reports — the four analytics payloads
   reportNetworth: () => req<NetWorthReport>("/api/reports/networth"),
@@ -2904,15 +3085,70 @@ export interface RulesPage {
 }
 
 // local ledger assistant
+export interface AssistantTurn {
+  id: string; asked_at: string; asked_by: string; question: string;
+  answer: string; blocks: AnswerBlock[]; tools_used: string[];
+  /** the conversation this turn belongs to; absent on an older server */
+  thread_id?: string | null;
+}
+/** where the next older page of the log starts */
+export interface AssistantCursor { before: string; before_id?: string | null }
 export const assistant = {
   // local=false means answers (and the ledger figures the tools return)
   // travel to `host` — the UI must say so instead of claiming "local"
   status: () => req<{ available: boolean; local: boolean; host: string }>("/api/assistant"),
-  ask: (question: string) =>
-    req<{ answer: string; tools_used: string[] }>("/api/assistant", {
+  // `answer` is the prose alone; `blocks` the ordered text + chart/table
+  // pieces the page draws (components/AssistantBlocks)
+  // a follow-up names the conversation it continues (`threadId`); the
+  // model then sees that thread's earlier turns and nothing else. A 404
+  // means that conversation no longer exists; `saved: false` or
+  // `removed: true` means the answer was kept in no conversation
+  ask: (question: string, threadId?: string | null) =>
+    req<{ answer: string; blocks?: AnswerBlock[]; tools_used: string[];
+          id?: string | null; thread_id?: string | null;
+          saved?: boolean; removed?: boolean }>("/api/assistant", {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ question }),
+      body: JSON.stringify(threadId ? { question, thread_id: threadId } : { question }),
     }),
+  // the household's answered questions, newest first; every member
+  // reads the same log, so a chart drawn on the phone is here too
+  // it pages by (asked_at, id): `next` is the cursor for the page after
+  // this one, and both halves go back on the next read
+  history: (cursor?: AssistantCursor | null) =>
+    req<{ turns: AssistantTurn[]; more: boolean; next?: AssistantCursor | null }>(
+      "/api/assistant/history"
+      + (cursor ? `?before=${encodeURIComponent(cursor.before)}`
+         + (cursor.before_id ? `&before_id=${encodeURIComponent(cursor.before_id)}` : "")
+        : "")),
+  // drops one conversation — every turn of the thread (a 404 when
+  // nothing was left to drop: someone removed it first)
+  forgetThread: (threadId: string) =>
+    req<{ ok: boolean; deleted: number }>(
+      `/api/assistant/threads/${encodeURIComponent(threadId)}`, { method: "DELETE" }),
+  // drops one turn: a server that predates conversations has only this
+  // door, and there a conversation's id is its one turn's id
+  forgetTurn: (turnId: string) =>
+    req<{ ok: boolean; deleted: number }>(
+      `/api/assistant/history/${encodeURIComponent(turnId)}`, { method: "DELETE" }),
+  clear: () =>
+    req<{ ok: boolean; deleted: number }>("/api/assistant/history", { method: "DELETE" }),
+  // one answer as a self-contained HTML page, handed to the browser as a
+  // download; the server re-validates the blocks and draws the charts
+  report: async (question: string, blocks: AnswerBlock[]) => {
+    const r = await rawFetch("/api/assistant/report", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ question, blocks }), credentials: "same-origin",
+    });
+    if (!r.ok) await settle<never>(r);
+    const name = /filename="?([^";]+)/.exec(r.headers.get("content-disposition") ?? "")?.[1]
+      ?? "oikonome-answer.html";
+    const url = URL.createObjectURL(await r.blob());
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    a.click();
+    URL.revokeObjectURL(url);
+  },
 };
 
 // Python round() — banker's rounding (half to even). Server-rendered

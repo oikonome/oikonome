@@ -1,0 +1,42 @@
+-- Which passkey signed a session in, and which one stands behind a phone's
+-- device token.
+--
+-- Removing a passkey has to mean the key can no longer act, not merely
+-- that it cannot sign in again: someone holding a lost or stolen
+-- authenticator who had already signed in with it would otherwise keep
+-- the browser session (up to its absolute cap) and the 90-day device
+-- token minted from it after the owner removed the key. The console's own
+-- passkey removal already ends the sessions its key opened; household
+-- sessions now record the key the same way so their removal can too.
+--
+-- NULL means the sign-in was not a passkey's (a password, a code), or
+-- that the row predates this column; such rows are left alone by a
+-- passkey removal, exactly as before. No backfill: a session or device
+-- token written before this migration does not know its key, and
+-- guessing would sign out the wrong ones.
+--
+-- Deliberately NOT a foreign key, like elevated_passkey_id (migration
+-- 120): the removal door ends what a key opened explicitly, before the
+-- key itself goes, and a dangling id on a row some other door left behind
+-- names a key that no longer exists and so matches nothing. Every other
+-- door that deletes passkeys (password and email change, reset, factor
+-- clear) already ends every session and device the account has.
+--
+-- Written through the column DEFAULT, the way tenant_id is filled from
+-- app.tenant_id: the sign-in (or the device mint) sets
+-- oikonome.signin_passkey for its own transaction only, and the row's
+-- INSERT picks it up. The app role's UPDATE on these control-plane tables
+-- is column-scoped to timestamps on purpose, and a key id stamped at
+-- insert never needs rewriting. Outside such a transaction the setting is
+-- unset or empty and the default is NULL.
+--
+-- Rehearsal against existing rows: a nullable column with a default
+-- that evaluates to NULL outside a sign-in — every existing row reads
+-- NULL, nothing is rewritten, nothing is backfilled.
+--
+-- No index: the removal looks these up by user_id first, which the
+-- existing per-user indexes already serve. Mirrored in schema.sql.
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS signin_passkey_id UUID
+    DEFAULT NULLIF(current_setting('oikonome.signin_passkey', true), '')::uuid;
+ALTER TABLE device_tokens ADD COLUMN IF NOT EXISTS signin_passkey_id UUID
+    DEFAULT NULLIF(current_setting('oikonome.signin_passkey', true), '')::uuid;

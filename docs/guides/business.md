@@ -114,7 +114,10 @@ Each business transaction sorts into one of three buckets:
 The **Review** tab is the **Schedule C review** queue: every business
 transaction without a line yet, with a suggested bucket and line you
 accept or override one row at a time; it says "Nothing to review" when
-the books are caught up.
+the books are caught up. An operating expense's line can also be picked
+on its row in the Books list, and a row that already has a line keeps
+the picker there: choose another line to change it, or **clear line**
+to take it off (an operating row returns to the review queue).
 
 The **P&L** shows revenue versus categorized expenses, the equity
 summary, and a CSV export your CPA can consume. A refund from a vendor

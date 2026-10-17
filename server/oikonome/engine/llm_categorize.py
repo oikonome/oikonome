@@ -29,8 +29,11 @@ still runs so migrated merchant_categories stay live). TWO config layers:
      operator's server, never to a tenant-configured one).
   2. ENV (operator-level default, used when the tenant has no llm_url):
        OIKONOME_LLM_URL         base URL of an OpenAI-compatible server
-                                (e.g. http://127.0.0.1:8080 or
-                                https://api.openai.com)
+                                (e.g. http://127.0.0.1:8080,
+                                https://api.openai.com or
+                                https://api.anthropic.com — Anthropic's
+                                OpenAI-shaped endpoint; a trailing /v1
+                                is tolerated)
        OIKONOME_LLM_MODEL       model name (required with URL)
        OIKONOME_LLM_API_KEY     optional bearer token
        OIKONOME_LLM_EXTRA_BODY  optional JSON merged into each request body
@@ -47,6 +50,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 from contextlib import contextmanager
@@ -66,6 +70,23 @@ MAX_RESPONSE_BYTES = 512 * 1024
 # here)
 BATCH_SIZE = 8
 
+# Anthropic's OpenAI-compatible endpoint. Its model listing wants the
+# native API's version header, and its completions answer 400 to two fields
+# every other OpenAI-shaped server tolerates: `temperature` (retired on its
+# current models) and `response_format` (only a strict JSON schema is
+# accepted, which these prompts do not carry). Both are dropped for it;
+# the prompts ask for JSON in words and json_answer reads a fenced reply.
+_ANTHROPIC_HOST_RE = re.compile(r"^https://api\.anthropic\.com$", re.I)
+ANTHROPIC_VERSION = "2023-06-01"
+# Its current models think before answering, and the thinking is billed
+# and counted against max_tokens but never returned through this endpoint.
+# The per-task caps here (30 tokens a merchant, 600 for the assistant)
+# are sized for the answer alone; under them a batch came back empty or
+# cut off mid-object once the model had spent the cap on thinking. The cap
+# is only a ceiling, so it is lifted to leave the thinking room.
+ANTHROPIC_MIN_MAX_TOKENS = 4096
+
+from .compat import jsonb as _jsonb
 from .categories import (
     FLOW_SQL as _FLOW_SQL,
     GENERIC_SQL as _GENERIC_SQL,
@@ -413,6 +434,42 @@ def configured(conn=None, role: str = "categorize") -> bool:
     return bool(_backend(conn, role)["url"])
 
 
+def base_url(url: str | None) -> str:
+    """The endpoint root every call appends its own `/v1/...` path to. An
+    OpenAI SDK base_url is pasted WITH `/v1` (that is how every provider
+    documents it), so a trailing `/v1` is folded away here rather than
+    doubled into `/v1/v1/chat/completions`."""
+    base = (url or "").rstrip("/")
+    if base.lower().endswith("/v1"):
+        base = base[:-3].rstrip("/")
+    return base
+
+
+def is_anthropic(base: str) -> bool:
+    return bool(_ANTHROPIC_HOST_RE.match(base or ""))
+
+
+def request_headers(be: dict, base: str) -> dict:
+    headers = {}
+    if be.get("api_key"):
+        headers["Authorization"] = f"Bearer {be['api_key']}"
+    if is_anthropic(base):
+        headers["anthropic-version"] = ANTHROPIC_VERSION
+    return headers
+
+
+def shape_body(base: str, body: dict) -> dict:
+    """Drop the request fields the provider at `base` refuses (see
+    _ANTHROPIC_HOST_RE). Runs BEFORE the backend's extra_body merge, so an
+    operator can still put a field back on purpose."""
+    if is_anthropic(base):
+        body.pop("temperature", None)
+        body.pop("response_format", None)
+        body["max_tokens"] = max(int(body.get("max_tokens") or 0),
+                                 ANTHROPIC_MIN_MAX_TOKENS)
+    return body
+
+
 def _prepare(be: dict, transport):
     """Vet the backend URL + build (base, transport, headers) for a chat POST.
     Shared by the categorizer (_chat) and the assistant (chat_tools) so the
@@ -420,7 +477,7 @@ def _prepare(be: dict, transport):
     re-checked at USE time (SimpleFIN's every-fetch guard) and the connect is
     DNS-pinned."""
     _honour_pause(be)
-    base = (be["url"] or "").rstrip("/")
+    base = base_url(be["url"])
     if not base:
         raise LLMError("no LLM backend configured (tenant llm_url config "
                        "or OIKONOME_LLM_URL env)")
@@ -432,10 +489,7 @@ def _prepare(be: dict, transport):
             raise LLMError(str(e))
         if transport is None:
             transport = pinned_transport()
-    headers = {}
-    if be["api_key"]:
-        headers["Authorization"] = f"Bearer {be['api_key']}"
-    return base, transport, headers
+    return base, transport, request_headers(be, base)
 
 
 def _pausable(conn, backend: dict, role: str = "categorize") -> dict:
@@ -560,6 +614,7 @@ def _chat(messages: list[dict], max_tokens: int, transport=None,
         "max_tokens": max_tokens,
         "response_format": {"type": "json_object"},
     }
+    shape_body(base, body)
     _merge_extra_body(body, be["extra_body"])
     from ..web.netguard import BlockedURL
     try:
@@ -576,10 +631,13 @@ def _chat(messages: list[dict], max_tokens: int, transport=None,
 
 def chat_tools(messages: list[dict], tools: list[dict], max_tokens: int,
                transport=None, backend: dict | None = None,
-               timeout: float = REQUEST_TIMEOUT) -> dict:
+               timeout: float = REQUEST_TIMEOUT,
+               tool_choice: str = "auto") -> dict:
     """OpenAI-compatible chat completion WITH tool-calling. Returns
     the raw assistant message dict (`content` + optional `tool_calls`). Same
-    netguard + DNS-pin as _chat via _prepare."""
+    netguard + DNS-pin as _chat via _prepare. `tool_choice="none"` keeps
+    the tools in the conversation (earlier calls still parse) but makes
+    this turn an answer."""
     be = backend if backend is not None else _backend()
     base, transport, headers = _prepare(be, transport)
     body = {
@@ -588,8 +646,9 @@ def chat_tools(messages: list[dict], tools: list[dict], max_tokens: int,
         "temperature": 0.1,
         "max_tokens": max_tokens,
         "tools": tools,
-        "tool_choice": "auto",
+        "tool_choice": tool_choice,
     }
+    shape_body(base, body)
     _merge_extra_body(body, be["extra_body"])
     from ..web.netguard import BlockedURL
     try:
@@ -1096,7 +1155,7 @@ def flow_classify(conn, stats: dict | None = None) -> int:
     filed "Chase Credit Card" under merchandise)."""
     from . import merchant_seed
     rows = conn.execute(f"""
-        SELECT DISTINCT COALESCE(merchant_name, name) AS merchant
+        SELECT DISTINCT COALESCE(merchant_name, name) AS merchant, name
         FROM transactions
         WHERE removed = 0 AND category_override IS NULL
           AND COALESCE(raw #>> '{{personal_finance_category,primary}}', '') = ''
@@ -1107,10 +1166,27 @@ def flow_classify(conn, stats: dict | None = None) -> int:
         for r in rows:
             m = r["merchant"]
             fm = merchant_seed.flow_match(m)
+            # the rows are keyed by the display merchant; when only the raw
+            # statement line says "loan payment" (the importer cleaned it
+            # to a bare servicer name), key on that line instead
             if not fm:
+                fm = merchant_seed.loan_match(r["name"])
+                if fm:
+                    n += _route_loan_line(conn, m, r["name"], *fm,
+                                          touched=touched)
+                continue
+            primary, detailed = fm
+            # The loan rule is one-way here as on the raw line
+            # (_route_loan_line): the same words arrive on money coming
+            # back — a reversed payment, a student loan's disbursement —
+            # and filed under loan payments that would net the proceeds
+            # against what was paid. Card payments and transfers keep
+            # both directions; those rules name bank mechanics either way.
+            if fm == merchant_seed.loan_match(m):
+                n += _route_loan_merchant(conn, m, primary, detailed,
+                                          touched=touched)
                 continue
             touched.add(m)            # raw descriptor, scopes apply
-            primary, detailed = fm
             conn.execute(
                 "DELETE FROM merchant_categories "
                 "WHERE merchant=%s AND source != 'user'", (m,))
@@ -1141,6 +1217,73 @@ def flow_classify(conn, stats: dict | None = None) -> int:
     if stats is not None:
         stats["flow_classified"] = n
     return n
+
+
+def _route_loan_merchant(conn, merchant: str, primary: str,
+                         detailed: str | None, *, touched: set) -> int:
+    """File the money-out rows of a merchant whose own name says loan
+    payment, and return how many moved. Money in under the same name is
+    left to the categorizers and the person (see _route_loan_line).
+
+    The merchant's cached category is purged only when a row actually
+    moved: a name that is all disbursements would otherwise lose its
+    cache, and re-ask the model about it, on every pass."""
+    cur = conn.execute(f"""
+        UPDATE transactions
+        SET category_primary = %s, category_detailed = %s,
+            category_source = 'flow'
+        WHERE removed = 0 AND category_override IS NULL
+          AND COALESCE(merchant_name, name) = %s AND amount > 0
+          AND COALESCE(raw #>> '{{personal_finance_category,primary}}', '') = ''
+          AND COALESCE(category_primary, '') NOT IN {_FLOW_SQL}""",
+        (primary, detailed, merchant))
+    if cur.rowcount:
+        touched.add(merchant)
+        conn.execute(
+            "DELETE FROM merchant_categories "
+            "WHERE merchant=%s AND source != 'user'", (merchant,))
+    return cur.rowcount
+
+
+def _route_loan_line(conn, merchant: str, line: str, primary: str,
+                     detailed: str | None, *, touched: set) -> int:
+    """File the rows whose RAW statement line names a loan payment, keyed
+    on that line, and return how many moved.
+
+    Money out only: the same words arrive on money coming back — a
+    reversed payment, a student loan's disbursement ("… STUDENT LOAN"
+    deposited) — and filed under loan payments those would net the
+    proceeds against what was paid, hiding the payments from spend. They
+    are left to the categorizers and the person.
+
+    The servicer's cached category goes only once no row of the merchant
+    is left for it to file. The servicer's name is a real merchant — a
+    late fee, an insurance add-on — and a cache the remaining rows still
+    use is not the error the display-name screen purges; dropping it would
+    re-ask the model about the merchant after every new payment line."""
+    cur = conn.execute(f"""
+        UPDATE transactions
+        SET category_primary = %s, category_detailed = %s,
+            category_source = 'flow'
+        WHERE removed = 0 AND category_override IS NULL
+          AND name = %s AND amount > 0
+          AND COALESCE(raw #>> '{{personal_finance_category,primary}}', '') = ''
+          AND COALESCE(category_primary, '') NOT IN {_FLOW_SQL}""",
+        (primary, detailed, line))
+    if not cur.rowcount:
+        return 0
+    left = conn.execute(f"""
+        SELECT 1 FROM transactions
+         WHERE removed = 0 AND category_override IS NULL
+           AND COALESCE(merchant_name, name) = %s
+           AND COALESCE(category_primary, '') NOT IN {_FLOW_SQL}
+         LIMIT 1""", (merchant,)).fetchone()
+    if not left:
+        touched.add(merchant)
+        conn.execute(
+            "DELETE FROM merchant_categories "
+            "WHERE merchant=%s AND source != 'user'", (merchant,))
+    return cur.rowcount
 
 
 # institution names arrive spelled differently on each side —
@@ -1500,16 +1643,36 @@ def amazon_categories(conn) -> list[str]:
     return sorted((cats | {"Shopping"}) - {"Refunds"})
 
 
+# An order with items of several kinds is asked about per item, so the
+# store matcher can carve its charge into the categories the items name
+# (store_match.record_parts): a row already classified whole whose listed
+# items carry no `category` key is asked again, once — the pass stamps
+# every listed item afterwards, with the category or with null when the
+# model answered for the order only, so the row never queues twice. Only
+# an item with a non-empty title text counts: an item whose title is empty
+# or null is never listed in the prompt, so no answer would ever stamp it,
+# and counting it would queue its order every night for good.
+_TITLED = "(jsonb_typeof(i->'title') = 'string' AND i->>'title' <> '')"
+_ITEMS_UNANSWERED = f"""(is_refund = 0
+     AND (SELECT count(DISTINCT i->>'title') FROM jsonb_array_elements(items_json) i
+           WHERE {_TITLED}) >= 2
+     AND EXISTS (SELECT 1 FROM jsonb_array_elements(items_json) i
+                  WHERE {_TITLED} AND NOT (i ? 'category')))"""
+
+
 def amazon_pending(conn, limit: int | None = None) -> list[dict]:
     q = ("SELECT dedup_key, payee, seller, memo, category, items_json "
          "FROM amazon_orders "
-         "WHERE category_source != 'llm' AND is_refund = 0 ORDER BY date DESC")
+         "WHERE (category_source != 'llm' AND is_refund = 0) "
+         f"OR {_ITEMS_UNANSWERED} ORDER BY date DESC")
     if limit:
         q += f" LIMIT {int(limit)}"
     return [dict(r) for r in conn.execute(q)]
 
 
-def _amazon_row_text(row: dict) -> str:
+def _amazon_items(row: dict) -> list[dict]:
+    """The order's titled items, as stored (dicts), at most MAX_ITEMS_PER_ROW
+    — the ones the prompt lists and the per-item answer is matched to."""
     items = row.get("items_json") or []
     if isinstance(items, str):
         try:
@@ -1521,10 +1684,20 @@ def _amazon_row_text(row: dict) -> str:
         # truthy and slices with a TypeError, which would end the nightly
         # summary pass rather than skip one row
         items = []
-    titles = [str(d.get("title", ""))[:MAX_TITLE_CHARS]
-              for d in items[:MAX_ITEMS_PER_ROW]
-              if isinstance(d, dict) and d.get("title")]
-    parts = ["; ".join(titles) if titles else (row["memo"] or "")[:MAX_TITLE_CHARS]]
+    return [d for d in items[:MAX_ITEMS_PER_ROW]
+            if isinstance(d, dict) and d.get("title")]
+
+
+_ITEM_TAGS = "abcdefghijklmnopqrstuvwxyz"
+
+
+def _amazon_row_text(row: dict) -> str:
+    titles = [str(d.get("title", ""))[:MAX_TITLE_CHARS] for d in _amazon_items(row)]
+    if len(titles) > 1:
+        listed = "; ".join(f"({_ITEM_TAGS[i]}) {t}" for i, t in enumerate(titles))
+    else:
+        listed = titles[0] if titles else ""
+    parts = [listed or (row["memo"] or "")[:MAX_TITLE_CHARS]]
     if row["seller"]:
         parts.append(f"(seller: {row['seller'][:60]})")
     return " ".join(p for p in parts if p).strip() or "unknown item"
@@ -1535,31 +1708,102 @@ def _amazon_prompt(rows, categories: list[str]) -> list[dict]:
     listing = "\n".join(f"{i + 1}. {_amazon_row_text(r)}" for i, r in enumerate(rows))
     system = (
         "You categorize Amazon purchases for a personal budget. "
-        "Assign each numbered purchase exactly one category from this list:\n"
+        "Assign each purchase exactly one category from this list:\n"
         f"{catalog}\n\n"
         "Rules: judge by what the product IS and its most likely use. "
         "Products for children/babies go to 'Kids & Baby' even if they are "
         "apparel or toys. Use 'Shopping' only when nothing else fits. "
-        'Reply with JSON only: {"1": "<category>", "2": "<category>", ...}'
+        "A purchase listed as several lettered items gets one category "
+        "PER ITEM, in order, as a JSON list. "
+        'Reply with JSON only: {"1": "<category>", '
+        '"2": ["<category of a>", "<category of b>"], ...}'
     )
     return [{"role": "system", "content": system},
             {"role": "user", "content": listing}]
 
 
-def _classify_amazon_batch(rows, categories: list[str],
-                           transport=None, backend=None) -> dict[int, str]:
-    content = _chat(_amazon_prompt(rows, categories), 30 * len(rows) + 200,
+def _classify_amazon_batch(rows, categories: list[str], transport=None,
+                           backend=None) -> dict[int, str | list[str]]:
+    """Per numbered row: the category the model gave the purchase, or a
+    list of one per lettered item when it answered per item."""
+    n_items = sum(max(1, len(_amazon_items(r))) for r in rows)
+    content = _chat(_amazon_prompt(rows, categories), 30 * n_items + 200,
                     transport=transport, backend=backend)
     canon = {c.lower(): c for c in categories}
-    out = {}
+    out: dict[int, str | list[str]] = {}
     for k, v in _json_object(content, "purchase-category").items():
         try:
             idx = int(k)
         except (TypeError, ValueError):
             continue
-        if 1 <= idx <= len(rows) and isinstance(v, str) and v.strip().lower() in canon:
+        if not 1 <= idx <= len(rows):
+            continue
+        if isinstance(v, str) and v.strip().lower() in canon:
             out[idx] = canon[v.strip().lower()]
+        elif isinstance(v, list) and v and all(
+                isinstance(x, str) and x.strip().lower() in canon for x in v):
+            out[idx] = [canon[x.strip().lower()] for x in v]
     return out
+
+
+def _amazon_answer(row: dict, answer) -> tuple[str, list | None]:
+    """(the order's category, the items to store) from one row's answer.
+
+    A per-item answer that names every listed item gives each item its
+    category and the order the category carrying the most of the items'
+    prices × quantities (equal weights where prices are missing). An
+    answer for the order only — a string, or a list of the wrong length —
+    gives the order
+    that category and every listed item `category: null`, so the row is
+    not asked again for what the model would not say. A titled item past
+    the listing cap was never asked about and is stamped null too: left
+    bare, it would queue the order every night for an answer the prompt
+    never requests (and the matcher rightly refuses to split on it). None
+    for the items when the row listed none."""
+    items = _amazon_items(row)
+    raw = row.get("items_json") or []
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raw = []
+    if not isinstance(raw, list):
+        raw = []
+    per_item = (answer if isinstance(answer, list) and len(answer) == len(items)
+                and items else None)
+    if per_item:
+        # weighed as the matcher weighs the split (store_match.item_quantity):
+        # `price` is the UNIT price, so six of a $2 item carry $12
+        from .store_match import item_quantity
+        weight: dict[str, float] = {}
+        for it, cat in zip(items, per_item):
+            try:
+                w = float(it.get("price"))
+                if not math.isfinite(w) or w <= 0:
+                    w = 1.0
+                else:
+                    w *= item_quantity(it)
+            except (TypeError, ValueError, OverflowError):
+                w = 1.0
+            weight[cat] = weight.get(cat, 0.0) + w
+        order_cat = max(weight.items(), key=lambda kv: kv[1])[0]
+    else:
+        order_cat = answer[0] if isinstance(answer, list) else answer
+    if not items:
+        return order_cat, None
+    stamped = []
+    listed = {id(d) for d in items}
+    i = 0
+    for d in raw:
+        if isinstance(d, dict) and id(d) in listed:
+            d = dict(d)
+            d["category"] = per_item[i] if per_item else None
+            i += 1
+        elif isinstance(d, dict) and d.get("title"):
+            d = dict(d)
+            d["category"] = None
+        stamped.append(d)
+    return order_cat, stamped
 
 
 def _classify_amazon(conn, *, limit, batch_size, dry_run, stats,
@@ -1580,15 +1824,23 @@ def _classify_amazon(conn, *, limit, batch_size, dry_run, stats,
             continue
         with conn.transaction():
             for idx, row in enumerate(batch, start=1):
-                cat = result.get(idx)
-                if cat is None:
+                answer = result.get(idx)
+                if answer is None:
                     stats["unparseable"] += 1
                     continue
                 stats["items_classified"] += 1
-                if not dry_run:
+                if dry_run:
+                    continue
+                cat, items = _amazon_answer(row, answer)
+                if items is None:
                     conn.execute(
                         "UPDATE amazon_orders SET category=%s, category_source='llm' "
                         "WHERE dedup_key=%s", (cat, row["dedup_key"]))
+                else:
+                    conn.execute(
+                        "UPDATE amazon_orders SET category=%s, category_source='llm', "
+                        "items_json=%s WHERE dedup_key=%s",
+                        (cat, _jsonb(items), row["dedup_key"]))
         log.info("amazon items: %d/%d", min(i + batch_size, len(rows)), len(rows))
 
 

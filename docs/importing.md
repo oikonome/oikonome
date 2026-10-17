@@ -5,6 +5,31 @@ below is idempotent (re-importing converges), deduplicated against your
 connected banks (±3 days, exact amount — the bank wins), and **one-click
 reversible** (Recent imports → undo).
 
+## How much history comes in
+
+One household setting decides how far back new history reaches: **Last
+month**, **3 months**, **6 months**, **1 year** or **Everything
+available** (the default). Pick it in the setup wizard's Connect step or
+on the Import page (**How much history should come in?**); it saves on
+the tap.
+
+- **Bank links** — a new Plaid link asks the bank for that much history.
+  Banks share up to two years, so "Everything available" means two. The
+  window is read when the link starts; a bank already linked keeps what
+  it brought.
+- **File imports** — every file format honours it. Rows dated before the
+  window (counted back from today in the household's time zone) are left
+  out, and the import result says so: "N older rows left out — the
+  history window is 3 months; widen it on the Accounts page or in the
+  wizard to bring them in." (`skipped_older` in the API result; a folder
+  import shows the line per file). Re-importing a statement you imported before is still
+  recognised and corrected as usual.
+
+More history means better bill detection and a budget seeded from real
+months; less keeps the first sync quick. To bring older history in
+later, widen the window (or choose **Everything available**) and import
+the older files from Accounts → Import.
+
 ## Live sync
 
 - **SimpleFIN (recommended, US/CA)** — sign up at bridge.simplefin.org
@@ -30,6 +55,18 @@ reversible** (Recent imports → undo).
 | PDF statement | bank, card or brokerage statement with a text layer (not a scan) | pick the statement kind on the Import page; the cycle is dated from the statement's period line, or from separate **Opening Date** / **Closing Date** lines; the sign of an unsigned line comes from the statement itself: on a bank or brokerage statement that prints a running balance, the one reading of in/out that makes the balances add up exactly (a statement whose balances could add up two ways says nothing); then the column it is printed under, when the statement has a withdrawals/debits and a deposits/credits column (a figure under Deposits is money in whatever the words say); then the section heading it sits under (*Withdrawals*, *Checks paid*, *Deposits and additions*, …). A printed minus, parentheses or CR/DR marker always wins. Only a line none of these covers is read by its words (deposit, withdrawal, dividend, …), where an unsigned line with no such word reads as money out — cash back taken with a purchase is money out, a cash-back *reward* is money in, and a retirement account's own distribution (IRA, RMD, Roth …) is money out while a fund's dividend or capital-gain distribution is money in; the import's warnings say how many lines were read by their words, so you can check them |
 | Monarch / Copilot / Simplifi | each app's CSV export | auto-detected |
 | Oikonome export ZIP | Settings → Data & maintenance on another instance | runs in the background with progress on the page (a big archive takes minutes; leaving the page doesn't stop it) — full restore: transactions, bills, your answers to recurring-bill and merchant-merge offers (something you declined is not offered again), the import history (so a file import that came along can still be undone under Recent imports), overrides, settings, and business-entity data (entities, equity, mileage, 1099 vendors, compliance, classifications). **Note:** a business entity's full EIN is never included in the export for security — after restoring, re-enter it (only the last 4 digits carry over). The daily email's recipient answers travel, with one narrowing: a **decline** always carries over, so somebody who said no stays off the list; an **acceptance** carries over only for an address that already has its own login on the destination household (in hosted mode, one whose email is confirmed). Everyone else — and anybody who had not answered yet — lands as *not invited* with an **Invite** button, because the invite *link* itself never travels. The restore summary tells you how many people have to accept a fresh invite before their mail resumes; Settings → Email & Push is where you send it. |
+
+**Restoring after you have already linked your banks.** You can restore
+an export before or after linking the same banks here; either way you end
+up with one copy of each account. When a bank is already linked, every
+restored account that matches exactly one linked account at that bank (same
+last four digits and type) is merged into it: the older history comes
+across, the days both copies cover are kept once, under the linked
+connection's transactions, and your notes, categories and receipts on those
+days stay on them. If two accounts at one bank share the last four digits
+and type, nothing is guessed — the restore summary names the accounts that
+may now appear twice, so you can link or remove the extra copy on the
+Accounts page.
 
 **Amount signs:** most bank CSVs use negative-for-spending — that's the
 default. If your import shows spending as income, undo it and re-import
@@ -92,6 +129,12 @@ disk rather than held in memory, which is why it may be that much larger
 [the reverse-proxy guide](reverse-proxy.md#upload-size-and-time-limits)).
 Drop the export ZIP **on its own** to use that limit: mixed in with other
 files it is read with the folder.
+Some formats carry a tighter limit of their own, because of how much
+work each one is to read: an OFX/QFX file is capped at **10 MB**, a
+register exported from YNAB, Mint, Monarch, Copilot or Simplifi at **40
+columns**, and any other CSV at **200 columns**, and no single row of
+any CSV may run past **128 KB**. A file past one of these
+is refused with a message saying which, before anything is imported.
 Receipts travel inside the export as the photos themselves, so they are
 most of a big archive: the receipts file inside it has no size cap of its
 own, but the whole ZIP must stay under the 500 MB upload, which is
@@ -109,6 +152,17 @@ single-file import **60 times an hour**, and an instance takes only a few
 uploads at once — see
 [troubleshooting](troubleshooting.md#an-upload-is-refused-or-times-out)
 for what the refusals look like.
+
+**Account numbers in file names.** A folder import names a new account
+after its file, and banks often name an export after the full account
+number. Only the last four digits of any run of eight or more are kept
+in the account's name and in the import history, and older names and
+archives are cut the same way. The account's internal id is permanent,
+though, so an account created before this rule still carries the number
+there, and it travels in exports; a restore lists any such account by
+name. To be rid of it, undo that account's imports under *Recent
+imports*, rename the files without the number, import them again, and
+remove the old, now empty account.
 
 **A folder import runs in the background.** Pressing *Import* hands the
 plan to the server and the page follows it file by file — *N of M files*,

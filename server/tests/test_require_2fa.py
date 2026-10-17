@@ -86,6 +86,16 @@ class Needs2FATests(unittest.TestCase):
         self.assertNotEqual(r.status_code, 403, r.text)
         self.assertNotIn("enroll a second factor", r.text)
 
+    def test_factorless_hosted_browser_cannot_subscribe_to_push(self):
+        """A push subscription is a channel that carries the household's
+        notices to a device, so opening one waits for the second factor
+        like every other write outside the enrolment surface. The clients
+        register push once the factor is enrolled."""
+        r = self.client.post("/api/notify/push/subscribe",
+                             json={"endpoint": "https://push.example/x"})
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertIn("enroll a second factor", r.text)
+
     def test_self_host_never_needs_2fa(self):
         os.environ.pop("OIKONOME_HOSTED", None)
         self.assertFalse(self.client.get("/api/me").json()["needs_2fa"])

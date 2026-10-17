@@ -12,7 +12,7 @@ import unittest
 
 from oikonome.engine import budget
 
-from .util import TODAY, _ensure_db, add_bill, make_db, write_config
+from .util import TODAY, _ensure_db, add_bill, add_txn, make_db, write_config
 
 
 class RecurringLoadTests(unittest.TestCase):
@@ -61,6 +61,10 @@ class RecurringLoadTests(unittest.TestCase):
         add_bill(self.conn, "Later", 900.0,
                  next_due=TODAY + dt.timedelta(days=25),
                  last_seen=TODAY - dt.timedelta(days=6))
+        # the payment last_seen names: without it this month's occurrence
+        # is overdue, and an overdue bill is owed this week
+        add_txn(self.conn, TODAY - dt.timedelta(days=6), 900.0, "LATER",
+                account="chk")
         t = budget.recurring_load(self.conn, TODAY)
         self.assertEqual(t["week_count"], 1)
         self.assertAlmostEqual(t["week_total"], 40.0, places=2)

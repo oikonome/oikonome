@@ -34,3 +34,42 @@ export function cadenceChoices(list: [string, string][],
   }
   return out;
 }
+
+/** The ADD pickers' short list: the common cadences, one-time, and the
+ *  envelopes. Anything unusual (every 2 weeks, every 14 days, every 3
+ *  months) is one "Custom interval…" pick away — see CUSTOM_UNITS. The
+ *  values are the server's FREQ:interval wire format, never the words. */
+export const ADD_CADENCES: [string, string][] = [
+  ["DAILY:1", "daily"], ["WEEKLY:1", "weekly"], ["MONTHLY:1", "monthly"],
+  ["YEARLY:1", "yearly"], ["ONE_TIME:1", "one-time"],
+  ["ENVELOPE:1", "envelope (monthly pool)"],
+  ["ENVELOPE:12", "envelope (annual pool)"],
+];
+
+/** "Custom interval…" units. Days and weeks are here because a paycheck
+ *  every 2 weeks or a bill every 14 days is common, and months/years alone
+ *  could not express either. */
+export const CUSTOM_UNITS: [string, string][] = [
+  ["DAILY", "day(s)"], ["WEEKLY", "week(s)"], ["MONTHLY", "month(s)"],
+  ["YEARLY", "year(s)"],
+];
+
+/** The largest custom count the server takes for each unit: about 20
+ *  years of that unit, because the server bounds an interval by how long
+ *  one cycle lasts, not by the bare number. A bill saved past it is
+ *  refused, so the picker never sends one. */
+export const CUSTOM_MAX: Record<string, number> = {
+  DAILY: 7300, WEEKLY: 1043, MONTHLY: 240, YEARLY: 20,
+};
+
+/** The cap for one unit. A unit the table does not know gets the smallest
+ *  cap, so a guess can never send a count the server refuses. */
+export function customMax(unit: string): number {
+  return CUSTOM_MAX[unit.toUpperCase()] ?? 20;
+}
+
+/** The cadence a custom interval sends: a blank or nonsense count is 1,
+ *  and a count past the unit's cap is the cap. */
+export function customCadence(unit: string, n: string): string {
+  return `${unit}:${Math.min(customMax(unit), Math.max(1, parseInt(n, 10) || 1))}`;
+}

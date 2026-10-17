@@ -70,7 +70,10 @@ class NetWorthTests(unittest.TestCase):
                          self.src, "the tiles ARE the breakdown")
 
     def test_the_month_delta_comes_from_the_trend_already_shipped(self):
-        self.assertIn("t[t.length - 1][1] - t[t.length - 2][1]", self.src)
+        """The hero's change is the last two points of the series the server
+        ships (the full-total series, so a mortgage payment is not a loss),
+        never a second computation of its own."""
+        self.assertIn("monthChange(nw.full_trend)", self.src)
 
     def test_the_profit_card_does_not_grow_a_second_hero(self):
         self.assertNotIn('fontSize: "2rem", fontWeight: 800', self.src)

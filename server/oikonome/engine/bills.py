@@ -86,6 +86,25 @@ def _monthly(amount: float, frequency: str | None, interval: int) -> float:
     return amount * PER_YEAR[frequency.upper()] / (interval or 1) / 12.0
 
 
+# The longest cycle a bill may repeat on: twenty years. The bound is on the
+# cycle's LENGTH, not the interval count — 240 reads as twenty years only
+# for MONTHLY; a YEARLY interval of 240 rolls the due date centuries out,
+# past the dates the rest of the product can read, and every night's bill
+# maintenance would fail on that one row.
+MAX_CYCLE_DAYS = 7305
+
+
+def cadence_too_long(frequency: str | None, interval) -> bool:
+    """True when `frequency`/`interval` repeats less often than once every
+    MAX_CYCLE_DAYS (or the interval is not a usable count)."""
+    try:
+        iv = int(interval or 1)
+    except (TypeError, ValueError, OverflowError):
+        return True
+    return budget._cycle_days({"frequency": frequency or "MONTHLY",
+                               "interval": iv}) > MAX_CYCLE_DAYS
+
+
 # The figure a 52-week / 365-day year gave before PER_YEAR moved to the mean
 # year — what every bill saved before that change still stores.
 _OLD_PER_YEAR = {"DAILY": 365.0, "WEEKLY": 52.0}
@@ -311,6 +330,8 @@ def save_bill(conn, *, payee: str, amount: float, bill_type: str = "occurrence",
     the explicit ask to restore it with the save."""
     if not float(amount) > 0:
         raise ValueError("bill amount must be positive dollars")
+    if cadence_too_long(frequency, interval):
+        raise ValueError("bill cadence is longer than twenty years")
     with conn.transaction():
         # Read-modify-write under the row lock: the new raw carries values
         # forward from the old one (lock_amount, anchors, companions), so two
@@ -389,6 +410,19 @@ def save_bill(conn, *, payee: str, amount: float, bill_type: str = "occurrence",
                                     else today.isoformat())
         else:
             raw["amount_set_on"] = prev_raw["amount_set_on"]
+        # The amounts the bill was paid at before this one, each with the
+        # day it stopped applying: a price change must not turn the months
+        # paid at the old price into unmatched spending (budget.
+        # bill_amount_bands reads this on every matcher). Carried forward
+        # on every save, appended to when the amount really changes.
+        hist = budget.amount_history_of(prev_raw)
+        if (prev_amt is not None and prev_amt > 0
+                and abs(prev_amt - abs(amount or 0)) > 0.005):
+            hist.append({"amount": round(prev_amt, 2),
+                         "until": today.isoformat()})
+        hist = hist[-budget.AMOUNT_HISTORY_MAX:]
+        if hist:
+            raw["amount_history"] = hist
         for flag, val in (("show_today", show_today),
                           ("match_category", match_category)):
             if val if val is not None else prev_raw.get(flag):
@@ -539,17 +573,17 @@ def _bill_row_matcher(payee, merchant, amount, raw, ids=None):
     key = budget._key_token(payee)
     btype = raw.get("bill_type", "occurrence")
     income = (amount or 0) > 0
-    ref = abs(amount or 0)
-    tol = budget.bill_tolerance(ref)
+    bands = budget.bill_amount_bands(amount, raw)
     match = budget.merchant_matcher(merchant, key, ids)
 
-    def ok(text: str, amt: float, merchant_id: str | None = None) -> bool:
+    def ok(text: str, amt: float, merchant_id: str | None = None,
+           date=None) -> bool:
         if not match(text, None, merchant_id):
             return False
         if btype == "envelope":
             return amt > 0
         return ((amt < 0 if income else amt > 0)
-                and abs(abs(amt) - ref) <= tol)
+                and budget.amount_fits(bands, amt, date))
     return ok
 
 
@@ -631,7 +665,15 @@ def apply_txn_categories(conn, *, bill_id: str | None = None,
         for b in bills:
             if b["id"] in keep:
                 braw = as_dict(b["raw"])
-                matchers.append((b["id"], keep[b["id"]], abs(b["amount"] or 0),
+                # a tie between two bills is broken by the distance to the
+                # nearest amount each bill knows — its old prices included,
+                # as the ledger matcher does — so a charge at one bill's
+                # old price is not handed to the other for sitting nearer
+                # its current one
+                bands = budget.bill_amount_bands(b["amount"], braw)
+                matchers.append((b["id"], keep[b["id"]],
+                                 (lambda bands: lambda amt: budget.amount_gap(
+                                     bands, amt))(bands),
                                  _bill_row_matcher(b["payee"], b["merchant"],
                                                    b["amount"], braw,
                                                    ids.get(b["payee"] or ""))))
@@ -640,8 +682,10 @@ def apply_txn_categories(conn, *, bill_id: str | None = None,
                 # bill is water, not "general services"
                 for c in companions_of(braw):
                     matchers.append((
-                        b["id"], keep[b["id"]], c["amount"],
-                        (lambda c: lambda text, amt, merchant_id=None:
+                        b["id"], keep[b["id"]],
+                        (lambda ref: lambda amt: abs(abs(amt) - ref))(
+                            abs(float(c["amount"]))),
+                        (lambda c: lambda text, amt, merchant_id=None, date=None:
                             amt > 0 and companion_matches(
                                 c, budget._tokens(text), amt))(c)))
         stats["bills"] = len(matchers)
@@ -651,7 +695,7 @@ def apply_txn_categories(conn, *, bill_id: str | None = None,
             since_args = [localtime.household_day(conn)
                           - dt.timedelta(days=days)]
         rows = conn.execute(
-            f"""SELECT t.id, t.amount, t.category_override, t.override_source,
+            f"""SELECT t.id, t.amount, t.date, t.category_override, t.override_source,
                       {budget.MATCH_PAYEE_SQL} AS raw_payee, t.name,
                       t.merchant_id::text AS merchant_id,
                       m.bill_id AS mark_bill, m.category AS mark_cat,
@@ -672,9 +716,9 @@ def apply_txn_categories(conn, *, bill_id: str | None = None,
                 continue
             text = budget.match_text(r["raw_payee"], r["name"])
             amt = r["amount"] or 0
-            hits = [(abs(abs(amt) - ref), bid, cat)
-                    for bid, cat, ref, ok in matchers
-                    if ok(text, amt, r["merchant_id"])]
+            hits = [(gap(amt), bid, cat)
+                    for bid, cat, gap, ok in matchers
+                    if ok(text, amt, r["merchant_id"], r["date"])]
             if not hits:
                 continue
             _, bid, cat = min(hits)            # closest amount, then id
@@ -1227,6 +1271,10 @@ def recent_auto_changes(conn, days: int = 1) -> list[dict]:
 def _insert_proposal(conn, *, pid, kind, payee, amount, bill_type="occurrence",
                      frequency=None, interval=1, next_due=None, evidence=None,
                      status="pending") -> bool:
+    # an offer is approved into save_bill, which refuses a cadence past
+    # twenty years; one is never filed that could not be approved
+    if frequency and cadence_too_long(frequency, interval):
+        return False
     now = dt.datetime.now(dt.timezone.utc)
     cur = conn.execute(
         """INSERT INTO bill_proposals
@@ -1381,17 +1429,31 @@ def settle_proposals_alert(conn) -> bool:
         return False
 
 
+def covering_bill(conn, payee: str, *, besides: str | None = None
+                  ) -> str | None:
+    """The active bill that already claims the charges a bill named `payee`
+    would match (its own key token, or its merchant's tokens; see
+    _cover_keys), other than the bill named `besides`, or None. An exact
+    name is the narrow case: a second bill keyed on the same token takes
+    the same rows, and the plan counts the charge twice."""
+    key = budget._key_token(payee or "")
+    if not key:
+        return None
+    cover = _cover_keys(conn.execute(
+        "SELECT payee, merchant FROM bills WHERE active = 1"
+        " AND payee IS DISTINCT FROM %s", (besides,)).fetchall())
+    return cover.get(key)
+
+
 def _apply_approved(conn, p, ev) -> dict:
+    note = None
     if p["kind"] == "add":
         # An offer made before the person added the bill themselves (the
         # detection pass and a hand save can cross) must not create a
         # second bill for the same charge, nor overwrite the hand-entered
         # one with the detected amount and cadence. The nightly would
         # retire the offer as superseded; approving it early does the same.
-        cover = _cover_keys(conn.execute(
-            "SELECT payee, merchant FROM bills WHERE active = 1").fetchall())
-        key = budget._key_token(p["payee"] or "")
-        by = cover.get(key) if key else None
+        by = covering_bill(conn, p["payee"] or "")
         if by is not None:
             conn.execute("UPDATE bill_proposals SET status='superseded', "
                          "decided_at=now() WHERE id=%s", (p["id"],))
@@ -1458,26 +1520,112 @@ def _apply_approved(conn, p, ev) -> dict:
                      "|| %s::jsonb, synced_at=now() WHERE id=%s",
                      (jsonb(ident), host["id"]))
         apply_txn_categories(conn, bill_id=host["id"])
+    elif p["kind"] == "amount_change":
+        # locked: the staleness check below and the write are one decision
+        bill = conn.execute("SELECT * FROM bills WHERE payee = %s FOR UPDATE",
+                            (p["payee"],)).fetchone()
+        if bill is None or not bill["active"]:
+            return {"error": f"bill '{p['payee']}' no longer exists"}
+        old = as_dict(bill["raw"])
+        # The offer was "this amount -> that one". If the person has since
+        # typed a different amount in, or pinned the amount, approving the
+        # old offer would overwrite their answer with the machine's: it is
+        # withdrawn instead, as the nightly withdraws an offer the bill has
+        # moved past.
+        try:
+            offered_from = round(abs(float(ev.get("old"))), 2)
+        except (TypeError, ValueError, OverflowError):
+            offered_from = None
+        if (old.get("lock_amount") or offered_from is None
+                or abs(abs(float(bill["amount"] or 0)) - offered_from) > 0.005):
+            conn.execute("UPDATE bill_proposals SET status='superseded', "
+                         "decided_at=now() WHERE id=%s", (p["id"],))
+            return {"error": f"'{p['payee']}' has changed since this offer "
+                             "was made — it was withdrawn"}
+        rec = old.get("recurrence") or {}
+        bmd = rec.get("byMonthDay") or []
+        # the schedule stays; only the amount moves, and save_bill files
+        # the amount it replaces under the bill's history so the earlier
+        # payments stay recognised. manual_touch=False: approving a
+        # machine proposal is not a hand-edit of the amount.
+        save_bill(conn, payee=p["payee"], amount=p["amount"],
+                  bill_type=old.get("bill_type", "occurrence"),
+                  frequency=rec.get("frequency"),
+                  interval=rec.get("interval") or 1, next_due=bill["due_on"],
+                  category=bill["category"], source=old.get("source", "detected"),
+                  last_seen=ev.get("charged_on") or old.get("lastDueOn"),
+                  by_month_day=bmd[0] if bmd else None,
+                  income=(bill["amount"] or 0) > 0, manual_touch=False)
     elif p["kind"] in ("frequency_change", "type_change"):
-        bill = get_bill(conn, p["payee"])
+        # locked after the proposal row (the order every approval and rename
+        # takes): the staleness check below and the write are one decision
+        bill = conn.execute("SELECT * FROM bills WHERE payee = %s FOR UPDATE",
+                            (p["payee"],)).fetchone()
         # an archived bill is out of the schedule, as for the remove,
         # attach and merchant kinds: a cadence change approved from a stale
         # list must not edit, or bring back, a bill the person archived
         if bill is None or not bill["active"]:
             return {"error": f"bill '{p['payee']}' no longer exists"}
         old = as_dict(bill["raw"])
+        # The offer carries the amount and due date it was worked out from.
+        # An amount typed in since, a drift, or a due date typed in since
+        # all mean the bill has moved past the offer: approving it would
+        # write the offer's stale amount over the person's or their date.
+        # It is withdrawn instead; the nightly offers it again from the
+        # bill as it is now if the cadence still fits. The nightly rolling
+        # the due date along the bill's own schedule is not such a move
+        # (see _rolled_on): the approval keeps the later date. A pinned price is
+        # not such a move — the pin is about the amount, the offer about
+        # the cadence — so it only changes what the approval writes
+        # (below), never whether it may.
+        pinned = bool(old.get("lock_amount"))
+        if _cadence_offer_is_stale(bill, old, ev):
+            conn.execute("UPDATE bill_proposals SET status='superseded', "
+                         "decided_at=now() WHERE id=%s", (p["id"],))
+            return {"error": f"'{p['payee']}' has changed since this offer "
+                             "was made — it was withdrawn"}
+        amount = p["amount"]
+        if pinned and p["kind"] == "frequency_change":
+            # the pin owns the amount: only the cadence moves. Not for a
+            # type change — there the amount changes meaning (one charge's
+            # price against a month's pool), so the pinned price written
+            # as the new figure would be wrong in kind: a $6 coffee pinned
+            # per charge would become a $6-a-month envelope overrun every
+            # month, which drift never corrects on a pinned bill. The
+            # offer's own figure is written and the pin is dropped (below).
+            amount = abs(float(bill["amount"] or 0))
+        elif p["kind"] == "frequency_change" and ev.get("old_amount") is None:
+            # an offer filed before it recorded its starting amount cannot
+            # be checked against the bill, so it changes the cadence alone
+            amount = abs(float(bill["amount"] or 0)) or p["amount"]
+        # never earlier than the bill's own due date: an offer without a
+        # recorded starting date must not undo a roll the nightly made
+        next_due = as_date(p["next_due"]) if p["next_due"] else None
+        if bill["due_on"] and (next_due is None or next_due < bill["due_on"]):
+            next_due = bill["due_on"]
         # manual_touch=False: approving a machine proposal is not a hand-edit
         # of the AMOUNT — it must not (re)start the drift grace window
-        save_bill(conn, payee=p["payee"], amount=p["amount"],
+        save_bill(conn, payee=p["payee"], amount=amount,
                   bill_type=p["bill_type"], frequency=p["frequency"],
-                  interval=p["interval"] or 1, next_due=p["next_due"],
+                  interval=p["interval"] or 1, next_due=next_due,
                   category=bill["category"], source=old.get("source", "detected"),
                   last_seen=ev.get("last_seen") or old.get("lastDueOn"),
                   by_month_day=ev.get("by_month_day"),
                   income=(bill["amount"] or 0) > 0, manual_touch=False)
+        if pinned and p["kind"] == "type_change":
+            # the pin was on a per-charge price, which a pool has no longer;
+            # carried onto the machine's pool figure it would stop drift from
+            # ever correcting a number the person never set
+            conn.execute("UPDATE bills SET raw = raw - 'lock_amount' "
+                         "WHERE id=%s", (bill["id"],))
+            note = ("the pinned amount was a per-charge price, so the pin "
+                    "was cleared — pin the new amount if it is right")
     conn.execute("UPDATE bill_proposals SET status='approved', "
                  "decided_at=now() WHERE id=%s", (p["id"],))
-    return {"approved": p["payee"], "kind": p["kind"]}
+    out = {"approved": p["payee"], "kind": p["kind"]}
+    if note:
+        out["note"] = note
+    return out
 
 
 # ---- ledger scan --------------------------------------------------------
@@ -1580,16 +1728,17 @@ def _withdrawn_rows(conn, today: dt.date) -> list[dict]:
 
 
 def _withdrawn_after(gone: list[dict], match, after: dt.date,
-                     bill_amt: float) -> list[dt.date]:
+                     bands) -> list[dt.date]:
     """Dates of the withdrawn charges that would have paid this bill after
     its last live charge, oldest first. A withdrawn twin of a charge that
-    is still live sits on or before that charge and says nothing."""
-    tol = budget.bill_tolerance(bill_amt)
+    is still live sits on or before that charge and says nothing. `bands`
+    is budget.bill_amount_bands: a charge withdrawn at the price the bill
+    had then is proof the merchant charged, as a live one is for `paid`."""
     return [e["date"] for e in _events(
                 [r for r in gone
                  if r["date"] > after
                  and match(r["text"], r["tokens"], r["merchant_id"])])
-            if abs(e["amount"] - bill_amt) <= tol]
+            if budget.amount_fits(bands, e["amount"], e["date"])]
 
 
 def _run_from_end(dates: list[dt.date], cycle: int) -> list[dt.date]:
@@ -1653,6 +1802,15 @@ def _complete_months(today: dt.date, n: int) -> list[str]:
     return list(reversed(out))
 
 
+def _covered_months(conn, months: list[str], today: dt.date) -> float:
+    """How many of these complete months the ledger covers (a partial
+    first month counts its share), never under one."""
+    first = budget.ledger_start(
+        conn, budget.excluded_account_ids(budget.load_config(conn)))
+    return max(1.0, sum(budget.month_coverage(first, int(m[:4]), int(m[5:]),
+                                              today) for m in months))
+
+
 def _monthly_totals(events, months: list[str]) -> tuple[list[float], list[int]]:
     tot = {m: 0.0 for m in months}
     cnt = {m: 0 for m in months}
@@ -1692,8 +1850,14 @@ def _cycle_to_proposal(cyc, run, med, events):
             "hits": len(run)}
 
 
-def run(conn, today: dt.date | None = None) -> dict:
-    """Nightly detection pass. Returns counters."""
+def run(conn, today: dt.date | None = None, *, propose: bool = True) -> dict:
+    """Nightly detection pass. Returns counters.
+
+    `propose=False` keeps the upkeep of the bills a household already has
+    (due dates rolled, amount drift, stopped-bill and changed-cadence
+    offers, the merchant names a bill gained) and skips only the search for
+    NEW bills and income — for a household that enters its bills by hand
+    and has said it does not want those offers every morning."""
     cfg = budget.load_config(conn)
     today = today or localtime.now_local(cfg).date()
     stats = {"proposed_add": 0, "proposed_remove": 0, "proposed_change": 0,
@@ -1744,8 +1908,9 @@ def run(conn, today: dt.date | None = None) -> dict:
         # caught when the offer is approved (_apply_approved).
         active_keys = set(_cover_keys(conn.execute(
             "SELECT payee, merchant FROM bills WHERE active = 1").fetchall()))
-        _propose_new(conn, groups, active_keys, today, stats)
-        _propose_income(conn, today, stats)
+        if propose:
+            _propose_new(conn, groups, active_keys, today, stats)
+            _propose_income(conn, today, stats)
     # bills that carry a transaction category stamp the rows they match
     # (and let go of rows they no longer should) — after the maintenance
     # above so a drifted amount's new tolerance is what gets applied
@@ -1787,20 +1952,21 @@ def _advance_due_dates(conn, today, stats):
             "SELECT id, due_on, raw FROM bills WHERE active = 1").fetchall():
         raw = as_dict(b["raw"])
         rec = raw.get("recurrence") or {}
-        due = as_date(b["due_on"])
-        if (raw.get("bill_type") == "envelope" or not due
-                or due >= today or not rec.get("frequency")):
-            continue  # envelope/one-time/current bills keep their anchor
-        bill = {"recurrence": rec, "anchor": due}
-        nxt, (y, m) = None, (today.year, today.month)
-        for _ in range(_scan_months(rec)):
-            for d in budget._occurrences_in_month(bill, y, m):
-                if d >= today:
-                    nxt = d
-                    break
-            if nxt:
-                break
-            y, m = (y, m + 1) if m < 12 else (y + 1, 1)
+        # One bill whose stored date or cycle is out of range (written
+        # before the twenty-year cycle bound, or by an older install) is
+        # left where it is: raising here would roll back the whole night's
+        # bill maintenance for the household, every night, over one row.
+        try:
+            due = as_date(b["due_on"])
+            if (raw.get("bill_type") == "envelope" or not due
+                    or due >= today or not rec.get("frequency")):
+                continue  # envelope/one-time/current bills keep their anchor
+            nxt = _next_occurrence(rec, due, today)
+            if nxt is not None:
+                as_date(nxt)            # a date the product can read back
+        except (TypeError, ValueError, OverflowError) as e:
+            log.warning("bill %s: due date not rolled (%s)", b["id"], e)
+            continue
         if not nxt:
             continue
         delta = {"dueOn": nxt.isoformat()}
@@ -1813,6 +1979,20 @@ def _advance_due_dates(conn, today, stats):
         # lose whatever they had just written (lock_amount, companions, …)
         if _roll_due(conn, b, nxt, delta):
             stats["due_advanced"] += 1
+
+
+def _next_occurrence(rec: dict, due: dt.date,
+                     today: dt.date) -> dt.date | None:
+    """The first occurrence on or after `today` of a series anchored at
+    `due`, or None when the scan finds none."""
+    bill = {"recurrence": rec, "anchor": due}
+    y, m = today.year, today.month
+    for _ in range(_scan_months(rec)):
+        for d in budget._occurrences_in_month(bill, y, m):
+            if d >= today:
+                return d
+        y, m = (y, m + 1) if m < 12 else (y + 1, 1)
+    return None
 
 
 def _roll_due(conn, snap, nxt: dt.date, delta: dict) -> bool:
@@ -2101,11 +2281,15 @@ def _propose_new(conn, groups, active_keys, today, stats):
             # slips across month ends (two bills in one month, none the
             # next): present in at least four of the last six months, five
             # or more charges, and the pool is the six-month average — a
-            # cold month is covered, a mild one leaves headroom
+            # cold month is covered, a mild one leaves headroom. The
+            # average is over the months the ledger covers: a month before
+            # it starts is no data, not a $0 bill, and dividing four
+            # months of bills by six sets the cap a third short, so every
+            # month overflows into the variable verdict.
             months6 = _complete_months(today, 6)
             t6, c6 = _monthly_totals(events, months6)
             present = sum(1 for cc in c6 if cc >= 1)
-            avg6 = sum(t6) / 6
+            avg6 = sum(t6) / _covered_months(conn, months6, today)
             if present >= 4 and sum(c6) >= 5 and avg6 >= ENV_MIN_MONTHLY:
                 monthly = round(avg6, 2)
                 ev = {"monthly_totals": dict(zip(months6, [round(t, 2) for t in t6])),
@@ -2353,6 +2537,12 @@ def _maintain_bills(conn, bills, rows, today, stats):
         # occurrence bills ------------------------------------------------
         tol = budget.bill_tolerance(bill_amt)
         amt_matched = [e for e in events if abs(e["amount"] - bill_amt) <= tol]
+        # ...and the payments at the amounts the bill had before: they say
+        # the bill is alive (removal) but not what it costs now (drift —
+        # a median over old and new prices would walk the amount back)
+        bands = budget.bill_amount_bands(b["amount"], raw)
+        paid = [e for e in events
+                if budget.amount_fits(bands, e["amount"], e["date"])]
         rec = raw.get("recurrence") or {}
         cycle = budget._cycle_days(rec) if rec.get("frequency") else None
 
@@ -2373,19 +2563,55 @@ def _maintain_bills(conn, bills, rows, today, stats):
         # A charge the bank feed withdrew is proof the merchant DID charge:
         # silence is measured from it, so a withdrawn cycle can never be
         # what makes a bill look dead.
-        if (amt_matched and (today - amt_matched[-1]["date"]).days > 2 * cycle
+        if (paid and (today - paid[-1]["date"]).days > 2 * cycle
                 and (not events or (today - events[-1]["date"]).days > 2 * cycle)
                 and not any((today - d).days <= 2 * cycle
                             for d in _withdrawn_after(
-                                gone(), match, amt_matched[-1]["date"],
-                                bill_amt))):
-            pid = _sig("remove", key, cycle, _month_key(amt_matched[-1]["date"]))
+                                gone(), match, paid[-1]["date"],
+                                bands))):
+            pid = _sig("remove", key, cycle, _month_key(paid[-1]["date"]))
             if _propose_for(conn, b, pid=pid, kind="remove", payee=payee,
                                 amount=bill_amt,
-                                evidence={"last_seen": amt_matched[-1]["date"].isoformat(),
+                                evidence={"last_seen": paid[-1]["date"].isoformat(),
                                           "cycle_days": cycle}):
                 stats["proposed_remove"] += 1
             continue
+
+        # price change: the merchant charged on the due date, at an amount
+        # outside every band the bill knows, and nothing inside a band
+        # landed that cycle. Drift cannot see it (it reads matched charges
+        # only), so left alone the bill would read unpaid every month
+        # until someone edited it. Proposed, never applied: a one-off at
+        # the merchant on the due day looks the same. One proposal per
+        # cycle; a rejected one stays rejected (its id is the charge's
+        # month). A locked or freshly hand-edited amount is left alone.
+        if (cycle and raw.get("dueOn") and events
+                and not raw.get("lock_amount")
+                and not in_manual_grace(raw, today)):
+            try:
+                occ = as_date(raw["dueOn"])
+            except (ValueError, TypeError):
+                occ = None
+            window = max(3, min(budget.PREPAY_MATCH_DAYS, cycle // 2))
+            while occ is not None and occ > today + dt.timedelta(days=window):
+                occ -= dt.timedelta(days=cycle)
+            if occ is not None and (today - occ).days <= cycle + window:
+                near = [e for e in events
+                        if abs((e["date"] - occ).days) <= window
+                        and e["date"] <= today]
+                if near and not any(
+                        budget.amount_fits(bands, e["amount"], e["date"])
+                        for e in near):
+                    new_amt = round(near[-1]["amount"], 2)
+                    pid = _sig("amount", key, new_amt,
+                               _month_key(near[-1]["date"]))
+                    ev = {"old": round(bill_amt, 2), "new": new_amt,
+                          "charged_on": near[-1]["date"].isoformat(),
+                          "due": occ.isoformat()}
+                    if not _price_was_rejected(conn, payee, bill_amt,
+                                               new_amt) and _propose_for(conn, b, pid=pid, kind="amount_change",
+                                    payee=payee, amount=new_amt, evidence=ev):
+                        stats["proposed_change"] += 1
 
         # amount drift: median of the last 3 matched occurrences (auto-apply,
         # unless amount-locked or hand-edited within the grace window).
@@ -2427,7 +2653,7 @@ def _maintain_bills(conn, bills, rows, today, stats):
                     ev = _cycle_to_proposal(cyc, run_dates, med, amt_matched)
                     ev["old_cycle_days"] = cycle
                     pid = _sig("freq", key, cyc[0], cycle)
-                    if _propose_for(conn, b, pid=pid, kind="frequency_change",
+                    if _offer_cadence(conn, b, pid=pid, kind="frequency_change",
                                         payee=payee, amount=round(med, 2),
                                         frequency=cyc[1], interval=cyc[2],
                                         next_due=ev["next_due"], evidence=ev):
@@ -2443,7 +2669,7 @@ def _maintain_bills(conn, bills, rows, today, stats):
                   "charges_per_month": dict(zip(months3, counts)),
                   "last_seen": events[-1]["date"].isoformat()}
             pid = _sig("type", key, "env", round(monthly, -1))
-            if _propose_for(conn, b, pid=pid, kind="type_change", payee=payee,
+            if _offer_cadence(conn, b, pid=pid, kind="type_change", payee=payee,
                                 amount=monthly, bill_type="envelope", evidence=ev):
                 stats["proposed_change"] += 1
 
@@ -2670,11 +2896,17 @@ def _bill_health(b, raw: dict, events: list[dict], today: dt.date,
     else:
         tol = budget.bill_tolerance(bill_amt)
         amt_matched = [e for e in events if abs(e["amount"] - bill_amt) <= tol]
-    last = amt_matched[-1]["date"] if amt_matched else None
+    # payments at the amounts the bill had before count as payments (last
+    # match, mismatch, stale); the drift read below stays on the current
+    # amount
+    bands = budget.bill_amount_bands(b["amount"], raw)
+    paid = (amt_matched if is_income else
+            [e for e in events if budget.amount_fits(bands, e["amount"], e["date"])])
+    last = paid[-1]["date"] if paid else None
 
     if not rec.get("frequency"):          # one-time scheduled bill
         due = as_date(raw.get("dueOn"))
-        if amt_matched or (due and due >= today):
+        if paid or (due and due >= today):
             health = "ok"
         elif due and (today - due).days > 30:
             health = "stale"
@@ -2691,7 +2923,7 @@ def _bill_health(b, raw: dict, events: list[dict], today: dt.date,
 
     cycle = budget._cycle_days(rec)
     withdrawn_on = None
-    if not amt_matched:
+    if not paid:
         # merchant IS in the ledger but never near the configured amount —
         # the case the 'ledger says' prefill exists for. With too few
         # charges for a fit there is no prefill; `last_seen` below still
@@ -2828,7 +3060,7 @@ def analyze_bills(conn, today: dt.date | None = None, *,
                 gone = _withdrawn_rows(conn, today)
             took = _withdrawn_after(
                 gone, match, _events(matched)[-1]["date"],
-                abs(b["amount"] or 0))
+                budget.bill_amount_bands(b["amount"], raw))
             if took:
                 verdict = _bill_health(b, raw, _events(matched), today,
                                        withdrawn=took)
@@ -2984,12 +3216,14 @@ def merchant_history(conn, payee: str, today: dt.date | None = None,
                     "SELECT payee, merchant, amount, raw FROM bills "
                     "WHERE active=1 AND amount<0 AND payee!=%s",
                     (payee,)).fetchall():
-                amt = abs(b["amount"] or 0)
+                # every price the other bill has had, as its matchers
+                # read it: a charge it took at last year's price is its
+                # charge, not this pool's
                 others.append((
                     budget.merchant_matcher(b["merchant"],
                                             budget._key_token(b["payee"] or "")),
                     as_dict(b["raw"]).get("bill_type") == "envelope",
-                    amt, budget.bill_tolerance(amt)))
+                    budget.bill_amount_bands(b["amount"], b["raw"])))
     # arbitrary merchant clicked from the Transactions page — `payee` IS a
     # real merchant name, so match on its full token set
     arb_toks = budget._tokens(payee) or ({key} if key else set())
@@ -3081,8 +3315,9 @@ def merchant_history(conn, payee: str, today: dt.date | None = None,
                                          want_canon, arb_toks))
         if not ok and want_cat:
             ok = (budget._cat_norm(r["category"]) == want_cat
-                  and not any(m(text) and (env or abs(r["amount"] - amt) <= tol)
-                              for m, env, amt, tol in others))
+                  and not any(m(text) and (env or budget.amount_fits(
+                                    bands, r["amount"], r["date"]))
+                              for m, env, bands in others))
         if ok:
             txns.append(r)
     # The list shows every matching row, the twin a linked or hidden account
@@ -3165,8 +3400,9 @@ def merchant_history(conn, payee: str, today: dt.date | None = None,
                                          want_canon, arb_toks))
         if not ok and want_cat:
             ok = (budget._cat_norm(r["category"]) == want_cat
-                  and not any(m(text) and (env or abs(r["amount"] - amt) <= tol)
-                              for m, env, amt, tol in others))
+                  and not any(m(text) and (env or budget.amount_fits(
+                                    bands, r["amount"], r["date"]))
+                              for m, env, bands in others))
         if ok:
             life_total += abs(r["amount"])
             life_count += 1
@@ -3213,6 +3449,154 @@ def _still_watched(conn, bill_row) -> bool:
     pass would stall the person's own save behind it."""
     fresh = conn.execute(_FRESH_BILL_SQL, (bill_row["id"],)).fetchone()
     return bool(fresh and fresh["active"] and not fresh["budget_disabled"])
+
+
+# How near a charge must sit to a price the person already turned down to
+# count as that price again: a few cents of tax or usage either side, not
+# the bill tolerance — a real later price change of a few dollars must
+# still be offered.
+REJECTED_PRICE_SLACK = 0.05
+
+
+def _price_was_rejected(conn, payee: str, bill_amt: float,
+                        new_amt: float) -> bool:
+    """Did the person already turn down moving this bill, at its current
+    amount, to (about) `new_amt`? A proposal's id carries the charge's
+    month, so without this a rejected price came back every cycle it was
+    charged. The rejection holds only while the bill still has the amount
+    it was made against — once that moves, the question is a new one."""
+    for r in conn.execute(
+            "SELECT amount, evidence FROM bill_proposals "
+            "WHERE kind = 'amount_change' AND status = 'rejected' "
+            "AND payee = %s", (payee,)).fetchall():
+        ev = as_dict(r["evidence"]) if r["evidence"] is not None else {}
+        try:
+            was = abs(float(r["amount"] or 0))
+            made_from = abs(float(ev.get("old")))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if (abs(made_from - abs(bill_amt)) <= 0.005 and was > 0
+                and abs(was - abs(new_amt)) <= max(1.0, was * REJECTED_PRICE_SLACK)):
+            return True
+    return False
+
+
+def _cadence_offer_is_stale(bill, raw: dict, ev: dict) -> bool:
+    """True when a frequency/type offer no longer describes `bill`: its
+    amount or due date is not the one the offer was made from (a due date
+    the bill's own schedule rolled on to excepted). A pinned
+    amount is not compared — the pin owns the amount and the approval
+    leaves it alone — but its due date still is. An offer that recorded
+    neither (filed before it kept them) is never stale by this test.
+
+    The cadence the offer was made from is compared too: a cadence the
+    person picked by hand since is their answer to the same question, and
+    approving would overwrite it — even with the due date untouched. The
+    roll test runs on that stamped cadence, not the bill's current one, or
+    a hand edit to a longer cycle (whose new due date sits on the NEW
+    schedule) would read as the nightly's roll."""
+    stamped = ev.get("old_recurrence")
+    if stamped is not None:
+        if not isinstance(stamped, dict) or _recurrence_stamp(raw) != {
+                k: stamped.get(k) for k in ("frequency", "interval",
+                                            "bill_type")}:
+            return True
+        roll_raw = {"recurrence": stamped.get("rule") or {}}
+    else:
+        roll_raw = raw
+    if ev.get("old_amount") is not None and not raw.get("lock_amount"):
+        try:
+            made_from = round(abs(float(ev["old_amount"])), 2)
+        except (TypeError, ValueError, OverflowError):
+            return True
+        if abs(abs(float(bill["amount"] or 0)) - made_from) > 0.005:
+            return True
+    if "old_due" in ev:
+        try:
+            due = as_date(ev["old_due"]) if ev["old_due"] else None
+        except (TypeError, ValueError):
+            return True
+        if due != bill["due_on"] and not _rolled_on(roll_raw, due,
+                                                    bill["due_on"]):
+            return True
+    return False
+
+
+def _recurrence_stamp(raw: dict) -> dict:
+    """The parts of a bill's cadence a frequency/type offer is about, in a
+    form two reads of the same bill compare equal."""
+    rec = raw.get("recurrence")
+    rec = rec if isinstance(rec, dict) else {}
+    try:
+        interval = int(rec.get("interval") or 1)
+    except (TypeError, ValueError, OverflowError):
+        interval = None
+    freq = rec.get("frequency")
+    return {"frequency": freq.upper() if isinstance(freq, str) else None,
+            "interval": interval,
+            "bill_type": raw.get("bill_type") or "occurrence"}
+
+
+def _rolled_on(raw: dict, old_due: dt.date | None,
+               due: dt.date | None) -> bool:
+    """True when `due` is where the bill's own schedule, counted on from
+    `old_due`, lands — the nightly roll moved it, not a hand edit. A pending
+    offer outlives the roll of the bill it is about; that roll changes
+    nothing the offer was worked out from (the approval keeps the later
+    date), so it must not withdraw the offer. A date typed off the
+    schedule still does."""
+    rec = raw.get("recurrence") or {}
+    if not (old_due and due and due > old_due and rec.get("frequency")):
+        return False
+    try:
+        return due in budget._occurrences_in_month(
+            {"recurrence": rec, "anchor": old_due}, due.year, due.month)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _offer_cadence(conn, bill_row, *, pid, kind, **kw) -> bool:
+    """File a frequency/type offer about an existing bill, stamped with the
+    amount, due date and cadence the bill has NOW (read fresh: the pass's snapshot
+    predates the due-date roll and any drift written this same pass), so
+    approving it can tell whether the bill has moved since.
+
+    A pinned amount still gets one: the pin is about the amount, the
+    offer about the cadence, and approving it keeps the pinned amount.
+    An offer withdrawn because the bill moved past it is offered again with
+    the current figures — its id names the cadence, not the figures, so a
+    plain insert would leave it withdrawn for good. A rejected one stays
+    rejected. Only a withdrawn row is reopened: an UPDATE on a pending row
+    could wait on an approval that holds it and waits on a bill this pass
+    has locked, and a withdrawn row is never held that way."""
+    fresh = conn.execute(
+        "SELECT b.amount, b.due_on, b.raw, b.active, "
+        "COALESCE((SELECT jsonb_exists(s.config->'disabled_bills', b.payee) "
+        "FROM tenant_settings s WHERE jsonb_typeof(s.config->'disabled_bills')"
+        " = 'array'), false) AS budget_disabled FROM bills b WHERE b.id=%s",
+        (bill_row["id"],)).fetchone()
+    if not fresh or not fresh["active"] or fresh["budget_disabled"]:
+        return False
+    if kw.get("frequency") and cadence_too_long(kw["frequency"],
+                                                kw.get("interval", 1)):
+        return False
+    ev = dict(kw.pop("evidence", None) or {})
+    ev["old_amount"] = round(abs(float(fresh["amount"] or 0)), 2)
+    ev["old_due"] = fresh["due_on"].isoformat() if fresh["due_on"] else None
+    fresh_raw = as_dict(fresh["raw"])
+    rule = fresh_raw.get("recurrence")
+    ev["old_recurrence"] = {**_recurrence_stamp(fresh_raw),
+                            "rule": dict(rule) if isinstance(rule, dict) else {}}
+    if _insert_proposal(conn, pid=pid, kind=kind, evidence=ev, **kw):
+        return True
+    return conn.execute(
+        "UPDATE bill_proposals SET status='pending', decided_at=NULL, "
+        "payee=%s, amount=%s, bill_type=%s, frequency=%s, interval=%s, "
+        "next_due=%s, evidence=%s, created_at=now() "
+        "WHERE id=%s AND kind=%s AND status='superseded'",
+        (kw["payee"], kw["amount"], kw.get("bill_type", "occurrence"),
+         kw.get("frequency"), kw.get("interval", 1),
+         as_date(kw.get("next_due")), jsonb(ev), pid, kind)).rowcount > 0
 
 
 def _propose_for(conn, bill_row, **kw) -> bool:
@@ -3263,12 +3647,17 @@ def _apply_drift(conn, bill_row, new_amt: float, evidence: dict, stats,
         monthly = sign * _monthly(new_amt, rec.get("frequency"),
                                   rec.get("interval") or 1)
     # the drift IS an amount-set: the next drift needs an occurrence after
-    # today, not a re-read of the same three
+    # today, not a re-read of the same three. The amount it replaces joins
+    # the bill's amount history, as a hand edit's would.
+    hist = budget.amount_history_of(fresh_raw)
+    if old:
+        hist.append({"amount": round(old, 2), "until": today.isoformat()})
     conn.execute(
         "UPDATE bills SET amount=%s, monthly_amount=%s, synced_at=now(), "
         "raw = COALESCE(raw, '{}'::jsonb) || %s::jsonb WHERE id=%s",
         (sign * new_amt, monthly,
-         jsonb({"amount_set_on": today.isoformat()}),
+         jsonb({"amount_set_on": today.isoformat(),
+                "amount_history": hist[-budget.AMOUNT_HISTORY_MAX:]}),
          bill_row["id"]))
     evidence = dict(evidence, old=round(old, 2), new=round(new_amt, 2))
     pid = _sig("drift", bill_row["id"], round(new_amt, 2),

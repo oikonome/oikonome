@@ -92,6 +92,10 @@ def _digits(name: str) -> list[str]:
 def _guess_account_name(filename: str) -> str:
     base = filename.rsplit("/", 1)[-1]
     base = re.sub(r"\.[A-Za-z]+$", "", base)
+    # a long digit run is an account or card number wherever it sits —
+    # "Checking1234567890123" has no word boundary to catch it below — and
+    # the name becomes the account's permanent slug-derived id
+    base = re.sub(r"\d{8,}", " ", base)
     base = re.sub(r"[_\-.]+", " ", base)
     base = re.sub(r"\b(19|20)\d{2}\b|\b\d{4,}\b", "", base)  # years/numbers
     base = re.sub(r"\b(export|statement|transactions|download|history)\b",
@@ -264,11 +268,11 @@ def analyze(conn, files: list[tuple[str, bytes]]) -> dict:
 def _ynab_accounts(data: bytes) -> int:
     """How many YNAB accounts a YNAB register names; 0 for any other file
     (or one that does not parse — the run reports that itself)."""
-    from ..sync import ynabimport
+    from ..sync import csvimport, ynabimport
     from .pages import upload_text
     try:
         text = upload_text(data)
-        header = next(csvmod.reader(io.StringIO(text)), [])
+        header = csvimport.read_header(text)
         if not ynabimport.looks_like_ynab(header):
             return 0
         return len(ynabimport.account_names(ynabimport.parse(text)))

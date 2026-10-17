@@ -14,12 +14,16 @@ from unittest import mock
 
 from oikonome.web import report
 
-from .util import TODAY, add_bill, add_txn, make_db, write_config
+from .util import (TODAY, add_bill, add_ledger_history, add_txn, make_db,
+                   write_config)
 
 
 class EmailRenderTests(unittest.TestCase):
     def setUp(self):
         self.conn = make_db()
+        # an established household: the tiles spread the whole month's
+        # budget only for a ledger that predates the month
+        add_ledger_history(self.conn, TODAY)
         # these tests assert the tile/plan anatomy, which only the
         # DETAIL face renders — the account opts into it the way a real
         # one does, through the stored setting (default is simple)
@@ -202,8 +206,10 @@ class EmailRenderTests(unittest.TestCase):
         # other: 1000/31 ≈ $32/day plan, spent past the budget → $0 forward
         for surface in (html, plain):
             self.assertIn("daily reduced from $32 to $0", surface)
-            # food (only $30 spent of $1,000) is AHEAD → raised
-            self.assertIn("daily raised from $32 to $56", surface)
+            # food ($42.50 spent today of $1,000) is AHEAD → raised: the
+            # $1,000 left at midnight is $59 a day over 17 days, and today's
+            # spend is inside today's allowance, so the days after keep it
+            self.assertIn("daily raised from $32 to $59", surface)
 
     def test_note_and_pace_carry_their_polarity_color(self):
         """The pace phrase beside the verdict word and each tile's daily
@@ -243,16 +249,17 @@ class EmailRenderTests(unittest.TestCase):
         self.assertEqual(tiles["Coffee"]["daily_note"],
                          "daily reduced from $3 to $1")
         self.assertEqual(tiles["Coffee"]["daily_note_tone"], "neg")
-        # parent: the carved remainder ($900 budget, $42.50 own spend) —
-        # raw numbers ($1,000 / $122.50) would read "from $32 to $52"
+        # parent: the carved remainder ($900 budget, $42.50 own spend,
+        # all of it today and inside today's $53 allowance, so the days
+        # after today keep $53) — raw numbers would read "from $32 to $55"
         self.assertEqual(tiles["Food"]["daily_note"],
-                         "daily raised from $29 to $50")
+                         "daily raised from $29 to $53")
         self.assertEqual(tiles["Food"]["daily_note_tone"], "pos")
         # both notes reach the email surfaces verbatim
         _, plain, html = report.build(d)
         for surface in (html, plain):
             self.assertIn("daily reduced from $3 to $1", surface)
-            self.assertIn("daily raised from $29 to $50", surface)
+            self.assertIn("daily raised from $29 to $53", surface)
 
     def test_why_names_custom_buckets_as_first_class(self):
         """Every budget category is an entry — food, everything-else AND

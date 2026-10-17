@@ -14,6 +14,12 @@ from __future__ import annotations
 
 
 
+# The display names of the two fixed buckets, as the Today tiles
+# (todayview.allowances) write them; month_status keys its reasons by the
+# internal names.
+_BUCKET_LABELS = {"food": "Food", "other": "Everything else"}
+
+
 def _m(v: float | None) -> str:
     """Whole-dollar money — SMS has no room for cents."""
     v = v or 0
@@ -63,7 +69,8 @@ def short_daily(d: dict, bucket_names: bool = True) -> str:
     if reasons:
         r = max(reasons, key=lambda x: x.get("variance", 0))
         if (r.get("variance") or 0) > 0:
-            lines.append(f"{r['bucket']} {_sign(r['variance'])} vs pace.")
+            label = _BUCKET_LABELS.get(r["bucket"], r["bucket"])
+            lines.append(f"{label} {_sign(r['variance'])} vs pace.")
     # the number to hit: per-day allowance for the rest of the month, one
     # entry per Today tile. The tiles come from todayview.allowances — the
     # function the Today page, the email HTML and the plain text all render
@@ -78,8 +85,14 @@ def short_daily(d: dict, bucket_names: bool = True) -> str:
             and all("month_budget" in (buckets.get(k) or {})
                     for k in ("food", "other"))):
         from ..web.todayview import allowances
-        days_left = max(1, dim - today.day + 1)
         allow, kids, tiles = allowances(d)
+        # the days the rates cover: once today has spend a tile's rate
+        # spreads over the days after today, so the count is the tiles'
+        # own rate_days, not the calendar's days left. Tiles can differ
+        # (one has spend today, another not); the smaller count never
+        # promises a day's room the rate was not spread over.
+        days_left = min((a["rate_days"] for _l, a in tiles),
+                        default=max(1, dim - today.day + 1))
         if bucket_names:
             rates = [f"{_m(a['rate'])}/day {label}" for label, a in tiles]
         else:
@@ -93,7 +106,7 @@ def short_daily(d: dict, bucket_names: bool = True) -> str:
             rates = [f"{_m(r)}/day {label}" for label, r in folded]
         if rates:
             lines.append("Spend at most " + ", ".join(rates)
-                         + f" — {days_left} days left.")
+                         + f" — {days_left} day{'' if days_left == 1 else 's'} left.")
     return "\n".join(lines)
 
 
@@ -114,7 +127,13 @@ def push_daily(d: dict) -> str:
 
 
 def short_monthly(d: dict, label: str) -> str:
-    """From lenses.month_summary() — the monthly email's source."""
+    """From lenses.month_summary() — the monthly email's source. A month
+    no saved budget stands behind has no verdict and no spendable to
+    measure against, so the text says so and gives the spend alone."""
+    if d.get("budget_set") is False or not d.get("verdict"):
+        return (f"Oikonome, {label}: no budget set · variable "
+                f"{_m(d.get('variable_actual'))} · out "
+                f"{_m(d.get('spend_total'))}.")
     verdict = d.get("verdict", "")
     variance = d.get("variance", 0) or 0
     return (f"Oikonome, {label}: {verdict_phrase(verdict)} "

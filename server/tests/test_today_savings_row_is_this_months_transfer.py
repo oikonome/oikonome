@@ -15,7 +15,7 @@ import unittest
 
 from oikonome.web import lenses, report, todayview
 
-from .util import TODAY, add_txn, make_db, write_config
+from .util import TODAY, add_ledger_history, add_txn, make_db, write_config
 
 
 class TodaySavingsRowTests(unittest.TestCase):
@@ -28,7 +28,9 @@ class TodaySavingsRowTests(unittest.TestCase):
             "INSERT INTO accounts (id,item_id,name,type,subtype,"
             "balance_current) VALUES ('sav','it1','Test Savings',"
             "'depository','savings',0) ON CONFLICT (tenant_id, id) DO NOTHING")
-        # one transfer inside the 90-day window, none this month
+        # the account has a ledger older than the 90-day window, and one
+        # transfer inside the window, none this month
+        add_ledger_history(self.conn, TODAY, account="sav")
         add_txn(self.conn, TODAY - dt.timedelta(days=75), -1500.0,
                 "TO SAVINGS", account="sav", primary="TRANSFER_IN")
 

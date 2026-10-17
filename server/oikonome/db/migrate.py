@@ -471,6 +471,21 @@ def run(admin_dsn: str | None = None) -> list[str]:
             # connection (they create tenants), so the app role needs
             # nothing here — not even SELECT.
             "REVOKE ALL ON signup_reclaims FROM oikonome_app;"
+            "REVOKE ALL ON email_change_reverts FROM oikonome_app;"
+            # Hosted Link add sessions and the queue of Items whose release
+            # failed mid-erasure: admin-connection tables (hashed public
+            # tokens, master-key-encrypted access tokens) the app role
+            # never reads
+            "REVOKE ALL ON plaid_link_sessions FROM oikonome_app;"
+            "REVOKE ALL ON plaid_release_queue FROM oikonome_app;"
+            # a pending login-email change: its link moves the account,
+            # so the app role may read that one is pending and whether its
+            # link was mailed (the settings card, on /api/me's pooled
+            # connection) and never the token, nor write anything
+            "REVOKE ALL ON email_change_requests FROM oikonome_app;"
+            "GRANT SELECT (id, user_id, old_email, new_email, session_id,"
+            " device_id, created_at, expires_at, used_at, mail_sent_at)"
+            " ON email_change_requests TO oikonome_app;"
             "REVOKE INSERT, UPDATE, DELETE ON signup_invites"
             " FROM oikonome_app;"
             "GRANT UPDATE (used_at, used_by_tenant) ON signup_invites"
@@ -635,6 +650,10 @@ def run(admin_dsn: str | None = None) -> list[str]:
 CP_SECRET_COLUMNS = (
     ("users", "id", "totp_secret"),            # per-user TOTP seed
     ("push_vapid", "id", "private_key"),       # the instance web-push key
+    # a Plaid Item waiting to be released: its access token, and the
+    # household's own Plaid secret when the Item was made under its keys
+    ("plaid_release_queue", "item_id", "access_token"),
+    ("plaid_release_queue", "item_id", "secret"),
 )
 
 

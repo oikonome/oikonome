@@ -23,7 +23,17 @@ derivation):
 
 Expected-so-far is prorated to the days that have elapsed: for the
 month in progress that is (day − 1) ÷ days in month, since today has
-not elapsed yet; a closed month expects the full variable budget.
+not elapsed yet; a closed month expects the full variable budget. A
+month whose ledger begins partway through counts its days from the
+first transaction and expects only the budget's share from there to
+month end (see the Budget guide), live or closed, so a first month is
+judged on the days the app actually saw.
+
+A lens judges only a budget you saved, or the frozen snapshot of a
+closed month. Before you save one, a provisional figure seeded from your
+history may fill the Budget page, but the Month lens shows a **no budget
+set** pill and the month's variable spend instead of a verdict, and the
+Year lens gives that month a **net** cell.
 
 **Only variable spending is judged** — Food and Everything else (custom
 budget categories are carved out of those two for display, so their
@@ -74,9 +84,11 @@ before the freeze existed likewise fall back to today's schedule
 projected backward. (The engine never fabricates: a bill with no
 history before its start date adds no expectations to months before it
 existed.) The **current month** is in progress ("day 12 of 31") and
-adds a pace projection: at the current rate, spending lands at
-actual ÷ day of month × days in month (today's date, today included),
-judged against the full variable budget with the month-end tolerance.
+adds a pace projection: spending through yesterday ÷ the days elapsed,
+carried to month end, judged against the variable budget (or a first
+month's share of it) with the month-end tolerance. In the first week of
+a new ledger the projection is the plan itself, unless even the plan's
+pace is over.
 
 The card shows: the money map for the month, **bills paid vs planned**
 (each posted payment, anything due but not posted, envelope usage and

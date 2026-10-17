@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block body %}
+<h1>Undo an email change</h1>
+<div class="card" style="max-width:28rem">
+  {% if error %}<div class="note" style="margin-bottom:.8rem;background:rgba(224,105,93,.10);border-color:rgba(224,105,93,.4);color:var(--red)">{{ error }}</div>{% endif %}
+  {% if state == "confirm" %}
+  <p style="margin-top:0">Put the account back on <b>{{ old_email }}</b>? Its sign-in
+    email is now <b>{{ shown }}</b>.</p>
+  <p class="sub">This signs every browser and device out and sends a password reset to
+    {{ old_email }}. Nothing else about the account changes.</p>
+  <form method="post" action="/account/email-revert">
+    <input type="hidden" name="token" value="{{ token }}">
+    <button class="pri">Put it back</button>
+  </form>
+  {% elif state == "done" %}
+  <div class="note" style="background:rgba(92,181,107,.10);border-color:rgba(92,181,107,.4);color:var(--green)">Done — the account signs in as {{ old_email }} again.</div>
+  <p class="sub" style="margin-top:.8rem">Every browser and device was signed out. A
+    password reset is on its way to {{ old_email }}; use it to choose a new password.
+    If the account has an authenticator or passkey, the reset will also ask for one of
+    your recovery codes.{% if support_email %} Questions:
+    <a href="mailto:{{ support_email }}">{{ support_email }}</a>.{% endif %}</p>
+  {% elif state == "taken" %}
+  <p style="margin-top:0">Another account uses <b>{{ old_email }}</b> now, so this one
+    cannot be moved back to it with this link.</p>
+  <p class="sub">{% if support_email %}Write to
+    <a href="mailto:{{ support_email }}">{{ support_email }}</a>{% else %}Tell whoever runs
+    this instance{% endif %} and say which address the account should have.</p>
+  {% else %}
+  <p class="sub"><a href="/login">Back to sign in</a></p>
+  {% endif %}
+</div>
+{% endblock %}

@@ -521,31 +521,40 @@ def txn_belongs_to_entity(conn, entity_id: str, txn_id: str) -> bool:
         {"eid": entity_id, "tid": txn_id}).fetchone() is not None
 
 
-def classify(conn, txn_id: str, bucket: str, *, sched_c_line=None,
+# Default for classify()'s `sched_c_line`: the caller did not mention the
+# line at all. Distinct from None, which is an explicit "clear the line".
+KEEP = object()
+
+
+def classify(conn, txn_id: str, bucket: str, *, sched_c_line=KEEP,
              note=None) -> None:
+    """Upsert a business transaction's class.
+
+    `sched_c_line` left at KEEP keeps whatever line is stored (the Books
+    tab's bucket dropdown changes the bucket alone, and must not demote a
+    confirmed row back to Unclassified on the P&L). A string sets or changes
+    the line; None clears it — a line saved by mistake has to be removable,
+    and only a caller that names the line can remove it."""
     if bucket not in BUCKETS:
         raise ValueError(f"bucket must be one of {BUCKETS}")
     # closed taxonomy: Schedule C Part II is a printed list of lines, so an
     # invented one cannot be reported and must not be stored
-    if sched_c_line is not None and sched_c_line not in SCHED_C_LINES:
+    keep_line = sched_c_line is KEEP
+    if not keep_line and sched_c_line is not None \
+            and sched_c_line not in SCHED_C_LINES:
         raise ValueError(f"sched_c_line must be one of {SCHED_C_LINES}")
-    # COALESCE, not EXCLUDED: `sched_c_line`/`note` are OPTIONAL arguments, so
-    # a caller that only changes the bucket (the Books tab's bucket dropdown)
-    # passes None for them — and with EXCLUDED that None would overwrite a
-    # Schedule C line the user had already confirmed, silently demoting the
-    # row back to Unclassified on the P&L and the year-end package. Clearing
-    # a line should be an explicit request, never a side effect of omitting
-    # an argument.
+    # `note` stays COALESCE: no client clears a note through this door
     conn.execute(
         """INSERT INTO business_txn_class (txn_id, bucket, sched_c_line, note)
            VALUES (%s,%s,%s,%s)
            ON CONFLICT (tenant_id, txn_id) DO UPDATE SET
              bucket = EXCLUDED.bucket,
-             sched_c_line = COALESCE(EXCLUDED.sched_c_line,
-                                     business_txn_class.sched_c_line),
+             sched_c_line = CASE WHEN %s THEN business_txn_class.sched_c_line
+                                 ELSE EXCLUDED.sched_c_line END,
              note = COALESCE(EXCLUDED.note, business_txn_class.note),
              updated_at = now()""",
-        (txn_id, bucket, sched_c_line, note))
+        (txn_id, bucket, None if keep_line else sched_c_line, note,
+         keep_line))
 
 
 # The row's amount net of partial reimbursement links, keeping the ledger

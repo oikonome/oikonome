@@ -16,7 +16,36 @@ from oikonome.engine import reporting
 from oikonome.sync import restore
 
 from .test_reporting_windows_and_exclusions import _txn
-from .util import make_db, seed_accounts, write_config
+from .util import add_txn, make_db, seed_accounts, write_config
+
+
+class TrailingTwelveMonthsTests(unittest.TestCase):
+    """The Spending page's trailing-12-month toplists cover exactly twelve
+    months: an annual charge on today's anniversary is counted once, not
+    once for last year and once for this, and a future-dated row is not
+    yet spending."""
+
+    def setUp(self):
+        self.conn = make_db()
+        seed_accounts(self.conn)
+        write_config(self.conn)
+        self.today = dt.date(2026, 7, 15)
+        for d in (dt.date(2025, 7, 15), dt.date(2026, 7, 15)):
+            add_txn(self.conn, d, 120.00, "QUILLMARK ANNUAL",
+                    primary="GENERAL_SERVICES", merchant="Quillmark")
+        add_txn(self.conn, dt.date(2026, 7, 20), 50.00, "QUILLMARK ADDON",
+                primary="GENERAL_SERVICES", merchant="Quillmark")
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_anniversary_charge_counts_once(self):
+        sp = reporting.compute_spending(self.conn, self.today)
+        merch = {r[0]: r[1] for r in sp["top_merchants"]}
+        cats = {r[0]: r[1] for r in sp["category_totals"]}
+        self.assertEqual(merch.get("Quillmark"), 120.00)
+        self.assertEqual(cats.get("GENERAL_SERVICES",
+                                  cats.get("GENERAL SERVICES")), 120.00)
 
 
 class ShortLedgerDivisorTests(unittest.TestCase):

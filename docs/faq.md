@@ -116,10 +116,11 @@ July 1 to today), because they show what is there now.
 Card terminals and banks spell a business several ways: cut at 13 or 20
 characters, with the city glued on, without the apostrophe. Big chains
 arrive already identified; a local shop does not, so each spelling starts
-as its own merchant. One exception: where your bank's line and your data
-provider have agreed on the same shop several times over, and the
-provider then calls a single charge on that same line something the line
-does not say, the charge stays with the shop the line means — the name
+as its own merchant. One exception: once your bank's line and your data
+provider have agreed on the same shop — one earlier charge is enough —
+and the provider then calls a charge on that same line something the line
+does not say, the charge stays with the shop the line means, so one card
+terminal stays one merchant whatever the feed calls it that day. The name
 from that one charge is set aside, and a real business of that name still
 gets a merchant of its own when you actually visit it.
 When the app sees spellings that look like one
@@ -148,8 +149,8 @@ string as their name, *seen this month* what has been active lately.
 By merchant. Every bill lists the merchants it pays (the **Merchants** row
 on its edit form, filled in automatically from your ledger when the bill
 is created). A charge is the bill's when the ledger shows it under one of
-those merchants and the amount is within the bill's band (a quarter of the
-bill, with a small floor). So when your bank starts spelling a payee
+those merchants and the amount is within the bill's band (half the bill,
+up to $30, for a bill under $120; a quarter of the bill above that). So when your bank starts spelling a payee
 differently, or you merge two spellings on the Merchants page, the bill
 follows the merchant rather than the letters. When the nightly pass sees
 your charges filed under a new merchant name, it offers to add it to the
@@ -325,9 +326,12 @@ the instance's mail is reaching them. An address the mail server refused is
 marked *not arriving* — with the reason it gave — and its scheduled emails
 are paused until it's fixed, because retrying a dead address every morning
 gets the rest of the instance's mail treated as spam too. Fix the address
-(Settings → Security → Email / username) and confirm the link sent to it;
-delivery restarts from there, and nothing you missed is lost — the app
-always has the full picture.
+(Settings → Security → Email / username) and press the button in the mail
+sent to the new address; delivery restarts from there, and nothing you
+missed is lost — the app always has the full picture. On a hosted instance
+the sign-in address does not change until that button is pressed: the card
+shows the new address as waiting for confirmation, and **Withdraw** calls
+the change off.
 
 If nothing is flagged, delivery itself may not be set up: Doctor → Email
 shows whether it is. **Self-hosted:** delivery (SMTP) lives under Settings
@@ -374,7 +378,10 @@ when the operator's add-on has one. A self-hosted instance has no cap.
 
 **I never clicked the confirmation email — what happens?**
 On a hosted instance the account keeps working, but no household email
-goes out until the address is confirmed, and the banner offers a resend.
+goes out until the address is confirmed. **Settings → Email & Push** and
+**Settings → Security** (Security & household and Email & Push in the phone
+app) carry a **Resend** button from the first day, and after three days a
+banner with the same button appears on every page.
 After a week you get one reminder with a fresh link. After 30 days the
 account is frozen for a week — a last email names the date and carries a
 fresh link, and the frozen screen has a **Resend** button — and then it is
@@ -465,6 +472,29 @@ instance has no cap.
 Import → Recent imports → roll back. Every import is batch-tagged and
 reversible, including bulk runs.
 
+**My import left out older rows — why?**
+The household's history window (Last month / 3 months / 6 months / 1 year
+/ Everything available) applies to every file import: rows dated before
+it are skipped and the import says how many. To bring them in, widen the
+window on the Import page (or choose **Everything available**) and import
+the file again — rows already in are recognised, not duplicated.
+
+**Bills I entered myself — why doesn't the app propose new ones?**
+Choosing **I'll enter them myself** in the setup wizard turns off the
+nightly search for new bills and paychecks. The bills you have are still
+kept up (due dates, price drift, change and stopped offers). **Find bills
+& income** on the Bills page runs a scan whenever you ask, and the
+nightly search comes back with **Look for new bills and paychecks every
+night**, the switch next to Find bills & income on the Bills page (web
+and phone).
+
+**How do I switch between light and dark?**
+By default the app follows your phone or computer's setting (**Auto**).
+Pin **Light** or **Dark** in the setup wizard's first step, from the
+account menu's **Theme** button in the browser, or Settings → Appearance in
+the phone app. The choice is saved for the household; a viewer login and
+the demo keep their own choice on each device instead.
+
 **Why did deleting my account ask for a recovery code?**
 An account that signs in with **only a passkey** (no authenticator
 app) can't prove the passkey inside a plain form, and the password
@@ -532,14 +562,25 @@ insurance check can split across several charges. See the
 reimbursements guide.
 
 **Do receipt line items change my budget?**
-No. The transaction's total is the only number the verdict and budgets
-see — line items explain a charge (and drive the tag-based expense
-report), never re-bucket it.
+Only for a store receipt matched to a charge (Costco, Amazon) whose
+items are of more than one kind: the charge is then split by those
+items, so the groceries in a mixed warehouse run count as food and the
+rest elsewhere. A split you edit or remove yourself wins, and the
+receipt leaves it alone. A receipt you attach or snap yourself explains
+the charge (and drives the tag-based expense report) without
+re-bucketing it. See the transactions guide, "Splits from a receipt".
 
 **A bill's amount changed and I didn't touch it.**
 Amount drift auto-applies: when a bill settles at a new real amount
 (subscription price hike), the bill updates and leaves an audit entry.
-Your own hand-edited amounts are immune to drift for 60 days.
+Your own hand-edited amounts are immune to drift for 60 days. A change
+bigger than the bill's band (half the bill, up to $30, for a bill under
+$120; a quarter of the bill above that) is never applied on its own: it
+shows up as an **amount change** proposal to approve. Dismiss it and that
+price (within 5 % or $1) is not offered again until the bill's amount
+changes; approving an old offer after you edited the amount
+is refused. Payments at the old amount stay matched to the bill either
+way.
 
 **I linked two sources for one account — will it double-count?**
 No. The healthiest preferred source serves the numbers; the rest are
@@ -571,3 +612,13 @@ chose. No backend configured → the Assistant hides entirely.
 No. Self-hosted instances talk only to the aggregators you configure
 and (if set) your SMTP and LLM endpoints. The Doctor page lists every
 outbound dependency.
+
+## Does the phone app update itself?
+
+Each time the app comes to the front it asks the store (at most every
+six hours) whether a newer build exists and offers it: on Android the
+Play update runs inside the app and restarts it when done; on iOS the
+App Store page opens. **Later** waits a day before asking again. A build
+that did not come from the store (a sideload, an emulator) is never
+asked.
+

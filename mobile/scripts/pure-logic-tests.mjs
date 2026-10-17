@@ -7,23 +7,35 @@
 // so `make test` goes red if the banker's rounding or the savings-goals
 // merge regresses.
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import zlib from "node:zlib";
 import test from "node:test";
 
-import { ApiError, countsInTotals, downloadRefusal, errText, inOperatingProfit,
-         whatIfRefusal } from "../src/lib/api.ts";
+import { ApiError, busyText, countsInTotals, downloadRefusal, errText,
+         inOperatingProfit, signInErrText, whatIfRefusal }
+  from "../src/lib/api.ts";
 import { accountTheme, billToggleNote, categoryForServer, CLEAR_CATEGORY, composeBugReport,
-         filterCategories, dayLabel, daySpend,
+         filterCategories, dayLabel, daySpend, rowSpend,
          elevationProof, recoveryNeedsPassword, hostOf,
-         hueOf, isPrivateHost, isValidYmd, logoProxyUrl, monogram,
+         hueOf, isPlanSavingsGoal, isPrivateHost, isValidYmd, logoProxyUrl,
+         mergeIncomeScenarios, monogram,
          monthYear, serverUrlVerdict, lastSyncPhrase, mergeSavingsGoals,
          money, moneyParam, numv, pyround, resolveFace, span, whatIfQuery,
-         withDayHeads }
+         withDayHeads, SIGN_IN_AGAIN, twoFactorRecheck }
   from "../src/lib/pure.ts";
 
 import * as pureModule from "../src/lib/pure.ts";
+import { FIRST_SYNC_RUNNING, firstSyncPending, linkedLine }
+  from "../src/lib/pure.ts";
 import { moneyCases } from "./money-cases.mjs";
+import { accountsSummary, adjustOf, billLine, billsSummary, budgetsSummary,
+         clockHour, deliverySummary, dueDayOf, finishBlurb, HISTORY_CHOICES,
+         historyMonthsOf, historyPhrase, MANUAL_CADENCES, manualTally,
+         nextDueForDay, ordinal, parseDueDay, proposalCadenceValue,
+         recipientRole, WIZARD_STEPS, wizardThemeChoice, cadenceTakesDueDay,
+         latestWins, proposalAdjustable, keptBudget, manualBudgetsBody,
+         manualBudgetsPrefill, manualBudgetsRefusal }
+  from "../src/components/wizard-logic.ts";
 
 import { clockLabel, glanceFace, STALE_AFTER_MS, wideEnoughForChips,
          widgetOwner, widgetOwnerChanged, credentialStamp, ownedCache,
@@ -41,6 +53,26 @@ const glance = (over = {}) => ({
           { text: "Gas over by $8", tone: "neg" }],
   as_of: "2026-01-15T09:40:00Z", ...over });
 const at = (ms) => ({ glance: glance(), fetched_at: ms });
+
+test("second-factor lockout: a phone signed out by a web enrolment is told to sign in again", () => {
+  assert.equal(twoFactorRecheck({ errorStatus: 401 }), "sign-in-again");
+  assert.equal(SIGN_IN_AGAIN, "Sign in again to continue");
+});
+
+test("second-factor lockout: still required sends the person to set it up on this phone", () => {
+  assert.equal(twoFactorRecheck({ me: { needs_2fa: true } }), "set-up-here");
+});
+
+test("second-factor lockout: a factor already on clears the lockout", () => {
+  assert.equal(twoFactorRecheck({ me: { needs_2fa: false } }), "cleared");
+  assert.equal(twoFactorRecheck({ me: {} }), "cleared");
+});
+
+test("second-factor lockout: an unreachable server is neither a sign-out nor a clear", () => {
+  assert.equal(twoFactorRecheck({ errorStatus: 503 }), "unreachable");
+  assert.equal(twoFactorRecheck({ errorStatus: 0 }), "unreachable");
+  assert.equal(twoFactorRecheck({ me: null }), "unreachable");
+});
 
 test("widget: no credential is Sign in, no plan is Set a plan", () => {
   assert.equal(glanceFace(at(0), false, 0).kind, "signin");
@@ -589,6 +621,27 @@ test("an old server without counts_as_spend still gets a non-zero day total", ()
   assert.equal(spent, 236.44);
 });
 
+test("the day total sums the server's spend_amount, not the amount column", () => {
+  // spend_amount is the verdict's own figure: a partially reimbursed
+  // charge counts net, a row on an excluded account counts 0 even though
+  // counts_as_spend is absent/true — so the subtotal matches the month hero
+  const spent = daySpend([
+    { ...tx("a", "2026-08-10", 100, "MEDICAL", true), spend_amount: 60 },
+    { ...tx("b", "2026-08-10", 800, "FOOD AND DRINK", true), spend_amount: 0 },
+    { ...tx("c", "2026-08-10", 50, "SHOPPING"), spend_amount: 0 },
+  ]);
+  assert.equal(spent, 60);
+});
+
+test("a null spend_amount falls back to the counts_as_spend rule", () => {
+  assert.equal(rowSpend({ ...tx("a", "2026-08-10", 40, "MEDICAL", true),
+                          spend_amount: null }), 40);
+  assert.equal(rowSpend({ ...tx("b", "2026-08-10", 40, "MEDICAL", false),
+                          spend_amount: null }), 0);
+  assert.equal(rowSpend({ ...tx("c", "2026-08-10", 40, "TRANSFER_OUT"),
+                          spend_amount: null }), 0);
+});
+
 test("a day with no spend still reports its count", () => {
   const [head] = withDayHeads([tx("a", "2026-08-10", -2450, "INCOME")]);
   assert.equal(head.count, 1);
@@ -1109,6 +1162,36 @@ test("the add-a-bank door closes exactly at the cap", () => {
   // handed a door the server would refuse after the bank is authorized
   assert.deepEqual(institutionAllowance(3, 4), { known: true, full: true });
   assert.deepEqual(institutionAllowance(2, 0), { known: true, full: false });
+});
+
+import { awaitsEmailConfirm } from "../src/lib/pure.ts";
+
+test("only a hosted, explicitly unconfirmed address closes the bank door",
+     () => {
+  assert.equal(awaitsEmailConfirm({ hosted: true, verified: false }), true);
+  assert.equal(awaitsEmailConfirm({ hosted: true, verified: true }), false);
+  // an older server that omits the flag, self-host, and a /api/me still
+  // in flight must never lock an owner out of connecting
+  assert.equal(awaitsEmailConfirm({ hosted: true }), false);
+  assert.equal(awaitsEmailConfirm({ hosted: false, verified: false }), false);
+  assert.equal(awaitsEmailConfirm(undefined), false);
+});
+
+import { bankAwaitsConfirm } from "../src/lib/pure.ts";
+
+test("the server's word on waiting for confirmation closes the bank door",
+     () => {
+  // a paying household whose owner has not confirmed may still connect:
+  // the server says so, and an unconfirmed address must not overrule it
+  assert.equal(bankAwaitsConfirm({ hosted: true, verified: false,
+    features: { bank_awaits_confirm: false } }), false);
+  assert.equal(bankAwaitsConfirm({ hosted: true, verified: false,
+    features: { bank_awaits_confirm: true } }), true);
+  // an older server that does not say falls back to "hosted, unconfirmed"
+  assert.equal(bankAwaitsConfirm({ hosted: true, verified: false,
+    features: {} }), true);
+  assert.equal(bankAwaitsConfirm({ hosted: true, verified: true }), false);
+  assert.equal(bankAwaitsConfirm(undefined), false);
 });
 
 test("an unknown or absent cap leaves the door open and the figure unsaid",
@@ -2079,10 +2162,58 @@ test("cache sweep: every shared download kind is ours, the platform's are not", 
   for (const n of ["oikonome-export.zip", "dump.sql.gz", "biz.csv",
                    "continuity.pdf", "calendar.ics", "receipt.JPG",
                    "receipt.webp", "oikonome-config.oikx",
-                   "oikonome-system-health.json"])
+                   "oikonome-system-health.json",
+                   "oikonome-answer-2026-10-15.html", "transactions.xlsx"])
     assert.equal(isSharedDownload(n), true, n);
   for (const n of ["ImagePicker", "http-cache", "notes.txt", "oikx"])
     assert.equal(isSharedDownload(n), false, n);
+});
+
+// Every name the app writes into the cache for the share sheet, read
+// from the source itself, must be one the sweep deletes: a format added
+// without widening isSharedDownload would leave that household's file in
+// the cache, unencrypted, after sign-out. A name whose extension is chosen
+// at run time has its choices listed here, so adding one fails loudly
+// until it is listed (and swept).
+const RUNTIME_EXTENSIONS = {
+  "src/app/(tabs)/transactions.tsx": ["csv", "xlsx"],
+  "src/app/txn.tsx": ["pdf", "png", "jpg"],
+};
+test("cache sweep: every file name the app downloads or writes is swept", () => {
+  const { isSharedDownload } = pureModule;
+  const root = new URL("../", import.meta.url);
+  const walk = (dir) => readdirSync(new URL(dir, root), { withFileTypes: true })
+    .flatMap((e) => e.isDirectory() ? walk(`${dir}${e.name}/`)
+      : /\.tsx?$/.test(e.name) ? [`${dir}${e.name}`] : []);
+  const lit = /(["'`])((?:\$\{[^}]*\}|[^"'`\s$])*\.(?:\$\{[^}]+\}|[A-Za-z0-9]+))\1/g;
+  const names = [];
+  for (const file of walk("src/")) {
+    const src = readFileSync(new URL(file, root), "utf8");
+    const spots = [
+      ...[...src.matchAll(/\.download\(([\s\S]*?)\);/g)].map((m) => m[1]),
+      ...[...src.matchAll(/filename=(\{`[^`]*`\}|"[^"]*")/g)].map((m) => m[1]),
+      ...[...src.matchAll(/cacheDirectory!?\s*\+\s*(\([^)]*\)|`[^`]*`|"[^"]*")/g)]
+        .map((m) => m[1]),
+    ];
+    for (const spot of spots) {
+      const found = [...spot.matchAll(lit)].map((m) => m[2])
+        .filter((n) => !n.startsWith("/"));        // a request path, not a name
+      for (const n of found.slice(-1)) {
+        const ext = /\.\$\{[^}]+\}$/.exec(n);
+        if (!ext) { names.push([file, n]); continue; }
+        const choices = RUNTIME_EXTENSIONS[file];
+        assert.ok(choices, `${file}: ${n} picks its extension at run time; list the choices`);
+        for (const c of choices) names.push([file, n.slice(0, ext.index) + "." + c]);
+      }
+    }
+  }
+  const files = new Set(names.map(([f]) => f));
+  for (const f of ["src/app/(tabs)/transactions.tsx", "src/app/txn.tsx",
+                   "src/app/settings.tsx", "src/app/business.tsx",
+                   "src/app/doctor.tsx", "src/lib/api.ts"])
+    assert.ok(files.has(f), `no download name found in ${f}: the scan has gone blind`);
+  assert.ok(names.some(([, n]) => n === "transactions.xlsx"));
+  for (const [f, n] of names) assert.equal(isSharedDownload(n), true, `${f}: ${n}`);
 });
 
 test("cache sweep: sign-out takes every download, a later sweep spares fresh ones", () => {
@@ -2446,9 +2577,9 @@ test("theme: an explicit auto survives the account reconcile", () => {
   assert.equal(accountTheme("auto"), "auto");
   assert.equal(accountTheme("light"), "light");
   assert.equal(accountTheme("dark"), "dark");
-  // never chosen: the dark default
-  assert.equal(accountTheme(undefined), "dark");
-  assert.equal(accountTheme(null), "dark");
+  // never chosen: follow the phone's own setting
+  assert.equal(accountTheme(undefined), "auto");
+  assert.equal(accountTheme(null), "auto");
   // not a theme this build knows: leave the phone's choice alone
   assert.equal(accountTheme("neon"), null);
 });
@@ -2493,6 +2624,38 @@ for (const [side, m] of [["mobile", mobileCad], ["web", webCad]]) {
     assert.deepEqual(m.cadenceChoices(STD_CADENCES, ["MONTHLY:3", "", null]),
                      STD_CADENCES);
   });
+
+  test(`${side}: the add picker can make a one-time, every-2-weeks or every-14-days bill`, () => {
+    const add = m.ADD_CADENCES.map(([k]) => k);
+    assert.ok(add.includes("ONE_TIME:1"), "one-time is a plain pick");
+    const units = m.CUSTOM_UNITS.map(([k]) => k);
+    assert.deepEqual(units, ["DAILY", "WEEKLY", "MONTHLY", "YEARLY"]);
+    assert.equal(m.customCadence("WEEKLY", "2"), "WEEKLY:2");
+    assert.equal(m.customCadence("DAILY", "14"), "DAILY:14");
+    assert.equal(m.customCadence("MONTHLY", ""), "MONTHLY:1");
+    assert.equal(m.customCadence("YEARLY", "0"), "YEARLY:1");
+    // the server bounds an interval at about 20 years of its unit, so the
+    // picker caps each unit there — 240 years would be refused
+    assert.deepEqual(m.CUSTOM_MAX,
+                     { DAILY: 7300, WEEKLY: 1043, MONTHLY: 240, YEARLY: 20 });
+    assert.equal(m.customMax("YEARLY"), 20);
+    assert.equal(m.customMax("weekly"), 1043);
+    assert.equal(m.customMax("FORTNIGHTLY"), 20, "an unknown unit gets the smallest cap");
+    assert.equal(m.customCadence("YEARLY", "20"), "YEARLY:20");
+    assert.equal(m.customCadence("YEARLY", "240"), "YEARLY:20");
+    assert.equal(m.customCadence("MONTHLY", "240"), "MONTHLY:240");
+    assert.equal(m.customCadence("MONTHLY", "241"), "MONTHLY:240");
+    assert.equal(m.customCadence("WEEKLY", "1043"), "WEEKLY:1043");
+    assert.equal(m.customCadence("WEEKLY", "1044"), "WEEKLY:1043");
+    assert.equal(m.customCadence("DAILY", "7300"), "DAILY:7300");
+    assert.equal(m.customCadence("DAILY", "7301"), "DAILY:7300");
+    assert.equal(m.customCadence("DAILY", "99999"), "DAILY:7300");
+    // every add choice reads in the bills list's own words
+    for (const [k, words] of m.ADD_CADENCES)
+      assert.equal(m.cadenceWords(k), words, k);
+    assert.equal(m.cadenceWords(m.customCadence("WEEKLY", "2")), "every 2 weeks");
+    assert.equal(m.cadenceWords(m.customCadence("DAILY", "14")), "every 14 days");
+  });
 }
 
 test("the two copies of the cadence picker are the same text", () => {
@@ -2506,6 +2669,24 @@ test("the two copies of the cadence picker are the same text", () => {
     };
     assert.notEqual(body(web).length, 0);
     assert.equal(body(mob), body(web), fn);
+  }
+});
+
+test("the two copies of the add picker's cadence lists are the same text", () => {
+  const web = readFileSync(
+    new URL("../../webapp/src/cadence.ts", import.meta.url), "utf8");
+  const mob = readFileSync(new URL("../src/lib/pure.ts", import.meta.url), "utf8");
+  const body = (src, head, end) => {
+    const i = src.indexOf(head);
+    return i === -1 ? "" : src.slice(i, src.indexOf(end, i));
+  };
+  for (const [head, end] of [["export const ADD_CADENCES", "\n];\n"],
+                             ["export const CUSTOM_UNITS", "\n];\n"],
+                             ["export const CUSTOM_MAX", "\n};\n"],
+                             ["export function customMax", "\n}\n"],
+                             ["export function customCadence", "\n}\n"]]) {
+    assert.notEqual(body(web, head, end).length, 0, head);
+    assert.equal(body(mob, head, end), body(web, head, end), head);
   }
 });
 
@@ -2526,6 +2707,15 @@ test("zone adopt: a fresh answer still on the instance zone adopts the phone's",
 test("zone adopt: a fresh answer with a household-chosen zone is left alone", () => {
   assert.equal(mobileCad.zoneToAdopt(
     { ...hostedOwner, timezone_source: "household" }, "America/Denver"), null);
+});
+
+test("zone adopt: waits out the second-factor lockout, then adopts on the next fresh answer", () => {
+  // the server refuses every settings write until a factor is enrolled,
+  // and a refusal is final for the launch — so no attempt is spent there
+  assert.equal(mobileCad.zoneToAdopt({ ...hostedOwner, needs_2fa: true },
+                                     "America/Denver"), null);
+  assert.equal(mobileCad.zoneToAdopt({ ...hostedOwner, needs_2fa: false },
+                                     "America/Denver"), "America/Denver");
 });
 
 test("zone adopt: a refusal is final, a dropped connection retries a few times", () => {
@@ -3558,4 +3748,1041 @@ test("ynab accounts: the import waits for an answer for every account", () => {
                YNAB_SEVERAL);
   assert.doesNotMatch("CSV columns not recognized — import it alone to map "
                       + "them", YNAB_SEVERAL);
+});
+
+// ---- the assistant's charts: the geometry is arithmetic, so it is
+// tested as arithmetic — bars stand on the zero line, a negative bar
+// hangs below it, ring arcs sum to the circle, counts stay counts ----
+import { barLayout, cellText, chartRows, historyNotKept, lineLayout, localTurn,
+         keepNotes, mayTidyLog, mergeTurns, nextCursor, pagingCursor, plainNumber, pruneLocal,
+         reportBlocks, sharedLogDenied,
+         ringLayout, shortMoney, groupThreads, threadKey,
+         conversationGone, followUpGone, replyNotKept,
+         partialNote, PARTIAL_NOTE, START_GONE_NOTE, REMOVED_NOTE, RESTARTED_NOTE,
+         threadMissing, threadDoorMissing, turnMissing } from "../src/lib/answer-pure.ts";
+
+test("answer charts: bars share one zero line and a negative hangs below it", () => {
+  const L = barLayout(["Jan", "Feb", "Mar"],
+                      [{ name: "Saved", values: [120, -45, 30] }], 300, 170);
+  assert.equal(L.bars.length, 3);
+  const [a, b, c] = L.bars;
+  assert.ok(a.y < L.zeroY && Math.abs(a.y + a.h - L.zeroY) < 0.01, "positive stands on zero");
+  assert.ok(Math.abs(b.y - L.zeroY) < 0.01 && b.h > 0, "negative hangs from zero");
+  assert.ok(a.h > c.h, "taller bar for the bigger value");
+  // one series, few bars: the value is written on each bar
+  assert.deepEqual(L.bars.map((r) => r.label), ["$120", "-$45", "$30"]);
+  assert.equal(L.xLabels.length, 3);
+  // two series: no per-bar labels, the legend names them
+  const two = barLayout(["Jan"], [{ name: "a", values: [1] }, { name: "b", values: [2] }], 300, 170);
+  assert.equal(two.bars.length, 2);
+  assert.ok(two.bars.every((r) => r.label === null));
+  assert.ok(two.bars[1].x > two.bars[0].x + two.bars[0].w, "grouped bars do not overlap");
+});
+
+test("answer charts: a long axis thins its labels, never drops the ends", () => {
+  const labels = Array.from({ length: 36 }, (_, i) => `m${i}`);
+  const B = barLayout(labels, [{ name: "x", values: labels.map(() => 1) }], 300, 170);
+  assert.ok(B.xLabels.length <= 7 && B.xLabels.length >= 5, String(B.xLabels.length));
+  assert.ok(B.bars.every((r) => r.label === null));
+  const L = lineLayout(labels, [{ name: "x", values: labels.map((_, i) => i) }], 300, 170);
+  assert.equal(L.xLabels[0].text, "m0");
+  assert.equal(L.xLabels.at(-1).text, "m35");
+  assert.equal(L.xLabels.at(-1).anchor, "end");
+  assert.equal(L.zeroY, null, "no zero line when nothing is negative");
+  assert.equal(L.lines.length, 1);
+  assert.equal(L.lines[0].points.split(" ").length, 36);
+});
+
+test("answer charts: ring arcs cover the circle once and skip non-positive parts", () => {
+  const R = ringLayout(["a", "b", "c", "d"], [50, 30, 0, -5], 60);
+  assert.equal(R.segs.length, 2);
+  assert.equal(R.total, 80);
+  assert.ok(Math.abs(R.segs.reduce((s, g) => s + g.dash, 0) - R.circ) < 1e-6);
+  assert.equal(R.segs[1].offset, R.segs[0].dash);
+  assert.ok(Math.abs(R.segs[0].share - 0.625) < 1e-9);
+  assert.deepEqual(ringLayout(["a"], [0], 60).segs, []);
+});
+
+test("answer charts: formats — axis money short, table numbers plain", () => {
+  assert.equal(shortMoney(1234), "$1.2k");
+  assert.equal(shortMoney(2000), "$2k");
+  assert.equal(shortMoney(-45), "-$45");
+  assert.equal(shortMoney(1_250_000), "$1.25M");
+  assert.equal(plainNumber(52), "52");
+  assert.equal(plainNumber(1204.1), "1,204.10");
+  assert.equal(cellText("Example Mart"), "Example Mart");
+  assert.equal(cellText(52), "52");
+  const t = chartRows(["Jan"], [{ name: "Spent", values: [412.5] }]);
+  assert.deepEqual(t.columns, ["", "Spent"]);
+  assert.equal(t.rows[0][0], "Jan");
+  assert.ok(t.rows[0][1].startsWith("$41"));
+});
+
+test("answer charts: the report sends the blocks, or the prose as one block", () => {
+  const blocks = [{ kind: "text", text: "hi" }];
+  assert.equal(reportBlocks("hi", blocks), blocks);
+  assert.deepEqual(reportBlocks("prose only", undefined), [{ kind: "text", text: "prose only" }]);
+  assert.deepEqual(reportBlocks("prose only", []), [{ kind: "text", text: "prose only" }]);
+});
+
+// ---- the assistant keeps an answer the server's log does not show ----
+const kept = (id, q = "q" + id) => ({ id, asked_at: "2026-01-0" + id + "T10:00:00Z",
+  asked_by: "a", question: q, answer: "a" + id, blocks: [], tools_used: [] });
+const NOW = new Date("2026-01-09T12:00:00Z");
+
+test("assistant: an answer with no id (older server, or a turn not kept) is shown", () => {
+  const t = localTurn("k1", "net worth?", { answer: "$5", tools_used: ["networth"] }, NOW);
+  assert.equal(t.id, null);
+  assert.equal(t.local, true);
+  assert.deepEqual(t.blocks, []);
+  assert.deepEqual(t.tools_used, ["networth"]);
+  assert.equal(t.asked_at, NOW.toISOString());
+  const shown = mergeTurns([t], [], []);
+  assert.equal(shown.length, 1);
+  assert.equal(shown[0].answer, "$5");
+  // a null id stays even beside server rows — nothing will ever carry it
+  assert.equal(mergeTurns([t], [kept("1")], []).length, 2);
+  assert.equal(pruneLocal([t], [kept("1")]).length, 1);
+});
+
+test("assistant: a kept turn the fresh page does not carry was removed elsewhere", () => {
+  const t = localTurn("k1", "q9", { answer: "a9", id: "9" }, NOW);
+  const later = { id: "1", asked_at: new Date(NOW.getTime() + 1000).toISOString() };
+  const earlier = { id: "2", asked_at: new Date(NOW.getTime() - 1000).toISOString() };
+  // a page read after the ask that spans the turn's time: the turn is gone
+  assert.deepEqual(pruneLocal([t], [later, earlier], true), []);
+  assert.deepEqual(pruneLocal([t], [later], false), []);
+  // a page read before the ask (newest row older) says nothing yet
+  assert.equal(pruneLocal([t], [earlier], true).length, 1);
+  // a page full of newer questions with an older page left: it may be there
+  assert.equal(pruneLocal([t], [later], true).length, 1);
+  // an empty page cannot tell fresh from stale
+  assert.equal(pruneLocal([t], [], false).length, 1);
+});
+
+test("assistant: a kept turn shows once — the log's row replaces the local copy", () => {
+  const t = localTurn("k1", "q9", { answer: "a9", id: "9" }, NOW);
+  assert.deepEqual(mergeTurns([t], [kept("1")], []).map((x) => x.id), ["9", "1"]);
+  const after = mergeTurns([t], [kept("9"), kept("1")], []);
+  assert.deepEqual(after.map((x) => x.id), ["9", "1"]);
+  assert.equal(after[0].local, undefined);
+  assert.deepEqual(pruneLocal([t], [kept("9")]), []);
+  // an older page that also carries it counts too
+  assert.equal(mergeTurns([t], [], [kept("9")]).length, 1);
+});
+
+test("assistant: local turns sit newest-first above the log; pages dedupe", () => {
+  const a = localTurn("k1", "first", { answer: "1" }, NOW);
+  const b = localTurn("k2", "second", { answer: "2" }, NOW);
+  const shown = mergeTurns([a, b], [kept("3"), kept("2")], [kept("2"), kept("1")]);
+  assert.deepEqual(shown.map((x) => x.question), ["second", "first", "q3", "q2", "q1"]);
+});
+
+test("assistant: a 404 history read means no shared log, not an error", () => {
+  assert.equal(historyNotKept(new ApiError(404, "Not Found")), true);
+  assert.equal(historyNotKept(new Error("404: {\"detail\":\"Not Found\"}")), true);
+  assert.equal(historyNotKept(new ApiError(500, "boom")), false);
+  assert.equal(historyNotKept(new Error("500: boom")), false);
+  assert.equal(historyNotKept(new Error("network down")), false);
+  assert.equal(historyNotKept(null), false);
+});
+
+// ---- paging the shared log by (asked_at, id): rows sharing a timestamp
+// at a page boundary must not be skipped ----
+const row = (id, at = "2026-01-15T09:00:00+00:00") => ({ id, asked_at: at });
+
+// ---- conversations: one card per thread, newest first ----
+test("assistant: turns group into conversations, newest first, each oldest first", () => {
+  const t = (id, thread, at) => ({ ...kept(id), thread_id: thread, asked_at: at });
+  const rows = [t("3", "1", "2026-01-03T10:00:00Z"), t("2", "2", "2026-01-02T10:00:00Z"),
+                t("1", "1", "2026-01-01T10:00:00Z")];
+  const threads = groupThreads(rows);
+  assert.deepEqual(threads.map((x) => x.id), ["1", "2"]);
+  assert.deepEqual(threads[0].turns.map((x) => x.id), ["1", "3"]);
+  assert.equal(threads[0].last_at, "2026-01-03T10:00:00Z");
+});
+
+test("assistant: a turn without a thread (older server) is a conversation of one", () => {
+  const threads = groupThreads([kept("1"), kept("2")]);
+  assert.equal(threads.length, 2);
+  assert.equal(threads[0].id, "2");
+  assert.equal(threadKey(kept("1")), "1");
+});
+
+test("assistant: a local follow-up sits in its thread; an unkept one is its own", () => {
+  const first = kept("1");
+  const follow = localTurn("k9", "and?", { answer: "more", id: "9", thread_id: "1" }, NOW);
+  const lost = localTurn("k8", "lost?", { answer: "x" }, NOW, null);
+  const threads = groupThreads([follow, lost, first]);
+  const mine = threads.find((x) => x.id === "1");
+  assert.deepEqual(mine.turns.map((x) => x.question), ["q1", "and?"]);
+  const alone = threads.find((x) => x.key === "k8");
+  assert.equal(alone.id, null);
+  // a follow-up answered by a server that could not keep it still joins the thread it was asked in
+  const unkept = localTurn("k7", "again?", { answer: "y" }, NOW, "1");
+  assert.equal(threadKey(unkept), "1");
+});
+
+test("assistant: older questions resume from the server's (time, id) cursor", () => {
+  const page = { turns: [row("c"), row("b")], more: true,
+                 next: { before: "2026-01-15T09:00:00+00:00", before_id: "b" } };
+  assert.deepEqual(nextCursor(page), { before: "2026-01-15T09:00:00+00:00", before_id: "b" });
+  // a server without `next` still gets the last row's id, not the time alone
+  assert.deepEqual(nextCursor({ turns: [row("c"), row("b")], more: true }),
+                   { before: "2026-01-15T09:00:00+00:00", before_id: "b" });
+});
+
+test("assistant: paging stops when the page says no more", () => {
+  assert.equal(nextCursor({ turns: [row("a")], more: false,
+                            next: { before: "x", before_id: "a" } }), null);
+  assert.equal(nextCursor({ turns: [], more: true }), null);
+  assert.equal(nextCursor(undefined), null);
+});
+
+test("assistant: the cursor follows the last older page, else the first", () => {
+  const first = { turns: [row("d")], more: true, next: { before: "t1", before_id: "d" } };
+  const older = { turns: [row("c")], more: true, next: { before: "t0", before_id: "c" } };
+  assert.deepEqual(pagingCursor(first, null), { before: "t1", before_id: "d" });
+  assert.deepEqual(pagingCursor(first, older), { before: "t0", before_id: "c" });
+  assert.equal(pagingCursor(first, { ...older, more: false }), null);
+});
+
+test("assistant: remove/clear are for editors who are not the shared login", () => {
+  assert.equal(mayTidyLog(true, { shared_login: false }), true);
+  assert.equal(mayTidyLog(true, {}), true);              // a demo household's own login
+  assert.equal(mayTidyLog(true, { shared_login: true }), false);
+  assert.equal(mayTidyLog(false, { shared_login: false }), false);
+  assert.equal(mayTidyLog(true, undefined), false);      // unknown is not privileged
+});
+
+test("assistant: the shared-login 403 is recognised, other errors are not", () => {
+  const sentence = "This is a shared demonstration login — it can't delete questions";
+  assert.equal(sharedLogDenied(new ApiError(403, sentence)), true);
+  assert.equal(sharedLogDenied(new Error(`403: {"detail":"${sentence}"}`)), true);
+  assert.equal(sharedLogDenied(new ApiError(403, "forbidden")), false);
+  assert.equal(sharedLogDenied(new ApiError(500, sentence)), false);
+  assert.equal(sharedLogDenied(null), false);
+});
+
+// ---- a conversation split across log pages, or removed elsewhere ----
+test("assistant: a thread whose start is on an older page is marked partial", () => {
+  const t = (id, thread, at) => ({ ...kept(id), thread_id: thread, asked_at: at });
+  // first page: two follow-ups of thread "1"; its opening turn is on page two
+  const firstPage = [t("5", "1", "2026-01-05T10:00:00Z"), t("4", "1", "2026-01-04T10:00:00Z"),
+                     t("3", "3", "2026-01-03T10:00:00Z")];
+  const split = groupThreads(firstPage);
+  assert.equal(split.find((x) => x.id === "1").partial, true);
+  assert.equal(split.find((x) => x.id === "3").partial, false, "a root alone is whole");
+  // once the older page lands the thread is whole, opening turn first
+  const whole = groupThreads([...firstPage, t("1", "1", "2026-01-01T10:00:00Z")]);
+  const one = whole.find((x) => x.id === "1");
+  assert.equal(one.partial, false);
+  assert.deepEqual(one.turns.map((x) => x.id), ["1", "4", "5"]);
+  // a turn from a server without threads is never partial
+  assert.equal(groupThreads([kept("1")])[0].partial, false);
+  // a local follow-up whose thread's start is not loaded is partial too
+  const lone = localTurn("k1", "and?", { answer: "x", id: "9", thread_id: "1" }, NOW);
+  assert.equal(groupThreads([lone])[0].partial, true);
+});
+
+test("assistant: the ask's 404 means the conversation is gone; other errors do not", () => {
+  assert.equal(conversationGone(new ApiError(404, "no such conversation")), true);
+  assert.equal(conversationGone(new Error("404: {\"detail\":\"no such conversation\"}")), true);
+  assert.equal(conversationGone(new ApiError(502, "assistant error")), false);
+  assert.equal(conversationGone(new ApiError(503, "busy")), false);
+  assert.equal(conversationGone(new Error("network down")), false);
+});
+
+test("assistant: the follow-up chip clears only when the log shows its thread removed", () => {
+  const t = (id, thread, at) => ({ ...kept(id), thread_id: thread, asked_at: at });
+  const f = { id: "1", question: "q1", last_at: "2026-01-04T10:00:00Z" };
+  const live = [t("4", "1", "2026-01-04T10:00:00Z"), t("1", "1", "2026-01-01T10:00:00Z")];
+  // still there: keep
+  assert.equal(followUpGone(f, live, { turns: live, more: false }), false);
+  // removed, and the page reaches back past its latest turn: clear
+  const after = [t("6", "6", "2026-01-06T10:00:00Z"), t("2", "2", "2026-01-02T10:00:00Z")];
+  assert.equal(followUpGone(f, after, { turns: after, more: true }), true);
+  // removed, and nothing more to read: clear
+  const short = [t("6", "6", "2026-01-06T10:00:00Z")];
+  assert.equal(followUpGone(f, short, { turns: short, more: false }), true);
+  // an empty log: clear
+  assert.equal(followUpGone(f, [], { turns: [], more: false }), true);
+  // absent only because newer turns pushed it past the first page: keep
+  const pushed = [t("8", "8", "2026-01-08T10:00:00Z"), t("7", "7", "2026-01-07T10:00:00Z")];
+  assert.equal(followUpGone(f, pushed, { turns: pushed, more: true }), false);
+  // a local turn of the thread (the log has not caught up) keeps it
+  const mine = localTurn("k1", "and?", { answer: "x", id: "9", thread_id: "1" }, NOW);
+  assert.equal(followUpGone(f, [mine, ...short], { turns: short, more: false }), false);
+});
+
+test("assistant: an answer kept in no conversation offers no follow-up", () => {
+  assert.equal(replyNotKept({ answer: "x", saved: false }), true);
+  assert.equal(replyNotKept({ answer: "x", removed: true }), true);
+  assert.equal(replyNotKept({ answer: "x", id: "9", thread_id: "1" }), false);
+  // a follow-up whose thread was removed mid-answer: no thread, no id
+  const gone = localTurn("k1", "and?", { answer: "x", thread_id: null, removed: true }, NOW, "1");
+  assert.equal(gone.thread_id, null);
+  assert.equal(gone.id, null);
+  const [th] = groupThreads([gone]);
+  assert.equal(th.id, null, "no follow-up on it");
+  assert.equal(th.key, "k1");
+  // the same for one the server could not record
+  const unsaved = localTurn("k2", "new?", { answer: "y", id: null, thread_id: null, saved: false },
+                            NOW, null);
+  assert.equal(groupThreads([unsaved])[0].id, null);
+});
+
+test("assistant: a re-asked answer keeps its note after the log reads it back", () => {
+  const t = localTurn("k1", "and?", { answer: "x", id: "9", thread_id: "9", saved: true },
+                      NOW, null, RESTARTED_NOTE);
+  assert.equal(t.note, RESTARTED_NOTE);
+  const row = { ...kept("9"), thread_id: "9" };
+  // before the prune runs, the log's row already takes the local note
+  const early = mergeTurns([t], [row], []);
+  assert.equal(early.length, 1, "shown once");
+  assert.equal(early[0].note, RESTARTED_NOTE);
+  assert.equal("local" in early[0], false, "the log's row is the one shown");
+  // the log carries it now: the note moves to the map, the local turn goes
+  const notes = keepNotes({}, [t], [row]);
+  assert.deepEqual(notes, { 9: RESTARTED_NOTE });
+  assert.deepEqual(pruneLocal([t], [row]), []);
+  const merged = mergeTurns([], [row], [], notes);
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].note, RESTARTED_NOTE);
+  // a note on an older-page row too
+  assert.equal(mergeTurns([], [], [row], notes)[0].note, RESTARTED_NOTE);
+  // nothing new: the same object and array come back (no re-render loop)
+  assert.equal(keepNotes(notes, [t], [row]), notes);
+  const plain = localTurn("k2", "q", { answer: "a", id: "8" }, NOW);
+  const mine = [plain];
+  assert.equal(pruneLocal(mine, [row]), mine);
+  assert.equal(keepNotes(notes, mine, [{ ...kept("8") }]), notes, "no note to keep");
+  assert.equal(mergeTurns([], [row], [])[0].note, undefined);
+});
+
+test("assistant: a noted answer whose row leaves the log is not shown again", () => {
+  const t = localTurn("k1", "and?", { answer: "x", id: "9", thread_id: "9", saved: true },
+                      NOW, null, RESTARTED_NOTE);
+  const row = { ...kept("9"), thread_id: "9" };
+  const notes = keepNotes({}, [t], [row]);
+  const mine = pruneLocal([t], [row]);
+  // removed elsewhere (or cleared, or slid past the page): the next read lacks it
+  const other = { ...kept("1"), thread_id: "1" };
+  const shown = mergeTurns(mine, [other], [], notes);
+  assert.deepEqual(shown.map((x) => x.id), ["1"], "no live conversation comes back");
+  assert.equal(groupThreads(shown).some((th) => th.id === "9"), false, "no follow-up");
+  // and the chip on it is cleared once the read covers its time
+  const f = { id: "9", question: "and?", last_at: row.asked_at };
+  assert.equal(followUpGone(f, shown, { turns: [other], more: false }), true);
+});
+
+test("assistant: an answer whose conversation was removed mid-answer says so", () => {
+  const gone = localTurn("k1", "and?", { answer: "x", thread_id: null, removed: true }, NOW, "1");
+  assert.equal(gone.note, REMOVED_NOTE);
+  assert.equal(gone.thread_id, null);
+  // the removal outranks a restart note it was asked with
+  const twice = localTurn("k2", "and?", { answer: "x", removed: true }, NOW, null, RESTARTED_NOTE);
+  assert.equal(twice.note, REMOVED_NOTE);
+  // an ordinary answer carries none
+  assert.equal("note" in localTurn("k3", "q", { answer: "a", id: "3" }, NOW), false);
+});
+
+test("assistant: a follow-up the server could not save stays in its conversation", () => {
+  const unsaved = localTurn("k1", "and?", { answer: "x", id: null, thread_id: "1", saved: false },
+                            NOW, "1");
+  assert.equal(unsaved.id, null, "no follow-up offered on the unkept answer itself");
+  assert.equal(unsaved.thread_id, "1");
+  const t = (id, at) => ({ ...kept(id), thread_id: "1", asked_at: at });
+  const threads = groupThreads([unsaved, t("1", "2026-01-01T10:00:00Z")]);
+  assert.equal(threads.length, 1, "one card, not a separate one");
+  assert.equal(threads[0].id, "1");
+  assert.deepEqual(threads[0].turns.map((x) => x.question), ["q1", "and?"]);
+  // a new question that could not be saved is still a conversation of one
+  const lone = localTurn("k2", "new?", { answer: "y", id: null, thread_id: null, saved: false },
+                         NOW, null);
+  assert.equal(groupThreads([lone])[0].id, null);
+});
+
+test("assistant: the partial note promises a start only while an older page is left", () => {
+  assert.equal(partialNote(false, true), null);
+  assert.equal(partialNote(false, false), null);
+  assert.equal(partialNote(true, true), PARTIAL_NOTE);
+  assert.equal(partialNote(true, false), START_GONE_NOTE);
+});
+
+test("assistant: only the server's own 404 means a conversation is already gone", () => {
+  const web = (code, detail) => new Error(`${code}: ${JSON.stringify({ detail })}`);
+  assert.equal(threadMissing(new ApiError(404, "no such conversation")), true);
+  assert.equal(threadMissing(web(404, "no such conversation")), true);
+  // an older server's framework 404: the threads door is missing
+  assert.equal(threadMissing(new ApiError(404, "Not Found")), false);
+  assert.equal(threadMissing(web(404, "Not Found")), false);
+  assert.equal(threadDoorMissing(new ApiError(404, "Not Found")), true);
+  assert.equal(threadDoorMissing(web(404, "Not Found")), true);
+  assert.equal(threadDoorMissing(new ApiError(404, "no such conversation")), false);
+  assert.equal(threadDoorMissing(new ApiError(403, "Not Found")), false);
+  assert.equal(threadDoorMissing(new Error("network down")), false);
+  // the turn door's own 404 on the fallback means that turn is gone
+  assert.equal(turnMissing(new ApiError(404, "no such question")), true);
+  assert.equal(turnMissing(web(404, "no such question")), true);
+  assert.equal(turnMissing(new ApiError(404, "Not Found")), false);
+  assert.equal(turnMissing(new ApiError(400, "no such question")), false);
+});
+
+// ---- net worth: the hero's "this month" is measured on the series it is
+// given, and an absent series is no change rather than another's ----
+import { monthChange } from "../src/lib/networth-pure.ts";
+
+test("monthChange: last month-end to now, null without an earlier month", () => {
+  // a mortgage payment: cash −1000 on the financial line, −200 (interest)
+  // on the full line once the loan's 800 fall is counted
+  const financial = [["2026-09", 5750], ["2026-10", 4750]];
+  const full = [["2026-09", -196050], ["2026-10", -196250]];
+  assert.equal(monthChange(full), -200);
+  assert.equal(monthChange(financial), -1000);
+  assert.equal(monthChange([["2026-10", 1]]), null);
+  assert.equal(monthChange([]), null);
+  assert.equal(monthChange(undefined), null);
+});
+
+// ---- the plan's Savings goal is found whatever its stored spelling ----
+test("isPlanSavingsGoal: matches Savings case- and space-insensitively only", () => {
+  assert.equal(isPlanSavingsGoal("Savings"), true);
+  assert.equal(isPlanSavingsGoal("savings"), true);
+  assert.equal(isPlanSavingsGoal("  SAVINGS "), true);
+  assert.equal(isPlanSavingsGoal("Savings fund"), false);
+  assert.equal(isPlanSavingsGoal("Emergency"), false);
+  assert.equal(isPlanSavingsGoal(""), false);
+});
+
+// ---- income scenarios: a save merges onto the live list, so another
+// device's edit is never erased by a stale seeded copy ----
+test("mergeIncomeScenarios: edits here win, untouched rows take the live value", () => {
+  const base = [{ name: "Full", take_home: 2000, cadence: "biweekly" },
+                { name: "Half", take_home: 1000, cadence: "biweekly" }];
+  const cur = [{ name: "Full", take_home: 2100, cadence: "biweekly" },
+               { name: "Half", take_home: 1000, cadence: "biweekly" }];
+  const rows = [{ name: "Full", take_home: "2000", cadence: "biweekly" },
+                { name: "Half", take_home: "$1,200", cadence: "monthly",
+                  touched: true }];
+  assert.deepEqual(mergeIncomeScenarios(rows, base, cur), [
+    { name: "Full", take_home: 2100, cadence: "biweekly" },
+    { name: "Half", take_home: 1200, cadence: "monthly" }]);
+});
+
+test("mergeIncomeScenarios: deletions on either side stick, additions elsewhere carry through", () => {
+  const base = [{ name: "Full", take_home: 2000, cadence: "biweekly" },
+                { name: "Half", take_home: 1000, cadence: "biweekly" },
+                { name: "Gone", take_home: 500, cadence: "monthly" }];
+  // elsewhere: "Gone" deleted, "Bonus" added
+  const cur = [{ name: "Full", take_home: 2000, cadence: "biweekly" },
+               { name: "Half", take_home: 1000, cadence: "biweekly" },
+               { name: "Bonus", take_home: 300, cadence: "monthly" }];
+  // here: "Half" removed, a new "Side" added, a blank row ignored
+  const rows = [{ name: "Full", take_home: "2000", cadence: "biweekly" },
+                { name: "Gone", take_home: "500", cadence: "monthly" },
+                { name: " Side ", take_home: "400", cadence: "weekly",
+                  touched: true },
+                { name: "  ", take_home: "", cadence: "biweekly",
+                  touched: true }];
+  assert.deepEqual(mergeIncomeScenarios(rows, base, cur), [
+    { name: "Full", take_home: 2000, cadence: "biweekly" },
+    { name: "Side", take_home: 400, cadence: "weekly" },
+    { name: "Bonus", take_home: 300, cadence: "monthly" }]);
+});
+
+test("mergeIncomeScenarios: names compare case-insensitively, no duplicate carried in", () => {
+  const base = [];
+  const cur = [{ name: "full", take_home: 1, cadence: "monthly" }];
+  const rows = [{ name: "Full", take_home: "9", cadence: "weekly",
+                  touched: true }];
+  assert.deepEqual(mergeIncomeScenarios(rows, base, cur),
+    [{ name: "Full", take_home: 9, cadence: "weekly" }]);
+  // an untouched row the server still has takes the live spelling
+  assert.deepEqual(mergeIncomeScenarios(
+    [{ name: "FULL", take_home: "9", cadence: "weekly" }],
+    [{ name: "Full", take_home: 9, cadence: "weekly" }], cur), cur);
+});
+
+// ---- Investment fees & basis: the web form and the mobile form post the
+// same body for the same rows, and refuse the same mistakes
+import * as mobileInvest from "../src/lib/settings-pure.ts";
+import * as webInvest from "../../webapp/src/investsettings.ts";
+
+for (const [side, m] of [["mobile", mobileInvest], ["web", webInvest]]) {
+  test(`${side}: investment settings convert percent to fraction and back`, () => {
+    const form = m.investFormOf({
+      advisory_fees: { "robo": 0.0025 },
+      advisory_fee_exempt_masks: ["1111", "2222"],
+      investment_basis_override: { "3333": 400 },
+    });
+    assert.deepEqual(form, {
+      fees: [{ inst: "robo", pct: "0.25" }],
+      exempt: "1111, 2222",
+      basis: [{ mask: "3333", amount: "400" }],
+    });
+    const r = m.investBody(form);
+    assert.equal(r.ok, true);
+    assert.deepEqual(r.body, {
+      advisory_fees: { robo: 0.0025 },
+      advisory_fee_exempt_masks: ["1111", "2222"],
+      investment_basis_override: { "3333": 400 },
+    });
+  });
+
+  test(`${side}: an empty view is an empty form, and saving it clears`, () => {
+    const form = m.investFormOf({ advisory_fees: null });
+    assert.deepEqual(form, { fees: [], exempt: "", basis: [] });
+    assert.deepEqual(m.investBody(form).body, {
+      advisory_fees: {}, advisory_fee_exempt_masks: [],
+      investment_basis_override: {} });
+  });
+
+  test(`${side}: investment settings normalize and skip blank rows`, () => {
+    const r = m.investBody({
+      fees: [{ inst: "  Robo Co ", pct: "0.35%" }, { inst: "", pct: "" }],
+      exempt: "1111 ,1111;2222",
+      basis: [{ mask: " 3333 ", amount: "$1,250.50" }, { mask: "", amount: "" }],
+    });
+    assert.equal(r.ok, true);
+    assert.deepEqual(r.body, {
+      advisory_fees: { "robo co": 0.0035 },
+      advisory_fee_exempt_masks: ["1111", "2222"],
+      investment_basis_override: { "3333": 1250.5 },
+    });
+  });
+
+  test(`${side}: an investment save posts only the sections that were edited`, () => {
+    // each section replaces its stored key whole, so posting one nobody
+    // touched would put back this form's copy over another device's save
+    const base = m.investFormOf({
+      advisory_fees: { robo: 0.0025, other: 0.004 },
+      advisory_fee_exempt_masks: ["1111", "2222"],
+      investment_basis_override: { "3333": 400 },
+    });
+    const edited = { ...base, basis: [...base.basis,
+                                      { mask: "4444", amount: "10" }] };
+    const r = m.investChanges(base, edited);
+    assert.equal(r.ok, true);
+    assert.deepEqual(r.body, {
+      investment_basis_override: { "3333": 400, "4444": 10 } });
+    // reordering, re-spacing or a blank unused row is not an edit
+    const same = { fees: [...base.fees].reverse().concat([{ inst: "", pct: "" }]),
+                   exempt: "2222 ,1111,", basis: base.basis };
+    assert.deepEqual(m.investChanges(base, same).body, {});
+    // clearing a section is an edit, and posts it as empty
+    assert.deepEqual(m.investChanges(base, { ...base, exempt: "" }).body, {
+      advisory_fee_exempt_masks: [] });
+    // a bad edit is refused just as a whole-form save would be
+    assert.equal(m.investChanges(base, { ...base, exempt: "12-4" }).ok, false);
+  });
+
+  test(`${side}: an edited section carries the stored value it started from`, () => {
+    // the server refuses a section whose stored value moved since this
+    // base was read, so another device's row in it is not dropped
+    const view = {
+      advisory_fees: { robo: 0.0025 },
+      advisory_fee_exempt_masks: null,
+      investment_basis_override: { "3333": 400 },
+    };
+    const seen = m.investSeenOf(view);
+    assert.deepEqual(seen, view);
+    assert.deepEqual(m.investSeenOf(null), {
+      advisory_fees: null, advisory_fee_exempt_masks: null,
+      investment_basis_override: null });
+    const base = m.investFormOf(view);
+    const r = m.investChanges(base, { ...base, exempt: "1111" }, seen);
+    assert.equal(r.ok, true);
+    assert.deepEqual(r.body, {
+      advisory_fee_exempt_masks: ["1111"],
+      advisory_fee_exempt_masks_base: null });
+    // untouched sections carry neither the value nor a base
+    assert.deepEqual(m.investChanges(base, base, seen).body, {});
+    // without a base the body is what it always was
+    assert.deepEqual(m.investChanges(base, { ...base, exempt: "1111" }).body, {
+      advisory_fee_exempt_masks: ["1111"] });
+    assert.equal(m.INVEST_STALE_STATUS, 409);
+  });
+
+  test(`${side}: masks accept letters the bank uses`, () => {
+    const r = m.investBody({
+      fees: [], exempt: "ab12, AB12 x9",
+      basis: [{ mask: " z1y2 ", amount: "400" }] });
+    assert.equal(r.ok, true);
+    assert.deepEqual(r.body.advisory_fee_exempt_masks, ["AB12", "X9"]);
+    assert.deepEqual(r.body.investment_basis_override, { Z1Y2: 400 });
+  });
+
+  test(`${side}: investment settings refuse what the server refuses`, () => {
+    const base = { fees: [], exempt: "", basis: [] };
+    for (const bad of [
+      { ...base, fees: [{ inst: "", pct: "0.25" }] },
+      { ...base, fees: [{ inst: "robo", pct: "" }] },
+      { ...base, fees: [{ inst: "robo", pct: "abc" }] },
+      { ...base, fees: [{ inst: "robo", pct: "150" }] },
+      { ...base, fees: [{ inst: "robo", pct: "-1" }] },
+      { ...base, exempt: "12-4" },
+      { ...base, exempt: "1" },
+      { ...base, exempt: "123456789" },
+      { ...base, basis: [{ mask: "", amount: "400" }] },
+      { ...base, basis: [{ mask: "33-33", amount: "400" }] },
+      { ...base, basis: [{ mask: "3333", amount: "-5" }] },
+      { ...base, basis: [{ mask: "3333", amount: "" }] },
+    ]) {
+      const r = m.investBody(bad);
+      assert.equal(r.ok, false, JSON.stringify(bad));
+      assert.equal(typeof r.error, "string");
+    }
+  });
+}
+
+test("linkWindowAnswer: Android's 'opened' is no close; only iOS's close releases the slot", () => {
+  const { linkWindowAnswer } = pureModule;
+  // Android resolves as soon as the Custom Tab starts — the person is
+  // still signing in, so nothing may be stamped or set aside
+  assert.deepEqual(linkWindowAnswer("opened"), { closed: false, mayReleaseSlot: false });
+  // iOS resolves only when the window goes away
+  assert.deepEqual(linkWindowAnswer("cancel"), { closed: true, mayReleaseSlot: true });
+  assert.deepEqual(linkWindowAnswer("dismiss"), { closed: true, mayReleaseSlot: true });
+});
+
+test("noCheckingLinked: a household without checking reads unknown cash, never $0", () => {
+  const { noCheckingLinked } = pureModule;
+  assert.equal(noCheckingLinked({ checking: null, no_checking: true }, null), true);
+  // an older server without the flag: the null balance alone says it
+  assert.equal(noCheckingLinked({ checking: null }, { checking: 0 }), true);
+  assert.equal(noCheckingLinked({ checking: 0 }, { no_checking: true }), true);
+  // a real $0 checking balance is a balance — the alarms stay live
+  assert.equal(noCheckingLinked({ checking: 0, no_checking: false },
+                                { no_checking: false }), false);
+  // no runway at all (a past day) is not "no checking"
+  assert.equal(noCheckingLinked(null, null), false);
+});
+
+test("a sign-in shed with 503 says busy, never a wrong password or a status", () => {
+  const shed = new ApiError(503, "server busy — try again shortly");
+  assert.equal(signInErrText(shed),
+               "The server is busy — try again in a moment.");
+  shed.retryAfter = "15";
+  assert.equal(signInErrText(shed),
+               "The server is busy — try again in 15 seconds.");
+  // a long or unreadable wait reads as "a moment", never a big number
+  assert.equal(busyText("3600"), "The server is busy — try again in a moment.");
+  assert.equal(busyText("soon"), "The server is busy — try again in a moment.");
+  assert.equal(busyText("1"), "The server is busy — try again in 1 second.");
+  // anything else keeps the server's own sentence
+  assert.equal(signInErrText(new ApiError(400, "bad email")), "bad email");
+});
+
+// ---- the proxy answering while the app restarts ----
+import { restartingText } from "../src/lib/api.ts";
+
+/** A client call answered by `status` with `body` under `headers`. */
+async function refusalOf(status, body, headers = {}, statusText = "") {
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => new Response(body,
+    { status, statusText, headers });
+  try {
+    const c = makeClient("https://example.invalid", "tok", () => {});
+    let caught;
+    try { await c.me(); } catch (e) { caught = e; }
+    assert.ok(caught instanceof ApiError, "a refusal must be an ApiError");
+    return caught;
+  } finally { globalThis.fetch = real; }
+}
+
+test("a gateway status with the proxy's page says the server is restarting",
+     async () => {
+  const page = "<!doctype html><html><body>Back in a moment</body></html>";
+  for (const status of [502, 503, 504]) {
+    const e = await refusalOf(status, page, { "content-type": "text/html" },
+                              "Service Unavailable");
+    assert.equal(e.status, status, "the status survives for the callers");
+    assert.equal(e.restarting, true);
+    assert.equal(errText(e), "The server is restarting — try again in a moment.");
+    assert.equal(signInErrText(e), errText(e));
+  }
+});
+
+test("an empty or mislabelled gateway answer is the restart too", async () => {
+  // HTTP/2 has no reason phrase, so the old status-text fallback was blank
+  const empty = await refusalOf(502, "", {}, "");
+  assert.equal(empty.restarting, true);
+  assert.equal(errText(empty), restartingText(null));
+  // an edge may rewrite the content-type; markup is still markup
+  const relabelled = await refusalOf(504, "<html>gateway</html>",
+                                     { "content-type": "text/plain" });
+  assert.equal(relabelled.restarting, true);
+});
+
+test("the proxy's Retry-After names the wait in the restarting sentence",
+     async () => {
+  const e = await refusalOf(503, "<html></html>",
+    { "content-type": "text/html", "Retry-After": "20" });
+  assert.equal(signInErrText(e), "The server is restarting — try again in 20 seconds.");
+  assert.equal(e.retryAfter, "20");
+});
+
+test("the app's own 503 stays a busy shed, and other refusals keep their words",
+     async () => {
+  const shed = await refusalOf(503,
+    JSON.stringify({ detail: "server busy — try again shortly" }),
+    { "content-type": "application/json", "Retry-After": "5" });
+  assert.notEqual(shed.restarting, true);
+  assert.equal(shed.detail, "server busy — try again shortly");
+  assert.equal(signInErrText(shed), "The server is busy — try again in 5 seconds.");
+  const own502 = await refusalOf(502,
+    JSON.stringify({ detail: "the bank did not answer" }),
+    { "content-type": "application/json" });
+  assert.notEqual(own502.restarting, true);
+  assert.equal(errText(own502), "the bank did not answer");
+  // a non-gateway page still falls back to the status line, as before
+  const other = await refusalOf(500, "<html>oops</html>",
+    { "content-type": "text/html" }, "Internal Server Error");
+  assert.notEqual(other.restarting, true);
+  assert.equal(other.detail, "Internal Server Error");
+});
+
+test("a bank whose first sync is queued says so, the web's words", () => {
+  assert.equal(FIRST_SYNC_RUNNING,
+               "first sync running — accounts appear in a minute");
+  assert.equal(linkedLine("Chase", "pending"),
+               "Linked Chase ✓ — first sync running — accounts appear in a minute");
+  assert.equal(linkedLine(undefined, "ok"), "Linked bank ✓");
+  const c = { aggregator: "plaid", last_ok: null, status: "ok" };
+  assert.equal(firstSyncPending(c), true);
+  assert.equal(firstSyncPending({ ...c, last_ok: "2026-10-16T10:00:00Z" }), false);
+  // a broken or released link is not "first sync running"
+  assert.equal(firstSyncPending({ ...c, status: "error:ITEM_LOGIN_REQUIRED" }), false);
+  assert.equal(firstSyncPending({ ...c, status_kind: "reauth" }), false);
+  assert.equal(firstSyncPending({ ...c, aggregator: "simplefin" }), false);
+});
+
+// ---- the setup wizard: six steps on every instance, the web's words ----
+test("wizard: the same six step keys on hosted and self-hosted, in the web's order", () => {
+  assert.deepEqual(WIZARD_STEPS,
+    ["appearance", "connect", "bills", "budgets", "email", "finish"]);
+});
+
+test("wizard appearance: Auto unless the household pinned light or dark", () => {
+  assert.equal(wizardThemeChoice(undefined), "auto");
+  assert.equal(wizardThemeChoice(null), "auto");
+  assert.equal(wizardThemeChoice(""), "auto");
+  assert.equal(wizardThemeChoice("auto"), "auto");
+  assert.equal(wizardThemeChoice("neon"), "auto");
+  assert.equal(wizardThemeChoice("light"), "light");
+  assert.equal(wizardThemeChoice("dark"), "dark");
+});
+
+test("wizard history pills: five choices, each pill writes its months", () => {
+  assert.deepEqual(HISTORY_CHOICES, [
+    [1, "Last month"], [3, "3 months"], [6, "6 months"], [12, "1 year"],
+    [null, "Everything available"]]);
+  for (const v of [1, 3, 6, 12]) assert.equal(historyMonthsOf(v), v);
+  // nothing stored, or a value no pill offers, reads as Everything
+  for (const v of [undefined, null, 0, 2, 24, "6"])
+    assert.equal(historyMonthsOf(v), null);
+  assert.equal(historyPhrase(null), "everything available");
+  assert.equal(historyPhrase(1), "last month");
+  assert.equal(historyPhrase(12), "1 year");
+});
+
+test("wizard manual form: the four cadences in the bill-save wire format", () => {
+  assert.deepEqual(MANUAL_CADENCES.map(([v]) => v),
+    ["MONTHLY:1", "WEEKLY:1", "WEEKLY:2", "YEARLY:1"]);
+  assert.deepEqual(MANUAL_CADENCES.map(([, l]) => l),
+    ["monthly", "weekly", "every 2 weeks", "yearly"]);
+});
+
+test("wizard due day: ordinals, parsing, and the next date it falls on", () => {
+  assert.deepEqual([1, 2, 3, 4, 11, 12, 13, 21, 22, 23, 31, 101, 111]
+    .map(ordinal), ["1st", "2nd", "3rd", "4th", "11th", "12th", "13th",
+                    "21st", "22nd", "23rd", "31st", "101st", "111th"]);
+  assert.equal(parseDueDay("14"), 14);
+  assert.equal(parseDueDay(" 1 "), 1);
+  for (const bad of ["", "0", "32", "1.5", "x", "-3"])
+    assert.equal(parseDueDay(bad), null);
+  assert.equal(dueDayOf("2026-11-14"), 14);
+  assert.equal(dueDayOf(null), null);
+  assert.equal(dueDayOf("soon"), null);
+  // today counts; a day already past rolls to next month
+  assert.equal(nextDueForDay(17, "2026-10-17"), "2026-10-17");
+  assert.equal(nextDueForDay(1, "2026-10-17"), "2026-11-01");
+  assert.equal(nextDueForDay(31, "2026-10-17"), "2026-10-31");
+  assert.equal(nextDueForDay(5, "2026-12-20"), "2027-01-05");
+  // a day the month lacks lands on its last day
+  assert.equal(nextDueForDay(31, "2026-04-10"), "2026-04-30");
+  assert.equal(nextDueForDay(30, "2026-02-15"), "2026-02-28");
+  assert.equal(nextDueForDay(31, "2026-11-30"), "2026-11-30");
+});
+
+test("wizard Adjust: only the fields the person moved ride with the approve", () => {
+  const p = { payee: "Electric — City Power", amount: 118.4,
+              next_due: "2026-11-14", frequency: "MONTHLY", interval: 1 };
+  assert.equal(proposalCadenceValue(p), "MONTHLY:1");
+  assert.equal(proposalCadenceValue({ frequency: "monthly", interval: 2 }),
+               "MONTHLY:2");
+  assert.equal(proposalCadenceValue({ frequency: "MONTHLY", interval: 1,
+                                      bill_type: "envelope" }), null);
+  assert.equal(proposalCadenceValue({}), null);
+  const same = { name: p.payee, amount: "118.40", cadence: "MONTHLY:1",
+                 dueDay: "14" };
+  assert.deepEqual(adjustOf(p, same), { adjust: {} });
+  // "$" and "," are how a phone keyboard types money
+  assert.deepEqual(adjustOf({ ...p, amount: 1000 },
+                            { ...same, amount: "$1,000.00" }), { adjust: {} });
+  assert.deepEqual(adjustOf(p, { name: " Electric ", amount: "120",
+                                 cadence: "MONTHLY:2", dueDay: "15" }),
+    { adjust: { name: "Electric", amount: 120, cadence: "MONTHLY:2",
+                due_day: 15 } });
+  // a blank due day keeps the finder's
+  assert.deepEqual(adjustOf(p, { ...same, dueDay: "" }), { adjust: {} });
+  assert.ok("error" in adjustOf(p, { ...same, name: "  " }));
+  assert.ok("error" in adjustOf(p, { ...same, amount: "0" }));
+  assert.ok("error" in adjustOf(p, { ...same, dueDay: "40" }));
+});
+
+test("wizard bill lines and the manual tally read like the web's rows", () => {
+  assert.equal(billLine(1000, "MONTHLY:1", "2026-11-01"),
+               "monthly · $1,000.00 · 1st");
+  assert.equal(billLine(2310, "WEEKLY:2", null), "every 2 weeks · $2,310.00");
+  // a label already in words passes through
+  assert.equal(billLine(10.99, "monthly", "2026-11-22"),
+               "monthly · $10.99 · 22nd");
+  assert.equal(manualTally(1, 0), "1 bill · 0 income.");
+  assert.equal(manualTally(3, 2), "3 bills · 2 income.");
+});
+
+test("wizard Done: the blurb names the first message the choice sends", () => {
+  assert.equal(clockHour(0), "12:00 am");
+  assert.equal(clockHour(7), "7:00 am");
+  assert.equal(clockHour(12), "12:00 pm");
+  assert.equal(clockHour(19), "7:00 pm");
+  const lead = "That's everything. The Today page carries your daily "
+    + "verdict from here on";
+  assert.equal(finishBlurb("email", 7),
+               `${lead}; the first email arrives tomorrow at 7:00 am.`);
+  assert.equal(finishBlurb("both", 19),
+               `${lead}; the first email arrives tomorrow at 7:00 pm.`);
+  assert.equal(finishBlurb("push", 7),
+               `${lead}; the first notification arrives tomorrow at 7:00 am.`);
+  assert.equal(finishBlurb("off", 7), `${lead}.`);
+});
+
+test("wizard Done: one summary line per step", () => {
+  assert.equal(accountsSummary(2, 5, null), "2 connected · everything available");
+  assert.equal(accountsSummary(0, 1, 6), "1 account from files · 6 months");
+  assert.equal(accountsSummary(0, 0, 3), "none yet · 3 months");
+  assert.equal(billsSummary(3, 1), "3 bills, 1 paycheck approved");
+  assert.equal(billsSummary(0, 0), "0 bills, 0 paychecks approved");
+  assert.equal(budgetsSummary(true, 640, 1100),
+               "Food $640 · Everything else $1,100");
+  assert.equal(budgetsSummary(true, 0, 900), "Food $0 · Everything else $900");
+  // a provisional seed is not the household's budget
+  assert.equal(budgetsSummary(false, 640, 1100),
+               "not set yet (Budget page any time)");
+  assert.equal(deliverySummary("email", 7, 2), "Email at 7:00 am · 2 recipients");
+  assert.equal(deliverySummary("both", 18, 1),
+               "Email and push at 6:00 pm · 1 recipient");
+  assert.equal(deliverySummary("push", 7, 3), "Push at 7:00 am · 3 recipients");
+  // the owner always receives: never "0 recipients"
+  assert.equal(deliverySummary("off", 7, 0), "Off · 1 recipient");
+  assert.equal(recipientRole({ owner: true }), "owner");
+  assert.equal(recipientRole({ via: "member" }), "member");
+  assert.equal(recipientRole({ invite: "accepted" }), "accepted");
+  assert.equal(recipientRole({ invite: "invited" }), "invitation sent");
+  assert.equal(recipientRole({ invite: "expired" }), "invitation expired");
+  assert.equal(recipientRole({}), "added");
+});
+
+// ---- the wizard's one-at-a-time settings saves: two saves sent together
+// can commit out of order, leaving the stored history window or setup
+// mode different from what the screen shows ----
+function deferredSender() {
+  const calls = [];
+  const send = (v) => new Promise((resolve, reject) =>
+    calls.push({ v, resolve, reject }));
+  return { calls, send };
+}
+const drain = () => new Promise((r) => setImmediate(r));
+
+test("wizard saves: one in flight per setting, the last tap wins", async () => {
+  const { calls, send } = deferredSender();
+  const busy = [];
+  const settled = [];
+  const s = latestWins(send, { busy: (b) => busy.push(b),
+    settled: (v, failed) => settled.push([v, failed]) });
+  s.save(3);
+  s.save(12);
+  s.save(6);
+  // the second and third taps wait; only the first is on the wire
+  assert.deepEqual(calls.map((c) => c.v), [3]);
+  assert.equal(s.pending(), true);
+  calls[0].resolve();
+  await drain();
+  // the waiting 12 was replaced by 6: the last tap is the last sent
+  assert.deepEqual(calls.map((c) => c.v), [3, 6]);
+  assert.deepEqual(settled, []);
+  calls[1].resolve();
+  await drain();
+  assert.deepEqual(settled, [[6, false]]);
+  assert.equal(s.pending(), false);
+  assert.equal(busy.at(-1), false);
+});
+
+test("wizard saves: a superseded failure is moot, the last one's is reported", async () => {
+  const { calls, send } = deferredSender();
+  const settled = [];
+  const s = latestWins(send, {
+    settled: (v, failed, e) => settled.push([v, failed, e?.message]) });
+  s.save("manual");
+  s.save("auto");
+  calls[0].reject(new Error("first"));
+  await drain();
+  // the later save still goes out; the earlier failure says nothing
+  assert.deepEqual(calls.map((c) => c.v), ["manual", "auto"]);
+  assert.deepEqual(settled, []);
+  calls[1].reject(new Error("last"));
+  await drain();
+  assert.deepEqual(settled, [["auto", true, "last"]]);
+  // a tap after the queue drained sends at once
+  s.save("manual");
+  assert.equal(calls.length, 3);
+});
+
+test("wizard saves: a send that throws is a failed save, not a stuck queue", async () => {
+  const settled = [];
+  const s = latestWins(() => { throw new Error("no client"); },
+    { settled: (v, failed) => settled.push([v, failed]) });
+  s.save(1);
+  await drain();
+  assert.deepEqual(settled, [[1, true]]);
+  assert.equal(s.pending(), false);
+});
+
+test("wizard Adjust: only an offer to add a bill or income can be adjusted", () => {
+  assert.equal(proposalAdjustable({ kind: "add" }), true);
+  for (const kind of ["attach", "merchant", "remove", "amount_change",
+                      "change", null, undefined, ""])
+    assert.equal(proposalAdjustable({ kind }), false, String(kind));
+});
+
+test("wizard Adjust: the due day shows only for monthly and yearly cadences", () => {
+  for (const c of ["MONTHLY:1", "MONTHLY:3", "YEARLY:1", "monthly:1"])
+    assert.equal(cadenceTakesDueDay(c), true, c);
+  for (const c of ["ENVELOPE:1", "ENVELOPE:12", "WEEKLY:1", "WEEKLY:2",
+                   "DAILY:1", "ONE_TIME:1", "", null, undefined])
+    assert.equal(cadenceTakesDueDay(c), false, String(c));
+  const p = { payee: "Gym", amount: -40, next_due: "2026-11-14",
+              frequency: "MONTHLY", interval: 1 };
+  const f = { name: "Gym", amount: "40.00", cadence: "MONTHLY:1",
+              dueDay: "20" };
+  assert.deepEqual(adjustOf(p, f), { adjust: { due_day: 20 } });
+  // switched to weekly, the hidden field's typed day is not sent
+  assert.deepEqual(adjustOf(p, { ...f, cadence: "WEEKLY:1" }),
+                   { adjust: { cadence: "WEEKLY:1" } });
+  // an envelope offer has no cadence of its own and no due date
+  assert.deepEqual(adjustOf({ ...p, bill_type: "envelope" },
+                            { ...f, cadence: "" }), { adjust: {} });
+  // nor is a hidden day validated
+  assert.deepEqual(adjustOf(p, { ...f, cadence: "DAILY:1", dueDay: "40" }),
+                   { adjust: { cadence: "DAILY:1" } });
+});
+
+// The history window, the setup answer and the nightly finder are the
+// owner's: the server answers anyone else's change with a 403. Each
+// control must check useOwner and give everyone else the web's line
+// instead of a control that only snaps back.
+test("owner-only settings: a non-owner reads the value, never a control", () => {
+  const gated = ["src/components/wizard-history.tsx",
+                 "src/components/wizard-bills.tsx",
+                 "src/app/(tabs)/bills.tsx"];
+  for (const file of gated) {
+    const src = readFileSync(new URL(`../${file}`, import.meta.url), "utf8");
+    assert.ok(/\buseOwner\(\)/.test(src), `${file}: gate on useOwner()`);
+    assert.ok(src.includes("the household owner sets this"),
+              `${file}: the non-owner line must be the web's words`);
+  }
+  // the wizard's Continue saves the pre-selected answer: owner only
+  const welcome = readFileSync(new URL("../src/app/welcome.tsx",
+                                       import.meta.url), "utf8");
+  assert.ok(/owner && storedMode !== setupMode\) saveMode/.test(welcome),
+            "welcome.tsx: a non-owner's Continue must not save setup_mode");
+  // the nightly switch is mounted for everyone and gates itself, so a
+  // member or viewer still sees where it stands
+  const bills = readFileSync(new URL("../src/app/(tabs)/bills.tsx",
+                                     import.meta.url), "utf8");
+  assert.ok(!/!viewer && <NightlyFinderSwitch/.test(bills),
+            "bills.tsx: the switch hides itself from viewers entirely");
+});
+
+test("wizard Adjust: a refused save is answered inside the open form", () => {
+  const src = readFileSync(new URL("../src/components/wizard-bills.tsx",
+                                   import.meta.url), "utf8");
+  // the refusal reaches the form, which shows it beside its own checks
+  assert.ok(/refused=\{adjustErr\?\.pid === x\.id/.test(src),
+            "the form must receive the server's refusal");
+  assert.ok(/\{err \|\| refused\}/.test(src),
+            "the form must show the refusal inline");
+  // and the form is not closed by a failure (only a success closes it)
+  const onError = src.slice(src.indexOf("onError: (e, v) =>"));
+  assert.ok(!/setAdjusting\(null\)/.test(onError.slice(0, onError.indexOf("},\n  });"))),
+            "a refused adjust must keep the form open with its values");
+});
+
+test("manual budgets: a blank box over a stored budget keeps the figure", () => {
+  const stored = { food_monthly: 600, other_monthly: 400,
+                   budgeted_income_monthly: 5000 };
+  // only everything-else typed: food and income stay out of the body, so
+  // the server keeps 600 and 5000, and the Savings plan counts them
+  const r = manualBudgetsBody({ income: "", food: "", other: "450" },
+                              stored, true, 1000);
+  assert.deepEqual(r.body, { other_monthly: 450 });
+  assert.equal(r.monthlyPlan, 5000 - 1000 - 600 - 450);
+  // a zero over a stored figure is the same as blank
+  assert.deepEqual(manualBudgetsBody({ income: "0", food: "0", other: "450" },
+                                     stored, true, 0).body,
+                   { other_monthly: 450 });
+  // nothing stored: an empty food/other is written as none, but a blank
+  // income is never sent, and a provisional seed is not counted as kept
+  const fresh = manualBudgetsBody({ income: "", food: "300", other: "" },
+                                  stored, false, 1000);
+  assert.deepEqual(fresh.body, { food_monthly: 300, other_monthly: 0 });
+  assert.equal(fresh.monthlyPlan, 5000 - 1000 - 300);
+  assert.equal(manualBudgetsBody({ income: "2,000", food: "$900", other: "" },
+                                 {}, false, 1500).monthlyPlan, 0);
+  assert.equal(keptBudget(640, false), 0);
+  assert.equal(keptBudget(640, true), 640);
+  assert.equal(keptBudget(null, true), 0);
+});
+
+test("manual budgets: a stored plan prefills; a new household starts blank", () => {
+  const s = { food_monthly: 600, other_monthly: 0,
+              budgeted_income_monthly: 5000 };
+  assert.deepEqual(manualBudgetsPrefill({ budgets_set: true }, s),
+                   { income: "5000", food: "600", other: "" });
+  assert.deepEqual(manualBudgetsPrefill(
+    { budgets_set: false, wizard_steps: { budgets: "done" } }, s),
+    { income: "5000", food: "600", other: "" });
+  assert.deepEqual(manualBudgetsPrefill({ budgets_set: false,
+                                          wizard_steps: {} }, s),
+                   { income: "", food: "", other: "" });
+});
+
+test("manual budgets: a save with no food or everything-else is refused", () => {
+  const words = "Enter a food or everything-else budget, or tap a suggestion.";
+  assert.equal(manualBudgetsRefusal("", ""), words);
+  assert.equal(manualBudgetsRefusal("0", "$0"), words);
+  assert.equal(manualBudgetsRefusal("abc", ""), words);
+  assert.equal(manualBudgetsRefusal("", "450"), null);
+  assert.equal(manualBudgetsRefusal("1,200", ""), null);
+  // the phone's step uses the shared rules, and the web's words
+  const src = readFileSync(new URL("../src/components/wizard-budgets.tsx",
+                                   import.meta.url), "utf8");
+  assert.ok(src.includes("manualBudgetsBody(") && src.includes("manualBudgetsRefusal("),
+            "wizard-budgets.tsx must build its body from the shared rules");
+  assert.ok(src.includes('"Saved — Continue below."'));
+  assert.ok(src.includes("(kept)"));
+  assert.ok(!/food_monthly: numv\(food\)/.test(src),
+            "a blank box must never be sent as $0 over a stored budget");
 });

@@ -37,6 +37,19 @@ place in that count.
   change, or an account recovery, new links on the household's own Plaid
   or MX keys are held until the owner confirms those keys in Settings;
   banks already linked keep syncing (see the security guide).
+  A new bank is saved the moment the link finishes at the bank, even if
+  the window or tab was closed before it reported back; its first pull
+  of history (up to two years, minutes for a big bank) then runs in
+  the background, and the row reads "first sync running — accounts
+  appear in a minute" until it lands. If you closed the bank's window
+  yourself, **cancel — I closed the bank window** under the button ends
+  the wait. Linking a login whose every account is already connected at
+  that institution is refused and takes no place in the institution
+  count; a login that adds any account is kept. On a hosted instance an
+  unconfirmed address may have to confirm first: the card above the
+  button then says "Confirm your email to connect a bank", with a way to
+  resend the link, and file imports and manual accounts stay open
+  meanwhile.
 - **Community scripts / collectors** — host-side scripts that push
   data for institutions no aggregator covers. They run on **your**
   machine (that's where the credentials stay); the **run** button shows
@@ -48,6 +61,16 @@ place in that count.
 
 They mix freely: connect for the ongoing feed, import files for older
 history — the importer deduplicates against connected sources.
+
+**How far back a new link reaches.** The household's history window —
+**Last month**, **3 months**, **6 months**, **1 year** or **Everything
+available** (the default), chosen in the setup wizard's Connect step or
+on the Import page — sets how much history a new Plaid link asks the
+bank for; banks share up to two years, so "Everything available" means
+two. The window is read when the link starts, so change it before
+linking; a bank already linked keeps what it brought. The same window
+applies to file imports. To bring in older history later, widen the
+window and import the older statements from Accounts → Import.
 
 ## Connection states
 
@@ -117,7 +140,9 @@ happened or your bank simply has not reported since this morning.
 
 The **↻** beside each institution reads the aggregator's copy for that
 one bank and tells you what it found, naming that bank's own clock when
-the answer is nothing. Whatever it pulls is categorized right away —
+the answer is nothing. For a bank whose first sync has not finished
+yet, it queues that first sync and says its history is still arriving.
+Whatever it pulls is categorized right away —
 new merchants classified, bill charges matched — so the rows do not sit
 under the bank's generic category until the next scheduled run. It is
 limited to 20 presses in ten minutes from one address and 30 per
@@ -216,7 +241,12 @@ Connected accounts get balances from the provider each sync. File-only
 and manual accounts start at $0 — edit the account and type the real
 balance, and mark your **primary checking** account so the cash
 forecast anchors on it. Until balances are set, forecast surfaces stay
-hidden rather than show numbers seeded from $0.
+hidden rather than show numbers seeded from $0. A checking account that
+came from a file and has no balance yet asks for one (Today's "Cash
+forecast is waiting on your balance") rather than being read as missing, and a checking row with a
+balance is preferred as the forecast's anchor. With no checking account
+at all, the forecast stays off and Today says "No checking account
+linked" instead of reporting a shortfall.
 
 When the bank shares them (from the liabilities pull), a card's next
 due date and statement balance appear under its balance on the account

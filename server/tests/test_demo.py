@@ -375,6 +375,38 @@ class DemoGeneratorTests(unittest.TestCase):
             "SELECT COUNT(*) n FROM receipts r WHERE NOT EXISTS "
             "(SELECT 1 FROM transactions t WHERE t.id = r.txn_id)"
         ).fetchone()["n"], 0)
+
+    def test_every_seeded_receipt_is_an_image_the_viewer_shows(self):
+        """The receipt image route renders only receipts.IMAGE_MIMES inline
+        and serves anything else as an opaque download, so every demo
+        receipt must be stored as one of those and decode as that image —
+        otherwise the demo's receipts open as unreadable files."""
+        import io
+
+        from PIL import Image
+
+        from oikonome.engine import receipts
+        rows = self.conn.execute(
+            "SELECT mime, image FROM receipts").fetchall()
+        self.assertTrue(rows)
+        for r in rows:
+            self.assertIn(r["mime"], receipts.IMAGE_MIMES)
+            with Image.open(io.BytesIO(bytes(r["image"]))) as img:
+                self.assertEqual(Image.MIME[img.format], r["mime"])
+
+    def test_a_receipt_name_with_markup_characters_draws_cleanly(self):
+        """Merchant and line names are drawn as pixels, never interpolated
+        into markup, so "&" or "<" in a name neither breaks the image nor
+        injects anything into it."""
+        import io
+
+        from PIL import Image
+        png = demo._receipt_png(
+            'Quill & Ink <b>"Co"</b>', dt.date(2026, 1, 5),
+            [("Ledger <pad> & pen", 12.5, "")], 12.5)
+        with Image.open(io.BytesIO(png)) as img:
+            self.assertEqual(img.format, "PNG")
+            self.assertNotIn(b"<b>", png)
         # line items sum to their receipt's transaction amount
         for r in self.conn.execute(
                 """SELECT r.id, t.amount, SUM(ri.amount) AS s
@@ -493,11 +525,12 @@ class DemoGeneratorTests(unittest.TestCase):
         self.assertGreater(d["transactions"], 0)
         self.assertGreater(d["bills"], 0)
         self.assertTrue(d["budgets_set"])
-        # Welcome.tsx stepKeys(): hosted drops "email"; self-host is the
-        # full list: connect → bills → budgets → (email) → finish, with no
-        # sync/import steps. Every key resume scans must be marked or
-        # /welcome re-enters mid-wizard instead of bouncing.
-        for k in ("connect", "bills", "budgets", "email", "finish"):
+        # Welcome.tsx stepKeys(), hosted and self-hosted alike: appearance
+        # → connect → bills → budgets → email → finish, with no sync/import
+        # steps. Every key resume scans must be marked or /welcome
+        # re-enters mid-wizard instead of bouncing.
+        for k in ("appearance", "connect", "bills", "budgets", "email",
+                  "finish"):
             self.assertIn(d["wizard_steps"].get(k), ("done", "skipped"), k)
 
     def test_alert_strip_is_exactly_two(self):

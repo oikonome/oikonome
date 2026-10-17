@@ -621,16 +621,45 @@ def answer_sync_nudge(conn, tenant_id: str) -> bool:
     return True
 
 
-def _enqueue_tenant_sync(tenant_id: str) -> None:
-    """Queue one full sync for the tenant on the worker, without making the
-    door that asked wait on Redis: a pool that cannot connect retries for
-    seconds, and the request it answers already waited. A queue that is
-    down is logged; the hourly sweep stays the floor."""
+async def _drop_finished_result(pool, job_id: str) -> bool:
+    """Forget the kept result of a job under `job_id` that is no longer
+    queued or running, so the id can be queued again. False when the job
+    is still waiting or in flight — that one stands for the new ask."""
+    from arq.constants import job_key_prefix, result_key_prefix
+    if await pool.exists(job_key_prefix + job_id):
+        return False
+    await pool.delete(result_key_prefix + job_id)
+    return True
+
+
+def _enqueue_in_background(what: str, job: str, *args,
+                           job_id: str | None = None,
+                           requeue_finished: bool = False) -> None:
+    """Queue one job on the worker without making the door that asked wait
+    on Redis: a pool that cannot connect retries for seconds, and the
+    request it answers already waited. A queue that is down is logged; the
+    hourly sweep stays the floor.
+
+    `job_id` makes the job one of a kind: arq refuses a second job under
+    an id that is still queued, running, or whose result it still keeps,
+    so two doors asking for the same pull queue it once.
+
+    `requeue_finished` lets the id be queued again once its job has
+    finished: arq keeps a finished job's result under its id for an hour
+    and refuses the id meanwhile, without a word to the caller. A pull
+    owed until it succeeds (a new bank's first sync) must not be refused
+    for an hour because an earlier try gave up."""
     async def _enqueue():
         from arq import create_pool
         pool = await create_pool(_redis_settings())
         try:
-            await pool.enqueue_job("sync_one", tenant_id)
+            if job_id is None:
+                await pool.enqueue_job(job, *args)
+            else:
+                queued = await pool.enqueue_job(job, *args, _job_id=job_id)
+                if (queued is None and requeue_finished
+                        and await _drop_finished_result(pool, job_id)):
+                    await pool.enqueue_job(job, *args, _job_id=job_id)
         finally:
             await pool.close()
 
@@ -638,11 +667,107 @@ def _enqueue_tenant_sync(tenant_id: str) -> None:
         try:
             asyncio.run(_enqueue())
         except Exception as e:                               # noqa: BLE001
-            log.warning("could not queue the sync tenant %s asked for: %s",
-                        tenant_id, e)
+            log.warning("could not queue %s: %s", what, e)
 
-    threading.Thread(target=_run, name=f"sync-nudge-{tenant_id}",
+    threading.Thread(target=_run, name=f"queue-{job}",
                      daemon=True).start()
+
+
+def _enqueue_tenant_sync(tenant_id: str) -> None:
+    """Queue one full sync for the tenant on the worker."""
+    _enqueue_in_background(f"the sync tenant {tenant_id} asked for",
+                           "sync_one", tenant_id)
+
+
+# A sweep's result for a new bank whose first pull it left to that bank's
+# first-sync job rather than pulling it itself.
+FIRST_SYNC_QUEUED = "queued:first-sync"
+
+
+def first_sync_job_id(item_id: str) -> str:
+    """The one arq job id a new Item's first pull is queued under, by every
+    door that asks for it (the link poll, the welcome wizard's nudge)."""
+    return f"first-sync:{item_id}"
+
+
+def queue_first_sync(tenant_id: str, item_id: str) -> None:
+    """Queue a new bank's first pull (transactions, then holdings and
+    liabilities) on the worker — the link poll saves the Item and answers
+    at once. Queued under one id per Item, so a door asking again while it
+    waits or runs adds nothing; once a try has finished without a pull
+    (it gave up behind a busy lock or failed), the next ask queues it
+    again rather than meeting the finished job's kept result. Lost (Redis
+    down), the wizard's nudge and the hourly sync queue it again."""
+    _enqueue_in_background(f"the first sync of item {item_id}",
+                           "sync_item", str(tenant_id), item_id, True,
+                           job_id=first_sync_job_id(item_id),
+                           requeue_finished=True)
+
+
+# How long one wizard nudge's pull of an Item stands for every other nudge
+# of it: both wizards nudge every 30 s and may be open at once, and a
+# backed-up queue would otherwise collect one pull per nudge.
+BACKFILL_NUDGE_WINDOW_S = 60
+
+
+def queue_backfill_sync(tenant_id: str, item_id: str,
+                        now: float | None = None) -> None:
+    """Queue one pull of an Item whose history is still arriving — the
+    welcome wizard's nudge, for a self-host that hears no Plaid webhook.
+    Runs on the worker, never in the web process; at most one per Item per
+    BACKFILL_NUDGE_WINDOW_S."""
+    bucket = int((now if now is not None else time.time())
+                 // BACKFILL_NUDGE_WINDOW_S)
+    _enqueue_in_background(f"the backfill pull of item {item_id}",
+                           "sync_item", str(tenant_id), item_id, False,
+                           job_id=f"backfill-nudge:{item_id}:{bucket}")
+
+
+# One arq pool per event loop for the async doors (the Plaid webhook): a
+# pool per event opened and closed a Redis connection for every webhook,
+# three of them per new bank.
+_ASYNC_POOLS: dict = {}
+
+
+async def enqueue_job(job: str, *args, job_id: str | None = None) -> bool:
+    """Queue one job from async code on a pool kept for this event loop.
+    True when Redis took it (or already holds a job under `job_id`); False,
+    logged, when the queue could not be reached — the caller decides
+    whether the sender should try again."""
+    from arq import create_pool
+    loop = asyncio.get_running_loop()
+    entry = _ASYNC_POOLS.get(id(loop))
+    if entry is not None and entry[0] is not loop:
+        entry = None
+    pool = None
+    try:
+        if entry is None:
+            lock = asyncio.Lock()
+            _ASYNC_POOLS[id(loop)] = entry = (loop, lock, [None])
+        _loop, lock, holder = entry
+        async with lock:
+            if holder[0] is None:
+                holder[0] = await create_pool(_redis_settings())
+            pool = holder[0]
+        kw = {"_job_id": job_id} if job_id is not None else {}
+        await pool.enqueue_job(job, *args, **kw)
+        return True
+    except Exception as e:                                   # noqa: BLE001
+        log.warning("could not queue %s: %s", job, e)
+        # a pool whose connection broke is rebuilt by the next event —
+        # only the pool THIS call used, and only while it is still the
+        # current one: another event may already have rebuilt it, and
+        # closing that healthy pool would fail every event mid-enqueue on it
+        if entry is not None and pool is not None:
+            async with entry[1]:
+                if entry[2][0] is not pool:
+                    return False
+                entry[2][0] = None
+                try:
+                    await pool.close()
+                except Exception:                            # noqa: BLE001
+                    pass
+        return False
 
 
 def _alert_failovers(conn, tenant_id: str) -> None:
@@ -770,6 +895,23 @@ def _sync_pass(conn, tenant_id: str, since_days: int, progress,
             "transactions": _item_txn_count(conn, it["id"])})
         new_status = "ok"
         try:
+            if it["aggregator"] == "plaid" and never_pulled(conn, it["id"]):
+                # A bank no pull has finished yet is owed its first pull:
+                # minutes of history, then its holdings and liabilities.
+                # Only its first-sync job makes that pull, a few at a time,
+                # announcing none of the history as new charges; made here
+                # it would run outside those turns, skip the holdings and
+                # hand the backfill to the household's webhooks. One job id
+                # per Item, so a sweep asking again adds nothing.
+                queue_first_sync(tenant_id, it["id"])
+                results[it["id"]] = FIRST_SYNC_QUEUED
+                _emit(progress, "item", {
+                    "id": it["id"], "name": name, "status": "ok",
+                    "transactions": _item_txn_count(conn, it["id"])})
+                # nothing observed: no status transition to judge
+                done += 1
+                _progress_mark(conn, None, {"done": done})
+                continue
             if it["aggregator"] == "plaid":
                 r = plaid.sync(conn, it["id"])
                 results[it["id"]] = f"ok:{r['added']}"
@@ -886,12 +1028,16 @@ def _sync_pass(conn, tenant_id: str, since_days: int, progress,
     # shell waiting to be relinked, a bank wanting a fresh login) has its
     # own status, sync_log row and link alert; it must not keep the row red
     # while every other connection syncs. The failure count rides in the
-    # note. A pass where nothing synced at all is not stamped.
+    # note. A pass where nothing synced at all is not stamped. A new bank
+    # whose first pull was handed to its own job was not synced by this
+    # pass, so it is not counted as one of its items.
     synced = sum(1 for v in results.values() if str(v).startswith("ok:"))
-    if synced or (items and failures == 0):
+    pulled = sum(1 for it in items
+                 if results.get(it["id"]) != FIRST_SYNC_QUEUED)
+    if synced or (pulled and failures == 0):
         alerts.heartbeat(conn, "sync",
                          f"{synced} ok, {failures} failed" if failures
-                         else f"{synced or len(items)} items")
+                         else f"{synced or pulled} items")
     # proactive email the moment a connection breaks or recovers —
     # a mail failure must never break the sync
     # The edge is judged against what was last ANNOUNCED for each item,
@@ -1072,7 +1218,12 @@ def _recent_txn_ids(conn) -> set[str] | None:
 def _webhooks_after_sync(conn, results: dict, before_ids: set | None,
                          tenant_id: str = "") -> None:
     """sync.completed and transactions.new for the household's webhooks.
-    Best-effort — a failure here never fails the sync."""
+    Best-effort — a failure here never fails the sync.
+
+    A connection whose first pull was handed to its first-sync job was not
+    pulled by this sync, and is neither a success nor a failure of it."""
+    results = {k: v for k, v in (results or {}).items()
+               if v != FIRST_SYNC_QUEUED}
     if before_ids is None or not results:
         return
     try:
@@ -1256,8 +1407,24 @@ def nightly_tenant(tenant_id: str) -> dict:
             _wh.prune(conn)
         except Exception as e:                   # noqa: BLE001
             log.warning("webhook prune failed tenant=%s: %s", tenant_id, e)
+        # A household that turned automatic bill detection off (it enters
+        # its bills by hand) gets no new-bill or new-income offers from the
+        # nightly — neither from the ledger finder nor from Plaid's streams.
+        # Upkeep of the bills it has, amount drift included, still runs, and
+        # the on-demand "Find bills & income" door is not this path.
         try:
-            stats = bills.run(conn)
+            from ..engine import budget as _bdet
+            detect_new = _bdet.load_config(conn).get(
+                "bill_detection_auto") is not False
+        except Exception as e:                   # noqa: BLE001
+            log.warning("bill detection setting unreadable tenant=%s: %s",
+                        tenant_id, e)
+            detect_new = True
+        if not detect_new:
+            log.info("bill detection off for tenant %s — no new bill or "
+                     "income offers tonight", tenant_id)
+        try:
+            stats = bills.run(conn, propose=detect_new)
         except Exception as e:                   # noqa: BLE001
             # Unguarded, this is the one step that can cost a household
             # EVERYTHING else: a single tenant-specific data defect here
@@ -1282,9 +1449,9 @@ def nightly_tenant(tenant_id: str) -> dict:
         try:
             from ..engine import budget as _bcfg
             from ..sync import plaid as _plaid
-            if ext.gate.tier_allows(conn, "plaid_recurring") and \
-                    _bcfg.load_config(conn).get("plaid_recurring",
-                                                True) is not False:
+            if detect_new and ext.gate.tier_allows(conn, "plaid_recurring") \
+                    and _bcfg.load_config(conn).get("plaid_recurring",
+                                                    True) is not False:
                 streams = []
                 # Healthy items only. The hourly sync deliberately retries
                 # broken ones — a re-auth or an outage clears by being
@@ -2015,15 +2182,16 @@ def email_tenant(tenant_id: str, send_it: bool = True,
                                         today=today_local),
                 today_local.year - 1)
         else:
-            # No budget, no verdict — the same rule the Today page and the
-            # native app follow. With nothing planned the engine still
+            # No budget, no verdict — the same rule, read the same way
+            # (budget.budgets_set: the STORED row), as the Today page and
+            # the native app. With nothing planned the engine still
             # produces a consistent "On budget · $0 of $0 left", which is
-            # arithmetic rather than news, so a household still in setup
-            # would be mailed a judgement on a plan it has not made. The
+            # arithmetic rather than news; and under a month of history
+            # the loaded config carries a provisional seed nobody saved,
+            # which would mail "Over budget" on the app's own guess. The
             # manual "email me now" button (force_email) still sends, so
             # nothing here becomes unreachable.
-            if not force_email and not (cfg.get("food_monthly")
-                                        or cfg.get("other_monthly")):
+            if not force_email and not _budget.budgets_set(conn):
                 # the skip is the day's decision, so the day is stamped
                 # with it: unstamped, the cadence came due every hour and
                 # Doctor read the silence as a relay that never sent
@@ -2268,6 +2436,7 @@ NIGHTLY_STEP_BUDGET = {
     "gate": 1800,
     "unverified": 1800,
     "purge": 3600,
+    "plaid-release-retry": 1800,
 }
 # the job's own timeout: every budget plus a margin, so arq never cancels
 # the run from outside before the steps' own budgets have had their say
@@ -2349,6 +2518,13 @@ async def _nightly_all_body():
     from . import reaper as _reaper
     reap = await _nightly_step("plaid-reap", _sweep, _reaper.reap_tenant,
                                "plaid-reap")
+    # Items whose release failed while their household was being erased
+    # or reset — no tenant sweep reaches them (jobs/reaper.py)
+    release_retry = await _nightly_step("plaid-release-retry",
+                                        _reaper.retry_queued_releases)
+    if isinstance(release_retry, dict) and any(release_retry.values()):
+        log.info("plaid release retry: %s", {k: len(v) for k, v in
+                                             release_retry.items()})
     # the installed gate's own sweeps run BEFORE the purge below, so an
     # account the gate froze tonight gets its full grace window rather than
     # racing this same run
@@ -2934,11 +3110,29 @@ async def sync_one(ctx, tenant_id: str):
     return await asyncio.to_thread(sync_tenant, tenant_id)
 
 
-def _sync_item_body(tenant_id: str, item_id: str) -> dict:
+def never_pulled(conn, item_id: str) -> bool:
+    """A newly linked Item no pull has finished yet, well or badly: every
+    Plaid pull writes a sync_log row when it ends (success or Plaid error).
+    Linked within the last day — an older Item without a row (a restored
+    household's, say) is an ordinary one."""
+    return conn.execute(
+        "SELECT 1 FROM items i WHERE i.id=%s "
+        "AND i.linked_at > now() - interval '1 day' "
+        "AND NOT EXISTS (SELECT 1 FROM sync_log s WHERE s.item_id = i.id)",
+        (item_id,)).fetchone() is not None
+
+
+def _sync_item_body(tenant_id: str, item_id: str,
+                    first: bool = False) -> dict:
     """One plaid item, one tenant — the webhook-driven scoped sync
     (SYNC_UPDATES_AVAILABLE). Pull, then the same best-effort sync-time
     categorize pass the hourly sweep runs, so webhook-fresh rows don't sit
-    uncategorized until the next poll."""
+    uncategorized until the next poll.
+
+    `first`: a newly linked Item's first pull, queued by the link poll.
+    It also pulls holdings and liabilities (a new brokerage must not wait
+    for the daily products pull), and announces nothing to the household's
+    webhooks — the rows it lands are history, not new charges."""
     conn = tenancy.tenant_connect(tenant_id)
     locked = False
     try:
@@ -2972,11 +3166,23 @@ def _sync_item_body(tenant_id: str, item_id: str) -> dict:
                            (item_id,)).fetchone()
         if row is None or row["status"] == "archived":
             return {"skipped": "archived" if row else "gone"}
+        # An Item no pull has touched yet gets its first pull whichever job
+        # reaches it: Plaid's INITIAL_UPDATE / HISTORICAL_UPDATE can beat
+        # the queued first-sync job, and a plain pull would announce the
+        # new bank's recent history to the household's webhooks as new
+        # charges and leave its holdings to the daily products pull.
+        if not first and never_pulled(conn, item_id):
+            first = True
         # Plaid's webhook is how most charges arrive where it is wired, so
         # this pull announces what it landed exactly as the full sweep
         # does; the sweep's own before-snapshot already holds these rows
-        # and would never name them.
-        before_ids = _recent_txn_ids(conn)
+        # and would never name them. A first-sync job that arrives after
+        # another job already made the Item's first pull announces too:
+        # what it lands now is new, not history.
+        pulled = first and conn.execute(
+            "SELECT 1 FROM sync_log WHERE item_id=%s LIMIT 1",
+            (item_id,)).fetchone() is not None
+        before_ids = None if first and not pulled else _recent_txn_ids(conn)
         try:
             r = plaid.sync(conn, item_id)
         except Exception as e:
@@ -2985,6 +3191,12 @@ def _sync_item_body(tenant_id: str, item_id: str) -> dict:
             raise
         _webhooks_after_sync(conn, {item_id: f"ok:{(r or {}).get('added', 0)}"},
                              before_ids, tenant_id)
+        if first:
+            try:
+                plaid.sync_products(conn, item_id)
+            except Exception as e:               # noqa: BLE001
+                log.warning("plaid first products failed item=%s: %s",
+                            item_id, e)
         from ..sync import base as _sync_base
         with _sync_base.categorize_lock(conn, tenant_id) as _held:
             if _held:
@@ -3015,9 +3227,301 @@ def _sync_item_body(tenant_id: str, item_id: str) -> dict:
             conn.close()
 
 
-async def sync_item(ctx, tenant_id: str, item_id: str):
-    """Webhook receiver → scoped sync (web/plaid_webhook.py enqueues)."""
-    return await asyncio.to_thread(_sync_item_body, tenant_id, item_id)
+def _is_never_pulled(tenant_id: str, item_id: str) -> bool:
+    """never_pulled on a short connection of its own, given straight back."""
+    conn = tenancy.tenant_connect(tenant_id)
+    try:
+        return never_pulled(conn, item_id)
+    finally:
+        conn.close()
+
+
+async def sync_item(ctx, tenant_id: str, item_id: str, first: bool = False):
+    """Webhook receiver → scoped sync (web/plaid_webhook.py enqueues), and
+    a new Item's first pull (the link poll queues it, queue_first_sync).
+
+    A first pull that finds another sync holding the household's lock is
+    tried again later: the holder covers the transactions (the nudge), but
+    only this job pulls the new Item's holdings and liabilities. At most
+    FIRST_SYNC_CONCURRENCY first pulls run at once — each holds a pooled
+    connection for minutes — and one beyond that is tried again shortly
+    rather than holding a job slot while it waits. A plain job that
+    reaches an Item no pull has finished IS its first pull (Plaid's
+    INITIAL_UPDATE often beats the queued first-sync job), so it waits for
+    a turn the same way; behind the household's lock it is covered by the
+    holder like any webhook pull. Waiting for a turn spends none of the job's
+    attempts, and turns go oldest job first.
+
+    Every way out of the first-sync road but a wait gives up the job's
+    place in the turn queue (the finally below): a webhook that comes back
+    to find another job pulled its Item, a pull that raises, a give-up. A
+    place left behind keeps its old enqueue time ahead of every younger
+    first pull and holds one of the few turns while nothing runs."""
+    from arq.worker import Retry
+    asked_first = first
+    key = ctx.get("job_id") or f"sync_item:{tenant_id}:{item_id}"
+    waiting = False
+    try:
+        if not first:
+            first = await asyncio.to_thread(_is_never_pulled, tenant_id,
+                                            item_id)
+            if not first:
+                return await asyncio.to_thread(_sync_item_body, tenant_id,
+                                               item_id)
+        queued = ctx.get("enqueue_time")
+        queued_at = queued.timestamp() if isinstance(queued, dt.datetime) \
+            else None
+        if not _FIRST_SYNC_SLOTS.take(key, queued_at):
+            if _first_sync_wait_spent(key, queued_at):
+                log.warning("first sync of item %s gave up waiting for a "
+                            "turn; the hourly sync queues it again", item_id)
+                return {"skipped": "no-turn"}
+            waiting = True
+            raise Retry(defer=FIRST_SYNC_SLOT_WAIT_S)
+        r = await _first_pull_with_turn(tenant_id, item_id)
+        if asked_first and isinstance(r, dict) \
+                and r.get("skipped") == "already-running":
+            # (a webhook's pull is covered by the holder's nudge, and the
+            # queued first-sync job still comes for the holdings)
+            tries = await _first_sync_real_try(ctx, key)
+            if tries < SYNC_ITEM_MAX_TRIES:
+                waiting = True
+                raise Retry(defer=min(FIRST_SYNC_RETRY_S * tries,
+                                      FIRST_SYNC_RETRY_MAX_S))
+            log.warning("first sync of item %s gave up behind a busy "
+                        "household lock; the hourly sync queues it again",
+                        item_id)
+        return r
+    finally:
+        if not waiting:
+            _FIRST_SYNC_SLOTS.forget(key)
+            if asked_first:
+                await _forget_first_sync_tries(ctx, key)
+
+
+async def _first_pull_with_turn(tenant_id: str, item_id: str):
+    """The first pull, on the turn sync_item just took.
+
+    The turn is the thread's to give back: a job arq cancels at its
+    timeout leaves its thread pulling, and the pull still counts. Given
+    back here only when the thread never started."""
+    guard = threading.Lock()
+    state = {"held": True, "started": False}
+
+    def _give_back():
+        with guard:
+            if state["held"]:
+                state["held"] = False
+                _FIRST_SYNC_SLOTS.release()
+
+    def _run():
+        with guard:
+            if not state["held"]:
+                return {"skipped": "abandoned"}
+            state["started"] = True
+        try:
+            return _sync_item_body(tenant_id, item_id, True)
+        finally:
+            _give_back()
+    try:
+        return await asyncio.to_thread(_run)
+    except BaseException:
+        with guard:
+            started = state["started"]
+        if not started:
+            _give_back()
+        raise
+
+
+def _first_sync_wait_spent(key: str, queued_at: float | None) -> bool:
+    """Has this job waited out its time for a turn? Measured from when the
+    job was queued, which arq keeps with the job: the waits the process
+    counted start again at zero when the worker restarts, and a job that
+    had already waited hours would get a fresh budget and run into arq's
+    max_tries instead. The count is the fallback for a job with no
+    enqueue time."""
+    if queued_at is not None:
+        return time.time() - queued_at > FIRST_SYNC_MAX_WAIT_S
+    return _FIRST_SYNC_SLOTS.waits(key) > FIRST_SYNC_MAX_SLOT_WAITS
+
+
+def _first_sync_tries_key(key: str) -> str:
+    return f"oikonome:first-sync-tries:{key}"
+
+
+async def _first_sync_real_try(ctx, key: str) -> int:
+    """Which real attempt behind a busy household lock this is, its waits
+    for a turn aside. Counted in Redis beside arq's own try count, so a
+    worker restart, which forgets the waits the process counted, cannot
+    make a job that waited a hundred times look like it tried a hundred
+    times. Without Redis it is arq's try count less the waits."""
+    redis = ctx.get("redis")
+    if redis is not None:
+        name = _first_sync_tries_key(key)
+        try:
+            n = await redis.incr(name)
+            await redis.expire(name, FIRST_SYNC_TRIES_TTL_S)
+            return max(1, int(n))
+        except Exception as e:                     # noqa: BLE001
+            log.warning("first-sync try count unavailable for %s: %s",
+                        key, e)
+    return max(1, ctx.get("job_try", 1) - _FIRST_SYNC_SLOTS.waits(key))
+
+
+async def _forget_first_sync_tries(ctx, key: str) -> None:
+    redis = ctx.get("redis")
+    if redis is None:
+        return
+    try:
+        await redis.delete(_first_sync_tries_key(key))
+    except Exception as e:                         # noqa: BLE001
+        # the count expires on its own; a job that ended keeps nothing
+        log.info("first-sync try count not cleared for %s: %s", key, e)
+
+
+class _FirstSyncTurns:
+    """FIRST_SYNC_CONCURRENCY turns at first pulls, handed out oldest job
+    first. A job that finds no turn free asks again FIRST_SYNC_SLOT_WAIT_S
+    later (arq re-scores it behind newer jobs, so without the queue a new
+    Item could take every turn an older one was waiting for); its place is
+    its original enqueue time, kept while it keeps asking. Counts each
+    job's waits, so they never spend the attempts the job has for real
+    work. Per worker process, like the turns themselves."""
+
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self._lock = threading.Lock()
+        self._busy = 0
+        self._waiting: dict = {}     # job -> [enqueued_at, last asked]
+        self._waits: dict = {}       # job -> [waits, last asked]
+
+    def _prune(self, now: float) -> None:
+        stale = now - FIRST_SYNC_WAITER_STALE_S
+        for k in [k for k, v in self._waiting.items() if v[1] < stale]:
+            del self._waiting[k]
+        old = now - 86400
+        for k in [k for k, v in self._waits.items() if v[1] < old]:
+            del self._waits[k]
+
+    def take(self, key: str, enqueued_at: float | None = None,
+             now: float | None = None) -> bool:
+        """A turn for job `key` if one is free and no older job still
+        asking is ahead of it for it; else its wait is counted."""
+        now = time.time() if now is None else now
+        with self._lock:
+            self._prune(now)
+            w = self._waiting.get(key)
+            if w is None:
+                w = self._waiting[key] = [
+                    enqueued_at if enqueued_at is not None else now, now]
+            w[1] = now
+            mine = (w[0], key)
+            ahead = sum(1 for k, v in self._waiting.items()
+                        if (v[0], k) < mine)
+            if self._busy + ahead < self.capacity:
+                self._busy += 1
+                del self._waiting[key]
+                return True
+            c = self._waits.setdefault(key, [0, now])
+            c[0] += 1
+            c[1] = now
+            return False
+
+    def waits(self, key: str) -> int:
+        with self._lock:
+            c = self._waits.get(key)
+            return c[0] if c else 0
+
+    def forget(self, key: str) -> None:
+        with self._lock:
+            self._waiting.pop(key, None)
+            self._waits.pop(key, None)
+
+    def acquire(self, blocking: bool = False) -> bool:
+        """A turn regardless of who waits — for a caller outside the queue."""
+        with self._lock:
+            if self._busy < self.capacity:
+                self._busy += 1
+                return True
+            return False
+
+    def release(self) -> None:
+        with self._lock:
+            if self._busy <= 0:
+                raise ValueError("first-sync turn released too many times")
+            self._busy -= 1
+
+
+# How long a first pull waits before trying again behind a sync that holds
+# the household's lock; each retry waits one step longer, up to the cap.
+FIRST_SYNC_RETRY_S = 60
+FIRST_SYNC_RETRY_MAX_S = 300
+# How many new Items' first pulls run at once, and how long one waits for
+# a turn. A burst of new households linking banks would otherwise put
+# every job slot — and as many pooled connections — on multi-minute
+# backfills while ordinary syncs and webhooks queue behind them.
+def _first_sync_concurrency() -> int:
+    try:
+        return max(1, int(env_num("OIKONOME_FIRST_SYNC_CONCURRENCY", "3")))
+    except ValueError:
+        log.warning("OIKONOME_FIRST_SYNC_CONCURRENCY is not a whole "
+                    "number — using 3")
+        return 3
+
+
+FIRST_SYNC_CONCURRENCY = _first_sync_concurrency()
+FIRST_SYNC_SLOT_WAIT_S = 30
+# A waiting job that stopped asking (dropped, its worker restarted) holds
+# no place in the queue after this; it gets its place back if it asks again.
+FIRST_SYNC_WAITER_STALE_S = 4 * FIRST_SYNC_SLOT_WAIT_S
+# How long a first pull waits for a turn before leaving the Item to the
+# hourly sync: a burst of new households can queue dozens of multi-minute
+# first pulls behind a handful of turns.
+FIRST_SYNC_MAX_WAIT_S = 6 * 3600
+FIRST_SYNC_MAX_SLOT_WAITS = FIRST_SYNC_MAX_WAIT_S // FIRST_SYNC_SLOT_WAIT_S
+# A job's count of real attempts outlives no job: longer than any job can
+# wait and retry, short enough that a job arq dropped leaves nothing.
+FIRST_SYNC_TRIES_TTL_S = 24 * 3600
+_FIRST_SYNC_SLOTS = _FirstSyncTurns(FIRST_SYNC_CONCURRENCY)
+# The attempts a sync_item job gets at real work. A first pull retries
+# behind the household's lock; under a burst of new links arq's default of
+# five attempts can be used up before the lock frees, which would leave the
+# new Item's history to the daily sync. Waits for a turn are counted apart
+# (_FirstSyncTurns) and arq is given room for both.
+SYNC_ITEM_MAX_TRIES = 40
+# arq's own ceiling for a sync_item job: every wait for a turn the time
+# budget allows, every real attempt, and a few tries arq re-runs when a
+# worker shuts down under a job. The job's own budgets must run out first,
+# so it ends with its give-up log rather than arq's "max retries exceeded".
+SYNC_ITEM_ARQ_MAX_TRIES = SYNC_ITEM_MAX_TRIES + FIRST_SYNC_MAX_SLOT_WAITS + 20
+# One Item's pull — a new Item's first is up to two years of history, page
+# by page with merchant resolution — and one household's full sync both
+# take minutes on a large ledger; arq's 300-second default cancelled them
+# while their thread ran on.
+SYNC_TIMEOUT = 30 * 60
+
+
+# A finish exchanges a token and runs the new Item's first sync, which for
+# a multi-year ledger takes minutes, and a sweep may finish several in a
+# row. arq's 300-second default would cancel the job while its thread kept
+# running; the outcome is recorded when the Item's row commits, so a
+# cancelled finish is safe, but the window is sized to the work anyway.
+PLAID_LINK_TIMEOUT = 30 * 60
+
+
+async def plaid_link_finish(ctx, tenant_id: str, link_token: str):
+    """LINK webhook → finish a Hosted Link add session nobody may be
+    polling (web/plaid_webhook.py enqueues; jobs/plaid_links.py)."""
+    from . import plaid_links
+    return await asyncio.to_thread(plaid_links.finish_session, tenant_id,
+                                   link_token)
+
+
+async def plaid_link_sweep(ctx):
+    """Every 5 minutes: finish open Hosted Link add sessions the webhook
+    did not (jobs/plaid_links.sweep)."""
+    from . import plaid_links
+    return await asyncio.to_thread(plaid_links.sweep)
 
 
 async def demo_reset_all(ctx):
@@ -3424,10 +3928,56 @@ STARTUP_GRANT_TRIES = 30
 STARTUP_GRANT_SLEEP = 2.0
 
 
+# Every job runs its work in a thread (asyncio.to_thread), so the loop's
+# default executor is the worker's real capacity — and asyncio sizes it
+# from the CPU count (min(32, cpu_count + 4)), which is few threads on a
+# small host. A job waiting for a thread is already running as far as arq
+# is concerned, its timeout counting down, so when the executor is
+# saturated a queued job's timeout can expire before its work starts,
+# cancelling syncs and cron sweeps that never ran. The executor is sized here, and arq takes
+# fewer jobs at once than there are threads: a nightly step that overran
+# its budget keeps its thread after its job has moved on (_nightly_step),
+# and the spare threads keep it from crowding out the jobs behind it.
+# Each running job holds about one pooled tenant connection, so unset the
+# thread count follows the worker's own pool: OIKONOME_POOL_MAX as the
+# worker sees it (compose maps OIKONOME_WORKER_POOL_MAX onto it) plus the
+# headroom, which keeps the jobs arq takes at once within the pool.
+WORKER_THREAD_HEADROOM = 2
+
+
+def _pool_max() -> int:
+    try:
+        return max(1, int(os.environ.get("OIKONOME_POOL_MAX") or "10"))
+    except ValueError:
+        return 10
+
+
+def _worker_threads() -> int:
+    default = _pool_max() + WORKER_THREAD_HEADROOM
+    try:
+        return max(2, int(env_num("OIKONOME_WORKER_THREADS", str(default))))
+    except ValueError:
+        log.warning("OIKONOME_WORKER_THREADS is not a whole number — "
+                    "using %s", default)
+        return default
+
+
+WORKER_THREADS = _worker_threads()
+WORKER_MAX_JOBS = max(1, WORKER_THREADS - WORKER_THREAD_HEADROOM)
+
+
+def _size_executor() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(max_workers=WORKER_THREADS,
+                           thread_name_prefix="job"))
+
+
 async def _startup(ctx):
     """Post-boot hygiene: a reboot broadcast whose deadline has passed by
     the time the worker is up means the restart is OVER — clear it so
     users aren't stuck reading a stale countdown."""
+    _size_executor()
     from .. import logsafe
     logsafe.install()          # one line per record, as in the web process
     def _clear():
@@ -3483,11 +4033,17 @@ class WorkerSettings:
     # nightly_all is listed with its own timeout too: the console's run-now
     # button enqueues it by name, and that path takes the function's
     # timeout, not the cron entry's
+    max_jobs = WORKER_MAX_JOBS
     functions = [sync_all, arq_func(nightly_all, timeout=NIGHTLY_TIMEOUT),
-                 email_all, demo_reset_all, sync_one,
-                 sync_item, broadcast_sweep, nightly_reboot,
+                 email_all, demo_reset_all,
+                 arq_func(sync_one, timeout=SYNC_TIMEOUT),
+                 arq_func(sync_item, timeout=SYNC_TIMEOUT,
+                          max_tries=SYNC_ITEM_ARQ_MAX_TRIES),
+                 broadcast_sweep, nightly_reboot,
                  blocklist_refresh, webhooks_all,
                  staging_sweep,
+                 arq_func(plaid_link_finish, timeout=PLAID_LINK_TIMEOUT),
+                 arq_func(plaid_link_sweep, timeout=PLAID_LINK_TIMEOUT),
                  arq_func(bulk_import_job.bulk_import_run,
                           timeout=bulk_import_job.ARQ_TIMEOUT)] + ext.job_functions()
     cron_jobs = [
@@ -3519,6 +4075,8 @@ class WorkerSettings:
         # email start) and between sync slots
         cron(nightly_reboot, minute=37),
         cron(webhooks_all, minute=set(range(60))),      # the webhook outbox
+        cron(plaid_link_sweep,                          # unpolled bank links
+             minute=set(range(3, 60, 5)), timeout=PLAID_LINK_TIMEOUT),
     ] + ext.cron_jobs()
     cron_jobs = [_in_zone(j, _cron_zone()) for j in cron_jobs]
     redis_settings = _redis_settings()

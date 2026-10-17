@@ -651,7 +651,11 @@ export default function TxnDetail() {
       <Card>
         <View style={s.actRow}>
           <View style={{ flex: 1 }}>
-            <Text style={s.mut}>Split across categories</Text>
+            <Text style={s.mut}>
+              {txn.split?.length && txn.split_source && txn.split_source !== "user"
+                ? "Split across categories by the receipt's items"
+                : "Split across categories"}
+            </Text>
             {txn.split?.length ? txn.split.map((p, i) => (
               <Text key={i} style={s.actVal}>
                 <Text style={s.mut}>{money(Math.abs(p.amount))}</Text>

@@ -308,6 +308,21 @@ class ElevationWindowTests(_Base):
             ("files", ("export.zip", b"PK\x05\x06" + b"\0" * 18))])
         self.assertEqual(r.status_code, 200, r.text)
         bulk_plan = r.json()
+        # a login-email change whose first mail a cap withheld was recorded
+        # without its rotation; the resend that mails it runs the rotation,
+        # so it steps up like the change door
+        from oikonome.auth import email_change
+        admin = tenancy.admin_connect()
+        try:
+            me = admin.execute(
+                "SELECT u.id, s.id AS sid FROM users u JOIN sessions s "
+                "ON s.user_id = u.id WHERE u.email=%s "
+                "ORDER BY s.created_at DESC LIMIT 1", (email,)).fetchone()
+            email_change.request(admin, me["id"], email,
+                                 f"held-{uuid.uuid4().hex[:8]}@example.dev",
+                                 session_id=me["sid"], mail_sent=False)
+        finally:
+            admin.close()
         probes = {
             # route key: (client, method, path, kwargs, fresh?)
             "POST /api/totp/enroll": (c, "post", "/api/totp/enroll", {}, False),
@@ -326,6 +341,8 @@ class ElevationWindowTests(_Base):
             "POST /api/email/change": (
                 c, "post", "/api/email/change",
                 {"data": {"new_email": "new@example.dev"}}, False),
+            "POST /api/email/change/resend": (
+                c, "post", "/api/email/change/resend", {}, False),
             "POST /api/account/leave": (
                 v, "post", "/api/account/leave", {}, False),
             "POST /api/account/delete": (

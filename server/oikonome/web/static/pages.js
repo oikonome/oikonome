@@ -565,6 +565,46 @@
       }
       return;
 
+      // "a moment.", or the server's Retry-After seconds when it sent a
+      // small one
+      function inWait(retryAfter) {
+        var secs = parseInt(retryAfter || "", 10);
+        return secs > 0 && secs <= 120
+          ? secs + " second" + (secs === 1 ? "" : "s") + "."
+          : "a moment.";
+      }
+
+      function busyText(retryAfter) {
+        return "The server is busy — try again in " + inWait(retryAfter);
+      }
+
+      // the proxy's answer while the app itself is away (a deploy, more
+      // capacity): restarting, not overloaded, and not unreachable
+      function restartingText(retryAfter) {
+        return "The server is restarting — try again in " + inWait(retryAfter);
+      }
+
+      // Whether a refusal's body is the app's own words: JSON, or plain
+      // text that is not a markup document. The proxy labels its page
+      // text/html, but an edge in front can rewrite the content-type, so a
+      // body that opens like markup counts as a page too. Same rule as the
+      // app's own client.
+      function appBody(ct, text) {
+        if (/html/i.test(ct || "")) return false;
+        var t = String(text || "").replace(/^\s+/, "");
+        if (t.charAt(0) === "{" || t.charAt(0) === "[") {
+          try { JSON.parse(t); return true; } catch (ignore) { return false; }
+        }
+        return t.charAt(0) !== "<";
+      }
+
+      // A 502/503/504 that is not the app talking (its page, or nothing at
+      // all) is the proxy answering because the app was not there to.
+      function proxyAnswered(status, ct, text) {
+        return (status === 502 || status === 503 || status === 504)
+          && (!String(text || "").trim() || !appBody(ct, text));
+      }
+
       function post() {
       fetch("/api/login", {
         method: "POST",
@@ -578,7 +618,10 @@
             var j = JSON.parse(t);
             detail = j.detail || j.message || t;
           } catch (ignore) { /* plain text */ }
-          return { ok: r.ok, status: r.status, detail: String(detail) };
+          return { ok: r.ok, status: r.status, detail: String(detail),
+                   retryAfter: r.headers.get("Retry-After"),
+                   restarting: proxyAnswered(
+                     r.status, r.headers.get("Content-Type"), t) };
         });
       }).then(function (res) {
         if (res.ok) {
@@ -592,6 +635,12 @@
         if (submitBtn) {
           submitBtn.disabled = false;
           submitBtn.textContent = mode2fa ? "Sign in with code" : "Sign in";
+        }
+        // Before reading any detail: the proxy's page is markup, not the
+        // app's words, and nothing in it answers the sign-in.
+        if (res.restarting) {
+          showErr(restartingText(res.retryAfter));
+          return;
         }
         var d = res.detail || "";
         if (d.indexOf("human_check_failed") >= 0) {
@@ -633,6 +682,13 @@
         }
         if (res.status === 429) {
           showErr("Too many failed attempts — try again in a few minutes.");
+          return;
+        }
+        // A 503 in the app's own words = the server is shedding load (too
+        // many sign-ins hashing at once, or the database full), not a wrong
+        // password and not an outage. The human-check token was already spent and reset above.
+        if (res.status === 503) {
+          showErr(busyText(res.retryAfter));
           return;
         }
         // A 5xx is OUR fault, not theirs. Falling through to the generic
@@ -1052,5 +1108,34 @@
     // like a typo of something, and a hint that flickers while you type
     // teaches people to ignore it
     field.addEventListener("blur", check);
+  }());
+
+  // One click, one signup. The form is a plain POST that takes a second or
+  // so (the human check, the password hash), and a second click in that
+  // time sends the same single-use human-check token again: the browser
+  // keeps only the second answer, which is the check refusing a spent
+  // token, while the first request quietly created the account. So the
+  // button locks on submit, as the sign-in button does, and unlocks when
+  // the page is shown again from the back/forward cache.
+  (function () {
+    var form = document.querySelector('form[action="/signup"]');
+    if (!form) return;
+    var btn = form.querySelector("button");
+    if (!btn) return;
+    var label = btn.textContent;
+    form.addEventListener("submit", function (e) {
+      if (form.getAttribute("data-sent") === "1") {
+        e.preventDefault();
+        return;
+      }
+      form.setAttribute("data-sent", "1");
+      btn.disabled = true;
+      btn.textContent = "Creating your account…";
+    });
+    window.addEventListener("pageshow", function () {
+      form.removeAttribute("data-sent");
+      btn.disabled = false;
+      btn.textContent = label;
+    });
   }());
 })();

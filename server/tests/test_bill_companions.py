@@ -244,3 +244,54 @@ class CompanionFeeInMonthStatusTests(unittest.TestCase):
                     if p["payee"] == "Zenith Water"), None)
         if row is not None:
             self.assertAlmostEqual(row["paid"], 91.00, places=2)
+
+
+class CompanionStraddlingTheMonthBoundaryTests(unittest.TestCase):
+    """A fee and its main charge on opposite sides of the 1st.
+
+    Cash basis: each row is spending in the month it is dated, exactly once.
+    A main charge settled last month must not take this month's fee out of
+    both months, and a fee posted last month must not be counted again
+    here on top of the charge it rode with."""
+
+    def setUp(self):
+        self.conn = make_db()
+        write_config(self.conn)
+        add_bill(self.conn, "Zenith Water", 90.00, frequency="MONTHLY",
+                 next_due=dt.date(2026, 7, 1),
+                 companions=[{"tokens": "servicing surcharge", "amount": 1.0,
+                              "window_days": 3}])
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _month(self):
+        return budget.month_status(self.conn, dt.date(2026, 7, 20))
+
+    def test_fee_this_month_after_a_charge_settled_last_month(self):
+        add_txn(self.conn, dt.date(2026, 6, 30), 90.00, "ZENITH WATER 0123",
+                primary="RENT_AND_UTILITIES")
+        add_txn(self.conn, dt.date(2026, 7, 2), 1.00, "SERVICING SURCHARGE",
+                primary="GENERAL_SERVICES")
+        ms = self._month()
+        b = ms["buckets"]
+        counted = b["fixed"]["actual"] + b["food"]["actual"] + b["other"]["actual"]
+        self.assertAlmostEqual(b["fixed"]["actual"], 1.00, places=2)
+        self.assertAlmostEqual(counted, 1.00, places=2,
+                               msg="the July fee is July spending, once")
+
+    def test_fee_last_month_before_a_charge_this_month(self):
+        add_txn(self.conn, dt.date(2026, 6, 30), 1.00, "SERVICING SURCHARGE",
+                primary="GENERAL_SERVICES")
+        add_txn(self.conn, dt.date(2026, 7, 1), 90.00, "ZENITH WATER 0123",
+                primary="RENT_AND_UTILITIES")
+        ms = self._month()
+        self.assertAlmostEqual(ms["buckets"]["fixed"]["actual"], 90.00, places=2,
+                               msg="the June fee was June's spending")
+        self.assertNotIn("Zenith Water", ms["drifts"],
+                         "the bill's price did not change")
+        june = budget.month_status(self.conn, dt.date(2026, 6, 30))
+        jb = june["buckets"]
+        self.assertAlmostEqual(
+            jb["fixed"]["actual"] + jb["food"]["actual"] + jb["other"]["actual"],
+            1.00, places=2)

@@ -215,6 +215,10 @@ ARCHIVE_CONTROL_SKIP = {
                      "hash bound to one phone enrolment and to this instance. "
                      "Credential material, not a record of the household; the "
                      "device it belongs to is what the archive lists.",
+    "email_change_reverts": "one-shot links that undo a login-email "
+                            "change — token hashes for a mailbox, live for "
+                            "days. Credential material, not a record of the "
+                            "household.",
 } | ext.gate.export_exclusions()
 
 _CREDENTIAL_COL = ("token", "hash", "secret", "endpoint", "p256dh",
@@ -260,6 +264,8 @@ ARCHIVE_TABLE_SKIP = {
     "job_runs": "job bookkeeping and heartbeats",
     "import_staging": "import scratch — parsed rows waiting on a preview, "
                       "and the tokens that commit them",
+    "assistant_turns": "the assistant's question-and-answer log — a "
+                       "conversation on this instance, not the books",
     "bulk_import_jobs": "import scratch and job bookkeeping — a folder "
                         "import's frozen plan and its progress",
     "bulk_import_files": "import scratch and job bookkeeping — the files "

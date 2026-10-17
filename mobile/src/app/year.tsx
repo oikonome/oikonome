@@ -14,7 +14,7 @@ import { useRefetchWhenShown } from "../lib/focus";
 import { useSession } from "../lib/session";
 import { VERDICT } from "../lib/verdict";
 import { C, money } from "../lib/theme";
-import { catLabel, routeInt } from "../lib/pure";
+import { catLabel, isPlanSavingsGoal, routeInt } from "../lib/pure";
 import { ESTIMATED_SAVINGS_CAPTION, labelSavingsRow, yearSavings }
   from "../lib/planner";
 
@@ -44,7 +44,7 @@ export default function YearLens() {
   // refetch to whoever shows it — this screen does, on the way back
   useRefetchWhenShown(today, TODAY_KEY);
   const goal = (today.data?.savings_goals ?? [])
-    .find((g) => g.name === "Savings");
+    .find((g) => isPlanSavingsGoal(g.name));
   const d = query.data;
   const atNow = y === now.getFullYear();
   const floor = d?.first_year ?? 1990;

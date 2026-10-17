@@ -12,20 +12,35 @@ matcher. YNAB's transfer marker ("Transfer : <Account>" payee) and
 
 from __future__ import annotations
 
-import csv
 import datetime as dt
-import io
 from typing import NamedTuple
 
 from ..engine.compat import as_date
 from . import flowmap, reimport
-from .base import (FileImportIds, Transaction, mask_file_raw,
+from .base import (FileImportIds, Transaction, drop_before_history, mask_file_raw,
                    upsert_transactions)
-from .csvimport import date_order, scrub_identifiers
+from .csvimport import bounded_dict_reader, date_order, scrub_identifiers
 from .rowcap import capped
 from .dedup import Deduper
 
 YNAB_COLUMNS = {"date", "payee", "outflow", "inflow"}
+
+
+# The register's own columns number about a dozen. Every row becomes a
+# dict over the header (twice, with the lower-cased copy) and its raw
+# copy, so the row cap alone does not bound the memory: a header of a
+# thousand empty columns over the capped row count is a few MB of file
+# and gigabytes of dicts, in the process every household shares. A
+# header past this is refused before a row is read.
+MAX_COLUMNS = 40
+
+
+def _check_width(fieldnames) -> None:
+    if fieldnames is not None and len(fieldnames) > MAX_COLUMNS:
+        raise ValueError(
+            f"this file has {len(fieldnames):,} columns (max "
+            f"{MAX_COLUMNS}) — export the register as it comes, without "
+            f"added columns")
 
 
 def looks_like_ynab(header: list[str]) -> bool:
@@ -84,7 +99,8 @@ def _account_key(row: dict) -> str | None:
 def parse(text: str) -> list[_Line]:
     """Every line of the register the importer would store, in file
     order. Refuses (ValueError) a date it cannot read."""
-    reader = csv.DictReader(io.StringIO(text))
+    reader = bounded_dict_reader(text)
+    _check_width(reader.fieldnames)
     # day-first or month-first is a property of the FILE (see
     # csvimport.date_order) — read the whole column before parsing a row
     # a data row with more cells than the header (a trailing comma, an
@@ -170,10 +186,10 @@ def _earlier_ids_on(conn, lines: list[_Line], pick: str) -> list[set[str]]:
     return out
 
 
-def earlier_on_pick(conn, lines: list[_Line], pick: str,
-                    names) -> dict[str, list[str]]:
-    """The live rows on `pick` an earlier import of the whole register put
-    there, per YNAB account in `names`.
+def _earlier_lines_on(conn, lines: list[_Line], pick: str,
+                      names) -> list[tuple[int, str]]:
+    """(file line, row id) for each live row on `pick` an earlier import
+    of the whole register put there for a YNAB account in `names`.
 
     A row counts only when BOTH hold: its id is exactly an id that import
     gave one of this account's lines, and its own raw records that line's
@@ -182,7 +198,7 @@ def earlier_on_pick(conn, lines: list[_Line], pick: str,
     names = set(names)
     mine = [i for i, ln in enumerate(lines) if ln.account in names]
     if not mine or not pick:
-        return {}
+        return []
     cands = _earlier_ids_on(conn, lines, pick)
     want: dict[str, list[int]] = {}
     for i in mine:
@@ -190,16 +206,26 @@ def earlier_on_pick(conn, lines: list[_Line], pick: str,
             want.setdefault(c, []).append(i)
     key = lines[0].account_key
     if not want or key is None:
-        return {}
-    hits: dict[str, list[str]] = {}
+        return []
+    hits: list[tuple[int, str]] = []
     for r in conn.execute(
             "SELECT id, raw->>%s AS acct FROM transactions"
             " WHERE account_id = %s AND removed = 0 AND id = ANY(%s)",
             (key, pick, sorted(want))).fetchall():
         for i in want[r["id"]]:
             if r["acct"] is not None and r["acct"] == lines[i].stored_account:
-                hits.setdefault(lines[i].account, []).append(r["id"])
+                hits.append((i, r["id"]))
                 break
+    return hits
+
+
+def earlier_on_pick(conn, lines: list[_Line], pick: str,
+                    names) -> dict[str, list[str]]:
+    """The live rows on `pick` an earlier import of the whole register put
+    there, per YNAB account in `names` (see _earlier_lines_on)."""
+    hits: dict[str, list[str]] = {}
+    for i, rid in _earlier_lines_on(conn, lines, pick, names):
+        hits.setdefault(lines[i].account, []).append(rid)
     return {n: list(dict.fromkeys(v)) for n, v in hits.items()}
 
 
@@ -280,15 +306,24 @@ def import_ynab(conn, account_id: str, text: str,
     away = [n for n in names if accounts[n] != account_id]
     asked = [n for n in away if (remove_earlier or {}).get(n) is True]
     doomed: list[str] = []
+    moved: set[int] = set()
     if away and account_id:
-        earlier = earlier_on_pick(conn, lines, account_id, away)
-        proven = {i for ids in earlier.values() for i in ids}
+        hits = _earlier_lines_on(conn, lines, account_id, away)
+        proven = {rid for _, rid in hits}
         out["foreign_left"] = _foreign_left(conn, lines, account_id, away,
                                             proven)
-        doomed = [i for n in asked for i in earlier.get(n, [])]
+        asked_set = set(asked)
+        doomed = list(dict.fromkeys(
+            rid for i, rid in hits if lines[i].account in asked_set))
+        # the lines whose earlier row is about to leave the pick: each is
+        # the household's own row changing account, so it lands at its
+        # destination whatever the history window says — left out there,
+        # the removal below would delete it from the ledger altogether
+        moved = {i for i, _ in hits if lines[i].account in asked_set
+                 and dest_of[i]}
     # the import first: a refusal it raises (a dedup window too large)
     # then leaves the ledger as it was, removals included
-    result = _import_mapped(conn, lines, dest_of, batch_id)
+    result = _import_mapped(conn, lines, dest_of, batch_id, moved=moved)
     if doomed:
         from . import batches
         gone = batches.retire_rows(conn, [i for i in doomed
@@ -326,7 +361,8 @@ def import_ynab(conn, account_id: str, text: str,
 
 
 def _import_mapped(conn, lines: list[_Line], dest_of: list,
-                   batch_id: str | None) -> dict:
+                   batch_id: str | None,
+                   moved: set[int] | frozenset = frozenset()) -> dict:
     """Write each line to its destination (`dest_of[i]`, None to leave it
     out).
 
@@ -335,10 +371,14 @@ def _import_mapped(conn, lines: list[_Line], dest_of: list,
     where it lands, never on where the other accounts went, and an
     account that lands where a whole-register import once put the file
     gets exactly the ids it got then. The dedup runs against each
-    destination's own rows, so a card line meets the card's feed."""
+    destination's own rows, so a card line meets the card's feed.
+
+    `moved` names the lines whose earlier row on another account is being
+    removed by this import: they are not new to the household, so the
+    history window does not leave them out."""
     txns_all: list[Transaction] = []
     landed: list[int] = []
-    skipped_dupes = corrected = 0
+    skipped_dupes = corrected = skipped_older = 0
     for dest in dict.fromkeys(d for d in dest_of if d):
         mine = [d == dest for d in dest_of]
         deduper = Deduper(conn, dest, "ynab",
@@ -352,6 +392,7 @@ def _import_mapped(conn, lines: list[_Line], dest_of: list,
         rule_changed = any(round(ln.signed_as * 100) != round(ln.amount * 100)
                            for ln, m in zip(lines, mine) if m)
         txns: list[Transaction] = []
+        line_of: list[int] = []     # the file line each of txns came from
         old_of: list[list[tuple[str, float]]] = []
         absorbed = []   # lines the feed now holds whose earlier row must go
         for i, (ln, m) in enumerate(zip(lines, mine)):
@@ -370,7 +411,7 @@ def _import_mapped(conn, lines: list[_Line], dest_of: list,
                    if rule_changed else None)
             if not m:
                 continue
-            landed.append(i)
+            line_of.append(i)
             old_of.append(
                 [(x, ln.signed_as) for x in (oid, old_ids.legacy_id(oid))
                  if x]
@@ -391,6 +432,18 @@ def _import_mapped(conn, lines: list[_Line], dest_of: list,
             conn, dest, txns, old_of, same_line=reimport.same_line_raw)
         corrected += reimport.retire_absorbed(conn, dest, "ynab", absorbed,
                                               taken={t.id for t in txns})
+        # the household's history window (Settings → how far back), applied
+        # after the ids are numbered over every line, so a line it leaves
+        # out does not shift the numbering of the lines that land, and after
+        # the re-import bookkeeping, so a row an earlier import stored under
+        # the old sign rule is still moved and then corrected by the write
+        inside, older = drop_before_history(
+            conn, [t for i, t in zip(line_of, txns) if i not in moved])
+        skipped_older += older
+        keep = {id(t) for t in inside} | {
+            id(t) for i, t in zip(line_of, txns) if i in moved}
+        landed.extend(i for i, t in zip(line_of, txns) if id(t) in keep)
+        txns = [t for t in txns if id(t) in keep]
         if batch_id:
             from . import batches
             batches.tag(conn, txns, batch_id)
@@ -398,4 +451,5 @@ def _import_mapped(conn, lines: list[_Line], dest_of: list,
     added = upsert_transactions(conn, txns_all)
     return {"imported": added, "rows": len(txns_all),
             "skipped_duplicates": skipped_dupes, "corrected": corrected,
+            "skipped_older": skipped_older,
             "_ids": {t.id for t in txns_all}, "_landed": landed}

@@ -69,6 +69,31 @@ class BillEditAfterArchiveOrDelete(unittest.TestCase):
             "payee": payee, "orig_payee": orig or payee, "amount": amount,
             "cadence": "MONTHLY:1"})
 
+    def test_a_stored_name_with_stray_whitespace_is_still_editable(self):
+        """A bill whose stored name carries trailing whitespace (an older
+        write, a feed's display name) is the same bill the list shows, so
+        an edit of it must land — not answer 409 "deleted" because the
+        trimmed name the form sends matches no row by string. The save
+        resolves the row by its slug, and the edit trims the stored name
+        on the way."""
+        self._add("Harbor Gym")
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            conn.execute("UPDATE bills SET payee = payee || '  ' "
+                         "WHERE payee = 'Harbor Gym'")
+        finally:
+            conn.close()
+        self.assertIsNone(self._row("Harbor Gym"))
+        r = self._edit("Harbor Gym", 55)
+        self.assertEqual(r.status_code, 200, r.text)
+        row = self._row("Harbor Gym")
+        self.assertIsNotNone(row, "the stored name was not trimmed")
+        self.assertEqual(abs(row["amount"]), 55)
+        # the second edit finds it by name alone
+        r = self._edit("Harbor Gym", 60)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(abs(self._row("Harbor Gym")["amount"]), 60)
+
     def test_edit_of_a_bill_archived_since_is_409_and_it_stays_archived(self):
         self._add("Archived Gym")
         self.client.post("/api/bills/delete", json={"payee": "Archived Gym"})

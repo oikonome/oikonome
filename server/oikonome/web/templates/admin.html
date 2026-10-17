@@ -250,11 +250,13 @@
       {% if bs.daily_ok %}<span class="pill g">daily backups healthy</span>{% else %}<span class="pill r">no backup in over 30h — nightly dump may be failing</span>{% endif %}
       <span class="sub">· last {{ '%.0f'|format(bs.newest_age_h) }}h ago
       · {{ bs.count }} dump{{ 's' if bs.count != 1 }} over {{ bs.days_covered }} day{{ 's' if bs.days_covered != 1 }}
-      · {{ bs.total_mb }} MB total · oldest {{ bs.oldest_at }}</span>
+      · {{ bs.total_mb }} MB total · oldest {{ bs.oldest_at }}
+      · watching <code>{{ host_state.backup_dir }}</code></span>
       <details style="margin-top:.4rem"><summary style="cursor:pointer" class="sub">latest dumps</summary>
         {% for b in host_state.backups %}<div class="sub"><code>{{ b.name }}</code> — {{ b.size_mb }} MB, {{ '%.0f'|format(b.age_h) }}h ago</div>{% endfor %}
       </details>
-      {% else %}<span class="pill r">none found</span> <span class="sub">no backup has been taken yet</span>{% endif %}</td></tr>
+      {% elif not host_state.backups_readable %}<span class="pill r">folder not readable by the app</span> <span class="sub"><code>{{ host_state.backup_dir }}</code> is closed to the app container — on the host, <code>chmod u=rwx,go=rx</code> it (the dumps inside stay owner-only), or re-run <code>./oikonome.sh install</code></span>
+      {% else %}<span class="pill r">none found</span> <span class="sub">no backup has been taken yet in <code>{{ host_state.backup_dir }}</code> (OIKONOME_BACKUP_DIR in docker/.env)</span>{% endif %}</td></tr>
     {% else %}
     <tr><th>Backups</th><td class="mut">backups dir not mounted (pre-compose-bind install — re-run install.sh)</td></tr>
     {% endif %}
@@ -456,6 +458,7 @@
     </form>
     {% endfor %}
   </div>
+  {% if cmd_watcher_behind %}<p class="pill r" style="margin:.5rem 0 0;display:inline-block">watcher out of date</p> <span class="sub">{{ cmd_watcher_behind }}</span>{% endif %}
   <p class="sub" style="margin:.5rem 0 0">Backup / status / logs run on one click; upgrade, restore, reset and uninstall arm a typed confirmation at the top of the page.</p>
   {% else %}
   <p class="mut">Not available — the host command watcher isn't installed. Run

@@ -70,6 +70,9 @@ SKIP = {
                 "must not start posting the ledger to a URL its operator "
                 "never saw, and the signing secret would not decrypt there",
     "webhook_deliveries": "webhook outbox / delivery log, kept a week",
+    "assistant_turns": "the assistant's question-and-answer log — a "
+                       "conversation on this instance, not the books; the "
+                       "figures in it are the ledger's, which travels",
 }
 
 

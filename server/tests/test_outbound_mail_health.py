@@ -105,7 +105,10 @@ class MailHealthTests(unittest.TestCase):
         st = mailhealth.status(self.admin)
         self.assertNotIn("someone", str(st))
         self.assertNotIn("example.com", str(st))
-        self.assertNotIn("550", str(st))
+        # the relay's code must not leak through the error or the reason
+        # (the timestamps beside them can carry any digits)
+        self.assertNotIn("550", st["last_fail"]["error"])
+        self.assertNotIn("550", st["reason"])
         self.assertEqual(st["last_fail"]["error"], "SMTPRecipientsRefused")
         # the plain-string form (older callers) is scrubbed the same way
         self.assertEqual(

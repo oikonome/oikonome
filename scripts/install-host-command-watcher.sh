@@ -19,7 +19,8 @@
 #     5 minutes, and REMOVES it before acting (single-use).
 #   * cmd must be in a fixed ALLOWLIST — never an arbitrary string/shell.
 #   * `restore` takes a backup filename: it must be a bare basename that
-#     EXISTS in <install>/backups (no path traversal, no absolute paths).
+#     EXISTS in the backup folder (<install>/backups unless
+#     OIKONOME_BACKUP_DIR moves it; no path traversal, no absolute paths).
 #   * one command at a time (a lock held while its run lives; a stale one
 #     from a crash is taken over, and nothing holds past six hours).
 #   * the console itself still requires an operator session + a typed
@@ -39,6 +40,7 @@ chown -R "$OWNER" "$ROOT/ops-state" 2>/dev/null || true
 
 cat > /usr/local/bin/oikonome-command-run <<SCRIPT
 #!/bin/sh
+# oikonome-command-run revision=2
 set -u
 ROOT="\$1"
 UID_C=$UID_C
@@ -116,7 +118,10 @@ restore_path=""
 if [ "\$cmd" = "restore" ]; then
   base=\$(basename -- "\$arg")
   case "\$base" in *..*|"" ) echo "bad restore filename"; rm -f "\$lock"; exit 0 ;; esac
-  restore_path="\$ROOT/backups/\$base"
+  # the folder OIKONOME_BACKUP_DIR names (default <install>/backups), read
+  # as the install owner: root never sources a file that user can edit
+  bdir=\$(cd "\$ROOT" && runuser -u "\$owner_user" -- bash -c '. scripts/env-file.sh && backup_dir_resolve "\$PWD/docker"' 2>/dev/null || true)
+  restore_path="\${bdir:-\$ROOT/backups}/\$base"
   if [ ! -f "\$restore_path" ]; then
     printf '{"id":"%s","cmd":"restore","state":"failed","rc":2,"started":%s,"finished":%s}\n' "\$id" "\$now" "\$now" > "\$status"
     echo "no such backup: \$base" > "\$log"
@@ -234,4 +239,15 @@ systemctl enable "$SVC-boot.service"
 # (scripts/watcher-marker.sh has the whole rule)
 . "$(dirname "$0")/watcher-marker.sh"
 watcher_mark "$ROOT" command "$TAG"
+# The checker above is a frozen copy: only re-running this installer as
+# root refreshes it, so an existing host keeps whatever an older version
+# wrote. The marker therefore names the revision of the checker it
+# installed, and the console compares it with what its operations need
+# (adminconsole.COMMAND_WATCHER_REVISION) and shows this installer's sudo
+# line when it is behind. A marker with no revision line predates this.
+# Bump it whenever the generated checker changes what it can do, here AND
+# in the checker's own "# oikonome-command-run revision=" line, which is
+# how the reboot installer learns what a marker-less checker is.
+#   2: restore looks in the folder OIKONOME_BACKUP_DIR names
+echo "revision=2" >> "$ROOT/ops-state/watchers/command"
 echo "command watcher installed for $ROOT (unit $SVC, drop-box uid $UID_C, runs as $OWNER)"

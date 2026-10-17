@@ -71,7 +71,7 @@ below; `./oikonome.sh help` prints the full usage line.
 
 The installer generates the database passwords and the encryption master key
 (protects bank tokens at rest), builds, and starts everything (SMTP for
-the daily email is not asked for here — the setup wizard's email step or
+the daily email is not asked for here — Settings → Email & Push or
 `docker/.env` takes it later). Re-running it is always safe —
 it keeps your `.env` and data. Prefer doing it by hand? Copy
 `docker/.env.example` to `docker/.env`, fill every value (the master key is
@@ -87,41 +87,70 @@ script, run `./oikonome.sh status` on the host and it prints the link
 again (opening the bare URL before the account exists lands on a 403 —
 the token is the key). Then, in order:
 
-1. **Connect** — **Connect an account** links a bank, card, or brokerage
+1. **Appearance** — **Auto** (the default: follows the phone or
+   computer's light/dark setting), **Light** or **Dark**. A tap applies at
+   once and is saved for the household, so every device you sign in on
+   matches. Change it later from the account menu (**Theme:**) in the
+   browser or Settings → Appearance on the phone.
+2. **Connect** — **Connect an account** links a bank, card, or brokerage
    (hosted goes straight to Plaid; self-host gets the provider grid —
    Plaid / MX / SimpleFIN / scripts / files). Linking pulls transactions,
    holdings and liabilities. Everything you've linked is listed
    underneath, one row each, with a status dot, how many accounts came
-   with it, when it last pulled, and a Disconnect button. Click **Done
-   connecting** when you've added everything. Optional file imports for
-   deeper history live under Connect / Accounts. When the instance enforces an
-   institution limit, the card also says how many of the allowed
-   institutions are connected, and the Connect button is disabled once
-   they're spent (see the accounts guide); self-host is never capped.
-2. **Bills** — waits for your bank's full history to arrive (up to two
-   years, delivered minutes after linking; you see each connection's
-   count and how far back it reaches), then approve/reject the bills
-   and paychecks detected from it. The wait is deliberate: income, bills
-   and the pre-filled budget are all derived from that history.
-   Rejections are remembered.
-3. **Budgets** — Food and Everything-else per month plus expected income,
-   pre-filled from your data. That's all the daily verdict needs.
-4. **Daily email delivery** (self-host only — hosted skips it) — optional:
-   give the instance an outbound SMTP account so the daily verdict and
-   alerts can reach your inbox, with guides for the common providers.
-5. **Done** — a recap, and how the daily verdict reaches you: **Email**,
-   **Push notification**, **Both** or **Off**, and the hour. Choosing push
-   registers the browser or phone you are on (the browser asks
-   permission; on http:// it cannot, the phone app can). For email, pick
-   **Verdict only** (one card: on budget or not, left to spend, pinned
-   bills) or the **Full report** (the whole Today page).
-   It goes to every login in your household — add a partner under
-   Settings → Users to include them (self-host can also add any address
-   under Settings → Email & Push; self-host needs SMTP first). Then you land
-   on Today. Every step but the history wait is skippable, and the green
-   **Finish setup** pill in the nav resumes at the first unfinished step —
-   so does **Finish setup** under Settings → Wizards, in the browser and
-   the phone app.
+   with it, when it last pulled, and a Disconnect button. **Import a file
+   instead** works just as well. Below the grid, **How much history should
+   come in?** picks **Last month**, **3 months**, **6 months**, **1 year**
+   or **Everything available** (the default). It saves on the tap and
+   applies to every bank you link from then on (banks share up to two
+   years) and every file you import (rows older than the window are left
+   out, and the import says how many). More history means better bill
+   detection and a budget seeded from real months; less keeps the first
+   sync quick. To bring older history in later, widen the window and
+   import from Accounts → Import. Click **Done connecting** when you've
+   added everything. When the instance enforces an institution limit, the
+   card also says how many of the allowed institutions are connected, and
+   the Connect button is disabled once they're spent (see the accounts
+   guide); self-host is never capped.
+3. **Bills & budgets** — first a question:
+   - **Find them for me, I'll adjust** (recommended) — waits for your
+     bank's history to arrive (delivered minutes after linking; you see
+     each connection's count and how far back it reaches), then the finder
+     proposes the bills and paychecks it can prove. **Approve**, **Dismiss**,
+     or **Adjust** one first — change its name, amount, cadence or due day,
+     then **Save & approve**; the charges that proved it stay attached.
+     **Approve all** takes the lot. The wait is deliberate: income, bills
+     and the pre-filled budget are all derived from that history.
+     Dismissals are remembered.
+   - **I'll enter them myself** — an empty list and a short form (name,
+     amount, cadence, due day; bill or paycheck). Each one matches its
+     charges by merchant from then on. This also turns off the nightly
+     search for *new* bills and paychecks (see the Bills guide); you can
+     still run **Find bills & income** on the Bills page any time.
+4. **Budgets** — Food & drink and Everything else per month, with your
+   approved bills and income above and savings as what's left. On the
+   finder path the figures are pre-filled from your history; on the
+   enter-them-myself path they start blank, with a suggestion from your
+   history beside each one to tap if you want it. That's all the daily
+   verdict needs.
+5. **Email & push** — the same on every instance. **Daily verdict**:
+   **Email**, **Push**, **Both** or **Off**, and the hour it sends. For
+   email, **Short summary instead of the full report** sends just the
+   verdict card (on budget or not, left to spend, pinned bills). Choosing
+   push registers the browser you are on (the browser asks permission; on
+   http:// it cannot, the phone app can); **Push to this device** does the
+   same on its own. **Who gets the email** lists the household's
+   addresses, each with its own on/off, and **Add another address**
+   invites one more — a new address gets one confirmation email first and
+   can unsubscribe from any message. A self-hosted instance also shows
+   whether its outbound mail account (SMTP) is set up, with a link to
+   Settings → Email & Push; until it is, nothing can be emailed.
+6. **Done** — a summary of what you set up (appearance, accounts and
+   history window, bills and paychecks approved, budgets, delivery and
+   recipients), and when the first email or notification arrives. Then
+   **Go to Today**. Every step but the Appearance choice and the history
+   wait is skippable, and the green **Finish setup** pill in the nav
+   resumes at the first unfinished step — so does **Finish setup** under
+   Settings → Wizards, in the browser and the phone app.
 
 Signing in before setup is finished takes you straight back into the
 wizard, so you never land on an empty dashboard wondering where to start.
@@ -263,7 +292,11 @@ recurring-bill tagging). Three ways to run the LLM, easiest first:
   host's LAN address (Docker Engine on Linux, where the server must also
   listen on that address rather than loopback only).
 - **Cloud**: any OpenAI-compatible API — endpoint URL + model name + your
-  API key (encrypted at rest, never shown again).
+  API key (encrypted at rest, never shown again). Anthropic's API works
+  as-is: URL `https://api.anthropic.com`, one of its model ids (Sonnet for
+  the bulk work, Opus for the assistant), the same id as the vision model
+  for receipts, and an Anthropic API key. A URL pasted with a trailing
+  `/v1` is fine.
 
 Skip it and everything still works; categorization is just manual. Two
 config layers: the wizard/Settings values are stored per tenant and **win**;
@@ -545,7 +578,17 @@ uninstall` offers to move them out to `~/oikonome-backups-<project>-<date>/`
 before deleting the folder (Enter keeps them; deleting them is the
 explicit opt-in). For scheduled backups, run `scripts/backup.sh` from
 cron/systemd with a destination **outside** the install — ideally another
-disk or machine. Backup, restore, reset, uninstall and an upgrade (from
+disk or machine — and set that same absolute path as
+`OIKONOME_BACKUP_DIR` in `docker/.env` (then `./oikonome.sh install`;
+if the console's host command watcher is already installed, also re-run
+`sudo sh scripts/install-host-command-watcher.sh <install-dir>` so the
+console's Restore looks in the new folder — the console flags a watcher
+that is out of date).
+That one setting is the folder `./oikonome.sh backup` and `restore` use
+and the one the admin console's backup card watches and restores from;
+the card names it. Dumps written anywhere else still restore by path
+(`./oikonome.sh restore /path/to/dump.sql.gz`), but the console cannot
+see them and will report no recent backup. Backup, restore, reset, uninstall and an upgrade (from
 its pull and pre-upgrade snapshot through the rebuild, and any Postgres
 major-version migration) share one lock (`.maintenance.lock` in
 the install folder), so a scheduled dump never starts under a restore or

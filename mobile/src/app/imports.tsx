@@ -23,6 +23,8 @@ import { patchQuery, removeFromList } from "../lib/cache";
 import { useSession } from "../lib/session";
 import { useOwner, useSharedLock, useViewer } from "../lib/viewer";
 import { C, mmddyy } from "../lib/theme";
+import { HistoryChoice } from "../components/wizard-history";
+import { HISTORY_CHOICES, historyMonthsOf } from "../components/wizard-logic";
 
 // A whole-ledger restore runs as a background job on the server — a big
 // archive takes minutes, longer than any request should be held open — so
@@ -65,7 +67,33 @@ function RestoreProgressLine() {
 // another device) finds it again through /jobs/current.
 // a folder-import file's warnings and corrected rows, as the job status
 // carries them per file
-type FileChecks = { warnings?: string[]; corrected?: number };
+type FileChecks = { warnings?: string[]; corrected?: number;
+                    skipped_older?: number };
+
+// Rows older than the household's history window never reach the ledger,
+// so an import that dropped some says how many and where the window is
+// widened — otherwise a short count reads as a misread file. The web
+// Import page's words, except where the window is widened: on the phone
+// that is this screen's own history choice, not the Accounts page. The
+// window is the owner's to change, so anyone else is pointed at them.
+function OlderRowsNote({ n }: { n?: number }) {
+  const { client } = useSession();
+  const owner = useOwner();
+  const settings = useQuery({ queryKey: ["settings"],
+    queryFn: () => client!.settingsFull(), enabled: !!client });
+  if (!n || n <= 0) return null;
+  const months = historyMonthsOf(settings.data?.history_months);
+  const win = HISTORY_CHOICES.find(([v]) => v === months)?.[1];
+  return (
+    <Text style={s.mut}>
+      {n} older row{n === 1 ? "" : "s"} left out
+      {win ? ` — the history window is ${win}` : ""}; {owner
+        ? "widen it on this screen or in the wizard"
+        : "the household owner can widen it"} to bring{" "}
+      {n === 1 ? "it" : "them"} in.
+    </Text>
+  );
+}
 
 function BulkJobCard({ onSettled }: { onSettled: (j: BulkJob) => void }) {
   const { client } = useSession();
@@ -121,6 +149,7 @@ function BulkJobCard({ onSettled }: { onSettled: (j: BulkJob) => void }) {
                               : ""))
                   : f.error}
             </Text>
+            {f.ok ? <OlderRowsNote n={n.skipped_older} /> : null}
             {f.ok ? (n.warnings ?? []).map((w, i) => (
               <Text key={i} style={{ color: C.warn, fontSize: 12,
                                      marginLeft: 12 }}>
@@ -493,6 +522,16 @@ export default function Imports() {
             </Text>
           </Card>
 
+          {/* the household's history reach — the same setting the
+              wizard's Connect step writes; a file's rows older than it are
+              left out, and this is where the older-rows note sends people
+              to widen it */}
+          <Card>
+            <HistoryChoice footnote={false}
+                           style={{ marginTop: 0, paddingTop: 0,
+                                    borderTopWidth: 0 }} />
+          </Card>
+
           {res && (
             <Card>
               {res.error ? (
@@ -521,6 +560,7 @@ export default function Imports() {
                         + "read differently (sign or year)"
                       : ""}.
                   </Text>
+                  <OlderRowsNote n={res.skipped_older} />
                   {res.note ? <Text style={s.mut}>{res.note}</Text> : null}
                   {res.kept_annotated ? (
                     <Text style={s.mut}>

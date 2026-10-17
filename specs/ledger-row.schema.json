@@ -17,6 +17,7 @@
     "mask":          {"type": ["string", "null"]},
     "pending":       {"type": "integer", "description": "1 = still pending at the bank"},
     "counts_as_spend": {"type": ["boolean", "null"], "description": "the verdict's own rule: does this row count as household spend"},
+    "spend_amount":  {"type": ["number", "null"], "description": "what this row adds to spending by the verdict's own math (net of a partial reimbursement; under the search's category filter, a split row's matching parts' share — the same figure the search's spend sum totals); 0 when it does not count. Day subtotals sum this, not amount"},
     "reimb":         {"type": "boolean", "description": "paired with a reimbursing deposit"},
     "reimb_flag":    {"type": "boolean", "description": "flagged as reimbursement expected"},
     "biz_flag":      {"type": "boolean", "description": "Schedule C tag on a household charge"},
@@ -51,12 +52,13 @@
     "override_manual": {"type": ["boolean", "null"], "description": "true when a person set the override"},
     "override_is_fee": {"type": ["boolean", "null"], "description": "true when the row is a companion charge — the fee that rides with override_bill's payment"},
     "split":         {"type": ["array", "null"],
-                      "description": "a hand split of this charge across categories, in order — stored category keys and cent-exact amounts summing to `amount`; null when the row is not split. `category` stays the whole row's own; the rollups count the parts",
+                      "description": "a split of this charge across categories, in order — stored category keys and cent-exact amounts summing to `amount`; null when the row is not split. `category` stays the whole row's own; the rollups count the parts. `split_source` says whether a person or a store receipt wrote them",
                       "items": {"type": "object",
                                 "properties": {"category": {"type": "string"},
                                                "amount":   {"type": "number"}},
                                 "required": ["category", "amount"],
                                 "additionalProperties": false}},
+    "split_source":  {"type": ["string", "null"], "description": "who wrote `split`: 'user' for a hand split, 'amazon' / 'costco' for the parts a matched store receipt's items name (recomputed on every match; a person's edit replaces them, a person's remove pins the row whole); null when the row is not split"},
     "splittable":    {"type": ["boolean", "null"], "description": "true when the split door will take this row — the spend test the rollups use (money out, not a transfer, not a card payment, not on a loan account); clients offer Split and Edit split only when true"}
   },
   "additionalProperties": false

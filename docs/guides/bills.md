@@ -22,14 +22,43 @@ the **Find bills & income** button (which reads "scanning…" while it
 works).
 
 Everything detection wants to change arrives as a **proposal** — new
-bill, cadence change, "this bill seems gone" — and sits pending until
-you approve or dismiss it. The one exception is **amount drift**.
+bill, cadence change, a price change on the due date, "this bill seems
+gone" — and sits pending until you approve or dismiss it. The one exception is **amount drift**.
+
+**Adjust before approving.** In the setup wizard each new-bill or
+paycheck proposal has an **Adjust** button beside Dismiss and Approve.
+It opens the proposal's name, amount, cadence and due day; change what
+is wrong and **Save & approve**. Only the fields you changed are
+applied — the rest keep the finder's values — and the bill is created
+exactly as an unadjusted approval would be, so the charges and merchants
+that proved it stay attached. A changed amount counts as your own edit,
+so drift leaves it alone for 60 days (see below). A new name that
+another bill already uses is refused and the proposal stays pending.
 
 Bank connections that know their own recurring streams (Plaid does) are
 cross-checked nightly: a stream Plaid sees that no bill covers arrives
 as a proposal too, marked "Plaid sees this recurring". It goes through
 the same approve/dismiss door. Switch the cross-check off in
 Settings → Connections if you would rather rely on the ledger alone.
+
+## Entering bills yourself (detection off)
+
+The setup wizard asks how you want bills and budgets set up. **Find them
+for me, I'll adjust** is the path above. **I'll enter them myself**
+starts with an empty list and a short form — name, amount, cadence and
+due day, added as a bill or a paycheck; each one matches its charges by
+merchant from then on, so renames and price drift keep working.
+
+Choosing it also switches off the nightly search for **new** bills and
+paychecks, including the Plaid cross-check above, so no new-bill offers
+arrive every morning. The upkeep of the bills you have keeps running:
+due dates roll forward, amount drift applies, and change, amount-change
+and "seems gone" proposals still appear for existing bills. **Find bills
+& income** on this page always works — it is a one-off scan you asked
+for, and its proposals still wait for your approval. To get nightly
+new-bill offers again, tick **Look for new bills and paychecks every
+night** — the switch sits on the Bills page next to **Find bills &
+income**, on the web and on the phone's Bills tab.
 
 ## Amount drift
 
@@ -39,6 +68,23 @@ audit entry — subscription price hikes shouldn't need paperwork. If you
 hand-edit an amount, it's immune to drift for 60 days, so detection
 won't fight you. A detection run that is already under way when you
 save an edit never writes over it either — your edit wins.
+
+Drift only moves within the matching tolerance: half the bill, up to $30,
+for a bill under $120, and a quarter of the bill above that ($15 → $7.50,
+$80 → $30, $200 → $50). A bigger price change — a gym that goes from $80 to $45 — is
+not applied on its own: when the merchant charges on the due date at an
+amount the bill does not recognise, and nothing it does recognise
+arrives that cycle, an **amount change** proposal appears with the
+charge ("charged $45.00 on 10/01/26, the bill says $80.00"). Approve
+it to make that the bill's amount, or edit the bill yourself. Dismiss
+it and that price (within 5 % or $1) is not offered again until the
+bill's amount changes. An offer you approve after editing the amount
+yourself is refused and withdrawn — your amount
+stands.
+
+A bill remembers the amounts it had before. Payments made at an earlier
+price keep their ⟳ mark and stay paid months after the amount changes,
+whether the change came from drift, a proposal or your own edit.
 
 ## How matching works
 
@@ -156,7 +202,8 @@ due date, red once it is late; the mobile app colours the same words under
 each bill the same way.
 
 Each bill row edits inline: rename, amount, cadence (the standard cycles,
-or **Custom interval…** for every N months or years — a bill already on
+or **Custom interval…** for every N months or years, up to about twenty
+years per cycle (240 months, 20 years) — a bill already on
 a custom interval keeps it listed in the picker, so editing something
 else never loses it), next due date, an occurrence cap (at most N per
 month), disable, archive, or delete. The enable/disable button sets the

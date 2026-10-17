@@ -33,9 +33,9 @@ class OpenSignupTests(unittest.TestCase):
     def tearDown(self):
         self._mail.stop(); self._dev.stop(); self._env.stop()
 
-    def _signup(self, email, invite=""):
+    def _signup(self, email, invite="", password=PW):
         return TestClient(self.appmod.app).post(
-            "/api/signup", data={"email": email, "password": PW,
+            "/api/signup", data={"email": email, "password": password,
                                  "invite": invite})
 
     def test_no_gate_configured_never_refuses_a_signup(self):

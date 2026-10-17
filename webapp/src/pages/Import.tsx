@@ -8,6 +8,26 @@ import { keptRowsNote, keptRowsQuestion } from "../components/RemoveAccountPanel
 import { sharedLock } from "../sharedlogin";
 import { isOwner, isViewer } from "../role";
 import { useElevate } from "../elevation";
+import { useLocation } from "react-router";
+import HistoryChoice, { HISTORY_CHOICES, HISTORY_SAVING, useHistorySaving }
+  from "../components/HistoryChoice";
+
+// Rows older than the household's history window never reach the ledger,
+// so an import that dropped some says how many and where the window is
+// widened — otherwise a short count reads as a misread file.
+function OlderRowsNote({ n }: { n?: number }) {
+  const s = useQuery({ queryKey: ["settings"], queryFn: api.settings });
+  if (!n || n <= 0) return null;
+  const win = HISTORY_CHOICES.find(([v]) =>
+    v === (s.data?.history_months ?? null))?.[1];
+  return (
+    <div style={{ marginTop: ".3rem" }}>
+      {n} older row{n === 1 ? "" : "s"} left out
+      {win ? ` — the history window is ${win}` : ""}; widen it on the
+      Accounts page or in the wizard to bring {n === 1 ? "it" : "them"} in.
+    </div>
+  );
+}
 
 // What an undo says beyond "done": the overlap warning, and the rows it
 // kept because the bank feed relies on them. A server that folds the
@@ -152,6 +172,7 @@ function BulkJobCard({ onSettled }: { onSettled: (j: BulkJob) => void }) {
                                 + "import read differently (sign or year)"
                               : ""))
                   : f.error}
+              {f.ok && <OlderRowsNote n={f.skipped_older} />}
               {f.ok && (f.warnings ?? []).length > 0 && (
                 <ul style={{ margin: ".2rem 0 0", paddingLeft: "1.2rem" }}>
                   {f.warnings!.map((w, i) => <li key={i}>{w}</li>)}
@@ -198,6 +219,9 @@ function PlanReview({ files, onSubmitted, onTaxDocs, onRestore }: {
   const [plan, setPlan] = useState<Awaited<
     ReturnType<typeof api.bulkAnalyze>> | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  // an import leaves out rows older than the STORED history window, read
+  // when it runs — a history choice still saving waits for its write
+  const saving = useHistorySaving();
 
   const analyze = useMutation({
     mutationFn: (files: File[]) => api.bulkAnalyze(files),
@@ -338,7 +362,8 @@ function PlanReview({ files, onSubmitted, onTaxDocs, onRestore }: {
             </table>
           </div>
           <button className="pri" style={{ marginTop: ".6rem" }}
-            disabled={run.isPending || !importable.length}
+            disabled={run.isPending || !importable.length || saving}
+            title={saving ? HISTORY_SAVING : undefined}
             onClick={() => run.mutate()}>
             {run.isPending ? "starting…"
               : `Import ${importable.length} file${importable.length === 1 ? "" : "s"}`}
@@ -368,6 +393,9 @@ const isArchive = (f: File) => /\.zip$/i.test(f.name);
 function DropZone({ onFiles, busy, mayRestore = true }: {
   onFiles: (files: File[]) => void; busy: boolean; mayRestore?: boolean;
 }) {
+  // a single file imports straight off the drop, and the import reads the
+  // stored history window — so a history choice still saving holds the door
+  const saving = useHistorySaving();
   const [over, setOver] = useState(false);
   const folderRef = useRef<HTMLInputElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -380,7 +408,8 @@ function DropZone({ onFiles, busy, mayRestore = true }: {
          onDragOver={(e) => { e.preventDefault(); setOver(true); }}
          onDragLeave={() => setOver(false)}
          onDrop={(e) => {
-           e.preventDefault(); setOver(false); take(e.dataTransfer.files);
+           e.preventDefault(); setOver(false);
+           if (!saving) take(e.dataTransfer.files);
          }}>
       <input ref={fileRef} type="file" multiple style={{ display: "none" }}
              onChange={(e) => { take(e.target.files); e.target.value = ""; }} />
@@ -390,12 +419,12 @@ function DropZone({ onFiles, busy, mayRestore = true }: {
         style={{ display: "none" }}
         onChange={(e) => { take(e.target.files); e.target.value = ""; }} />
       <div style={{ fontSize: "1.05rem", fontWeight: 600 }}>
-        {busy ? "reading…" : "Drop files here"}</div>
+        {busy ? "reading…" : saving ? HISTORY_SAVING : "Drop files here"}</div>
       <div style={{ display: "flex", gap: ".5rem", justifyContent: "center",
                     flexWrap: "wrap", margin: ".6rem 0" }}>
-        <button className="pri" disabled={busy}
+        <button className="pri" disabled={busy || saving}
                 onClick={() => fileRef.current?.click()}>choose files</button>
-        <button disabled={busy}
+        <button disabled={busy || saving}
                 onClick={() => folderRef.current?.click()}>
           or a whole folder</button>
       </div>
@@ -434,6 +463,9 @@ export default function Import({ heading = "Import transactions",
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const accounts = useQuery({ queryKey: ["accounts"], queryFn: api.accounts });
   const batches = useQuery({ queryKey: ["batches"], queryFn: api.importBatches });
+  // the setup wizard embeds this page inside its Connect step, which shows
+  // the same history choice right below — once on screen is enough
+  const inWizard = useLocation().pathname.endsWith("/welcome");
   // What the one door handed over, and where it routed it.
   const [staged, setStaged] = useState<File[]>([]);
   const [taxDocs, setTaxDocs] = useState<File[]>([]);
@@ -583,6 +615,13 @@ export default function Import({ heading = "Import transactions",
         <DropZone onFiles={route} busy={escalate.isPending || restore.isPending}
                   mayRestore={mayRestore} />
       )}
+      {/* the household's history reach — the same setting the wizard's
+          Connect step writes; a file's rows older than it are left out */}
+      {!inWizard && (
+        <div className="card">
+          <HistoryChoice footnote={false} />
+        </div>
+      )}
 
       {res?.error && <div className="note bad">{res.error}</div>}
       {res && !res.error && (
@@ -596,6 +635,7 @@ export default function Import({ heading = "Import transactions",
             ? ` · corrected ${res.corrected} an earlier import read `
               + "differently (sign or year)"
             : ""}.
+          <OlderRowsNote n={res.skipped_older} />
           {res.note && <div style={{ marginTop: ".3rem" }}>{res.note}</div>}
           {!!res.kept_annotated && (
             <div style={{ marginTop: ".3rem" }}>
@@ -845,6 +885,8 @@ function MappingCard({ need, onDone }: {
   // returns a new token; submitting the old one again would only ever
   // answer "upload expired".
   const [token, setToken] = useState(need.token);
+  // the import reads the stored history window; a choice still saving waits
+  const saving = useHistorySaving();
   const finish = useMutation({
     mutationFn: () => api.importMapped(token, cols),
     onSuccess: (r) => {
@@ -929,7 +971,8 @@ function MappingCard({ need, onDone }: {
         </div>
       )}
       <button className="pri" style={{ marginTop: ".7rem" }}
-              disabled={!ready || finish.isPending}
+              disabled={!ready || finish.isPending || saving}
+              title={saving ? HISTORY_SAVING : undefined}
               onClick={() => finish.mutate()}>
         Import with this mapping
       </button>
@@ -960,6 +1003,8 @@ function YnabAccountsCard({ need, onDone }: {
   const accounts = useQuery({ queryKey: ["accounts"], queryFn: api.accounts });
   // a correctable refusal re-parks the file under a new token
   const [token, setToken] = useState(need.token);
+  // the import reads the stored history window; a choice still saving waits
+  const saving = useHistorySaving();
   // "" = not answered yet, "skip", "__new__", or an account id
   const [dest, setDest] = useState<Record<string, string>>({});
   const [newName, setNewName] = useState<Record<string, string>>(() =>
@@ -1049,7 +1094,8 @@ function YnabAccountsCard({ need, onDone }: {
           later does not bring removed rows back.</p>
       )}
       <button className="pri" style={{ marginTop: ".7rem" }}
-              disabled={!ready || finish.isPending}
+              disabled={!ready || finish.isPending || saving}
+              title={saving ? HISTORY_SAVING : undefined}
               onClick={() => finish.mutate()}>
         Import these accounts
       </button>

@@ -23,6 +23,8 @@ import { bizWizardEntryStep } from "../bizmath";
 import { isOwner } from "../role";
 import { openPlaidHostedLink, plaidLinkOutcome } from "./ConnectHub";
 import DemoLock from "./DemoLock";
+import { bankAwaitsConfirm, CONFIRM_TO_CONNECT, VerifyEmailCard }
+  from "./VerifyEmailCard";
 import { sharedLock } from "../sharedlogin";
 
 const STRUCTURES = [
@@ -95,6 +97,11 @@ export default function BusinessWizard({ resume, onDone, onCancel }: {
   // opens it is drawn only for them. Adding the account by hand stays.
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const owner = isOwner(me);
+  // a free trial whose owner has not confirmed connects no bank: this door
+  // closes with the reason, like every other add-a-bank door, rather than
+  // open a bank sign-in the server refuses afterwards
+  const confirmFirst = bankAwaitsConfirm(me.data) ? CONFIRM_TO_CONNECT
+                                                  : null;
   // Step marks live in tenant config (biz_wizard_steps), exactly as the
   // Welcome wizard does it: they record that setup finished (the Business
   // page's "continue setup" prompt reads them). They never pick the step a
@@ -373,7 +380,12 @@ export default function BusinessWizard({ resume, onDone, onCancel }: {
               // (it plants a credential that outlives the login), so the
               // button is shown switched off with that refusal's sentence
               <DemoLock on={false} shared={sharedLock(me.data, "credential")}>
-                <button className="pri" disabled={busy}
+                {confirmFirst && (
+                  <VerifyEmailCard me={me.data} inline>
+                    {confirmFirst}
+                  </VerifyEmailCard>)}
+                <button className="pri" disabled={busy || !!confirmFirst}
+                        title={confirmFirst ?? undefined}
                         onClick={() => connect.mutate()}>
                   {connect.isPending ? "waiting for your bank…"
                                      : "Connect an account"}</button>

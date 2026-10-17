@@ -42,6 +42,10 @@ const LIGHT = {
   entity: "#6f47c4",
 };
 
+// Nothing stored means Auto: the app follows the phone's light/dark
+// setting until someone pins one (the setup wizard's first step offers
+// the choice, with Auto pre-selected). Dark stays the palette the tokens
+// were designed in, not the default a new install opens on.
 export function getThemeMode(): ThemeMode {
   const v = store.getString("mode");
   return v === "light" || v === "dark" ? v : "auto";

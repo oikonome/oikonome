@@ -8,7 +8,7 @@
 // adoptsDeviceZone, the reimbursement matcher's reimbCandidateWhy,
 // pairGapHint and reimbLeft, receiptDetailsDraft, and the whole-value
 // save rebase (rebaseFields, rebaseKeyed, rebaseNamedList, rebaseNamedSave,
-// assetListLanded).
+// assetListLanded) and the planner's historyBasisNote).
 
 // The awaiting-reimbursement rows the owed-back case runs, exported so the
 // server suite can seed the same rows and check the server's own figure
@@ -38,8 +38,34 @@ export function moneyCases(impl, assert) {
   const { parseMoneyDraft, signedBalance, mergePlannerBuckets, reimbOwed,
           spendPickerGroups, localYmd, adoptsDeviceZone, reimbCandidateWhy,
           pairGapHint, reimbLeft, receiptDetailsDraft, rebaseFields,
-          rebaseKeyed, rebaseNamedList, rebaseNamedSave, assetListLanded } = impl;
+          rebaseKeyed, rebaseNamedList, rebaseNamedSave, assetListLanded,
+          historyBasisNote } = impl;
   return {
+    "the planner says how many days a scaled suggestion stands on": () => {
+      assert.equal(historyBasisNote({ history_days: 12, history_scaled: true,
+                                      min_rate_days: 7 }),
+                   "Based on 12 days of history — scaled to a month.");
+      // under the settled threshold the line says the figure will move
+      // and asks for a revisit
+      assert.equal(historyBasisNote({ history_days: 3, history_scaled: true,
+                                      min_rate_days: 7 }),
+                   "Based on 3 days of history — scaled to a month — under "
+                   + "a week, so expect it to move; revisit after your first "
+                   + "full month.");
+      assert.equal(historyBasisNote({ history_days: 1, history_scaled: true,
+                                      min_rate_days: 7 }).startsWith(
+                     "Based on 1 day of history"), true);
+      // complete months behind it, no history, or no payload: no line
+      assert.equal(historyBasisNote({ history_days: 95, history_scaled: false,
+                                      min_rate_days: 7 }), null);
+      assert.equal(historyBasisNote({ history_days: 0, history_scaled: true }),
+                   null);
+      assert.equal(historyBasisNote(undefined), null);
+      // a ledger that began today: no suggestion, and the line says why
+      assert.equal(historyBasisNote({ history_days: 0, history_scaled: true,
+                                      not_enough_history: true }),
+                   "Not enough history yet — come back tomorrow.");
+    },
     "a whole-value save keeps what another device saved meanwhile": () => {
       // one field changed here, another changed elsewhere: both survive
       assert.deepEqual(
@@ -338,6 +364,15 @@ export function moneyCases(impl, assert) {
         assert.equal(adoptsDeviceZone({ ...me, timezone: "America/Chicago" },
                                       z), false, z);
       assert.equal(adoptsDeviceZone(undefined, "America/Chicago"), false);
+    },
+    "an account still enrolling its second factor adopts no zone until it has one": () => {
+      const me = { role: "owner", demo: false, hosted: true, needs_2fa: true,
+                   timezone: "Etc/UTC", timezone_source: "instance" };
+      // every settings write is refused until a factor is enrolled
+      assert.equal(adoptsDeviceZone(me, "America/Chicago"), false);
+      // the /api/me after enrolment is the one that adopts
+      assert.equal(adoptsDeviceZone({ ...me, needs_2fa: false },
+                                    "America/Chicago"), true);
     },
   };
 }

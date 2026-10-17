@@ -464,9 +464,11 @@ class BucketPaceIsTheTilesFigureTests(unittest.TestCase):
         body = r.json()
         self.assertLess(body["bucket_amount"], body["spend_sum"],
                         "fixture: the overflow purchase is listed whole")
-        self.assertEqual(body["per_day_days"], TODAY.day)
+        # the days the ledger has seen of the month: it began on the 9th
+        days = (TODAY - dt.date(2026, 7, 9)).days + 1
+        self.assertEqual(body["per_day_days"], days)
         self.assertEqual(body["per_day"],
-                         round(body["bucket_amount"] / TODAY.day, 2))
+                         round(body["bucket_amount"] / days, 2))
 
 
 class EmailLabelLinkTests(unittest.TestCase):

@@ -91,10 +91,11 @@ after the descriptor itself, so one payee shows up twice: once tidily
 named, once as something like `ACME KITE SUPPLY RIVERTON`.
 
 New charges are filed under the identified merchant. The same applies the
-other way round: where your bank's line and your data provider have agreed
-on a shop several times over, a single charge the provider suddenly names
-something else — something the line does not say — stays with the shop the
-line means. That one charge's name is set aside rather than remembered, so
+other way round: once your bank's line and your data provider have agreed
+on a shop — a single earlier charge is enough — a charge the provider
+names something else, something the line does not say, stays with the
+shop the line means. So the charges from one card terminal stay one
+merchant even when the feed names them differently from day to day. That one charge's name is set aside rather than remembered, so
 a real business of that name still gets its own merchant the first time you
 visit it — and the charge itself is searchable by the line your statement
 shows, not by the name it was moved off.

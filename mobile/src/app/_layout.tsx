@@ -3,13 +3,14 @@ import { PersistQueryClientProvider } from "@tanstack/react-query-persist-client
 import { Stack, usePathname, useRouter } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import { useEffect, useState } from "react";
-import { AppState, Modal, Platform, View } from "react-native";
+import { AppState, KeyboardAvoidingView, Modal, Platform, View } from "react-native";
 import * as ScreenCapture from "expo-screen-capture";
 
 import ElevationModal from "../components/elevation-modal";
 import { LogosProvider } from "../components/merchant-avatar";
 import { ext } from "../ext";
 import { PINNED_SERVER_URL, type Me } from "../lib/api";
+import { useAppUpdateCheck } from "../lib/app-updates";
 import { markLaunchConsumed, settleLaunch } from "../lib/launch";
 import { pushSupported } from "../lib/push";
 import { pushRoute, pushSentAt } from "../lib/pure";
@@ -77,6 +78,9 @@ function Gate({ children }: { children: React.ReactNode }) {
       setInFront(st === "active"));
     return () => sub.remove();
   }, []);
+  // the store may hold a newer build: offer it each time the app comes
+  // to the front (throttled inside)
+  useAppUpdateCheck(inFront);
 
   useEffect(() => {
     if (phase === "loading") return;
@@ -201,6 +205,13 @@ export default function RootLayout() {
         <Prefetcher />
         <LogosProvider>
         <Gate>
+          {/* Android draws edge-to-edge, so the window no longer shrinks
+              for the keyboard (adjustResize is a no-op): pad the whole
+              navigator by the keyboard's height instead, or the input at
+              the bottom of a screen sits under the keys. iOS keeps its
+              per-sheet avoidance; a second layer there would double-pad */}
+          <KeyboardAvoidingView style={{ flex: 1 }}
+                                behavior={Platform.OS === "android" ? "padding" : undefined}>
           <Stack screenOptions={{
             headerStyle: { backgroundColor: C.bg },
             headerTintColor: C.text,
@@ -254,6 +265,7 @@ export default function RootLayout() {
             <Stack.Screen name="feedback"
                           options={{ title: "Feedback & bug reports" }} />
           </Stack>
+          </KeyboardAvoidingView>
         </Gate>
         </LogosProvider>
         {/* the one "confirm it's you" sheet every guarded call shares —

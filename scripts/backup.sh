@@ -13,10 +13,9 @@ set -euo pipefail
 # tokens are encrypted at rest; nothing else is. So the dump gets the same
 # owner-only treatment install.sh gives docker/.env: umask 077 means the
 # gzip redirect below creates the file 0600 from its first byte (no
-# world-readable window), and a backup directory we create ourselves lands
-# 0700. A directory the operator already made is left alone — that is their
-# call to share (the usage note above recommends an external location), and
-# the 0600 files inside it are protected either way.
+# world-readable window). The directory itself is the exception: it is
+# created 0755 (see the mkdir below), and a directory the operator already
+# made is left alone — the 0600 files inside it are protected either way.
 umask 077
 INSTALL=${1:?install dir}; DEST=${2:?backup dir}; KEEP=${3:-30}
 # absolute: the lock's holder file is cleared on exit, after the cd below
@@ -50,7 +49,12 @@ elif command -v podman >/dev/null 2>&1 && podman compose version >/dev/null 2>&1
 else
   C="podman-compose"
 fi
-mkdir -p "$DEST"
+# The folder, unlike the dumps, must be listable by the app container: when
+# OIKONOME_BACKUP_DIR points the console's backup card here, compose binds
+# it read-only into a container running under another uid, and a 0700
+# folder reads there as "no backups at all". Names, sizes and ages are all
+# the card needs; the dumps themselves stay 0600.
+(umask 022; mkdir -p "$DEST")
 STAMP=$(date +%Y%m%d-%H%M%S)
 OUT="$DEST/oikonome-$STAMP.sql.gz"
 # Dump to a name the restore picker CANNOT see, and rename into place only

@@ -7,7 +7,7 @@ import unittest
 
 from oikonome.engine import budget, savings
 
-from .util import add_txn, make_db, write_config
+from .util import add_ledger_history, add_txn, make_db, write_config
 
 TODAY = dt.date(2026, 7, 15)
 
@@ -69,7 +69,9 @@ class GoalProgressTests(unittest.TestCase):
         self.conn.close()
 
     def test_matched_net_and_pace(self):
-        # 3 monthly $300 deposits + one $100 withdrawal, all inside 90d
+        # 3 monthly $300 deposits + one $100 withdrawal, all inside 90d,
+        # on an account whose ledger covers the whole window
+        add_ledger_history(self.conn, TODAY, account="sav")
         for i, d in enumerate((TODAY - dt.timedelta(days=75),
                                TODAY - dt.timedelta(days=45),
                                TODAY - dt.timedelta(days=15))):

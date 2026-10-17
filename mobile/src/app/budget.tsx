@@ -16,9 +16,10 @@ import StaleBanner from "../components/stale-banner";
 import { Card, H, HelpLink } from "../components/ui";
 import { errText, Account, BudgetSettings, CustomBucket } from "../lib/api";
 import { saveSettings } from "../lib/cache";
-import { goalHasWords, goalNeedsAccount, mergePlannerBuckets,
-         mergeSavingsGoals, numv, type GoalDraft,
-         type PlannerRow, catLabel } from "../lib/pure";
+import { goalHasWords, goalNeedsAccount, isPlanSavingsGoal,
+         mergeIncomeScenarios, mergePlannerBuckets,
+         mergeSavingsGoals, numv, type GoalDraft, type ScenarioDraft,
+         type PlannerRow, catLabel, historyBasisNote } from "../lib/pure";
 import { useRefetchWhenShown } from "../lib/focus";
 import { labelSavingsRow, monthSavings, plannerUnallocAuto }
   from "../lib/planner";
@@ -87,7 +88,7 @@ export default function Budget() {
       return n;
     });
   };
-  const goal = (d?.savings_goals ?? []).find((g) => g.name === "Savings");
+  const goal = (d?.savings_goals ?? []).find((g) => isPlanSavingsGoal(g.name));
   // the month's posted contribution when the server sends it; otherwise
   // the goal's 90-day average, labelled as one (Today's rule)
   const sav = goal ? monthSavings(goal) : null;
@@ -118,7 +119,9 @@ export default function Budget() {
             {d.income !== null && (
               <><B>{m$(d.income)}</B><M> in → </M></>
             )}
-            <B>{m$(d.buckets.fixed?.month_budget ?? 0)}</B><M> bills → </M>
+            {/* scheduled bills, not the fixed bar's cash basis, so the
+                chain balances (same figure and words as web) */}
+            <B>{m$(d.scheduled_month ?? d.buckets.fixed?.month_budget ?? 0)}</B><M> bills due → </M>
             <B>{m$(d.variable_budget)}</B><M> to spend</M>
             {(d.savings_plan ?? 0) > 0.005 && (
               <><M> → </M><B>{m$(d.savings_plan!)}</B><M> saved</M></>
@@ -379,9 +382,14 @@ function M({ children }: { children: React.ReactNode }) {
 // ---- the planner: give every dollar a job ----
 type Row = PlannerRow & { id: string };
 
-export function Planner({ s0, viewer, onSaved, onDirty }: {
+export function Planner({ s0, viewer, onSaved, onDirty, wizard }: {
   s0: BudgetSettings; viewer: boolean; onSaved: () => void;
   onDirty?: (v: boolean) => void;
+  /** Set by the welcome wizard (the web's non-standalone BudgetPlanner):
+   *  /api/settings always carries the provisional first-run seed once any
+   *  spend exists, and that seed can predate categorization, so in the
+   *  wizard only the person's own save of this step counts as a plan. */
+  wizard?: { saved: boolean };
 }) {
   const { client } = useSession();
   const qc = useQueryClient();
@@ -398,14 +406,19 @@ export function Planner({ s0, viewer, onSaved, onDirty }: {
   const [savingsTouched, setSavingsTouched] = useState(false);
   // the Savings plan the planner opened with, already outside other_monthly
   const [savingsSeed, setSavingsSeed] = useState(0);
+  // the numbers came from the suggestion, not a saved plan: only then
+  // does the history line describe what the person is looking at
+  const [fromHistory, setFromHistory] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   // one-time seed. An established user's plan comes entirely from s0 —
   // it doesn't need ["budgets-suggest"] (a median-over-history
   // computation) to show the plan card, so only a first-time user (whose
   // seed leans on bucket_candidates) waits for it.
   useEffect(() => {
-    const userSaved = !!(s0.food_monthly || s0.other_monthly
-      || s0.budgeted_income_monthly);
+    const userSaved = wizard
+      ? wizard.saved
+      : !!(s0.food_monthly || s0.other_monthly
+           || s0.budgeted_income_monthly);
     if (rows !== null || (sug.isPending && !userSaved)) return;
     const suggestions = sug.data?.suggestions;
     const pick = (saved: number | null, suggested?: number) =>
@@ -435,13 +448,14 @@ export function Planner({ s0, viewer, onSaved, onDirty }: {
                                suggestions?.other_monthly),
                           Math.round(claimed)));
     const savedGoal = (s0.savings_goals ?? [])
-      .find((g) => g.name === "Savings");
+      .find((g) => isPlanSavingsGoal(g.name));
     if (userSaved && savedGoal != null) {
       setSavings(String(savedGoal.monthly_plan ?? 0));
       setSavingsSeed(numv(String(savedGoal.monthly_plan ?? 0)));
       setSavingsTouched(true);
     }
-  }, [rows, sug.isPending, sug.data, s0]);
+    setFromHistory(!userSaved);
+  }, [rows, sug.isPending, sug.data, s0, wizard?.saved]);
 
   const save = useMutation({
     mutationFn: async () => {
@@ -463,9 +477,11 @@ export function Planner({ s0, viewer, onSaved, onDirty }: {
       // ALWAYS persist the Savings goal — a $0 plan is a remembered
       // choice, not an absence
       const others = (cur.savings_goals ?? [])
-        .filter((g) => g.name !== "Savings");
+        .filter((g) => !isPlanSavingsGoal(g.name));
       const curGoal = (cur.savings_goals ?? [])
-        .find((g) => g.name === "Savings");
+        .find((g) => isPlanSavingsGoal(g.name));
+      // the stored goal keeps its own spelling: renaming it here would
+      // be an edit the person never made
       body.savings_goals = [...others,
         { ...(curGoal ?? { name: "Savings", target: 0, tokens: [],
                            start_balance: 0 }),
@@ -530,6 +546,11 @@ export function Planner({ s0, viewer, onSaved, onDirty }: {
         a monthly number on each budget category, and what&apos;s left
         becomes savings. Everything is pre-filled from your real history.
       </Text>
+      {fromHistory && historyBasisNote(sug.data) && (
+        <Text style={[st.mut, { fontSize: 13 }]}>
+          {historyBasisNote(sug.data)}
+        </Text>
+      )}
 
       {inc > 0 && (
         <View style={{ gap: 4, marginTop: 6 }}>
@@ -702,8 +723,7 @@ function FlowBar({ label, color, frac }: {
 }
 
 // ---- income scenarios ----
-type ScenarioRow = { id: string; name: string; take_home: string;
-                     cadence: string };
+type ScenarioRow = ScenarioDraft & { id: string };
 
 function IncomeScenarios({ s0, onSaved, onDirty }: {
   s0: BudgetSettings; onSaved: () => void;
@@ -716,22 +736,43 @@ function IncomeScenarios({ s0, onSaved, onDirty }: {
       { id: newRowId(), name: r.name, take_home: String(r.take_home),
         cadence: r.cadence })));
   const [active, setActive] = useState(s0.active_scenario ?? "");
+  // the copy this card was seeded from: the merge base at save time
+  const baseline = useRef(s0.income_scenarios ?? []);
+  const baseActive = useRef(s0.active_scenario ?? "");
   const [msg, setMsg] = useState<string | null>(null);
   // every draft edit marks the card dirty so a sibling save's remount
   // loop skips it — otherwise the remount wipes the unsaved scenario
   const patch = (i: number, p: Partial<ScenarioRow>) => {
     onDirty?.(true);
-    setRows((rs) => rs.map((x, j) => (j === i ? { ...x, ...p } : x)));
+    setRows((rs) => rs.map(
+      (x, j) => (j === i ? { ...x, ...p, touched: true } : x)));
   };
   const save = useMutation({
-    mutationFn: () => saveSettings(qc, client!, {
-      income_scenarios: rows.filter((r) => r.name.trim())
-        .map((r) => ({ name: r.name.trim(),
-                       take_home: numv(r.take_home),
-                       cadence: r.cadence })),
-      active_scenario: active,
-    }),
-    onSuccess: () => { setMsg("Income scenario saved."); onSaved(); },
+    mutationFn: async () => {
+      // The server replaces the list wholesale, and these rows were
+      // seeded at mount; merge against its CURRENT list so a scenario
+      // added or edited on another device since is not erased.
+      const cur = await client!.settingsFull();
+      const body: Record<string, unknown> = {
+        income_scenarios: mergeIncomeScenarios(
+          rows, baseline.current, cur.income_scenarios ?? []),
+      };
+      // the active pick is sent only when it was changed here; omitted,
+      // the server keeps whichever one is live now
+      if (active !== baseActive.current) body.active_scenario = active;
+      return saveSettings(qc, client!, body);
+    },
+    onSuccess: (v) => {
+      // the saved view is the new merge base, and the card shows what was
+      // merged in from elsewhere rather than its own pre-save rows
+      const scen = v.income_scenarios ?? [];
+      baseline.current = scen;
+      baseActive.current = v.active_scenario ?? "";
+      setRows(scen.map((x) => ({ id: newRowId(), name: x.name,
+        take_home: String(x.take_home), cadence: x.cadence })));
+      setActive(v.active_scenario ?? "");
+      setMsg("Income scenario saved."); onSaved();
+    },
     onError: (e) => setMsg(errText(e)),
   });
   const CAD = ["weekly", "biweekly", "semimonthly", "monthly"];
@@ -791,7 +832,7 @@ function IncomeScenarios({ s0, onSaved, onDirty }: {
             onPress={() => { onDirty?.(true);
               setRows((rs) =>
                 [...rs, { id: newRowId(), name: "", take_home: "",
-                          cadence: "biweekly" }]); }}>
+                          cadence: "biweekly", touched: true }]); }}>
         + Add scenario
       </Text>
       <Text style={st.mut}>
@@ -1075,11 +1116,13 @@ function BucketRules({ s0, onSaved, onDirty }: {
       monthly: String(b.monthly || ""),
       categories: b.categories ?? [],
       merchants: (b.merchants ?? []).join(", ") })));
+  // absent means on, the way the budget engine reads it: an unchecked
+  // switch here would be posted back as false by the next bucket save
   const [dynamic, setDynamic] =
-    useState(!!s0.dynamic_variable_budget);
+    useState(s0.dynamic_variable_budget !== false);
   // the Switch flips before the save; this is what it falls back to when
   // the server says no
-  const committedDyn = useRef(!!s0.dynamic_variable_budget);
+  const committedDyn = useRef(s0.dynamic_variable_budget !== false);
   const [msg, setMsg] = useState<string | null>(null);
   const save = useMutation({
     mutationFn: async (dyn: boolean) => {

@@ -7,10 +7,13 @@ Two decisions, both made on purpose and both final for the period:
     catch-up days, is the failure) and the cadence is stamped with a note;
   * a daily verdict skipped because no budget is set: stamped with that
     note, so the cadence stops coming due every hour and Doctor does not
-    read the silence as a relay that never sent.
+    read the silence as a relay that never sent. "Set" means saved: a
+    ledger younger than a month gets a provisional seed from the loader,
+    and that guess must not be mailed as a verdict the Today page hides.
 The manual "email me now" button is untouched by both.
 """
 
+import datetime as dt
 import unittest
 from unittest import mock
 
@@ -18,7 +21,7 @@ from oikonome.engine import budget
 from oikonome.jobs import worker
 from oikonome.web import lens_email, report
 
-from .util import accept_recipient_invite, make_db
+from .util import accept_recipient_invite, add_txn, make_db
 
 
 class CadenceWithNothingToSendTests(unittest.TestCase):
@@ -67,6 +70,40 @@ class CadenceWithNothingToSendTests(unittest.TestCase):
             self.assertEqual(worker.email_tenant(self.tid), "")
         send.assert_not_called()
         self.assertEqual(self._note("daily-email"), worker.NO_BUDGET)
+
+    def test_a_provisional_seed_is_not_a_budget_to_mail_a_verdict_on(self):
+        # a ledger that starts this month and no saved budget: the loader
+        # seeds a budget from the spend so far, the Today page and the app
+        # read the stored row and show "set your budgets" — the daily mail,
+        # its push and its SMS must stay quiet the same way
+        self.conn.execute("DELETE FROM transactions")
+        budget.save_config(self.conn, {"email_recipients": ["one@example.com"],
+                                       "dynamic_variable_budget": False})
+        accept_recipient_invite(self.tid, "one@example.com")
+        today = dt.date.today()
+        start = max(today.replace(day=1), today - dt.timedelta(days=6))
+        d = start
+        while d <= today:
+            add_txn(self.conn, d, 50.0, "TARGET")
+            d += dt.timedelta(days=1)
+        loaded = budget.load_config(self.conn)
+        self.assertTrue(loaded.get("food_monthly")
+                        or loaded.get("other_monthly"),
+                        "precondition: the loader seeds a provisional budget")
+        self.assertFalse(budget.budgets_set(self.conn))
+        with mock.patch.dict("os.environ",
+                             {"OIKONOME_SMTP_HOST": "smtp.example.com"}), \
+             mock.patch.object(report, "send_each") as send, \
+             mock.patch.object(report, "gather") as gather:
+            self.assertEqual(worker.email_tenant(self.tid), "")
+        gather.assert_not_called()
+        send.assert_not_called()
+        self.assertEqual(self._note("daily-email"), worker.NO_BUDGET)
+
+    def test_a_saved_budget_is_set(self):
+        budget.save_config(self.conn, {"other_monthly": 900,
+                                       "dynamic_variable_budget": False})
+        self.assertTrue(budget.budgets_set(self.conn))
 
     def _doctor_daily_row(self):
         from oikonome.web import doctor

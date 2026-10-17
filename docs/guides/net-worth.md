@@ -6,10 +6,20 @@ The headline number is exact: the sum of live account balances (debts
 negative), plus any property, vehicles, and other manual assets you've
 added — those are editable right on this page. Accounts linked as
 multiple sources of one real account count once (see the Accounts
-guide). Beside the total, **+$X this month** is the change since the
-previous month's point on the trend line below. Two tiles split it into
-**Financial accounts** (cash + investments − card debt) and **Property
-& vehicles, net** (after the mortgage payoff).
+guide). Beside the total, **+$X this month** is the change in that
+total since the end of last month — property included, so a mortgage
+payment counts only the interest it cost, not the whole payment that
+left your checking account. Two tiles split it into **Financial
+accounts** (cash + investments − card debt), whose own **this month**
+line is the change in the financial accounts alone, and **Property &
+vehicles, net** (after the mortgage payoff). The property layer's past
+values come from its nightly record, or for a connected loan from the
+principal paid on it: rows the lender marks as principal, or each
+payment split by the principal-paid-this-year figure the lender
+reports. A loan whose history shows only whole payments, with neither,
+leaves the months the nightly record does not cover unknown, so no
+headline change shows until the record covers last month. Manual assets hold
+their value until you edit them.
 
 A connected loan account typed as a **mortgage** moves into the
 property layer alongside your real estate and, once linked, takes the
@@ -19,7 +29,11 @@ were and never displace it.
 
 ## Net worth over time
 
-The trend line is a **reconstruction, not a recorded history**. Every
+The chart draws **financial accounts only** (cash + investments − card
+debt); property and its loan are left out, so its **This month** pill
+matches the Financial accounts figure above, not the headline's change,
+which includes property. The trend line is a **reconstruction, not a
+recorded history**. Every
 account is anchored to its exact current value and walked backward:
 investment accounts through their share-level transaction history
 valued at historical prices (so market growth and crashes are
@@ -139,14 +153,31 @@ The estimate is folded into the yearly bars and the total. It exists
 only for the institutions you name; nothing is assumed about any other
 platform, even ones that also don't itemize their fees.
 
-Configuration lives in the tenant settings document (there is no form for
-it yet): `advisory_fees` maps a lowercase fragment of the institution's
-name to the yearly rate as a fraction — `{"evergreen": 0.0025}` for 0.25%
-— and `advisory_fee_exempt_masks` lists the last digits of any account at
-those institutions that is self-directed and pays no fee. The same
-document's `investment_basis_override` (`{"1234": 400}`, keyed by account
-mask) pins a brokerage account's money-in where the feed's cost basis is
-not trustworthy — lots transferred in-kind arrive with a near-zero basis.
+Set it up under **Settings → Connections → Investment fees & basis** (the
+same card is in the mobile app's Settings, under Connections):
+
+- **Advisory fees** — one row per institution: a piece of its name (any
+  case; it matches every institution whose name contains it) and the
+  yearly fee as a percentage, `0.25` for 0.25%.
+- **Fee-free accounts** — the last characters of any account at those
+  institutions that is self-directed and pays no fee, comma-separated
+  (2 to 8 letters or digits, as the bank shows them).
+- **Money-in overrides** — an account's last characters and the dollars
+  actually put into it. This replaces the feed's cost basis for that
+  account where it is not trustworthy — lots transferred in-kind arrive
+  with a near-zero basis — while the value stays live.
+
+Clearing every row and saving switches the estimate (or the override) off.
+Over the API the same three keys ride `POST /api/settings`, from an
+owner's session or token only (anyone else gets 403):
+`advisory_fees` (`{"name fragment": 0.0025}`, a fraction from 0 to 1),
+`advisory_fee_exempt_masks` (a list of masks, each 2 to 8 letters or
+digits, stored upper-case) and `investment_basis_override`
+(`{"1234": 400}`, dollars of 0 or more). A key you send replaces that
+section whole, so a script that reads, edits and writes back should also
+send the value it started from as `<key>_base` (for example
+`advisory_fees_base`): when the stored section has changed since, the save
+answers 409 and nothing is written, and the script reads again.
 
 ## Gotchas
 

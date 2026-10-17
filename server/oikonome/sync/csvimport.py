@@ -22,13 +22,12 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
-import io
 import re
 
 from ..engine.compat import as_date
 from . import flowmap, reimport
 from .base import (FileImportIds, Transaction, mask_long_digits,
-                   upsert_transactions)
+                   drop_before_history, upsert_transactions)
 from .rowcap import capped
 from .dedup import WINDOW_DAYS as DEDUP_WINDOW_DAYS  # noqa: F401 (re-export)
 from .dedup import Deduper
@@ -157,6 +156,150 @@ def _parse_amount(s: str) -> float:
     return float(s)
 
 
+# A bank's export runs to a few dozen columns at the very most. Every row
+# becomes a dict over the WHOLE header (DictReader pads a short row with
+# None), so the row cap alone does not bound the memory: a header of a
+# thousand empty columns over the capped row count is a few MB of file and
+# gigabytes of dicts, in the process every household shares. A header past
+# this is refused before a row is read.
+MAX_COLUMNS = 200
+
+
+def check_width(fieldnames, limit: int = MAX_COLUMNS) -> None:
+    """Refuse a header wider than `limit` columns, before any row is read."""
+    if fieldnames is not None and len(fieldnames) > limit:
+        raise ValueError(
+            f"this file has {len(fieldnames):,} columns (max {limit}) — "
+            f"export the transactions as your bank or app produces them, "
+            f"without added columns")
+
+
+# The header is parsed before anything knows which importer the file is
+# for: format detection, auto-mapping and the mapping card all read it. A
+# column count can only be checked once the row is a list, and by then a
+# single 49 MB line of commas has already become tens of millions of cells.
+# So the first lines are read under a character budget instead: a real
+# header is a few hundred characters, and the mapping card's sample rows
+# are only a handful of lines more.
+MAX_HEADER_CHARS = 64 * 1024
+MAX_SAMPLE_CHARS = 256 * 1024
+
+
+class _OverBudget(ValueError):
+    pass
+
+
+def _lines_within(text: str, budget: int):
+    """The lines of `text` (split on \\n, as io.StringIO splits them) while
+    their running length stays within `budget`; raises _OverBudget at the
+    first line that would pass it. Each search is bounded by the budget, so
+    an oversized line costs nothing to discover."""
+    pos, n = 0, len(text)
+    while pos < n:
+        end = text.find("\n", pos, pos + budget)
+        if end < 0:
+            if n - pos > budget:
+                raise _OverBudget
+            end = n - 1
+        line = text[pos:end + 1]
+        budget -= len(line)
+        yield line
+        pos = end + 1
+
+
+def read_header(text: str) -> list[str]:
+    """The CSV's first record, refused with a reason when it is longer than
+    MAX_HEADER_CHARS or wider than MAX_COLUMNS — before any detector or
+    mapping step builds anything over it."""
+    try:
+        header = next(csv.reader(_lines_within(text, MAX_HEADER_CHARS)), [])
+    except _OverBudget:
+        raise ValueError(
+            f"the first line of this file is longer than "
+            f"{MAX_HEADER_CHARS // 1024} KB — that is not a column header; "
+            f"export the transactions as your bank or app produces them"
+        ) from None
+    check_width(header)
+    return header
+
+
+def sample_rows(text: str, header: list[str], n: int = 5) -> list[list[str]]:
+    """Up to `n` data rows after the header, for the mapping card, each cut
+    to the header's width. Reading stops early rather than failing when the
+    rows run past MAX_SAMPLE_CHARS: the sample only illustrates the file."""
+    rows: list[list[str]] = []
+    rdr = csv.reader(_lines_within(text, MAX_SAMPLE_CHARS))
+    try:
+        next(rdr, None)
+        for row in rdr:
+            if len(rows) >= n:
+                break
+            rows.append(row[:len(header)])
+    except (_OverBudget, csv.Error):
+        pass
+    return rows
+
+
+# The header and sample bounds above cover only the first lines; a short
+# header can still be followed by one enormous data row, and csv turns a
+# 40 MB line of commas into millions of cells (a few hundred MB, measured)
+# before the row cap has counted it as one. Every DATA record — every line
+# of it, since a quoted field may run across many — is therefore read under
+# its own character budget, the size csv itself allows a single
+# field by default, far past any bank's row. A row may also carry only a
+# few cells past its header — an unquoted comma or two in a memo is the
+# honest case — so each row is refused past that before it becomes a dict
+# and its cells are kept for the whole file.
+MAX_ROW_CHARS = 128 * 1024
+MAX_ROW_OVERFLOW = 50
+
+
+class _BoundedLines:
+    """The lines of `text` (split on \\n, as io.StringIO splits them) under
+    a character budget per RECORD, not per line: a quoted field may hold
+    newlines, so one record can run across any number of short lines, and
+    csv would build all of its cells before the row's width is counted.
+    The budget is spent by every line handed out and refilled by `reset()`,
+    which the reader's tap calls before asking for each record — csv pulls
+    lines only while it assembles one record, so everything spent between
+    two resets belongs to that record. Each line-end search is bounded by
+    what is left, so an oversized line or record costs nothing to discover."""
+
+    def __init__(self, text: str, per_record: int = MAX_ROW_CHARS):
+        self.text, self.pos, self.line_no = text, 0, 0
+        self.per_record = per_record
+        self.reset()
+
+    def reset(self) -> None:
+        self.left = self.per_record
+        self.first_line = self.line_no + 1
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> str:
+        text, pos, n = self.text, self.pos, len(self.text)
+        if pos >= n:
+            raise StopIteration
+        self.line_no += 1
+        end = text.find("\n", pos, pos + self.left)
+        if end < 0:
+            if n - pos > self.left:
+                where = (f"line {self.line_no:,}"
+                         if self.first_line == self.line_no else
+                         f"the record starting at line {self.first_line:,}")
+                raise ValueError(
+                    f"{where} of this file is longer than "
+                    f"{self.per_record // 1024} KB — that is not a "
+                    f"transaction row; export the transactions as your bank "
+                    f"or app produces them")
+            end = n - 1
+        line = text[pos:end + 1]
+        self.left -= len(line)
+        self.pos = end + 1
+        return line
+
+
 _INDEX_REF = re.compile(r"#(\d{1,4})")
 
 
@@ -167,19 +310,47 @@ class _Tap:
     the LAST such column; the mapping step names a column by its position
     ('#3') so either one can be chosen, and that reads the cells."""
 
-    def __init__(self, it):
-        self.it, self.last = it, []
+    def __init__(self, it, lines: "_BoundedLines | None" = None):
+        self.it, self.last, self.lines = it, [], lines
+        self.width: int | None = None   # the header's, once it is read
 
     def __iter__(self):
         return self
 
     def __next__(self):
+        if self.lines is not None:
+            self.lines.reset()          # a fresh budget for this record
         self.last = next(self.it)
+        if (self.width is not None
+                and len(self.last) > self.width + MAX_ROW_OVERFLOW):
+            raise ValueError(
+                f"line {self.it.line_num:,} of this file has "
+                f"{len(self.last):,} cells under a {self.width}-column "
+                f"header — export the transactions as your bank or app "
+                f"produces them")
         return self.last
 
     @property
     def line_num(self):
         return self.it.line_num
+
+
+def bounded_dict_reader(text: str) -> csv.DictReader:
+    """A csv.DictReader over `text` with each data row bounded before it is
+    built: every record (all its lines, quoted newlines included) is read
+    under MAX_ROW_CHARS, and a row carrying more
+    than MAX_ROW_OVERFLOW cells past its header is refused. Without this,
+    one short header over a single line of millions of commas becomes
+    millions of cells (kept under DictReader's restkey) before any row cap
+    has counted it as one row. The header is read here, so the caller's
+    own width check on `fieldnames` still runs before any data row.
+    `reader.reader` is the _Tap, whose `last` is the current row's cells."""
+    lines = _BoundedLines(text)
+    reader = csv.DictReader(lines)
+    tap = reader.reader = _Tap(reader.reader, lines)
+    header = reader.fieldnames or []
+    tap.width = len(header)
+    return reader
 
 
 def _cell(row: dict, header: list[str], key, cells: list | None = None):
@@ -209,9 +380,10 @@ def import_csv(conn, account_id: str, text: str, mapping: dict, *,
     out, Credit = money in — instead of one signed Amount; the direction is
     unambiguous, so amount_sign is ignored for those); merchant, category
     (optional). Returns counters."""
-    reader = csv.DictReader(io.StringIO(text))
-    tap = reader.reader = _Tap(reader.reader)
+    reader = bounded_dict_reader(text)
+    tap = reader.reader
     header = reader.fieldnames or []
+    check_width(header)
     for req in ("date", "name"):
         if mapping.get(req) is None:
             raise ValueError(f"mapping is missing required column: {req}")
@@ -326,9 +498,13 @@ def import_csv(conn, account_id: str, text: str, mapping: dict, *,
         conn, account_id, txns, old_of, same_line=reimport.same_line_raw)
     corrected += reimport.retire_absorbed(conn, account_id, "csv", absorbed,
                                           taken={t.id for t in txns})
+    # the household's history window (Settings → how far back): rows
+    # dated before it are left out and counted, never written
+    txns, skipped_older = drop_before_history(conn, txns)
     if batch_id:
         from . import batches
         batches.tag(conn, txns, batch_id)
     added = upsert_transactions(conn, txns)
     return {"imported": added, "rows": len(txns),
-            "skipped_duplicates": skipped_dupes, "corrected": corrected}
+            "skipped_duplicates": skipped_dupes, "corrected": corrected,
+            "skipped_older": skipped_older}

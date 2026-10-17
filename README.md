@@ -89,28 +89,28 @@ around a single daily email, so the tool does the checking, not you.
 | 60-day cash-flow forecast with card-payoff scenarios |
 | Cash Flow report — flow picture, saved-by-month with a 60-day forecast tail, spending & income breakdowns with income by source, and interest & fees paid by year |
 | Debt payoff planner — every card and loan on one schedule, avalanche or snowball, with an extra-payment what-if and the debt-free month |
-| Automatic recurring-bill detection with evidence + approve/reject |
-| Envelope budgets — monthly **and** lumpy annual pools |
+| Automatic recurring-bill detection with evidence + approve, adjust or reject — or enter bills yourself with new-bill detection off |
+| Envelope budgets — monthly **and** lumpy annual pools; a first month paces from the day the ledger begins, with suggestions scaled from the days seen so far |
 | Retirement projection via historical market replay |
 | Bank sync — Plaid · MX · SimpleFIN, on your own keys |
-| File imports — CSV · OFX/QFX · Quicken QIF · Mint · YNAB · PDF, one file or a whole folder at once (run in the background); re-importing a file corrects rows an earlier version read differently |
+| File imports — CSV · OFX/QFX · Quicken QIF · Mint · YNAB · PDF, one file or a whole folder at once (run in the background); re-importing a file corrects rows an earlier version read differently; one history window (last month to everything) bounds every import and new bank link |
 | Multi-source accounts with automatic failover |
-| Receipt & check image parsing (vision line-items); snap a receipt before the charge posts and it matches itself when the charge arrives |
+| Receipt & check image parsing (vision line-items); snap a receipt before the charge posts and it matches itself when the charge arrives; a mixed Costco or Amazon order splits its charge by the items' categories |
 | Local-LLM categorization — data never leaves the box |
-| Net worth over time |
+| Net worth over time, with an estimate of advisory fees your broker does not itemize and money-in overrides for in-kind transfers, both set in Settings |
 | Merchant identity you control — logos, chain outlets under their brand, rename, merge spelling variants, undo |
 | Transaction provenance — check number, payment channel, location, line of business, and *why* a row has its category |
 | Split one charge across several categories by hand |
-| Ledger search with totals, the average per visit and spending per day for any month, category or date range |
-| Ask-your-ledger assistant — read-only summaries, answered by the on-box model |
+| Ledger search with totals, the average per visit and spending per day for any month, category or date range — and a CSV or .xlsx download of exactly the rows a view shows |
+| Ask-your-ledger assistant — read-only summaries, answered by the on-box model; draws charts and tables, keeps a household history, and saves any answer as a self-contained HTML report |
 | Business / self-employed tracking — entities, P&L, Schedule C, mileage, estimated tax |
 | Household logins — members and view-only readers with their own second factor and email preferences, and an activity log of who changed what |
 | Continuity packet — one printable PDF of the accounts, debts, bills, income and businesses, for whoever has to run the household without you |
 | Passkeys / TOTP 2FA, per-tenant encryption at rest |
 | Email, SMS (your own Twilio credentials) and push delivery of the summaries |
 | Webhooks, a Prometheus `/metrics` exporter, Home Assistant sensors and a local MCP server — on read-only tokens |
-| One-command manager (install / backup / restore / upgrade), with a database snapshot before every upgrade and a documented rollback |
-| Native iOS and Android app with a home-screen widget — source in `mobile/`, built pinned to your own server |
+| One-command manager (install / backup / restore / upgrade), with a database snapshot before every upgrade, a documented rollback, a configurable backup folder the admin console also reads, and a self-refreshing "back in a moment" page behind the bundled HTTPS proxy while the app restarts |
+| Native iOS and Android app with a home-screen widget — it offers the store's newer build when one exists; source in `mobile/`, built pinned to your own server |
 
 <sub>Nothing here is gated: a self-hosted instance has every feature, with
 no tiers and no license checks.</sub>
@@ -165,7 +165,8 @@ git clone https://github.com/oikonome/oikonome.git && cd oikonome
 `logs`, `backup`, `restore`, `reset`, `uninstall`. Everything (code, config,
 database) lives in one folder; add automatic-certificate TLS with
 `./oikonome.sh https <domain>`. The installer runs a guided setup wizard on
-first boot.
+first boot — appearance, accounts and how much history to bring in, bills
+and budgets (found for you or entered by hand), and daily email and push.
 
 Requires a container runtime (Docker or Podman) with Compose. The local LLM
 for categorization is bundled — no external AI account needed. Full walkthrough

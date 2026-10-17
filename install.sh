@@ -418,6 +418,20 @@ mkdir -p "$DATA_DIR" || die "Can't create $DATA_DIR"
 # left to Docker it is created root-owned, and the documented "drop the
 # model file into ./models" step then fails for the person installing.
 mkdir -p ../backups ../ops-state ../ops-cmd ../models 2>/dev/null || true
+# a backup folder moved by OIKONOME_BACKUP_DIR is the console's bind source
+# too: create it here for the same reason, and open it to go=rx whether or
+# not it already existed — the app container lists it under another uid,
+# and a 0700 folder (what scripts/backup.sh used to create) reads there as
+# "no backups". Only a folder the install's owner owns: one someone else
+# shares with us keeps the mode they gave it. The dumps stay 0600.
+if [ -n "${OIKONOME_BACKUP_DIR:-$(env_read OIKONOME_BACKUP_DIR)}" ]; then
+  BACKUP_DIR=$(backup_dir_resolve "$PWD")
+  mkdir -p "$BACKUP_DIR" 2>/dev/null || true
+  _uid() { stat -c %u "$1" 2>/dev/null || stat -f %u "$1" 2>/dev/null; }
+  if [ -d "$BACKUP_DIR" ] && [ "$(_uid "$BACKUP_DIR")" = "$(_uid ..)" ]; then
+    chmod u=rwx,go=rx "$BACKUP_DIR" 2>/dev/null || true
+  fi
+fi
 # ops-cmd is the console→host command drop-box. Default it CLOSED (0700)
 # so the reboot lever is inert until the root-run
 # scripts/install-host-reboot-watcher.sh enables it — that installer
@@ -475,7 +489,9 @@ for i in $(seq 1 $TRIES); do
   # effective port = environment first, then .env — same order compose uses
   PORT=$(env_read OIKONOME_PORT)
   PORT=${OIKONOME_PORT:-${PORT:-8042}}
-  if curl -sf "http://localhost:${PORT}/readyz" >/dev/null 2>&1; then
+  # the address it is published on: localhost answers only a wildcard bind
+  PROBE_HOST=$(probe_host "${OIKONOME_BIND_ADDRESS:-$(env_read OIKONOME_BIND_ADDRESS)}")
+  if curl -sf "http://${PROBE_HOST}:${PORT}/readyz" >/dev/null 2>&1; then
     [ -t 1 ] && printf '\r\033[K'
     ok "App is up — database migrated, all services healthy ($((i * 5))s)"
     # The commit that has now migrated this database. The next
@@ -538,7 +554,7 @@ for i in $(seq 1 $TRIES); do
     # unclaimed and to /app/ once it is (a tokenless GET /setup itself is
     # a 403 by design, so it cannot be the probe).
     CLAIM_PROBE=$(curl -s -o /dev/null -w '%{redirect_url}' \
-        "http://localhost:${PORT}/" 2>/dev/null || true)
+        "http://${PROBE_HOST}:${PORT}/" 2>/dev/null || true)
     if [ -n "$SETUP_TOKEN" ] && case "$CLAIM_PROBE" in */setup) true ;; *) false ;; esac; then
       if [ -n "${OIKONOME_ASSUME_YES:-}" ] || [ ! -t 1 ]; then
         # non-interactive (the console's reset re-runs this through the

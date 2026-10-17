@@ -227,7 +227,7 @@ class RotationPausesWebhooks(unittest.TestCase):
         from oikonome.auth import factor_reset
         _, email = self._signup()
         mine = _hook(email)
-        conn = tenancy.control_connect()
+        conn = tenancy.admin_connect()
         try:
             uid = conn.execute("SELECT id FROM users WHERE email=%s",
                                (email,)).fetchone()["id"]

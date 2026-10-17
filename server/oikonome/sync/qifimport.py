@@ -43,7 +43,7 @@ import re
 from ..engine.compat import as_date
 from . import flowmap
 from .base import (FileImportIds, Transaction, ensure_split_account,
-                   upsert_transactions)
+                   drop_before_history, upsert_transactions)
 from .csvimport import scrub_identifiers
 from .csvimport import date_order
 from .rowcap import MAX_IMPORT_ROWS, check_len
@@ -139,6 +139,11 @@ _LIST_SECTIONS = {"cat", "class", "security", "memorized", "prices",
                   "invitem", "template", "bud"}
 
 
+# A non-empty line, split where str.splitlines splits (an old Mac export
+# ends its lines with a bare CR); empty lines were skipped anyway.
+_LINE = re.compile("[^\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]+")
+
+
 def parse_qif(text: str) -> list[dict]:
     out: list[dict] = []
     rec: dict = {}
@@ -147,10 +152,12 @@ def parse_qif(text: str) -> list[dict]:
     current_type = ""           # that account's declared Quicken type
     section = ""                # the !Type: of the records being read
     types: dict[str, str] = {}  # account name → its declared type
-    for line in text.splitlines():
-        line = line.rstrip("\r")
-        if not line:
-            continue
+    # one line at a time: splitlines() built every line of the file as its
+    # own string up front — about eight times the text for a file of short
+    # lines, none of which reaches the row cap (only finished records
+    # count) — before the first record was read
+    for m in _LINE.finditer(text):
+        line = m.group()
         tag, rest = line[0], line[1:]
         if tag == "!":
             # !Account starts an account header; any other bang directive
@@ -328,18 +335,25 @@ def _import_into(conn, account_id: str, rows: list[dict], *,
     txns = ids.resolve(conn, txns)
     if legacy_of:
         txns = _adopt_legacy_invst(conn, account_id, txns, legacy_of)
+    # the household's history window (Settings → how far back): rows
+    # dated before it are left out and counted, never written
+    every = txns
+    txns, skipped_older = drop_before_history(conn, txns)
     if batch_id:
         from . import batches
         batches.tag(conn, txns, batch_id)
     added = upsert_transactions(conn, txns)
     # never a row this import has just written: that is a cash record
-    # whose id happens to equal a share-only record's old one
-    written = {t.id for t in txns}
+    # whose id happens to equal a share-only record's old one. Read over
+    # every row of the file, the ones the history window left out
+    # included: whether an old record is retired must not depend on it
+    written = {t.id for t in every}
     no_cash_legacy = [p for p in no_cash_legacy if p[0] not in written]
     if no_cash_legacy:
         _retire_legacy_no_cash(conn, account_id, no_cash_legacy)
     return {"imported": added, "rows": len(txns),
-            "skipped_duplicates": skipped_dupes}
+            "skipped_duplicates": skipped_dupes,
+            "skipped_older": skipped_older}
 
 
 def _adopt_legacy_invst(conn, account_id: str, txns: list[Transaction],

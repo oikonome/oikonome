@@ -3,8 +3,9 @@
 `OIKONOME_MASTER_KEY` (in `docker/.env`) is the root of Oikonome's
 at-rest encryption. Aggregator tokens, API keys and webhook signing
 secrets encrypt under a per-household data key, which is itself stored
-wrapped by the master key; TOTP seeds and the instance's web-push signing key encrypt directly
-under it. The database alone is not enough to read those secrets — and
+wrapped by the master key; TOTP seeds, the instance's web-push signing key
+and the tokens of bank connections waiting to be released at Plaid encrypt
+directly under it. The database alone is not enough to read those secrets — and
 that is the point.
 
 ## Back it up

@@ -100,9 +100,9 @@ class BrokenCounterTests(unittest.TestCase):
         self.addCleanup(patch.stop)
         return proxies
 
-    def _signup(self, email):
+    def _signup(self, email, password=PW):
         return TestClient(self.appmod.app).post(
-            "/api/signup", data={"email": email, "password": PW,
+            "/api/signup", data={"email": email, "password": password,
                                  "invite": "", "ref": ""})
 
     def _user_exists(self, email) -> bool:
@@ -120,7 +120,9 @@ class BrokenCounterTests(unittest.TestCase):
         email = f"brkr-{uuid.uuid4().hex[:10]}@x.dev"
         self.assertEqual(self._signup(email).status_code, 200)
         proxies = self._break("count(*) AS n FROM signup_reclaims")
-        r = self._signup(email)
+        # a second person: the same password again would be the first
+        # person repeating their own form, which signs them in instead
+        r = self._signup(email, password=PW + "-someone-else")
         self.assertEqual(r.status_code, 409, r.text)
         self.assertIn("already has an account", r.text)
         self.assertTrue(any(p.fired for p in proxies))

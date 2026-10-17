@@ -173,6 +173,27 @@ class HostedInvitesAreAddressedAndDeliveredOnly(_Household):
         self.assertEqual(len(self._pending()), before,
                          "a refused mint must leave no invite behind")
 
+    def test_an_unaddressed_invite_row_claims_nothing_on_hosted(self):
+        """The mint door never makes one here, but a row that names nobody
+        (minted before the rule, or written by hand) must not become the
+        bearer link into the shared namespace the rule exists to close."""
+        import secrets
+        token = secrets.token_urlsafe(24)
+        admin = tenancy.admin_connect()
+        try:
+            admin.execute(
+                "INSERT INTO invites (token_hash, tenant_id, role, label,"
+                " created_by, expires_at) VALUES (%s,%s,'viewer',"
+                "'the sitter',%s, now() + interval '1 day')",
+                (invites._h(token), self.tid, self.uid))
+        finally:
+            admin.close()
+        email = f"anyone-{uuid.uuid4().hex[:8]}@example.dev"
+        r = TestClient(self.app).post("/api/invite/claim", json={
+            "token": token, "email": email, "password": "family-member-pass"})
+        self.assertNotEqual(r.status_code, 200, r.text)
+        self.assertFalse(self._has_user(email))
+
     def test_the_link_reaches_the_mailbox_and_not_the_minter(self):
         alice = f"alice4-{uuid.uuid4().hex[:8]}@example.dev"
         r = self.owner.post("/api/invites",

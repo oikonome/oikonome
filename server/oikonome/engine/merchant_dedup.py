@@ -1231,7 +1231,15 @@ def detail(conn, display: str) -> dict | None:
     places are all personal rows; identity (variants, seen-range, the
     merchant row) is unscoped, like the catalog's. None when no row
     displays as `display`."""
-    personal = f"COALESCE(true {budget.PERSONAL_ONLY_SQL}, false)"
+    # A linked shadow (the second feed of a dual-sourced card) or a hidden
+    # account carries the same purchases the primary does, or money the
+    # user asked to leave out — the Spending screen drops both, so the
+    # merchant's count, total, category and places do too. Identity stays
+    # unscoped: the name still lists, the variants still show.
+    from . import links
+    shadows = links.shadow_ids(conn)
+    personal = (f"COALESCE(true {budget.PERSONAL_ONLY_SQL}, false) "
+                "AND NOT (t.account_id = ANY(%(shadows)s::text[]))")
     head = conn.execute(
         f"""SELECT {DISPLAY_MERCHANT} AS display,
                    count(*) FILTER (WHERE {personal}) AS rows,
@@ -1259,8 +1267,8 @@ def detail(conn, display: str) -> dict | None:
                        FILTER (WHERE {personal}) AS category
               FROM transactions t {MC_JOIN}
               LEFT JOIN merchants pm ON pm.id = mm.parent_id
-             WHERE t.removed = 0 AND {DISPLAY_MERCHANT} = %s
-             GROUP BY 1""", (display,)).fetchone()
+             WHERE t.removed = 0 AND {DISPLAY_MERCHANT} = %(display)s
+             GROUP BY 1""", {"display": display, "shadows": shadows}).fetchone()
     if head is None:
         return None
     out = dict(head)
@@ -1291,9 +1299,11 @@ def detail(conn, display: str) -> dict | None:
                        AND (t.location_city IS NOT NULL
                             OR t.location_address IS NOT NULL
                             OR t.location_lat IS NOT NULL)
+                       AND NOT (t.account_id = ANY(%s::text[]))
                        {budget.PERSONAL_ONLY_SQL}
                      GROUP BY 1, 2, 3) l
-             ORDER BY l.n DESC, l.last DESC LIMIT 5""", (display,)).fetchall()]
+             ORDER BY l.n DESC, l.last DESC LIMIT 5""",
+        (display, shadows)).fetchall()]
     # The user's own rule for it, if any (what new rows will get) — found
     # the way apply() finds it (llm_categorize._rules_cte): a rule's string
     # resolves through merchant_canonical to a canonical and, when the
@@ -1386,7 +1396,6 @@ def listing(conn, q: str = "", limit: int = 200,
         raise ValueError("sort must be one of " + ", ".join(LISTING_SORTS))
     if filter not in LISTING_FILTERS:
         raise ValueError("filter must be one of " + ", ".join(LISTING_FILTERS))
-    args: list = []
     # Every merchant is LISTED, business-only ones included: the catalog must
     # never hide a name that `rename` can still reach, or the screen offers no
     # way to correct it and the rename's row count comes from nowhere. What
@@ -1398,6 +1407,15 @@ def listing(conn, q: str = "", limit: int = 200,
     # NULL when the session vars are unset, and a WHERE drops NULL rows, so
     # COALESCE(..., false) is what makes it mean the same thing inside FILTER.
     personal = f"COALESCE(true {budget.PERSONAL_ONLY_SQL}, false)"
+    # A linked shadow (the second feed of a dual-sourced card) or a hidden
+    # account counts as neither personal nor business money: its purchases
+    # are the primary's again, or money the user asked to leave out, and the
+    # Spending screen drops both. Without this a dual-sourced card's
+    # merchants show every visit twice and sort=spend / "oneoff" read the
+    # doubled figures. The row still feeds the identity columns (variants,
+    # seen-range), so a name only a shadow carries still lists.
+    from . import links
+    args: list = [links.shadow_ids(conn)]
     conds: list[str] = []
     having = ""
     if q.strip():
@@ -1453,12 +1471,16 @@ def listing(conn, q: str = "", limit: int = 200,
         f"""WITH t AS (
                 SELECT r.merchant_id, r.merchant_outlet, r.merchant_name,
                        r.name,
-                       count(*) FILTER (WHERE r.personal) AS n_personal,
-                       sum(r.amount) FILTER (WHERE r.personal) AS amt_personal,
-                       count(*) FILTER (WHERE NOT r.personal) AS n_business,
+                       count(*) FILTER (WHERE r.personal AND r.counted)
+                           AS n_personal,
+                       sum(r.amount) FILTER (WHERE r.personal AND r.counted)
+                           AS amt_personal,
+                       count(*) FILTER (WHERE NOT r.personal AND r.counted)
+                           AS n_business,
                        min(r.date) AS first_seen, max(r.date) AS last_seen
                   FROM (SELECT t.merchant_id, t.merchant_outlet, t.merchant_name,
-                               t.name, t.amount, t.date, {personal} AS personal
+                               t.name, t.amount, t.date, {personal} AS personal,
+                               NOT (t.account_id = ANY(%s::text[])) AS counted
                           FROM transactions t
                          WHERE t.removed = 0 OFFSET 0) r
                  GROUP BY 1, 2, 3, 4)

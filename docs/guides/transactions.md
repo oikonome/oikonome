@@ -62,6 +62,24 @@ Reimburse page; it's a shortcut, not a filter. The count of business
 rows lives on the Business tab; the headline's own "*N* business (not in
 the totals)" note explains why the three figures look the way they do.
 
+## Downloading what you see
+
+The **CSV · XLSX** links at the right of the headline (on the phone, the
+**download CSV / XLSX** chip above the filter strip) save the rows the
+page is showing — the month on screen, or a search with every filter
+you have applied, all pages of it, not just the visible one. Columns are
+the ones you read on the page: date, payee, amount (money in positive,
+money out negative), category, account, pending, note, owner, business,
+reimbursable, channel, check number, city and region, the Amazon or
+store items on the row, the bill it pays, the bank's own text, and the
+row id last. A payee that starts like a spreadsheet formula is written
+with a leading quote so Excel and Calc show it as text. One download
+holds up to 50,000 rows; the full-household export under Settings is the
+way to take everything. A household prepares one download at a time: a
+second one asked for while the first is still being written is refused
+with "an export is already running", and a busy instance may answer
+"try again in a minute"; wait for the first, then click again.
+
 ## The date range
 
 Beside the from/to boxes sit the same eight range buttons every other
@@ -259,6 +277,30 @@ Parts must be spending categories — transfers, income and loan payments
 are decided for the whole row, never for a part. A pending charge that
 posts for a different amount drops its split (the parts no longer add
 up); split it again once it settles.
+
+### Splits from a receipt
+
+A charge matched to a Costco receipt or an Amazon order whose items are
+of more than one kind is split for you: a receipt that was $50 of
+groceries and a $10 household item counts $50 under **Costco - Food &
+Drink** and $10 under **Costco - Home**, so the food budget sees the
+groceries and only the groceries. The parts follow the items' prices, scaled to what the
+card was charged (tax and shipping shared pro rata), and the row shows
+them with a **✂ split by receipt** pill. Costco items carry their
+category from the receipt's department; Amazon items get theirs from the
+AI backend that does categorization, the same pass that names the order
+(it reads up to six items of an order, so a larger order is not split
+and keeps its single category). Money in — a refund — is never split by
+a receipt.
+
+A receipt's split is recomputed whenever the store's records are matched
+again, so it tracks a corrected receipt. Your own answer always wins:
+editing the parts makes the split yours and the receipt stops touching
+it; **Remove split** pins the row's category so the whole charge counts
+there and the receipt does not split it again (clear that category pin
+to get the receipt's parts back). A receipt whose items all read as one
+category, or an item without a price or a category, leaves the row
+whole under the receipt's single category as before.
 
 ## Receipts
 

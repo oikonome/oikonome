@@ -94,6 +94,13 @@ class Gate:
         """None = uncapped."""
         return None
 
+    def bank_awaits_confirm(self, conn) -> bool:
+        """True when this household can connect no bank until its owner
+        confirms their email address — the clients then close the
+        add-a-bank doors and say why, instead of offering a bank sign-in
+        the server would refuse. A household's own instance never waits."""
+        return False
+
     def institution_cap_message(self, cap: int, used: int) -> str:
         """What a household is told when adding one more institution would
         pass the cap: the numbers and the way forward."""
@@ -177,6 +184,21 @@ class Gate:
     def on_demo_household(self, admin, tenant_id) -> None:
         """A demonstration household was seeded or refreshed: write
         whatever plan row it should carry (nothing, by default)."""
+        return None
+
+    def on_login_email_moved(self, admin, tenant_id, user_id,
+                             old_email: str, new_email: str) -> None:
+        """The login address of this user is moving: called inside the
+        transaction that moves it, just BEFORE the users row is rewritten,
+        so the row still holds the old address and its verified state. A
+        hosted add-on records what it needs about the address being left.
+        Nothing, by default."""
+        return None
+
+    def on_email_verified(self, admin, tenant_id, user_id) -> None:
+        """This user's current address was just stamped verified (inside
+        the transaction that stamped it; read the users row for the
+        address). Nothing, by default."""
         return None
 
     def on_tenant_purge(self, admin, tenant_id) -> None:
@@ -326,6 +348,12 @@ class _FailClosedGate(Gate):
     def on_tenant_delete_scheduled(self, tenant_id) -> str:
         # nothing that charges the household could be paused
         return "unavailable"
+
+    def on_login_email_moved(self, admin, tenant_id, user_id,
+                             old_email: str, new_email: str) -> None:
+        # what the add-on keeps about the address being left cannot be
+        # recorded; the move rolls back and the link stays usable
+        raise GateUnavailable("recording the address an account leaves")
 
     def on_tenant_purge(self, admin, tenant_id) -> None:
         # what the add-on keeps beyond the account's life cannot be

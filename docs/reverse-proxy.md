@@ -191,10 +191,25 @@ Either remedy fixes it:
 
 ## Abuse defense: auto-ban + fail2ban
 
-A client IP that keeps tripping rate limits or failing login is **auto-banned**
-— rejected with `429` before routing, cheaply, for 15 minutes (escalating for
-repeat offenders). Only public IPs are eligible (loopback/LAN never), and it is
+A client IP that keeps failing login is **auto-banned** — rejected with `429`
+before routing, cheaply, for 15 minutes (escalating for repeat offenders).
+Tripping a rate limit is not itself a strike: the limit already refuses the
+excess, and a crowd of phones behind one carrier address (CGNAT) trips it
+honestly — and that holds for every limit, the upload budget included.
+Only public IPs are eligible (loopback/LAN never), and it is
 on by default (`OIKONOME_AUTOBAN=0` disables it).
+
+An IPv6 client is counted as its whole **/64**, for the per-address limits,
+the strikes and the ban alike: a /64 is what a provider hands one customer,
+and a host that owns one can answer from any of its addresses, so counting
+per address would let it step past every cap. IPv4 addresses are counted as
+they are. The `ip=` in the log lines below is still the exact address.
+One wider rule sits on top, for the sign-in human check only: after 15
+failed sign-ins in 15 minutes from one IPv6 **/48**, every address in that
+/48 is asked to prove it is human. That is a challenge and nothing more —
+never a ban and never a strike — so a host rotating through the /64s of its
+/48 cannot dodge the check, while an office or carrier pool sharing one is
+at most shown a checkbox.
 
 Every security event is also logged to **stdout** as one stable line for an
 external jail:
@@ -208,7 +223,8 @@ oikonome-security event=autoban ip=203.0.113.7 ban_seconds=900 prior_bans=1
 `ip=` is the **resolved** client (past the proxy / Cloudflare), so a host-side
 `fail2ban` jail filtering on `oikonome-security event=autoban ip=<HOST>` bans the
 actual offender at your firewall, not the proxy. (Filter on `event=autoban` — the
-`auth_fail`/`ratelimited` lines are the individual strikes leading up to it.)
+`auth_fail` lines are the individual strikes leading up to it; `ratelimited`
+lines are logged for visibility and are not strikes.)
 Point the jail at the app container's logs (`docker logs`/journald).
 
 ## Optional: Cloudflare Turnstile on the login page
@@ -245,7 +261,11 @@ a bot getting through costs a whole account.
 One exception to the quiet path: if failed sign-ins spike across the whole
 instance — a stuffing run from many addresses at many accounts, which no
 single per-IP or per-account count would notice — every sign-in is challenged
-until the burst subsides.
+until the burst subsides. That count measures breadth: a source (an IPv4
+address, or an IPv6 /48) adds at most three failures to it, so arming it
+takes failures from many sources and no single host can do it alone — it
+would otherwise put a check in front of every sign-in, including the phone
+apps, which cannot show one and send the person to the emailed unlock link.
 
 If Cloudflare is unreachable the check **fails open** and sign-in still works.
 That is deliberate: a third-party outage must not lock you out of your own
@@ -319,3 +339,17 @@ entryPoints:
       respondingTimeouts:
         readTimeout: 600s
 ```
+
+## The "back in a moment" page
+
+The generated Caddyfile serves a small self-refreshing page (status 503,
+`Retry-After: 5`) whenever the app does not answer — during the restart a
+deploy or a capacity change causes, or if the app has crashed. Monitors still
+see a 503, so an outage is never hidden; people see a sentence instead of a
+blank error. Only a GET gets the plain refresh. A form that was submitted
+(a POST) gets a version that does not resubmit it: a refresh would re-request
+the form's URL without its fields, and a one-time link would then read as
+used. That version waits for `/readyz` and then goes back to the form, so the
+person presses the button again. If you run your own proxy, copy the whole
+`handle_errors 502 503 504` block, both `handle` branches, from a generated
+Caddyfile.

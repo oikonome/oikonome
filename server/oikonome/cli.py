@@ -514,7 +514,8 @@ def keycheck() -> bool:
     until the original key is set — surface that now, not as crypto errors
     mid-sync. Probes every wrapped tenant data key (each tenant with any
     encrypted secret has one) plus every control-plane ciphertext
-    (CP_CIPHERTEXT_COLUMNS: TOTP seeds, the web-push signing key), which
+    (CP_CIPHERTEXT_COLUMNS: TOTP seeds, the web-push signing key, the
+    tokens of Plaid Items queued for release), which
     encrypt directly under the master key."""
     from cryptography.fernet import Fernet, InvalidToken
 
@@ -569,7 +570,8 @@ def rotate_master_key() -> bool:
     cheap — tenant secrets encrypt under per-tenant DATA keys, so rotation
     never touches secret rows; it re-wraps each tenant_keys row (old
     master → new) plus every control-plane ciphertext (CP_CIPHERTEXT_COLUMNS
-    — TOTP seeds and the web-push signing key), which encrypt directly
+    — TOTP seeds, the web-push signing key and queued Plaid release
+    tokens), which encrypt directly
     under the master. Run with the NEW key in OIKONOME_MASTER_KEY
     and the OLD one in OIKONOME_MASTER_KEY_OLD (procedure incl. the
     container invocation: docs/master-key.md).

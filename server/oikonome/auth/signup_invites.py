@@ -87,6 +87,22 @@ def lookup(conn, token: str, email: str) -> dict | None:
         (_h(token), email.strip().lower())).fetchone()
 
 
+def spent_by(conn, token: str, email: str):
+    """The tenant an invite bound to exactly this email was SPENT on, or
+    None. Only a redemption records a tenant (a re-mint burns older links
+    without one), so a hit means this very link created that household:
+    the signup door uses it to recognise the same form sent twice after
+    the first request already consumed the invite."""
+    if not token or not email:
+        return None
+    row = conn.execute(
+        """SELECT used_by_tenant FROM signup_invites
+           WHERE token_hash = %s AND used_at IS NOT NULL
+             AND used_by_tenant IS NOT NULL AND email = %s""",
+        (_h(token), email.strip().lower())).fetchone()
+    return row["used_by_tenant"] if row else None
+
+
 def consume(conn, invite_id, tenant_id) -> bool:
     """Burn the invite against the tenant it minted. Conditional on
     used_at IS NULL so one-time-use holds under concurrent signups; the

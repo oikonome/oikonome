@@ -26,7 +26,8 @@ import httpx
 
 from ..db import crypto
 from ..engine.compat import as_date
-from .base import Account, Transaction, filter_import_duplicates, log_sync, \
+from .base import ROUTINE_PULL_DAYS, Account, Transaction, bound_first_pull, \
+    filter_import_duplicates, log_sync, \
     reconcile_vanished_pendings, upsert_item, upsert_transactions, \
     upsert_accounts
 
@@ -318,7 +319,11 @@ def _default_since(conn, raw_accounts: list[dict]) -> dt.date:
         if row is None:
             deep = True
             break
-    return dt.date.today() - dt.timedelta(days=730 if deep else 30)
+    if not deep:
+        return dt.date.today() - dt.timedelta(days=ROUTINE_PULL_DAYS)
+    # the household's history window bounds the deep pull, as it bounds a
+    # Plaid link's backfill and every file import
+    return bound_first_pull(conn, dt.date.today() - dt.timedelta(days=730))
 
 
 def sync(conn, since: dt.date | None = None, transport=None) -> dict:
@@ -334,10 +339,12 @@ def sync(conn, since: dt.date | None = None, transport=None) -> dict:
             if since is None:
                 since = _default_since(conn, raw_accounts)
             # MX takes ONE from_date for every member, so a reconnected
-            # member's gap deepens the shared window for this pull
+            # member's gap deepens the shared window for this pull — never
+            # past the household's history window, or every other member's
+            # rows from before it would land with the gap
             resync, resync_items = _resync_from(conn)
             if resync is not None:
-                since = min(since, resync)
+                since = min(since, bound_first_pull(conn, resync))
             raw_txns = _transactions(h, guid, since)
             # member names are cosmetic — a failed _members call
             # must NOT error the whole MX sync (and flip healthy members to

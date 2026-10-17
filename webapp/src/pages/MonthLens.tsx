@@ -9,7 +9,7 @@ import MoneyMap, { Track } from "../components/MoneyMap";
 import { planRows } from "../components/PlanBars";
 import { api, mmdd, money, type MonthLensData, catLabel } from "../api/client";
 import { VERDICT } from "./Today";
-import { monthSavings } from "../moneymath";
+import { isPlanSavingsGoal, monthSavings } from "../moneymath";
 
 export default function MonthLens({ y, m }: { y: number; m: number }) {
   const q = useQuery({ queryKey: ["lens-month", y, m],
@@ -23,9 +23,15 @@ export default function MonthLens({ y, m }: { y: number; m: number }) {
   if (q.isLoadingError) return <div className="note bad">Couldn't load: {String(q.error)}</div>;
   const d: MonthLensData = q.data;
   const goal = (today.data?.savings_goals ?? [])
-    .find((g) => g.name === "Savings");
+    .find((g) => isPlanSavingsGoal(g.name));
+  // no budget the household saved stands behind the month: no verdict,
+  // the Today page's no-budget rule (mobile: month.tsx unjudged)
+  const unjudged = d.verdict === null;
   const v = VERDICT[d.verdict as keyof typeof VERDICT] ?? VERDICT["ON BUDGET"];
-  const remaining = d.variable_budget - d.variable_actual;
+  // an unjudged month (verdict null, budget_set false) still carries a
+  // numeric variable_budget; the ?? only covers an older server's null
+  const budget = d.variable_budget ?? 0;
+  const remaining = budget - d.variable_actual;
   const p = d.projection;
   const net = d.income.actual !== null ? d.income.actual - d.spend_total : null;
 
@@ -36,22 +42,38 @@ export default function MonthLens({ y, m }: { y: number; m: number }) {
            demoted to one flow line ---- */}
       <div className="card" style={{ marginTop: "1rem" }}>
         <div style={{ display: "flex", alignItems: "center", gap: ".5rem" }}>
-          <span className={`pill ${v.cls}`}>{v.label}</span>
+          {unjudged ? <span className="pill m">no budget set</span>
+            : <span className={`pill ${v.cls}`}>{v.label}</span>}
           <span className="pill m">
             {d.status === "final" ? "final"
               : d.status === "future" ? "planned" : `day ${new Date(d.as_of + "T00:00").getDate()} of ${d.days_in_month}`}
           </span>
         </div>
+        {unjudged ? (
+          <div className="hero-remaining" style={{ marginTop: ".45rem" }}>
+            <b>{money(d.variable_actual)}</b>
+            <span className="sub" style={{ fontSize: "1rem", fontWeight: 400 }}>
+              {" "}variable spend
+            </span>
+          </div>
+        ) : (<>
         <div className="hero-remaining" style={{ marginTop: ".45rem" }}>
           <b className={remaining < 0 ? "neg" : ""}>{money(Math.abs(remaining))}</b>
           <span className="sub" style={{ fontSize: "1rem", fontWeight: 400 }}>
             {" "}{remaining < 0 ? "over" : d.status === "final" ? "left unspent of" : "left of"}{" "}
-            {money(d.variable_budget)} to spend
+            {money(budget)} to spend
           </span>
         </div>
         <Track paceLabel row={{ label: "", judged: true, actual: d.variable_actual,
                                 expected: d.variable_actual - d.variance,
-                                budget: d.variable_budget }} />
+                                budget }} />
+        </>)}
+        {unjudged ? (
+          <div className="sub" style={{ marginTop: "1.4rem" }}>
+            No budget saved yet, so this month gets no verdict — set one on
+            the Budget page.
+          </div>
+        ) : (
         <div className="sub" style={{ marginTop: "1.4rem" }}>
           {d.variance > d.tolerance
             ? <b className="neg">{money(d.variance)} over budget</b>
@@ -60,6 +82,7 @@ export default function MonthLens({ y, m }: { y: number; m: number }) {
               : <b style={{ color: "var(--amber)" }}>within tolerance ({money(d.tolerance)})</b>}
           {d.status !== "final" && " so far"}
         </div>
+        )}
         {/* a closed month with no frozen snapshot is judged against
             TODAY's budget — say so rather than pass it off as history */}
         {d.status === "final" && d.budget_source === "live" && (

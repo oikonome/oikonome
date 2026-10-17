@@ -14,7 +14,8 @@ import MerchantAvatar from "../components/MerchantAvatar";
 import TxnTable from "../components/TxnTable";
 import { SIMPLE_CADENCES } from "./Bills";
 import { canEdit } from "../role";
-import { cadenceChoices, cadenceWords } from "../cadence";
+import { CUSTOM_UNITS, cadenceChoices, cadenceWords, customCadence, customMax }
+  from "../cadence";
 const money = (v: number | null | undefined) => money$(v, true);  // cents on transaction/recurring surfaces
 
 
@@ -81,6 +82,8 @@ export default function RecurringHistory() {
     onSuccess: (r, v) => {
       const gone = proposalSuperseded(r);
       if (gone) toast(`${r.payee} is already tracked — the offer was withdrawn`);
+      // the approve changed something the person set (a pin cleared)
+      else if (r.note) toast(`Approved: ${r.payee} — ${r.note}`);
       // the decided proposal leaves the list now — the server has already
       // committed it, and waiting on the history payload to re-prove that
       // left the row sitting there
@@ -423,14 +426,13 @@ function AddAsBill({ d, onDone }: { d: BillsHistoryData; onDone: () => void }) {
   const [cadence, setCadence] = useState(d.fit?.cadence ?? "MONTHLY:1");
   const [nextDue, setNextDue] = useState(d.fit?.next_due ?? "");
   const [err, setErr] = useState<string | null>(null);
-  // "Custom interval…" → any FREQ:interval (every X months / years) for
+  // "Custom interval…" → any FREQ:interval (every X days … years) for
   // unusual bills. The engine schedules + budgets any
   // interval already, so this just widens the picker.
   const [customN, setCustomN] = useState("2");
   const [customUnit, setCustomUnit] = useState("YEARLY");
   const effCadence = cadence === "CUSTOM"
-    ? `${customUnit}:${Math.max(1, parseInt(customN, 10) || 1)}`
-    : cadence;
+    ? customCadence(customUnit, customN) : cadence;
   // explicit user action, distinct from the silent defaults above: fill
   // the form from the ledger fit and SAY what the ledger saw (fit.label),
   // so choosing e.g. the envelope suggestion is an informed click. The
@@ -475,12 +477,13 @@ function AddAsBill({ d, onDone }: { d: BillsHistoryData; onDone: () => void }) {
         <option value="CUSTOM">Custom interval…</option>
       </select>
       {cadence === "CUSTOM" && (
-        <span>every <input type="number" min="1" style={{ width: "3.5rem" }}
+        <span>every <input type="number" min="1" max={customMax(customUnit)} style={{ width: "3.5rem" }}
                value={customN} onChange={(e) => setCustomN(e.target.value)} />
           <select value={customUnit}
                   onChange={(e) => setCustomUnit(e.target.value)}>
-            <option value="MONTHLY">month(s)</option>
-            <option value="YEARLY">year(s)</option>
+            {CUSTOM_UNITS.map(([v, label]) => (
+              <option key={v} value={v}>{label}</option>
+            ))}
           </select></span>
       )}
       <input type="date" value={nextDue} onChange={(e) => setNextDue(e.target.value)} />
@@ -529,7 +532,7 @@ function MerchantCategory({ payee, onDone }: { payee: string; onDone: () => void
   // offered: a merchant rule cannot make a merchant a transfer — the server
   // refuses that write — so listing them only produced an error after the
   // confirm.
-  const cats = useQuery({ queryKey: ["cats"], queryFn: api.categories });
+  const cats = useQuery({ queryKey: ["categories"], queryFn: api.categories });
   const std = new Set([...(cats.data?.plaid_spend ?? []),
                        ...(cats.data?.plaid_flow ?? [])]);
   const custom = (cats.data?.categories ?? []).filter((c) => !std.has(c));

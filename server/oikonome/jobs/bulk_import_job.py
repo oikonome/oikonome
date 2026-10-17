@@ -177,7 +177,7 @@ def status(conn, job_id) -> dict | None:
                "state": r["state"]}
         res = as_dict(r["result"]) or {}
         for k in ("ok", "imported", "error", "account_id", "warnings",
-                  "corrected"):
+                  "corrected", "skipped_older"):
             if k in res:
                 row[k] = res[k]
         files.append(row)
@@ -679,11 +679,12 @@ def _run_one(work, tenant_id: str, decision: dict, name: str, data: bytes,
                 if not erasure.push_may_write(work, tenant_id):
                     raise _Refused(STOP_NOTES["household_deleted"],
                                    stop="household_deleted")
-                if not name.lower().endswith(".pdf"):
-                    # A PDF takes them inside import_pdf, after its slow
-                    # sandboxed read and before its first ledger row:
-                    # taken here, every edit in the household would wait
-                    # out each statement's extraction.
+                if not name.lower().endswith((".pdf", ".ofx", ".qfx")):
+                    # A PDF or OFX/QFX file takes them inside its importer,
+                    # after its slow sandboxed read (a wait for a parse
+                    # slot, then a child, up to a minute each) and before
+                    # its first ledger row: taken here, every edit in the
+                    # household would wait out each statement's read.
                     hold_ledger_write_locks(work)
                 account_id = decision.get("account_id")
                 if not account_id:
@@ -714,6 +715,9 @@ def _run_one(work, tenant_id: str, decision: dict, name: str, data: bytes,
                 "account_id": account_id,
                 "warnings": warnings,
                 "corrected": int(result.get("corrected") or 0),
+                # rows the household's history window left out, shown per
+                # file as a single upload shows them
+                "skipped_older": int(result.get("skipped_older") or 0),
                 "rows": (result.get("rows") or 0)
                 + (result.get("skipped_duplicates") or 0)}
     except HTTPException as e:

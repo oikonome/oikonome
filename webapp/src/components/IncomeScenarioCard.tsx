@@ -1,7 +1,8 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
-import { errText, money, type Settings as SettingsData } from "../api/client";
+import { useRef, useState } from "react";
+import { api, errText, money, type Settings as SettingsData } from "../api/client";
 import { saveSettings } from "../api/cache";
+import { mergeIncomeScenarios, type ScenarioDraft } from "../incomescenarios";
 
 // Named take-home scenarios; the active one, converted to a monthly
 // figure, drives the plan, the dynamic variable budget and the daily
@@ -11,28 +12,48 @@ export default function IncomeScenarioCard({ data, onSaved }: {
 }) {
   // named scenarios, one active (an older saving/not-saving pair arrives
   // migrated into list form from the server)
-  interface Row { name: string; take_home: string; cadence: string }
+  type Row = ScenarioDraft;
   const [rows, setRows] = useState<Row[]>(
     (data.income_scenarios ?? []).map((x) => ({
       name: x.name, take_home: String(x.take_home), cadence: x.cadence })));
   const [active, setActive] = useState(data.active_scenario ?? "");
   const [err, setErr] = useState<string | null>(null);
+  // the copy this card was seeded from: the merge base at save time
+  const baseline = useRef(data.income_scenarios ?? []);
+  const baseActive = useRef(data.active_scenario ?? "");
   const qc = useQueryClient();
   const save = useMutation({
-    // seeds ["settings"] with the returned view as the response lands
-    mutationFn: () => saveSettings(qc, {
-      income_scenarios: rows
-        .filter((r) => r.name.trim())
-        .map((r) => ({ name: r.name.trim(),
-                       take_home: Number(r.take_home.replace(/[$,\s]/g, "")),
-                       cadence: r.cadence })),
-      active_scenario: active,
-    }),
-    onSuccess: () => { setErr(null); onSaved(); },
+    mutationFn: async () => {
+      // The server replaces the list wholesale, and these rows were
+      // seeded at mount; merge against its CURRENT list so a scenario
+      // added or edited on another device since is not erased.
+      const cur = await api.settings();
+      const body: Record<string, unknown> = {
+        income_scenarios: mergeIncomeScenarios(
+          rows, baseline.current, cur.income_scenarios ?? []),
+      };
+      // the active pick is sent only when it was changed here; omitted,
+      // the server keeps whichever one is live now
+      if (active !== baseActive.current) body.active_scenario = active;
+      // seeds ["settings"] with the returned view as the response lands
+      return saveSettings(qc, body);
+    },
+    onSuccess: (v) => {
+      // the saved view is the new merge base, and the card shows what was
+      // merged in from elsewhere rather than its own pre-save rows
+      const scen = v.income_scenarios ?? [];
+      baseline.current = scen;
+      baseActive.current = v.active_scenario ?? "";
+      setRows(scen.map((x) => ({
+        name: x.name, take_home: String(x.take_home), cadence: x.cadence })));
+      setActive(v.active_scenario ?? "");
+      setErr(null); onSaved();
+    },
     onError: (e) => setErr(errText(e)),
   });
   const upd = (i: number, patch: Partial<Row>) =>
-    setRows(rows.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+    setRows(rows.map(
+      (r, j) => (j === i ? { ...r, ...patch, touched: true } : r)));
   const activeRow = rows.find((r) => r.name === active) ?? rows[0];
   const monthly = activeRow
     ? Number(activeRow.take_home.replace(/[$,\s]/g, "")) *
@@ -81,7 +102,8 @@ export default function IncomeScenarioCard({ data, onSaved }: {
       )}
       <button type="button" style={{ marginBottom: ".5rem" }}
               onClick={() => setRows([...rows,
-                { name: "", take_home: "", cadence: "biweekly" }])}>
+                { name: "", take_home: "", cadence: "biweekly",
+                  touched: true }])}>
         Add scenario</button>
       <p className="mut" style={{ fontSize: 13 }}>
         {monthly && Number.isFinite(monthly)

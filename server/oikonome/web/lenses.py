@@ -96,31 +96,42 @@ def month_state(conn, y: int, m: int, today: dt.date, *,
     return st
 
 
-def _projection(st: dict, as_of: dt.date) -> dict:
-    """Month-end pace projection for an in-progress month — the Today
-    card's math (todayview.build_context proj), judged against the FULL
-    variable budget with the frozen tolerance rule (at month end,
-    expected = the full budget, so tolerance = max($50, 5% of budget)).
+def _projection(st: dict) -> dict:
+    """Month-end pace projection for an in-progress month, judged against
+    the month's spendable — the budget's paced share, the whole variable
+    budget unless the ledger began inside the month — with the frozen
+    tolerance rule (at month end, expected = that spendable, so
+    tolerance = max($50, 5% of it)).
 
-    The pace runs over ELAPSED days, the same fraction the verdict uses:
-    today has not finished, so counting it as a completed $0 day would
-    project an on-pace household with nothing spent yet this morning as
-    under budget while the verdict says on budget. Today's spending stays
-    out of the numerator for the same reason (spend through yesterday
-    over the days through yesterday, the forecast's horizon), or a
-    household spending its allowance every day projects over budget. On
-    day 1 nothing has elapsed and the projection is the plan itself."""
-    var_budget = (st["buckets"]["food"]["month_budget"]
-                  + st["buckets"]["other"]["month_budget"])
-    elapsed = as_of.day - 1
-    through_yesterday = (st["variable_actual"]
-                         - (st.get("variable_today") or 0.0))
-    pace_total = (through_yesterday / elapsed * st["days_in_month"]
-                  if elapsed >= 1 else var_budget)
+    The window is the verdict's own (budget.pace_window): the pace is
+    spend through yesterday over the finished days since the pace start
+    (budget.paced_daily), carried over every paced day of the month.
+    Today has not finished, so counting it as a completed $0 day would
+    project an on-pace household as under budget while the verdict says
+    on budget; the days before the ledger are no data, not days of no
+    spending. Until the window is settled (the month's first days, a
+    ledger days old) the verdict calls nothing under, so the projection
+    is the plan itself — unless even that pace runs over, which the
+    verdict says at once too."""
+    var_budget = st["variable_budget_paced"]
+    daily = budget.paced_daily(st)
+    pace_total = (daily * st["pace"]["paced_days"] if daily is not None
+                  else var_budget)
     variance = pace_total - var_budget
     tolerance = max(50.0, var_budget * 0.05)
+    verdict = _verdict(variance, tolerance)
+    if not st["pace_settled"] and verdict != "OVER BUDGET":
+        pace_total, variance, verdict = var_budget, 0.0, "ON BUDGET"
     return {"pace_total": _R(pace_total), "variance": _R(variance),
-            "tolerance": _R(tolerance), "verdict": _verdict(variance, tolerance)}
+            "tolerance": _R(tolerance), "verdict": verdict}
+
+
+def _judged(conn, st: dict) -> bool:
+    """Does a budget the household made stand behind this month? A closed
+    month's frozen snapshot does (snapshots are only taken of a saved
+    budget); otherwise the stored settings must carry one
+    (budget.budgets_set)."""
+    return st["budget_source"] == "snapshot" or budget.budgets_set(conn)
 
 
 def _ser_txn(r, fixed: bool) -> dict:
@@ -468,6 +479,10 @@ def month_summary(conn, year: int, month: int,
               else "in_progress" if (year, month) == (today.year, today.month)
               else "future")
     b = st["buckets"]
+    # a verdict needs a budget the household made: a frozen snapshot, or a
+    # saved one — never the loader's unsaved first-month guess (the Today
+    # page, the app and the daily email gate on the same answer)
+    judged = _judged(conn, st)
 
     def bucket(k):
         v = b[k]
@@ -516,7 +531,7 @@ def month_summary(conn, year: int, month: int,
     _cfg = budget.load_config(conn)
     saved_month = None
     _goal = next((g for g in _savings.goals(_cfg)
-                  if str(g["name"]) == "Savings"), None)
+                  if _savings.is_plan_savings_goal(g)), None)
     if (_goal is not None and not _savings.is_plan_only(_goal)
             and status != "future"):
         _first = dt.date(year, month, 1)
@@ -526,13 +541,27 @@ def month_summary(conn, year: int, month: int,
     return {
         "y": year, "m": month, "status": status,
         "as_of": as_of.isoformat(), "days_in_month": st["days_in_month"],
-        "verdict": st["verdict"], "variance": _R(st["variance"]),
+        "verdict": st["verdict"] if judged else None,
+        "variance": _R(st["variance"]) if judged else 0.0,
         "tolerance": _R(st["tolerance"]),
-        "projection": (_projection(st, as_of)
-                       if status == "in_progress" else None),
+        # false: no budget of the household's own stands behind this
+        # month, so there is no verdict and no projection to show
+        "budget_set": judged,
+        "projection": (_projection(st)
+                       if status == "in_progress" and judged else None),
         "variable_actual": _R(st["variable_actual"]),
-        "variable_budget": _R(b["food"]["month_budget"]
-                              + b["other"]["month_budget"]),
+        # the month's spendable: the budget's paced share, so a first
+        # month the ledger began inside of reads "$X of $Y" against the
+        # days it covered — the gap the verdict judges. With no saved
+        # budget behind the month (budget_set false) a reader shows the
+        # spend alone and ignores this, but a native build in the stores
+        # predates that branch and always prints budget minus spend, red
+        # when negative: a null reaches it as $0 and every month with
+        # spending reads "over $0 to spend". So the figure stays numeric
+        # and never below the spend — there is no budget to be over.
+        "variable_budget": (_R(st["variable_budget_paced"]) if judged
+                            else _R(max(st["variable_budget_paced"],
+                                        st["variable_actual"]))),
         "buckets": {k: bucket(k) for k in ("fixed", "food", "other")},
         "bills": {
             "posted": _R(b["fixed"]["actual"]),
@@ -671,6 +700,21 @@ def year_summary(conn, year: int, today: dt.date | None = None,
                                   if inc is not None else None)})
             continue
         st = month_state(conn, year, m, today, memo=memo)
+        if not _judged(conn, st):
+            # the month in progress with no budget the household saved:
+            # the cash-flow fact a no-snapshot month shows, never a
+            # verdict on the loader's unsaved guess
+            key = f"{year:04d}-{m:02d}"
+            inc = (_R(income_m.get(key, 0) or 0)
+                   if cov.month(key) else None)
+            spend = _R(st["total_actual"])
+            cells.append({"m": m, "status": "net", "verdict": None,
+                          "variance": None, "variable_actual": None,
+                          "variable_budget": None,
+                          "income": inc, "spend": spend,
+                          "net": (_R(inc - spend)
+                                  if inc is not None else None)})
+            continue
         if st.get("plan_surplus") is not None:
             plan_surplus = st["plan_surplus"]
         for k in ("food", "other", "fixed"):
@@ -678,8 +722,7 @@ def year_summary(conn, year: int, today: dt.date | None = None,
             annual[k]["actual"] += b["actual"]
             annual[k]["expected"] += b["expected"]
             annual[k]["month_budget"] += b["month_budget"]
-        var_budget = _R(st["buckets"]["food"]["month_budget"]
-                        + st["buckets"]["other"]["month_budget"])
+        var_budget = _R(st["variable_budget_paced"])
         # the cash-flow fact beside the verdict, the way the Month lens
         # hero reads it (income from the bank series, spend = the month's
         # total out), so a reader walking the year sees what each month
@@ -691,7 +734,7 @@ def year_summary(conn, year: int, today: dt.date | None = None,
         flow = {"income": inc, "spend": spend,
                 "net": _R(inc - spend) if inc is not None else None}
         if (year, m) == (today.year, today.month):
-            proj = _projection(st, st["as_of"])
+            proj = _projection(st)
             cells.append({"m": m, "status": "projected",
                           "verdict": proj["verdict"],
                           "variance": proj["variance"],
@@ -772,7 +815,7 @@ def year_summary(conn, year: int, today: dt.date | None = None,
     saved_ytd = None
     _lens_cfg = budget.load_config(conn)
     goal = next((g for g in savings.goals(_lens_cfg)
-                 if str(g["name"]) == "Savings"), None)
+                 if savings.is_plan_savings_goal(g)), None)
     span_end = min(today, dt.date(year, 12, 31))
     windows = []
     for c in cells:

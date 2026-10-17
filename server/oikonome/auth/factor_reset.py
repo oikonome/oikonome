@@ -257,6 +257,15 @@ def clear_second_factor(conn, user_id, expect_members=None) -> dict:
     with conn.transaction():
         members = reset_mod.revoke_everything(
             conn, user_id, expect_members=expect_members)
+        # and every link that would put the account back on an address it
+        # left. A revert ends in a password reset to that address, and on
+        # an account the operator has just left with no factor that reset
+        # asks for no recovery code — the old inbox would own the account.
+        # The operator has decided out of band who that is. (A self-serve
+        # reset burns none of them, on purpose: whoever moved the account
+        # could run one from the new inbox to disarm the owner's link.)
+        from . import email_revert
+        email_revert.burn_all(conn, user_id)
     reset_mod.drop_recovery_codes(user_id)
     # a pending cooling-off request is moot once the operator has cleared
     # the factors by hand — leaving it live would let it land later, after

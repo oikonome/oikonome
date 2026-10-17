@@ -276,8 +276,11 @@ class SnapshotTests(unittest.TestCase):
                              [[dt.date.today().isoformat(), 4750.0]])
             row = conn.execute(
                 "SELECT by_class FROM networth_snapshot").fetchone()
+            # the financial classes, plus the property net recorded
+            # beside them for the full net-worth line
             self.assertEqual(row["by_class"],
-                             {"Cash": 5000, "Card debt": -250})
+                             {"Cash": 5000, "Card debt": -250,
+                              reporting.SNAPSHOT_PROPERTY_KEY: 0})
         finally:
             conn.close()
 

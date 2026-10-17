@@ -289,3 +289,122 @@ def reap_tenant(tenant_id: str) -> dict:
                 worker.answer_sync_nudge(conn, tenant_id)
     finally:
         conn.close()
+
+
+# How long a release that failed during an erasure or reset keeps being
+# retried. Plaid bills the Item monthly for as long as it exists, so the
+# retry runs nightly; past this the Item is taken as beyond this instance
+# (keys revoked, the environment gone) and the token is let go rather than
+# kept indefinitely after the household that owned it was erased.
+RELEASE_RETRY_DAYS = 30
+
+# A link holds its freshly exchanged token in the queue until the Item is
+# saved (sync.plaid.link_item). Such a hold is released only once it is
+# older than any link could still be running — younger, the link that
+# queued it may be about to save the Item.
+LINK_HOLD_GRACE = dt.timedelta(hours=1)
+
+
+def retry_queued_releases(now: dt.datetime | None = None,
+                          transport=None) -> dict:
+    """Retry /item/remove for every Item in plaid_release_queue — releases
+    that failed while their household's rows were being deleted.
+
+    The per-tenant reap above cannot see these: it runs over live
+    households' item rows, and the rows of an erased household are gone,
+    with them the only other copy of the access token. A row leaves the
+    queue when the Item is removed (or Plaid says it is already gone), when
+    some household still holds the Item (a purge abandoned after its
+    release keeps the connection, and its own reaper owns it), or once it
+    has been retried for RELEASE_RETRY_DAYS. Never raises; returns
+    {'released': [...], 'kept': [...], 'dropped': [...], 'given_up': [...]}.
+    """
+    from cryptography.fernet import InvalidToken
+
+    from ..db import crypto
+    now = now or dt.datetime.now(dt.timezone.utc)
+    out: dict = {"released": [], "kept": [], "dropped": [], "given_up": []}
+    try:
+        admin = tenancy.admin_connect()
+    except Exception as e:                                 # noqa: BLE001
+        log.warning("plaid release retry: no admin connection: %s", e)
+        return out
+    try:
+        rows = admin.execute(
+            "SELECT item_id, access_token, client_id, secret, base_url, "
+            "reason, queued_at FROM plaid_release_queue "
+            "ORDER BY queued_at").fetchall()
+        for r in rows:
+            iid = r["item_id"]
+            if r["reason"] == plaid.LINK_HOLD_REASON \
+                    and now - r["queued_at"] < LINK_HOLD_GRACE:
+                continue
+            try:
+                held = admin.execute(
+                    "SELECT 1 FROM items WHERE id=%s AND aggregator='plaid' "
+                    "AND access_token IS NOT NULL LIMIT 1",
+                    (iid,)).fetchone()
+                if held:
+                    admin.execute("DELETE FROM plaid_release_queue "
+                                  "WHERE item_id=%s", (iid,))
+                    out["dropped"].append(iid)
+                    continue
+                platform = os.environ.get("OIKONOME_PLAID_CLIENT_ID")
+                err = None
+                try:
+                    secret = crypto.decrypt_cp(r["secret"]) if r["secret"] \
+                        else (os.environ.get("OIKONOME_PLAID_SECRET")
+                              if platform and r["client_id"] == platform
+                              else None)
+                    token = crypto.decrypt_cp(r["access_token"])
+                except (InvalidToken, ValueError, RuntimeError) as e:
+                    # sealed under a master key this instance no longer
+                    # has: no later night reads it either, so the row
+                    # takes the bounded give-up road below instead of
+                    # being retried for good, and says so loudly — the
+                    # Item keeps billing until someone removes it at Plaid
+                    log.error("plaid release retry: the queued token for "
+                              "item=%s does not decrypt under the current "
+                              "master key (%s) — restore the key it was "
+                              "sealed with, or remove the Item from the "
+                              "Plaid dashboard", iid, type(e).__name__)
+                    secret, token, err = None, None, "UNDECRYPTABLE"
+                if err is None and secret:
+                    client = plaid.Client(r["client_id"], secret,
+                                          r["base_url"], transport=transport)
+                    try:
+                        client.remove_item(token)
+                    except plaid.PlaidError as e:
+                        if e.code != "ITEM_NOT_FOUND":
+                            err = e.code
+                elif err is None:
+                    err = "NO_CREDENTIALS"
+                if err is None:
+                    admin.execute("DELETE FROM plaid_release_queue "
+                                  "WHERE item_id=%s", (iid,))
+                    _ledger_removed(iid, f"{r['reason']}-retry")
+                    out["released"].append(iid)
+                    log.info("plaid release retry: removed item=%s", iid)
+                    continue
+                if now - r["queued_at"] >= dt.timedelta(
+                        days=RELEASE_RETRY_DAYS):
+                    admin.execute("DELETE FROM plaid_release_queue "
+                                  "WHERE item_id=%s", (iid,))
+                    out["given_up"].append(iid)
+                    log.error("plaid release retry: gave up on item=%s "
+                              "after %s days (%s) — remove it from the "
+                              "Plaid dashboard", iid, RELEASE_RETRY_DAYS,
+                              err)
+                    continue
+                admin.execute(
+                    "UPDATE plaid_release_queue SET attempts=attempts+1, "
+                    "last_try_at=now(), last_error=%s WHERE item_id=%s",
+                    (err[:64], iid))
+                out["kept"].append(iid)
+            except Exception as e:                         # noqa: BLE001
+                log.warning("plaid release retry failed item=%s: %s",
+                            iid, e)
+                out["kept"].append(iid)
+    finally:
+        admin.close()
+    return out

@@ -56,8 +56,11 @@ DATA_MAP = {
     "mileage_log": "business mileage entries",
     "vendor_1099": "1099 vendor records",
     "transaction_notes": "your notes on transactions",
-    "transaction_splits": "charges you split by hand across categories "
-                          "(the parts, in order)",
+    "transaction_splits": "charges split across categories, the parts in "
+                          "order — split by hand (source user) or from a "
+                          "store receipt's items (source amazon/costco; a "
+                          "restore skips these and the store match "
+                          "rebuilds them from the restored receipts)",
     "activity_log": "the household's activity log — who changed which "
                     "category, bill, note or rule, and when",
     "account_links": "same-account links across data sources",
@@ -103,6 +106,9 @@ CONTROL_SKIP = {
                           "instance's keys.",
     "support_consents": "consent to let THIS platform's operator read the "
                         "data — it cannot be transferred to another one.",
+    "email_change_reverts": "links that undo a login-email change — token "
+                            "hashes keyed to a mailbox and to the source "
+                            "instance.",
 } | ext.gate.export_exclusions()
 
 def _control_csv(conn, table: str) -> str:

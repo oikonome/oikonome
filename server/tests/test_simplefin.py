@@ -379,6 +379,36 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(row["type"], "depository")
         self.assertEqual(row["balance_current"], 900.0)  # kept, not flipped
 
+    def test_a_classification_during_a_pull_keeps_its_sign(self):
+        """The pull reads the classified types first and writes balances
+        later. A person classifying the account in between must not have
+        the pull write back the sign it chose from its earlier read: the
+        card would read as an asset until the next pull."""
+        from unittest import mock
+        payload = copy.deepcopy(PAYLOAD)
+        payload["accounts"] = [
+            {"id": "acc-misread", "name": "Everyday Spending",  # no credit hint
+             "currency": "USD", "balance": "-250.00",
+             "available-balance": "-100.00",
+             "org": {"name": "Demo Bank"}, "transactions": []}]
+        self._sync(payload)
+        real = sync_base.user_set_types
+
+        def read_then_classify(conn):
+            snapshot = real(conn)            # taken before the classify
+            sync_base.mark_type_user_set(conn, "acc-misread", "credit",
+                                         "credit card")
+            return snapshot
+        with mock.patch.object(simplefin, "user_set_types",
+                               read_then_classify):
+            self._sync(payload)
+        row = self.conn.execute(
+            "SELECT type, balance_current, balance_available FROM accounts "
+            "WHERE id='acc-misread'").fetchone()
+        self.assertEqual(row["type"], "credit")
+        self.assertEqual(row["balance_current"], 250.0)
+        self.assertEqual(row["balance_available"], 100.0)
+
     def test_classifying_a_card_flips_the_stored_balance_at_once(self):
         """Between the user's correction and the next hourly pull, the
         stored SimpleFIN balance must already carry the engine's sign.

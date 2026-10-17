@@ -65,6 +65,14 @@ tank of petrol sitting inside a grocery budget makes both numbers
 wrong. Your own overrides still outrank it, as they outrank everything.
 The merchants guide has the detail, and the page to undo it on.
 
+The same goes for a loan payment on an imported statement line that
+carries no category of its own: a line that says it is a student-loan or
+loan payment ("… STD LN PMT", "AUTO LOAN PMT") is filed under **loan
+payments**, even when the importer cleaned the name down to the bare
+servicer, so it is not read as a utility or a service. It still counts
+as money out. A servicer's other charges are left alone, and your own
+overrides outrank this too.
+
 ## The verdict is variable-only
 
 Fixed bills never make you "over": they're obligations with their own

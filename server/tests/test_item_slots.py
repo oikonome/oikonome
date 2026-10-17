@@ -35,6 +35,8 @@ def _transport(item_id: str):
                 {"institution": {"name": "Demo Bank"}}))
         if path == "/accounts/get":
             return httpx.Response(200, text=json.dumps({"accounts": []}))
+        if path == "/item/remove":
+            return httpx.Response(200, text=json.dumps({}))
         if path == "/transactions/sync":
             return httpx.Response(200, text=json.dumps(TXN_PAGE))
         return httpx.Response(404, text="{}")
@@ -183,6 +185,75 @@ class SlotLedgerTests(unittest.TestCase):
             self.conn.execute(
                 "UPDATE plaid_item_ledger SET environment='sandbox' "
                 "WHERE item_id=%s", (item_id,))
+
+    def test_an_item_refused_at_the_cap_still_holds_its_place(self):
+        """A link refused at token exchange has already created a billed
+        Item; handing it back must leave it in the ledger as released, so
+        the released-Item hold counts it and repeated refused links cannot
+        mint Items past the cap for free."""
+        from oikonome.sync import base as sync_base
+        saved = {k: os.environ.get(k) for k in
+                 ("OIKONOME_HOSTED", "OIKONOME_HOSTED_MAX_INSTITUTIONS")}
+        os.environ.update(OIKONOME_HOSTED="1",
+                          OIKONOME_HOSTED_MAX_INSTITUTIONS="1",
+                          OIKONOME_PLAID_CLIENT_ID="cid",
+                          OIKONOME_PLAID_SECRET="sec",
+                          OIKONOME_PLAID_ENV="production")
+        try:
+            self.conn.execute(
+                "INSERT INTO items (id, aggregator, institution_name) "
+                "VALUES (%s, 'plaid', 'Held Bank')",
+                (f"pl-held-{uuid.uuid4().hex[:8]}",))
+            before = sync_base.released_count(self.conn)
+            item_id = f"pl-refused-{uuid.uuid4().hex[:10]}"
+            with self.assertRaises(ValueError):
+                plaid.link_item(self.conn, "public-x",
+                                transport=_transport(item_id))
+            row = self._ledger(item_id)
+            self.assertIsNotNone(row, "refused Item missing from the ledger")
+            self.assertEqual(row["credential_source"], "platform")
+            self.assertIsNotNone(row["removed_at"])
+            self.assertIsNone(self.conn.execute(
+                "SELECT 1 FROM items WHERE id=%s", (item_id,)).fetchone())
+            self.assertEqual(sync_base.released_count(self.conn), before + 1)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def _flipping_transport(self, item_id: str):
+        """The household saves its own Plaid keys while the link is in
+        flight — after the key-swap check let the link through, before
+        the ledger row is written."""
+        inner = _transport(item_id)
+        seen = []
+
+        def handler(request):
+            # the second institution lookup is the branding refresh, which
+            # runs after the key check and before the ledger write
+            if request.url.path == "/institutions/get_by_id":
+                seen.append(1)
+            if len(seen) == 2 and request.url.path == "/institutions/get_by_id":
+                write_config(self.conn, plaid_client_id="byo-cid",
+                             plaid_secret="byo-sec")
+            return inner.handle_request(request)
+        return httpx.MockTransport(handler)
+
+    def test_the_row_names_the_keys_that_minted_the_item(self):
+        """The success and refusal rows both read the source from the
+        client that made the Item, so a settings change mid-link cannot
+        make the two paths disagree or bill the platform's Item to the
+        household's keys."""
+        os.environ.update(OIKONOME_PLAID_CLIENT_ID="cid",
+                          OIKONOME_PLAID_SECRET="sec",
+                          OIKONOME_PLAID_ENV="production")
+        item_id = f"pl-flip-{uuid.uuid4().hex[:10]}"
+        plaid.link_item(self.conn, "public-x",
+                        transport=self._flipping_transport(item_id))
+        self.assertEqual(self._ledger(item_id)["credential_source"],
+                         "platform")
 
 
 if __name__ == "__main__":

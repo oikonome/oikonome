@@ -61,7 +61,8 @@ admin console once mail works.
 ### no daily email at all, and SMTP is fine
 Check whether a budget is set (**Budget** → Food and Everything-else). The
 scheduled daily verdict is skipped while there is no plan to judge, since
-the only thing it could report is "on budget, $0 of $0". **Send today's
+the only thing it could report is "on budget, $0 of $0". Suggested
+first-month figures do not count until you save them. **Send today's
 email now** (in the Daily email card under Settings → Email & Push) still sends
 on demand if you want to see the message. Doctor's daily email row says
 *not sent: no budget is set yet* when this is the cause.
@@ -111,6 +112,18 @@ Connections (see the import-history guide). The logos themselves are
 fetched by the instance, not by your browser, so an instance with no
 outbound internet access shows monogram marks and nothing else.
 
+### sign-in or signup says the server is briefly busy (503)
+Checking a password is deliberately memory-hard: each check holds about
+64 MiB while it runs. So only a few run at once
+(`OIKONOME_ARGON2_CONCURRENCY`, default 3); the rest wait in line for up
+to `OIKONOME_ARGON2_WAIT` seconds (default 5) and are then answered
+**503** with a `Retry-After`, rather than the container running out of
+memory and restarting for everyone. The same 503 answers a signup or an
+email confirmation when the database has no free connection. Both clear
+on their own; submit again after a few seconds. On a machine with more
+memory and cores, raise the concurrency in `docker/.env`, keeping
+concurrency × 64 MiB well inside the app container's memory limit.
+
 ### "server is busy" reading a receipt, or the Assistant refuses
 Both are deliberate limits, not failures. Reading a receipt photo and
 answering an Assistant question each hold a lot of memory and a worker
@@ -123,6 +136,23 @@ very thread the limit exists to spare. Wait a moment and retry. On a big machine
 `OIKONOME_RECEIPT_PARSE_CONCURRENCY`, `OIKONOME_RECEIPT_PARSE_WAIT_S`
 and `OIKONOME_ASSISTANT_CONCURRENCY` in `docker/.env`; the defaults suit
 a small container.
+
+### a new bank shows "first sync pending", or syncs lag behind
+When a bank link finishes, the connection is saved at once and its first
+pull of history runs in the background on the worker — a couple of years
+of transactions can take a few minutes, and the accounts fill in when it
+lands. If that, or ordinary syncs, lag well behind on a busy instance,
+the worker is short of threads: every background job runs in one of
+`OIKONOME_WORKER_THREADS` (default: the worker's pool size plus two), and
+the worker takes two fewer jobs at once. Each running job holds about one
+database connection, so raise `OIKONOME_WORKER_POOL_MAX` in `docker/.env`
+(as far as your database's connection limit allows — on a managed
+database, less the slots the provider reserves for its own agents, which
+its plan states) and restart the
+worker; the thread count follows it. At most
+`OIKONOME_FIRST_SYNC_CONCURRENCY` (default 3) new banks pull their first
+history at once, so a burst of new links waits its turn rather than
+crowding out ordinary syncs.
 
 ### an upload is refused or times out
 Uploads are the one request shape that costs an instance real memory

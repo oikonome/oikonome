@@ -1441,7 +1441,8 @@ def _configure(conn, g: _Gen, rng: random.Random, today: dt.date,
                                "start_balance": 0}],
             "wizard_done": True,
             "wizard_steps": {k: "done" for k in
-                             ("connect", "bills", "budgets", "email", "finish")},
+                             ("appearance", "connect", "bills", "budgets",
+                              "email", "finish")},
         })
 
 
@@ -1581,33 +1582,52 @@ _OFFICE_ITEMS = [("USB-C hub", "business"), ("Printer paper", "business"),
                  ("HDMI cable", "")]
 
 
-def _receipt_svg(merchant: str, date, items, total: float) -> bytes:
-    """A simple receipt-looking SVG — self-contained, no vision model
-    needed, renders in the receipt viewer's plain <img>."""
-    h = 150 + 24 * len(items)
-    lines = "".join(
-        f'<text x="24" y="{118 + i * 24}" font-size="14" '
-        f'font-family="monospace">{desc[:28]}</text>'
-        f'<text x="356" y="{118 + i * 24}" font-size="14" '
-        f'font-family="monospace" text-anchor="end">{amt:,.2f}</text>'
-        for i, (desc, amt, _tag) in enumerate(items))
-    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="380" '
-           f'height="{h}" viewBox="0 0 380 {h}">'
-           f'<rect width="380" height="{h}" fill="#fffdf5"/>'
-           f'<text x="190" y="40" font-size="18" font-family="monospace" '
-           f'text-anchor="middle" font-weight="bold">{merchant}</text>'
-           f'<text x="190" y="64" font-size="13" font-family="monospace" '
-           f'text-anchor="middle">{date} · thank you</text>'
-           f'<line x1="24" y1="84" x2="356" y2="84" stroke="#888" '
-           f'stroke-dasharray="4"/>{lines}'
-           f'<line x1="24" y1="{h - 44}" x2="356" y2="{h - 44}" '
-           f'stroke="#888" stroke-dasharray="4"/>'
-           f'<text x="24" y="{h - 20}" font-size="15" '
-           f'font-family="monospace" font-weight="bold">TOTAL</text>'
-           f'<text x="356" y="{h - 20}" font-size="15" '
-           f'font-family="monospace" font-weight="bold" '
-           f'text-anchor="end">${total:,.2f}</text></svg>')
-    return svg.encode()
+def _receipt_png(merchant: str, date, items, total: float) -> bytes:
+    """A simple receipt-looking PNG, drawn at seed time with no vision
+    model involved. It must be a raster image: the receipt image route
+    renders only receipts.IMAGE_MIMES inline and serves anything else as
+    an opaque download, so a vector receipt would never show in the
+    viewer. Text is drawn as pixels, never parsed as markup, so a name
+    carrying "&" or "<" cannot break or inject into the image."""
+    import io
+
+    from PIL import Image, ImageDraw, ImageFont
+
+    k = 2                                   # drawn at 2x for a crisp viewer
+    w, h = 380, 150 + 24 * len(items)
+    img = Image.new("RGB", (w * k, h * k), (0xff, 0xfd, 0xf5))
+    d = ImageDraw.Draw(img)
+    ink, rule = (0x22, 0x22, 0x22), (0x88, 0x88, 0x88)
+
+    def font(px):
+        return ImageFont.load_default(size=px * k)
+
+    def text(x, y, s, px, anchor="ls", bold=False):
+        f = font(px)
+        d.text((x * k, y * k), s, font=f, fill=ink, anchor=anchor)
+        if bold:                            # the default font has no bold face
+            d.text((x * k + 1, y * k), s, font=f, fill=ink, anchor=anchor)
+
+    def dashed(y):
+        x = 24
+        while x < 356:
+            d.line([(x * k, y * k), (min(x + 4, 356) * k, y * k)],
+                   fill=rule, width=k)
+            x += 8
+
+    text(190, 40, str(merchant), 18, "ms", bold=True)
+    text(190, 64, f"{date} - thank you", 13, "ms")
+    dashed(84)
+    for i, (desc, amt, _tag) in enumerate(items):
+        y = 118 + i * 24
+        text(24, y, str(desc)[:28], 14)
+        text(356, y, f"{amt:,.2f}", 14, "rs")
+    dashed(h - 44)
+    text(24, h - 20, "TOTAL", 15, bold=True)
+    text(356, h - 20, f"${total:,.2f}", 15, "rs", bold=True)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
 
 
 def _receipts(conn, g: _Gen, rng: random.Random, today: dt.date) -> None:
@@ -1704,9 +1724,9 @@ def _receipts(conn, g: _Gen, rng: random.Random, today: dt.date) -> None:
                                      parsed_at)
                VALUES (%s,%s,%s,'parsed',%s,now()) RETURNING id""",
             (txn["id"],
-             _receipt_svg(txn["merchant"] or txn["name"], txn["date"],
+             _receipt_png(txn["merchant"] or txn["name"], txn["date"],
                           items, txn["amount"]),
-             "image/svg+xml",
+             "image/png",
              jsonb({"merchant": txn["merchant"] or txn["name"],
                     "total": txn["amount"],
                     "date": txn["date"].isoformat()}))).fetchone()["id"]

@@ -236,6 +236,15 @@ def add_txn(conn, date, amount, name, *, primary="GENERAL_MERCHANDISE",
     return txn_id
 
 
+def add_ledger_history(conn, before, *, account="card", days=120):
+    """A cent of interest `days` before `before`: the ledger is older than
+    the month under test. The live verdict paces a ledger that starts
+    inside the month from its first day, so a fixture that means an
+    established household with one row this month needs this."""
+    return add_txn(conn, as_date(before) - dt.timedelta(days=days), -0.01,
+                   "INTEREST PAID", primary="INCOME", account=account)
+
+
 def add_bill(conn, payee, amount, *, frequency="MONTHLY", interval=1,
              next_due=None, bill_type="occurrence", income=False,
              last_seen=None, source="detected", **kw):

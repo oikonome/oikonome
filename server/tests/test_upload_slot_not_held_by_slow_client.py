@@ -202,7 +202,7 @@ class OnlyRoutesThatAcceptAFileSpendUploadCapacity(unittest.TestCase):
         """Hand-maintaining this list is how it rots. Derivation is only
         worth anything if it actually finds the routes."""
         paths = set(security.upload_route_paths(self.app))
-        for expected in ("/api/import", "/api/transactions/{txn_id}/receipt",
+        for expected in ("/api/import", "/api/transactions/{txn_id:path}/receipt",
                          "/api/import/bulk/analyze",
                          "/api/import/taxdoc/analyze",
                          "/api/connections/import", "/import"):
@@ -216,12 +216,15 @@ class OnlyRoutesThatAcceptAFileSpendUploadCapacity(unittest.TestCase):
 
     def test_every_upload_route_is_recognised_from_its_request_path(self):
         """The templates have to survive the trip through path matching —
-        /api/transactions/{txn_id}/receipt is the one with a parameter."""
+        /api/transactions/{txn_id:path}/receipt is the one with a parameter,
+        and its id may hold a slash (a file-import reference), which the
+        server has already decoded by the time the path is matched."""
         for template in security.upload_route_paths(self.app):
-            concrete = template.replace("{txn_id}", "abc123")
-            self.assertTrue(
-                security._accepts_upload({"app": self.app, "path": concrete}),
-                template)
+            for txn in ("abc123", "ofx:card:2025/03/01-7"):
+                concrete = template.replace("{txn_id:path}", txn)
+                self.assertTrue(
+                    security._accepts_upload({"app": self.app, "path": concrete}),
+                    (template, concrete))
 
     def test_a_collector_push_door_is_not_an_upload_route(self):
         """The host-side collectors POST JSON to /api/import/<source>. They

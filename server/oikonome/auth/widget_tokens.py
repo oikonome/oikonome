@@ -59,7 +59,12 @@ def lookup(conn, token: str) -> dict | None:
                 JOIN users u ON u.id = w.user_id
                 JOIN tenants t ON t.id = w.tenant_id
            WHERE w.token_hash = %s AND w.revoked_at IS NULL
-                 AND d.revoked_at IS NULL AND d.expires_at > now()""",
+                 AND d.revoked_at IS NULL AND d.expires_at > now()
+                 -- the same person and household as the parent device,
+                 -- and the person still in that household (see
+                 -- device_tokens.lookup)
+                 AND d.user_id = w.user_id AND d.tenant_id = w.tenant_id
+                 AND u.tenant_id = w.tenant_id""",
         (_h(token),)).fetchone()
     if row is None:
         return None

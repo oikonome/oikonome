@@ -852,6 +852,10 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
   // line is offered on the row too, from the closed list the review
   // queue reads (the same cache entry)
   const [lineFor, setLineFor] = useState<string | null>(null);
+  // a row that has a line keeps the picker, so a line saved by mistake
+  // can be changed or cleared (the web's Books table, same rule)
+  const lineEditable = (x: BizTxn) =>
+    bizNeedsLine(x) || (x.amount > 0 && !!x.sched_c_line);
   const lineList = useQuery({ queryKey: ["biz-suggestions", entity.id],
     queryFn: () => client!.bizSuggestions(entity.id), enabled: !!client });
   type TxnList = { transactions: BizTxn[] };
@@ -861,17 +865,20 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
   // a line goes with the bucket only when one is picked on the row: a
   // bucket change alone leaves any line the server holds as it is
   const classify = useMutation({
+    // `line` undefined leaves the stored line alone; null clears it (the
+    // body names the key, which the server reads as "set this line")
     mutationFn: ({ txnId, bucket, line }:
-        { txnId: string; bucket: string; line?: string }) =>
+        { txnId: string; bucket: string; line?: string | null }) =>
       client!.bizClassify(entity.id, txnId,
-        line ? { bucket, sched_c_line: line } : { bucket }),
+        line !== undefined ? { bucket, sched_c_line: line } : { bucket }),
     onMutate: async ({ txnId, bucket, line }) => {
       await qc.cancelQueries({ queryKey: ["biztxns", entity.id] });
       const prev = qc.getQueriesData<TxnList>(
         { queryKey: ["biztxns", entity.id] });
       const flip = (rows: BizTxn[]) => rows.map((x) =>
         x.id === txnId ? { ...x, bucket, effective_bucket: bucket,
-                           ...(line ? { sched_c_line: line } : {}) } : x);
+                           ...(line !== undefined
+                             ? { sched_c_line: line } : {}) } : x);
       // the prefix holds both a year's list and the paged 'all' view
       patchQueries<TxnList | InfiniteData<TxnList>>(
         qc, ["biztxns", entity.id], (o) => "pages" in o
@@ -1043,26 +1050,47 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
                   ))}
                 </View>
               )}
-              {lineFor === x.id && !ro && bizNeedsLine(x) && (
+              {lineFor === x.id && !ro && lineEditable(x) && (
                 <View style={{ flexDirection: "row", flexWrap: "wrap",
                                gap: 4, marginTop: 4 }}>
                   {(lineList.data?.lines ?? []).map((ln) => (
-                    <Pressable key={ln} style={s.chip}
+                    <Pressable key={ln}
+                               style={[s.chip,
+                                 x.sched_c_line === ln && s.chipOn]}
                                disabled={classify.isPending
                                  && classify.variables?.txnId === x.id}
                                onPress={() => { setLineFor(null);
-                                 classify.mutate({ txnId: x.id,
-                                   bucket: x.bucket ?? "operating",
-                                   line: ln }); }}>
+                                 if (ln !== x.sched_c_line)
+                                   classify.mutate({ txnId: x.id,
+                                     bucket: x.bucket ?? "operating",
+                                     line: ln }); }}>
                       <Text style={{ color: C.mut, fontSize: 11 }}>
                         {ln}
                       </Text>
                     </Pressable>
                   ))}
+                  {x.sched_c_line ? (
+                    <Pressable style={s.chip}
+                               disabled={classify.isPending
+                                 && classify.variables?.txnId === x.id}
+                               onPress={() => { setLineFor(null);
+                                 classify.mutate({ txnId: x.id,
+                                   bucket: x.bucket ?? "operating",
+                                   line: null }); }}>
+                      <Text style={{ color: C.bad, fontSize: 11 }}>
+                        clear line
+                      </Text>
+                    </Pressable>
+                  ) : null}
                 </View>
               )}
+              {!ro && x.sched_c_line ? (
+                <Text style={s.mut} numberOfLines={1}>
+                  {x.sched_c_line}
+                </Text>
+              ) : null}
             </View>
-            {!ro && bizNeedsLine(x) && (
+            {!ro && lineEditable(x) && (
               <Text style={{ color: C.accent, fontSize: 12, padding: 4 }}
                     onPress={() => setLineFor(
                       lineFor === x.id ? null : x.id)}>

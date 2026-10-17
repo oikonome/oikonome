@@ -7,7 +7,8 @@ import { useEffect, useState } from "react";
 import { Linking, Platform, Pressable, StyleSheet, Text,
          TextInput, View } from "react-native";
 
-import { abandonMintGrant, ApiError, errText, getVerifiedServerUrl,
+import { abandonMintGrant, ApiError, getVerifiedServerUrl,
+         signInErrText,
          loginAndMintDevice, mintDeviceWithGrant, requestUnlock,
          PINNED_SERVER_URL } from "../lib/api";
 import { deviceLimitRetry, mintGrantRefused,
@@ -158,6 +159,11 @@ export default function Login() {
       if (e instanceof ApiError && e.status === 404) {
         setErr("This server doesn't offer passkey sign-in. Use your "
                + "password.");
+      } else if (e instanceof ApiError
+                 && (e.status === 503 || e.restarting)) {
+        // a 502/504 from the proxy mid-restart is the same wait, not a
+        // failed passkey (the web login says the restarting line too)
+        setErr(signInErrText(e));
       } else if (e instanceof PasskeySheetError) {
         // the platform refused before any key was used — say what it said,
         // because a bare "didn't work" gives the person nothing to act on
@@ -211,7 +217,8 @@ export default function Login() {
             + "yourself a sign-in link below: open it, then sign in here "
             + "as usual.");
       } else {
-        setErr(errText(e));
+        // a 503 says "busy", never the raw status or a wrong password
+        setErr(signInErrText(e));
       }
     } finally {
       setBusy(false);
@@ -267,7 +274,7 @@ export default function Login() {
       } else {
         // the grant may still be good (a dropped connection): the picker
         // stays, and its Cancel closes the session
-        setErr(errText(e));
+        setErr(signInErrText(e));
       }
     } finally {
       setBusy(false);
@@ -355,7 +362,7 @@ export default function Login() {
                                 + "usual — the link itself does not sign "
                                 + "you in.");
                        })
-                       .catch((e) => setErr(errText(e)))
+                       .catch((e) => setErr(signInErrText(e)))
                        .finally(() => setBusy(false));
                    }}>
           <Text style={s.link}>

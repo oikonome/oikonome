@@ -10,8 +10,10 @@ import Sheet from "../../components/sheet";
 import CalendarSection from "../../components/calendar-section";
 import StaleBanner from "../../components/stale-banner";
 import { Card, H, HelpLink, KV, Meter, Pill } from "../../components/ui";
-import { ApiError, errText, Bill, BillsData, Proposal } from "../../lib/api";
-import { patchDismissedHint, patchList, removeFromList } from "../../lib/cache";
+import { ApiError, errText, Bill, BillsData, Proposal, SettingsView }
+  from "../../lib/api";
+import { patchDismissedHint, patchList, patchQuery, removeFromList,
+         saveSettings } from "../../lib/cache";
 import { useRouter, useScrollToTop } from "expo-router";
 import { useMemo, useRef, useState } from "react";
 
@@ -30,9 +32,10 @@ export const ymLabel = (ym: string) => {
   const [y, m] = ym.split("-").map(Number);
   return new Date(y, m - 1, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" });
 };
-import { useViewer } from "../../lib/viewer";
+import { useOwner, useViewer } from "../../lib/viewer";
 import { C, mmddyy, money } from "../../lib/theme";
-import { catLabel, filterCategories, missedBillPill,
+import { ADD_CADENCES, CUSTOM_UNITS, catLabel, customCadence, customMax,
+         filterCategories, missedBillPill,
          proposalSuperseded } from "../../lib/pure";
 
 // the web row's status column, ported whole: a quiet row IS the ✓ —
@@ -229,6 +232,65 @@ function cadenceGroup(b: Bill): string {
   return named[c] ?? "One-time / other";
 }
 
+// The nightly finder's on/off (the web Bills page's switch, same words).
+// Choosing "I'll enter them myself" in the wizard turns it off; this is
+// the one place to turn it back on, so it sits beside the Find button.
+// The setting is the owner's (the server refuses anyone else with a 403),
+// so everyone else reads where it stands instead of a switch that snaps
+// back.
+function NightlyFinderSwitch({ onError }: { onError: (m: string) => void }) {
+  const owner = useOwner();
+  const { client } = useSession();
+  const qc = useQueryClient();
+  const settings = useQuery({ queryKey: ["settings"],
+    queryFn: () => client!.settingsFull(), enabled: !!client });
+  const save = useMutation({
+    mutationFn: (on: boolean) =>
+      saveSettings(qc, client!, { bill_detection_auto: on }),
+    // the switch flips on the tap; saveSettings then seeds the cache with
+    // the server's full view, and a failed write refetches the stored one
+    onMutate: (on) => patchQuery<SettingsView>(qc, ["settings"],
+                                               { bill_detection_auto: on }),
+    onError: (e) => {
+      onError(errText(e));
+      qc.invalidateQueries({ queryKey: ["settings"] });
+    },
+  });
+  // absent means on — only an explicit false stops it
+  const on = settings.data ? settings.data.bill_detection_auto !== false
+    : true;
+  if (!owner)
+    return settings.data ? (
+      <View style={{ marginHorizontal: 12, marginTop: 8 }}>
+        <Text style={{ color: C.text, fontSize: 14 }}>
+          Nightly search for new bills and paychecks: {on ? "on" : "off"}
+        </Text>
+        <Text style={[s.mut, { marginTop: 2 }]}>
+          the household owner sets this
+        </Text>
+      </View>
+    ) : null;
+  return (
+    <View style={{ marginHorizontal: 12, marginTop: 8 }}>
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+        <Text style={{ color: C.text, fontSize: 14, flex: 1 }}>
+          Look for new bills and paychecks every night
+        </Text>
+        <Switch value={on} disabled={!settings.data || save.isPending}
+                onValueChange={(v) => save.mutate(v)}
+                accessibilityLabel="Look for new bills and paychecks every night"
+                trackColor={{ true: C.accent, false: C.hover }}
+                thumbColor={C.text} />
+      </View>
+      <Text style={[s.mut, { marginTop: 2 }]}>
+        Off: the nightly search proposes nothing new; drift, due dates and
+        change/stopped offers for your existing bills still run, and Find
+        bills & income always works.
+      </Text>
+    </View>
+  );
+}
+
 export default function Bills() {
   const { client } = useSession();
   // re-tapping the active tab scrolls back to the top
@@ -281,7 +343,9 @@ export default function Bills() {
       const gone = proposalSuperseded(r);
       setNotice(gone ? `${r.payee} is already tracked — the offer was withdrawn.`
         : v.action === "approve"
-        ? "Approved — the bill is live." : "Proposal rejected.");
+        // the approve changed something the person set (a pin cleared)
+        ? "Approved — the bill is live." + (r.note ? ` ${r.note}` : "")
+        : "Proposal rejected.");
       dropProposal(v.pid);
       if (v.action === "approve" && !gone) {
         refetchSchedule();
@@ -306,9 +370,12 @@ export default function Bills() {
   const approveAll = useMutation({
     mutationFn: () => client!.billsApproveAll(),
     onSuccess: (r) => {
-      setNotice(r.failed.length
+      setNotice((r.failed.length
         ? `Approved ${r.approved}; ${r.failed.length} stayed pending.`
-        : `Approved all ${r.approved} proposal${r.approved === 1 ? "" : "s"}.`);
+        : `Approved all ${r.approved} proposal${r.approved === 1 ? "" : "s"}.`)
+        // an approve that cleared a pin says so, per bill
+        + (r.notes?.length
+          ? ` — ${r.notes.map((n) => `${n.payee}: ${n.note}`).join("; ")}` : ""));
       // only what stayed pending is still a proposal
       qc.setQueryData<BillsData>(["bills"], (old) => old && {
         ...old,
@@ -529,6 +596,7 @@ export default function Bills() {
         </Pressable>
       </View>
       )}
+      <NightlyFinderSwitch onError={setNotice} />
       {detect.data && (() => {
         const nInc = detect.data.proposed_income ?? 0;
         const nBill = Math.max(0, (detect.data.proposed_add ?? 0) - nInc);
@@ -660,7 +728,8 @@ export default function Bills() {
                       red, add is green, drift stays amber */}
                   {p.kind ? (
                     <Pill text={p.kind === "attach" ? "fee"
-                            : p.kind === "merchant" ? "add merchant" : p.kind}
+                            : p.kind === "merchant" ? "add merchant"
+                            : p.kind === "amount_change" ? "amount change" : p.kind}
                           tone={p.kind === "remove" ? "bad"
                             : p.kind === "add" ? "good" : "warn"} />
                   ) : null}
@@ -885,8 +954,7 @@ function AddBillFields({ pending, error, archived, onAdd, onCancel }: {
   const [nAmount, setNAmount] = useState("");
   const [nCadence, setNCadence] = useState("MONTHLY:1");
   const [nCustomN, setNCustomN] = useState("2");
-  const [nCustomUnit, setNCustomUnit] =
-    useState<"MONTHLY" | "YEARLY">("YEARLY");
+  const [nCustomUnit, setNCustomUnit] = useState("YEARLY");
   const [nDue, setNDue] = useState("");
   const [nIncome, setNIncome] = useState(false);
   const [nPinned, setNPinned] = useState(false);
@@ -896,8 +964,7 @@ function AddBillFields({ pending, error, archived, onAdd, onCancel }: {
   const merchants = useQuery({ queryKey: ["merchants"],
     queryFn: () => client!.merchants(), enabled: !!client });
   const effCadence = nCadence === "CUSTOM"
-    ? `${nCustomUnit}:${Math.max(1, parseInt(nCustomN, 10) || 1)}`
-    : nCadence;
+    ? customCadence(nCustomUnit, nCustomN) : nCadence;
   const nIsEnv = effCadence.startsWith("ENVELOPE");
   const form = (): AddBillForm => ({ payee: nPayee, amount: nAmount,
     cadence: effCadence, due: nDue, income: nIncome, pinned: nPinned,
@@ -934,13 +1001,9 @@ function AddBillFields({ pending, error, archived, onAdd, onCancel }: {
       <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
         {/* FREQ:interval values, the same wire format the web
             add-form sends — never the human label. The list is the
-            web's SIMPLE_CADENCES verbatim (+ Custom): no invented
-            options, and daily exists here too. */}
-        {([["DAILY:1", "daily"], ["WEEKLY:1", "weekly"],
-           ["MONTHLY:1", "monthly"], ["YEARLY:1", "yearly"],
-           ["ENVELOPE:1", "envelope (monthly pool)"],
-           ["ENVELOPE:12", "envelope (annual pool)"],
-           ["CUSTOM", "custom interval…"],
+            web's add list (ADD_CADENCES, checked against the web copy)
+            + Custom: no invented options. */}
+        {([...ADD_CADENCES, ["CUSTOM", "custom interval…"],
           ] as [string, string][]).map(([v, l]) => (
           <Pressable key={v}
                      style={[s.chip, nCadence === v && s.chipOn]}
@@ -952,18 +1015,23 @@ function AddBillFields({ pending, error, archived, onAdd, onCancel }: {
       </View>
       {nCadence === "CUSTOM" && (
         <View style={{ flexDirection: "row", alignItems: "center",
-                       gap: 6 }}>
+                       gap: 6,
+                       flexWrap: "wrap" }}>
           <Text style={{ color: C.mut, fontSize: 12 }}>every</Text>
-          <TextInput style={[s.input, { width: 52 }]}
-                     keyboardType="number-pad" value={nCustomN}
-                     onChangeText={setNCustomN} />
-          {(["MONTHLY", "YEARLY"] as const).map((u) => (
+          {/* the cap depends on the unit (about 20 years of it), so the
+              field clamps as it is typed rather than at a fixed length */}
+          <TextInput style={[s.input, { width: 60 }]}
+                     keyboardType="number-pad" value={nCustomN} maxLength={4}
+                     onChangeText={(t) => setNCustomN(
+                       Number(t) > customMax(nCustomUnit)
+                         ? String(customMax(nCustomUnit)) : t)} />
+          {CUSTOM_UNITS.map(([u, label]) => (
             <Pressable key={u}
                        style={[s.chip, nCustomUnit === u && s.chipOn]}
                        onPress={() => setNCustomUnit(u)}>
               <Text style={{ color: nCustomUnit === u
                                ? C.text : C.mut, fontSize: 12 }}>
-                {u === "MONTHLY" ? "month(s)" : "year(s)"}
+                {label}
               </Text>
             </Pressable>
           ))}

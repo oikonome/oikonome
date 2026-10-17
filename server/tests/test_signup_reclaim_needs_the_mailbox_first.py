@@ -73,7 +73,12 @@ class ReclaimTests(unittest.TestCase):
         for p in (self._rmail, self._vmail, self._dev, self._env):
             p.stop()
 
-    def _signup(self, email, invite="", ref="", password=PW):
+    def _signup(self, email, invite="", ref="", password=None):
+        # each signup is a different person unless a test says otherwise:
+        # the same address AND password minutes apart is the first
+        # person repeating their own form, which signs them in
+        if password is None:
+            password = f"{PW}-{uuid.uuid4().hex[:8]}"
         return TestClient(self.appmod.app).post(
             "/api/signup", data={"email": email, "password": password,
                                  "invite": invite, "ref": ref})
@@ -169,6 +174,30 @@ class ReclaimTests(unittest.TestCase):
         _, again = self._finish(token)
         self.assertEqual(again.status_code, 400)
 
+    def test_spent_revert_links_alone_leave_a_household_reclaimable(self):
+        """An undo link for a login-email change is credential bookkeeping
+        about the address, not anything the household made. A shell whose
+        only rows are spent links still reads as empty, so the replace
+        road stays open to whoever proves the mailbox."""
+        from oikonome.auth import email_revert
+        email = f"rvshell-{uuid.uuid4().hex[:8]}@x.dev"
+        self.assertEqual(self._signup(email).status_code, 200)
+        sq = self._user(email)
+        admin = tenancy.admin_connect()
+        try:
+            gone = f"rvshell-old-{uuid.uuid4().hex[:8]}@x.dev"
+            token = email_revert.create(admin, sq["id"], gone, email)
+            row = email_revert.lookup(admin, token)
+            self.assertTrue(email_revert.spend(admin, row["id"]))
+            admin.commit()
+        finally:
+            admin.close()
+        self.assertEqual(self._signup(email, password="owner-real-password")
+                         .status_code, 409)
+        _c, r = self._finish(self.sent[-1][1])
+        self.assertEqual(r.status_code, 303, r.text)
+        self.assertNotEqual(self._user(email)["tenant_id"], sq["tenant_id"])
+
     def test_the_click_moves_a_member_squat_out_of_the_strangers_household(self):
         host = f"host-{uuid.uuid4().hex[:8]}@x.dev"
         victim = f"vic-{uuid.uuid4().hex[:8]}@x.dev"
@@ -200,6 +229,66 @@ class ReclaimTests(unittest.TestCase):
         self.assertEqual(n, 1)                             # host intact
 
 
+
+    def test_revert_link_dies_when_the_account_moves_household(self):
+        """A member who changed their address onto the victim's holds a
+        link back to the address they left. The reclaim moves that row
+        into a fresh household on the victim's credentials; a link minted
+        before the move must not hand that household to the old inbox."""
+        from oikonome.auth import email_revert
+        host = f"rvhost-{uuid.uuid4().hex[:8]}@x.dev"
+        victim = f"rvvic-{uuid.uuid4().hex[:8]}@x.dev"
+        attacker = f"rvatk-{uuid.uuid4().hex[:8]}@x.dev"
+        self.assertEqual(self._signup(host).status_code, 200)
+        h = self._user(host)
+        admin = tenancy.admin_connect()
+        try:
+            uid = admin.execute(
+                "INSERT INTO users (tenant_id, email, password_hash, role, "
+                "verified_at) VALUES (%s, %s, 'x', 'member', now()) "
+                "RETURNING id", (h["tenant_id"], attacker)).fetchone()["id"]
+            # the member's own change onto the victim's address, as the
+            # door records it: unverified on hosted, a link to the old one
+            admin.execute("UPDATE users SET email=%s, verified_at=NULL "
+                          "WHERE id=%s", (victim, uid))
+            revert = email_revert.create(admin, uid, attacker, victim)
+            admin.commit()
+        finally:
+            admin.close()
+        self.assertEqual(self._signup(victim).status_code, 409)
+        _c, r = self._finish(self.sent[-1][1])
+        self.assertEqual(r.status_code, 303, r.text)
+        moved = self._user(victim)
+        self.assertEqual(moved["id"], uid)
+        self.assertNotEqual(moved["tenant_id"], h["tenant_id"])
+        with mock.patch.object(self.appmod, "_deliver_reset"), \
+                mock.patch.object(self.appmod,
+                                  "_deliver_email_reverted_notice"):
+            rv = TestClient(self.appmod.app).post(
+                "/account/email-revert", data={"token": revert})
+        self.assertEqual(rv.status_code, 400, rv.text)
+        self.assertEqual(self._user(victim)["id"], uid)
+        self.assertIsNone(self._user(attacker))
+
+    def test_a_revert_link_needs_the_household_it_was_minted_in(self):
+        """Bound to the tenant as well as the user: a row re-parented by
+        any road, not only the reclaim, leaves its old links dead."""
+        from oikonome.auth import email_revert
+        a = f"rvt-a-{uuid.uuid4().hex[:8]}@x.dev"
+        b = f"rvt-b-{uuid.uuid4().hex[:8]}@x.dev"
+        self.assertEqual(self._signup(a).status_code, 200)
+        self.assertEqual(self._signup(b).status_code, 200)
+        ua, ub = self._user(a), self._user(b)
+        admin = tenancy.admin_connect()
+        try:
+            gone = f"rvt-old-{uuid.uuid4().hex[:8]}@x.dev"
+            revert = email_revert.create(admin, ua["id"], gone, a)
+            admin.execute("UPDATE users SET tenant_id=%s, role='member' "
+                          "WHERE id=%s", (ub["tenant_id"], ua["id"]))
+            admin.commit()
+            self.assertIsNone(email_revert.lookup(admin, revert))
+        finally:
+            admin.close()
 
     def test_a_move_out_at_the_intake_cap_is_refused_and_the_link_kept(self):
         """Moving a member out makes a household that did not exist, so it

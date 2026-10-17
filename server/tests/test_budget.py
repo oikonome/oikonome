@@ -9,7 +9,8 @@ import unittest
 
 from oikonome.engine import budget
 
-from .util import TODAY, add_bill, add_txn, make_db, write_config
+from .util import (TODAY, add_bill, add_ledger_history, add_txn, make_db,
+                   write_config)
 
 
 class BudgetBase(unittest.TestCase):
@@ -272,6 +273,7 @@ class TestVerdict(BudgetBase):
                      dynamic_variable_budget=False)
         # TODAY is the 15th of a 31-day month: 14 days elapsed
         pace = round(2000 * 14 / 31, 2)          # 903.23
+        add_ledger_history(self.conn, TODAY)
         add_txn(self.conn, TODAY - dt.timedelta(days=1), pace, "TARGET")
         self.conn.commit()
         st = self.status()
@@ -482,6 +484,7 @@ class WhyHeadlineNeverContradictsTheVerdict(unittest.TestCase):
         # dated yesterday: spend on the day in progress earns that day's
         # allowance into expected, which would move the fixture's bars
         spent_on = today - dt.timedelta(days=1)
+        add_ledger_history(self.conn, today)
         add_txn(self.conn, spent_on, spend, "GROCER A",
                 primary="FOOD_AND_DRINK")
         add_txn(self.conn, spent_on, spend, "SHOP B",

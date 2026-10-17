@@ -76,6 +76,67 @@ relay, extra email recipients, the AI endpoint) and holds new bank links
 on the household's own Plaid or MX keys the same way. Plan to re-add passkeys
 and sign phones back in right after.
 
+## Security notices
+
+Whenever a sign-in credential changes, the account is told by email at
+its own address, so a change made from a stolen session is never silent:
+
+- **Password changed**, **authenticator app set up, replaced or turned
+  off**, **passkey added or removed**, **recovery codes regenerated** — a
+  short notice saying what changed. It carries no link. If it was you,
+  there is nothing to do; if it was not, reset your password from the
+  sign-in page straight away and write to the instance's support address
+  (the mail names it when one is set; otherwise tell whoever runs the
+  instance). The same short notice can also arrive as a push notification
+  on your signed-in phone, and as a text to the household's confirmed
+  number when your account is the household's only owner.
+- **Changing your sign-in email** (hosted) — the new address is only
+  *asked for* at first: the account keeps signing in with the old one,
+  Settings shows the new one as pending, and a link goes to the new
+  address. Open it and press **Confirm the new email** on the page it
+  opens; only then does the account move. The link works for **24
+  hours** and **once**, and stops working if you ask for a different
+  address, withdraw the change, sign out the browser or phone you asked
+  from, or reset your password. If someone else signs up with that
+  address first, it is theirs and the link says so. The sign-outs, token
+  revocations and passkey removals that come with an email change (see
+  Gotchas) happen when you ask, not when you confirm.
+  If the mail does not arrive, check that inbox's spam folder, then ask
+  for the **same** address again (or call `POST /api/email/change/resend`
+  from the browser or app that asked): a fresh link goes out, the earlier
+  one stops working, and nothing is signed out a second time. Confirmation
+  mail is limited — five a day per account, and an address that several
+  other accounts have just had mailed waits up to an hour (five in a day).
+  When a limit holds a mail back you are told so and how long to wait,
+  and the refusal says none was sent. Nothing is kept as a pending change
+  — Settings shows none — and nothing is signed out; once the wait is
+  over, ask for the address again (which asks you to confirm it is you).
+- **Sign-in email changed** — the mail goes to the address the account
+  just *left*, because that inbox is the one place someone who moved your
+  account cannot silence. It shows the new address only partly (for
+  example `j***@example.com`), enough to recognise the change. If the old
+  address was confirmed, the mail also carries a link to **put the
+  account back on this address**. It works for **72 hours** and **once**.
+  The link needs the instance's public address to be configured; without
+  it the mail still arrives, and asks you to get the link from whoever
+  runs the instance.
+  Opening it shows a confirmation page; pressing the button there moves
+  the sign-in email back to the old address, **signs out every browser,
+  phone and tablet**, revokes your script tokens and browser
+  notifications, pauses webhooks, and **mails a password reset** to the
+  old address. Finish that reset to take the account back: it is the
+  reset, not the link, that removes anything a stranger enrolled, so an
+  account with a second factor still asks for a recovery code there. The
+  address the account was moved to is told it was moved back.
+
+An old address that was never confirmed is still told about the change,
+but gets no link — an address typed wrong at sign-up must not be able to
+take the account. The link also stops working if the account has since
+moved to another household, if a newer change from the same address
+replaced it, or if another account now uses that address (then the page
+says so; ask whoever runs the instance). If you changed the email
+yourself, ignore the mail — the link simply expires.
+
 ## The step-up rule
 
 Every security-posture change — changing the password or email, turning
@@ -126,16 +187,23 @@ with each change keep working.
 **Enable 2FA** shows a QR code to scan into an authenticator app (with the
 secret spelled out for manual entry); enter the code it produces to confirm. Your existing sign-in keeps working
 until you confirm — enrollment can't half-enable and lock you out.
-Confirming signs out every other session. To replace the authenticator,
-turn 2FA off (password + current code) and enroll again — there is no
-in-place re-enroll button.
+Confirming signs out every other session.
+
+**Replace authenticator** (under the 2FA card — for a new phone or a
+lost one) goes through the confirm-it's-you sheet first: your password
+and a code from the old authenticator, or — if it's gone — **Lost your
+authenticator?** there, which takes the password plus a recovery code.
+Then scan the new QR code and confirm with a code from the new app. From
+that moment the old authenticator's codes stop working, and the same
+clean-up as turning 2FA on runs: every other session is signed out and
+the rest of the credential rotation below applies.
 
 **Turning 2FA off requires both** your password and a live code — it's a
 downgrade, so it's held to the strictest proof — and also signs out
 every other session.
 
-Turning 2FA on or off (and adding your first passkey) is a credential
-rotation too: other signed-in phones are signed out, script tokens are
+Turning 2FA on or off, replacing the authenticator (and adding your
+first passkey) is a credential rotation too: other signed-in phones are signed out, script tokens are
 revoked, unspent reset links and pending invitations are cancelled,
 webhooks are paused, browser notifications stop, and an owner's change
 removes the members its invitations brought in during the last 7 days,
@@ -216,7 +284,10 @@ TOTP and the section is absent there. In the phone apps, a passkey
 additionally needs the app build to list the server's domain.
 **Add a passkey** confirms your password, prompts your device, and lets
 you name the key; each entry shows when it was created and last used.
-Removing one is a step-up action like any other.
+Removing one is a step-up action like any other, and it ends whatever
+that key signed in — the browser sessions and the phones whose sign-in
+came from it. If it is the passkey you are signed in with, you are
+signed out and told why; sign in again with what you have left.
 
 An account whose only strong factor is a passkey **cannot sign in with
 the password alone** — sign in with the passkey, or a recovery code.

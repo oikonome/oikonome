@@ -40,6 +40,12 @@ class _Base(unittest.TestCase):
         self.email = f"wps-{uuid.uuid4().hex[:8]}@x.dev"
         admin = tenancy.admin_connect()
         try:
+            # The instance signing key is a singleton in the shared test
+            # database; a module that ran under another master key leaves
+            # it encrypted under a key this process never sees, and every
+            # send then fails to sign. Drop it so the first send mints one
+            # under this process's own key, whatever ran before.
+            admin.execute("DELETE FROM push_vapid")
             self.tid = tenancy.create_tenant(admin, self.email)
             self.uid = admin.execute(
                 "INSERT INTO users (tenant_id, email, password_hash, "

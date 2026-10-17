@@ -99,7 +99,14 @@ def lookup(conn, token: str) -> dict | None:
            FROM device_tokens d JOIN users u ON u.id = d.user_id
                 JOIN tenants t ON t.id = d.tenant_id
            WHERE d.token_hash = %s AND d.revoked_at IS NULL
-                 AND d.expires_at > now()""", (_h(token),)).fetchone()
+                 AND d.expires_at > now()
+                 -- the token speaks for the household it was minted in,
+                 -- and only while its holder still belongs to it: a
+                 -- person moved to another household (or whose row was
+                 -- re-pointed) must not carry this token's tenant with
+                 -- them. Every path that moves users.tenant_id revokes
+                 -- tokens today; this keeps that true if one forgets.
+                 AND u.tenant_id = d.tenant_id""", (_h(token),)).fetchone()
     if row is not None:
         conn.execute(
             """UPDATE device_tokens SET last_seen = now(),
@@ -175,11 +182,17 @@ def push_targets(conn, tenant_id, user_id=None) -> list[dict]:
     the refusal existed would otherwise keep carrying the household's
     notices to whichever visitor's phone planted it. The condition is the
     same column demoguard.is_shared_login reads, so the two cannot drift
-    on who that login is."""
+    on who that login is.
+
+    A device whose holder has since moved to another household is not a
+    target either — the same household test `lookup` applies before the
+    token may act. The phone belongs to someone who is no longer in this
+    household, so its notices must not follow them."""
     return conn.execute(
         """SELECT d.push_token, d.push_platform
            FROM device_tokens d JOIN users u ON u.id = d.user_id
-           WHERE d.tenant_id = %s AND d.revoked_at IS NULL
+           WHERE d.tenant_id = %s AND u.tenant_id = d.tenant_id
+                 AND d.revoked_at IS NULL
                  AND d.expires_at > now() AND d.push_token IS NOT NULL
                  AND d.push_dead_at IS NULL
                  AND NOT u.second_factor_waived

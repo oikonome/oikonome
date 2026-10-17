@@ -1,6 +1,6 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useState } from "react";
-import { api } from "../api/client";
+import { api, errText } from "../api/client";
 
 /** public claim page for a one-time family invite link
  *  (/app/invite?token=…). Renders pre-auth, like Login. */
@@ -15,7 +15,7 @@ export default function InviteClaim({ onDone }: { onDone: () => void }) {
   // on hosted the link is mailed there and nowhere else, which is the only
   // mailbox proof this pre-auth form has. Show the address and lock the
   // field so the rule the server enforces is the one the page presents.
-  const bound = (peek.data as { email?: string } | undefined)?.email ?? "";
+  const bound = peek.data?.email ?? "";
   const claim = useMutation({
     mutationFn: () => api.inviteClaim(token, bound || email, password),
     onSuccess: onDone,
@@ -24,6 +24,22 @@ export default function InviteClaim({ onDone }: { onDone: () => void }) {
     <div className="centered"><div className="card"
       style={{ maxWidth: "24rem", width: "100%" }}>{children}</div></div>
   );
+  // Only the server's 404 says the link itself is dead. Anything else (a
+  // dropped connection, a 502 while the instance restarts) says nothing
+  // about the invite, and sending the invitee back to the owner for a
+  // fresh link they do not need is the wrong advice.
+  const peekDead = peek.isError
+    && /^404:/.test(peek.error instanceof Error ? peek.error.message : "");
+  if (peek.isError && !peekDead)
+    return box(<>
+      <h1>Couldn't check your invite</h1>
+      <p className="mut">The server didn't answer just now. Your link may
+        still be good — try again in a moment.</p>
+      <button className="pri" disabled={peek.isFetching}
+              onClick={() => peek.refetch()}>
+        {peek.isFetching ? "checking…" : "Try again"}</button>
+    </>);
+  // any error still standing here is the 404
   if (!token || peek.isError)
     return box(<>
       <h1>Invite not valid</h1>
@@ -59,7 +75,7 @@ export default function InviteClaim({ onDone }: { onDone: () => void }) {
       {field("Password (10+ characters)", "password", password, setPassword,
              { minLength: 10 })}
       {claim.isError && (
-        <p style={{ color: "var(--red)" }}>{String(claim.error)}</p>
+        <p style={{ color: "var(--red)" }}>{errText(claim.error)}</p>
       )}
       <button className="pri" disabled={claim.isPending}>
         {claim.isPending ? "creating…" : "Create account & sign in"}

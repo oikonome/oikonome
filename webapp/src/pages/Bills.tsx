@@ -6,10 +6,11 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createContext, Fragment, useContext, useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
-import { api, errText, mmdd, money as money$, toast, type Bill, type BillsData, catLabel, proposalSuperseded } from "../api/client";
-import { patchList, removeFromList } from "../api/cache";
-import { canEdit } from "../role";
-import { cadenceChoices } from "../cadence";
+import { api, errText, mmdd, money as money$, toast, type Bill, type BillsData, type Settings, catLabel, proposalSuperseded } from "../api/client";
+import { patchList, patchQuery, removeFromList, saveSettings } from "../api/cache";
+import { canEdit, isOwner } from "../role";
+import { ADD_CADENCES, CUSTOM_UNITS, cadenceChoices, customCadence, customMax }
+  from "../cadence";
 const money = (v: number | null | undefined) => money$(v, true);  // cents on transaction/recurring surfaces
 
 // ---- stepping back through the months ----
@@ -45,16 +46,13 @@ const GROUPS: [string, string][] = [
 const groupOf = (cadence: string) =>
   GROUPS.find(([v]) => v === cadence)?.[1] ?? "One-time / other";
 
-// The ADD pickers stay short: the common cadences + the
-// envelopes; anything unusual (every 2 weeks/3 months/2 years…) is one
+// The ADD pickers stay short: the common cadences, one-time and the
+// envelopes; anything unusual (every 2 weeks/14 days/3 months…) is one
 // "Custom interval…" click. GROUPS above still labels + groups every cadence,
 // and inline EDIT keeps the full server list plus the bill's own interval
 // when that list lacks it, so an existing custom bill can always keep it.
-export const SIMPLE_CADENCES: [string, string][] = [
-  ["DAILY:1", "daily"], ["WEEKLY:1", "weekly"], ["MONTHLY:1", "monthly"],
-  ["YEARLY:1", "yearly"], ["ENVELOPE:1", "envelope (monthly pool)"],
-  ["ENVELOPE:12", "envelope (annual pool)"],
-];
+// The list lives in ../cadence so the phone's copy is checked against it.
+export const SIMPLE_CADENCES: [string, string][] = ADD_CADENCES;
 const groupRank = (name: string) => {
   const i = GROUPS.findIndex(([, g]) => g === name);
   return i === -1 ? 90 : i;
@@ -126,6 +124,53 @@ const LINKLIKE = { padding: 0, background: "none", border: "none",
 const FLAGBTN = { padding: ".08rem .3rem", fontSize: 11, border: "none",
                   background: "none", color: "var(--mut)",
                   cursor: "pointer" } as const;
+
+// The nightly finder's on/off. Choosing "I'll enter them myself" in the
+// wizard turns it off; this is the one place to turn it back on, so it
+// sits beside the button that runs the same search by hand.
+function NightlyFinderSwitch() {
+  const qc = useQueryClient();
+  const s = useQuery({ queryKey: ["settings"], queryFn: api.settings });
+  const save = useMutation({
+    mutationFn: (on: boolean) => saveSettings(qc, { bill_detection_auto: on }),
+    // the box flips on the click; saveSettings then seeds the cache with
+    // the server's full view, and a failed write refetches the stored one
+    onMutate: (on) => patchQuery<Settings>(qc, ["settings"],
+                                           { bill_detection_auto: on }),
+    onError: (e) => {
+      toast(errText(e));
+      qc.invalidateQueries({ queryKey: ["settings"] });
+    },
+  });
+  // the switch is the household's, and the server refuses anyone but the
+  // owner a change — a member or viewer reads where it stands instead of
+  // flipping a box that only answers 403
+  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
+  // absent or null means on — only an explicit false stops it
+  const on = s.data ? s.data.bill_detection_auto !== false : true;
+  if (!isOwner(me))
+    return !s.data ? null : (
+      <div className="sub" style={{ fontSize: 12, marginTop: ".45rem" }}>
+        Nightly search for new bills and paychecks:{" "}
+        <b style={{ color: "var(--ink)" }}>{on ? "on" : "off"}</b> — the
+        household owner sets this.</div>
+    );
+  return (
+    <div style={{ marginTop: ".45rem" }}>
+      <label style={{ display: "inline-flex", gap: ".4rem",
+                      alignItems: "center", cursor: "pointer" }}>
+        <input type="checkbox" checked={on}
+               disabled={!s.data || save.isPending}
+               onChange={(e) => save.mutate(e.target.checked)} />
+        Look for new bills and paychecks every night
+      </label>
+      <div className="sub" style={{ fontSize: 12, marginTop: ".1rem" }}>
+        Off: the nightly search proposes nothing new; drift, due dates and
+        change/stopped offers for your existing bills still run, and Find
+        bills &amp; income always works.</div>
+    </div>
+  );
+}
 
 // autoDetect (wizard): run the finder on mount so the step opens with
 // proposals already on screen — confirm, don't hunt for a button
@@ -224,7 +269,8 @@ export default function Bills({ autoDetect = false }:
     onSuccess: (r, v) => {
       const gone = proposalSuperseded(r);
       toast(gone ? `${r.payee} is already tracked — the offer was withdrawn`
-        : `${v.action === "approve" ? "Approved" : "Rejected"}: ${r.payee}`);
+        : `${v.action === "approve" ? "Approved" : "Rejected"}: ${r.payee}`
+          + (r.note ? ` — ${r.note}` : ""));
       // drop the decided proposal from the cached list NOW: the server has
       // already committed it, and waiting for the refetch to prove it left
       // the row sitting there through every other query this triggers.
@@ -244,10 +290,13 @@ export default function Bills({ autoDetect = false }:
   const approveAll = useMutation({
     mutationFn: api.billsApproveAll,
     onSuccess: (r) => {
-      toast(r.failed.length
+      toast((r.failed.length
         ? `Approved ${r.approved}; ${r.failed.length} could not be applied `
           + `and stayed pending (${r.failed.map((f) => f.error).join("; ")})`
-        : `Approved all ${r.approved} proposal${r.approved === 1 ? "" : "s"}`);
+        : `Approved all ${r.approved} proposal${r.approved === 1 ? "" : "s"}`)
+        // an approve that cleared a pin says so, per bill
+        + (r.notes?.length
+          ? ` — ${r.notes.map((n) => `${n.payee}: ${n.note}`).join("; ")}` : ""));
       refetchAll();
     },
     onError: (e) => toast(errText(e)),
@@ -527,6 +576,9 @@ export default function Bills({ autoDetect = false }:
             )}
           </span>
         </div>
+        {/* a viewer reads the finder's state like the rest of the page;
+            only the owner gets the switch */}
+        <NightlyFinderSwitch />
         <div className="sub" style={{ marginTop: ".2rem", display: "flex",
                                       gap: ".9rem", flexWrap: "wrap",
                                       alignItems: "center" }}>
@@ -1100,7 +1152,7 @@ function BillRows({ b, isEnv, cols, editing, mayEdit, onEdit,
 
 // Manual add: create a bill by hand — for anything the
 // detector won't find, including unusual cadences. "Custom…" builds an
-// arbitrary FREQ:interval (every X months / years); the engine already
+// arbitrary FREQ:interval (every X days / weeks / months / years); the engine already
 // schedules + budgets any interval (budget._occurrences_in_month honors it).
 /** The payee an add was refused over because an archived bill holds the
  *  name, or null for any other failure. */
@@ -1133,9 +1185,7 @@ function AddBillForm({ onCancel, onSaved }:
   // the add hit an archived bill of the same name: offer to bring it back
   // with the values entered here
   const [archived, setArchived] = useState(false);
-  const cadence = mode === "CUSTOM"
-    ? `${customUnit}:${Math.max(1, parseInt(customN, 10) || 1)}`
-    : mode;
+  const cadence = mode === "CUSTOM" ? customCadence(customUnit, customN) : mode;
   const isEnv = cadence.startsWith("ENVELOPE");
   const save = useMutation({
     mutationFn: (restore: boolean) => api.billsSave({
@@ -1184,13 +1234,14 @@ function AddBillForm({ onCancel, onSaved }:
           <option value="CUSTOM">Custom interval…</option>
         </select>
         {mode === "CUSTOM" && (
-          <label className="mut">every <input type="number" min="1"
+          <label className="mut">every <input type="number" min="1" max={customMax(customUnit)}
                  value={customN} style={{ width: "3.5rem" }}
                  onChange={(e) => setCustomN(e.target.value)} />
             <select value={customUnit}
                     onChange={(e) => setCustomUnit(e.target.value)}>
-              <option value="MONTHLY">month(s)</option>
-              <option value="YEARLY">year(s)</option>
+              {CUSTOM_UNITS.map(([v, label]) => (
+                <option key={v} value={v}>{label}</option>
+              ))}
             </select></label>
         )}
         <label className="mut">next due <input type="date" value={nextDue}

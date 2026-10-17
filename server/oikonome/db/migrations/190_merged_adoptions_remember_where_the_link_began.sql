@@ -1,0 +1,16 @@
+-- A restore merged onto an account the link had already filled records
+-- the day that link's own rows begin.
+--
+-- The reconnect guard matches incoming rows near its cutoff against the
+-- restored ones, a few days either side. For an adoption made at link
+-- time that window past the cutoff is right: nothing on the account is
+-- newer than the restore. For a merge the live lineage starts the day
+-- after the cutoff, so the window would test the link's own first days
+-- against the restored days just before them, and drop a hold's
+-- settlement or a second same-price charge as a copy of a restored row.
+-- The guard reads this column to end the seam the day before it; NULL
+-- (every link-side adoption) keeps the window.
+--
+-- No backfill: an open adoption cannot tell from its row whether it came
+-- from a merge, and it closes within the guard's reconcile window anyway.
+ALTER TABLE account_adoptions ADD COLUMN IF NOT EXISTS live_from DATE;

@@ -112,7 +112,7 @@ class PossessiveNameTests(unittest.TestCase):
 
     def test_the_line_may_still_overrule_a_stray_guess_for_it(self):
         usual = [self._enriched(f"2026-08-{d + 1:02d}", 20.0 + d, f"ph{d}")
-                 for d in range(merchant_identity.ESTABLISHED_ROWS)]
+                 for d in range(3)]
         merchant_identity.resolve(self.conn)
         add_txn(self.conn, "2026-04-14", 7.40, LINE, merchant=STRAY,
                 txn_id="pstray")

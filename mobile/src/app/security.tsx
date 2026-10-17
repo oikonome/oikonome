@@ -14,13 +14,14 @@ import { Alert, Pressable, ScrollView, StyleSheet, Switch, Text,
          TextInput, View } from "react-native";
 import { SvgXml } from "react-native-svg";
 import PullRefresh from "../components/pull-refresh";
+import { VerifyEmailCard } from "../components/verify-email-card";
 
 import { Card, H, Pill, SharedLock } from "../components/ui";
 import { errText, Me, NextCodeNeeded } from "../lib/api";
 import { invalidateAfterRotation, patchList, patchQuery, removeFromList,
          smsPauseNote }
   from "../lib/cache";
-import { inviteOutcome, membersRemovedNote, oneTimeCodeSentence,
+import { inviteOutcome, localDayOf, membersRemovedNote, oneTimeCodeSentence,
          svgFromDataUri, type InviteOutcome } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { C, mmddyy } from "../lib/theme";
@@ -89,12 +90,6 @@ export default function Security() {
   // switched off, each saying why (null = live)
   const lockLogin = useSharedLock("login");
   const lockGrant = useSharedLock("grant");
-  const resend = useMutation({
-    mutationFn: () => client!.verifyResend(),
-    onSuccess: (r) => Alert.alert(r.verified
-      ? "Already verified — reload." : "Verification email sent."),
-    onError: (e) => Alert.alert("Resend failed", explain(e)),
-  });
   return (
     <ScrollView style={s.wrap} contentContainerStyle={{ paddingBottom: 24 }}
       refreshControl={<PullRefresh tintColor={C.accent} colors={[C.accent]}
@@ -118,21 +113,17 @@ export default function Security() {
           next visitor. Explore freely; the data is synthetic.
         </Text>
       )}
-      {me.data?.hosted && me.data.verified === false && (
+      <VerifyEmailCard me={me.data} />
+      {/* reached from the forced-2FA lockout: say where the way out is,
+          since the authenticator card sits below the password and email
+          ones (web: TwoFactorGate) */}
+      {me.data?.needs_2fa && !demo && (
         <Card>
           <Text style={{ color: C.warn, fontSize: 13 }}>
-            Verify your email — we sent a link to {me.data.email}. No
-            email? Check spam, or resend.
+            This server requires two-factor authentication. Set up an
+            authenticator app under Two-factor authentication below —
+            this phone stays signed in.
           </Text>
-          <Pressable style={[s.btn, { alignSelf: "flex-start",
-                                      marginTop: 6 },
-                             resend.isPending && { opacity: 0.5 }]}
-                     disabled={resend.isPending}
-                     onPress={() => resend.mutate()}>
-            <Text style={s.btnText}>
-              {resend.isPending ? "sending…" : "Resend"}
-            </Text>
-          </Pressable>
         </Card>
       )}
       {/* This device's own locks live here with the rest of security,
@@ -179,7 +170,10 @@ export default function Security() {
           <PasswordCard />
           {/* a view-only login cannot change its own address — the server
               403s it, so mirror the web and don't offer the card */}
-          {mayEdit && <EmailCard email={me.data?.email ?? ""} />}
+          {mayEdit && <EmailCard email={me.data?.email ?? ""}
+                                  pending={me.data?.pending_email ?? null}
+                                  pendingUntil={
+                                    me.data?.pending_email_expires_at ?? null} />}
           {me.data?.factor_reset_pending ? (
             <PendingRecoveryCard lands={me.data.factor_reset_pending} />
           ) : null}
@@ -280,7 +274,12 @@ function PasswordCard() {
 }
 
 // ---- change email ----
-function EmailCard({ email }: { email: string }) {
+// (web: Settings → Security "Email / username") On hosted the address moves
+// only when the new mailbox presses the button in its confirm mail; until
+// then it is shown as pending, with a way to withdraw it.
+function EmailCard({ email, pending, pendingUntil }: {
+  email: string; pending: string | null; pendingUntil: string | null;
+}) {
   const { client } = useSession();
   const qc = useQueryClient();
   const [next, setNext] = useState("");
@@ -289,9 +288,9 @@ function EmailCard({ email }: { email: string }) {
     mutationFn: () => client!.emailChange(next.trim()),
     onSuccess: (r) => {
       setMsg({ bad: false,
-        text: (r.verify_sent
-          ? "Email changed — check the new address for a verification "
-            + "link."
+        text: (r.pending_email
+          ? `Confirmation sent to ${r.pending_email} — your sign-in email `
+            + "changes when you press the button in that mail."
           : "Email changed.")
           + (r.passkeys_removed
               ? ` ${r.passkeys_removed} passkey(s) were removed — re-add them.`
@@ -312,12 +311,26 @@ function EmailCard({ email }: { email: string }) {
               : "")
           + smsPauseNote(qc, r) + membersRemovedNote(r) });
       setNext("");
-      patchQuery<Me>(qc, ["me"], { email: r.email,
-        ...(r.verify_sent ? { verified: false } : {}) });
+      // a pending change moved nothing — the sign-in address and its
+      // verified state stand — so only the pending line is patched
+      patchQuery<Me>(qc, ["me"], r.pending_email
+        ? { pending_email: r.pending_email } : { email: r.email });
+      qc.invalidateQueries({ queryKey: ["me"] });
       // the same credential rotation a password change is
       for (const k of ["sessions", "devices", "tokens", "invites", "members"])
         qc.invalidateQueries({ queryKey: [k] });
       invalidateAfterRotation(qc);
+    },
+    onError: (e) => setMsg({ text: explain(e), bad: true }),
+  });
+  // only takes something away, so no step-up
+  const withdraw = useMutation({
+    mutationFn: () => client!.emailChangeCancel(),
+    onSuccess: () => {
+      setMsg({ text: `The change to ${pending} was withdrawn.`, bad: false });
+      patchQuery<Me>(qc, ["me"], { pending_email: null,
+                                   pending_email_expires_at: null });
+      qc.invalidateQueries({ queryKey: ["me"] });
     },
     onError: (e) => setMsg({ text: explain(e), bad: true }),
   });
@@ -332,6 +345,26 @@ function EmailCard({ email }: { email: string }) {
         signed-in phone, script token and pending family invite is removed
         — re-add them after.
       </Text>
+      {pending && (
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 8,
+                       flexWrap: "wrap", marginTop: 6 }}>
+          <Text style={[s.mut, { flexShrink: 1 }]}>
+            Waiting for confirmation:{" "}
+            <Text style={{ color: C.text, fontWeight: "700" }}>{pending}</Text>
+            {pendingUntil
+              ? ` (the link works until ${mmddyy(localDayOf(pendingUntil))})`
+              : ""}
+          </Text>
+          <Pressable style={[s.btn, s.btnQuiet,
+                             withdraw.isPending && { opacity: 0.5 }]}
+                     disabled={withdraw.isPending}
+                     onPress={() => withdraw.mutate()}>
+            <Text style={s.btnText}>
+              {withdraw.isPending ? "withdrawing…" : "Withdraw"}
+            </Text>
+          </Pressable>
+        </View>
+      )}
       <TextInput style={s.input} placeholder="new email"
                  placeholderTextColor={C.mut} keyboardType="email-address"
                  autoCapitalize="none" value={next} onChangeText={setNext} />
@@ -425,12 +458,17 @@ function TwoFactorCard({ enabled, left }: {
     onSuccess: (r) => {
       setEnroll(null); setCode("");
       if (r.recovery_codes?.length) setCodes(r.recovery_codes);
-      setMsg({ text: "Two-factor is on — every other session was "
+      setMsg({ text: (enabled ? "Your new authenticator is set up — the "
+                       + "old one no longer works"
+                     : "Two-factor is on") + " — every other session was "
                      + "signed out." + smsPauseNote(qc, r)
                      + membersRemovedNote(r), bad: false });
       // setEnroll(null) above already re-rendered the card; without this
       // it shows the "off" form under the "on" message until ["me"] lands
-      patchQuery<Me>(qc, ["me"], { totp_enabled: true,
+      // needs_2fa too: the tabs layout's forced-2FA lockout lifts on it and
+      // re-sends this phone's push registration and widget credential,
+      // which the server refused while no factor was on
+      patchQuery<Me>(qc, ["me"], { totp_enabled: true, needs_2fa: false,
         ...(r.recovery_codes ? { recovery_codes_left: r.recovery_codes.length }
                              : {}) });
       // a second-factor change removes members who joined through the
@@ -478,31 +516,7 @@ function TwoFactorCard({ enabled, left }: {
   return (
     <Card>
       <H>Two-factor authentication</H>
-      {enabled ? (
-        <>
-          <View style={{ flexDirection: "row", alignItems: "center",
-                         gap: 6 }}>
-            <Pill text="enabled" tone="good" />
-            <Text style={s.mut}>
-              Signing in requires your password and a 6-digit code.
-            </Text>
-          </View>
-          <TextInput style={s.input}
-                     placeholder="current 6-digit code (required to turn off)"
-                     placeholderTextColor={C.mut}
-                     keyboardType="number-pad" maxLength={6}
-                     value={code} onChangeText={setCode} />
-          <Pressable style={[s.btn, s.btnQuiet,
-                       { alignSelf: "flex-start", marginTop: 6 },
-                       (!code || disable.isPending) && { opacity: 0.5 }]}
-                     disabled={!code || disable.isPending}
-                     onPress={() => disable.mutate()}>
-            <Text style={[s.btnText, { color: C.warn }]}>
-              {disable.isPending ? "turning off…" : "Turn off 2FA"}
-            </Text>
-          </Pressable>
-        </>
-      ) : enroll ? (
+      {enroll ? (
         <>
           <Text style={s.mut}>
             Scan this QR with your authenticator app (or type the secret
@@ -532,7 +546,8 @@ function TwoFactorCard({ enabled, left }: {
                        disabled={!code || confirm.isPending}
                        onPress={() => confirm.mutate()}>
               <Text style={s.btnText}>
-                {confirm.isPending ? "confirming…" : "Confirm and enable"}
+                {confirm.isPending ? "confirming…"
+                  : enabled ? "Confirm and replace" : "Confirm and enable"}
               </Text>
             </Pressable>
             <Pressable style={[s.btn, s.btnQuiet]}
@@ -541,6 +556,45 @@ function TwoFactorCard({ enabled, left }: {
               <Text style={[s.btnText, { color: C.mut }]}>cancel</Text>
             </Pressable>
           </View>
+        </>
+      ) : enabled ? (
+        <>
+          <View style={{ flexDirection: "row", alignItems: "center",
+                         gap: 6 }}>
+            <Pill text="enabled" tone="good" />
+            <Text style={s.mut}>
+              Signing in requires your password and a 6-digit code.
+            </Text>
+          </View>
+          <TextInput style={s.input}
+                     placeholder="current 6-digit code (required to turn off)"
+                     placeholderTextColor={C.mut}
+                     keyboardType="number-pad" maxLength={6}
+                     value={code} onChangeText={setCode} />
+          <Pressable style={[s.btn, s.btnQuiet,
+                       { alignSelf: "flex-start", marginTop: 6 },
+                       (!code || disable.isPending) && { opacity: 0.5 }]}
+                     disabled={!code || disable.isPending}
+                     onPress={() => disable.mutate()}>
+            <Text style={[s.btnText, { color: C.warn }]}>
+              {disable.isPending ? "turning off…" : "Turn off 2FA"}
+            </Text>
+          </Pressable>
+          {/* Turning off needs a code from the authenticator, so someone
+              who LOST it has no way out from here. Replacing goes through
+              the confirm-it's-you sheet instead, where "Lost your
+              authenticator?" takes the password and a recovery code. */}
+          <Text style={[s.mut, { marginTop: 8 }]}>
+            New phone or lost your authenticator?{" "}
+            <Text style={{ color: C.accent,
+                           opacity: start.isPending ? 0.5 : 1 }}
+                  onPress={() => {
+                    if (start.isPending) return;
+                    setCode(""); start.mutate();
+                  }}>
+              {start.isPending ? "starting…" : "Replace authenticator"}
+            </Text>
+          </Text>
         </>
       ) : (
         <>

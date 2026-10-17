@@ -47,8 +47,16 @@ def _transport(state: dict):
                 {"link_sessions": [{"results": {"item_add_results": [
                     {"public_token": "pub-1"}]}}]}))
         if path == "/item/public_token/exchange":
+            state["exchanges"] = state.get("exchanges", 0) + 1
+            if state["exchanges"] > 1 and state.get("single_use"):
+                # Plaid's answer to a public token used a second time
+                return httpx.Response(400, text=json.dumps(
+                    {"error_type": "INVALID_INPUT",
+                     "error_code": "INVALID_PUBLIC_TOKEN",
+                     "error_message": "public token already exchanged"}))
             return httpx.Response(200, text=json.dumps(
-                {"item_id": "pl-new-1", "access_token": "access-prod-new"}))
+                {"item_id": state.get("item_id", "pl-new-1"),
+                 "access_token": "access-prod-new"}))
         if path == "/item/get" and state.get("item_get_fails") == "plaid":
             return httpx.Response(400, text=json.dumps(
                 {"error_type": "API_ERROR",
@@ -112,10 +120,23 @@ class PlaidLinkPagesTests(unittest.TestCase):
 
     def setUp(self):
         pages._PLAID_LINK.clear()
+        # a fresh process: nothing open on record either, or a session an
+        # earlier test left would count under the cap as one opened
+        # before a restart
+        admin = tenancy.admin_connect()
+        try:
+            admin.execute("DELETE FROM plaid_link_sessions WHERE tenant=%s",
+                          (str(self.tid),))
+        finally:
+            admin.close()
 
     def test_add_flow_end_to_end(self):
+        from oikonome.jobs import worker
         state = {"link_token": "lt-add"}
-        with _patch_client(state):
+        queued = []
+        with _patch_client(state), mock.patch.object(
+                worker, "queue_first_sync",
+                lambda t, i: queued.append((str(t), i))):
             r = self.client.post("/accounts/plaid/link", data={},
                                  follow_redirects=False)
             self.assertEqual(r.status_code, 303)
@@ -138,6 +159,12 @@ class PlaidLinkPagesTests(unittest.TestCase):
         self.assertTrue(s["done"])
         self.assertEqual(s["kind"], "add")
         self.assertEqual(s["institution"], "Chase")   # resolved via /item/get
+        # the first pull is the worker's: the answer says so, and the job
+        # for the new Item was queued
+        self.assertEqual(s["first_sync"], "pending")
+        self.assertEqual(queued, [(str(self.tid), "pl-new-1")])
+        with _patch_client(state):
+            worker._sync_item_body(str(self.tid), "pl-new-1", True)
         conn = tenancy.tenant_connect(self.tid)
         try:
             it = conn.execute("SELECT institution_name, status, tx_cursor "
@@ -405,7 +432,7 @@ class PlaidLinkPagesTests(unittest.TestCase):
         Plaid's error code, or the failure's kind — never the message,
         which carries request ids, hosts and response text."""
         for i, (how, want) in enumerate((("plaid", "INTERNAL_SERVER_ERROR"),
-                                         ("network", "ConnectError"))):
+                                         ("network", "HTTP_TRANSPORT"))):
             item, token = f"pl-chk{i}", f"lt-chk{i}"
             conn = tenancy.tenant_connect(self.tid)
             try:
@@ -427,6 +454,146 @@ class PlaidLinkPagesTests(unittest.TestCase):
             self.assertEqual(r.json()["error"], want)
             for leak in ("detail-from-plaid", "req-secret", "10.9.8.7"):
                 self.assertNotIn(leak, r.text)
+
+    def test_a_poll_queued_behind_the_finishing_one_reports_its_success(self):
+        """Two polls of one finished session: the second passed the
+        unlocked done-check before the first completed and took the sync
+        lock after it. It must answer the finished link, never exchange
+        the single-use public token again and turn the success into a
+        failure."""
+        import contextlib
+        from oikonome.sync import base as base_mod
+        token = "lt-race"
+        state = {"link_token": token, "link_done": True,
+                 "item_id": f"pl-race-{uuid.uuid4().hex[:6]}",
+                 "single_use": True}
+        user = {"tenant_id": self.tid, "role": "owner"}
+        real_lock = base_mod.tenant_sync_lock
+        first_ran = []
+
+        @contextlib.contextmanager
+        def lock_after_the_first_poll(conn, tid):
+            if not first_ran:
+                # this is the second poll, waiting on the lock while the
+                # first one runs to completion
+                first_ran.append(None)
+                first_ran[0] = pages.plaid_link_status(token, user)
+            with real_lock(conn, tid) as held:
+                yield held
+
+        with _patch_client(state):
+            self.client.post("/accounts/plaid/link", data={},
+                             follow_redirects=False)
+            with mock.patch.object(base_mod, "tenant_sync_lock",
+                                   lock_after_the_first_poll):
+                second = pages.plaid_link_status(token, user)
+        self.assertEqual(first_ran[0]["kind"], "add")
+        self.assertEqual(second["kind"], "add", second)
+        self.assertTrue(second["done"])
+        self.assertEqual(state["exchanges"], 1)
+
+    def test_parallel_add_sessions_cannot_pass_the_institution_cap(self):
+        """Every open add session can still finish and create a billed
+        Item, so with one slot left a second add session is refused until
+        the first finishes or ages out — opening two and completing both
+        would land the household over the cap."""
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            held = sync_base.institutions_held(conn)
+        finally:
+            conn.close()
+        with mock.patch.object(sync_base, "institution_cap",
+                               lambda conn=None: held + 1), \
+                _patch_client({"link_token": "lt-cap-1"}):
+            r = self.client.post("/accounts/plaid/link", data={},
+                                 headers={"Accept": "application/json"})
+            self.assertEqual(r.status_code, 200, r.text)
+        with mock.patch.object(sync_base, "institution_cap",
+                               lambda conn=None: held + 1), \
+                _patch_client({"link_token": "lt-cap-2"}):
+            r = self.client.post("/accounts/plaid/link", data={},
+                                 headers={"Accept": "application/json"})
+            self.assertEqual(r.status_code, 400, r.text)
+            self.assertNotIn("lt-cap-2", pages._PLAID_LINK)
+            # a finished session no longer holds the slot
+            pages._PLAID_LINK["lt-cap-1"]["done"] = True
+            r = self.client.post("/accounts/plaid/link", data={},
+                                 headers={"Accept": "application/json"})
+            self.assertEqual(r.status_code, 200, r.text)
+            # nor does one abandoned past the hold window
+            pages._PLAID_LINK["lt-cap-2"]["at"] -= pages._PLAID_ADD_HOLD + 1
+            with _patch_client({"link_token": "lt-cap-3"}):
+                r = self.client.post("/accounts/plaid/link", data={},
+                                     headers={"Accept": "application/json"})
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertIn("lt-cap-3", pages._PLAID_LINK)
+
+    def _cap_one_slot(self):
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            held = sync_base.institutions_held(conn)
+        finally:
+            conn.close()
+        return mock.patch.object(sync_base, "institution_cap",
+                                 lambda conn=None: held + 1)
+
+    def _start_json(self, token):
+        with _patch_client({"link_token": token}):
+            return self.client.post("/accounts/plaid/link", data={},
+                                    headers={"Accept": "application/json"})
+
+    def test_an_abandoned_add_window_gives_its_slot_to_a_new_start(self):
+        """A closed bank window stops being polled; the next add at the
+        cap must not wait out the hour behind it, and the abandoned
+        session must not be able to finish beside its replacement."""
+        with self._cap_one_slot():
+            self.assertEqual(self._start_json("lt-gone").status_code, 200)
+            pages._PLAID_LINK["lt-gone"]["at"] -= pages._PLAID_ADD_LIVE + 1
+            r = self._start_json("lt-next")
+            self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("lt-next", pages._PLAID_LINK)
+        self.assertNotIn("lt-gone", pages._PLAID_LINK)
+        r = self.client.get("/accounts/plaid/link/lt-gone/status")
+        self.assertEqual(r.status_code, 404)
+
+    def test_an_unpolled_add_survives_a_start_that_has_room(self):
+        """A phone backgrounded through a long bank sign-in stops polling
+        and comes back; another start with slots to spare must not take
+        its session away. Only at the cap does the oldest unpolled one
+        give up its place."""
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            held = sync_base.institutions_held(conn)
+        finally:
+            conn.close()
+        with mock.patch.object(sync_base, "institution_cap",
+                               lambda conn=None: held + 2):
+            self.assertEqual(self._start_json("lt-away").status_code, 200)
+            pages._PLAID_LINK["lt-away"]["at"] -= pages._PLAID_ADD_LIVE + 1
+            r = self._start_json("lt-room")
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertIn("lt-away", pages._PLAID_LINK)
+            self.assertIn("lt-room", pages._PLAID_LINK)
+            # now at the cap: the new start fits only without the
+            # unpolled session, and the polled one is untouched
+            r = self._start_json("lt-full")
+            self.assertEqual(r.status_code, 200, r.text)
+        self.assertNotIn("lt-away", pages._PLAID_LINK)
+        self.assertIn("lt-room", pages._PLAID_LINK)
+        self.assertIn("lt-full", pages._PLAID_LINK)
+
+    def test_two_windows_still_being_polled_cannot_pass_the_cap(self):
+        with self._cap_one_slot():
+            self.assertEqual(self._start_json("lt-live").status_code, 200)
+            # older than the liveness window, but its client keeps polling
+            pages._PLAID_LINK["lt-live"]["at"] -= pages._PLAID_ADD_LIVE + 1
+            with _patch_client({"link_token": "lt-live"}):
+                r = self.client.get("/accounts/plaid/link/lt-live/status")
+            self.assertEqual(r.status_code, 200, r.text)
+            r = self._start_json("lt-second")
+            self.assertEqual(r.status_code, 400, r.text)
+        self.assertIn("lt-live", pages._PLAID_LINK)
+        self.assertNotIn("lt-second", pages._PLAID_LINK)
 
     def test_link_session_pinned_to_tenant(self):
         pages._PLAID_LINK["lt-foreign"] = {
@@ -451,6 +618,9 @@ class PlaidLinkPagesTests(unittest.TestCase):
         try:
             sync_base.upsert_item(conn, "pl-sync", "plaid", "Sync Bank",
                                   "access-prod-s")
+            # pulled before: a bank's first pull is the worker's job
+            conn.execute("INSERT INTO sync_log (item_id, added) "
+                         "VALUES ('pl-sync', 0)")
         finally:
             conn.close()
         with _patch_client({}):
@@ -484,6 +654,9 @@ class PlaidLinkPagesTests(unittest.TestCase):
         try:
             sync_base.upsert_item(conn, "pl-json", "plaid", "Json Bank",
                                   "access-prod-j")
+            # pulled before: a bank's first pull is the worker's job
+            conn.execute("INSERT INTO sync_log (item_id, added) "
+                         "VALUES ('pl-json', 0)")
         finally:
             conn.close()
         with _patch_client({}):

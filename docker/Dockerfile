@@ -17,6 +17,14 @@ RUN npm run build
 FROM python:3.14-slim
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 OIKONOME_SPA_DIST=/app/webapp/dist
+# glibc gives every thread that allocates its own malloc arena, and an
+# arena rarely hands memory back to the system once a burst is over. The
+# server answers requests from a pool of threads, so one large download or
+# import leaves its peak resident in whichever arena served it, and the
+# process creeps up across many of them. Two arenas keep that bounded; the
+# interpreter's own small-object allocator does most allocation under one
+# lock anyway, so little contention is traded for it.
+ENV MALLOC_ARENA_MAX=2
 # pg_dump 18 for the in-app database-dump download — the base
 # distro's own postgresql-client can lag the PG18 server and refuse it
 RUN apt-get update \

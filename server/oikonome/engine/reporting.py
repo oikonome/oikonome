@@ -28,6 +28,8 @@ import datetime as dt
 import hashlib
 import json
 import logging
+import math
+import threading
 import re
 
 from . import budget
@@ -120,8 +122,9 @@ INCOME_NET = """GREATEST(-t.amount - COALESCE((SELECT SUM(pr.amount)
 # computes the identical value — SUM of the same rows, COALESCEd to 0 and
 # floored at 0 — in a single hash probe per row. Use the pair together:
 # `FROM transactions t {REIMB_PARTIAL_JOIN}` and `SUM({NET_AMOUNT_JOINED})`.
-# Row-level readers (budget._spend_rows) keep NET_AMOUNT; the join form is
-# for the full-scan aggregates in this module and the lenses.
+# The full-scan aggregates in this module and the lenses use it; the budget
+# engine's row reader has its own copy under another alias
+# (budget.REIMB_NET_JOIN), and per-row readers of a few rows keep NET_AMOUNT.
 # Like NET_AMOUNT, only links on a deposit still on the ledger count.
 REIMB_PARTIAL_JOIN = ("LEFT JOIN (SELECT r.expense_id, SUM(r.amount) AS s "
                       "FROM reimbursements r JOIN transactions rd "
@@ -225,6 +228,51 @@ def _live_accounts(conn, owner: str | None = None):
     return conn.execute(q, args).fetchall()
 
 
+def _property_items(conn, live_loans) -> list[dict]:
+    """The property layer: real estate + vehicles − mortgage, as rows.
+
+    Values from tenant config `manual_assets` (user-editable). A live
+    aggregator loan account replaces the manual mortgage entry automatically
+    once linked. Shared by the report and the nightly snapshot, so the
+    property net a snapshot records is the one the page showed that day."""
+    try:
+        manual = budget.load_config(conn).get("manual_assets", [])
+    except Exception:
+        manual = []
+    # A live MORTGAGE supersedes a manual mortgage entry — an auto or student
+    # loan does not. Testing `live_loans` as a whole would let any loan of any
+    # subtype delete the manual mortgage from net worth and then relabel that
+    # unrelated loan "mortgage": a $300k home loan vanishing because a $20k
+    # car loan arrived, overstating net worth by the mortgage and lying about
+    # what the remaining row is.
+    live_mortgages = [r for r in live_loans if (r["subtype"] or "") == "mortgage"]
+    prop_items = []
+    for m in manual:
+        if not isinstance(m, dict):
+            continue
+        if m.get("kind") == "mortgage" and live_mortgages:
+            continue                              # live balance supersedes
+        # The Settings-save path runs every asset value through _num(), but a
+        # restored/hand-edited config can carry a non-numeric value straight
+        # into the tenant — a bad row must be skipped, not 500 the net-worth
+        # dashboard (one of the hottest endpoints) and the AI assistant.
+        try:
+            value = round(float(m.get("value") or 0), 2)
+        except (ValueError, TypeError):
+            continue
+        prop_items.append({"name": m.get("name", "?"), "kind": m.get("kind", "?"),
+                           "value": value,
+                           "source": f"manual ({m.get('as_of', '?')})"})
+    for ln in live_loans:
+        # Carry the real subtype through — NetWorth.tsx filters property_items
+        # on kind == 'mortgage' for its "incl. mortgage payoff" caption, so a
+        # mislabelled auto loan is a wrong number on the page, not just a tag.
+        prop_items.append({"name": f"{ln['inst']} {ln['name']}",
+                           "kind": (ln["subtype"] or "loan") or "loan",
+                           "value": round(-(ln["bal"] or 0), 2), "source": "live (Plaid)"})
+    return prop_items
+
+
 def compute_networth(conn, owner: str | None = None,
                      today: dt.date | None = None, *,
                      trend: bool = True, history: bool = False) -> dict:
@@ -268,49 +316,36 @@ def compute_networth(conn, owner: str | None = None,
                                      key=lambda x: -x[1]),
             "by_asset_class": sorted(([k, round(v, 2)] for k, v in by_class.items()),
                                      key=lambda x: -x[1]),
-            "trend": [], "coinbase_pl": [], "retirement_combined": {},
+            "trend": [], "full_trend": [], "coinbase_pl": [],
+            "retirement_combined": {},
             "trend_estimated_until": 0, "snapshot_trend": [],
             "savings_trend": [], "owner": owner,
         }
-    try:
-        manual = budget.load_config(conn).get("manual_assets", [])
-    except Exception:
-        manual = []
-    # A live MORTGAGE supersedes a manual mortgage entry — an auto or student
-    # loan does not. Testing `live_loans` as a whole would let any loan of any
-    # subtype delete the manual mortgage from net worth and then relabel that
-    # unrelated loan "mortgage": a $300k home loan vanishing because a $20k
-    # car loan arrived, overstating net worth by the mortgage and lying about
-    # what the remaining row is.
-    live_mortgages = [r for r in live_loans if (r["subtype"] or "") == "mortgage"]
-    prop_items = []
-    for m in manual:
-        if not isinstance(m, dict):
-            continue
-        if m.get("kind") == "mortgage" and live_mortgages:
-            continue                              # live balance supersedes
-        # The Settings-save path runs every asset value through _num(), but a
-        # restored/hand-edited config can carry a non-numeric value straight
-        # into the tenant — a bad row must be skipped, not 500 the net-worth
-        # dashboard (one of the hottest endpoints) and the AI assistant.
-        try:
-            value = round(float(m.get("value") or 0), 2)
-        except (ValueError, TypeError):
-            continue
-        prop_items.append({"name": m.get("name", "?"), "kind": m.get("kind", "?"),
-                           "value": value,
-                           "source": f"manual ({m.get('as_of', '?')})"})
-    for ln in live_loans:
-        # Carry the real subtype through — NetWorth.tsx filters property_items
-        # on kind == 'mortgage' for its "incl. mortgage payoff" caption, so a
-        # mislabelled auto loan is a wrong number on the page, not just a tag.
-        prop_items.append({"name": f"{ln['inst']} {ln['name']}",
-                           "kind": (ln["subtype"] or "loan") or "loan",
-                           "value": round(-(ln["bal"] or 0), 2), "source": "live (Plaid)"})
+    prop_items = _property_items(conn, live_loans)
     property_net = round(sum(p["value"] for p in prop_items), 2)
 
     series = (_reconstruct_trend(conn, total, today=today)   # anchored-exact-today, back-cast
               if trend else [])
+    # the same months on the base of the Total net worth figure: what the
+    # page's headline change is measured on, so a mortgage payment (cash
+    # out, loan balance down) reads as the interest it cost, not as the
+    # whole payment lost
+    full_series = []
+    if series:
+        months = [m for m, _ in series]
+        prop = _held_with_cash(conn, months,
+                               _property_trend(conn, months, property_net,
+                                               live_loans))
+        full_series = [[m, None if p is None else round(v + p, 2)]
+                       for (m, v), p in zip(series, prop)]
+    # A month whose property value is only a guess has no figure, and the
+    # clients measure the change off the last two points; so the series
+    # starts after the last such month — when that is last month, the
+    # current month stands alone and the page shows no change rather than
+    # a guessed one.
+    unknown = [i for i, (_, v) in enumerate(full_series) if v is None]
+    if unknown:
+        full_series = full_series[unknown[-1] + 1:]
     return {
         "current_total": total,
         "property_items": prop_items,
@@ -321,6 +356,10 @@ def compute_networth(conn, owner: str | None = None,
         "by_asset_class": sorted(([k, round(v, 2)] for k, v in by_class.items()),
                                  key=lambda x: -x[1]),
         "trend": series,
+        # `trend` is financial accounts only (current_total's base);
+        # `full_trend` adds the property layer month by month and ends at
+        # full_total
+        "full_trend": full_series,
         "coinbase_pl": _coinbase_pl(conn),
         "retirement_combined": _retirement_combined(conn),
         # index up to which the trend is a reconstruction (best guess). Everything
@@ -331,6 +370,43 @@ def compute_networth(conn, owner: str | None = None,
         "snapshot_trend": _snapshot_series(conn) if trend and history else [],
         "savings_trend": _cumulative_savings(conn) if trend and history else [],
     }
+
+
+def _recorded_month_ends(conn) -> dict:
+    """Recorded financial month-ends, {YYYY-MM: total}: imported month-end
+    reports first, then the last nightly snapshot of each month."""
+    recorded = {r["month"]: r["total"] for r in conn.execute(
+        "SELECT month, total FROM networth_recorded")}
+    for r in conn.execute(
+            "SELECT DISTINCT ON (to_char(date,'YYYY-MM')) "
+            "       to_char(date,'YYYY-MM') AS m, total "
+            "FROM networth_snapshot ORDER BY to_char(date,'YYYY-MM'), date DESC"):
+        recorded.setdefault(r["m"], r["total"])
+    return recorded
+
+
+def _held_with_cash(conn, months: list, prop: list) -> list:
+    """The property layer, held wherever the financial trend holds cash.
+
+    `_reconstruct_trend` rebuilds every month after the last recorded
+    month-end from that record's cash (from today's when nothing is
+    recorded): a mortgage payment's cash never leaves those points. The
+    loan walked back through its rows would still carry the payment's
+    principal, so the two layers added together read the principal as a
+    gain with no outflow beside it — a payment month that lost money
+    shows a rise. Holding the loan at the record (or at today) keeps both
+    layers blind to the same payment; the months up to the last record
+    keep the walk, because there the cash that paid it is in the figure.
+    The current month is today's figure in both layers and is untouched."""
+    if len(prop) < 2:
+        return prop
+    recorded = _recorded_month_ends(conn)
+    anchored = [i for i, m in enumerate(months[:-1]) if m in recorded]
+    if not anchored:
+        return [prop[-1]] * len(prop)
+    last = anchored[-1]
+    return (prop[:last + 1] + [prop[last]] * (len(prop) - 2 - last)
+            + [prop[-1]])
 
 
 def _trend_estimated_until(conn, months: list) -> int:
@@ -662,13 +738,7 @@ def _reconstruct_trend(conn, today_total, today: dt.date | None = None):
     # (b) nightly `networth_snapshot`s, collapsed to month-end.
     # Recorded catches real cash moves the frozen-cash reconstruction cannot
     # see, so recorded wins.
-    recorded = {r["month"]: r["total"] for r in conn.execute(
-        "SELECT month, total FROM networth_recorded")}
-    for r in conn.execute(
-            "SELECT DISTINCT ON (to_char(date,'YYYY-MM')) "
-            "       to_char(date,'YYYY-MM') AS m, total "
-            "FROM networth_snapshot ORDER BY to_char(date,'YYYY-MM'), date DESC"):
-        recorded.setdefault(r["m"], r["total"])
+    recorded = _recorded_month_ends(conn)
     ym = [d[:7] for d in months]
     # Recorded month-end balances pin the reconstruction. There can be MORE than
     # one recorded region (e.g. an older historical block reconstructed from
@@ -762,7 +832,11 @@ def _brokerage_pl(conn) -> list[dict]:
     A holding with no cost_basis is cash (CUR:USD, gain 0) or an untracked lot;
     those contribute value to BOTH sides (0 gain). Each row names its
     institution so the combined view can group by it."""
-    override = budget.load_config(conn).get("investment_basis_override", {})
+    # Masks are stored upper-case by the settings door and a feed may report
+    # letters in either case, so the lookup ignores case on both sides.
+    override = {str(k).upper(): v for k, v in
+                (budget.load_config(conn).get("investment_basis_override")
+                 or {}).items()}
     scope, sp = _pl_scope(conn)
     # One entry per ACCOUNT: two accounts can share an institution and a
     # display name (two spouses' "Roth IRA"), and merged they would read as
@@ -792,8 +866,8 @@ def _brokerage_pl(conn) -> list[dict]:
         v, c, mask = d["v"], d["c"], d["mask"]
         if v < 1:                                  # skip drained/closed lineages
             continue
-        if mask in override:                       # manual dashboard basis
-            c = float(override[mask])
+        if mask and str(mask).upper() in override:  # manual dashboard basis
+            c = float(override[str(mask).upper()])
         out.append({"name": d["name"], "institution": d["inst"],
                     "basis": round(c, 2),
                     "value": round(v, 2), "pl": round(v - c, 2),
@@ -919,12 +993,177 @@ def snapshot_networth(conn):
         total += signed
         cls = asset_class(r["type"], r["subtype"])
         by_class[cls] = by_class.get(cls, 0) + signed
+    # the property layer's net rides along under its own key (not an asset
+    # class of the financial total, which `total` alone is), so the full
+    # net-worth line can be measured month to month from recorded values
+    try:
+        by_class[SNAPSHOT_PROPERTY_KEY] = round(sum(
+            p["value"] for p in _property_items(
+                conn, [r for r in rows if r["type"] == "loan"])), 2)
+    except Exception:                                      # noqa: BLE001
+        log.exception("snapshot: property layer unavailable")
     with conn.transaction():
         conn.execute(
             """INSERT INTO networth_snapshot (date, total, by_class) VALUES (%s,%s,%s)
                ON CONFLICT (tenant_id, date) DO UPDATE
                SET total=EXCLUDED.total, by_class=EXCLUDED.by_class""",
             (today, round(total, 2), jsonb(by_class)))
+
+
+# by_class key under which the nightly snapshot records the property net
+SNAPSHOT_PROPERTY_KEY = "property_net"
+
+
+def _finite(x):
+    """A finite float, or None: a restored snapshot can carry a string,
+    a boolean or a number too wide for a double where a figure belongs."""
+    if isinstance(x, bool):
+        return None
+    try:
+        f = float(x)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _counts_as_principal(row) -> bool:
+    """A loan row the servicer itself labels as principal."""
+    return any("PRINCIPAL" in (row[k] or "").upper()
+               for k in ("category_override", "category_detailed", "name"))
+
+
+def _charges_interest(row) -> bool:
+    """A loan row that is the lender's interest charge."""
+    return any("INTEREST" in (row[k] or "").upper()
+               for k in ("category_override", "category_detailed", "name"))
+
+
+# months with a charge on the loan before its ledger reads as the lender's
+# whole statement even where no row is named as interest
+_STATEMENT_CHARGE_MONTHS = 3
+
+
+def _loan_movements(conn, loan) -> list | None:
+    """(date, amount) rows that moved one loan's balance, signed as the
+    ledger stores them (positive = more owed), or None when the ledger
+    holds payments whose principal share is unknown.
+
+    A loan whose ledger carries the lender's interest as well as payments
+    is a full statement: its rows sum to the balance change. A charge that
+    is not interest (a late fee) does not make one — it says nothing about
+    how the payments split — so the ledger must show interest by name or a
+    charge recurring month after month. A ledger of payments alone does
+    not say how much of each payment was principal, and crediting the
+    whole payment to the balance makes a mortgage month read as costing
+    nothing. So there a payment counts when the servicer labels it
+    principal; otherwise the liabilities record's principal paid this
+    year, as a share of the payments posted this year, splits each
+    payment — only when the ledger reaches back past the start of that
+    year and the share is a share at all (more principal than payments
+    means payments are missing). Other charges raise the balance as they
+    stand. With no split known the answer is None: holding the loan flat
+    would count the whole payment as lost, which is as much a guess."""
+    rows = [(_iso(r["date"]), r["amount"] or 0.0, r) for r in conn.execute(
+        "SELECT date, amount, name, category_detailed, category_override "
+        "FROM transactions WHERE removed=0 AND account_id = %s",
+        (loan["id"],))]
+    charges = [(d, a, r) for d, a, r in rows if a > 0]
+    if (any(_charges_interest(r) for _, _, r in charges)
+            or len({d[:7] for d, _, _ in charges})
+            >= _STATEMENT_CHARGE_MONTHS):
+        return [(d, a) for d, a, _ in rows]
+    fees = [(d, a) for d, a, _ in charges]
+    payments = [(d, a, r) for d, a, r in rows if a <= 0]
+    if not any(a for _, a, _ in payments):
+        return fees
+    labelled = [(d, a) for d, a, r in payments if _counts_as_principal(r)]
+    if labelled:
+        return labelled + fees
+    share = None
+    lia = conn.execute(
+        "SELECT as_of, raw FROM liabilities WHERE account_id = %s",
+        (loan["id"],)).fetchone()
+    if lia:
+        raw = as_dict(lia["raw"])
+        ytd = _finite(raw.get("ytd_principal_paid"))
+        as_of = _iso(lia["as_of"])[:10] if lia["as_of"] else None
+        # the year's payments are all in the ledger only when it begins
+        # before the year did
+        whole_year = min(d for d, _, _ in rows) < f"{as_of[:4]}-01-01" \
+            if as_of else False
+        if ytd is not None and ytd >= 0 and as_of and whole_year:
+            paid = -sum(a for d, a, _ in payments
+                        if d[:4] == as_of[:4] and d <= as_of)
+            if paid > 0 and ytd <= paid:
+                share = ytd / paid
+    if share is None:
+        return None
+    return [(d, a * share) for d, a, _ in payments] + fees
+
+
+def _property_trend(conn, months: list, now_net: float,
+                    live_loans) -> list:
+    """The property layer's net at each month in `months` (YYYY-MM),
+    aligned with them, ending at `now_net`.
+
+    A month the nightly snapshot recorded a property net for uses the last
+    recording in that month. Any other month walks the live loan balances
+    back through what reduced or raised them after the month's end
+    (_loan_movements: a principal payment lowers the balance, so before it
+    the debt was larger); the manual entries have no history and hold
+    their value. A month with a payment after it whose principal is
+    unknown is None: any figure for it is a guess. The current month is
+    today's figure exactly."""
+    if not months:
+        return []
+    recorded = {}
+    # the value is read as JSON text and checked here: a restored archive
+    # can hold a string, a boolean or 1e999 under the key, and a cast in
+    # SQL would fail the whole page on it
+    for r in conn.execute(
+            "SELECT DISTINCT ON (to_char(date,'YYYY-MM')) "
+            "       to_char(date,'YYYY-MM') AS m, "
+            "       by_class->>%s AS p "
+            "FROM networth_snapshot "
+            "WHERE jsonb_typeof(by_class) = 'object' "
+            "  AND jsonb_typeof(by_class->%s) = 'number' "
+            "ORDER BY to_char(date,'YYYY-MM'), date DESC",
+            (SNAPSHOT_PROPERTY_KEY, SNAPSHOT_PROPERTY_KEY)):
+        p = _finite(r["p"])
+        if p is not None:
+            recorded[r["m"]] = p
+    posted = []
+    unknown_until = ""          # newest payment whose principal is unknown
+    for ln in live_loans:
+        mv = _loan_movements(conn, ln)
+        if mv is not None:
+            posted.extend(mv)
+            continue
+        newest = conn.execute(
+            "SELECT max(date) AS d FROM transactions"
+            " WHERE removed=0 AND account_id = %s AND amount < 0",
+            (ln["id"],)).fetchone()["d"]
+        unknown_until = max(unknown_until, _iso(newest) if newest else "")
+    posted.sort()
+    dates = [d for d, _ in posted]
+    after = [0.0] * (len(posted) + 1)
+    for i in range(len(posted) - 1, -1, -1):
+        after[i] = after[i + 1] + posted[i][1]
+    out = []
+    for m in months:
+        if m in recorded:
+            out.append(recorded[m])
+            continue
+        y, mo = int(m[:4]), int(m[5:7])
+        end = dt.date(y, mo, calendar.monthrange(y, mo)[1]).isoformat()
+        if unknown_until > end:
+            out.append(None)
+            continue
+        # balance then = balance now − what posted since; the layer holds
+        # the loan as −balance, so the net then is higher by that sum
+        out.append(round(now_net + after[bisect.bisect_right(dates, end)], 2))
+    out[-1] = round(now_net, 2)
+    return out
 
 
 def _snapshot_series(conn):
@@ -984,8 +1223,13 @@ def compute_spending(conn, today: dt.date | None = None) -> dict:
     # lands under its own category for its share (the year totals still
     # add up: the parts sum to the row)
     pamt2 = _R2.format(f"SUM({PART_NET_JOINED})")
+    # n counts TRANSACTIONS: the split join yields one row per part, so a
+    # plain COUNT(*) would call a three-way split three purchases.
+    # DISTINCT t.id holds per grouping set — a split whose parts land in
+    # two categories is one purchase in each, and one in its year.
     all_time = conn.execute(
-        f"SELECT to_char(t.date,'YYYY') yr, {PART_CAT} cat, {pamt2} amt, COUNT(*) n, "
+        f"SELECT to_char(t.date,'YYYY') yr, {PART_CAT} cat, {pamt2} amt, "
+        f"COUNT(DISTINCT t.id) n, "
         f"GROUPING(to_char(t.date,'YYYY'), {PART_CAT}) g "
         f"FROM transactions t {REIMB_PARTIAL_JOIN} {SPLIT_JOIN} WHERE {SPEND_WHERE} {excl} "
         f"GROUP BY GROUPING SETS ((yr, cat), (yr), (cat))",
@@ -1002,13 +1246,16 @@ def compute_spending(conn, today: dt.date | None = None) -> dict:
     # dominated by whatever you spent most on since the ledger began — a
     # mortgage paid off years ago outranks this year's groceries forever — and
     # a spending report is about behaviour you can still change. by_year
-    # below keeps the long view; that is its job.
+    # below keeps the long view; that is its job. Twelve months means twelve:
+    # the lower bound is strict, or an annual charge dated on today's
+    # anniversary counts twice (last year's and this year's), and a row
+    # dated past today (a scheduled payment) is not yet spending.
     top_merch = conn.execute(
         f"SELECT {DISPLAY_MERCHANT} payee, {amt2} amt, COUNT(*) n, "
         f"       max({MERCHANT_LOGO}) logo "
         f"FROM transactions t {MC_JOIN} {REIMB_PARTIAL_JOIN} WHERE {SPEND_WHERE} "
-        f"AND t.date >= %s::date - INTERVAL '12 months' {excl} "
-        f"GROUP BY payee ORDER BY amt DESC LIMIT 40", (today, *ex_p)).fetchall()
+        f"AND t.date > %s::date - INTERVAL '12 months' AND t.date <= %s {excl} "
+        f"GROUP BY payee ORDER BY amt DESC LIMIT 40", (today, today, *ex_p)).fetchall()
     # Amazon's own sub-categories, all time — the category grouping above,
     # narrowed to the 'Amazon…' prefix (LIKE 'Amazon%' is a case-sensitive
     # prefix test, which startswith reproduces).
@@ -1022,8 +1269,8 @@ def compute_spending(conn, today: dt.date | None = None) -> dict:
     cat_tot = conn.execute(
         f"SELECT {PART_CAT} cat, {pamt2} amt FROM transactions t {REIMB_PARTIAL_JOIN} "
         f"{SPLIT_JOIN} WHERE {SPEND_WHERE} "
-        f"AND t.date >= %s::date - INTERVAL '12 months' {excl} "
-        f"GROUP BY cat ORDER BY amt DESC LIMIT 15", (today, *ex_p)).fetchall()
+        f"AND t.date > %s::date - INTERVAL '12 months' AND t.date <= %s {excl} "
+        f"GROUP BY cat ORDER BY amt DESC LIMIT 15", (today, today, *ex_p)).fetchall()
     cat_all = sorted(by_cat, key=lambda r: -r["amt"])[:15]
     years = sorted({r["yr"] for r in by_year_cat})
     cats = [r["cat"] for r in cat_all]
@@ -1200,7 +1447,35 @@ FLOW_RANGES = {"cur": 1, "1m": 1, "3m": 3, "6m": 6, "1y": 12, "3y": 36,
 # charge re-filed, reimbursed, split or removed, or an account hidden,
 # moves it with no bill or setting changing. Any change to any of them
 # misses instead.
-_FIXED_MONTH_CACHE: dict[tuple[str, str, str], tuple[float, float]] = {}
+# A closed run's (income by kind, spend) sits here too, under a key of its
+# own (see flow_breakdown).
+_FIXED_MONTH_CACHE: dict[tuple[str, str, str], tuple[object, float]] = {}
+# The stamp each household's cache entries were last written under. A new
+# stamp (any ledger, bill or config write) makes every entry under the old
+# one unreachable, so they are dropped at once instead of sitting until the
+# dict passes its size cap — hourly feed pulls would otherwise leave a copy
+# of every closed run per stamp in every worker.
+_FIXED_CACHE_STAMP: dict[str, str] = {}
+# Requests run on the worker's thread pool and all share the dict, so the
+# turn — the one place that walks it — holds a lock, and takes a snapshot
+# of the keys so a write from a request that slipped in before the lock
+# cannot change the size of what it iterates.
+_FIXED_CACHE_LOCK = threading.Lock()
+
+
+def _fixed_cache_turn(tid: str, stamp: str) -> None:
+    """Forget a household's entries written under an earlier stamp."""
+    if _FIXED_CACHE_STAMP.get(tid) == stamp:
+        return
+    with _FIXED_CACHE_LOCK:
+        if _FIXED_CACHE_STAMP.get(tid) == stamp:
+            return
+        for k in list(_FIXED_MONTH_CACHE.keys()):
+            if k[0] == tid and k[1] != stamp:
+                _FIXED_MONTH_CACHE.pop(k, None)
+        _FIXED_CACHE_STAMP[tid] = stamp
+        if len(_FIXED_MONTH_CACHE) > 100_000:
+            _FIXED_MONTH_CACHE.clear()
 # the stamp in the key already misses on any change to an input; the
 # expiry is a backstop for an input the stamp does not name, not the
 # freshness rule. Ten minutes made every visit after a quiet spell walk
@@ -1754,8 +2029,7 @@ def flow_breakdown(conn, today: dt.date, range_key: str) -> dict:
                 v = float(st["buckets"]["fixed"]["actual"] or 0)
                 total += v
                 if cur < month_start:              # the live month stays live
-                    if len(_FIXED_MONTH_CACHE) > 100_000:
-                        _FIXED_MONTH_CACHE.clear()
+                    _fixed_cache_turn(tid, stamp)
                     _FIXED_MONTH_CACHE[key] = (v, now + _FIXED_CACHE_TTL)
             except Exception:                      # noqa: BLE001
                 log.exception("fixed-spend month %s failed", cur)
@@ -1768,24 +2042,52 @@ def flow_breakdown(conn, today: dt.date, range_key: str) -> dict:
         total_out = 0.0
         fixed = 0.0
         for a, b in runs:
-            for r in conn.execute(
-                    f"""SELECT t.name, COALESCE(t.category_detailed,'') AS d,
-                              {INCOME_NET} AS amt
-                         FROM transactions t
-                        WHERE {_INCOME_WHERE} AND t.date >= %s AND t.date < %s
+            # A run of CLOSED months sums to the same in and out until one
+            # of its inputs moves, and the stamp names them all (the
+            # ledger, the bills the income kinds are read from, the
+            # config); the bank accounts and the exclusion ride in the key
+            # too. The all-time window is two whole-ledger scans per run
+            # otherwise, on every visit. Kept beside the closed months'
+            # fixed totals, under the same expiry, so one clear drops both.
+            rkey = (tid, stamp, f"run:{a.isoformat()}:{b.isoformat()}:"
+                                f"{','.join(bank)}:{excl_sql}:{ex_p!r}")
+            hit = _FIXED_MONTH_CACHE.get(rkey)
+            now = dt.datetime.now().timestamp()
+            if hit is not None and hit[1] > now:
+                run_inc, run_out = hit[0]
+            else:
+                # income per kind, each kind summed in scan order; the cache
+                # keeps these few totals, never the rows (a multi-year run
+                # holds every deposit in history)
+                run_inc: dict[str, float] = {}
+                for r in conn.execute(
+                        f"""SELECT t.name, COALESCE(t.category_detailed,'') AS d,
+                                  {INCOME_NET} AS amt
+                             FROM transactions t
+                            WHERE {_INCOME_WHERE} AND t.date >= %s AND t.date < %s
+                            {excl_sql}""",
+                        (bank, a, b, *ex_p)):
+                    # the same exclusion on the IN side as on the OUT side
+                    # below — judged under different rules, an excluded
+                    # account that takes $6k in and pays $5.5k out reads as
+                    # "+$5,500 stayed"
+                    k = _kind(r["name"], r["d"])
+                    run_inc[k] = run_inc.get(k, 0.0) + float(r["amt"] or 0)
+                run_out = float(conn.execute(
+                    f"""SELECT {_R2.format(f"COALESCE(SUM({NET_AMOUNT_JOINED}), 0)")} amt
+                         FROM transactions t {REIMB_PARTIAL_JOIN}
+                        WHERE {SPEND_WHERE} AND t.date >= %s AND t.date < %s
                         {excl_sql}""",
-                    (bank, a, b, *ex_p)):
-                # the same exclusion on the IN side as on the OUT side
-                # below — judged under different rules, an excluded account
-                # that takes $6k in and pays $5.5k out reads as "+$5,500
-                # stayed"
-                inc[_kind(r["name"], r["d"])] += float(r["amt"] or 0)
-            run_out = float(conn.execute(
-                f"""SELECT {_R2.format(f"COALESCE(SUM({NET_AMOUNT_JOINED}), 0)")} amt
-                     FROM transactions t {REIMB_PARTIAL_JOIN}
-                    WHERE {SPEND_WHERE} AND t.date >= %s AND t.date < %s
-                    {excl_sql}""",
-                (a, b, *ex_p)).fetchone()["amt"] or 0)
+                    (a, b, *ex_p)).fetchone()["amt"] or 0)
+                if b <= today.replace(day=1):     # the live month stays live
+                    try:                   # a cache miss never fails the page
+                        _fixed_cache_turn(tid, stamp)
+                        _FIXED_MONTH_CACHE[rkey] = ((dict(run_inc), run_out),
+                                                    now + _FIXED_CACHE_TTL)
+                    except Exception:      # noqa: BLE001
+                        log.exception("cash-flow run cache write failed")
+            for k, v in run_inc.items():
+                inc[k] += v
             total_out += run_out
             fixed += min(_fixed_for(a, b - dt.timedelta(days=1)), run_out)
         sp = {"fixed": round(fixed, 2), "variable": round(total_out - fixed, 2)}
@@ -2266,7 +2568,8 @@ def _advisory_fee_estimate(conn, today: dt.date | None = None) -> dict[str, dict
     fees = cfg.get("advisory_fees") or {}
     if not isinstance(fees, dict) or not fees:
         return {}
-    exempt = [str(m) for m in (cfg.get("advisory_fee_exempt_masks") or [])]
+    exempt = [str(m).upper()
+              for m in (cfg.get("advisory_fee_exempt_masks") or [])]
     # the shadow exclusion compute_fees applies to the itemized rows: a
     # dual-linked account would otherwise be walked twice and estimate twice
     # the advisory cut on one real balance — and the same entity separation,
@@ -2285,7 +2588,7 @@ def _advisory_fee_estimate(conn, today: dt.date | None = None) -> dict[str, dict
                FROM accounts a JOIN items i ON i.id=a.item_id
                WHERE lower(i.institution_name) LIKE %s
                  AND a.type='investment'
-                 AND NOT (COALESCE(a.mask, '') = ANY(%s))
+                 AND NOT (upper(COALESCE(a.mask, '')) = ANY(%s))
                  AND NOT (a.id = ANY(%s))
                  AND ({budget.COMBINE_OR} a.entity_id IS NULL)""",
             ("%" + str(token).lower() + "%", exempt, shadows)).fetchall()

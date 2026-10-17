@@ -472,12 +472,18 @@ export function localDayOf(ts: string): string {
  *  would make it stop applying — there Settings offers the device zone
  *  instead. Never for a member or on a demo, never over a zone already
  *  chosen, and never a UTC/Etc zone: that is what a privacy-hardened
- *  browser reports, not where anyone is. */
+ *  browser reports, not where anyone is.
+ *
+ *  Not while the account still has to enrol a second factor either: the
+ *  server refuses every settings write until it has one, so an attempt
+ *  then is spent on a certain refusal. Answering false keeps the attempt
+ *  unspent, and the /api/me that follows enrolment says yes. */
 export function adoptsDeviceZone(m: {
-  role: string; demo?: boolean; hosted?: boolean;
+  role: string; demo?: boolean; hosted?: boolean; needs_2fa?: boolean;
   timezone?: string; timezone_source?: string;
 } | undefined, device: string): boolean {
   if (!m || m.role !== "owner" || m.demo || !m.hosted) return false;
+  if (m.needs_2fa) return false;
   if (m.timezone_source !== "instance") return false;
   if (!device || device === m.timezone) return false;
   return !/^(Etc\/|UTC$|GMT$|Universal$|Zulu$)/.test(device);
@@ -522,4 +528,35 @@ export function monthSavings(
     return { plan: goal.monthly_plan, saved: month, averaged: false };
   return { plan: goal.monthly_plan, saved: goal.rate_90d,
            averaged: goal.rate_90d !== null };
+}
+
+/** The savings goal the budget planner owns. Goal names are unique
+ *  case-insensitively on the server, so a goal typed as "savings" in the
+ *  Savings goals card IS the plan's Savings row; an exact-spelling match
+ *  would miss it, append a second "Savings", and have every planner save
+ *  refused as a duplicate. Mobile mirrors this predicate. */
+export const isPlanSavingsGoal = (name: string): boolean =>
+  name.trim().toLowerCase() === "savings";
+
+/** The planner's line under suggestions taken from under a month of
+ *  history: how many days the figures come from, and that they were
+ *  scaled to a month. Under the server's settled threshold
+ *  (min_rate_days) the rate is a few days' own, so the line says to
+ *  expect it to move.
+ *  With no finished day of ledger at all it says to come back tomorrow.
+ *  null when complete months stand behind the suggestions. Twin:
+ *  historyBasisNote in mobile/src/lib/pure.ts. */
+export function historyBasisNote(s: {
+  history_days?: number; history_scaled?: boolean; min_rate_days?: number;
+  not_enough_history?: boolean;
+} | null | undefined): string | null {
+  // not one finished day of ledger: the server offers no suggestion
+  if (s?.not_enough_history)
+    return "Not enough history yet — come back tomorrow.";
+  if (!s || !s.history_scaled || !s.history_days) return null;
+  const n = s.history_days;
+  const head = `Based on ${n} day${n === 1 ? "" : "s"} of history — scaled to a month`;
+  return n < (s.min_rate_days ?? 7)
+    ? `${head} — under a week, so expect it to move; revisit after your first full month.`
+    : `${head}.`;
 }

@@ -77,6 +77,33 @@ data_dir_resolve() {
   canon_path "$v"
 }
 
+# probe_host BIND_ADDRESS — the host part of a URL that reaches the app
+# port from this machine. With OIKONOME_BIND_ADDRESS pinned to one address
+# the port is published there only, so `localhost` finds nothing and every
+# readiness probe reads a healthy app as down; a wildcard (or unset) bind
+# answers on loopback. IPv6 literals are bracketed for use in a URL.
+probe_host() {
+  case ${1:-} in
+    ""|0.0.0.0|::|"[::]") echo localhost ;;
+    \[*\]) echo "$1" ;;
+    *:*) echo "[$1]" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+# backup_dir_resolve DOCKER_DIR — the folder scheduled and manual backups
+# land in and the admin console reads (compose binds it at /state/backups):
+# OIKONOME_BACKUP_DIR from the environment first, then DOCKER_DIR/.env, a
+# relative value resolved against DOCKER_DIR as compose resolves a bind
+# source; DOCKER_DIR/../backups when unset.
+backup_dir_resolve() {
+  local dir=$1 v
+  v=${OIKONOME_BACKUP_DIR:-$(dotenv_get "$dir/.env" OIKONOME_BACKUP_DIR)}
+  v=${v:-../backups}
+  case $v in /*) : ;; *) v="$dir/$v" ;; esac
+  canon_path "$v"
+}
+
 # pg_data_version DIR ENGINE IMAGE — the PG_VERSION of the Postgres data
 # folder DIR. Prints the major and returns 0; prints nothing and returns 0
 # when DIR holds no cluster (absent, or no PG_VERSION in it); returns 2

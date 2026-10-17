@@ -21,18 +21,24 @@ function TxnRow({ t, onPress, onLongPress, selected }:
   // paired payback (↩ reimb) and a still-awaiting flag are different
   // states — one is resolved, the other is money someone still owes
   // you, and the web NAMES both instead of leaving bare glyphs
-  const marks = [
-    t.check_number ? `#${t.check_number}` : "",
-    t.payment_processor ? `via ${t.payment_processor}` : "",
-    t.payment_channel === "online" ? "online" : "",
-    t.recurring_bill ? "⟳ recurring" : "",
-    t.reimb ? "↩ reimb"
-      : t.reimb_flag ? "⚑ awaiting reimbursement" : "",
-    t.biz_flag ? "🏢 biz" : "",
-    t.has_receipt ? "📎" : "",
-    // a hand split: the rollups count its parts, not the category shown
-    t.split?.length ? `✂ split ${t.split.length} ways` : "",
-  ].filter(Boolean).join(" · ");
+  // the recurring mark is a link on the web, so it reads in the accent
+  // colour there; here it carries the same colour so a bill's row stands
+  // out from the muted marks around it
+  const marks: { text: string; color?: string }[] = [
+    { text: t.check_number ? `#${t.check_number}` : "" },
+    { text: t.payment_processor ? `via ${t.payment_processor}` : "" },
+    { text: t.payment_channel === "online" ? "online" : "" },
+    { text: t.recurring_bill ? "⟳ recurring" : "", color: C.accent },
+    { text: t.reimb ? "↩ reimb"
+      : t.reimb_flag ? "⚑ awaiting reimbursement" : "" },
+    { text: t.biz_flag ? "🏢 biz" : "" },
+    { text: t.has_receipt ? "📎" : "" },
+    // a split: the rollups count its parts, not the category shown — a
+    // receipt's parts (the store matcher's reading of its items) say so
+    { text: t.split?.length
+      ? `✂ split ${t.split.length} ways${t.split_source && t.split_source !== "user" ? " by receipt" : ""}`
+      : "" },
+  ].filter((m) => m.text);
   return (
     <Pressable onPress={onPress ? () => onPress(t) : undefined}
                onLongPress={onLongPress ? () => onLongPress(t) : undefined}
@@ -64,7 +70,14 @@ function TxnRow({ t, onPress, onLongPress, selected }:
           {t.override_is_fee && t.override_bill
             ? ` · fee of ${t.override_bill}` : ""}
           {t.pending ? " · pending" : ""}
-          {marks ? `  ${marks}` : ""}
+          {marks.map((m, i) => (
+            <Text key={i}>
+              {i ? " · " : "  "}
+              <Text style={m.color ? { color: m.color, fontWeight: "600" } : null}>
+                {m.text}
+              </Text>
+            </Text>
+          ))}
           {t.note ? <Text style={{ fontStyle: "italic" }}> ✎ {t.note}</Text>
                   : null}
         </Text>

@@ -6,7 +6,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useDeferredValue, useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import TxnTable from "../components/TxnTable";
-import { api, mmdd, money as money$, catLabel } from "../api/client";
+import { api, mmdd, money as money$, catLabel, errText, toast } from "../api/client";
 import { RANGES, RANGE_LABEL, ledgerRange } from "../components/RangePicker";
 import { SnapReceiptButton, WaitingBadge } from "../components/WaitingReceipts";
 import { canEdit } from "../role";
@@ -187,6 +187,37 @@ export default function Transactions() {
       ...(scopeF ? { scope: scopeF } : {}),
     }),
   };
+  // the download door takes the page's filters without its page number
+  const exportQs = new URLSearchParams(
+    Object.entries(params).filter(([k]) => k !== "page")).toString();
+  // A large ledger takes a few seconds before the file starts, and a
+  // plain link gives no sign anything is happening, so a second click
+  // (or CSV then XLSX) used to start a second export beside the first.
+  // The download runs through fetch instead, with both links standing
+  // down until it lands; the server also answers a second one with 429.
+  const [exporting, setExporting] = useState<"csv" | "xlsx" | null>(null);
+  const startExport = (format: "csv" | "xlsx") => async (e: React.MouseEvent) => {
+    e.preventDefault();
+    if (exporting) return;
+    setExporting(format);
+    try {
+      const r = await fetch(`/api/transactions/export?${exportQs}&format=${format}`,
+                            { credentials: "same-origin" });
+      if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
+      const name = /filename="?([^";]+)/.exec(
+        r.headers.get("content-disposition") ?? "")?.[1] ?? `transactions.${format}`;
+      const url = URL.createObjectURL(await r.blob());
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = name;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      toast(`Download failed: ${errText(err)}`);
+    } finally {
+      setExporting(null);
+    }
+  };
   const query = useQuery({
     queryKey: ["txns", params],
     queryFn: () => api.transactions(params),
@@ -201,7 +232,10 @@ export default function Transactions() {
       return ("page" in prevParams) === ("page" in params) ? prev : undefined;
     },
   });
-  const cats = useQuery({ queryKey: ["cats"], queryFn: api.categories });
+  // One key for /api/categories app-wide: Budget, Bills and Rules read the
+  // same list, so a second key fetched it again on every page change and a
+  // rule edit (which invalidates this key) left the other copy stale.
+  const cats = useQuery({ queryKey: ["categories"], queryFn: api.categories });
   const accts = useQuery({ queryKey: ["accounts"], queryFn: api.accounts });
   const owners = useQuery({ queryKey: ["owners"], queryFn: api.owners });
   // count pill on the awaiting-reimbursement door. The business count that
@@ -434,6 +468,27 @@ export default function Transactions() {
                     {query.data.amazon_items.unpriced > 0 &&
                       ` (${query.data.amazon_items.unpriced} without a price)`}
                   </span>
+                </>
+              )}
+            </span>
+          )}
+          {/* the page as a file — the same filters, every page of rows,
+              named after what was asked for. Fetched same-origin (the
+              server refuses a cross-site start); the href stays so the
+              link still reads as a download */}
+          {query.data && (
+            <span className="sub" style={{ marginLeft: "auto", fontSize: ".85rem",
+                                           whiteSpace: "nowrap" }}
+                  title="download these rows, filters included">
+              {exporting ? (
+                <span aria-live="polite">preparing {exporting.toUpperCase()}…</span>
+              ) : (
+                <>
+                  <a href={`/api/transactions/export?${exportQs}&format=csv`} download
+                     onClick={startExport("csv")}>CSV</a>
+                  {" · "}
+                  <a href={`/api/transactions/export?${exportQs}&format=xlsx`} download
+                     onClick={startExport("xlsx")}>XLSX</a>
                 </>
               )}
             </span>

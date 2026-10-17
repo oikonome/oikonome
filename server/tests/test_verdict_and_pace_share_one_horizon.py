@@ -10,9 +10,13 @@ The cash forecast's pace is spend through yesterday over the days through
 yesterday, so on-plan spending (today included) walks at the plan rate.
 
 The first-run seed and the history suggestion divide by the months the
-ledger covers, so a month of history is not read as a third of a quarter.
+ledger covers, so a month of history is not read as a third of a quarter,
+and a partial month is its daily rate over the finished days it covers,
+scaled to a month, because that is how the verdict paces it
+(budget.pace_window).
 """
 
+import calendar
 import datetime as dt
 import unittest
 
@@ -20,7 +24,7 @@ from oikonome import localtime
 from oikonome.engine import budget, forecast
 from oikonome.web import todayview
 
-from .util import TODAY, add_txn, make_db, write_config
+from .util import TODAY, add_ledger_history, add_txn, make_db, write_config
 
 # util config: food 1000 + other 1000, dynamic scaling off. TODAY is the
 # 15th of a 31-day month.
@@ -74,6 +78,7 @@ class VerdictCountsTodaysAllowanceTests(unittest.TestCase):
 
     def test_spending_past_todays_allowance_is_still_over(self):
         first = TODAY.replace(day=1)
+        add_ledger_history(self.conn, first)
         add_txn(self.conn, first, 400.0, "HARDWARE BARN")
         st = budget.month_status(self.conn, first)
         self.assertEqual(st["verdict"], "OVER BUDGET")
@@ -87,6 +92,8 @@ class VerdictCountsTodaysAllowanceTests(unittest.TestCase):
 
     def test_a_closed_month_is_judged_against_the_whole_budget(self):
         end = TODAY.replace(day=DAYS)
+        # an established household: the ledger predates the month
+        add_ledger_history(self.conn, TODAY.replace(day=1))
         add_txn(self.conn, end, 60.0, "HARDWARE BARN")
         st = budget.month_status(self.conn, end, closed=True)
         self.assertAlmostEqual(st["variable_expected"], 2000.0, 2)
@@ -128,15 +135,20 @@ class SeedDividesByCoveredMonthsTests(unittest.TestCase):
         self.assertEqual(seed["food_monthly"], 600.0)
         self.assertFalse(seed["_provisional"])
 
-    def test_a_partial_month_is_never_scaled_up_and_is_not_saved(self):
+    def test_a_partial_month_is_scaled_by_what_it_covers_and_is_not_saved(self):
         # ten days of history in the last full month — dated from the real
         # household day, because load_config seeds from that day
         today = localtime.now_local(None).date()
         last_end = today.replace(day=1) - dt.timedelta(days=1)
-        add_txn(self.conn, last_end - dt.timedelta(days=9), 300.0,
-                "HARDWARE BARN")
+        first = last_end - dt.timedelta(days=9)
+        add_txn(self.conn, first, 300.0, "HARDWARE BARN")
         seed = budget._seed_config(self.conn, today=today)
-        self.assertEqual(seed["other_monthly"], 300.0)
+        # ten finished days of last month and every finished day of this
+        # one (today is not over), at their daily rate, as a month
+        days = 10 + today.day - 1
+        dim = calendar.monthrange(today.year, today.month)[1]
+        self.assertEqual(seed["other_monthly"],
+                         round(300.0 / days * dim, -1))
         self.assertTrue(seed["_provisional"])
         # load_config hands the provisional seed out but does not keep it
         cfg = budget.load_config(self.conn)
@@ -153,11 +165,12 @@ class SeedDividesByCoveredMonthsTests(unittest.TestCase):
         add_txn(self.conn, last, 1600.0, "HARDWARE BARN")
         add_txn(self.conn, TODAY.replace(day=10), 1500.0, "HARDWARE BARN")
         seed = budget._seed_config(self.conn, today=TODAY)
-        covered = (budget.month_coverage(last, last.year, last.month, TODAY)
-                   + budget.month_coverage(last, TODAY.year, TODAY.month,
-                                           TODAY))
-        self.assertGreater(covered, 1.0)
-        self.assertEqual(seed["other_monthly"], round(3100.0 / covered, -1))
+        # the 15th..30th of June and July 1st..14th: thirty finished days
+        days = (calendar.monthrange(last.year, last.month)[1] - 14
+                + TODAY.day - 1)
+        self.assertEqual(days, 30)
+        self.assertEqual(seed["other_monthly"],
+                         round(3100.0 / days * DAYS, -1))
         self.assertTrue(seed["_provisional"])
 
     def _partial_history(self, amount=300.0, back=9):
@@ -210,11 +223,23 @@ class SuggestionIgnoresThePartialMonthTests(unittest.TestCase):
         out = budget.suggest_budgets(self.conn, TODAY)
         self.assertEqual(out["suggestions"]["food_monthly"], 1400.0)
 
-    def test_only_the_month_in_progress_is_not_scaled_up(self):
+    def test_the_month_in_progress_alone_is_scaled_to_a_month(self):
+        # the 2nd through the 14th: thirteen finished days of 31
         add_txn(self.conn, TODAY.replace(day=2), 100.0, "CORNER GROCER",
                 primary="FOOD_AND_DRINK")
         out = budget.suggest_budgets(self.conn, TODAY)
-        self.assertEqual(out["suggestions"]["food_monthly"], 100.0)
+        self.assertEqual(out["suggestions"]["food_monthly"],
+                         round(100.0 * DAYS / 13, -1))
+
+    def test_todays_spending_waits_for_the_day_to_finish(self):
+        # a grocery run today: no day of the ledger has finished yet, so
+        # there is no rate to suggest from, and no suggestion is offered
+        add_txn(self.conn, TODAY, 100.0, "CORNER GROCER",
+                primary="FOOD_AND_DRINK")
+        out = budget.suggest_budgets(self.conn, TODAY)
+        self.assertNotIn("food_monthly", out["suggestions"])
+        self.assertTrue(out["not_enough_history"])
+        self.assertEqual(out["history_days"], 0)
 
 
 if __name__ == "__main__":

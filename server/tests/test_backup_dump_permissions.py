@@ -81,11 +81,14 @@ class BackupDumpPermissionTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         return dest
 
-    def test_a_fresh_dump_and_its_directory_are_owner_only(self):
+    def test_a_fresh_dump_is_owner_only_in_a_listable_directory(self):
         dest = self._run()
-        self.assertEqual(_mode(dest), 0o700,
-                         "the backup directory the script created is "
-                         "readable by other accounts on the host")
+        # the directory must be listable by the app container's uid (the
+        # console's backup card binds it read-only); only names, sizes and
+        # ages are exposed — the dump below is what carries the data
+        self.assertEqual(_mode(dest), 0o755,
+                         "the backup directory the script created cannot "
+                         "be listed by the console's container")
         dumps = sorted(dest.glob("oikonome-*.sql.gz"))
         self.assertEqual(len(dumps), 1)
         self.assertEqual(_mode(dumps[0]), 0o600,

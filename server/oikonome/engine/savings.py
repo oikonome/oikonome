@@ -18,6 +18,7 @@ from __future__ import annotations
 import datetime as dt
 
 from .. import localtime
+from .compat import as_date
 
 MILESTONES = (25, 50, 75, 100)
 
@@ -28,6 +29,15 @@ def goals(cfg: dict) -> list[dict]:
         if isinstance(g, dict) and str(g.get("name") or "").strip():
             out.append(g)
     return out
+
+
+def is_plan_savings_goal(g: dict) -> bool:
+    """True for the plan's standing Savings goal. Matched trimmed and
+    case-insensitively, the same way the clients find it and the goal
+    editor refuses a duplicate name: a goal typed as "savings" IS that
+    goal everywhere, so the server must not read it as some other goal and
+    drop the month map's and Today's Savings figures."""
+    return str(g.get("name") or "").strip().lower() == "savings"
 
 
 def goal_mode(g: dict) -> str:
@@ -111,6 +121,9 @@ def _like_token(tok: str) -> str:
     return f"%{esc}%"
 
 
+_MISS = object()
+
+
 def _owner_scope(conn, g: dict) -> tuple[str, list]:
     """The money a goal may count, as (SQL fragment, params) on alias `t`.
 
@@ -122,9 +135,18 @@ def _owner_scope(conn, g: dict) -> tuple[str, list]:
     acc = g.get("account_id")
     ent = None
     if acc:
-        row = conn.execute("SELECT entity_id FROM accounts WHERE id=%s",
-                           (acc,)).fetchone()
-        ent = row["entity_id"] if row else None
+        # asked once per figure per goal on one page; remembered on the
+        # checkout until an account row is written
+        mkey = ("goal_account_entity", str(acc))
+        hit = getattr(conn, "memo_get", lambda k, d=None: d)(mkey, _MISS)
+        if hit is not _MISS:
+            ent = hit
+        else:
+            row = conn.execute("SELECT entity_id FROM accounts WHERE id=%s",
+                               (acc,)).fetchone()
+            ent = row["entity_id"] if row else None
+            if hasattr(conn, "memo_put"):
+                conn.memo_put(mkey, ent, "accounts")
     if ent:
         return ("""
   AND (t.entity_id = %s OR (t.entity_id IS NULL AND t.account_id IN
@@ -154,6 +176,31 @@ def _matched_net(conn, g: dict, since: dt.date | None = None,
     Linked shadow accounts are excluded like every other
     money aggregate — a token-matched goal over a dual-sourced savings
     account would otherwise count each transfer once per linked source."""
+    cond, params = _matched_where(conn, g, since, until)
+    sql = f"SELECT COALESCE(SUM(-t.amount), 0) AS net FROM transactions t {cond}"
+    # The status, the forecast walk and goal progress each ask for the same
+    # goal's net over the same window in one request; the answer is the
+    # query's, so the query and its parameters are the key, and it is
+    # dropped with any write to what the budget engine's ledger reads.
+    mkey = ("goal_net", sql, repr(params))
+    hit = getattr(conn, "memo_get", lambda k: None)(mkey)
+    if hit is not None:
+        return hit
+    row = conn.execute(sql, params).fetchone()
+    out = float(row["net"])
+    if hasattr(conn, "memo_put"):
+        from . import budget as _b   # late: avoid a circular import at load
+        conn.memo_put(mkey, out, *_b._LEDGER_TABLES)
+    return out
+
+
+def _matched_where(conn, g: dict, since: dt.date | None,
+                   until: dt.date | None) -> tuple[str, list]:
+    """The rows that count as a goal's contributions, as a WHERE clause on
+    alias `t` and its parameters: TRANSFER rows on the goal's account,
+    token-filtered, shadows dropped, inside its owner's scope. One
+    definition, so what a goal's net sums and what its pace counts as a
+    month of saving can never drift apart."""
     from . import links
     where = ["t.removed = 0",
              """COALESCE(t.category_override, t.category_primary, '')
@@ -181,11 +228,7 @@ def _matched_net(conn, g: dict, since: dt.date | None = None,
         where.append("t.date <= %s")
         params.append(until)
     scope, scope_params = _owner_scope(conn, g)
-    row = conn.execute(
-        f"SELECT COALESCE(SUM(-t.amount), 0) AS net FROM transactions t "
-        f"WHERE {' AND '.join(where)}" + scope,
-        params + scope_params).fetchone()
-    return float(row["net"])
+    return f"WHERE {' AND '.join(where)}" + scope, params + scope_params
 
 
 def matched_net(conn, cfg: dict, g: dict, since: dt.date | None = None,
@@ -198,10 +241,27 @@ def matched_net(conn, cfg: dict, g: dict, since: dt.date | None = None,
     goes to the FIRST token-less goal in config order; later token-less
     siblings read 0 (first-claim partition — deterministic, never
     double-counts; give later goals tokens to scope them properly)."""
+    part = _net_parts(conn, cfg, g)
+    if part is None:
+        return 0.0                       # a sibling already claimed it
+    own, carved = part
+    if not carved and own is g:
+        return _matched_net(conn, g, since=since, until=until)
+    total = _matched_net(conn, own, since=since, until=until)
+    return round(total - sum(_matched_net(conn, s, since=since, until=until)
+                             for s in carved), 2)
+
+
+def _net_parts(conn, cfg: dict, g: dict) -> tuple[dict, list[dict]] | None:
+    """How `matched_net` partitions a goal's account: the predicate whose
+    rows it adds (`own`, for `_matched_where`) and the tokened siblings
+    whose rows it takes back out, or None when an earlier token-less
+    sibling claimed the account and the goal reads 0. Shared with the
+    pace's month test so both see the same rows as this goal's."""
     acc = _goal_account(conn, g)
     has_tokens = any(str(t).strip() for t in (g.get("tokens") or []))
     if not acc or has_tokens:
-        return _matched_net(conn, g, since=since, until=until)
+        return g, []
     # siblings are goals reading the same account now: two goals pinned to
     # the two sources of one linked account share it like any other pair
     same = [s for s in goals(cfg) if _goal_account(conn, s) == acc]
@@ -210,13 +270,10 @@ def matched_net(conn, cfg: dict, g: dict, since: dt.date | None = None,
     tokened = [s for s in same
                if any(str(t).strip() for t in (s.get("tokens") or []))]
     if len(tokenless) <= 1 and not tokened:
-        return _matched_net(conn, g, since=since, until=until)
+        return g, []
     if tokenless and str(tokenless[0].get("name")) != str(g.get("name")):
-        return 0.0                       # a sibling already claimed it
-    total = _matched_net(conn, {"account_id": acc}, since=since, until=until)
-    carved = sum(_matched_net(conn, s, since=since, until=until)
-                 for s in tokened)
-    return round(total - carved, 2)
+        return None
+    return {"account_id": acc}, tokened
 
 
 def _checking_side_rows(conn, g: dict, plan: float,
@@ -370,6 +427,97 @@ def month_saved(conn, cfg: dict, g: dict, since: dt.date, until: dt.date,
     return posted_for_plan(conn, cfg, g, since=since, until=until, memo=memo)
 
 
+# A goal's pace needs about a month of its account's ledger before
+# "off pace" is a claim about saving rather than about how new the feed is.
+PACE_MIN_DAYS = 30
+
+
+def _goal_first_date(conn, g: dict) -> dt.date | None:
+    """The first ledger day of the account a goal reads (the household's
+    ledger start when the goal names no account)."""
+    from . import budget as _b   # late: avoid a circular import at load
+    acc = _goal_account(conn, g)
+    if not acc:
+        return _b.ledger_start(conn)
+    mkey = ("goal_first_date", str(acc))
+    hit = getattr(conn, "memo_get", lambda k: None)(mkey)
+    if hit is not None:
+        return hit[0]
+    row = conn.execute(
+        "SELECT MIN(date) AS d FROM transactions "
+        "WHERE removed = 0 AND account_id = %s", (acc,)).fetchone()
+    out = as_date(row["d"]) if row and row["d"] else None
+    if hasattr(conn, "memo_put"):
+        conn.memo_put(mkey, (out,), *_b._LEDGER_TABLES)
+    return out
+
+
+def _covered_days(conn, g: dict, since: dt.date, today: dt.date) -> int:
+    """Days of the pace window [since, today] the goal's ledger covers."""
+    first = _goal_first_date(conn, g)
+    lo = max(since, first) if first else since
+    return max(0, (today - lo).days)
+
+
+def _pace_months(conn, cfg: dict, g: dict, since: dt.date,
+                 today: dt.date) -> float:
+    """The months a goal's pace divides by: three for a full window, else
+    the CALENDAR months from the ledger's first day to today. The first
+    row is itself a deposit, so the month it funds counts: two monthly
+    $500 transfers 35 days apart are two months of saving ($500/mo), not
+    1.15 months ($870/mo) — and a single transfer last week is one month,
+    never a rate four times its size.
+
+    Calendar months, not days / 30.44: April 1 to May 1 is 30 days, which
+    a day count reads as under one month, so the May 1 deposit would make
+    two months' saving read as one $1,000 month. The month in progress
+    counts once the goal's account has a row in it; before that, a goal
+    funded on the 15th read on the 15th of the next month is one month of
+    saving, not half a month each of two. Only a contribution opens it:
+    the interest or fee the bank posts on the 1st is not saving, and
+    counting its month would halve the rate of a goal funded once, and
+    neither is a withdrawal or a sibling goal's deposit."""
+    days = _covered_days(conn, g, since, today)
+    if days >= (today - since).days:
+        return 3.0
+    first = _goal_first_date(conn, g)
+    lo = max(since, first) if first else since
+    months = (today.year * 12 + today.month) - (lo.year * 12 + lo.month)
+    if months == 0 or _has_contribution_this_month(conn, cfg, g, today):
+        months += 1
+    return float(min(3, max(1, months)))
+
+
+def _has_contribution_this_month(conn, cfg: dict, g: dict,
+                                 today: dt.date) -> bool:
+    """Whether the month in progress holds a contribution the goal's net
+    counts: a TRANSFER into its account (amount < 0, Plaid signs) on the
+    rows `matched_net` adds, less the rows it hands to tokened siblings.
+    Interest or a fee would add a month the numerator never sees; so would
+    a withdrawal, which only lowers the net, and so would a sibling's own
+    transfer, which the net already carves out — each halves the rate of a
+    goal funded once."""
+    part = _net_parts(conn, cfg, g)
+    if part is None:
+        return False
+    own, carved = part
+    since = today.replace(day=1)
+
+    def contributions(goal: dict) -> set:
+        cond, params = _matched_where(conn, goal, since, today)
+        rows = conn.execute(
+            f"SELECT t.id FROM transactions t {cond} AND t.amount < 0",
+            params).fetchall()
+        return {r["id"] for r in rows}
+
+    mine = contributions(own)
+    for s in carved:
+        if not mine:
+            break
+        mine -= contributions(s)
+    return bool(mine)
+
+
 def progress(conn, cfg: dict, today: dt.date | None = None,
              memo: dict | None = None) -> list[dict]:
     """Per-goal progress + pace. Pace projects from the trailing 3 months
@@ -404,9 +552,13 @@ def progress(conn, cfg: dict, today: dt.date | None = None,
             continue
         saved = round(float(g.get("start_balance") or 0)
                       + matched_net(conn, cfg, g), 2)
-        rate = round(matched_net(conn, cfg, g,
-                                 since=today - dt.timedelta(days=90))
-                     / 3.0, 2)
+        # The pace window is the trailing 90 days, divided by the months
+        # the goal's ledger actually covers inside it: a goal funded for a
+        # month is not a third of a three-month window, which would read
+        # it "off pace" and put its ETA three times too far.
+        since = today - dt.timedelta(days=90)
+        cover = _pace_months(conn, cfg, g, since, today)
+        rate = round(matched_net(conn, cfg, g, since=since) / cover, 2)
         target = float(g.get("target") or 0)
         remaining = max(0.0, target - saved)
         eta = None
@@ -422,7 +574,9 @@ def progress(conn, cfg: dict, today: dt.date | None = None,
             days = min(30.44 * remaining / rate, 365.0 * 100)
             eta = (today + dt.timedelta(days=days)).isoformat()
         on_pace = None
-        if target > 0 and g.get("target_date") and remaining > 0:
+        # under a month of ledger there is no rate to judge a pace by
+        if (target > 0 and g.get("target_date") and remaining > 0
+                and _covered_days(conn, g, since, today) >= PACE_MIN_DAYS):
             try:
                 td = dt.date.fromisoformat(str(g["target_date"]))
                 months_left = max(0.1, (td - today).days / 30.44)

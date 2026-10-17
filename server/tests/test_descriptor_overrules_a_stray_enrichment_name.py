@@ -33,7 +33,7 @@ class StrayEnrichmentNameTests(unittest.TestCase):
     def tearDown(self):
         self.conn.close()
 
-    def _habit(self, line=LINE, name=USUAL, n=merchant_identity.ESTABLISHED_ROWS):
+    def _habit(self, line=LINE, name=USUAL, n=3):
         ids = [add_txn(self.conn, f"2026-08-{d + 1:02d}", 20.0 + d, line,
                        merchant=name, txn_id=f"h{line[:3]}{d}") for d in range(n)]
         merchant_identity.resolve(self.conn)
@@ -180,7 +180,7 @@ class StrayEnrichmentNameTests(unittest.TestCase):
     def test_a_whole_ledger_resolved_at_once_gives_the_same_answer(self):
         """A restore resolves every row in one pass; the verdict must not
         depend on the stray key sorting before the usual one."""
-        for d in range(merchant_identity.ESTABLISHED_ROWS):
+        for d in range(3):
             add_txn(self.conn, f"2026-08-{d + 1:02d}", 20.0, LINE,
                     merchant=USUAL, txn_id=f"all{d}")
         add_txn(self.conn, "2026-04-14", 7.40, LINE, merchant=STRAY, txn_id="allstray")
@@ -215,11 +215,136 @@ class StrayEnrichmentNameTests(unittest.TestCase):
         merchant_identity.resolve(self.conn)
         self.assertNotEqual(self._merchant_of("ext1")["name"], "Remote Deposit")
 
-    def test_a_few_rows_are_a_coincidence_not_a_habit(self):
-        self._habit(n=merchant_identity.ESTABLISHED_ROWS - 1)
-        add_txn(self.conn, "2026-04-14", 7.40, LINE, merchant=STRAY, txn_id="few1")
+    def test_one_agreeing_row_is_enough(self):
+        """The line's own word outranks a name it does not contain from
+        the first visit on: a household must not pay for a twin merchant
+        on every new terminal until some count of visits is reached."""
+        usual = self._habit(n=1)
+        add_txn(self.conn, "2026-04-14", 7.40, LINE, merchant=STRAY, txn_id="one1")
         merchant_identity.resolve(self.conn)
-        self.assertEqual(self._merchant_of("few1")["name"], STRAY)
+        self.assertEqual(self._merchant_of("one1")["id"],
+                         self._merchant_of(usual[0])["id"])
+        self.assertNotIn(STRAY, self._names())
+
+    def test_a_settled_hold_is_a_witness(self):
+        """The only row that ever agreed under this line was a hold the
+        feed retired when the charge posted under a wallet-prefixed line.
+        What the hold said about its line is still true."""
+        add_txn(self.conn, "2026-08-01", 20.0, LINE, merchant=USUAL,
+                txn_id="hold1", pending=1)
+        merchant_identity.resolve(self.conn)
+        add_txn(self.conn, "2026-08-02", 20.0, f"WALLETCO {LINE}", merchant=USUAL,
+                txn_id="post1")
+        self.conn.execute("UPDATE transactions SET removed=1 WHERE id='hold1'")
+        self.conn.execute("UPDATE transactions SET pending_transaction_id='hold1'"
+                          " WHERE id='post1'")
+        merchant_identity.resolve(self.conn)
+        add_txn(self.conn, "2026-08-20", 7.40, LINE, merchant=STRAY, txn_id="stray2",
+                pending=1)
+        merchant_identity.resolve(self.conn)
+        self.assertEqual(self._merchant_of("stray2")["id"],
+                         self._merchant_of("hold1")["id"])
+        self.assertNotIn(STRAY, self._names())
+
+    def test_a_stray_name_the_clean_reads_as_the_lines_word_joins_the_line(self):
+        """A number-prefixed guess the string clean reduces to a word the
+        line does contain is not doubted; it must then be read as the
+        line's payee under that same clean form, or it falls between the
+        two rules and mints a merchant named after the bare word."""
+        line = "PAYLOOP 12 HARBOR KITE SPRINGFIELD"
+        usual = self._habit(line=line, name="Harbor Kite", n=2)
+        mid = self._merchant_of(usual[0])["id"]
+        # a reviewed merge gave the merchant its full name, which the
+        # bank's cut-short line does not spell
+        self.conn.execute(
+            "UPDATE merchants SET name='12 Harbor Kite Works', "
+            "name_source='llm' WHERE id=%s", (mid,))
+        self.conn.execute(
+            "UPDATE merchant_canonical SET canonical='12 Harbor Kite Works', "
+            "method='llm' WHERE merchant_id=%s", (mid,))
+        self.assertEqual(merchant_dedup.canonical_merchant("10 Harbor"), "Harbor")
+        add_txn(self.conn, "2025-06-07", 6.45, line, merchant="10 Harbor",
+                txn_id="ten1")
+        merchant_identity.resolve(self.conn)
+        self.assertEqual(self._merchant_of("ten1")["id"], mid)
+        self.assertNotIn("Harbor", self._names())
+
+    def test_a_clean_form_too_short_to_name_a_payee_carries_no_line_reading(self):
+        """A reading of a line needs one real word of three letters: a
+        two-letter stub, raw or cleaned, never reads as the line's payee,
+        so the clean form cannot widen what a line may claim."""
+        line = "MW CANTEEN"
+        for stub in ("Mw", "10 Mw", "The Mw"):
+            clean = merchant_dedup.canonical_merchant(stub) or ""
+            self.assertFalse(merchant_identity._reads_as(line, clean), stub)
+            self.assertFalse(merchant_identity._reads_as(line, stub), stub)
+        self.assertFalse(merchant_identity._descriptor_names(line, "Mw"))
+
+    def test_a_processor_line_never_overrules_the_payee_behind_it(self):
+        """A processor's line ("PAYLOOP INST XFER") once read as the
+        processor's own name — the aggregator listing the processor as a
+        payment-app counterparty — is not the line agreeing about a payee.
+        Every later charge on it names the real payee, and folding them
+        into the processor would file every payee it ever carries as one."""
+        line = "PAYLOOP INST XFER"
+        tid = add_txn(self.conn, "2025-02-01", 12.00, line, merchant="Payloop",
+                      txn_id="proc1")
+        self.conn.execute(
+            "UPDATE transactions SET raw=%s WHERE id=%s",
+            (jsonb({"counterparties": [{
+                "name": "Payloop", "type": "payment_app",
+                "entity_id": "ent_payloop", "confidence_level": "VERY_HIGH"}]}),
+             tid))
+        merchant_identity.resolve(self.conn)
+        self.assertEqual(self._merchant_of(tid)["name"], "Payloop")
+        add_txn(self.conn, "2025-02-09", 18.50, line, merchant="Marlow Bakery",
+                txn_id="proc2")
+        merchant_identity.resolve(self.conn)
+        self.assertEqual(self._merchant_of("proc2")["name"], "Marlow Bakery")
+
+    def test_the_asking_rows_never_witness_their_own_line(self):
+        """The line's evidence is OTHER rows. Rows asking about a line are
+        left out of both what it was named and what it was filed under, so
+        a name can never vote for itself — and another row carrying that
+        very name, which the line does not spell, is no reading of it."""
+        line = "RIVERTON TRAILHEAD KIOSK"
+        a = add_txn(self.conn, "2025-03-01", 9.0, line, merchant=STRAY,
+                    txn_id="self1")
+        merchant_identity.resolve(self.conn)
+        ev = merchant_identity._descriptor_evidence(self.conn, [(line, [a])])
+        self.assertEqual(ev[line], {"named": set(), "mids": set()})
+        self.assertIsNone(merchant_identity._merchant_by_bank_descriptor(
+            self.conn, line, [a]))
+        b = add_txn(self.conn, "2025-03-08", 9.0, line, merchant=STRAY,
+                    txn_id="self2")
+        ev = merchant_identity._descriptor_evidence(self.conn, [(line, [b])])
+        self.assertEqual(ev[line]["named"], {STRAY.lower()})
+        self.assertIsNone(merchant_identity._merchant_by_bank_descriptor(
+            self.conn, line, [b], evidence=ev))
+
+    def test_a_clean_spelling_of_the_holds_set_aside_name_is_not_that_name(self):
+        """A posted charge follows its hold's set-aside name only when the
+        feed repeated that name exactly. A different raw name that merely
+        cleans to it is judged on its own evidence, so the string clean
+        can never widen the door a hold opens."""
+        self._habit()
+        add_txn(self.conn, "2025-04-14", 7.40, LINE, merchant=STRAY,
+                txn_id="sh1", pending=1)
+        merchant_identity.resolve(self.conn)
+        self.assertEqual(self.conn.execute(
+            "SELECT merchant_name_set_aside AS s FROM transactions "
+            " WHERE id='sh1'").fetchone()["s"], STRAY)
+        posted = "The Ashbury Park #12"
+        self.assertEqual(merchant_dedup.canonical_merchant(posted), STRAY)
+        add_txn(self.conn, "2025-04-15", 7.40, f"{LINE} SPRINGFIELD OR",
+                merchant=posted, txn_id="sp1")
+        self.conn.execute("UPDATE transactions SET removed=1 WHERE id='sh1'")
+        self.conn.execute("UPDATE transactions SET pending_transaction_id='sh1'"
+                          " WHERE id='sp1'")
+        merchant_identity.resolve(self.conn)
+        self.assertEqual(self.conn.execute(
+            "SELECT merchant_name FROM transactions WHERE id='sp1'"
+        ).fetchone()["merchant_name"], posted)
 
     def test_a_line_already_split_between_two_merchants_decides_nothing(self):
         self._habit()
@@ -248,7 +373,7 @@ class StrayEnrichmentNameTests(unittest.TestCase):
         aggregator did name is the only payee evidence there is, and it
         stands."""
         line = "JUNIPER MARKET SPRINGFIELD OR"
-        for d in range(merchant_identity.ESTABLISHED_ROWS):
+        for d in range(3):
             self._bare(line, f"nameless{d}", f"2026-08-{d + 1:02d}")
         merchant_identity.resolve(self.conn)
         add_txn(self.conn, "2026-04-14", 12.00, line, merchant=STRAY,
@@ -264,9 +389,9 @@ class StrayEnrichmentNameTests(unittest.TestCase):
         line = "POS DEBIT PURCHASE"
 
         def build():
-            for d in range(merchant_identity.ESTABLISHED_ROWS):
+            for d in range(3):
                 self._bare(line, f"c{d}", f"2026-08-{d + 1:02d}")
-            for d in range(merchant_identity.ESTABLISHED_ROWS):
+            for d in range(3):
                 add_txn(self.conn, f"2026-08-{d + 10:02d}", 30.0 + d, line,
                         merchant="Juniper Hardware", txn_id=f"ch{d}")
             add_txn(self.conn, "2026-04-14", 31.00, line,
@@ -282,11 +407,29 @@ class StrayEnrichmentNameTests(unittest.TestCase):
         self.tearDown()
         self.setUp()
         build()
-        for t in ("c0", "c1", "c2", "c3", "c4", "ch0", "ch1", "ch2", "ch3",
-                  "ch4", "cm"):
+        for t in ("c0", "c1", "c2", "ch0", "ch1", "ch2", "cm"):
             merchant_identity.resolve(self.conn, txn_ids=[t])
         row_by_row = {self._merchant_of(t)["name"] for t in ("c0", "ch0", "cm")}
         self.assertEqual(row_by_row, at_once)
+
+    def test_a_hand_named_line_outranks_a_stray_name(self):
+        """A person renamed the line's merchant. The person's answer
+        outranks a stray HIGH guess under that same line, and the stray
+        name claims no merchant."""
+        self._habit(n=3)
+        mid = self._merchant_of("hPAY0")["id"]
+        self.conn.execute(
+            "UPDATE merchants SET name='Toyworks', name_source='manual' "
+            "WHERE id=%s", (mid,))
+        self.conn.execute(
+            "UPDATE merchant_canonical SET canonical='Toyworks', method='manual' "
+            "WHERE merchant_id=%s", (mid,))
+        stray = add_txn(self.conn, "2026-04-14", 7.40, LINE, merchant=STRAY,
+                        txn_id="hand1")
+        merchant_identity.resolve(self.conn)
+        self.assertEqual(self._merchant_of(stray)["id"], mid)
+        self.assertEqual(self._merchant_of(stray)["name"], "Toyworks")
+        self.assertNotIn(STRAY, self._names())
 
     def test_a_persons_rename_of_the_stray_name_still_wins(self):
         self._habit()

@@ -86,11 +86,34 @@ def release_bank_links(tenant_id) -> dict:
     return results
 
 
+def hand_back_open_links(tenant_id) -> dict:
+    """Finish the tenant's bank-link sessions still open, handing back every
+    Item the person made at Plaid, before the release (as the erasure does):
+    a link finished at the bank moments ago has no items row yet, so the
+    release cannot see it, and once the session goes nothing can exchange
+    or remove it. Never raises; {link_token: word}, and a session that was
+    not handed back is warned about by link token."""
+    from ..jobs import plaid_links
+    try:
+        out = plaid_links.hand_back_open_sessions(tenant_id)
+    except Exception as e:                                 # noqa: BLE001
+        print(f"warning: open bank links of {tenant_id} not handed back: "
+              f"{e}", file=sys.stderr)
+        return {}
+    for lt, word in out.items():
+        if word in ("busy", "error"):
+            print(f"warning: an open bank link of {tenant_id} was not "
+                  f"handed back ({word}): {lt}", file=sys.stderr)
+    return out
+
+
 def _release_and_record(admin, tenant_id) -> dict:
-    """Release the tenant's bank links and, when any did not release, leave
-    the retry marker. The item ids are read while the rows still exist:
-    they are the only handle an operator has to finish a failed release."""
+    """Hand back open link sessions, release the tenant's bank links and,
+    when any did not release, leave the retry marker. The item ids are
+    read while the rows still exist: they are the only handle an operator
+    has to finish a failed release."""
     from .. import erasure
+    hand_back_open_links(tenant_id)
     released = release_bank_links(tenant_id)
     retry_ids = erasure.collect_retry_ids(tenant_id)
     erasure.record_pending_release(admin, tenant_id, released, retry_ids)
@@ -111,6 +134,11 @@ def release_links_only(tenant_id) -> dict:
             erasure.release_writers(admin, tenant_id)
     finally:
         admin.close()
+
+
+# What a bank link left open across a data reset answers when it finishes.
+RESET_REFUSAL = ("this household's data was reset while the bank link was "
+                 "open — connect the bank again")
 
 
 def reset_tenant_data(tenant_id) -> ResetResult:
@@ -140,6 +168,20 @@ def reset_tenant_data(tenant_id) -> ResetResult:
                             counts[t] = n
             finally:
                 conn.close()
+            # the link sessions are control-plane rows the RLS wipe does not
+            # reach. A finished or update-mode one is spent and goes. An
+            # add session still open stays on record, marked: the person
+            # may yet finish at the bank, and that row is the only handle
+            # on the Item it makes — so the finisher (the LINK webhook, the
+            # sweep, a poll) exchanges the token and hands the Item back
+            # rather than put a bank into the household just wiped, or
+            # leave it billing with nothing here able to remove it
+            from ..jobs import plaid_links
+            plaid_links.refuse_open_adds(admin, tenant_id, RESET_REFUSAL)
+            admin.execute(
+                "DELETE FROM plaid_link_sessions WHERE tenant=%s "
+                "AND NOT (kind='add' AND done_at IS NULL)",
+                (str(tenant_id),))
         finally:
             # session-level, so it must not be left to the connection's close
             erasure.release_writers(admin, tenant_id)
@@ -148,12 +190,25 @@ def reset_tenant_data(tenant_id) -> ResetResult:
     return ResetResult(counts, released)
 
 
-def unreleased(released: dict, retry_ids: dict | None = None) -> list[str]:
-    """Human lines for whatever the provider release could not finish."""
+def unreleased(released: dict, retry_ids: dict | None = None,
+               queue_survives: bool = True) -> list[str]:
+    """Human lines for whatever the provider release could not finish.
+
+    `queue_survives` says whether the nightly retry will ever run: true
+    for one household's reset, where plaid_release_queue outlives the
+    household's rows; false for the full instance reset
+    (``--release-links``), which deletes the database holding that queue
+    — and the master key its tokens are sealed under — right after."""
     out = []
     failed = released.get("plaid_failed")
-    if isinstance(failed, list) and failed:
-        out.append("bank links still live at Plaid (remove them in the "
+    if isinstance(failed, list) and failed and not queue_survives:
+        out.append("bank links still live at Plaid — this reset deletes the "
+                   "database and its retry queue, so nothing here will "
+                   "release them later: remove these items in the Plaid "
+                   "dashboard now: " + ", ".join(map(str, failed)))
+    elif isinstance(failed, list) and failed:
+        out.append("bank links still live at Plaid (the nightly run retries "
+                   "the release for 30 days; after that, remove them in the "
                    "Plaid dashboard): " + ", ".join(map(str, failed)))
     elif failed:
         out.append("bank links could not be released at Plaid; their item "
@@ -162,6 +217,33 @@ def unreleased(released: dict, retry_ids: dict | None = None) -> list[str]:
     if released.get("mx_user") == "error":
         out.append("the MX user could not be deleted at MX")
     return out
+
+
+def release_queue_leftovers() -> list[str]:
+    """Retry plaid_release_queue once and return a line per Item still in
+    it — the full instance reset deletes the queue and the key its tokens
+    are sealed under, so whatever is named here keeps billing until it is
+    removed in the Plaid dashboard."""
+    from ..jobs import reaper
+    try:
+        reaper.retry_queued_releases()
+    except Exception as e:                                 # noqa: BLE001
+        print(f"warning: the queued bank-link releases were not retried: "
+              f"{e}", file=sys.stderr)
+    try:
+        admin = tenancy.admin_connect()
+        try:
+            rows = admin.execute(
+                "SELECT item_id, reason FROM plaid_release_queue "
+                "ORDER BY queued_at").fetchall()
+        finally:
+            admin.close()
+    except Exception as e:                                 # noqa: BLE001
+        return [f"the queue of failed bank-link releases could not be read "
+                f"({type(e).__name__}); check plaid_release_queue before "
+                f"the database goes"]
+    return [f"bank link still live at Plaid ({r['reason']}) — remove item "
+            f"{r['item_id']} in the Plaid dashboard" for r in rows]
 
 
 def all_tenants() -> list[tuple[str, str]]:
@@ -256,10 +338,17 @@ def main(argv: list[str]) -> int:
         # the caller can say so before the database goes
         stuck = 0
         for tid, who in all_tenants():
-            lines = unreleased(release_links_only(tid))
+            lines = unreleased(release_links_only(tid),
+                               queue_survives=False)
             stuck += len(lines)
             for line in lines:
                 print(f"  NOT RELEASED ({who}, {tid}): {line}")
+        # The queue of releases that failed during earlier erasures, and the
+        # holds on links that were mid-exchange, belong to no tenant left
+        # and die with the database: one last try, then name what remains
+        for line in release_queue_leftovers():
+            stuck += 1
+            print(f"  NOT RELEASED: {line}")
         return 1 if stuck else 0
     rest = [a for a in args if not a.startswith("--")]
 

@@ -10,7 +10,10 @@ The verdict card does not appear until you have set a monthly budget, and
 the daily email does not go out either. There is nothing honest to say
 yet: with no plan the arithmetic is "on budget, $0 of $0 left", which is
 a judgement on a plan you have not made. Finish setup — or just set Food
-and Everything-else in **Budget** — and both start the next day.
+and Everything-else in **Budget** — and both start the next day. In your
+first month the Budget page may show suggested figures drawn from the
+spending seen so far; those are a starting point, not a budget, until
+you save them.
 
 ("Send today's email now" on the Daily email card in Settings still
 sends at any time, if you want to see what the message looks like
@@ -36,6 +39,12 @@ few days — "under" reads as on budget, because barely any month has
 passed to spend in and the good news would be about the calendar, not
 your spending. "Over" is never suppressed: blowing the budget on the 1st
 is worth saying immediately.
+
+A ledger that starts partway through the month (a new account, a first
+import) counts its elapsed days from its first transaction rather than
+the 1st, and the month's budget is the share for the days from there to
+month end (see the Budget guide). Until it has at least a week of
+finished days behind it, "under" likewise reads as on budget.
 
 **Fixed bills never make you "over."** A bill is an obligation with its
 own schedule — rent posting on the 3rd instead of the 1st is timing, not
@@ -89,8 +98,9 @@ budget divider; there is no pace tick because the day is the unit.
 The month gauges (with their pace ticks) live in the Monthly budget
 card below.
 
-The daily rate — (month budget − spent so far) ÷ days left — still
-drives every number, but it only speaks up when it changes: a tile
+The daily rate — (month budget − spent before today) ÷ the days left,
+today included — still drives every number (for a ledger that began
+this month, the month budget is its paced share), but it only speaks up when it changes: a tile
 whose allowance drifted from the plan says so in prose ("daily reduced
 from $61 to $52"). A reduced daily also says how to get the old one
 back — "skip 3 days of spending and the daily is back to $61" — or,
@@ -132,9 +142,13 @@ or a press on the phone.
 ## The plan, in one line
 
 The bottom of the verdict card shows the month's plan as a flow —
-**income → bills → to spend → saved → excess** — with a link to the
+**income → bills due → to spend → saved → excess** — with a link to the
 Budget page, which owns the detail (income, per-category budgets,
-carve-outs, the savings plan). The "saved" step appears only when you
+carve-outs, the savings plan). **Bills due** is the month's own bill
+schedule — the figure "to spend" is scaled from — so a bill autopaid a
+few days early, at the end of the month before it is due, counts here in
+the month that owes it, while the Bills bar counts the cash where it
+left. The "saved" step appears only when you
 have a fixed savings plan; a sweep-mode goal sits beside the chain as
 its own short sentence ("sweep up to $X — $Y available so far this
 month").
@@ -178,7 +192,10 @@ control (the email says how many more there are instead). Paychecks are
 matched to the ledger the way bills are: a deposit that has already
 posted is in today's balance and is not walked in again on payday, and
 a paycheck that is late is simply not projected — unlike an overdue
-bill, it is never re-dated to tomorrow.
+bill, it is never re-dated to tomorrow. Payday itself is the one
+exception: a paycheck due today that hasn't posted yet is walked in
+tomorrow, since the walk starts tomorrow, while its line in the table
+still names today.
 
 Two card-payoff scenarios exist: **autopay statement balance** (the
 realistic default) and **pay all cards now** (the comparison). When
@@ -200,6 +217,13 @@ If any account still sits at an unset $0 balance, the forecast hides
 rather than present $0 as truth; the verdict card says so instead
 ("Cash forecast is waiting on your balance", with a link to Accounts).
 Set real balances on the Accounts page and it appears.
+
+The forecast starts from your checking balance, so with no checking
+account linked (only cards, or only savings) there is nothing to start
+from. The forecast and the cash warnings stay off, and the verdict card
+and the daily email say "No checking account linked" with a pointer to
+Accounts instead of reporting a shortfall against an account you do not
+have. Link your checking account and the cash picture appears.
 
 ## On your phone's home screen
 

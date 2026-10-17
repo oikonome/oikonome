@@ -51,14 +51,14 @@ SESSION_DEPS = ("Depends(current_user)", "Depends(_user())")
 # each line is somebody's decision, not a leftover.
 MEMBER_OK = {
     # --- the household's money: the whole point of the role -------------
-    "POST /api/transactions/{txn_id}/category",
+    "POST /api/transactions/{txn_id:path}/category",
     # a hand split of one charge is bookkeeping like a category pick
-    "PUT /api/transactions/{txn_id}/split",
-    "DELETE /api/transactions/{txn_id}/split",
-    "POST /api/transactions/{txn_id}/note",
-    "POST /api/transactions/{txn_id}/owner",
-    "POST /api/transactions/{txn_id}/entity",
-    "POST /api/transactions/{txn_id}/receipt",
+    "PUT /api/transactions/{txn_id:path}/split",
+    "DELETE /api/transactions/{txn_id:path}/split",
+    "POST /api/transactions/{txn_id:path}/note",
+    "POST /api/transactions/{txn_id:path}/owner",
+    "POST /api/transactions/{txn_id:path}/entity",
+    "POST /api/transactions/{txn_id:path}/receipt",
     "POST /api/transactions/bulk",
     # retiring a pending hold the bank abandoned: inside the household,
     # visible, and reversible (removed=1 keeps the row and its id)
@@ -86,8 +86,8 @@ MEMBER_OK = {
     "POST /bills/proposal",
     "POST /api/reimburse/link",
     "POST /api/reimburse/unlink",
-    "POST /api/reimburse/{txn_id}/flag",
-    "POST /api/reimburse/{txn_id}/unflag",
+    "POST /api/reimburse/{txn_id:path}/flag",
+    "POST /api/reimburse/{txn_id:path}/unflag",
     "POST /api/receipts/{rid}/parse",
     "POST /api/receipts/{rid}/items/{line}/tag",
     "DELETE /api/receipts/{rid}",
@@ -104,6 +104,13 @@ MEMBER_OK = {
     "POST /api/settings",
     "POST /settings",
     "POST /api/assistant",
+    # a POST only in shape: the answer's blocks go up, an HTML page of
+    # them comes back, nothing is written
+    "POST /api/assistant/report",
+    # the household's own question log: a member may tidy it
+    "DELETE /api/assistant/history/{turn_id}",
+    "DELETE /api/assistant/threads/{thread_id}",
+    "DELETE /api/assistant/history",
 
     # --- the business books, for a household that runs one --------------
     "POST /api/business/entities",
@@ -121,10 +128,10 @@ MEMBER_OK = {
     "DELETE /api/business/entities/{entity_id}/compliance/{obligation_id}",
     "POST /api/business/entities/{entity_id}/reimburse",
     "POST /api/business/entities/{entity_id}/import-flags",
-    "POST /api/business/entities/{entity_id}/transactions/{txn_id}/class",
+    "POST /api/business/entities/{entity_id}/transactions/{txn_id:path}/class",
     "POST /api/business/combine",
-    "POST /api/business/{txn_id}/flag",
-    "POST /api/business/{txn_id}/unflag",
+    "POST /api/business/{txn_id:path}/flag",
+    "POST /api/business/{txn_id:path}/unflag",
     "POST /api/accounts/{account_id}/entity",
     "POST /api/accounts/{account_id}/owner",
 
@@ -181,6 +188,8 @@ MEMBER_OK = {
     # these too (permissions.SELF_WRITE_OK).
     "POST /api/password/change",
     "POST /api/email/change",
+    "POST /api/email/change/cancel",
+    "POST /api/email/change/resend",
     "POST /api/me/email",
     "POST /api/account/leave",
     "POST /api/sessions/revoke",
@@ -216,6 +225,10 @@ OWNER_ONLY_OPTIONS = {
     # rely on (force_kept) is the owner's, as on the account-remove door
     "POST /api/import/rollback": "force_kept",
     "POST /import/rollback": "force_kept",
+    # members save their own budget and notice settings; the three
+    # investment keys (fees, fee-free masks, money-in overrides) are the
+    # owner's, like the rest of the Connections section
+    "POST /api/settings": "advisory_fees",
 }
 
 

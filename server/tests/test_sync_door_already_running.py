@@ -135,6 +135,9 @@ class ManualSyncCategorizes(unittest.TestCase):
             conn.execute(
                 "INSERT INTO items (id, aggregator, institution_name, status) "
                 "VALUES ('it-cat', 'plaid', 'Test Bank', 'ok')")
+            # pulled before: a bank's first pull is the worker's, not ↻'s
+            conn.execute("INSERT INTO sync_log (item_id, added) "
+                         "VALUES ('it-cat', 0)")
         finally:
             conn.close()
         return tid

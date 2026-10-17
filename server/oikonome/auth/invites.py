@@ -186,6 +186,12 @@ def claim(conn, token: str, email: str, password: str,
         raise ValueError(err)
     if mark_verified is None:
         mark_verified = not env_flag("OIKONOME_HOSTED")
+    # Hash BEFORE the burn. The hasher can refuse for a passing reason
+    # (passwords.HasherBusy when every slot stays taken), which the web
+    # layer answers "try again" — and a retry can only work if nothing
+    # irreversible has happened yet. Hashed after the burn, a busy server
+    # spent the invitee's one link and created no member.
+    pw_hash = passwords.hash_password(password)
     # Control connections are autocommit, so a SELECT … FOR UPDATE lock
     # would NOT span the claim — two concurrent claims on one "one-time"
     # invite could each pass the SELECT and both create a user. Burn the
@@ -212,6 +218,11 @@ def claim(conn, token: str, email: str, password: str,
         if inv is not None:
             bound = bound_address(inv["label"])
             if bound and bound != email:
+                raise ValueError(WRONG_ADDRESS)
+            # On hosted every invite names its address (`create` refuses
+            # one that does not), so an unnamed one is a row nothing here
+            # minted — never a bearer link into the shared namespace.
+            if not bound and env_flag("OIKONOME_HOSTED"):
                 raise ValueError(WRONG_ADDRESS)
     if inv is None:
         raise ValueError(CLAIM_FAILED)
@@ -256,7 +267,7 @@ def claim(conn, token: str, email: str, password: str,
                 """INSERT INTO users (tenant_id, email, password_hash, role,
                                       verified_at)
                    VALUES (%s,%s,%s,%s,%s) RETURNING id""",
-                (inv["tenant_id"], email, passwords.hash_password(password),
+                (inv["tenant_id"], email, pw_hash,
                  inv["role"],
                  dt.datetime.now(dt.timezone.utc) if mark_verified
                  else None)).fetchone()

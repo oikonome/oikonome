@@ -68,5 +68,29 @@ class ApiRepliesAreNotCached(unittest.TestCase):
         self.assertEqual(r.headers.get("cache-control"), "private, no-cache")
 
 
+    def test_a_redeemed_export_download_is_no_store(self):
+        r = self.client.post("/api/export/token", json={
+            "kind": "zip", "password": "correct-horse-battery"})
+        self.assertEqual(r.status_code, 200, r.text)
+        d = self.client.get(r.json()["url"])
+        self.assertEqual(d.status_code, 200, d.text[:200])
+        self.assertEqual(d.content[:2], b"PK")
+        self.assertEqual(d.headers.get("cache-control"), "no-store")
+
+    def test_household_pages_outside_the_api_are_no_store(self):
+        from oikonome.web.app import _never_cached
+        for path in ("/api", "/api/me", "/export", "/export/dump",
+                     "/export/continuity", "/act", "/admin/console",
+                     "/admin/console/tenant/x", "/metrics"):
+            self.assertTrue(_never_cached(path), path)
+        for path in ("/", "/login", "/exporter", "/apix", "/metricsz"):
+            self.assertFalse(_never_cached(path), path)
+        # and on the wire: a refused export and the one-click mail door
+        for path in ("/export", "/act?t=nope", "/metrics"):
+            r = TestClient(self.app).get(path, follow_redirects=False)
+            self.assertEqual(r.headers.get("cache-control"), "no-store",
+                             path)
+
+
 if __name__ == "__main__":
     unittest.main()

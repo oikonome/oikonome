@@ -197,7 +197,11 @@ matched to a sum. Then:
   breakdown is the store's own accounting, not a guess.
 - The charge takes the receipt's dominant category, and its detail panel
   says why: *matched to an Amazon order*, *matched to a Costco receipt*.
-  A category you set by hand still wins.
+  When the items fall under more than one category, the charge is
+  **split by the receipt** into those parts, so a mixed warehouse run
+  counts in each budget bucket (see *Splits from a receipt* in the
+  Transactions guide). A category you set by hand still wins, and so
+  does a split you edit or remove.
 - The items become **searchable** from the Transactions page like any
   other line items.
 - Charges an import can't explain are left alone. A Costco fuel or
@@ -210,12 +214,14 @@ everything already collected.
 
 ## What receipts never do
 
-Budget math is unchanged: the **transaction's own total** is the only
-number the verdict, budgets, and reports see. Line items explain a
-charge; they never re-bucket or split it. To count one charge under
-several categories, **split the row by hand** (the ✂ action in its ⋯
-menu — see the Transactions guide); the receipt then documents what the
-parts were.
+A receipt you photograph or attach leaves the charge whole: the
+**transaction's own total** is the only number the verdict, budgets,
+and reports see, and its line items explain the charge without
+re-bucketing it. Only a matched store record (an Amazon order, a Costco
+receipt) splits a charge, and only by its own item categories. To count
+any other charge under several categories, **split the row by hand**
+(the ✂ action in its ⋯ menu — see the Transactions guide); the receipt
+then documents what the parts were.
 
 ## Gotchas
 

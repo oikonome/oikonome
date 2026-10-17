@@ -111,9 +111,16 @@ SELF_WRITE_OK = ("/api/logout", "/api/password/change", "/api/totp",
 # enrolled factor still do not reach a route listed here.
 READ_POST_OK = (
     # the conversational assistant over the household's own ledger: it
-    # routes tool calls that only SELECT and returns prose. Nothing it can
-    # reach writes a row, so it is a read in every sense but the verb.
+    # routes tool calls that only SELECT and returns prose (and, under
+    # /report, the same answer as an HTML page). Nothing it can reach
+    # changes the household's data; the one row an ask writes is the
+    # caller's own entry in the question log, and the trim that bounds the
+    # log deletes only the caller's own older entries, so a viewer asking
+    # touches no one else's rows. Exact paths, not a
+    # family: the question log under /assistant/history is deleted
+    # through the same prefix, and that is a write.
     "/api/assistant",
+    "/api/assistant/report",
 )
 
 # Owner-only path families. Prefix match at a segment boundary, so
@@ -222,6 +229,36 @@ OWNER_ONLY_SETTINGS = frozenset({
 # `owner &&` gating in lockstep, which the member-role test pins.
 
 
+# Owner-only settings a member's save is REFUSED for changing instead of
+# having them dropped. Each one decides what the household's data becomes
+# — how far back the next bank link backfills (which cannot be widened once
+# the link is made), and whether the nightly finder and the bank's own
+# stream offer new bills and income at all — and a member's Import or
+# Bills page shows the choice, so dropped it would read as saved and spring
+# back. The stored value echoed back by a whole-document save is not a
+# change and passes, so a member's budget edit in that same save still
+# lands. Values are the 403 text; the clients gate these on the owner role.
+OWNER_REFUSED_SETTINGS = {
+    "history_months": "only the household's owner can change how far back "
+                      "its history reaches",
+    "setup_mode": "only the household's owner can change how the "
+                  "household's bills are set up",
+    "bill_detection_auto": "only the household's owner can change whether "
+                           "new bills and income are found automatically",
+}
+
+
+def refused_setting_change(role: str, key: str, requested,
+                           stored) -> str | None:
+    """The 403 text when this role may not move `key` from `stored` to
+    `requested` (both already read the way the settings GET publishes
+    them), else None."""
+    if role == "owner" or key not in OWNER_REFUSED_SETTINGS \
+            or requested == stored:
+        return None
+    return OWNER_REFUSED_SETTINGS[key]
+
+
 def path_within(path: str, prefixes) -> bool:
     """Whether a request path is one of these endpoints or nested under one.
 
@@ -261,7 +298,7 @@ def read_only_route(path: str) -> bool:
     billed or step-up door. Adding a route here must never buy anything
     but the role gate.
     """
-    return path_within(path, READ_POST_OK)
+    return path in READ_POST_OK
 
 
 def can_write(role: str, path: str) -> bool:

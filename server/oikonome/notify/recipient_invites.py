@@ -250,6 +250,77 @@ def need_base_url(smtp) -> bool:
                 and not os.environ.get("OIKONOME_BASE_URL", "").rstrip("/"))
 
 
+def multi_household() -> bool:
+    """Whether this instance holds more than one household — the half of
+    the delivery-detail rule that does not depend on the address. It costs
+    an admin connection, so a caller deciding many addresses asks it once
+    and passes the answer to `delivery_detail_visible`. Unable to tell
+    counts as shared: that is the answer that discloses nothing."""
+    try:
+        from ..web.pages import _tenant_count
+        return _tenant_count() > 1
+    except Exception:                                    # noqa: BLE001
+        log.exception("household count for the delivery-detail rule failed")
+        return True
+
+
+def delivery_detail_visible(tenant_id, email: str, *,
+                            member: bool | None = None,
+                            invite_state: str | None = None,
+                            multi_tenant: bool | None = None) -> bool:
+    """Whether this household may see the detail of the delivery record for
+    an address — bounce vs complaint, the provider's own words — or only
+    that its mail to the address is held.
+
+    The record is keyed on the address, instance-wide, so on a box with
+    several households it may have come from another household's mail.
+    Whether a mailbox bounced or marked mail as spam is the business of the
+    households it answers to: one of their own accounts, or a recipient who
+    accepted their invitation. A single-household box has no one else the
+    record could belong to, so there every address is visible.
+
+    The ONE rule for every surface that shows a delivery record (the
+    recipient grid, Resend's answer). A caller that already holds the
+    household's view of the address passes `member` (an account on this
+    household) and `invite_state`; otherwise both are looked up. A caller
+    deciding many addresses passes `multi_tenant` (from `multi_household`)
+    so the household count is asked once, not once per address. Unable to
+    tell is the answer that discloses nothing."""
+    e = _norm(email)
+    try:
+        if member is None:
+            conn = _conn()
+            try:
+                standing = conn.execute(
+                    """SELECT 1 FROM users
+                        WHERE tenant_id = %s AND lower(email) = %s
+                       UNION ALL
+                       SELECT 1 FROM recipient_invites
+                        WHERE tenant_id = %s AND email = %s
+                              AND accepted_at IS NOT NULL
+                       LIMIT 1""", (tenant_id, e, tenant_id, e)).fetchone()
+            finally:
+                conn.close()
+            if standing:
+                return True
+        elif member or invite_state == "accepted":
+            return True
+        if multi_tenant is None:
+            multi_tenant = multi_household()
+        return not multi_tenant
+    except Exception:                                    # noqa: BLE001
+        log.exception("recipient standing check failed")
+        return False
+
+
+def _complaint_reason(tenant_id, e: str) -> str:
+    """What Resend may say about a complaint on this address: `complained`
+    or the generic `held` (`delivery_detail_visible` has the rule). The
+    complaint still stops the send either way; only the word changes."""
+    return ("complained" if delivery_detail_visible(tenant_id, e)
+            else "held")
+
+
 def resend(tenant_id, email: str, *, invited_by=None,
            inviter: str | None = None) -> dict:
     """The Resend button: `{"sent": bool, "reason": str}`, synchronously.
@@ -259,7 +330,8 @@ def resend(tenant_id, email: str, *, invited_by=None,
     it). Reasons when something went out: `invited` (a fresh link) and
     `delivery_check`. Reasons when nothing did: `accepted` (already
     receiving the mail, nothing to recover), `declined`, `complained`,
-    `cooldown`, `cap`, `undelivered` (the relay refused the mail),
+    `held` (a complaint this household has no standing to see, so it is
+    told only that mail to the address is held), `cooldown`, `cap`, `undelivered` (the relay refused the mail),
     `no_mail` (no relay configured for a check, or a relay but no
     OIKONOME_BASE_URL to build an invitation link under), `blocked`,
     `invalid`, `error`.
@@ -276,7 +348,7 @@ def resend(tenant_id, email: str, *, invited_by=None,
         if st and st["state"] == "complained":
             # a spam complaint is the recipient refusing the mail itself;
             # an owner's Resend must not override it
-            return {"sent": False, "reason": "complained"}
+            return {"sent": False, "reason": _complaint_reason(tenant_id, e)}
     from ..web.app import (_deliver_recipient_invite, _tenant_smtp,
                            record_unbuildable_link, smtp_unresolved)
     smtp = _tenant_smtp(tenant_id)
@@ -354,7 +426,8 @@ def _send_delivery_check(tenant_id, email: str, inviter) -> dict:
         return {"sent": False, "reason": "no_mail"}
     st = delivery.state_for(email)
     if st and st["state"] == "complained":
-        return {"sent": False, "reason": "complained"}
+        return {"sent": False,
+                "reason": _complaint_reason(tenant_id, _norm(email))}
     # An address the operator deactivated at the provider, or the provider
     # blocked, stays as it is: the household's Resend must not reverse a
     # decision it did not make, with the operator's provider credential.

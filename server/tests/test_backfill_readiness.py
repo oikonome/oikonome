@@ -167,6 +167,53 @@ class BackfillEndpointTests(unittest.TestCase):
         self.assertIsNone(empty["earliest"])
         self.assertEqual(empty["progress"], 0.0)
 
+    def test_an_item_fills_against_the_window_its_link_asked_for(self):
+        """The window cannot be changed on an Item once it is made: one
+        linked for two years keeps backfilling two years after the
+        household picks three months. Measured against the household's new
+        choice, three months of landed history would read as a full bar
+        while most of that Item's history is still to come."""
+        import datetime as dt
+        from oikonome.engine import budget
+        self._item("it-two-years", raw=json.dumps({"days_requested": 730}))
+        self._item("it-before-record")          # predates the record: 730
+        self._item("it-short", raw=json.dumps({"days_requested": 93}))
+        start = (dt.date.today() - dt.timedelta(days=92)).isoformat()
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            with budget.config_txn(conn) as cfg:
+                cfg["history_months"] = 3
+            # an account of each Item's own (the shared fixture accounts
+            # would go with the Items when the next test clears them)
+            for n, iid in enumerate(("it-two-years", "it-before-record",
+                                     "it-short")):
+                acct = f"acct-{iid}"
+                conn.execute(
+                    "INSERT INTO accounts (id, item_id, name, type, "
+                    "subtype, balance_current) VALUES "
+                    "(%s, %s, 'Window Checking', 'depository', 'checking', 0)",
+                    (acct, iid))
+                add_txn(conn, start, 10.0 + n, f"FIRST {n}", account=acct)
+        finally:
+            conn.close()
+        try:
+            r = self.client.get("/api/onboarding/backfill").json()
+        finally:
+            conn = tenancy.tenant_connect(self.tid)
+            try:
+                with budget.config_txn(conn) as cfg:
+                    cfg.pop("history_months", None)
+            finally:
+                conn.close()
+        by = {i["id"]: i for i in r["items"]}
+        self.assertFalse(r["all_ready"])
+        for iid in ("it-two-years", "it-before-record"):
+            self.assertFalse(by[iid]["ready"], iid)
+            self.assertLess(by[iid]["progress"], 0.2, iid)
+        # an Item linked under the short window is as far along as it gets
+        # before the bank says complete
+        self.assertEqual(by["it-short"]["progress"], 0.95)
+
     def test_progress_is_full_only_when_the_bank_says_complete(self):
         self._item("it-done", tx_update_status="HISTORICAL_UPDATE_COMPLETE")
         r = self.client.get("/api/onboarding/backfill").json()
@@ -230,6 +277,11 @@ class BackfillPollIsReadOnlyTests(unittest.TestCase):
                 """INSERT INTO items (id, aggregator, institution_name,
                                       access_token)
                    VALUES ('it-wait', 'plaid', 'P Bank', 'tok')""")
+            # its first pull finished a while ago; the rest of the history
+            # is still on its way
+            conn.execute(
+                "INSERT INTO sync_log (item_id, added, ran_at) "
+                "VALUES ('it-wait', 0, now() - interval '5 minutes')")
         finally:
             conn.close()
 
@@ -261,26 +313,34 @@ class BackfillPollIsReadOnlyTests(unittest.TestCase):
             self.assertIsNone(self._sync_state())
             st.assert_not_called()
 
-    def test_nudge_post_claims_the_sync_job(self):
+    def test_the_nudge_queues_a_pull_on_the_worker_and_pulls_nothing_here(self):
         from unittest import mock
-        with mock.patch("oikonome.jobs.worker.sync_tenant",
-                        return_value={"it-wait": "ok"}):
+
+        from oikonome.jobs import worker
+        queued = []
+        with mock.patch("oikonome.jobs.worker.sync_tenant") as st, \
+                mock.patch("oikonome.jobs.worker._sync_item_body") as body, \
+                mock.patch.object(worker, "BACKFILL_NUDGE_WINDOW_S",
+                                  10 ** 9), \
+                mock.patch.object(
+                    worker, "_enqueue_in_background",
+                    lambda what, job, *a, job_id=None:
+                        queued.append((job, a, job_id))):
             r = self.client.post("/api/onboarding/backfill/nudge")
             self.assertEqual(r.status_code, 200, r.text)
-            body = r.json()
-            self.assertEqual(set(body), {"items", "all_ready", "syncing"})
-            self.assertTrue(body["syncing"])
-            # wait for the background thread to settle the row INSIDE the
-            # mock; a thread left running would outlive the patch, re-mark
-            # the job running with the real sync, and make a later test see
-            # syncing=True
-            import time
-            for _ in range(100):
-                if self._sync_state() == "done":
-                    break
-                time.sleep(0.05)
-        # what matters is that the POST, not the GET, took the claim
-        self.assertEqual(self._sync_state(), "done")
+            body_json = r.json()
+            self.assertEqual(set(body_json), {"items", "all_ready",
+                                              "syncing"})
+            self.assertTrue(body_json["syncing"])
+            # a second nudge within the minute names the same job
+            self.client.post("/api/onboarding/backfill/nudge")
+        st.assert_not_called()
+        body.assert_not_called()
+        self.assertEqual([q[0] for q in queued], ["sync_item", "sync_item"])
+        self.assertEqual(queued[0][1], (str(self.tid), "it-wait", False))
+        self.assertEqual(queued[0][2], queued[1][2])
+        # the web process claimed nothing it would have to settle
+        self.assertIsNone(self._sync_state())
 
     def test_nudge_is_owner_only(self):
         inv = self.client.post("/api/invites",
@@ -313,7 +373,8 @@ class WizardGateWiringTests(unittest.TestCase):
 
     def test_step_two_waits_for_the_backfill(self):
         w = self._src("pages/Welcome.tsx")
-        self.assertIn("<BackfillGate><Bills autoDetect /></BackfillGate>", w,
+        # the auto pane carries the scan; it must not mount until the gate opens
+        self.assertIn("<BackfillGate><AutoBillsPane /></BackfillGate>", w,
                       "detection must not mount until the gate opens")
         self.assertIn("onboardingBackfill", w)
 
@@ -336,7 +397,7 @@ class WizardGateWiringTests(unittest.TestCase):
         self.assertIsNotNone(m, "the wizard must compute backfillReady")
         self.assertIn("isError", m.group(1))
         self.assertIn("all_ready", m.group(1))
-        bills = re.search(r"title: \"Confirm bills & income\".*?body:", w,
+        bills = re.search(r"label: \"Confirm bills & income\".*?body:", w,
                           re.S)
         self.assertIsNotNone(bills)
         self.assertRegex(bills.group(0),
@@ -358,6 +419,9 @@ class WizardGateWiringTests(unittest.TestCase):
                       re.S)
         self.assertIsNotNone(m, "the auto-scan guard is gone")
         self.assertIn("q.isSuccess", m.group(1))
+        # the wizard's own auto pane runs the same scan under the same guard
+        wb = self._src("components/WizardBills.tsx")
+        self.assertRegex(wb, r"if \(q\.isSuccess && !ran\.current\)")
 
     def test_gate_keeps_nudging_while_it_waits(self):
         # one nudge on mount is not enough: the link-time pull is still

@@ -77,6 +77,11 @@ export async function registerNativePush(
     // An unreadable /me falls through: the server still says no.
     const me = await client.me().catch(() => undefined);
     if (sharedLock(me, "grant")) return "shared";
+    // an account still enrolling its second factor is refused every
+    // write, this one included: leave the once-per-sign-in attempt
+    // unspent, and ask for no permission yet — the tabs layout calls
+    // again once the lockout clears
+    if (me?.needs_2fa) { attempted = false; return "skipped"; }
     const Notifications = await import("expo-notifications");
     const perm = await Notifications.getPermissionsAsync();
     let status = perm.status;

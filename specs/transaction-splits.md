@@ -9,9 +9,10 @@ Decisions:
    flow category), each non-zero with the row's sign, distinct
    categories, summing to the row's amount to the cent. Validated in one
    place (`engine/splits.validate`) and refused with a sentence the
-   client shows as-is. No proportional or receipt-derived splitting:
-   a receipt's items describe, a split re-buckets, and the arithmetic of
-   a split is the person's claim about their money.
+   client shows as-is. A person's split is never proportional or
+   derived for them: the arithmetic of a hand split is their claim about
+   their money. (A STORE's split is — decision 6 — and is marked as
+   such, so the two are never confused.)
    Only a row the spend rollups read can be split — exactly
    `budget.SPEND_ONLY_SQL` (`splits.SPLITTABLE_SQL`), nothing stricter: a
    refund, transfer, card payment or loan-account row would carry parts
@@ -62,10 +63,36 @@ Decisions:
    rewrite); business books (Schedule C classes) are
    per-row and unaffected.
 5. **Surfaces.** The ledger row carries `split` (the parts, stored keys)
-   in the three-way row contract; the category filter and the assistant's
-   category search answer for any part. Web: ✂ in the row's ⋯ strip, a
-   panel under the row (`SplitPanel`), the parts drawn in the category
-   cell in place of the picker. Mobile: a card on the transaction screen
-   with the same editor, the category sheet serving one part at a time;
-   a "✂ split N ways" mark on the ledger row. Export/restore round-trips
-   `transaction_splits`.
+   and `split_source` in the three-way row contract; the category filter
+   and the assistant's category search answer for any part. Web: ✂ in
+   the row's ⋯ strip, a panel under the row (`SplitPanel`), the parts
+   drawn in the category cell in place of the picker, the pill saying
+   "split by receipt" for a store's parts. Mobile: a card on the
+   transaction screen with the same editor, the category sheet serving
+   one part at a time; a "✂ split N ways [by receipt]" mark on the
+   ledger row. Export/restore round-trips the PERSON's
+   `transaction_splits`; a store's are regenerated from the restored
+   records.
+6. **A store's records split the charge they explain
+   (`transaction_splits.source` = 'amazon' / 'costco').** The budget's
+   food bucket reads "Costco - Food & Drink" per PART. Without a split, a
+   mixed receipt would sit whole in its dominant category, so the hardware
+   half of a grocery run would count as food and the grocery half of a
+   hardware run would not. `store_match.record_parts` buckets a matched record's items by
+   category (Costco: the receipt's per-item department category and
+   `amount`; Amazon: the per-item category the local model stamps on
+   `items_json` and the item `price`), nets a storewide coupon pro rata,
+   scales the buckets to the cents the card was charged with
+   largest-remainder rounding, and writes them under the store's prefix
+   when two or more remain — validated by the same `splits.validate` a
+   person's parts pass. Recomputed from scratch with the match on every
+   run (`DELETE … WHERE source = <store>`), never over a row that has a
+   hand split or whose category the person pinned (`override_source =
+   'user'`, the pins restated just before), never on money in. A charge
+   that is one of several for one record (an order billed per shipment)
+   takes the record's proportions scaled to its own amount — the record
+   does not say which item shipped when. The person outranks the store
+   the way they outrank every machine pass: PUT replaces the parts as
+   theirs; DELETE on a store's parts also pins the row's category
+   (`data.set_category`), so the next run reads the row as answered;
+   clearing that pin hands the row back to the receipt.

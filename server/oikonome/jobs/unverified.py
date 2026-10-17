@@ -20,7 +20,9 @@ confirmed an address:
   external release included, exactly like a deletion the operator or the
   owner asked for. There is no second wipe path.
 
-Clicking any of the links confirms the address on the spot (`confirm`);
+Clicking any of the links — any unexpired one mailed to the address the
+account is still at, an earlier one included — confirms the address on
+the spot (`confirm`);
 a frozen household comes back when the person presses the button that
 click lands on (`reopen`), which is a POST no mail scanner sends.
 
@@ -158,9 +160,10 @@ def reopen(admin, user_id) -> str | None:
 
     Only a VERIFIED user reopens anything, and that is the whole of what
     the token has to have achieved: ANY unexpired link this mailbox was
-    sent will do, including one a newer mint superseded, because minting
-    burns the older link and nothing can tell that shape from a link a
-    scanner spent. All of them were mailed to the same address, none
+    sent will do, spent or not: a scanner may have spent it, and nothing
+    can tell that shape from a person's own click. All of them were
+    mailed to the same address (a link stops answering once the account
+    moves to another — email_verify), none
     outlives its week, and none of them lifts anything until that address
     is proved — so the door is as wide as the mailbox and no wider.
     Demanding the newest link would only strand a person who opens the
@@ -363,16 +366,27 @@ def _freeze(admin, tid: str, now: dt.datetime) -> str | None:
         log.warning("unverified freeze of %s held: notice not sent", tid)
         return "held"
     with admin.transaction():
-        # re-assert under the row lock: a click since the candidate scan
-        # (confirm() takes the same lock) makes this household somebody's
+        # Re-assert under row locks: a click since the candidate scan
+        # makes this household somebody's. The tenant row orders this
+        # against the purge and a reopen; the household's USER rows are
+        # what orders it against a click, because confirm() writes the
+        # user row and never the tenant — it takes that row's lock first
+        # (email_verify.consume). So a click that committed before these
+        # locks is seen by the re-read below, and one arriving after waits
+        # for this freeze to commit and then finds a frozen household,
+        # whose confirmed page offers the reopen button.
         locked = admin.execute(
             "SELECT 1 FROM tenants WHERE id=%s "
             "AND coalesce(status,'active')='active' FOR UPDATE",
             (tid,)).fetchone()
+        if locked is None:
+            return None
+        admin.execute("SELECT 1 FROM users WHERE tenant_id=%s FOR UPDATE",
+                      (tid,))
         proven = admin.execute(
             "SELECT 1 FROM users WHERE tenant_id=%s AND (verified_at IS NOT "
             "NULL OR first_verified_at IS NOT NULL)", (tid,)).fetchone()
-        if locked is None or proven is not None:
+        if proven is not None:
             return None
         # and re-ask the money question here too. The candidate scan ran
         # before a reminder round and a whole SMTP round trip ago, and a

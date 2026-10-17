@@ -84,6 +84,8 @@ class TodayFullGapTests(unittest.TestCase):
             r["plan_surplus"], 6000 - r["avg_bills"] - r["variable_budget"],
             places=2)
         self.assertGreater(r["avg_bills"], 0)
+        # this month's own schedule, beside the evened average
+        self.assertAlmostEqual(r["scheduled_month"], 720.0, places=2)
         self.assertLess(r["avg_bills"], fixed)   # July carries the annual hit
         self.assertIsNone(r["variable_scale"])   # dynamic budget off
         self.assertIn("annual",

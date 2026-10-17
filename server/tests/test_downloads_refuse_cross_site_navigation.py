@@ -15,7 +15,8 @@ from fastapi.testclient import TestClient
 
 from .util import _ensure_db
 
-PATHS = ["/api/business/export.csv", "/api/receipts/report?format=csv"]
+PATHS = ["/api/business/export.csv", "/api/receipts/report?format=csv",
+         "/api/transactions/export?format=csv"]
 
 
 class CrossSiteDownloadTests(unittest.TestCase):

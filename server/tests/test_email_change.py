@@ -1,7 +1,7 @@
 """Change the login email/username. Re-auth like the
 other account-security doors; the write goes through the ADMIN
 connection (keeps the app role out of users.email). On hosted
-the new address starts unverified and a verification token is minted.
+the change waits for the new mailbox to confirm it.
 """
 
 import os
@@ -119,27 +119,24 @@ class EmailChangeTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["email"], new.lower())
 
-    def test_hosted_resets_verification(self):
+    def test_hosted_change_waits_for_the_new_mailbox(self):
+        """On hosted the address is only asked for: the account stays on
+        the old one, and /api/me says which address is pending (the whole
+        two-step road is tests/test_hosted_email_change_waits_for_the_new_mailbox)."""
         os.environ["OIKONOME_HOSTED"] = "1"
         try:
-            c, _ = self._fresh()   # hosted signup starts unverified anyway
+            c, old = self._fresh()
             new = f"hv-{uuid.uuid4().hex[:8]}@example.dev"
             r = c.post("/api/email/change",
                        data={"new_email": new, "password": PW})
             self.assertEqual(r.status_code, 200)
-            self.assertTrue(r.json()["verify_sent"])
-            self.assertFalse(c.get("/api/me").json()["verified"])
-            # a verification row was minted for the user
-            admin = tenancy.admin_connect()
-            try:
-                uid = admin.execute("SELECT id FROM users WHERE email=%s",
-                                    (new,)).fetchone()["id"]
-                n = admin.execute("SELECT COUNT(*) AS n FROM "
-                                  "email_verifications WHERE user_id=%s AND "
-                                  "used_at IS NULL", (uid,)).fetchone()["n"]
-            finally:
-                admin.close()
-            self.assertEqual(n, 1)
+            # nothing was sent to the sign-in address, which stays verified
+            self.assertFalse(r.json()["verify_sent"])
+            self.assertEqual(r.json()["email"], old)
+            self.assertEqual(r.json()["pending_email"], new)
+            me = c.get("/api/me").json()
+            self.assertEqual(me["email"], old)
+            self.assertEqual(me["pending_email"], new)
         finally:
             os.environ.pop("OIKONOME_HOSTED", None)
 

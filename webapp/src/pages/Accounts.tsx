@@ -4,15 +4,19 @@
 // row), an Archived collapsible for closed/historical accounts, Top holdings.
 // Also SimpleFIN connect, Plaid hosted link and manual accounts.
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { openPlaidHostedLink, plaidLinkOutcome } from "../components/ConnectHub";
+import { openPlaidHostedLink, plaidLinkOutcome, usePlaidLinkResume,
+         firstSyncPending, useFirstSyncLanding }
+  from "../components/ConnectHub";
 import DemoLock from "../components/DemoLock";
+import { bankAwaitsConfirm, CONFIRM_TO_CONNECT, VerifyEmailCard }
+  from "../components/VerifyEmailCard";
 import { sharedLock } from "../sharedlogin";
 import ImportPage from "./Import";
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { ext } from "../ext";
 import { Link, useSearchParams } from "react-router";
 import { ago, api, errText, linkCardVisible, mmdd, money, type Account,
-         type Connection, type Settings } from "../api/client";
+         type Connection, type Me, type Settings } from "../api/client";
 import { signedBalance } from "../moneymath";
 import { patchList, removeFromList } from "../api/cache";
 import { canEdit, isOwner, isViewer } from "../role";
@@ -154,9 +158,17 @@ export default function Accounts({ embedded }: { embedded?: boolean } = {}) {
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const mayEdit = canEdit(me);
   const owner = isOwner(me);
+  // a bank link a closed or reloaded tab stopped watching is picked up
+  // here, so the person still learns how it ended
+  usePlaidLinkResume(owner && !embedded);
   const accounts = useQuery({ queryKey: ["accounts"], queryFn: api.accounts });
   const settings = useQuery({ queryKey: ["settings"], queryFn: api.settings });
-  const conns = useQuery({ queryKey: ["connections"], queryFn: api.connections });
+  const conns = useQuery({ queryKey: ["connections"], queryFn: api.connections,
+    // a just-linked bank's first sync runs on the worker: poll until it
+    // lands, then refresh the accounts it brings
+    refetchInterval: (q) =>
+      (q.state.data?.connections ?? []).some(firstSyncPending) ? 5000 : false });
+  useFirstSyncLanding(conns.data?.connections);
   const holds = useQuery({ queryKey: ["holdings"], queryFn: api.holdings });
   const [notice, setNotice] = useState<string | null>(null);
   const [editId, setEditId] = useState<string | null>(null);
@@ -540,7 +552,7 @@ function OwnerImport({ onDone }: { onDone: DoneFn }) {
                        shared demonstration login, which is refused them */
                     ? <DemoLock on={false}
                         shared={sharedLock(me.data, "credential")}>
-                        <ConnectCard onDone={onDone}
+                        <ConnectCard onDone={onDone} me={me.data}
                           hosted={!!me.data?.hosted}
                           used={me.data?.features?.institutions_used}
                           cap={me.data?.features?.institution_cap} />
@@ -569,6 +581,10 @@ function GroupRows({ g, archived, hidden, mayEdit, owner, primary, excluded,
   // are shown switched off, the refusal's sentence on hover
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const credLock = sharedLock(me.data, "credential");
+  // a fresh link for a removed connection is a new one, which a trial
+  // still waiting on confirmation cannot make (the ConnectCard's reason)
+  const relinkLock = credLock
+    ?? (bankAwaitsConfirm(me.data) ? CONFIRM_TO_CONNECT : null);
   const openLink = (itemId?: string, manageAccounts = false) => {
     setLinking(true);
     // a closed window or a refused re-auth resolves too — only a real
@@ -755,8 +771,8 @@ function GroupRows({ g, archived, hidden, mayEdit, owner, primary, excluded,
             /* the removed Item's token is gone — reconnect = a FRESH link
                (no item_id), not update mode */
             <>{" "}<button className="pri" style={{ padding: ".05rem .45rem", fontSize: 12 }}
-                    disabled={linking || !!credLock}
-                    title={credLock ?? "link this bank again"}
+                    disabled={linking || !!relinkLock}
+                    title={relinkLock ?? "link this bank again"}
                     onClick={() => openLink()}>
               reconnect ↗</button>
             </>
@@ -1310,8 +1326,8 @@ function EditRow({ a, owner, primary, excluded, onDone, onCancel }: {
   );
 }
 
-function ConnectCard({ onDone, hosted = false, used, cap }: {
-  onDone: DoneFn; hosted?: boolean;
+function ConnectCard({ onDone, me, hosted = false, used, cap }: {
+  onDone: DoneFn; me?: Me; hosted?: boolean;
   used?: number; cap?: number | null;
 }) {
   const [token, setToken] = useState("");
@@ -1319,6 +1335,9 @@ function ConnectCard({ onDone, hosted = false, used, cap }: {
   // the bank tab is slow to come back; a second click would open a second
   // Link session in the meantime
   const [linking, setLinking] = useState(false);
+  // a closed bank TAB tells nobody: the person says so, the wait ends and
+  // the server stops holding a connection slot for that window
+  const cancelLink = useRef(false);
   const connect = useMutation({
     mutationFn: () => api.simplefinConnect(token),
     onSuccess: (r) => {
@@ -1329,6 +1348,10 @@ function ConnectCard({ onDone, hosted = false, used, cap }: {
   });
   const full = typeof cap === "number" && typeof used === "number"
     && used >= cap;
+  // a free trial whose owner has not confirmed has an allowance of zero:
+  // the door is closed here, with the reason, before the tap the server
+  // refuses (the importer beside this card stays open)
+  const confirmFirst = bankAwaitsConfirm(me) ? CONFIRM_TO_CONNECT : null;
   return (
     <div className="card">
       <h2>Connect a bank</h2>
@@ -1345,19 +1368,32 @@ function ConnectCard({ onDone, hosted = false, used, cap }: {
               new tab. Balances and transactions arrive on their own after
               that.</>}
       </p>
+      {confirmFirst && (
+        <VerifyEmailCard me={me} inline>{confirmFirst}</VerifyEmailCard>)}
       <div style={{ display: "flex", gap: ".5rem", flexWrap: "wrap",
                     alignItems: "center" }}>
-        <button className="pri" disabled={full || linking}
-          title={full ? "you are at this account's institution limit" : undefined}
+        <button className="pri" disabled={full || linking || !!confirmFirst}
+          title={confirmFirst
+            ?? (full ? "you are at this account's institution limit"
+                     : undefined)}
           onClick={() => {
             setLinking(true);
-            void openPlaidHostedLink()
+            cancelLink.current = false;
+            void openPlaidHostedLink("",
+              { cancelled: () => cancelLink.current })
             .then((s) => onDone(plaidLinkOutcome(s, "add").text))
             .catch((e) => onDone(errText(e)))
             .finally(() => setLinking(false));
           }}>
           {linking ? "connecting…"
             : hosted ? "+ Connect an account ↗" : "+ Add via Plaid ↗"}</button>
+        {linking && (
+          <button type="button" className="linklike mut"
+            style={{ fontSize: 13 }}
+            onClick={() => { cancelLink.current = true; }}>
+            cancel — I closed the bank window
+          </button>
+        )}
       </div>
       {/* The two cards are peers, so they carry the same SHAPE: a
           heading, a line saying what this is, the action, then the
@@ -1374,7 +1410,7 @@ function ConnectCard({ onDone, hosted = false, used, cap }: {
           server: the cap has a per-tenant override an operator can raise,
           so no number is hardcoded here; the wording around them is the
           installed add-on's. */}
-      {typeof cap === "number" && typeof used === "number" && (
+      {typeof cap === "number" && typeof used === "number" && !confirmFirst && (
         <p className="sub" style={{ marginTop: ".6rem", marginBottom: 0 }}>
           {ext.allowanceNote(used, cap, full)}
         </p>

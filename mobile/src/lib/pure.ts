@@ -6,7 +6,7 @@
 // goal lost to a concurrent edit. The server suite runs that script
 // too, so `make test` goes red on a regression.
 import type { AccountRemoveMode, CustomBucket, ElevationProof,
-              ElevationStatus, SavingsGoal } from "./api";
+              ElevationStatus, IncomeScenario, SavingsGoal } from "./api";
 
 /** the screens' loose amount-field parser: "$1,234.56 " → 1234.56 */
 export const numv = (v: string) =>
@@ -168,29 +168,36 @@ export type DayHead = { kind: "day"; key: string; label: string;
 /** A ledger row, as far as day grouping cares. */
 type DatedRow = { id: string; date: string; amount: number;
                   category?: string | null;
-                  counts_as_spend?: boolean | null };
+                  counts_as_spend?: boolean | null;
+                  spend_amount?: number | null };
 
-/** What one day of the ledger cost.
+/** What one ledger row adds to the day's spending.
  *
- *  The house rule, not a sum of the column: transfers and card payments
- *  move money between the user's own accounts, and money in is not
- *  spending. Summing raw amounts would print a figure that disagrees with
- *  the verdict, the daily email and the Business worksheet, which all
- *  already exclude exactly these.
+ *  The server sends the verdict's own figure (spend_amount: net of a
+ *  partial reimbursement, a split row's matching parts' share under the
+ *  search's category filter, 0 for any row the verdict does not count — transfers, money in, excluded
+ *  or hidden accounts, linked shadows). Summing that, not the amount
+ *  column, is what makes a day subtotal agree with the month hero; the
+ *  client must not re-derive spend semantics, because the display
+ *  category can't see overrides collapsing to transfers or loan-account
+ *  rows.
  *
- *  The server decides which rows count (counts_as_spend, computed from the
- *  same SQL the verdict uses) — the client must not re-derive spend
- *  semantics: the display category can't see overrides collapsing to
- *  transfers or loan-account rows, so any local rule diverges. The
- *  category fallback below exists only for a NEW app against an OLD
- *  server that doesn't send the field yet — without it every day would
- *  total $0. Mirrors the web's TxnTable daySpend exactly. */
+ *  Fallbacks exist only for a NEW app against an OLDER server: the
+ *  counts_as_spend flag with the gross amount, and before that a category
+ *  rule — without them every day would total $0. Mirrors the web's
+ *  TxnTable rowSpend exactly. */
+export const rowSpend = (t: DatedRow): number => {
+  if (typeof t.spend_amount === "number") return t.spend_amount;
+  const counts = typeof t.counts_as_spend === "boolean"
+    ? t.counts_as_spend
+    : t.amount > 0 && !(t.category || "").includes("TRANSFER");
+  return counts ? t.amount : 0;
+};
+
+/** What one day of the ledger cost: the sum of rowSpend, never the
+ *  amount column (see rowSpend). Mirrors the web's TxnTable daySpend. */
 export const daySpend = (group: readonly DatedRow[]) =>
-  group.reduce((sum, t) =>
-    sum + ((typeof t.counts_as_spend === "boolean"
-            ? t.counts_as_spend
-            : t.amount > 0 && !(t.category || "").includes("TRANSFER"))
-           ? t.amount : 0), 0);
+  group.reduce((sum, t) => sum + rowSpend(t), 0);
 
 /** "Thu · Aug 13" — the weekday is the reason the divider exists.
  *
@@ -584,6 +591,31 @@ export function institutionAllowance(cap?: number | null, used?: number):
     { known: boolean; full: boolean } {
   const known = typeof cap === "number" && typeof used === "number";
   return { known, full: known && used! >= cap! };
+}
+
+// ---- an address still to confirm closes the hosted bank door ----
+// Hosted only: until an owner of the household has confirmed, the plan's
+// institution allowance is zero and the server refuses the link, so every
+// add-a-bank door shows the confirm card and disables itself first.
+// `verified` absent (self-host, an older server) is never "unconfirmed".
+// Statement and CSV imports stay open. Mirrors webapp awaitsEmailConfirm.
+export function awaitsEmailConfirm(
+    me: { hosted?: boolean; verified?: boolean } | undefined): boolean {
+  return !!me?.hosted && me.verified === false;
+}
+
+// Whether the add-a-bank doors are closed until an owner confirms. The
+// server says so (`features.bank_awaits_confirm`), because only it knows
+// why the allowance is 0: an ordinary free trial waits on confirmation, a
+// paying household does not, whether or not its owner has confirmed. Only
+// a server too old to say falls back to awaitsEmailConfirm. Mirrors
+// webapp bankAwaitsConfirm.
+export function bankAwaitsConfirm(
+    me: { hosted?: boolean; verified?: boolean;
+          features?: { bank_awaits_confirm?: boolean } } | undefined):
+    boolean {
+  const said = me?.features?.bank_awaits_confirm;
+  return typeof said === "boolean" ? said : awaitsEmailConfirm(me);
 }
 
 // ---- net-worth trend timeframe toggles (mirrors webapp NetWorth.tsx) ----
@@ -1457,6 +1489,59 @@ export function linkPollMayRetry(e: unknown): boolean {
   return status < 400 || status >= 500 || status === 408 || status === 429;
 }
 
+/** True when the household has no checking account the cash runway can
+ *  start from (card-only or savings-only). The server says so outright;
+ *  an older payload is read by its null checking balance. Cash ahead is
+ *  then unknown, not $0, so no "short" or "tight" line may be drawn from
+ *  it. (web: Today.tsx noChecking) */
+export function noCheckingLinked(
+  runway: { checking: number | null; no_checking?: boolean } | null
+    | undefined,
+  forecast: { no_checking?: boolean } | null | undefined,
+): boolean {
+  return !!forecast?.no_checking || !!runway?.no_checking
+    || (!!runway && runway.checking == null);
+}
+
+/** What a bank saved but not yet pulled says on its connection row and in
+ *  the link's own result line — the web's FIRST_SYNC_RUNNING
+ *  (webapp/src/components/ConnectHub.tsx), word for word. */
+export const FIRST_SYNC_RUNNING =
+  "first sync running — accounts appear in a minute";
+
+/** A live Plaid connection whose first pull has not landed yet: no
+ *  last_ok and nothing wrong with it (the web's firstSyncPending). */
+export function firstSyncPending(c: {
+  aggregator: string; last_ok: string | null; status: string | null;
+  status_kind?: string }): boolean {
+  if (c.aggregator !== "plaid" || c.last_ok) return false;
+  const kind = c.status_kind ?? "ok";
+  return kind === "ok" && !(c.status || "").startsWith("error")
+    && c.status !== "reaped";
+}
+
+/** The line a successful add earns: "Linked Chase ✓", and while its
+ *  first pull is queued on the worker, what happens next. */
+export function linkedLine(institution: string | undefined,
+                           firstSync?: string): string {
+  return `Linked ${institution || "bank"} ✓`
+    + (firstSync === "pending" ? ` — ${FIRST_SYNC_RUNNING}` : "");
+}
+
+/** What the in-app browser's answer says about the bank sign-in window.
+ *  iOS resolves only when the window closes ("cancel"/"dismiss"), so that
+ *  answer IS the close. Android resolves "opened" the moment the Custom
+ *  Tab starts, while the person is still signing in: that is no close at
+ *  all, and the close must come from the app returning to the foreground.
+ *  A close learned that way is only a guess (the person may have switched
+ *  apps mid-OAuth), so it never sets the session aside: the server's own
+ *  second look decides whether the link was abandoned. */
+export function linkWindowAnswer(type: string | undefined):
+    { closed: boolean; mayReleaseSlot: boolean } {
+  if (type === "opened") return { closed: false, mayReleaseSlot: false };
+  return { closed: true, mayReleaseSlot: true };
+}
+
 /** The bucket a business cost shows on the Books control: the one the
  *  server's P&L counts it in (a cost dated before the business started is
  *  start-up there), else the stored class, else operating. A control that
@@ -1525,12 +1610,15 @@ export function bizMemberDoorMissing(
 
 /** Whether a file in the app cache is one this app downloaded or wrote
  *  for the share sheet: the full-data export, the database dump
- *  (.sql.gz), CSVs, the year-end ZIP, the continuity PDF, the compliance
- *  calendar, receipt images, the diagnostic bundle (.json) and the
+ *  (.sql.gz), CSVs and the spreadsheet (.xlsx) the transactions list
+ *  downloads, the year-end ZIP, the continuity PDF, the compliance
+ *  calendar, receipt images, the diagnostic bundle (.json), the
+ *  assistant's answer report (.html — it carries household figures, so it
+ *  must not outlive a sign-out or an account switch) and the
  *  passphrase-sealed connections bundle (.oikx). The platform's own subdirectories are not ours to delete;
  *  the pickers' scratch folders are swept on their own (PICKER_SCRATCH). */
 export const isSharedDownload = (name: string): boolean =>
-  /\.(zip|csv|sql|gz|pdf|ics|jpe?g|png|webp|oikx|json)$/i.test(name);
+  /\.(zip|csv|xlsx|sql|gz|pdf|ics|jpe?g|png|webp|oikx|json|html)$/i.test(name);
 
 /** The folders in the app cache the photo and document pickers copy a
  *  picked file into: a photographed check (its routing and account
@@ -1665,12 +1753,18 @@ export function localDayOf(ts: string): string {
  *  would make it stop applying — there Settings offers the device zone
  *  instead. Never for a member or on a demo, never over a zone already
  *  chosen, and never a UTC/Etc zone: that is what a privacy-hardened
- *  browser reports, not where anyone is. */
+ *  browser reports, not where anyone is.
+ *
+ *  Not while the account still has to enrol a second factor either: the
+ *  server refuses every settings write until it has one, so an attempt
+ *  then is spent on a certain refusal. Answering false keeps the attempt
+ *  unspent, and the /api/me that follows enrolment says yes. */
 export function adoptsDeviceZone(m: {
-  role: string; demo?: boolean; hosted?: boolean;
+  role: string; demo?: boolean; hosted?: boolean; needs_2fa?: boolean;
   timezone?: string; timezone_source?: string;
 } | undefined, device: string): boolean {
   if (!m || m.role !== "owner" || m.demo || !m.hosted) return false;
+  if (m.needs_2fa) return false;
   if (m.timezone_source !== "instance") return false;
   if (!device || device === m.timezone) return false;
   return !/^(Etc\/|UTC$|GMT$|Universal$|Zulu$)/.test(device);
@@ -1902,14 +1996,13 @@ export function pushStillLive(
 
 /** The theme an owner's account asks for, from the stored settings value
  *  (the web's reconcile in App.tsx, same rule). Absent means never chosen,
- *  which is the dark default; "auto" is a choice of its own — follow the
- *  OS — and must survive the reconcile, or picking "match system" would
- *  snap back to dark on the next launch. Anything else is not a theme this
- *  build knows, and changes nothing. */
+ *  which follows the phone's own setting ("auto"); an explicit light or
+ *  dark pins. Anything else is not a theme this build knows, and changes
+ *  nothing. */
 export function accountTheme(
     stored: unknown): "auto" | "light" | "dark" | null {
   if (stored === undefined || stored === null || stored === "")
-    return "dark";
+    return "auto";
   return stored === "auto" || stored === "light" || stored === "dark"
     ? stored : null;
 }
@@ -1948,6 +2041,45 @@ export function cadenceChoices(list: [string, string][],
     if (v && !out.some(([k]) => k === v)) out.push([v, cadenceWords(v)]);
   }
   return out;
+}
+
+/** The ADD pickers' short list: the common cadences, one-time, and the
+ *  envelopes. Anything unusual (every 2 weeks, every 14 days, every 3
+ *  months) is one "Custom interval…" pick away — see CUSTOM_UNITS. The
+ *  values are the server's FREQ:interval wire format, never the words. */
+export const ADD_CADENCES: [string, string][] = [
+  ["DAILY:1", "daily"], ["WEEKLY:1", "weekly"], ["MONTHLY:1", "monthly"],
+  ["YEARLY:1", "yearly"], ["ONE_TIME:1", "one-time"],
+  ["ENVELOPE:1", "envelope (monthly pool)"],
+  ["ENVELOPE:12", "envelope (annual pool)"],
+];
+
+/** "Custom interval…" units. Days and weeks are here because a paycheck
+ *  every 2 weeks or a bill every 14 days is common, and months/years alone
+ *  could not express either. */
+export const CUSTOM_UNITS: [string, string][] = [
+  ["DAILY", "day(s)"], ["WEEKLY", "week(s)"], ["MONTHLY", "month(s)"],
+  ["YEARLY", "year(s)"],
+];
+
+/** The largest custom count the server takes for each unit: about 20
+ *  years of that unit, because the server bounds an interval by how long
+ *  one cycle lasts, not by the bare number. A bill saved past it is
+ *  refused, so the picker never sends one. */
+export const CUSTOM_MAX: Record<string, number> = {
+  DAILY: 7300, WEEKLY: 1043, MONTHLY: 240, YEARLY: 20,
+};
+
+/** The cap for one unit. A unit the table does not know gets the smallest
+ *  cap, so a guess can never send a count the server refuses. */
+export function customMax(unit: string): number {
+  return CUSTOM_MAX[unit.toUpperCase()] ?? 20;
+}
+
+/** The cadence a custom interval sends: a blank or nonsense count is 1,
+ *  and a count past the unit's cap is the cap. */
+export function customCadence(unit: string, n: string): string {
+  return `${unit}:${Math.min(customMax(unit), Math.max(1, parseInt(n, 10) || 1))}`;
 }
 
 // ---- the shared demonstration login: one owner login whose password is
@@ -2600,3 +2732,100 @@ export function ynabAllAnswered(
 /** A folder import's refusal of a YNAB register of several accounts:
  *  that file is finished on its own, where the accounts can be placed. */
 export const YNAB_SEVERAL = /covers \d+ YNAB accounts/;
+
+/** The savings goal the budget planner owns. Goal names are unique
+ *  case-insensitively on the server, so a goal typed as "savings" in the
+ *  Savings goals card IS the plan's Savings row; an exact-spelling match
+ *  would miss it, append a second "Savings", and have every planner save
+ *  refused as a duplicate. The web client applies the same predicate. */
+export const isPlanSavingsGoal = (name: string): boolean =>
+  name.trim().toLowerCase() === "savings";
+
+/** One income-scenario row as the editor holds it. `touched` marks a row
+ *  the person changed (or added) on this screen. */
+export interface ScenarioDraft {
+  name: string; take_home: string; cadence: string; touched?: boolean;
+}
+
+/**
+ * The income_scenarios list to save, given the editor's rows, the list it
+ * was seeded from (`baseline`) and the server's list read just before
+ * saving (`current`).
+ *
+ * The server replaces the whole list, so a save built only from the
+ * seeded copy would erase whatever another device or member saved since.
+ * Invariant: a row edited here wins; an untouched row takes its live
+ * server value; an untouched row that the server no longer has (and was
+ * in the baseline) was deleted elsewhere and stays deleted; a row the
+ * person removed here stays removed; a scenario added elsewhere since the
+ * baseline is carried through. Names compare case-insensitively, the
+ * same way the server rejects duplicates. The web client applies the same
+ * rule; keep the two in step.
+ */
+export function mergeIncomeScenarios(rows: readonly ScenarioDraft[],
+                                     baseline: readonly IncomeScenario[],
+                                     current: readonly IncomeScenario[]):
+    IncomeScenario[] {
+  const key = (n: string) => n.trim().toLowerCase();
+  const baseNames = new Set(baseline.map((s) => key(s.name)));
+  const curByName = new Map(current.map((s) => [key(s.name), s]));
+  const out: IncomeScenario[] = [];
+  const has = (n: string) => out.some((o) => key(o.name) === key(n));
+  for (const r of rows) {
+    const name = r.name.trim();
+    if (!name) continue;
+    if (!r.touched) {
+      const live = curByName.get(key(name));
+      if (live) { out.push(live); continue; }
+      if (baseNames.has(key(name))) continue;   // deleted elsewhere
+    }
+    out.push({ name, take_home: Number(r.take_home.replace(/[$,\s]/g, "")),
+               cadence: r.cadence });
+  }
+  for (const s of current)
+    if (!baseNames.has(key(s.name)) && !has(s.name))
+      out.push(s);                                // added elsewhere since
+  return out;
+}
+
+/** What the forced second-factor lockout does after asking the server
+ *  again. Enrolling a factor on the web signs every OTHER device out —
+ *  this phone's token included — so a 401 here is the expected answer to
+ *  "I set it up on the web", not a fault: the person is told to sign in
+ *  again. Still required → the phone's own Security screen, where an
+ *  authenticator can be set up without losing this sign-in. Cleared → the
+ *  lockout simply goes away. Anything else (offline, a 5xx) leaves the
+ *  lockout up and says so. */
+export type TwoFactorRecheck =
+  "sign-in-again" | "set-up-here" | "cleared" | "unreachable";
+export const SIGN_IN_AGAIN = "Sign in again to continue";
+export function twoFactorRecheck(r: {
+  me?: { needs_2fa?: boolean } | null; errorStatus?: number | null;
+}): TwoFactorRecheck {
+  if (r.errorStatus === 401) return "sign-in-again";
+  if (r.errorStatus != null || !r.me) return "unreachable";
+  return r.me.needs_2fa ? "set-up-here" : "cleared";
+}
+
+/** The planner's line under suggestions taken from under a month of
+ *  history: how many days the figures come from, and that they were
+ *  scaled to a month. Under the server's settled threshold
+ *  (min_rate_days) the rate is a few days' own, so the line says to
+ *  expect it to move.
+ *  With no finished day of ledger at all it says to come back tomorrow.
+ *  null when complete months stand behind the suggestions. Twin:
+ *  historyBasisNote in webapp/src/moneymath.ts. */
+export function historyBasisNote(s: {
+  history_days?: number; history_scaled?: boolean; min_rate_days?: number;
+  not_enough_history?: boolean;
+} | null | undefined): string | null {
+  // not one finished day of ledger: the server offers no suggestion
+  if (s?.not_enough_history)
+    return "Not enough history yet — come back tomorrow.";
+  if (!s || !s.history_scaled || !s.history_days) return null;
+  const n = s.history_days;
+  const head = `Based on ${n} day${n === 1 ? "" : "s"} of history — scaled to a month`;
+  return n < (s.min_rate_days ?? 7)
+    ? `${head} — under a week, so expect it to move; revisit after your first full month.`
+    : `${head}.`;
+}

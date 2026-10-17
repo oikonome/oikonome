@@ -102,7 +102,12 @@ ALTER TABLE sessions
     -- and WHICH passkey proved it (migration 120), so a credential
     -- rotation keeps that key and no other. NULL means the proof was a
     -- password or a recovery code, and no key is kept.
-    ADD COLUMN IF NOT EXISTS elevated_passkey_id UUID;
+    ADD COLUMN IF NOT EXISTS elevated_passkey_id UUID,
+    -- which passkey signed this session in (migration 187), so removing
+    -- that key ends the session. NULL = not a passkey sign-in. Filled at
+    -- insert from the sign-in's transaction-local setting.
+    ADD COLUMN IF NOT EXISTS signin_passkey_id UUID
+        DEFAULT NULLIF(current_setting('oikonome.signin_passkey', true), '')::uuid;
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_id ON sessions(id);
 
@@ -152,6 +157,10 @@ CREATE TABLE IF NOT EXISTS device_tokens (
 -- session by another name, and an elevation must not leak across rows
 ALTER TABLE device_tokens ADD COLUMN IF NOT EXISTS elevated_at TIMESTAMPTZ;
 ALTER TABLE device_tokens ADD COLUMN IF NOT EXISTS elevated_passkey_id UUID;
+-- the passkey whose sign-in this device token was minted from (migration
+-- 187); removing the key revokes the token
+ALTER TABLE device_tokens ADD COLUMN IF NOT EXISTS signin_passkey_id UUID
+    DEFAULT NULLIF(current_setting('oikonome.signin_passkey', true), '')::uuid;
 CREATE INDEX IF NOT EXISTS idx_device_tokens_user ON device_tokens(user_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_device_tokens_id ON device_tokens(id);
 
@@ -221,7 +230,9 @@ CREATE TABLE IF NOT EXISTS email_verifications (
     token_hash  TEXT NOT NULL UNIQUE,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     expires_at  TIMESTAMPTZ NOT NULL,
-    used_at     TIMESTAMPTZ
+    used_at     TIMESTAMPTZ,
+    -- the address the link was mailed to (migration 195)
+    sent_to     TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_email_verifications_user
     ON email_verifications(user_id);
@@ -584,6 +595,10 @@ CREATE TABLE IF NOT EXISTS transaction_splits (
     line      INTEGER NOT NULL,              -- 1-based, display order
     category  TEXT NOT NULL,                 -- stored key (FOOD_AND_DRINK / a custom name)
     amount    DOUBLE PRECISION NOT NULL,     -- same sign as the row; parts sum to it
+    -- who wrote the parts: 'user' (a hand split, outranks everything) or a
+    -- store matcher ('amazon' / 'costco' — the receipt's items, recomputed
+    -- on every match run, never over a person's)
+    source    TEXT NOT NULL DEFAULT 'user',
     PRIMARY KEY (tenant_id, txn_id, line),
     CONSTRAINT transaction_splits_txn_fk FOREIGN KEY (tenant_id, txn_id)
         REFERENCES transactions (tenant_id, id) ON DELETE CASCADE
@@ -1254,6 +1269,30 @@ CREATE TABLE IF NOT EXISTS bulk_import_files (
 -- predicate, a fraction of the per-row cost on a full ledger scan
 -- (migration 110 converted existing installs; keep the two in step).
 
+-- the assistant's log of questions and answers (migration 185): one row
+-- per answered question, instance-local, never exported
+CREATE TABLE IF NOT EXISTS assistant_turns (
+    tenant_id   UUID NOT NULL DEFAULT NULLIF(current_setting('app.tenant_id', true), '')::uuid,
+    id          UUID NOT NULL DEFAULT gen_random_uuid(),
+    asked_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    asked_by_id UUID,
+    asked_by    TEXT NOT NULL DEFAULT '',
+    question    TEXT NOT NULL,
+    answer      TEXT NOT NULL,
+    blocks      JSONB NOT NULL DEFAULT '[]'::jsonb
+        CONSTRAINT assistant_turns_blocks_is_a_list
+            CHECK (jsonb_typeof(blocks) = 'array'),
+    tools_used  TEXT[] NOT NULL DEFAULT '{}',
+    -- the conversation this turn belongs to: the first turn's id
+    thread_id   UUID NOT NULL DEFAULT gen_random_uuid(),
+    PRIMARY KEY (tenant_id, id)
+);
+CREATE INDEX IF NOT EXISTS assistant_turns_recent
+    ON assistant_turns (tenant_id, asked_at DESC);
+-- the thread index is migration 186's: schema.sql runs whole before the
+-- pending migrations on every start, and an index on a column a
+-- migration adds would fail on a database that predates it
+
 DO $$
 DECLARE t TEXT;
 BEGIN
@@ -1268,7 +1307,7 @@ BEGIN
         'transaction_splits','activity_log','webhooks','webhook_deliveries',
         'import_staging','business_entity','entity_membership','equity_movement',
         'business_txn_class','compliance_obligation','mileage_log','vendor_1099',
-        'bulk_import_jobs','bulk_import_files']
+        'bulk_import_jobs','bulk_import_files','assistant_turns']
     LOOP
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
         EXECUTE format('DROP POLICY IF EXISTS tenant_isolation ON %I', t);
@@ -1295,3 +1334,63 @@ CREATE TABLE IF NOT EXISTS ops_state (
     value      TEXT,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Plaid Hosted Link sessions on record, so the LINK webhook and a worker
+-- sweep can finish one no client is polling (migration 194). Admin
+-- connection only; `tenant` is named in every WHERE clause.
+CREATE TABLE IF NOT EXISTS plaid_link_sessions (
+    link_token      TEXT PRIMARY KEY,
+    tenant          UUID NOT NULL,
+    kind            TEXT NOT NULL,
+    item_id         TEXT,
+    manage_accounts BOOLEAN NOT NULL DEFAULT false,
+    institution     TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    exchanged       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    done_at         TIMESTAMPTZ,
+    reply           JSONB
+);
+CREATE INDEX IF NOT EXISTS plaid_link_sessions_open
+    ON plaid_link_sessions (tenant, created_at) WHERE done_at IS NULL;
+
+-- Plaid Items whose release failed during an erasure or reset, kept (token
+-- encrypted under the master key) until the nightly retry removes them
+-- (migration 194). Admin connection only.
+CREATE TABLE IF NOT EXISTS plaid_release_queue (
+    item_id       TEXT PRIMARY KEY,
+    tenant        TEXT,
+    access_token  TEXT NOT NULL,
+    client_id     TEXT NOT NULL,
+    secret        TEXT,
+    base_url      TEXT NOT NULL,
+    reason        TEXT NOT NULL,
+    queued_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    last_try_at   TIMESTAMPTZ,
+    last_error    TEXT
+);
+
+-- a hosted login-email change waits for the new mailbox (migration 196):
+-- the request is recorded here and the account moves only when the link
+-- mailed to the new address is followed and its button pressed.
+-- Control plane, no RLS, admin-only; sha256 of the link token at rest.
+CREATE TABLE IF NOT EXISTS email_change_requests (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    old_email   TEXT NOT NULL,
+    new_email   TEXT NOT NULL,
+    -- the credential that asked: a browser session or a phone's device
+    -- token (their API-safe ids), at most one of them
+    session_id  UUID,
+    device_id   UUID,
+    token_hash  TEXT NOT NULL UNIQUE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at  TIMESTAMPTZ NOT NULL,
+    used_at     TIMESTAMPTZ,
+    -- when its confirmation mail went out; NULL when a cap withheld it
+    -- (migration 197): the caps count only mail that was sent
+    mail_sent_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_change_requests_user
+  ON email_change_requests (user_id) WHERE used_at IS NULL;

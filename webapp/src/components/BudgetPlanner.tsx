@@ -1,10 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type CSSProperties, useEffect, useState } from "react";
 import { Link } from "react-router";
-import { api } from "../api/client";
+import { api, errText } from "../api/client";
 import { saveSettings } from "../api/cache";
-import { mergePlannerBuckets, plannerUnallocAuto, type PlannerRow }
-  from "../moneymath";
+import { historyBasisNote, isPlanSavingsGoal, mergePlannerBuckets,
+         plannerUnallocAuto, type PlannerRow } from "../moneymath";
 
 // The balance-your-budget planner — the wizard's budgets step AND the
 // standing /balance page share it.
@@ -40,6 +40,9 @@ export default function BudgetPlanner({ onSaved, standalone = false,
   // the Savings plan as saved when the planner opened: "Everything else"
   // is already net of it, so only a change from it moves the pool
   const [savingsSeed, setSavingsSeed] = useState(0);
+  // the numbers came from the suggestion, not a saved plan: only then
+  // does the history line describe what the person is looking at
+  const [fromHistory, setFromHistory] = useState(false);
   const numv = (v: string) => Number((v || "0").replace(/[$,\s]/g, "")) || 0;
   // unsaved edits signal — the Budget page skips remounting
   // this card after a sibling's save while it holds a draft
@@ -99,7 +102,7 @@ export default function BudgetPlanner({ onSaved, standalone = false,
       pick(s.data.other_monthly, sug.data?.suggestions.other_monthly),
       Math.round(existingTotal + seededTotal)));
     const savedGoal = (s.data.savings_goals ?? [])
-      .find((g) => g.name === "Savings");
+      .find((g) => isPlanSavingsGoal(g.name));
     // the ROW's presence means the user has spoken — an explicit
     // $0 is a remembered choice, not an invitation to re-prefill the
     // leftover. Only a truly absent goal lets the auto value fill first.
@@ -108,6 +111,7 @@ export default function BudgetPlanner({ onSaved, standalone = false,
       setSavingsSeed(numv(String(savedGoal.monthly_plan ?? 0)));
       setSavingsTouched(true);
     }
+    setFromHistory(!userSaved);
     setInit(true);
   }, [init, s.data, ob.data, sug.data, sug.isPending, standalone]);
 
@@ -174,9 +178,11 @@ export default function BudgetPlanner({ onSaved, standalone = false,
       // re-prefill the leftover on every return visit
       const plan = numv(savingsShown);
       const others = (cur.savings_goals ?? [])
-        .filter((g) => g.name !== "Savings");
+        .filter((g) => !isPlanSavingsGoal(g.name));
       const curGoal = (cur.savings_goals ?? [])
-        .find((g) => g.name === "Savings");
+        .find((g) => isPlanSavingsGoal(g.name));
+      // the stored goal keeps its own spelling: renaming it here would
+      // be an edit the person never made
       body.savings_goals = [...others,
         { ...(curGoal ?? { name: "Savings", target: 0,
                            tokens: [], start_balance: 0 }),
@@ -212,7 +218,9 @@ export default function BudgetPlanner({ onSaved, standalone = false,
     .map((r) => r.name.trim());
   // no food suggestion + no food history = categorization probably hasn't
   // caught up yet
-  const suggestPending = !(sug.data?.suggestions.food_monthly ?? 0);
+  // (not when the ledger is a day old: there is simply no history yet)
+  const suggestPending = !sug.data?.not_enough_history
+    && !(sug.data?.suggestions.food_monthly ?? 0);
   return (
     <div>
       <p className="mut" style={{ marginTop: 0 }}>
@@ -221,6 +229,10 @@ export default function BudgetPlanner({ onSaved, standalone = false,
         left becomes savings. Everything is pre-filled from your real
         history — adjust any number and the picture updates.
       </p>
+      {fromHistory && historyBasisNote(sug.data) && (
+        <p className="mut" style={{ marginTop: "-.4rem", fontSize: 13 }}>
+          {historyBasisNote(sug.data)}</p>
+      )}
       {/* the balance graphic: in / out / save, live as fields change */}
       {inc > 0 && (
         <div style={{ margin: "0 0 1rem", padding: ".8rem 1rem",
@@ -443,7 +455,7 @@ export default function BudgetPlanner({ onSaved, standalone = false,
                     display: "flex", flexWrap: "wrap", gap: ".6rem",
                     alignItems: "center",
                     justifyContent: standalone ? "flex-start" : "flex-end" }}>
-        {save.isError && <span className="mut">{String(save.error)}</span>}
+        {save.isError && <span className="mut">{errText(save.error)}</span>}
         {save.isSuccess && !standalone && (
           <span className="mut">Saved — Continue below.</span>)}
         {save.isSuccess && standalone && (

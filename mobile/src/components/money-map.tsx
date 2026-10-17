@@ -16,10 +16,15 @@ const money = (v: number) => money$(v, false);
 
 export interface PlanBucket {
   actual: number; expected: number; month_budget: number;
+  // paced_*: the share of the budget the month may spend (the whole of it
+  // unless the ledger began inside the month) — what Today's rows measure
+  // against, so they agree with the hero and the email. The Budget, Month
+  // and Year maps send none and fall back to the whole month.
+  paced_budget?: number;
   children?: { name: string; actual: number; expected: number;
-               month_budget: number }[];
+               month_budget: number; paced_budget?: number }[];
   display_actual?: number; display_expected?: number;
-  remaining_budget?: number;
+  remaining_budget?: number; paced_remaining_budget?: number;
 }
 // the web's PlanRow.to: where the row's transactions are
 /** The transactions screen with the filters a row's `to` names
@@ -90,17 +95,18 @@ export function planRows(
       actual: kids.length ? (food.display_actual ?? food.actual) : food.actual,
       expected: kids.length ? (food.display_expected ?? food.expected)
                             : food.expected,
-      budget: kids.length ? (food.remaining_budget ?? food.month_budget)
-                          : food.month_budget,
+      budget: kids.length ? (food.paced_remaining_budget
+                             ?? food.remaining_budget ?? food.month_budget)
+                          : (food.paced_budget ?? food.month_budget),
     });
     for (const c of kids)
       rows.push({ label: c.name, actual: c.actual, expected: c.expected,
-                  budget: c.month_budget, judged: true, to: ledger(c.name) });
+                  budget: c.paced_budget ?? c.month_budget, judged: true, to: ledger(c.name) });
   }
   if (other) {
     for (const c of other.children ?? [])
       rows.push({ label: c.name, actual: c.actual, expected: c.expected,
-                  budget: c.month_budget, judged: true, to: ledger(c.name) });
+                  budget: c.paced_budget ?? c.month_budget, judged: true, to: ledger(c.name) });
     const kids = other.children ?? [];
     rows.push({
       label: "Everything else", judged: true, to: ledger("other"),
@@ -110,8 +116,9 @@ export function planRows(
                           : other.actual,
       expected: kids.length ? (other.display_expected ?? other.expected)
                             : other.expected,
-      budget: kids.length ? (other.remaining_budget ?? other.month_budget)
-                          : other.month_budget,
+      budget: kids.length ? (other.paced_remaining_budget
+                             ?? other.remaining_budget ?? other.month_budget)
+                          : (other.paced_budget ?? other.month_budget),
     });
   }
   // bills + savings are IN the plan but never in the verdict

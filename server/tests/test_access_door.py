@@ -86,3 +86,26 @@ class AccessDoorTests(unittest.TestCase):
             page = self.client.get("/login").text
         self.assertNotIn("No account?", page)
 
+    def test_an_android_test_build_link_is_offered_only_when_set_and_https(self):
+        """An instance with a test build names where testers get it; one
+        without shows nothing, and a plain-http link is never offered."""
+        with patch.dict(os.environ, {"OIKONOME_ANDROID_TEST_URL":
+                                     "https://play.google.com/apps/internaltest/1"}):
+            self.assertEqual(self.client.get("/api/access").json()["android_test_url"],
+                             "https://play.google.com/apps/internaltest/1")
+        with patch.dict(os.environ, {"OIKONOME_ANDROID_TEST_URL": "http://example.com/x"}):
+            self.assertIsNone(self.client.get("/api/access").json()["android_test_url"])
+        with patch.dict(os.environ, {"OIKONOME_ANDROID_TEST_URL": ""}):
+            self.assertIsNone(self.client.get("/api/access").json()["android_test_url"])
+
+    def test_the_sign_in_page_names_the_android_test_build_only_when_set(self):
+        """The server-rendered sign-in page (the one a hosted instance serves)
+        carries the same quiet link as the API field, and nothing without it."""
+        with patch.dict(os.environ, {"OIKONOME_ANDROID_TEST_URL":
+                                     "https://play.google.com/apps/internaltest/1"}):
+            page = self.client.get("/login").text
+            self.assertIn("Android test build", page)
+            self.assertIn("https://play.google.com/apps/internaltest/1", page)
+        with patch.dict(os.environ, {"OIKONOME_ANDROID_TEST_URL": ""}):
+            self.assertNotIn("Android test build", self.client.get("/login").text)
+

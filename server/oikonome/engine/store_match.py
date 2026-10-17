@@ -14,15 +14,28 @@ negative (refunds positive). So a match is txn.amount == -record.amount.
 Matching is recomputed from scratch on every run (idempotent). Human
 decisions (manual_categories) are re-applied LAST so a run can never
 clobber a manual override — that ordering is load-bearing.
+
+A record whose items name more than one category also carves the charge
+into those categories as a split (transaction_splits, source = the store):
+a receipt that is part groceries and part household goods counts each part
+in its own category, instead of the whole charge in its dominant one. The parts are
+the items' categories weighted by their amounts and scaled to what the
+card was charged (tax and rounding spread pro rata, the last cent on the
+largest part), so they add up to the row the way a hand split must. They
+are the record's reading, recomputed with the match on every run, and they
+never displace a person's: a row with a hand split, or whose category the
+person pinned, is left alone.
 """
 from __future__ import annotations
 
 import datetime as dt
 import itertools
+import json
 import math
 import re
 from dataclasses import dataclass
 
+from . import splits as _splits
 from .compat import MAX_AMOUNT, as_date
 
 
@@ -112,8 +125,9 @@ def run_match(conn, store: Store) -> dict:
     split_col = (f", {store.split_records[0]} AS split_kind"
                  if store.split_records else "")
     records = [dict(r) for r in conn.execute(
-        f"SELECT dedup_key, date, amount, category, payment_method{split_col} "
-        f"FROM {store.records}")]
+        f"SELECT dedup_key, date, amount, category, payment_method, items_json"
+        f"{split_col} FROM {store.records}")]
+    by_key = {r["dedup_key"]: r for r in records}
 
     # Budget purchase rows only: a bare name regex would stamp
     # '<Store> - Unmatched' onto brokerage *stock trades* (a store's ticker
@@ -214,7 +228,25 @@ def run_match(conn, store: Store) -> dict:
 
     matched_ids = {m[0] for m in matches}
     kind = store.label.lower()
+    txn_amount = {t["id"]: t["amount"] for t in store_txns}
+    # the parts each matched charge would carry, from its record's items;
+    # None where the record reads as one category (or cannot be read)
+    auto_splits = [(txn_id, parts) for txn_id, dedup_key, _ in matches
+                   if (parts := record_parts(by_key[dedup_key].get("items_json"),
+                                             txn_amount[txn_id], prefix))]
+    split_rows = 0
     with conn.transaction():
+        # The parts were computed from the amount read above, outside this
+        # transaction. Lock the rows they are for, first and in id order
+        # (transactions before their splits, as splits.set_split takes
+        # them), so a sync cannot post a new amount between the check
+        # below and the insert; a row whose amount already moved is
+        # skipped there, and the next run splits what it now says.
+        if auto_splits:
+            conn.execute(
+                "SELECT id FROM transactions WHERE id = ANY(%s) "
+                "ORDER BY id FOR UPDATE",
+                (sorted(t for t, _ in auto_splits),))
         # Recompute from scratch: clear prior store overrides + matches —
         # THIS store's, by kind, never a person's pin that happens to
         # start with the store's name
@@ -260,10 +292,141 @@ def run_match(conn, store: Store) -> dict:
                           override_source = 'user'
                         WHERE id IN (SELECT transaction_id FROM manual_categories
                                       WHERE bill_id IS NULL)""")
+        # The record's split, recomputed from scratch like the match: THIS
+        # store's parts go, then come back for every matched charge whose
+        # items read as several categories. After the pins above, because
+        # a pinned row is the person's whole-row answer and gets no parts;
+        # a row carrying a hand split keeps it, whatever the receipt says.
+        #
+        # Parts go only where the match itself took the row — its override
+        # is this store's kind. That excludes a person's pin, and equally
+        # any override the store's rank did not displace above: the split
+        # is the record's reading at a finer grain, and a row whose
+        # whole-row category the store may not write may not have its
+        # parts written by the store either.
+        conn.execute("DELETE FROM transaction_splits WHERE source = %s", (kind,))
+        for txn_id, parts in auto_splits:
+            ok = conn.execute(
+                f"""SELECT t.amount FROM transactions t
+                     WHERE t.id = %s AND t.removed = 0
+                       AND t.override_source = %s
+                       AND NOT EXISTS (SELECT 1 FROM transaction_splits sp
+                                        WHERE sp.txn_id = t.id)
+                       AND ({_splits.SPLITTABLE_SQL})""",
+                (txn_id, kind)).fetchone()
+            if not ok or not _usable(ok["amount"]) or (
+                    round(ok["amount"] * 100) != round(txn_amount[txn_id] * 100)):
+                continue
+            for line, p in enumerate(parts, 1):
+                conn.execute(
+                    """INSERT INTO transaction_splits
+                           (txn_id, line, category, amount, source)
+                       VALUES (%s, %s, %s, %s, %s)""",
+                    (txn_id, line, p["category"], p["amount"], kind))
+            split_rows += 1
 
     key = store.label.lower()
     return {
         f"{key}_plaid_txns": len(store_txns),
         "matched": len(matches),
         "unmatched": len(store_txns) - len(matches),
+        "split": split_rows,
     }
+
+
+# ---- the record's split --------------------------------------------------
+
+def item_quantity(item: dict) -> float:
+    """How many of the item were bought, for weighting a unit price. A
+    quantity that is missing or not a positive count of things (zero, a
+    negative, text, a value whose product with the price is no sum of
+    money) counts as one: a bad quantity says nothing about the price, so
+    it does not cost the record its reading."""
+    q = item.get("quantity")
+    try:
+        q = float(q)
+        price = abs(float(item.get("price")))
+    except (TypeError, ValueError, OverflowError):
+        return 1.0
+    if not math.isfinite(q) or q <= 0 or not _usable(price * q):
+        return 1.0
+    return q
+
+
+def _item_buckets(items) -> dict[str, float] | None:
+    """What the record's items add up to per category. None when the items
+    cannot carry a split: no list, an item without a category, an amount
+    that is not money. Costco items carry `amount` (price × quantity, as the
+    register printed it), taken as it stands; Amazon items carry the UNIT
+    `price` and a `quantity`, so six of a $2 item weigh $12, not $2."""
+    if isinstance(items, str):
+        try:
+            items = json.loads(items)
+        except ValueError:
+            return None
+    if not isinstance(items, list) or not items:
+        return None
+    out: dict[str, float] = {}
+    for it in items:
+        if not isinstance(it, dict):
+            return None
+        cat = it.get("category")
+        if "amount" in it:
+            amt = it["amount"]
+        else:
+            amt = it.get("price")
+        if not isinstance(cat, str) or not cat.strip() or not _usable(amt):
+            return None
+        try:
+            amt = float(amt)
+        except (TypeError, ValueError):
+            return None
+        if "amount" not in it:
+            amt *= item_quantity(it)
+        out[cat.strip()] = out.get(cat.strip(), 0.0) + amt
+    return out
+
+
+def record_parts(items, charge: float, prefix: str) -> list[dict] | None:
+    """The split a matched charge takes from its record's items, as
+    [{category, amount}, …] in the row's sign, or None when the record
+    reads as one category (or cannot be read) and the single override is
+    the whole answer.
+
+    Buckets are the items' amounts per category; a negative bucket (a
+    storewide coupon on its own line) is netted pro rata into the
+    positive ones first, so a coupon lowers each category in proportion
+    to its share. The
+    buckets are then scaled to the cents the card was charged — tax,
+    shipping and rounding spread in proportion — with the largest
+    remainders taking the leftover cents, so the parts sum to the row
+    exactly. A bucket that rounds to nothing is dropped; fewer than two
+    parts left is no split. Only money out splits: a refund is one row."""
+    if not _usable(charge) or charge <= 0:
+        return None
+    buckets = _item_buckets(items)
+    if not buckets:
+        return None
+    owed = -sum(v for v in buckets.values() if v < 0)
+    pos = {c: v for c, v in buckets.items() if v > 0}
+    total = sum(pos.values())
+    if owed > 0 and total > 0:
+        pos = {c: v - owed * (v / total) for c, v in pos.items()}
+        pos = {c: v for c, v in pos.items() if v > 0}
+        total = sum(pos.values())
+    if len(pos) < 2 or total <= 0:
+        return None
+    want = round(charge * 100)
+    raw = {c: want * v / total for c, v in pos.items()}
+    cents = {c: int(math.floor(x)) for c, x in raw.items()}
+    short = want - sum(cents.values())
+    for c in sorted(raw, key=lambda c: (raw[c] - cents[c], pos[c]), reverse=True)[:short]:
+        cents[c] += 1
+    parts = [{"category": f"{prefix}{c}", "amount": n / 100}
+             for c, n in sorted(cents.items(), key=lambda kv: -kv[1]) if n > 0]
+    if len(parts) < 2:
+        return None
+    try:
+        return _splits.validate(charge, parts)
+    except _splits.SplitError:
+        return None

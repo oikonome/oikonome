@@ -1,9 +1,13 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { lazy, Suspense, useRef, useState } from "react";
-import { ago, api, AuthError, errText, type Connection, type Settings } from "../api/client";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { ago, api, AuthError, errText, req, toast, type Connection,
+         type Settings } from "../api/client";
 import { ext } from "../ext";
 import { patchQuery, removeFromList } from "../api/cache";
 import { sharedLock } from "../sharedlogin";
+import { bankAwaitsConfirm, CONFIRM_TO_CONNECT, VerifyEmailCard }
+  from "./VerifyEmailCard";
+import { HISTORY_SAVING, useHistorySaving } from "./HistoryChoice";
 // The file importer is a page of its own and opens only behind the
 // "Import files" button, so its code arrives on that click rather than
 // riding in with every screen that shows this hub.
@@ -50,7 +54,43 @@ export function bankLinkHoldNote(s: Settings | undefined,
  *  how it ended: add / update on success; exited when the user left Link
  *  without finishing; add_failed / update_failed when the bank or the
  *  exchange refused; cancelled when the user told us they closed the tab. */
-export type PlaidLinkResult = { kind?: string; institution?: string; error?: string };
+export type PlaidLinkResult = { kind?: string; institution?: string; error?: string;
+                                /** "pending": the bank is saved and its
+                                 *  first pull is queued on the worker */
+                                first_sync?: "pending" | "ok" };
+
+/** What a bank saved but not yet pulled says on its connection row and in
+ *  the link's own result line. Mobile: FIRST_SYNC_RUNNING in
+ *  mobile/src/lib/pure.ts. */
+export const FIRST_SYNC_RUNNING =
+  "first sync running — accounts appear in a minute";
+
+/** A live Plaid connection whose first pull has not landed yet: no
+ *  last_ok and nothing wrong with it. */
+export function firstSyncPending(c: Connection): boolean {
+  if (c.aggregator !== "plaid" || c.last_ok) return false;
+  const kind = c.status_kind ?? "ok";
+  return kind === "ok" && !(c.status || "").startsWith("error")
+    && c.status !== "reaped";
+}
+
+/** Keep the connection list fresh while a first sync is running, and when
+ *  one lands refresh what it fills (accounts, the verdict, the wizard).
+ *  Returns the refetch interval for the caller's ["connections"] query. */
+export function useFirstSyncLanding(conns: Connection[] | undefined
+): number | false {
+  const qc = useQueryClient();
+  const waiting = useRef<Set<string>>(new Set());
+  const pending = (conns ?? []).filter(firstSyncPending).map((c) => c.id);
+  const key = pending.join(",");
+  useEffect(() => {
+    const now = new Set(key ? key.split(",") : []);
+    const landed = [...waiting.current].some((id) => !now.has(id));
+    waiting.current = now;
+    if (landed) afterFirstPull(qc);
+  }, [key, qc]);
+  return pending.length ? 5000 : false;
+}
 
 /** The sentence a finished Plaid session earns, and whether it changed
  *  anything. The session resolves normally for a close or a failure too
@@ -76,7 +116,8 @@ export function plaidLinkOutcome(s: PlaidLinkResult,
         + ` didn't complete — the connection still reports an error${detail}.` };
     default:
       return { ok: true, text: mode === "add"
-        ? `Linked ${s.institution || "bank"}.`
+        ? `Linked ${s.institution || "bank"}`
+          + (s.first_sync === "pending" ? ` — ${FIRST_SYNC_RUNNING}.` : ".")
         : mode === "fix" ? "Reconnected." : "Connected accounts updated." };
   }
 }
@@ -130,33 +171,100 @@ export async function openPlaidHostedLink(itemId = "", opts?: {
   const started = await openTabAt(
     () => api.plaidLinkStart(itemId, !!opts?.manageAccounts),
     (r) => r.hosted_link_url, "Plaid");
-  // Poll until the session is finished server-side (exchange + first sync).
-  // Cap ~15 min — Hosted Link URL lifetime is 30 min; stop sooner for UX.
-  // The server resolves kind:"exited" when Plaid stamps the session
-  // finished with nothing added (the in-Link exit button); the cancelled
-  // callback covers the case Plaid never hears about — a closed tab.
-  //
-  // This poll is what makes the server exchange the bank's token, so one
-  // failed request must not end it: a dropped connection, a restart or an
-  // edge timeout while the first sync runs would otherwise lose a link the
-  // person just finished in the bank tab. Transient failures back off and
-  // keep polling until the deadline; only a definite refusal (a 4xx such
-  // as an unknown session) or a sign-out ends the wait early.
-  const deadline = Date.now() + 15 * 60 * 1000;
-  let wait = 2500;
-  while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, wait));
-    if (opts?.cancelled?.()) return { kind: "cancelled" };
-    try {
-      const s = await api.plaidLinkStatus(started.link_token);
-      wait = 2500;
-      if (s.done) return s;
-    } catch (e) {
-      if (!pollMayRetry(e)) throw e;
-      wait = Math.min(wait * 2, 30_000);
+  const s = await pollPlaidLink(started.link_token, opts?.cancelled);
+  // the person said they closed the bank window: tell the server, or the
+  // abandoned add session keeps holding a connection slot and the next
+  // Connect is refused (it still finishes it if Plaid reports a bank)
+  if (s.kind === "cancelled" && !itemId)
+    void setPlaidLinkAside(started.link_token);
+  return s;
+}
+
+/** Stop an add session holding a place under the institution cap and
+ *  stop it being resumed. Best-effort: an older server simply 404s/405s. */
+export function setPlaidLinkAside(linkToken: string): Promise<void> {
+  return req(`/accounts/plaid/link/${encodeURIComponent(linkToken)}`,
+             { method: "DELETE" })
+    .then(() => undefined, () => undefined);
+}
+
+/** How long a client waits on one link session: the Hosted Link URL's
+ *  30 minutes, plus a few for a person who opened it near the end and is
+ *  still inside Link. Giving up sooner told the person the link timed out
+ *  while the URL still worked. The server finishes the session either way
+ *  (the LINK webhook and the worker's sweep); this is only how long the
+ *  page keeps watching for the answer. */
+export const PLAID_LINK_WAIT_MS = 35 * 60 * 1000;
+
+/** The link sessions this tab is already watching, so the resume on
+ *  mount (usePlaidLinkResume) never polls one twice. */
+const watching = new Set<string>();
+
+/** Poll one session until the server reports it finished (exchange + first
+ *  sync). The server resolves kind:"exited" when Plaid stamps the session
+ *  finished with nothing added (the in-Link exit button); the cancelled
+ *  callback covers the case Plaid never hears about — a closed tab.
+ *
+ *  One failed request must not end the wait: a dropped connection, a
+ *  restart or an edge timeout while the first sync runs would otherwise
+ *  lose sight of a link the person just finished. Transient failures back
+ *  off and keep polling until the deadline; only a definite refusal (a 4xx
+ *  such as an unknown session) or a sign-out ends the wait early. */
+export async function pollPlaidLink(linkToken: string,
+                                    cancelled?: () => boolean,
+                                    resume = false
+): Promise<PlaidLinkResult> {
+  watching.add(linkToken);
+  try {
+    const deadline = Date.now() + PLAID_LINK_WAIT_MS;
+    let wait = 2500;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, wait));
+      if (cancelled?.()) return { kind: "cancelled" };
+      try {
+        // a resumed session is watched for its answer only: the server
+        // does not keep it counted under the institution cap for us
+        const s = resume
+          ? await req<PlaidLinkResult & { done: boolean }>(
+              `/accounts/plaid/link/${encodeURIComponent(linkToken)}`
+              + "/status?resume=1")
+          : await api.plaidLinkStatus(linkToken);
+        wait = 2500;
+        if (s.done) return s;
+      } catch (e) {
+        if (!pollMayRetry(e)) throw e;
+        wait = Math.min(wait * 2, 30_000);
+      }
     }
+    throw new Error("Timed out waiting for the bank connection");
+  } finally {
+    watching.delete(linkToken);
   }
-  throw new Error("Timed out waiting for the bank connection");
+}
+
+/** Pick up the household's bank links still able to finish — ones a
+ *  closed or reloaded tab stopped watching while the person was in the
+ *  bank's window — and say how each ended. Owner-only on the server; any
+ *  refusal (a member, an older server) just means nothing to resume. */
+export function usePlaidLinkResume(enabled: boolean): void {
+  const qc = useQueryClient();
+  useEffect(() => {
+    if (!enabled) return;
+    let live = true;
+    req<{ sessions: { link_token: string }[] }>("/accounts/plaid/links/open")
+      .then(({ sessions }) => {
+        for (const { link_token } of sessions ?? []) {
+          if (watching.has(link_token)) continue;
+          void pollPlaidLink(link_token, () => !live, true).then((s) => {
+            if (s.kind === "cancelled") return;
+            afterFirstPull(qc);
+            toast(plaidLinkOutcome(s, "add").text);
+          }).catch(() => { /* the server finishes it regardless */ });
+        }
+      })
+      .catch(() => { /* nothing to resume */ });
+    return () => { live = false; };
+  }, [enabled, qc]);
 }
 
 /** A status poll failure worth trying again: no answer at all (offline,
@@ -312,12 +420,19 @@ export function PlaidFlow({ onDone }: { onDone: () => void }) {
  *  rather than at the server's refusal, which on the hosted link path can
  *  land AFTER the token exchange — the household watches a bank it just
  *  authorized get removed again. */
-function PlaidConnectButton({ label, hint, itemId = "", full = false }: {
+function PlaidConnectButton({ label, hint, itemId = "", full = false,
+                             closed }: {
   label: string; hint: string; itemId?: string; full?: boolean;
+  // a sentence saying why the door is shut ahead of the server (an
+  // address still to confirm); the button stays visible, disabled
+  closed?: string | null;
 }) {
   const qc = useQueryClient();
   const st = useQuery({ queryKey: ["settings"], queryFn: api.settings });
   const held = bankLinkHoldNote(st.data, "plaid");
+  // the link token asks Plaid for the stored history window, which can
+  // never be narrowed afterwards — a history choice still saving waits
+  const saving = useHistorySaving();
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   // backing out of the bank tab is normal, not an error — it gets its own
@@ -346,7 +461,8 @@ function PlaidConnectButton({ label, hint, itemId = "", full = false }: {
         // below; the message only covers the moment before that list
         // has refetched, then goes — two green lines naming the same
         // bank read as two connections
-        setMsg(`Linked ${s.institution || "bank"} ✓`);
+        setMsg(`Linked ${s.institution || "bank"} ✓`
+               + (s.first_sync === "pending" ? ` — ${FIRST_SYNC_RUNNING}` : ""));
         await Promise.all([
           qc.invalidateQueries({ queryKey: ["connections"] }),
           // the institutions-used figure rides /api/me
@@ -364,12 +480,15 @@ function PlaidConnectButton({ label, hint, itemId = "", full = false }: {
   return (
     <div>
       <button className="pri" style={{ fontSize: 15 }}
-        disabled={busy || full || !!held}
-        title={full ? "you are at this account's institution limit" : undefined}
+        disabled={busy || full || !!held || !!closed || saving}
+        title={closed ?? (saving ? HISTORY_SAVING
+          : full ? "you are at this account's institution limit" : undefined)}
         onClick={() => void run()}>
         {busy ? "Connecting…" : label}
       </button>
       {held && <p style={{ fontSize: 13, color: "var(--amber)" }}>{held}</p>}
+      {saving && !busy && <p className="mut" style={{ fontSize: 13 }}>
+        {HISTORY_SAVING}</p>}
       {/* the escape hatch: the server only learns about an exit Plaid
           reports, and a closed TAB reports nothing — without this the
           button sat on "Connecting…" for 15 minutes after a back-out */}
@@ -400,6 +519,9 @@ function HubFixButton({ c }: { c: Connection }) {
   const st = useQuery({ queryKey: ["settings"], queryFn: api.settings });
   // a re-auth hands the bank login to the same client a new link does
   const held = bankLinkHoldNote(st.data, "plaid");
+  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
+  // linking a gone bank afresh mints a new token from the stored window
+  const saving = useHistorySaving();
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
   if (c.aggregator !== "plaid") return null;
@@ -408,6 +530,12 @@ function HubFixButton({ c }: { c: Connection }) {
         : (c.status || "").startsWith("error") ? "attention" : "ok");
   const gone = kind === "gone" || c.status === "reaped";
   if (!gone && kind !== "reauth" && kind !== "attention") return null;
+  // linking a gone bank afresh is a new connection, which the allowance of
+  // a trial still waiting on confirmation refuses; signing in again to a
+  // live one adds nothing and stays open
+  const closed = gone && bankAwaitsConfirm(me.data) ? CONFIRM_TO_CONNECT
+                                                     : null;
+  const why = held ?? closed ?? (gone && saving ? HISTORY_SAVING : null);
   const run = () => {
     setBusy(true); setNote(null);
     // new accounts at the bank are offered only with Link's account
@@ -426,12 +554,12 @@ function HubFixButton({ c }: { c: Connection }) {
   };
   return (
     <>
-      <button className="linked-x" disabled={busy || !!held}
-        title={held ?? (gone ? "link this bank again"
-                              : "sign in to the bank again")}
+      <button className="linked-x" disabled={busy || !!why}
+        title={why ?? (gone ? "link this bank again"
+                             : "sign in to the bank again")}
         onClick={run}>
         {busy ? "waiting…" : gone ? "reconnect ↗" : "fix ↗"}</button>
-      {(note ?? held) && <small className="sub">{note ?? held}</small>}
+      {(note ?? why) && <small className="sub">{note ?? why}</small>}
     </>
   );
 }
@@ -460,6 +588,8 @@ export function MxFlow({ onDone }: { onDone: () => void }) {
   // both actions dead with no way to revive them.
   const keysReady = !!s.data?.mx_api_key_set;
   const held = bankLinkHoldNote(s.data, "mx");
+  // a pull's start date is bounded by the stored history window
+  const saving = useHistorySaving();
   const connect = useMutation({
     // the widget URL comes from the server response; openTabAt opens the
     // tab inside the click (a tab opened after the round-trip is blocked),
@@ -503,7 +633,8 @@ export function MxFlow({ onDone }: { onDone: () => void }) {
           onClick={() => connect.mutate()}>
           {connect.isPending ? "…" : "Open MX Connect (link a bank)"}
         </button>
-        <button disabled={!keysReady || sync.isPending}
+        <button disabled={!keysReady || sync.isPending || saving}
+          title={saving ? HISTORY_SAVING : undefined}
           onClick={() => sync.mutate()}>
           {sync.isPending ? "syncing…" : "Sync now"}
         </button>
@@ -520,6 +651,8 @@ export function SimplefinFlow({ onDone }: { onDone: () => void }) {
   const qc = useQueryClient();
   const [token, setToken] = useState("");
   const [err, setErr] = useState<string | null>(null);
+  // the claim runs the first pull at once, bounded by the stored window
+  const saving = useHistorySaving();
   const connect = useMutation({
     mutationFn: () => api.simplefinConnect(token.trim()),
     onSuccess: () => { afterFirstPull(qc); onDone(); },
@@ -542,7 +675,8 @@ export function SimplefinFlow({ onDone }: { onDone: () => void }) {
                  color: "var(--ink)" }} />
       {err && <p style={{ color: "var(--red)" }}>{err}</p>}
       <button className="pri" style={{ marginTop: ".5rem" }}
-        disabled={connect.isPending || !token.trim()}
+        disabled={connect.isPending || !token.trim() || saving}
+        title={saving ? HISTORY_SAVING : undefined}
         onClick={() => connect.mutate()}>
         {connect.isPending ? "claiming + first sync…" : "Connect SimpleFIN"}
       </button>
@@ -559,6 +693,8 @@ export default function ConnectHub({ onDone }: { onDone?: () => void }) {
   const conns = useQuery({ queryKey: ["connections"],
                            queryFn: api.connections,
                            refetchInterval: 5000 });
+  // a first sync landing refreshes the accounts and the wizard it fills
+  useFirstSyncLanding(conns.data?.connections);
   const st = useQuery({ queryKey: ["settings"], queryFn: api.settings });
   const [open, setOpen] = useState<ProviderKey | null>(null);
   const hosted = !!me.data?.hosted;
@@ -637,6 +773,11 @@ export default function ConnectHub({ onDone }: { onDone?: () => void }) {
     const used = me.data?.features?.institutions_used;
     const capKnown = typeof cap === "number" && typeof used === "number";
     const full = capKnown && used >= cap;
+    // a free trial whose owner has not confirmed has an allowance of
+    // zero: the door is closed here, with the reason, before the tap the
+    // server refuses
+    const confirmFirst = bankAwaitsConfirm(me.data) ? CONFIRM_TO_CONNECT
+                                                    : null;
     return (
       <div className="card" style={{ marginBottom: "1rem" }}>
         <h2>Connect your accounts</h2>
@@ -644,15 +785,20 @@ export default function ConnectHub({ onDone }: { onDone?: () => void }) {
           <>
             <p className="mut">Pick your bank and sign in — that's it.
               Transactions, balances and cards flow in automatically.</p>
+            {confirmFirst && (
+              <VerifyEmailCard me={me.data} inline>
+                {confirmFirst}
+              </VerifyEmailCard>)}
             {/* "account", not "bank" — a card, a brokerage and a bank are
                 all accounts; and once one is in, the button invites the
                 next */}
-            <PlaidConnectButton full={full} label={linked.length
+            <PlaidConnectButton full={full} closed={confirmFirst} label={linked.length
                 ? "+ Connect another account ↗" : "+ Connect an account ↗"}
               hint="Opens your bank's sign-in (Plaid) in a new tab. This page
                 stays put — when you finish, the connection appears below so
                 you can link another or continue the wizard." />
-            {capKnown && (
+            {/* "0 of 0" while the address waits says nothing true */}
+            {capKnown && !confirmFirst && (
               <p className="sub" style={{ marginTop: ".2rem", marginBottom: 0 }}>
                 {ext.allowanceNote(used, cap, full)}
               </p>)}
@@ -692,7 +838,7 @@ export default function ConnectHub({ onDone }: { onDone?: () => void }) {
                           ? <> · <span style={{ color: "var(--red)" }}>needs attention</span></>
                           : c.last_ok
                             ? <> · synced {ago(c.last_ok)}</>
-                            : <> · first sync pending</>}
+                            : <> · {FIRST_SYNC_RUNNING}</>}
                         {/* the bank's own clock. Sync reads Plaid's copy;
                             the bank refreshes that copy on its own
                             schedule, so this is the number that explains a

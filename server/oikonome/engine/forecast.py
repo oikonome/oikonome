@@ -62,8 +62,29 @@ CARD_SCOPE_SQL = """
 """
 
 
-def _checking_balance(conn, cfg: dict) -> float:
-    """Per-tenant primary checking: explicit config wins, else the
+def _checking_balance(conn, cfg: dict) -> float | None:
+    return _checking_start(conn, cfg)[0]
+
+
+def _checking_start(conn, cfg: dict) -> tuple[float | None, bool, bool]:
+    """The runway's starting checking balance; whether the bank reported
+    it as an AVAILABLE balance (True) or the walk fell back to the current
+    balance (False) — a pending deposit is inside the first and not the
+    second, which the payday re-date has to know; and whether the balance
+    is UNSET (True: a checking row exists but nobody has given it a
+    balance yet).
+
+    None when the household has no checking account the runway may start
+    from (a card-only or savings-only household); 0.0 with unset=True when
+    checking accounts exist but none has a balance yet (a files-only
+    import). That is an unknown, not a $0 balance: read as $0, every card
+    balance and bill becomes a "short today" alarm about an account that
+    does not exist. The surfaces read `unset` from the row itself rather
+    than guessing from what other accounts the household has: an imported
+    checking with no balance beside a linked savings account (or beside a
+    linked checking the household excluded) is just as unknown.
+
+    Per-tenant primary checking: explicit config wins, else the
     largest-balance depository checking account. An account the household
     excluded on the Accounts page is not its checking account — pinned or
     biggest — for the same reason its cards are out of the runway: the
@@ -86,14 +107,20 @@ def _checking_balance(conn, cfg: dict) -> float:
         # unless the household combines entities (the auto-pick below
         # applies the same rule)
         row = conn.execute(
-            """SELECT COALESCE(balance_available, balance_current) AS bal
+            """SELECT COALESCE(balance_available, balance_current) AS bal,
+                      balance_available IS NOT NULL AS has_avail
                FROM accounts WHERE id = %s
                  AND (NULLIF((SELECT current_setting('app.combine_entities', true)),'')='true'
                       OR entity_id IS NULL)""", (acct_id,)).fetchone()
         if row and row["bal"] is not None:
-            return row["bal"]
-    row = conn.execute(
-        """SELECT COALESCE(balance_available, balance_current) AS bal
+            return row["bal"], bool(row["has_avail"]), False
+    # Only a row that carries a balance may win the pick: every file
+    # import (Mint, QIF, OFX, a competitor export) creates a checking row
+    # nobody has set a balance on, and sorting it as $0 would let it beat a
+    # real overdrawn account and silence every cash alarm.
+    rows = conn.execute(
+        """SELECT COALESCE(balance_available, balance_current) AS bal,
+                  balance_available IS NOT NULL AS has_avail
            FROM accounts WHERE type = 'depository' AND subtype = 'checking'
              AND NOT (id = ANY(%s))   -- the Accounts page's "excl" toggle
              AND (NULLIF((SELECT current_setting('app.combine_entities', true)),'')='true' OR entity_id IS NULL)  -- don't auto-pick a business account
@@ -101,9 +128,18 @@ def _checking_balance(conn, cfg: dict) -> float:
              AND (NULLIF((SELECT current_setting('app.shadow_ids', true)), '') IS NULL
                   OR NOT (id = ANY(string_to_array(
                           (SELECT current_setting('app.shadow_ids', true)), ','))))
-           ORDER BY COALESCE(balance_current, 0) DESC LIMIT 1""",
-        (excluded,)).fetchone()
-    return row["bal"] if row and row["bal"] is not None else 0.0
+           ORDER BY COALESCE(balance_available, balance_current) IS NULL,
+                    COALESCE(balance_current, 0) DESC LIMIT 1""",
+        (excluded,)).fetchall()
+    if not rows:
+        return None, False, False
+    row = rows[0]
+    if row["bal"] is not None:
+        return row["bal"], bool(row["has_avail"]), False
+    # checking accounts exist but none carries a balance yet: that is a
+    # balance the household has not set, not a missing account — $0 here
+    # lets the surfaces ask for today's balance instead of for an account
+    return 0.0, False, True
 
 
 def next_paycheck(conn, today: dt.date | None = None, *,
@@ -144,6 +180,88 @@ def _paycheck_amount(conn, payee: str, row_amount: float, today: dt.date,
     return est if cap is None else min(est, cap)
 
 
+def _series_cadence(rec: dict) -> str | None:
+    """An income series' recurrence in the income scenario's cadence words
+    (budget.CADENCE_MONTHLY's keys); None when it is none of them."""
+    freq = str(rec.get("frequency") or "").upper()
+    try:
+        interval = max(1, int(rec.get("interval") or 1))
+    except (TypeError, ValueError):
+        interval = 1
+    if freq == "WEEKLY":
+        return {1: "weekly", 2: "biweekly"}.get(interval)
+    if freq == "DAILY":
+        return {7: "weekly", 14: "biweekly"}.get(interval)
+    if freq == "MONTHLY" and interval == 1:
+        return ("semimonthly" if len(rec.get("byMonthDay") or []) >= 2
+                else "monthly")
+    return None
+
+
+def _group_by_payer(series: list[dict]) -> list[list[dict]]:
+    """Income series grouped by who pays them. A payer is its merchant
+    identity — series that share a resolved merchant id are one payer —
+    and only a series with no merchant identity falls back to the payee's
+    key word: "State Pension" and "State Example Co Payroll" share a first
+    word and nothing else, and treating them as one payer would cap a pension
+    at a payroll scenario's take-home."""
+    groups: list[tuple[set, list[dict]]] = []
+    by_key: dict[str, list[dict]] = {}
+    for b in series:
+        ids = set(b.get("ids") or ())
+        if not ids:
+            by_key.setdefault(b.get("key") or b["payee"], []).append(b)
+            continue
+        # series that share any merchant id join one payer, merging every
+        # group the new series bridges
+        merged_ids, merged = set(ids), [b]
+        for g in groups:
+            if g[0] & ids:
+                merged_ids |= g[0]
+                merged = g[1] + merged
+        groups = [g for g in groups if not g[0] & ids]
+        groups.append((merged_ids, merged))
+    return [g[1] for g in groups] + list(by_key.values())
+
+
+def _scenario_caps(income_bills: list[dict], cadence: str,
+                   take_home: float) -> dict[str, float]:
+    """Per-deposit caps, by payee, for the income series an income scenario
+    describes. The scenario's take-home is ONE paycheck at its own cadence,
+    so it caps the largest series paid at that cadence and nothing else —
+    an empty answer when no series runs at it, because a take-home figure
+    for one cadence says nothing about income paid at another.
+
+    Semimonthly is the exception: detection rarely stores a 1st-and-15th
+    payroll as one series reading semimonthly — it stores the two paydays
+    as two MONTHLY series of the same payer, and a scenario that matched
+    nothing there would silently stop reaching the forecast. So with no
+    semimonthly series, the payer with two or more MONTHLY series (the
+    most money among such payers) is the one described: its two largest series are each one of the two
+    deposits (capped at the take-home), and when no payer has two, the
+    largest lone monthly series is paid the whole month at once (capped at
+    two take-homes)."""
+    same = [b for b in income_bills
+            if _series_cadence(b.get("recurrence") or {}) == cadence]
+    if same:
+        return {max(same, key=lambda b: b["amount"])["payee"]: take_home}
+    if cadence != "semimonthly":
+        return {}
+    monthly = [b for b in income_bills
+               if _series_cadence(b.get("recurrence") or {}) == "monthly"]
+    if not monthly:
+        return {}
+    payers = _group_by_payer(monthly)
+    # a payer with two monthly paydays is the pair the scenario names; a
+    # lone monthly series (a pension) is chosen only when no pair exists
+    group = max(payers,
+                key=lambda g: (len(g) >= 2, sum(b["amount"] for b in g)))
+    group = sorted(group, key=lambda b: b["amount"], reverse=True)[:2]
+    per = (take_home if len(group) == 2
+           else take_home * budget.CADENCE_MONTHLY["semimonthly"])
+    return {b["payee"]: per for b in group}
+
+
 def build(conn, today: dt.date | None = None, days: int = HORIZON_DAYS,
           *, memo: dict | None = None) -> dict:
     # `memo`: the optional request-scoped cache described on
@@ -155,6 +273,13 @@ def build(conn, today: dt.date | None = None, days: int = HORIZON_DAYS,
     end = today + dt.timedelta(days=days)
 
     checking_bal = _checking_balance(conn, cfg)
+    # no checking account: the walk still runs (the calendar and the cash
+    # chart read its dated events and month-to-month deltas, which do not
+    # depend on the start), but the result says so, and every surface that
+    # would quote a balance or a shortfall from it stays quiet instead
+    no_checking = checking_bal is None
+    if no_checking:
+        checking_bal = 0.0
     # the runway must drop an excluded account's balances and payoff events
     # exactly as every report drops its rows, or the cash chart's forecast
     # tail pays off a card the actuals beside it never counted
@@ -282,9 +407,19 @@ def build(conn, today: dt.date | None = None, days: int = HORIZON_DAYS,
                  else dt.date(d.year, d.month + 1, 1))
 
     # active income-scenario take-home caps the per-deposit estimate so a
-    # lower configured paycheck applies immediately
+    # lower configured paycheck applies immediately — but only for the ONE
+    # series the scenario describes. Its take-home is a single paycheck at
+    # its own cadence; capping every income series with it would walk a
+    # $3,000 monthly pension in at a $2,000 biweekly paycheck and end the
+    # runway short.
     _scen = budget.active_income_scenario(cfg)
     pay_cap = (_scen.get("take_home") if _scen else None) or None
+    pay_caps = (_scenario_caps(
+        budget._recurring_bills(conn, caps=cfg.get("occurrence_caps"),
+                                disabled=cfg.get("disabled_bills"),
+                                income=True, memo=memo),
+        str(_scen.get("cadence") or "biweekly"), float(pay_cap))
+        if pay_cap is not None else {})
     # Paychecks go through the same occurrence rule as bills, deposit side:
     # one that already posted is in the live starting balance, so walking
     # it in again on payday would count the same money twice for the days
@@ -295,7 +430,8 @@ def build(conn, today: dt.date | None = None, days: int = HORIZON_DAYS,
         payee = p["payee"]
         if payee not in amounts:
             amounts[payee] = _paycheck_amount(
-                conn, payee, p["occ"]["bill"]["amount"], today, cap=pay_cap)
+                conn, payee, p["occ"]["bill"]["amount"], today,
+                cap=pay_caps.get(payee))
         events.append((p["due"], amounts[payee], payee))
 
     # --- daily burn rates ---------------------------------------------------
@@ -350,11 +486,14 @@ def build(conn, today: dt.date | None = None, days: int = HORIZON_DAYS,
                 sweep_months.append((due, wants))
     plan_daily = ((b["food"]["month_budget"] + b["other"]["month_budget"])
                   / st["days_in_month"])
-    # over elapsed days, like the verdict's pace: today is not over yet, so
-    # today's spending stays out of the numerator as well — spend through
-    # yesterday over the days through yesterday, one horizon on both sides
-    pace_daily = ((st["variable_actual"] - (st.get("variable_today") or 0.0))
-                  / (today.day - 1)) if today.day >= 5 else plan_daily
+    # the verdict's own pace (budget.pace_window, via paced_daily): spend
+    # through yesterday over the finished days since the later of the 1st
+    # and the ledger's first day — so the forecast burns at the rate the
+    # verdict judges. Until the window is settled (the month's first days,
+    # a ledger days old: the verdict's own test) the plan stands in for it.
+    _paced = budget.paced_daily(st)
+    pace_daily = (_paced if _paced is not None and st["pace_settled"]
+                  else plan_daily)
     pace_daily = max(pace_daily, plan_daily * 0.25)   # a quiet week isn't a trend
 
     # Envelope drip: charge what's LEFT of each pool over the days left
@@ -475,6 +614,7 @@ def build(conn, today: dt.date | None = None, days: int = HORIZON_DAYS,
     return {
         "start": round(start, 2), "days": days, "card_debt": round(card_debt, 2),
         "checking": round(checking_bal, 2),
+        "no_checking": no_checking,
         "plan": plan, "pace": pace, "pace_now": pace_now,
         "pace_nocards": pace_nocards, "pace_stmt": pace_stmt,
         "events": events_out,

@@ -64,6 +64,37 @@ RECONCILE_DAYS = 14
 # seam that it gets matched properly instead.
 DEEP_BACKFILL_DAYS = 30
 
+# What one page of a backfill learned has to hold for the next one (each
+# page is its own `filter_incoming` call), and it is kept on the adoption
+# row (`account_adoptions.guard_ledger`), never on the transactions: the
+# bank's `modified` restates a row's raw record wholesale, and a copy the
+# guard dropped without carrying its id has no row to write on at all.
+#   absorbed — incoming id -> the restored row it was dropped as a copy of
+#     (the same id when the id was carried onto that row). The row stands
+#     for that one charge and absorbs no other; a later delivery of the
+#     same incoming id is the copy again and is dropped without matching.
+#   awaiting — the restored holds a merge retired. The bank's posted
+#     charge for each is still to come, and is not a copy of anything the
+#     restore holds as posted.
+#   settled — hold id -> the settlement that claimed it. The settlement is
+#     inserted by this backfill inside the restored span, and must not
+#     absorb a restored charge's own re-delivery on a later page.
+# A new adoption has a new row, so it always starts clean.
+
+# raw keys an earlier version of the guard left on rows; cleared on every
+# new adoption so an archive taken mid-guard does not carry them forward
+_LEGACY_GUARD_KEYS = ["_carried_from", "_awaits_settlement", "_settled_by"]
+
+
+def _clear_guard_marks(conn, account_id: str) -> None:
+    """Strip the raw notes an earlier version of the guard left on these
+    rows. Nothing reads them any more; an export carries raw, so without
+    this they would ride along into every later archive."""
+    keys = _LEGACY_GUARD_KEYS
+    conn.execute("UPDATE transactions SET raw = raw - %s::text[]"
+                 " WHERE account_id = %s AND raw ?| %s::text[]",
+                 (keys, account_id, keys))
+
 # Every column that points at accounts.id, from information_schema rather
 # than memory. A missed one would orphan the rows it holds — the bills
 # still pointing at a renamed account are the difference between a
@@ -595,6 +626,7 @@ def _adopt_one(conn, old: dict, new_id: str, item_id: str):
                 history_from = span["lo"] or span["lo_any"]
                 moved = _rewrite_account_id(conn, old["id"], new_id, item_id)
                 if moved:
+                    _clear_guard_marks(conn, new_id)
                     _retire_orphaned_pending(conn, new_id)
                     conn.execute(
                         """INSERT INTO account_adoptions
@@ -929,7 +961,8 @@ def pending(conn, account_id: str) -> dict | None:
     """The live adoption for an account, if its backfill is still being
     reconciled."""
     return conn.execute(
-        """SELECT account_id, cutoff_date, history_from
+        """SELECT account_id, adopted_at, cutoff_date, history_from,
+                  live_from, guard_ledger
              FROM account_adoptions
             WHERE account_id = %s AND reconciled_at IS NULL
               AND adopted_at > now() - make_interval(days => %s)
@@ -955,7 +988,9 @@ class _Absorbed:
         The cutoff is `max(date)` over the account's live rows at the
         moment of adoption, so no restored row is dated after it — which
         makes `date <= cutoff` a proof, not a heuristic, that a candidate
-        predates the reconnect. Without it the candidate set is every live
+        predates the reconnect. A restore merged onto an account the link
+        had already filled records the day before the live lineage's first
+        row instead (see `_merge_one`), so the same proof holds there. Without it the candidate set is every live
         row in the window, so a charge that arrives days AFTER the
         reconnect (still inside the 14-day guard) could be picked as "the
         row the matcher consumed" and have its Plaid id overwritten;
@@ -975,7 +1010,8 @@ class _Absorbed:
     """
 
     def __init__(self, conn, account_id: str, lo: dt.date, hi: dt.date,
-                 cutoff: dt.date, *, skip_ids: set | None = None):
+                 cutoff: dt.date, *, skip_ids: set | None = None,
+                 spoken_for: set | None = None):
         from .dedup import MAX_CANDIDATES, _tokens
         self._cells: dict[tuple[int, dt.date], list[dict]] = {}
         # limit + 1 so the cap is DETECTED rather than silently applied —
@@ -987,14 +1023,18 @@ class _Absorbed:
         # returns whichever rows Postgres reached first) and renaming a
         # row on evidence that was never complete.
         rows = conn.execute(
+            # spoken_for: rows earlier pages already accounted for (see
+            # the guard ledger), which stand for one charge each
             """SELECT id, date, amount, name, merchant_name
-                 FROM transactions
-                WHERE account_id = %s AND removed = 0
-                  AND date <= %s
-                  AND date BETWEEN %s - INTERVAL '3 days'
-                                AND %s + INTERVAL '3 days'
-                LIMIT %s""",
-            (account_id, cutoff, lo, hi, MAX_CANDIDATES + 1)).fetchall()
+                  FROM transactions t
+                 WHERE account_id = %s AND removed = 0
+                   AND date <= %s
+                   AND date BETWEEN %s - INTERVAL '3 days'
+                                 AND %s + INTERVAL '3 days'
+                   AND NOT (id = ANY(%s))
+                 LIMIT %s""",
+            (account_id, cutoff, lo, hi, list(spoken_for or ()),
+             MAX_CANDIDATES + 1)).fetchall()
         if len(rows) > MAX_CANDIDATES:
             log.warning("reconnect: account %s holds more than %s rows in "
                         "the adoption window — carrying no Plaid ids for "
@@ -1055,6 +1095,9 @@ def filter_incoming(conn, account_id: str, txns: list) -> tuple[list, dict]:
     history_from = adopt.get("history_from")
     if isinstance(history_from, dt.datetime):
         history_from = history_from.date()
+    live_from = adopt.get("live_from")
+    if isinstance(live_from, dt.datetime):
+        live_from = live_from.date()
 
     def _f(t, name):
         return t.get(name) if isinstance(t, dict) else getattr(t, name, None)
@@ -1078,6 +1121,22 @@ def filter_incoming(conn, account_id: str, txns: list) -> tuple[list, dict]:
         } if ids else set()
     passthrough = [t for t in txns if _f(t, "id") in held]
     txns = [t for t in txns if _f(t, "id") not in held]
+
+    # What earlier pages of this backfill accounted for (see the guard
+    # ledger above). An id an earlier page already dropped as a copy is the
+    # same copy again — a `modified` restating it, or the replay sending it
+    # twice — and is dropped as it was, not matched afresh: a fresh match
+    # would use up a second restored row, or the settlement of a hold.
+    ledger = adopt.get("guard_ledger") or {}
+    absorbed_ids: dict = dict(ledger.get("absorbed") or {})
+    settled_by: dict = dict(ledger.get("settled") or {})
+    awaiting = [h for h in ledger.get("awaiting") or ()
+                if h not in settled_by]
+    new_absorbed: dict = {}
+    new_settled: dict = {}
+    redelivered = [t for t in txns if _f(t, "id") in absorbed_ids]
+    txns = [t for t in txns if _f(t, "id") not in absorbed_ids]
+    spoken_for = set(absorbed_ids.values()) | set(settled_by.values())
 
     # Only the DEEP backfill is dropped on the date alone. Rows near the
     # seam are matched instead: blind-dropping everything below the cutoff
@@ -1107,9 +1166,28 @@ def filter_incoming(conn, account_id: str, txns: list) -> tuple[list, dict]:
     # older is kept as it is. An adoption recorded without the floor keeps
     # the old rule, which is the most it can prove.
     from .base import is_file_import_id
-    from .dedup import Deduper, WINDOW_DAYS, _tokens
+    from .dedup import WINDOW_DAYS, _tokens
     deep_before = cutoff - dt.timedelta(days=DEEP_BACKFILL_DAYS)
     seam_ends = cutoff + dt.timedelta(days=WINDOW_DAYS)
+    if live_from is not None:
+        # A restore merged onto a link that already held rows: from the
+        # link's first day on, every row is the live lineage's own (the
+        # days both covered were paired at the merge), so nothing dated
+        # then may be matched against the restored days just before it —
+        # a hold's settlement would go as a copy of yesterday's coffee.
+        #
+        # Nor anything dated after the newest restored day. The reach past
+        # the cutoff exists for a second feed that dates a charge a day or
+        # two differently; a merge only ever pairs a Plaid account with the
+        # same bank's Plaid account, which dates a posted charge the same
+        # whichever link delivers it, and the restore's own holds were
+        # retired at the merge. So a row past the cutoff is a charge the
+        # backup never held — typically the settlement of one of those
+        # holds — and matching it would drop it and put its id on a
+        # restored row, which the row's own re-delivery on a later page
+        # then claims again: two charges, one row.
+        seam_ends = min(seam_ends, live_from - dt.timedelta(days=1),
+                        cutoff)
     before_history = (history_from - dt.timedelta(days=WINDOW_DAYS)
                       if history_from is not None else None)
     older, overlap, buckets = [], [], []
@@ -1135,7 +1213,8 @@ def filter_incoming(conn, account_id: str, txns: list) -> tuple[list, dict]:
     # than a date rule: same amount, within three days, and a shared name
     # token, each existing row absorbing at most one incoming.
     dates = [d for t, d, b in buckets if b == "overlap" and d is not None]
-    kept, deduped, carried = [], 0, 0
+    kept, carried, settled_holds = [], 0, 0
+    deduped = len(redelivered)
     # (date, amount) of every incoming row dropped as already held, and the
     # file rows a carried id landed on: see _note_file_rows_relied_on
     absorbed_by_held: list[tuple[dt.date, float]] = []
@@ -1143,20 +1222,9 @@ def filter_incoming(conn, account_id: str, txns: list) -> tuple[list, dict]:
     absorbed = None                 # built on the first claim, not before
     m = None
     if overlap:
-        # The seam is a bounded window (DEEP_BACKFILL_DAYS before the
-        # cutoff, WINDOW_DAYS after it), but a busy account still holds
-        # thousands of rows in
-        # it — well past the file-importer default, which exists to stop a
-        # hand-picked CSV scanning a decade.
-        # max_date=cutoff: the matcher exists to recognize re-deliveries
-        # of what the RESTORE holds, and every restored row is dated at or
-        # before the cutoff by construction. Without the bound, rows this
-        # same backfill inserted moments ago (dated past the cutoff)
-        # would become candidates, and an earlier page's genuine charge could
-        # absorb a later page's distinct same-amount charge as a
-        # "duplicate" — a silent drop inside the sync's own stream.
-        m = Deduper(conn, account_id, "__no_source_prefix__", dates,
-                    max_candidates=50_000, max_date=cutoff)
+        m = _seam_matcher(conn, account_id, dates, cutoff, spoken_for)
+    holds = (_awaiting_settlement(conn, account_id, awaiting, dates)
+             if awaiting and dates else [])
     for t, d, bucket in buckets:
         if bucket == "older":
             continue
@@ -1164,14 +1232,36 @@ def filter_incoming(conn, account_id: str, txns: list) -> tuple[list, dict]:
         if bucket == "after" or d is None or amt is None:
             kept.append(t)
             continue
-        if m.claim(d, float(amt), _f(t, "name"), _f(t, "merchant_name")):
+        hold = (_settles(holds, m, d, float(amt), _tokens(
+                    _f(t, "name"), _f(t, "merchant_name")))
+                if holds else None)
+        if hold is not None:
+            # the posted charge of a hold the merge retired: a charge the
+            # restore never held as posted, so it is the account's own
+            if _f(t, "id"):
+                new_settled[hold["id"]] = _f(t, "id")
+            settled_holds += 1
+            kept.append(t)
+            continue
+        used = _claim(m, d, float(amt), _f(t, "name"),
+                      _f(t, "merchant_name"))
+        if used is not None:
             deduped += 1
             new_id = _f(t, "id")
+            if new_id:
+                # Which restored row this copy used up, so that no later
+                # page offers it again. Rows the matcher cannot tell apart
+                # are interchangeable to it, so naming any one of them is
+                # exactly as good as naming the right one — for the pool.
+                # Moving an identity onto it is a different matter, and
+                # waits for `_Absorbed` to prove the row.
+                new_absorbed[new_id] = used["id"]
             if new_id and dates:
                 if absorbed is None:
                     absorbed = _Absorbed(conn, account_id, min(dates),
                                          max(dates), cutoff,
-                                         skip_ids=set(ids))
+                                         skip_ids=set(ids),
+                                         spoken_for=spoken_for)
                 old_id = absorbed.take(
                     d, float(amt),
                     _tokens(_f(t, "name"), _f(t, "merchant_name")))
@@ -1180,6 +1270,10 @@ def filter_incoming(conn, account_id: str, txns: list) -> tuple[list, dict]:
                 # which is what the guard is for.
                 try:
                     if old_id and _rewrite_txn_id(conn, old_id, new_id):
+                        # the row now wears the incoming id: that is the
+                        # row this charge used up, whichever the matcher
+                        # happened to tick off
+                        new_absorbed[new_id] = new_id
                         carried += 1
                         if is_file_import_id(old_id):
                             renamed_file_rows.append(new_id)
@@ -1196,14 +1290,137 @@ def filter_incoming(conn, account_id: str, txns: list) -> tuple[list, dict]:
             absorbed_by_held.append((d, float(amt)))
     _note_file_rows_relied_on(conn, account_id, absorbed_by_held,
                               renamed_file_rows)
+    if new_absorbed or new_settled:
+        _remember(conn, adopt, new_absorbed, new_settled)
     stats = {"dropped_before_cutoff": len(older), "deduped_overlap": deduped,
              "carried_plaid_ids": carried, "cutoff": str(cutoff),
              "kept_before_history": kept_before_history}
+    if settled_holds:
+        stats["kept_as_settlements"] = settled_holds
     if older or deduped:
         log.info("reconnect: account %s — dropped %s pre-cutoff, %s "
                  "overlapping duplicates, carried %s ids",
                  account_id, len(older), deduped, carried)
     return passthrough + kept, stats
+
+
+def _seam_matcher(conn, account_id: str, dates: list, cutoff: dt.date,
+                  spoken_for: set):
+    """The seam's duplicate matcher, with each candidate knowing its row.
+
+    The file importers' `Deduper` holds no ids, only (cents, date) cells of
+    name tokens; the guard needs the id of the row each claim used up, to
+    remember it for the next page. So the pool is fetched here, once, in
+    the shape the Deduper matches on plus the id, and the rows an earlier
+    page already accounted for start used.
+
+    max_date=cutoff: the matcher exists to recognize re-deliveries of what
+    the RESTORE holds, and every restored row is dated at or before the
+    cutoff by construction. Without the bound, rows this same backfill
+    inserted moments ago (dated past the cutoff) would become candidates,
+    and an earlier page's genuine charge could absorb a later page's
+    distinct same-amount charge as a "duplicate" — a silent drop inside
+    the sync's own stream. The bound is past the file-importer default
+    because the seam of a busy account holds thousands of rows, while that
+    default exists to stop a hand-picked CSV scanning a decade."""
+    from .dedup import Deduper, _tokens
+    limit = 50_000
+    m = Deduper(conn, account_id, "", [], max_candidates=limit)
+    if not dates:
+        return m
+    hi = min(max(dates) + dt.timedelta(days=3), cutoff)
+    rows = conn.execute(
+        """SELECT id, date, amount, name, merchant_name FROM transactions
+            WHERE removed = 0 AND account_id = %s
+              AND date BETWEEN %s::date - INTERVAL '3 days' AND %s
+            LIMIT %s""",
+        (account_id, min(dates), hi, limit + 1)).fetchall()
+    if len(rows) > limit:
+        raise ValueError("too much existing history in the adoption seam "
+                         "to check for duplicates")
+    for r in rows:
+        m._by_cell.setdefault(
+            (round(float(r["amount"]) * 100), r["date"]), []).append({
+                "id": r["id"], "used": r["id"] in spoken_for,
+                "tokens": _tokens(r["name"], r["merchant_name"])})
+    return m
+
+
+def _claim(m, d: dt.date, amount: float, name, merchant_name) -> dict | None:
+    """`Deduper.claim`, answering WHICH candidate it used up (None: no
+    match). The claim only ever ticks off a candidate of the same amount
+    within its reach, so those are the only ones to watch."""
+    from .dedup import WINDOW_DAYS
+    cents = round(amount * 100)
+    watch = [c for k in range(-WINDOW_DAYS, WINDOW_DAYS + 1)
+             for c in m._by_cell.get((cents, d + dt.timedelta(days=k)), ())
+             if not c["used"]]
+    if not m.claim(d, amount, name, merchant_name):
+        return None
+    return next((c for c in watch if c["used"]), {"id": None})
+
+
+def _remember(conn, adopt: dict, absorbed: dict, settled: dict) -> None:
+    """Add what this page accounted for to the adoption's guard ledger.
+    Merged in SQL rather than written back whole, so the ledger a
+    concurrent page wrote is extended, not overwritten."""
+    from psycopg.types.json import Jsonb
+    conn.execute(
+        """UPDATE account_adoptions SET guard_ledger =
+               COALESCE(guard_ledger, '{}'::jsonb)
+               || jsonb_build_object(
+                   'absorbed', COALESCE(guard_ledger->'absorbed', '{}')
+                               || %s::jsonb,
+                   'settled', COALESCE(guard_ledger->'settled', '{}')
+                              || %s::jsonb)
+            WHERE account_id = %s AND adopted_at = %s""",
+        (Jsonb({k: v for k, v in absorbed.items() if v}), Jsonb(settled),
+         adopt["account_id"], adopt["adopted_at"]))
+
+
+def _awaiting_settlement(conn, account_id: str, hold_ids: list,
+                         dates: list) -> list[dict]:
+    """The holds a merge retired whose posted charge has not arrived yet,
+    within reach of this page (see the guard ledger)."""
+    from .dedup import WINDOW_DAYS, _tokens
+    rows = conn.execute(
+        """SELECT id, date, amount, name, merchant_name FROM transactions
+            WHERE id = ANY(%s) AND account_id = %s AND removed = 1
+              AND date BETWEEN %s::date - %s::int AND %s::date""",
+        (list(hold_ids), account_id, min(dates), WINDOW_DAYS,
+         max(dates))).fetchall()
+    return [{"id": r["id"], "date": r["date"],
+             "cents": round(float(r["amount"]) * 100), "used": False,
+             "tokens": _tokens(r["name"], r["merchant_name"])} for r in rows]
+
+
+def _settles(holds: list[dict], m, d: dt.date, amount: float,
+             tokens: set) -> dict | None:
+    """The retired hold an incoming row is the posted charge of, or None.
+
+    The same bank's feed dates a posted charge the same day whichever link
+    delivers it, so a row with an unclaimed same-day restored twin is that
+    twin's re-delivery and goes to the matcher, even when a hold is also in
+    reach. Otherwise the nearest unclaimed hold of the same amount, dated
+    on or before the row within the matcher's reach and sharing a name
+    token, is the one it settles."""
+    from .dedup import WINDOW_DAYS, _distinct_names
+    cents = round(amount * 100)
+    if m is not None and any(
+            not c["used"] and not _distinct_names(tokens, c["tokens"])
+            for c in m._by_cell.get((cents, d), ())):
+        return None
+    best = None
+    for h in holds:
+        lag = (d - h["date"]).days
+        if (h["used"] or h["cents"] != cents or not 0 <= lag <= WINDOW_DAYS
+                or not tokens & h["tokens"]):
+            continue
+        if best is None or lag < (d - best["date"]).days:
+            best = h
+    if best is not None:
+        best["used"] = True
+    return best
 
 
 def _note_file_rows_relied_on(conn, account_id: str,
@@ -1356,3 +1573,422 @@ def list_adoptions(conn, item_id: str | None = None) -> list[dict]:
         args = (item_id,)
     return [dict(r) for r in
             conn.execute(sql + " ORDER BY adopted_at DESC", args).fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# The other order: link first, restore second.
+#
+# Everything above runs on the LINK side and is triggered by an incoming
+# account the household does not hold yet. When the bank was linked before
+# the archive was restored, the live account already exists, so the link
+# side has nothing to adopt ("already ours") and the restore then brings
+# the same real account back under its old Plaid id beside it. Plaid ids are
+# scoped to the Item, so nothing collides, and nothing else ever compares
+# the two: the guard only filters FUTURE pages, the twin sweep is an
+# operator tool, and retiring the shell only archives it — an archived
+# connection's rows still count in every aggregate. So the restore
+# reconciles from its own side, once its rows have landed.
+# ---------------------------------------------------------------------------
+
+# Bound on the rows compared when two lineages of one account are settled
+# inside a restore; past it the account is left unmerged and the person is
+# told, rather than settling it on a partial read.
+_MERGE_MAX_ROWS = 200_000
+
+
+def _same_bank_sql(alias_live: str, alias_rest: str) -> str:
+    # institution_id when both carry one; the name only for an item old
+    # enough to have none recorded — the same rule `_candidates` uses
+    return (f"(CASE WHEN {alias_live}.institution_id IS NOT NULL"
+            f"       AND {alias_rest}.institution_id IS NOT NULL"
+            f"  THEN {alias_live}.institution_id = {alias_rest}.institution_id"
+            f"  ELSE lower({alias_live}.institution_name)"
+            f"       = lower({alias_rest}.institution_name) END)")
+
+
+def _restored_twins(conn, restored_ids) -> tuple[list[tuple[dict, dict]],
+                                                 list[dict]]:
+    """Pair each restored Plaid account with the live account it duplicates.
+
+    Returns (pairs, ambiguous). A pair is (restored, live) where the live
+    account is the ONLY live one at that bank with the restored account's
+    mask and type, and the restored account is the only one this restore
+    brought back with that mask and type at that bank — the uniqueness
+    `adopt_accounts` demands, asked from both ends, because welding a
+    chequing history onto a savings feed is worse than an extra account.
+    `ambiguous` lists the restored accounts that have a possible twin here
+    but no unique one; they are left as they are and named to the person.
+
+    A restored account the bank reports with no mask is never paired: with
+    nothing to prove identity, two same-type accounts at one bank are as
+    likely two real accounts as one account held twice. It is named as
+    ambiguous whenever a live account of its type at that bank could be its
+    twin (one with no mask either, or the only one of that type), so the
+    copy the live link may now duplicate is never left unmentioned.
+    """
+    if not restored_ids:
+        return [], []
+    restored = [dict(r) for r in conn.execute(
+        """SELECT a.id, a.name, a.mask, a.type, a.item_id,
+                   i.institution_id, i.institution_name
+              FROM accounts a JOIN items i ON i.id = a.item_id
+             WHERE a.id = ANY(%s)
+               AND i.aggregator = 'plaid'
+               AND COALESCE(i.access_token, '') = ''
+               AND COALESCE(i.status, '') = 'restored'
+               AND a.user_removed_at IS NULL""",
+        (list(restored_ids),)).fetchall()]
+    unmasked = [r for r in restored if not (r["mask"] or "").strip()]
+    restored = [r for r in restored if (r["mask"] or "").strip()]
+    pairs, ambiguous = [], []
+    for r in unmasked:
+        live = conn.execute(
+            f"""SELECT COALESCE(btrim(a.mask), '') = '' AS no_mask
+                  FROM accounts a JOIN items i ON i.id = a.item_id
+                  JOIN items ri ON ri.id = %s
+                 WHERE i.aggregator = 'plaid'
+                   AND COALESCE(i.access_token, '') <> ''
+                   AND COALESCE(i.status, '') NOT IN ('archived', 'restored')
+                   AND {_same_bank_sql('i', 'ri')}
+                   AND lower(btrim(COALESCE(a.type, '')))
+                       = lower(btrim(%s))
+                   AND a.user_removed_at IS NULL""",
+            (r["item_id"], r["type"] or "")).fetchall()
+        if len(live) == 1 or any(lv["no_mask"] for lv in live):
+            ambiguous.append(r)
+    for r in restored:
+        live = conn.execute(
+            f"""SELECT a.id, a.item_id, i.tx_update_status
+                  FROM accounts a JOIN items i ON i.id = a.item_id
+                  JOIN items ri ON ri.id = %s
+                 WHERE i.aggregator = 'plaid'
+                   AND COALESCE(i.access_token, '') <> ''
+                   AND COALESCE(i.status, '') NOT IN ('archived', 'restored')
+                   AND {_same_bank_sql('i', 'ri')}
+                   AND btrim(a.mask) = btrim(%s)
+                   AND lower(btrim(a.type)) = lower(btrim(%s))
+                   AND a.user_removed_at IS NULL""",
+            (r["item_id"], r["mask"], r["type"] or "")).fetchall()
+        if not live:
+            continue                  # nothing here it could duplicate
+        siblings = [s for s in restored
+                    if s["mask"].strip() == r["mask"].strip()
+                    and (s["type"] or "").strip().lower()
+                    == (r["type"] or "").strip().lower()
+                    and ((s["institution_id"] or None,
+                          (s["institution_name"] or "").lower())
+                         == (r["institution_id"] or None,
+                             (r["institution_name"] or "").lower()))]
+        if len(live) != 1 or len(siblings) != 1:
+            ambiguous.append(r)
+            continue
+        pairs.append((r, dict(live[0])))
+    # one live account never absorbs two restored ones
+    seen: dict[str, int] = {}
+    for _, lv in pairs:
+        seen[lv["id"]] = seen.get(lv["id"], 0) + 1
+    ambiguous += [r for r, lv in pairs if seen[lv["id"]] > 1]
+    pairs = [(r, lv) for r, lv in pairs if seen[lv["id"]] == 1]
+    return pairs, ambiguous
+
+
+def _pair_overlap(conn, restored_id: str, live_id: str) -> list[tuple[str, str]] | None:
+    """(restored row, live row) pairs that are one charge held twice.
+
+    One-to-one ACROSS the two lineages, never within one: two same-price
+    coffees on one day are two restored rows and two live rows, and pair
+    off as two twins — whereas the operator twin sweep, which looks at one
+    account's rows without knowing where each came from, would read them
+    as one charge held twice. The match itself is the importers' rule
+    (same amount within WINDOW_DAYS with a shared name token, or the same
+    day with names that do not contradict), so a raw bank descriptor finds
+    Plaid's cleaned name for the same charge — but every same-day pair is
+    made before any off-day one, and a restored row dated outside the live
+    lineage's days is only ever paired on its own day.
+
+    Only the days both lineages cover are compared. None when the overlap
+    is past the bound."""
+    from .dedup import WINDOW_DAYS, _distinct_names, _tokens
+    span = conn.execute(
+        "SELECT min(date) AS lo, max(date) AS hi FROM transactions"
+        " WHERE account_id = %s AND removed = 0", (live_id,)).fetchone()
+    rspan = conn.execute(
+        "SELECT min(date) AS lo, max(date) AS hi FROM transactions"
+        " WHERE account_id = %s AND removed = 0", (restored_id,)).fetchone()
+    if not span["lo"] or not rspan["lo"]:
+        return []
+    lo = max(span["lo"], rspan["lo"]) - dt.timedelta(days=WINDOW_DAYS)
+    hi = min(span["hi"], rspan["hi"]) + dt.timedelta(days=WINDOW_DAYS)
+    if lo > hi:
+        return []
+
+    def rows(aid):
+        return conn.execute(
+            """SELECT id, date, amount, name, merchant_name, pending
+                 FROM transactions
+                WHERE account_id = %s AND removed = 0
+                  AND date BETWEEN %s AND %s
+                ORDER BY date, id LIMIT %s""",
+            (aid, lo, hi, _MERGE_MAX_ROWS + 1)).fetchall()
+    live, mine = rows(live_id), rows(restored_id)
+    if len(live) > _MERGE_MAX_ROWS or len(mine) > _MERGE_MAX_ROWS:
+        return None
+    cells: dict[tuple[int, dt.date], list[dict]] = {}
+    for r in live:
+        cells.setdefault((round(float(r["amount"]) * 100), r["date"]),
+                         []).append({"id": r["id"], "used": False,
+                                     "pending": bool(r["pending"]),
+                                     "tokens": _tokens(r["name"],
+                                                       r["merchant_name"])})
+    mine = [(r, round(float(r["amount"]) * 100),
+             _tokens(r["name"], r["merchant_name"])) for r in mine]
+    out: list[tuple[str, str]] = []
+    paired: set[str] = set()
+    # Pass one: the same amount on the same day, one to one — a shared name
+    # token first, then names that merely do not contradict. It runs over
+    # every row before any off-day match is tried, so a recurring charge
+    # held by both lineages (the same coffee every morning) pairs day for
+    # day; a greedy nearest-day walk would let one morning's row take the
+    # next morning's partner and shift the whole run by a day.
+    #
+    # A posted live row is taken before a pending one: on the day the bank
+    # holds both a hold and the charge it became, the restored copy is the
+    # posted charge, and paired with the hold, everything a person put on
+    # it would follow the hold the bank is about to remove.
+    for want_pending in (False, True):
+        for want_token in (True, False):
+            for r, cents, toks in mine:
+                if r["id"] in paired:
+                    continue
+                for c in cells.get((cents, r["date"]), ()):
+                    if c["used"] or c["pending"] != want_pending:
+                        continue
+                    if (toks & c["tokens"] if want_token
+                            else not _distinct_names(toks, c["tokens"])):
+                        c["used"] = True
+                        paired.add(r["id"])
+                        out.append((r["id"], c["id"]))
+                        break
+    # Pass two: what is still unpaired may match a live row a few days off
+    # (the two feeds dated the charge differently), nearest day first, on a
+    # shared name token. Only for a restored row inside the days the live
+    # lineage covers: one dated before the link's first row is history the
+    # link never held, and pairing it off-day would retire a real charge.
+    for r, cents, toks in mine:
+        if r["id"] in paired or not (span["lo"] <= r["date"] <= span["hi"]):
+            continue
+        hit = None
+        for delta in range(1, WINDOW_DAYS + 1):
+            for d in (r["date"] - dt.timedelta(days=delta),
+                      r["date"] + dt.timedelta(days=delta)):
+                for c in cells.get((cents, d), ()):
+                    if not c["used"] and toks & c["tokens"]:
+                        hit = c
+                        break
+                if hit:
+                    break
+            if hit:
+                break
+        if hit:
+            hit["used"] = True
+            paired.add(r["id"])
+            out.append((r["id"], hit["id"]))
+    return out
+
+
+def _move_account_children(conn, old_id: str, new_id: str) -> None:
+    """Point everything that names `old_id` at the existing `new_id`.
+
+    The live account's own one-per-account state is the current truth:
+    its liability record and its holdings come from the feed that is
+    syncing now, so the restored snapshot of them is dropped wherever the
+    live account already has its own, instead of colliding with it. A
+    link-group membership the live account already has wins the same way.
+    """
+    for table in ("liabilities", "account_links", "holdings",
+                  "crypto_holdings"):
+        conn.execute(
+            f"DELETE FROM {table} WHERE account_id = %s AND EXISTS"
+            f" (SELECT 1 FROM {table} WHERE account_id = %s)",
+            (old_id, new_id))
+    for table, col in ACCOUNT_REFS:
+        conn.execute(f"UPDATE {table} SET {col} = %s WHERE {col} = %s",
+                     (new_id, old_id))
+    from .base import carry_stood_in_accounts
+    carry_stood_in_accounts(conn, old_id, new_id)
+
+
+def _merge_one(conn, restored: dict, live: dict) -> dict | None:
+    """Merge one restored account into the live account it duplicates —
+    one transaction. None when either row is gone or the overlap is past
+    the bound (nothing is changed then)."""
+    from psycopg.types.json import Jsonb
+
+    from .base import FILE_IMPORT_ID_PREFIXES
+    from .reanchor import hold_pairing_lock
+    rid, lid = restored["id"], live["id"]
+    with conn.transaction():
+        # pairing lock, then the settings row, then account rows: the order
+        # every writer of these uses (see `_adopt_one`), taken up front —
+        # this runs in the restore job, not on a request path
+        hold_pairing_lock(conn)
+        _settings_row_lock(conn, wait=True)
+        held = conn.execute(
+            "SELECT id FROM accounts WHERE id = ANY(%s) ORDER BY id"
+            " FOR UPDATE", ([rid, lid],)).fetchall()
+        if len(held) != 2:
+            return None
+        # the live lineage's first day, read before anything moves onto it:
+        # every row dated earlier is one only the restore can have brought
+        live_lo = conn.execute(
+            "SELECT min(date) AS lo FROM transactions"
+            " WHERE account_id = %s AND removed = 0", (lid,)).fetchone()["lo"]
+        # The cutoff is the newest restored POSTED day: the restore's holds
+        # are retired just below, and their settlements are told apart by
+        # what is stamped on them, not by a date the backup happened to
+        # hold a promise for.
+        span = conn.execute(
+            "SELECT max(date) FILTER (WHERE COALESCE(pending, 0) = 0) AS hi,"
+            " min(date) AS lo_any,"
+            " min(date) FILTER (WHERE NOT (id LIKE ANY(%s))) AS lo"
+            " FROM transactions WHERE account_id = %s AND removed = 0",
+            ([p + "%" for p in FILE_IMPORT_ID_PREFIXES], rid)).fetchone()
+        # A restored hold is a promise its own (gone) Item would have kept;
+        # the live feed already carries the posted charge, or will.
+        _clear_guard_marks(conn, rid)
+        # Each is recorded as awaiting its settlement (on the adoption
+        # below), so the backfill guard keeps that posted charge rather
+        # than matching it against an earlier same-price charge the
+        # restore holds.
+        retired_holds = [r["id"] for r in conn.execute(
+            "UPDATE transactions SET removed = 1"
+            " WHERE account_id = %s AND pending = 1 AND removed = 0"
+            " RETURNING id", (rid,)).fetchall()]
+        pairs = _pair_overlap(conn, rid, lid)
+        if pairs is None:
+            raise _TooBig()
+        # account-level answers a person gave on the old install, where the
+        # fresh link has none of its own yet
+        conn.execute(
+            """UPDATE accounts l SET
+                   display_name = COALESCE(l.display_name, r.display_name),
+                   owner        = COALESCE(l.owner, r.owner),
+                   entity_id    = COALESCE(l.entity_id, r.entity_id),
+                   type    = CASE WHEN r.type_user_set AND NOT l.type_user_set
+                                  THEN r.type ELSE l.type END,
+                   subtype = CASE WHEN r.type_user_set AND NOT l.type_user_set
+                                  THEN r.subtype ELSE l.subtype END,
+                   type_user_set = l.type_user_set OR r.type_user_set
+              FROM accounts r WHERE l.id = %s AND r.id = %s""", (lid, rid))
+        _move_account_children(conn, rid, lid)
+        # The live row survives each pair: it wears the id the bank's later
+        # `removed`/`modified` deltas will name. Everything a person put on
+        # the restored copy — category and its kind, owner, notes, receipts,
+        # splits, flags, pairings — goes across with the retirement.
+        for old_txn, live_txn in pairs:
+            _retire_twin_locked(conn, live_txn, old_txn)
+        touched = _rewrite_account_id_in_config(conn, rid, lid)
+        conn.execute("DELETE FROM accounts WHERE id = %s", (rid,))
+        # The connection the account came on is archived in the same
+        # transaction as the move: written afterwards, a job that died in
+        # between left a 'restored' connection asking to be reconnected,
+        # and no retry would archive it, because its account was gone.
+        _retire_donors(conn, {restored["item_id"]})
+        # The record of the old id is what a statement re-imported later
+        # finds its file rows through. It arms the backfill guard only when
+        # the live link is still replaying history: a finished backfill has
+        # nothing left to filter. Read here, under the locks, so a sync that
+        # finished the replay a moment ago is seen.
+        status = conn.execute(
+            "SELECT tx_update_status FROM items WHERE id = %s",
+            (live["item_id"],)).fetchone()
+        settled = bool(status) and (status["tx_update_status"]
+                                    == "HISTORICAL_UPDATE_COMPLETE")
+        history_from = span["lo"] or span["lo_any"]
+        cutoff = span["hi"]
+        if not settled and live_lo is not None and cutoff is not None:
+            # The guard treats every row dated at or before the cutoff as
+            # one the restore brought, and lets it absorb an incoming
+            # charge. Here the live lineage already holds rows of its own —
+            # pending ones included — so a cutoff at the newest restored day
+            # would let a live coffee swallow a second, distinct one and a
+            # live hold swallow its own settlement, which the bank then
+            # retires: the charge would exist nowhere. The days both
+            # lineages cover were already paired one to one above, so the
+            # guard only has to cover what is older than the live lineage.
+            cutoff = min(cutoff, live_lo - dt.timedelta(days=1))
+            if history_from is not None and cutoff < history_from:
+                # the restore holds nothing older than the live lineage:
+                # nothing is left for the replay to duplicate
+                settled = True
+        conn.execute(
+            """INSERT INTO account_adoptions
+                   (account_id, old_account_id, item_id, cutoff_date,
+                    history_from, live_from, guard_ledger, reconciled_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s, CASE WHEN %s THEN now() END)""",
+            (lid, rid, live["item_id"], cutoff, history_from, live_lo,
+             Jsonb({"awaiting": retired_holds}) if retired_holds else None,
+             settled))
+        from ..db import tenancy
+        tenancy.set_entity_scope(conn)
+    return {"account_id": lid, "old_account_id": rid,
+            "item_id": restored["item_id"], "twins": len(pairs),
+            "config": touched}
+
+
+class _TooBig(Exception):
+    """The overlap is past the bound; the merge's transaction rolls back."""
+
+
+def _label(r: dict) -> str:
+    name = r.get('name') or 'an account'
+    mask = (r.get('mask') or '').strip()
+    # an account the bank reports with no mask is named by its name alone
+    return f"{name} ••{mask}" if mask else name
+
+
+def merge_restored_onto_live(conn, restored_ids) -> tuple[list[dict],
+                                                          list[str]]:
+    """After a restore: merge each restored Plaid account into the live
+    account the household had already linked for it.
+
+    Returns (merged, notes). Each merge is its own transaction, so one
+    that fails leaves the others and the restore itself in place; the
+    notes name every account that may now appear twice."""
+    pairs, ambiguous = _restored_twins(conn, restored_ids)
+    merged: list[dict] = []
+    notes: list[str] = []
+    left: list[dict] = list(ambiguous)
+    for restored, live in pairs:
+        try:
+            rec = _merge_one(conn, restored, live)
+        except _TooBig:
+            rec = None
+            log.warning("restore: %s holds too much history to merge onto "
+                        "%s", restored["id"], live["id"])
+        except Exception:                                # noqa: BLE001
+            rec = None
+            log.warning("restore: could not merge %s onto %s",
+                        restored["id"], live["id"], exc_info=True)
+        if rec is None:
+            if conn.execute("SELECT 1 FROM accounts WHERE id = %s",
+                            (restored["id"],)).fetchone():
+                left.append(restored)
+            continue
+        merged.append(rec)
+        log.info("restore: merged %s onto the linked %s (%s overlapping "
+                 "rows held once)", rec["old_account_id"], rec["account_id"],
+                 rec["twins"])
+    if merged:
+        notes.append(
+            f"{len(merged)} restored account"
+            f"{'s were' if len(merged) != 1 else ' was'} already linked "
+            f"here and merged into the live connection, history and notes "
+            f"included")
+    if left:
+        notes.append(
+            "these restored accounts look like ones already linked here but "
+            "could not be matched to exactly one, so they may now appear "
+            "twice: " + ", ".join(_label(r) for r in left)
+            + ". Check the Accounts page and link or remove the extra copy")
+    return merged, notes

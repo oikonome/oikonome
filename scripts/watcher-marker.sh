@@ -43,6 +43,15 @@ watcher_mark() {
        || systemctl is-enabled --quiet \
             "oikonome-$_wm_other-watcher.path" 2>/dev/null; then
         date -u +%Y-%m-%dT%H:%M:%SZ > "$_wm_dir/$_wm_other"
+        # A command watcher found this way was installed without a marker,
+        # so the marker can only say what revision its checker is if the
+        # checker says so itself; one that does not predates revisions and
+        # is left at revision 1, which keeps the console's "behind" notice.
+        [ "$_wm_other" = command ] && _wm_rev=$(sed -n \
+            's/^# oikonome-command-run revision=\([0-9][0-9]*\)$/\1/p' \
+            "${WATCHER_COMMAND_RUN:-/usr/local/bin/oikonome-command-run}" \
+            2>/dev/null | head -n 1) && [ -n "$_wm_rev" ] \
+            && echo "revision=$_wm_rev" >> "$_wm_dir/$_wm_other"
         chmod u=rw,go=r "$_wm_dir/$_wm_other"
         echo "found the $_wm_other watcher already enabled; marked it too"
     fi

@@ -1030,6 +1030,9 @@ const BUCKETS: [string, string][] = [
   ["startup_195", "Start-up (§195)"],
 ];
 
+// the line picker's "clear line" choice: no real Schedule C line has
+// this value, so it cannot collide with one
+const CLEAR_LINE = "__clear__";
 const BOOKS_PAGE = 100;
 
 function BooksSection({ entityId, readOnly }:
@@ -1115,12 +1118,17 @@ function BooksSection({ entityId, readOnly }:
   };
   // a row bucketed here with no line stays in Schedule C review; the
   // line is offered on the row too, from the same closed list (and the
-  // same cache entry) the review queue reads
-  const wantsLine = !readOnly && loaded.some(bizNeedsLine);
+  // same cache entry) the review queue reads. A row that has a line keeps
+  // the picker, so a line saved by mistake can be changed or cleared.
+  const lineEditable = (t: BizTxn) =>
+    bizNeedsLine(t) || (t.amount > 0 && !!t.sched_c_line);
+  const wantsLine = !readOnly && loaded.some(lineEditable);
   const lineList = useQuery({ queryKey: ["biz-suggestions", entityId],
     queryFn: () => api.bizSuggestions(entityId), enabled: wantsLine });
-  const setLine = (t: BizTxn, line: string) => {
-    if (!line || !t.bucket) return;
+  // `line` null clears it: the body names the key, which the server reads
+  // as "set this line", where leaving the key out keeps the stored one
+  const setLine = (t: BizTxn, line: string | null) => {
+    if (line === "" || !t.bucket || line === t.sched_c_line) return;
     const bucket = t.bucket;
     if (year === undefined)
       patchQueries<InfiniteData<BizPage>>(
@@ -1206,12 +1214,23 @@ function BooksSection({ entityId, readOnly }:
                   {BUCKETS.map(([v, l]) =>
                     <option key={v} value={v}>{l}</option>)}
                 </select>)}
-                {!readOnly && bizNeedsLine(t) && (
-                  <select value="" style={{ display: "block", marginTop: 2 }}
-                          onChange={(e) => setLine(t, e.target.value)}>
-                    <option value="">choose a line…</option>
+                {!readOnly && lineEditable(t) && (
+                  <select value={t.sched_c_line ?? ""}
+                          style={{ display: "block", marginTop: 2 }}
+                          onChange={(e) => setLine(t,
+                            e.target.value === CLEAR_LINE
+                              ? null : e.target.value)}>
+                    {!t.sched_c_line &&
+                      <option value="">choose a line…</option>}
                     {(lineList.data?.lines || []).map((l) =>
                       <option key={l} value={l}>{l}</option>)}
+                    {/* a stored line the list has not loaded yet still
+                        shows as the selection */}
+                    {t.sched_c_line && !(lineList.data?.lines || [])
+                      .includes(t.sched_c_line) &&
+                      <option value={t.sched_c_line}>{t.sched_c_line}</option>}
+                    {t.sched_c_line &&
+                      <option value={CLEAR_LINE}>clear line</option>}
                   </select>)}</td>
             </tr>
           ))}

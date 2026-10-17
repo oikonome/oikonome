@@ -171,5 +171,168 @@ class ResetDataReleasesBankLinksTests(unittest.TestCase):
         self.assertIn(f"{self._items_left()} bank link", text)
 
 
+class OpenLinksAndQueuedReleasesAreNotLostTests(unittest.TestCase):
+    """A reset must not silently drop the two other handles on live Items:
+    a link the person finished at the bank that nobody exchanged yet (an
+    open session), and a release that failed earlier and waits in
+    plaid_release_queue. Open sessions are handed back before the release;
+    the full instance reset, which deletes the queue with the database,
+    retries it once and names every Item still in it."""
+
+    def setUp(self):
+        self.conn = make_db()
+        self.addCleanup(self.conn.close)
+        self.tid = str(self.conn.execute(
+            "SELECT current_setting('app.tenant_id') AS t").fetchone()["t"])
+        write_config(self.conn, plaid_client_id="cid", plaid_secret="sec")
+        self.lt = f"lt-reset-{uuid.uuid4().hex[:8]}"
+        from oikonome.jobs import plaid_links
+        plaid_links.record(self.tid, self.lt, "add", None, False, None)
+        self.queued = f"pl-queued-{uuid.uuid4().hex[:8]}"
+        self.held = f"pl-hold-{uuid.uuid4().hex[:8]}"
+        admin = tenancy.admin_connect()
+        try:
+            for iid, why in ((self.queued, "erasure"),
+                             (self.held, plaid.LINK_HOLD_REASON)):
+                admin.execute(
+                    "INSERT INTO plaid_release_queue (item_id, tenant, "
+                    "access_token, client_id, base_url, reason) "
+                    "VALUES (%s, %s, 'sealed', 'cid', 'https://x', %s)",
+                    (iid, self.tid, why))
+        finally:
+            admin.close()
+        self.addCleanup(self._drop_queue)
+
+    def _drop_queue(self):
+        admin = tenancy.admin_connect()
+        try:
+            admin.execute("DELETE FROM plaid_release_queue "
+                          "WHERE item_id = ANY(%s)",
+                          ([self.queued, self.held],))
+            admin.execute("DELETE FROM plaid_link_sessions WHERE tenant=%s",
+                          (self.tid,))
+        finally:
+            admin.close()
+
+    def _sessions_left(self):
+        admin = tenancy.admin_connect()
+        try:
+            return admin.execute(
+                "SELECT count(*) AS n FROM plaid_link_sessions "
+                "WHERE tenant=%s", (self.tid,)).fetchone()["n"]
+        finally:
+            admin.close()
+
+    def test_a_household_reset_hands_back_open_links_and_refuses_the_rest(self):
+        from oikonome.jobs import plaid_links
+        handed = []
+        with mock.patch.object(plaid_links, "hand_back_open_sessions",
+                               lambda tid, *a, **k:
+                               handed.append(str(tid)) or {}), \
+                mock.patch.object(plaid, "release_tenant_items",
+                                  lambda *a, **k: 0):
+            reset.reset_tenant_data(self.tid)
+        self.assertEqual(handed, [self.tid])
+        # still open at the bank: kept on record as the only handle on the
+        # Item it may yet make, but never again offered or counted
+        self.assertEqual(self._sessions_left(), 1)
+        sess = plaid_links.load(self.lt, self.tid)
+        self.assertEqual(sess["refuse"], reset.RESET_REFUSAL)
+        self.assertEqual(plaid_links.open_sessions(self.tid), [])
+        self.assertEqual(plaid_links.recent_open(self.tid, 3600), set())
+
+    def test_a_link_finished_after_the_reset_hands_its_bank_back(self):
+        from oikonome.jobs import plaid_links
+        with mock.patch.object(plaid_links, "hand_back_open_sessions",
+                               lambda tid, *a, **k: {}), \
+                mock.patch.object(plaid, "release_tenant_items",
+                                  lambda *a, **k: 0):
+            reset.reset_tenant_data(self.tid)
+        # the person finishes at the bank after the reset; the LINK webhook
+        # resolves the token and the worker finishes the session
+        self.assertEqual(plaid_links.tenant_for_link(self.lt), self.tid)
+        iid = f"pl-late-{uuid.uuid4().hex[:8]}"
+        calls = []
+
+        def handler(request):
+            calls.append(request.url.path)
+            if request.url.path == "/link/token/get":
+                return httpx.Response(200, text=json.dumps(
+                    {"link_sessions": [{"results": {"item_add_results": [
+                        {"public_token": "pub-late"}]}}]}))
+            if request.url.path == "/item/public_token/exchange":
+                return httpx.Response(200, text=json.dumps(
+                    {"item_id": iid, "access_token": "access-late"}))
+            if request.url.path == "/item/remove":
+                return httpx.Response(200, text=json.dumps(
+                    {"request_id": "r"}))
+            return httpx.Response(404, text="{}")
+
+        def for_tenant(conn, transport=None):
+            return plaid.Client("cid", "sec", plaid.ENV_URLS["sandbox"],
+                                transport=httpx.MockTransport(handler))
+        with mock.patch.object(plaid.Client, "for_tenant",
+                               staticmethod(for_tenant)):
+            word = plaid_links.finish_session(self.tid, self.lt)
+        self.assertEqual(word, "blocked")
+        self.assertIn("/item/public_token/exchange", calls)
+        self.assertIn("/item/remove", calls,
+                      "the bank made after the reset was left billing")
+        self.assertIsNone(self.conn.execute(
+            "SELECT 1 FROM items WHERE id=%s", (iid,)).fetchone(),
+            "the bank went into the household just wiped")
+        reply = plaid_links.load(self.lt, self.tid)["reply"]
+        self.assertEqual(reply["kind"], "add_failed")
+        self.assertEqual(reply["error"], reset.RESET_REFUSAL)
+
+    def test_the_full_reset_retries_the_queue_and_names_what_is_left(self):
+        from oikonome.jobs import plaid_links, reaper
+        handed, retried, out = [], [], []
+        with mock.patch.object(reset, "all_tenants",
+                               lambda: [(self.tid, "owner@example.dev")]), \
+                mock.patch.object(plaid_links, "hand_back_open_sessions",
+                                  lambda tid, *a, **k:
+                                  handed.append(str(tid)) or {}), \
+                mock.patch.object(plaid, "release_tenant_items",
+                                  lambda *a, **k: 0), \
+                mock.patch.object(mx, "release_tenant_user",
+                                  lambda *a, **k: "none"), \
+                mock.patch.object(reaper, "retry_queued_releases",
+                                  lambda *a, **k: retried.append(1) or {}), \
+                mock.patch("builtins.print",
+                           lambda *a, **kw: out.append(" ".join(map(str, a)))):
+            code = reset.main(["reset", "--release-links"])
+        self.assertEqual(code, 1, "the caller was told everything released")
+        self.assertEqual(handed, [self.tid])
+        self.assertEqual(retried, [1])
+        text = "\n".join(out)
+        self.assertIn(self.queued, text)
+        self.assertIn(self.held, text,
+                      "a link held mid-exchange died with the database "
+                      "unnamed")
+        self.assertIn("NOT RELEASED", text)
+
+    def test_the_full_reset_passes_when_the_retry_clears_the_queue(self):
+        from oikonome.jobs import reaper
+
+        def retry_releases_all(*a, **k):
+            admin = tenancy.admin_connect()
+            try:
+                admin.execute("DELETE FROM plaid_release_queue")
+            finally:
+                admin.close()
+            return {}
+        with mock.patch.object(reset, "all_tenants",
+                               lambda: [(self.tid, "owner@example.dev")]), \
+                mock.patch.object(plaid, "release_tenant_items",
+                                  lambda *a, **k: 0), \
+                mock.patch.object(mx, "release_tenant_user",
+                                  lambda *a, **k: "none"), \
+                mock.patch.object(reaper, "retry_queued_releases",
+                                  retry_releases_all), \
+                mock.patch("builtins.print", lambda *a, **kw: None):
+            self.assertEqual(reset.main(["reset", "--release-links"]), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

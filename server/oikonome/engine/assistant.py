@@ -7,24 +7,47 @@ what the code computes. The model never sees free SQL and can never write; it
 only picks which of a handful of vetted summaries to fetch. Runs on the same
 LLM backend as categorization (bundled Ollama by default, so your financial
 data never leaves the box) and is unavailable when no LLM is configured.
+
+An answer can carry charts and tables: the model writes a small JSON spec
+in a fenced block, assistant_blocks validates it, and the clients draw it
+(and can save the whole answer as a self-contained HTML report).
 """
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
+import logging
 import threading
+import uuid as _uuid
 from urllib.parse import urlsplit
 
 from ..envnum import env_num
+from . import assistant_blocks as _blocks
 from . import llm_categorize as _llm
 
-MAX_TOKENS = 600
+# an answer may carry a chart or table spec beside its prose; a dozen
+# months in two series is ~150 tokens, a ten-row table ~200
+MAX_TOKENS = 1100
 MAX_TOOL_HOPS = 3
+# Hop budget spent and the model still asking for data: one more call with
+# tools withheld, so it answers from what it has (a thorough model asked
+# "by month" wants a lookup per month and would otherwise run out of hops
+# holding six results and no answer), and one more when that turn comes
+# back empty (_FINAL_RETRIES). Worst case is therefore
+# (MAX_TOOL_HOPS + 1 + _FINAL_RETRIES) x _HOP_TIMEOUT per ask.
 # The model decides how many tools to call per hop; each call is a ledger
 # query on the web thread, so an over-eager (or adversarially prompted)
 # reply must not fan out without bound.
 MAX_CALLS_PER_HOP = 4
-_TOOL_RESULT_CAP = 2000
+# A tool result is trimmed to this many JSON characters before the model
+# sees it — structurally (lists and maps shortened, see _fit_result), never
+# cut mid-string: a result sliced at a character count is broken JSON, and
+# a model handed broken JSON for the spending summary asks for the same
+# figures again one lookup at a time until its hops run out.
+_TOOL_RESULT_CAP = 4000
+log = logging.getLogger(__name__)
+
 # Process-wide in-flight cap. Each ask holds a web threadpool thread for up
 # to MAX_TOOL_HOPS x _HOP_TIMEOUT; the per-IP rate limit does not stop many
 # tenants (or one tenant behind many addresses) from pinning every thread
@@ -46,6 +69,12 @@ class AssistantUnavailable(Exception):
 
 class AssistantBusy(Exception):
     """Every in-flight slot is taken — try again shortly."""
+
+
+class ThreadRemoved(Exception):
+    """A follow-up's conversation was deleted while its answer was being
+    written: the answer is not kept, so the deleted conversation does not
+    come back as the one turn that outlived it."""
 
 
 def available(conn=None) -> bool:
@@ -180,6 +209,12 @@ def _t_spend_lookup(conn, args) -> dict:
         f"SELECT to_char(t.date,'YYYY') yr, {amt2} amt, {count} n "
         f"FROM {src} WHERE {cond} GROUP BY yr ORDER BY yr",
         params).fetchall()
+    # the most recent 24 months of the filter: "by month this year" is one
+    # call, not one per month
+    by_month = conn.execute(
+        f"SELECT to_char(t.date,'YYYY-MM') ym, {amt2} amt, {count} n "
+        f"FROM {src} WHERE {cond} GROUP BY ym ORDER BY ym DESC LIMIT 24",
+        params).fetchall()
     top = conn.execute(
         f"SELECT {DISPLAY_MERCHANT} payee, {amt2} amt, {count} n "
         f"FROM {src} WHERE {cond} "
@@ -190,6 +225,7 @@ def _t_spend_lookup(conn, args) -> dict:
         "total": tot["amt"], "transactions": tot["n"],
         "first": tot["first"], "last": tot["last"],
         "by_year": [[r["yr"], r["amt"], r["n"]] for r in by_year],
+        "by_month": [[r["ym"], r["amt"], r["n"]] for r in reversed(by_month)],
         "top_merchants": [[r["payee"], r["amt"], r["n"]] for r in top],
     }
 
@@ -240,7 +276,10 @@ TOOLS = [
                        "and/or a calendar year. Use whenever the question "
                        "names a specific shop, category (e.g. groceries = "
                        "'food and drink'), or year — 'how much at X', 'how "
-                       "much on Y in 2025', 'what did I spend this year'.",
+                       "much on Y in 2025', 'what did I spend this year'. "
+                       "One call returns the total, the per-year and the "
+                       "per-month breakdown and the top merchants for the "
+                       "filter: never call it once per month.",
         "parameters": {"type": "object", "properties": {
             "merchant": {"type": "string",
                          "description": "part of the merchant name"},
@@ -267,8 +306,49 @@ _SYSTEM = (
     "then answer concisely in plain language with the actual figures (US "
     "dollars). Say which period a figure covers. If the tools don't cover "
     "the question, say so briefly. Do not mention the tools or JSON. "
-    "Today is {today}."
+    "Today is {today}.\n\n{charts}"
 )
+
+
+def _fit_result(result, cap: int = _TOOL_RESULT_CAP) -> str:
+    """`result` as JSON of at most `cap` characters that is STILL JSON. A
+    map that is too long has its largest list or map halved — a `by_…`
+    series keeps its most recent half, any other list its first (the
+    leaders of a ranking) — until it fits, and says so with
+    `truncated: true`. Only a value that cannot be shortened that way is
+    ever cut by character count."""
+    s = json.dumps(result, default=str)
+    if len(s) <= cap or not isinstance(result, dict):
+        return s[:cap]
+    out = dict(result)
+    while len(s) > cap:
+        big = [(k, v) for k, v in out.items()
+               if isinstance(v, (list, dict)) and len(v) > 1]
+        if not big:
+            break
+        k, v = max(big, key=lambda kv: len(json.dumps(kv[1], default=str)))
+        keep = max(1, len(v) // 2)
+        if isinstance(v, dict):
+            out[k] = dict(list(v.items())[:keep])
+        elif k.startswith("by_"):
+            out[k] = v[-keep:]
+        else:
+            out[k] = v[:keep]
+        out["truncated"] = True
+        s = json.dumps(out, default=str)
+    return s[:cap]
+
+
+# The answer-only turn's nudge. tool_choice "none" alone is not enough:
+# a model still reaching for a lookup can spend that turn on a tool call
+# the endpoint withholds and hand back an empty message on some
+# OpenAI-compatible endpoints, so the turn says in words that the lookups
+# are over, and an empty reply earns one more such turn before the
+# apology.
+_ANSWER_NOW = ("No more lookups are available. Answer the question now "
+               "from the results above, with the figures they hold; if "
+               "they do not cover it, say what is missing.")
+_FINAL_RETRIES = 1
 
 
 def _run_tool(conn, name: str, args: dict) -> dict:
@@ -281,12 +361,18 @@ def _run_tool(conn, name: str, args: dict) -> dict:
         return {"error": f"{type(e).__name__}: {e}"}
 
 
-def ask(conn, question: str, transport=None, backend: dict | None = None) -> dict:
+def ask(conn, question: str, transport=None, backend: dict | None = None,
+        context: list[dict] | None = None) -> dict:
     """Answer a plain-language question about the tenant's ledger. Returns
-    {answer, tools_used}. Raises AssistantUnavailable when no LLM is set."""
+    {answer, blocks, tools_used}: `answer` is the prose alone, `blocks` the
+    ordered text + chart/table pieces the clients render (see
+    assistant_blocks). `context` is the thread so far — [{question,
+    answer}] oldest first, as thread_context returns it — for a follow-up;
+    the model sees those turns before the new question and nothing else
+    of the log. Raises AssistantUnavailable when no LLM is set."""
     question = (question or "").strip()
     if not question:
-        return {"answer": "", "tools_used": []}
+        return {"answer": "", "blocks": [], "tools_used": []}
     be = backend if backend is not None else _llm._backend(conn,
                                                            role="assistant")
     if not (be.get("url")):
@@ -294,29 +380,74 @@ def ask(conn, question: str, transport=None, backend: dict | None = None) -> dic
     if not _IN_FLIGHT.acquire(blocking=False):
         raise AssistantBusy()
     try:
-        return _ask(conn, question, be, transport)
+        return _ask(conn, question, be, transport, context or [])
     finally:
         _IN_FLIGHT.release()
 
 
-def _ask(conn, question: str, be: dict, transport) -> dict:
+_CHART_ONLY = "The answer is in the chart below."
+
+
+def _context_messages(context: list[dict]) -> list[dict]:
+    """The thread so far as alternating user/assistant messages: the
+    newest THREAD_CONTEXT_TURNS turns, each answer cut to
+    THREAD_CONTEXT_CHARS. The prose only — a chart block is a figure the
+    model already quoted in the prose, and re-reading JSON helps nothing."""
+    out = []
+    for t in list(context)[-THREAD_CONTEXT_TURNS:]:
+        q = str(t.get("question") or "").strip()[:1000]
+        a = str(t.get("answer") or "").strip()
+        if not q or not a:
+            continue
+        if len(a) > THREAD_CONTEXT_CHARS:
+            a = a[:THREAD_CONTEXT_CHARS].rstrip() + " …"
+        out.append({"role": "user", "content": q})
+        out.append({"role": "assistant", "content": a})
+    return out
+
+
+def _ask(conn, question: str, be: dict, transport,
+         context: list[dict] | None = None) -> dict:
     from .. import localtime
     from . import budget as _budget
     # the model's "today" is the household's day, or "this month" in its
     # answers rolls over hours before the household's own calendar does
     today = localtime.now_local(_budget.load_config(conn)).date()
     messages = [{"role": "system",
-                 "content": _SYSTEM.format(today=today.isoformat())},
+                 "content": _SYSTEM.format(today=today.isoformat(),
+                                           charts=_blocks.guide())},
+                *_context_messages(context or []),
                 {"role": "user", "content": question[:1000]}]
     used: list[str] = []
-    for _ in range(MAX_TOOL_HOPS):
+    for hop in range(MAX_TOOL_HOPS + 1 + _FINAL_RETRIES):
+        final = hop >= MAX_TOOL_HOPS
+        if final:
+            messages.append({"role": "user", "content": _ANSWER_NOW})
         msg = _llm.chat_tools(messages, TOOLS, MAX_TOKENS,
                               transport=transport, backend=be,
-                              timeout=_HOP_TIMEOUT)
+                              timeout=_HOP_TIMEOUT,
+                              tool_choice="none" if final else "auto")
         calls = (msg.get("tool_calls") or [])[:MAX_CALLS_PER_HOP]
+        if final:
+            calls = []
         if not calls:
-            return {"answer": (msg.get("content") or "").strip(),
-                    "tools_used": used}
+            content = msg.get("content")
+            answer = (content if isinstance(content, str) else "").strip()
+            if answer:
+                prose, blocks = _blocks.parse(answer)
+                if not prose and blocks:
+                    # only a chart came back: `answer` is what a client
+                    # that draws no blocks shows (and what keeps the turn
+                    # in the log), and the raw fence is not a sentence
+                    prose = _CHART_ONLY
+                return {"answer": prose, "blocks": blocks,
+                        "tools_used": used}
+            if final:
+                log.warning("assistant: the answer-only turn came back "
+                            "empty (hop %d, %d tool calls so far)",
+                            hop, len(used))
+                continue
+            break
         messages.append({"role": "assistant",
                          "content": msg.get("content") or "",
                          "tool_calls": calls})
@@ -331,7 +462,322 @@ def _ask(conn, question: str, be: dict, transport) -> dict:
             used.append(name)
             messages.append({
                 "role": "tool", "tool_call_id": tc.get("id", ""),
-                "content": json.dumps(result, default=str)[:_TOOL_RESULT_CAP],
+                "content": _fit_result(result),
             })
     return {"answer": "I wasn't able to finish answering that — try "
-                      "rephrasing.", "tools_used": used}
+                      "rephrasing.", "blocks": [], "tools_used": used}
+
+
+# ---- the log of questions and answers --------------------------------------
+
+# about how many answered questions each asker keeps; their oldest go as
+# new ones arrive, so the table stays a recent log rather than a
+# transcript forever (see _trim)
+HISTORY_KEEP = 200
+HISTORY_PAGE = 50
+# A follow-up is answered with its own thread as context — the earlier
+# questions and the prose answers, never the charts and never another
+# thread — bounded so a long conversation cannot grow the prompt without
+# limit: the newest turns, each answer cut to a readable length.
+THREAD_CONTEXT_TURNS = 8
+THREAD_CONTEXT_CHARS = 1500
+
+
+def thread_context(conn, thread_id: str) -> list[dict]:
+    """The thread's turns so far, oldest first, as `ask` wants its
+    context: [{question, answer}]. Empty when the household has no such
+    thread (another household's id reads as none under the row policy)."""
+    rows = conn.execute(
+        """SELECT question, answer FROM assistant_turns
+            WHERE thread_id = %s ORDER BY asked_at, id""",
+        (str(_uuid.UUID(str(thread_id))),)).fetchall()
+    return [{"question": r["question"], "answer": r["answer"]} for r in rows]
+
+
+def record_turn(conn, user, question: str, result: dict,
+                thread_id: str | None = None) -> str | None:
+    """Keep an answered question. Returns the row id, or None when there
+    was nothing to keep (an empty answer). A new question opens a thread
+    of its own (thread_id = its id); a follow-up names the thread it
+    continues, and raises ThreadRemoved (keeping nothing) when that thread
+    no longer has a turn. Trims the asker's own share of the household's
+    log to about their newest HISTORY_KEEP rows (see _trim)."""
+    from . import activity as _activity
+    answer = (result.get("answer") or "").strip()
+    if not answer:
+        return None
+    uid, who = _activity.actor_of(user)
+    row_id = str(_uuid.uuid4())
+    thread = str(_uuid.UUID(str(thread_id))) if thread_id else row_id
+    # The check, the insert and the trim are ONE transaction: tenant
+    # connections run in autocommit, where a row lock taken by a bare
+    # statement is released the moment that statement returns, and a
+    # removal could then land between the check and the insert.
+    with conn.transaction():
+        if uid is not None and conn.execute(
+                "SELECT 1 FROM users WHERE id = %s AND tenant_id = "
+                "current_setting('app.tenant_id')::uuid FOR SHARE",
+                (uid,)).fetchone() is None:
+            # The asker left this household while the model was answering
+            # — removed, or moved out into a household of their own (their
+            # row still exists, elsewhere). Leaving already blanked their
+            # rows (forget_asker), so writing their id and address now
+            # would name someone who no longer belongs here.
+            uid, who = None, ""
+            # ... or the whole household was erased meanwhile: the erasure
+            # locks the members first, so this check waited for it, and a
+            # row written now would be the one thing to outlive it.
+            if conn.execute(
+                    "SELECT 1 FROM tenants WHERE id = "
+                    "current_setting('app.tenant_id')::uuid").fetchone() is None:
+                return None
+        # A follow-up joins a conversation that must still exist: the
+        # model may have been answering for a minute, and the conversation
+        # can have been deleted meanwhile. Writing the follow-up anyway
+        # would bring the deleted conversation back as a thread whose
+        # opening is gone. The share lock holds one of its turns until
+        # this transaction commits, so a removal that starts now waits for
+        # the insert, and forget_thread's second pass then takes it too.
+        if thread != row_id and conn.execute(
+                "SELECT 1 FROM assistant_turns WHERE thread_id = %s "
+                "LIMIT 1 FOR SHARE", (thread,)).fetchone() is None:
+            raise ThreadRemoved()
+        # The share lock is held until this transaction commits, so a
+        # removal (DELETE) or a move-out (UPDATE of tenant_id) that starts
+        # after the check waits for the row below, and its forget_asker
+        # then reaches it. A share lock rather than a key-share one,
+        # because a move-out is an UPDATE of a non-key column and would
+        # not wait for a key-share lock.
+        row = conn.execute(
+            """INSERT INTO assistant_turns
+                   (id, thread_id, asked_by_id, asked_by, question, answer,
+                    blocks, tools_used)
+               VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s) RETURNING id""",
+            (row_id, thread, uid, who, question[:1000], answer,
+             json.dumps(result.get("blocks") or [], default=str),
+             list(result.get("tools_used") or []))).fetchone()
+        # the share is keyed as the rows spell their asker: the id as
+        # the database prints it, or the name when there is no id
+        _trim(conn, str(_uuid.UUID(uid)) if uid is not None else who)
+    # a caller on a non-autocommit connection may already have had a
+    # transaction open (the block above was then a savepoint)
+    conn.commit()
+    return str(row["id"])
+
+
+def _trim(conn, me: str) -> None:
+    """Bound the log: each asker keeps about their newest HISTORY_KEEP
+    turns. Three invariants hold, whoever asks and whatever runs at once:
+
+    (i) one asker's trim never deletes another asker's rows. Asking is
+        open to every role, a viewer's included, so a trim that reached
+        past the asker's own rows would let anyone push everyone else's
+        questions out of the log just by asking enough. Each share is
+        counted and cut on its own; the log is still bounded, by the
+        number of people in the household. Rows whose asker left share
+        one share (their name is blank, see forget_asker).
+    (ii) a conversation never loses its opening turn while any follow-up
+        of it, anyone's, stays: a follow-up would otherwise hand the model
+        a conversation that starts in the middle with nothing saying so.
+        The opening is the conversation's anchor and goes only as its
+        last row; what a long conversation loses is its oldest follow-ups.
+    (iii) the trim and a concurrent follow-up cannot leave an orphan.
+
+    The asker's turns are ranked by how recently their CONVERSATION was
+    last active, by anyone — a conversation another member keeps going
+    is not old — then newest first within it. Turns past the share go,
+    an opening only when no other row of its conversation remains.
+
+    Concurrency, under READ COMMITTED. A follow-up holds a share lock on
+    one of its conversation's rows from its existence check until it
+    commits (record_turn). The trim first locks the rows it means to
+    delete FOR UPDATE SKIP LOCKED, and only then, in a NEW statement —
+    so a fresh snapshot that sees every follow-up committed meanwhile —
+    decides whether an opening still has company. A row a pending
+    follow-up holds is skipped, not waited for: it survives this trim
+    (and, being a row of the conversation, keeps the opening too); the
+    next trim takes it. A follow-up that comes after the lock waits for
+    this transaction, then finds the rows deleted and either locks a
+    survivor (the opening is then kept) or finds none and keeps nothing
+    (ThreadRemoved). Deleting in one statement on a stale snapshot is
+    what this replaces: its wait on the follow-up's lock ended with the
+    follow-up committed but invisible to it, so the opening went and the
+    follow-up stayed behind alone. Never waiting also means two trims,
+    or a trim and a follow-up, cannot deadlock."""
+    ids = [r["id"] for r in conn.execute(
+        """SELECT id FROM assistant_turns
+            WHERE id IN (
+                SELECT id FROM (
+                    SELECT id, COALESCE(asked_by_id::text, asked_by) AS who,
+                           row_number() OVER (
+                               PARTITION BY COALESCE(asked_by_id::text,
+                                                     asked_by)
+                               ORDER BY last DESC, thread_id DESC,
+                                        asked_at DESC, id DESC) AS n
+                      FROM (SELECT *, max(asked_at) OVER (
+                                       PARTITION BY thread_id) AS last
+                              FROM assistant_turns) t) ranked
+                 WHERE who = %(me)s AND n > %(keep)s)
+            ORDER BY id FOR UPDATE SKIP LOCKED""",
+        {"me": me, "keep": HISTORY_KEEP}).fetchall()]
+    if not ids:
+        return
+    conn.execute(
+        """DELETE FROM assistant_turns d
+            WHERE d.id = ANY(%(ids)s::uuid[])
+              AND (d.id <> d.thread_id
+                   OR NOT EXISTS (
+                       SELECT 1 FROM assistant_turns o
+                        WHERE o.thread_id = d.thread_id AND o.id <> d.id
+                          AND NOT o.id = ANY(%(ids)s::uuid[])))""",
+        {"ids": ids})
+
+
+def parse_cursor(before: str | None, before_id: str | None = None
+                 ) -> tuple[_dt.datetime | None, str | None]:
+    """The page cursor as (asked_at, id). Raises ValueError for one that
+    is not a timestamp (or an id that is not a uuid), so a bad link is
+    refused before it reaches the database."""
+    if not before:
+        if before_id:
+            raise ValueError("before_id needs before")
+        return None, None
+    at = _dt.datetime.fromisoformat(str(before).strip())
+    if at.tzinfo is None:
+        # asked_at is handed out with its offset; a bare one is read as UTC
+        at = at.replace(tzinfo=_dt.timezone.utc)
+    rid = str(_uuid.UUID(str(before_id))) if before_id else None
+    return at, rid
+
+
+def history(conn, limit: int = HISTORY_PAGE, before: str | None = None,
+            before_id: str | None = None) -> dict:
+    """The household's answered questions, newest first. The next page
+    starts after (`before`, `before_id`) — the last row's asked_at and id,
+    handed back as `next` — so rows sharing one timestamp are neither
+    skipped nor repeated. `before` alone (no id) pages by the time only.
+    Raises ValueError for a malformed cursor."""
+    limit = max(1, min(int(limit or HISTORY_PAGE), HISTORY_PAGE))
+    at, rid = parse_cursor(before, before_id)
+    where, args = "", []
+    if at is not None and rid is not None:
+        where, args = "WHERE (asked_at, id) < (%s, %s::uuid)", [at, rid]
+    elif at is not None:
+        where, args = "WHERE asked_at < %s", [at]
+    rows = conn.execute(
+        f"""SELECT id, thread_id, asked_at, asked_by, question, answer, blocks,
+                   tools_used
+            FROM assistant_turns {where}
+            ORDER BY asked_at DESC, id DESC LIMIT %s""",
+        (*args, limit + 1)).fetchall()
+    more = len(rows) > limit
+    turns = [{
+        "id": str(r["id"]),
+        "thread_id": str(r["thread_id"]),
+        "asked_at": r["asked_at"].isoformat(),
+        "asked_by": r["asked_by"],
+        "question": r["question"],
+        "answer": r["answer"],
+        "blocks": r["blocks"] or [],
+        "tools_used": list(r["tools_used"] or []),
+    } for r in rows[:limit]]
+    nxt = ({"before": turns[-1]["asked_at"], "before_id": turns[-1]["id"]}
+           if more and turns else None)
+    return {"turns": turns, "more": more, "next": nxt}
+
+
+def forget_asker(conn, tenant_id, user_id) -> int:
+    """A member is leaving the household: their questions and the answers
+    stay — they are the household's record — but the log stops naming
+    them. Runs inside the caller's removal transaction, on whichever
+    connection that is (the tenant is pinned for the transaction, so an
+    app-role connection passes the row policy). Returns rows changed."""
+    conn.execute("SELECT set_config('app.tenant_id', %s, true)",
+                 (str(tenant_id),))
+    return conn.execute(
+        "UPDATE assistant_turns SET asked_by_id = NULL, asked_by = '' "
+        "WHERE tenant_id = %s AND asked_by_id = %s",
+        (str(tenant_id), str(user_id))).rowcount
+
+
+# why the one-turn door kept an opening: the clients show it beside the
+# 200 they already treat as success
+OPENING_KEPT = ("This question opens a conversation that still has "
+                "follow-ups; remove the whole conversation, or its "
+                "follow-ups first.")
+
+
+def forget_turn(conn, turn_id: str) -> dict:
+    """Drop one turn — the question and answer named by its own id — and
+    nothing else of its conversation. Returns {"deleted": n} and, when an
+    opening was kept, {"reason": OPENING_KEPT}.
+
+    An opening (its id is its thread's id) goes only as the last row of its
+    conversation, the rule the trim keeps: dropped while follow-ups remain
+    it would leave them headless — rows that answer a question nobody can
+    see. Refused, not widened to the whole conversation, because the
+    clients already in people's hands send this id meaning that one answer,
+    and a follow-up they never chose to remove must not go with it.
+
+    The turn is locked first. A follow-up being written holds a share lock
+    on one of the thread's turns (record_turn), so the lock waits for it to
+    commit, and the check that runs after sees the follow-up it wrote. A
+    follow-up arriving after the lock waits on it, and finds the opening
+    gone (ThreadRemoved) once this commits."""
+    with conn.transaction():
+        row = conn.execute(
+            "SELECT id, thread_id FROM assistant_turns WHERE id = %s "
+            "FOR UPDATE", (turn_id,)).fetchone()
+        if row is None:
+            out = {"deleted": 0}
+        elif row["id"] == row["thread_id"] and conn.execute(
+                "SELECT 1 FROM assistant_turns WHERE thread_id = %s "
+                "AND id <> %s LIMIT 1", (row["thread_id"], row["id"])
+                ).fetchone() is not None:
+            out = {"deleted": 0, "reason": OPENING_KEPT}
+        else:
+            out = {"deleted": conn.execute(
+                "DELETE FROM assistant_turns WHERE id = %s",
+                (row["id"],)).rowcount}
+    conn.commit()
+    return out
+
+
+def forget(conn, turn_id: str | None = None) -> int:
+    """Drop one turn (see forget_turn) or, with no id, the whole log.
+    Returns rows gone.
+
+    The whole log is deleted in two passes in one transaction, as
+    forget_thread does and for the same reason: the first pass waits for a
+    follow-up holding its share lock on a turn, but its view of the table
+    was fixed before that follow-up's row existed and would leave it
+    behind, headless, in a log the household asked to empty. The second
+    pass sees it."""
+    if turn_id:
+        return forget_turn(conn, turn_id)["deleted"]
+    gone = 0
+    with conn.transaction():
+        for _ in range(2):
+            gone += conn.execute("DELETE FROM assistant_turns").rowcount
+    conn.commit()
+    return gone
+
+
+def forget_thread(conn, thread_id: str) -> int:
+    """Drop one conversation: every turn of the thread. Returns rows gone.
+
+    Two passes in one transaction. A follow-up being written holds one of
+    the thread's turns (record_turn's share lock), so the first delete
+    waits for it — but that delete's view of the table was fixed when it
+    started, before the follow-up's row existed, and would leave that row
+    behind as the deleted conversation's one survivor. The second pass
+    sees it. A follow-up arriving after the first pass finds the thread's
+    turns locked, waits, then finds them gone and keeps nothing."""
+    gone = 0
+    with conn.transaction():
+        for _ in range(2):
+            gone += conn.execute(
+                "DELETE FROM assistant_turns WHERE thread_id = %s",
+                (thread_id,)).rowcount
+    conn.commit()
+    return gone

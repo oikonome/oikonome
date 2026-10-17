@@ -93,6 +93,12 @@ class BillsPageStepsBackTests(unittest.TestCase):
                          400)
         self.assertEqual(self.client.get("/api/bills?month=2026-13").status_code,
                          400)
+        # a well-formed month outside the years the app reads is a 400,
+        # never the 500 its month arithmetic would raise
+        for bad in ("0001-01", "1899-12", "2101-01", "9999-12"):
+            self.assertEqual(
+                self.client.get(f"/api/bills?month={bad}").status_code, 400,
+                bad)
 
     def test_a_month_with_more_days_than_the_due_day_still_reads(self):
         # February: a past month whose last day is before the 29th/30th/31st

@@ -226,6 +226,9 @@ class LockHoldersThatDoNotSyncAnswerTheNudge(unittest.TestCase):
         from oikonome.web import pages
         self.conn.execute("UPDATE items SET aggregator='plaid' "
                           "WHERE id='it1'")
+        # pulled before: a bank's first pull is the worker's job
+        self.conn.execute("INSERT INTO sync_log (item_id, added) "
+                          "VALUES ('it1', 0)")
 
         def pull(conn, item_id):
             self._turn_a_sync_away()

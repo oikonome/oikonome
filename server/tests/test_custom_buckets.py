@@ -374,10 +374,14 @@ class ApiTests(unittest.TestCase):
              "categories": ["ENTERTAINMENT"], "merchants": []}]})
         d = self.client.get("/api/today/full").json()
         other = d["buckets"]["other"]
+        share = d["month_share"]
         self.assertEqual(other["children"],
                          [{"name": "Fun", "actual": 80.0,
                            "expected": other["children"][0]["expected"],
-                           "month_budget": 300.0}])
+                           "month_budget": 300.0,
+                           "paced_budget": round(300.0 * share, 2)}])
+        self.assertEqual(other["paced_remaining_budget"],
+                         round(700.0 * share, 2))
         self.assertEqual(other["display_actual"], other["actual"] - 80.0)
         self.assertEqual(other["remaining_budget"], 700.0)
         self.assertNotIn("children", d["buckets"]["fixed"])
@@ -391,8 +395,14 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         body = r.json()
         self.assertIn("suggestions", body)
-        self.assertIn("food_monthly", body["suggestions"])
-        self.assertIn("other_monthly", body["suggestions"])
+        # a ledger with no finished day yet gets no figures, and says so
+        if body["history_days"] < 1:
+            self.assertTrue(body["not_enough_history"])
+            self.assertNotIn("food_monthly", body["suggestions"])
+        else:
+            self.assertFalse(body["not_enough_history"])
+            self.assertIn("food_monthly", body["suggestions"])
+            self.assertIn("other_monthly", body["suggestions"])
         self.assertIsInstance(body["suggestions"]["buckets"], dict)
 
     def test_suggest_requires_auth(self):

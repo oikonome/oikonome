@@ -188,7 +188,7 @@ PROBE_READ_TIMEOUT = 2.0
 PROBE_MAX_BYTES = 64 * 1024
 
 
-def _probe_json(url: str, transport=None):
+def _probe_json(url: str, transport=None, headers: dict | None = None):
     import json
     import time
 
@@ -196,7 +196,7 @@ def _probe_json(url: str, transport=None):
 
     from ..notify.webhooks import _with_deadline
     end = time.monotonic() + PROBE_DEADLINE
-    with httpx.Client(transport=transport,
+    with httpx.Client(transport=transport, headers=headers or {},
                       timeout=PROBE_READ_TIMEOUT) as c:
         # a transport with no connection pool (a test's) opens no socket
         if hasattr(c._transport, "_pool"):
@@ -314,7 +314,7 @@ def _llm_plan(conn) -> list[dict]:
         be = llm._backend(conn, role=role)
         if not be["url"]:
             continue
-        base = be["url"].rstrip("/")
+        base = llm.base_url(be["url"])
         p = probes.setdefault(base, {"be": be, "roles": [], "models": set()})
         p["roles"].append(role)
         model = (be.get("vision_model") or be["model"]
@@ -379,7 +379,11 @@ def _llm_probe_rows(plan: list[dict], public: bool = False) -> list[dict]:
             # endpoint decides what it answers and how slowly, and anyone
             # who can open this page (or build a feedback bundle) triggers
             # the read
-            listing = _probe_json(f"{base}/v1/models", transport=pin)
+            # with the backend's own credentials: a cloud provider lists
+            # its models only to a key, and Anthropic's endpoint wants
+            # the native API's version header too
+            listing = _probe_json(f"{base}/v1/models", transport=pin,
+                                  headers=llm.request_headers(be, base))
             # the endpoint's own answer, bounded before it is rendered:
             # this row is read by every member and rides in every feedback
             # ZIP, and an id that is null (join crashes) or a kilobyte long

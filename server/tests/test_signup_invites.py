@@ -12,6 +12,7 @@ connection only (column scope stays closed).
 
 import os
 import unittest
+from unittest import mock
 import uuid
 
 import psycopg
@@ -265,7 +266,9 @@ class VerifyEmailTests(_Base):
         r = TestClient(self.client.app).get("/verify-email?token=nope")
         self.assertEqual(r.status_code, 400)
 
-    def test_resend_mints_and_burns_prior(self):
+    def test_resend_mints_a_fresh_link_and_keeps_the_earlier_one(self):
+        """Mails arrive out of order, so a resend must not turn the first
+        mail's link — the one most people open — into "already used"."""
         email, session = self._hosted_user()
         u = _user_row(email)
         r = session.post("/api/verify-email/resend")
@@ -279,7 +282,7 @@ class VerifyEmailTests(_Base):
                 (u["id"],)).fetchone()["n"]
         finally:
             admin.close()
-        self.assertEqual(live, 1)                 # newest only
+        self.assertEqual(live, 2)                 # the signup's and the resend's
 
     def test_resend_after_verified_reports_verified(self):
         email, session = self._hosted_user()
@@ -292,6 +295,42 @@ class VerifyEmailTests(_Base):
                      follow_redirects=False)
         r = session.post("/api/verify-email/resend")
         self.assertTrue(r.json()["verified"])
+
+
+class SharedAddressLimitsCountPerAccountTests(_Base):
+    """A carrier's CGNAT puts a crowd of new households on one public
+    address. The confirmation resend, the app's device mint and the passkey
+    sign-in are counted per ACCOUNT, with only a wide per-address
+    backstop, so the fourth household on one address is not locked out of
+    the link that unblocks its bank — and a refusal names the real wait."""
+
+    _hosted_user = VerifyEmailTests._hosted_user
+
+    def test_resend_is_counted_per_account_not_per_shared_address(self):
+        sessions = [self._hosted_user()[1] for _ in range(4)]
+        for s in sessions:
+            for _ in range(3):
+                self.assertEqual(
+                    s.post("/api/verify-email/resend").status_code, 200)
+        r = sessions[0].post("/api/verify-email/resend")
+        self.assertEqual(r.status_code, 429, r.text)
+        self.assertIn("within the hour", r.json()["detail"])
+
+    def test_device_mint_is_counted_per_ticket_owner(self):
+        import oikonome.web.app as appmod
+        from oikonome.auth import device_tokens
+        from oikonome.web import security
+        owner = "00000000-0000-0000-0000-0000000d1e57"
+        for _ in range(20):
+            self.assertTrue(security._account_limit(
+                ("device_mint", owner), 20, 3600))
+        with mock.patch.object(device_tokens, "mint_ticket_owner_hint",
+                               return_value=owner), \
+             mock.patch.object(device_tokens, "redeem_mint_ticket") as rd:
+            r = TestClient(appmod.app).post(
+                "/api/devices", json={"mint_ticket": "t" * 40})
+        self.assertEqual(r.status_code, 429, r.text)
+        rd.assert_not_called()            # the ticket was not spent
 
 
 class HostedRootRoutingTests(_Base):

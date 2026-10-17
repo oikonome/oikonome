@@ -26,7 +26,10 @@
 {% set view = (face | default(none)) or st.today_view or 'detail' %}
 {% set under = st.verdict == 'UNDER BUDGET' %}
 {% set var_budget = st.buckets.food.month_budget + st.buckets.other.month_budget %}
-{% set remaining = var_budget - st.variable_actual %}
+{# the hero's month figure: the paced share and what is left of it
+   (budget.month_status), the remainder the tiles hand out a day at a time #}
+{% set hero_budget = st.variable_budget_paced if st.variable_budget_paced is defined else var_budget %}
+{% set remaining = st.month_remaining_paced if st.month_remaining_paced is defined else var_budget - st.variable_actual %}
 
 
 {# ---- alerts are NOT here. The mail closes with a per-recipient
@@ -157,7 +160,7 @@
   <div>
     <span class="sub" style="float:right;margin-left:.65rem;">
       <b class="{{ 'neg' if remaining < 0 else '' }}" style="{{ '' if remaining < 0 else 'color:var(--ink)' }};font-weight:600;">{{ money(remaining|abs) }}</b>
-      {{ 'over the' if remaining < 0 else 'of' }} {{ money(var_budget) }}{{ '' if remaining < 0 else ' left' }}
+      {{ 'over the' if remaining < 0 else 'of' }} {{ money(hero_budget) }}{{ '' if remaining < 0 else ' left' }}
       · {{ day.days_left }} day{{ '' if day.days_left == 1 else 's' }}</span>
     <span class="{{ 'neg' if over else 'pos' }}" style="font-size:21px;font-weight:800;letter-spacing:-.01em;">
       {{ 'Over budget' if over else ('Under budget' if under else 'On budget') }}</span>
@@ -175,7 +178,6 @@
   {# tile meter is DAY-scoped, not month-scoped: fill = today's spend of
      today's allowance, no pace tick.
      The month gauges live in the Monthly budget card — MIRRORS Today.tsx #}
-  {% set pace_frac = st.today.day / st.days_in_month %}
   {% if view != 'detail' %}
   {# SIMPLE face: the one number — still-spendable today across every
      variable bucket — a day meter, and a chip per bucket. Every string
@@ -252,6 +254,13 @@
     {% if email %}Set today's checking balance on the Accounts page and everything comes alive.
     {% else %}<a href="/accounts">Set today's checking balance on Accounts</a> and everything comes alive.{% endif %}
   </div>
+  {% elif st.runway and st.runway.no_checking %}
+  <div style="margin-top:.6rem;border-top:1px solid var(--line);padding-top:.5rem;font-size:.85rem;">
+    <b>No checking account linked</b> — cash ahead starts from your checking
+    balance, so there is nothing to forecast yet.
+    {% if email %}Link your checking account on the Accounts page to see cash ahead.
+    {% else %}<a href="/accounts">Link your checking account on Accounts</a> to see cash ahead.{% endif %}
+  </div>
   {% elif cash and cash.state == 'critical' %}
   <div style="margin-top:.6rem;border-top:1px solid var(--line);padding-top:.5rem;font-size:.85rem;color:var(--red);">
     {% if cash.kind == 'today' %}Short <b>{{ money(cash.short) }}</b> today — checking doesn't cover cards &amp; bills before the next paycheck. Cover it from savings{% if cash.slow_to is not none %}, or slow spending to <b>{{ money(cash.slow_to) }}/day</b>{% endif %}.
@@ -297,7 +306,11 @@
     <span class="sub">Plan:</span>
     <span class="sub"><b style="color:var(--ink);">{{ money(st.income) }}</b> in</span>
     <span style="color:var(--line);">&#8594;</span>
-    <span class="sub"><b style="color:var(--ink);">{{ money(st.buckets.fixed.month_budget) }}</b> bills</span>
+    {# the bills the month is SCHEDULED to owe — the figure the variable
+       scale subtracted, so in → bills due → to spend balances. The fixed
+       bar keeps the cash basis (an early autopay of next month's bill is
+       cash gone here, but not this month's plan). #}
+    <span class="sub"><b style="color:var(--ink);">{{ money(st.scheduled_month if st.scheduled_month is defined else st.buckets.fixed.month_budget) }}</b> bills due</span>
     <span style="color:var(--line);">&#8594;</span>
     <span class="sub"><b style="color:var(--ink);">{{ money(var_budget) }}</b> to spend</span>
     <span style="color:var(--line);">&#8594;</span>

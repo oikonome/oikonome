@@ -65,7 +65,7 @@ class ProbeBoundsTests(_Tenant):
             return c
         held_during_probe = []
 
-        def probe(url, transport=None):
+        def probe(url, transport=None, headers=None):
             held_during_probe.append(
                 any(not getattr(c, "_returned", c.closed) for c in handed))
             return {"data": [{"id": "m"}]}
@@ -122,7 +122,7 @@ class ProbeBoundsTests(_Tenant):
     def test_the_ollama_row_probes_the_configured_address(self):
         seen = []
 
-        def probe(url, transport=None):
+        def probe(url, transport=None, headers=None):
             seen.append(url)
             return {"version": "0.9"}
         with _clean_env(OIKONOME_LLM_URL="http://ollama.lan.example:11434"), \
@@ -138,7 +138,7 @@ class ProbeBoundsTests(_Tenant):
                      llm_model="m")
         seen = []
 
-        def probe(url, transport=None):
+        def probe(url, transport=None, headers=None):
             seen.append(url)
             return {"data": [{"id": "m"}]}
         with _clean_env(), mock.patch.object(doctor, "_probe_json", probe):

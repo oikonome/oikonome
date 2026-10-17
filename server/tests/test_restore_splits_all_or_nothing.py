@@ -109,6 +109,31 @@ class RestoreSplitGroupTests(unittest.TestCase):
         self.assertNotIn("transaction_splits", counts)
         self.assertEqual(counts.get("already_present"), 2)
 
+    def test_a_hand_split_in_the_archive_outranks_a_store_split_here(self):
+        """A person's split outranks a store's reading of the charge. A row
+        that, since the archive was written, gained only a store matcher's
+        parts takes the archive's hand split back — store parts dropped,
+        the next match run reads the row as the person's — instead of
+        keeping the machine's and discarding what the person wrote."""
+        from oikonome.sync import export
+        splits.set_split(self.conn, self.txn, [
+            {"category": FOOD, "amount": 70}, {"category": OTHER, "amount": 30}])
+        archive = export.build_zip(self.conn)
+        splits.clear_split(self.conn, self.txn)
+        for line, (cat, amt) in enumerate(((HOME, 55), (OTHER, 45)), 1):
+            self.conn.execute(
+                "INSERT INTO transaction_splits (txn_id, line, category, amount,"
+                " source) VALUES (%s, %s, %s, %s, 'amazon')",
+                (self.txn, line, cat, amt))
+        counts = restore.restore_zip(self.conn, archive)
+        rows = self.conn.execute(
+            "SELECT category, amount, source FROM transaction_splits "
+            "WHERE txn_id = %s ORDER BY line", (self.txn,)).fetchall()
+        self.assertEqual([(r["category"], r["amount"], r["source"]) for r in rows],
+                         [(FOOD, 70.0, "user"), (OTHER, 30.0, "user")])
+        self.assertEqual(counts.get("transaction_splits"), 2)
+        self.assertEqual(splits.stale(self.conn), [])
+
 
 if __name__ == "__main__":
     unittest.main()

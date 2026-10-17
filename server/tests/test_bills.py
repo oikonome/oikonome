@@ -139,6 +139,24 @@ class TestProposals(DetectBase):
         self.assertEqual(adds[0]["bill_type"], "envelope")
         self.assertGreater(adds[0]["amount"], 150)
 
+    def test_a_utility_pool_averages_only_the_months_the_ledger_covers(self):
+        """Four months of ledger: the pool is the four months' average,
+        not their sum over six — a month before the ledger starts is no
+        data, and a cap a third short overflows into the verdict monthly."""
+        start = dt.date(TODAY.year, TODAY.month - 4, 1)
+        add_txn(self.conn, start, -0.01, "INTEREST PAID", primary="INCOME")
+        for day, amt in ((start.replace(day=10), 200.0),
+                         (start.replace(month=start.month + 1, day=9), 160.0),
+                         (start.replace(month=start.month + 2, day=8), 120.0),
+                         (start.replace(month=start.month + 2, day=30), 100.0),
+                         (start.replace(month=start.month + 3, day=25), 220.0)):
+            add_txn(self.conn, day, amt, "CITY POWER",
+                    primary="RENT_AND_UTILITIES")
+        rd.run(self.conn, TODAY)
+        adds = [p for p in self.pending("add") if p["payee"] == "CITY POWER"]
+        self.assertEqual([(p["bill_type"], p["amount"]) for p in adds],
+                         [("envelope", 200.0)])
+
     def test_long_cycle_two_hits_need_the_same_merchant(self):
         """Two parking lots six months apart share a city token; that is
         not a semi-annual bill. At the two-hit minimum the merchant string

@@ -16,8 +16,9 @@ superuser — the postgres superuser credential exists only in the one-shot
 migration container.
 
 Hardening notes for deployers: `OIKONOME_MASTER_KEY` is required by the
-compose stack (aggregator tokens, webhook signing secrets, TOTP seeds and
-the instance's web-push signing key encrypt at rest under it — the installer generates it; keep a
+compose stack (aggregator tokens, webhook signing secrets, TOTP seeds,
+the instance's web-push signing key and the tokens of bank connections
+still waiting to be released at Plaid encrypt at rest under it — the installer generates it; keep a
 copy, restores need the same key; backup + rotation procedure:
 [docs/master-key.md](docs/master-key.md)), run behind TLS, keep the compose
 Postgres unexposed, enable TOTP on your account.
@@ -92,6 +93,20 @@ has changed since the mail went out does nothing. They (and the
 unsubscribe link) are keyed from `OIKONOME_MASTER_KEY`, so rotating the
 key voids the ones already sent.
 
+Every change to a sign-in credential (password, authenticator, passkey,
+recovery codes) is announced to the account's own address, so a change
+made from a stolen session is never silent. On a hosted instance a
+sign-in email change does not move the account until the new mailbox
+answers: the link goes to the new address, works once within 24 hours,
+and the account moves only when the button on the page it opens is
+pressed. The address the account left is then told, with the new one
+partly masked, and — when that old address was confirmed — given a
+single-use link, good for 72 hours, that puts the account back on it,
+signs out every device, revokes script tokens, pauses webhooks and mails
+a password reset there; it is that reset, not the link, that strips
+whatever a stranger enrolled. Pending resets for the old address die
+with the move. The full flow is in the Security guide (in-app Help).
+
 A mailed password reset strips every second factor, so on an account with
 one enrolled it demands a recovery code as well — inbox control alone must
 never equal account ownership. The way back in for someone who has lost the
@@ -144,7 +159,23 @@ most about 1.5 MB of drawing content and 40 megapixels of embedded images
 per page, 500 pages, about 2 MB of extracted text — with every decoder
 capped, so a small compressed file cannot inflate into a large one inside
 the server; a plain-text tax upload carries the same text ceiling, and
-an image is refused for decoding past 40 megapixels. Set `OIKONOME_TRUSTED_PROXIES` if
+an image is refused for decoding past 40 megapixels. File imports bound
+their own shape before reading it: an OFX/QFX file is capped at 10 MB, a
+CSV at 200 columns (40 for the budgeting-app registers), and every data
+row is read through a bounded reader (128 KB per line), so one enormous
+row cannot balloon the shared process.
+
+Password hashing is memory-hard (argon2id, about 64 MiB per hash), so
+only a few hashes run at once (`OIKONOME_ARGON2_CONCURRENCY`, default 3)
+and a sign-in that waits past `OIKONOME_ARGON2_WAIT` seconds is answered
+`503` with `Retry-After`, rather than a burst of sign-ins exhausting the
+container's memory; a database with no free connection sheds signups the
+same way. Tripping a rate limit is not an auto-ban strike (only failed
+sign-ins are), so many honest clients behind one carrier address are not
+banned, and an IPv6 client is counted as its whole /64 for every
+per-address limit, strike and ban; the sign-in human check also counts
+each IPv6 /48 (15 failed sign-ins in 15 minutes challenges the whole /48 —
+a challenge only, never a ban or strike). Set `OIKONOME_TRUSTED_PROXIES` if
 anything fronts the app, or all of them see the proxy as the only client
 (see [docs/reverse-proxy.md](docs/reverse-proxy.md)). Under rootless
 Podman the app cannot see real client addresses at all, so auto-ban, the

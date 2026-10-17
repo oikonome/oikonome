@@ -18,7 +18,7 @@ import SavingsGoalsCard from "../components/SavingsGoalsCard";
 import ViewerLock from "../components/ViewerLock";
 import { api, money } from "../api/client";
 import { canEdit } from "../role";
-import { monthSavings } from "../moneymath";
+import { isPlanSavingsGoal, monthSavings } from "../moneymath";
 
 const toast = (m: string) =>
   window.dispatchEvent(new CustomEvent("oiko-toast", { detail: m }));
@@ -69,7 +69,7 @@ export default function Budget() {
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const ob = useQuery({ queryKey: ["onboarding"], queryFn: api.onboarding });
   const d = q.data;
-  const goal = (d?.savings_goals ?? []).find((g) => g.name === "Savings");
+  const goal = (d?.savings_goals ?? []).find((g) => isPlanSavingsGoal(g.name));
   // the plan's controls are editor chrome (writes are 403'd
   // server-side too); a viewer still reads the plan and this month.
   const mayEdit = canEdit(me);
@@ -127,8 +127,10 @@ export default function Budget() {
               <span style={{ color: "var(--line)" }}>→</span>
             </>)}
             <span><b style={{ fontSize: "1.25rem" }}>
-              {money(d.buckets.fixed.month_budget)}</b>
-              <span className="sub"> bills</span></span>
+              {/* scheduled bills, not the fixed bar's cash basis, so the
+                  chain balances (same figure and words as Today) */}
+              {money(d.scheduled_month ?? d.buckets.fixed.month_budget)}</b>
+              <span className="sub"> bills due</span></span>
             <span style={{ color: "var(--line)" }}>→</span>
             <span><b style={{ fontSize: "1.25rem" }}>{money(d.variable_budget)}</b>
               <span className="sub"> to spend</span></span>

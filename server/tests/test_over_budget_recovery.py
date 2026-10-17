@@ -10,12 +10,15 @@ import unittest
 
 from oikonome.engine import budget
 
-from .util import add_txn, make_db, write_config
+from .util import add_ledger_history, add_txn, make_db, write_config
 
 
 class OverBudgetRecoveryLine(unittest.TestCase):
     def setUp(self):
         self.conn = make_db()
+        # an established household: the ledger predates the month, so the
+        # caps spread each bucket's whole budget over the days left
+        add_ledger_history(self.conn, dt.date(2026, 8, 1))
 
     def tearDown(self):
         self.conn.close()
@@ -32,10 +35,12 @@ class OverBudgetRecoveryLine(unittest.TestCase):
         self.assertEqual(st["verdict"], "OVER BUDGET")
         rec = st["why"]["recovery"]
         self.assertIsNotNone(rec)
-        self.assertIn("last 16 days", rec)
-        # floor((930-700)/16) = 14 ; floor((930-620)/16) = 19
-        self.assertIn("$14/day on Food", rec)
-        self.assertIn("$19/day on Everything else", rec)
+        # the spend is today's, past today's allowance: the caps are the
+        # tiles' own rates, over the 15 days after today
+        self.assertIn("last 15 days", rec)
+        # floor((930-700)/15) = 15 ; floor((930-620)/15) = 20
+        self.assertIn("$15/day on Food", rec)
+        self.assertIn("$20/day on Everything else", rec)
 
     def test_spent_out_bucket_gets_zero_not_a_rounded_allowance(self):
         write_config(self.conn, food_monthly=500, other_monthly=900,
@@ -52,8 +57,8 @@ class OverBudgetRecoveryLine(unittest.TestCase):
         self.assertIn("$0 day", rec)
         self.assertNotIn("/day on Food", rec)
         # the bucket with budget left still gets its cap:
-        # floor((900-550)/16) = 21
-        self.assertIn("$21/day on Everything else", rec)
+        # floor((900-550)/15) = 23 — today is spent, so the days after it
+        self.assertIn("$23/day on Everything else", rec)
 
     def test_zero_budget_bucket_with_spend_counts_as_spent_out(self):
         """A $0-budget custom bucket carrying real spend is valid config —

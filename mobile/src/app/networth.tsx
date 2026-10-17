@@ -13,6 +13,7 @@ import StaleBanner from "../components/stale-banner";
 import { Card, H, HelpLink, KV } from "../components/ui";
 import { errText, ManualAsset, PLRow } from "../lib/api";
 import { saveSettings } from "../lib/cache";
+import { monthChange } from "../lib/networth-pure";
 import { RANGE_LABEL, rangeCaption, TREND_RANGES, trendWindow,
          type TrendRange } from "../lib/pure";
 import { useSession } from "../lib/session";
@@ -70,10 +71,10 @@ export default function NetWorth() {
   const eu = d?.trend_estimated_until !== undefined
     && d.trend_estimated_until - w.start > 0
     ? d.trend_estimated_until - w.start : undefined;
-  const delta = fullTrend.length >= 2
-    ? fullTrend[fullTrend.length - 1][1]
-      - fullTrend[fullTrend.length - 2][1]
-    : null;
+  // the hero's change is on the total's own base (property included);
+  // the financial-only change sits on the Financial accounts line
+  const delta = monthChange(d?.full_trend);
+  const finDelta = monthChange(d?.trend);
   const mortgage = (d?.property_items ?? [])
     .filter((p) => p.kind === "mortgage")
     .reduce((t, p) => t + p.value, 0);
@@ -108,7 +109,14 @@ export default function NetWorth() {
             )}
           </Text>
           <KV k="Financial accounts" v={m$(d.current_total)} />
-          <Text style={s.mut}>cash + investments − card debt · live</Text>
+          <Text style={s.mut}>
+            cash + investments − card debt · live
+            {finDelta !== null && (
+              <Text style={{ color: finDelta >= 0 ? C.good : C.bad }}>
+                {" · "}{plTxt(finDelta)} this month
+              </Text>
+            )}
+          </Text>
           <KV k="Property & vehicles, net" v={m$(d.property_net)} />
           <Text style={s.mut}>
             after {m$(Math.abs(mortgage))} mortgage payoff

@@ -33,6 +33,7 @@ import os
 from ..envnum import env_flag
 from .. import ext
 import re
+import threading as _threading
 import uuid
 from typing import Annotated
 
@@ -40,12 +41,13 @@ import psycopg
 
 from fastapi import (APIRouter, Body, Depends, File, Form, HTTPException,
                      Query, Request, UploadFile)
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BeforeValidator
 from starlette.concurrency import run_in_threadpool
 
 from ..db import tenancy
 from ..engine import activity as _activity
+from ..engine import assistant
 from . import data, demoguard, mailguard, permissions
 from .security import limit
 
@@ -131,6 +133,89 @@ def _csv_safe(v):
         # shifts a cell in some readers on its own
         return "'" + v
     return v
+
+
+# A reader can cut one cell into several: Excel in a locale whose list
+# separator is ';' (most of continental Europe, much of Latin America)
+# splits a .csv on ';', a tab splits it in a tab-separated read, and a
+# line break ends the record in a reader that does not honour the quote
+# around it (in a ';' read the quote sits mid-field, so it opens nothing).
+# A double quote protects only a field it OPENS, so quoting the cell does
+# not stop the piece after any of these from being read as a cell of its
+# own.
+_CSV_PIECE_BREAK = frozenset(";\t\r\n")
+_CSV_INVISIBLE = frozenset(_CSV_INVISIBLE_LEAD)
+_CSV_FORMULA = frozenset(_CSV_FORMULA_LEAD)
+
+
+def _csv_piece_safe(v: str) -> str:
+    """Put a quote after every piece break whose piece would open with a
+    formula character once its invisible lead is trimmed.
+
+    One pass from right to left, carrying "the next visible character is
+    a formula character". A tab, CR or line feed is both a break and
+    invisible, so a run of them does not clear that flag; the quote put in
+    after the break nearest the formula character does, because it is
+    then the first visible character of every piece that reaches it. A
+    lookahead regex does the same job in time quadratic in the length of a
+    tab run, and the regex engine holds the interpreter lock the whole
+    while — one restored note of tabs would stall every household."""
+    if not ("=" in v or "+" in v or "-" in v or "@" in v):
+        return v
+    if not (";" in v or "\t" in v or "\n" in v or "\r" in v):
+        return v
+    out = []
+    lead = False
+    changed = False
+    for ch in reversed(v):
+        if lead and ch in _CSV_PIECE_BREAK:
+            out.append("'")
+            lead = False
+            changed = True
+        out.append(ch)
+        if ch in _CSV_FORMULA:
+            lead = True
+        elif ch not in _CSV_INVISIBLE and ch != '"':
+            # a double quote keeps the flag: csv doubles it, and a reader
+            # that splits on the break opens a quoted field there, closes it
+            # at the doubled quote and reads what follows as the cell
+            lead = False
+    if not changed:
+        return v
+    out.reverse()
+    return "".join(out)
+
+
+class _SafeCsvWriter:
+    """csv.writer whose text cells cannot open a formula after a ';', a
+    tab or a line break: the piece is prefixed with a quote, the same mark
+    _csv_safe puts on a cell's own head. Only text that both holds a break
+    and has a formula character after it changes; a plain note, a signed
+    amount ("-12.50") and a date are written as they were."""
+
+    def __init__(self, w):
+        self._w = w
+
+    @staticmethod
+    def _cell(v):
+        if isinstance(v, str):
+            return _csv_piece_safe(v)
+        return v
+
+    def writerow(self, row):
+        return self._w.writerow([self._cell(v) for v in row])
+
+    def writerows(self, rows):
+        for row in rows:
+            self.writerow(row)
+
+
+def _csv_writer(buf):
+    """The one way this module writes a CSV: every text cell is also safe
+    in a spreadsheet that splits on ';' (see _SafeCsvWriter). Callers still
+    run free text through _csv_safe for the cell's own head."""
+    import csv as _csvmod
+    return _SafeCsvWriter(_csvmod.writer(buf))
 
 
 def _filename_safe(v: str, fallback: str = "export") -> str:
@@ -230,9 +315,13 @@ def _log_proposal(conn, user, pid: str, action: str, r: dict) -> None:
         act = "confirmed" if action == "approve" else "dismissed"
     else:
         act = "applied" if action == "approve" else "kept"
+    detail = {"proposal": kind, "income": kind == "income", "pid": pid}
+    if r.get("note"):
+        # the apply changed something the person did not ask for (a pin
+        # cleared); the log keeps the explanation next to the decision
+        detail["note"] = r["note"]
     _activity.record(conn, user, "bill", act, target=payee, label=payee,
-                     detail={"proposal": kind, "income": kind == "income",
-                             "pid": pid})
+                     detail=detail)
 
 
 def _log_merge(conn, user, pid: str, action: str, r: dict) -> None:
@@ -252,22 +341,10 @@ def _log_merge(conn, user, pid: str, action: str, r: dict) -> None:
 
 
 def _budgets_set(conn) -> bool:
-    """Has the household a budget of its own? Read from the stored
-    settings row, not the loaded document: under a month of history the
-    loader fills in a provisional seed that is never saved, and a seed is
-    the app's guess, not a plan the household made."""
-    row = conn.execute(
-        "SELECT config->'food_monthly' AS f, config->'other_monthly' AS o "
-        "FROM tenant_settings").fetchone()
-    if not row:
-        return False
-
-    def amount(v) -> float:
-        try:
-            return float(v or 0)
-        except (TypeError, ValueError):
-            return 0.0
-    return bool(amount(row["f"]) or amount(row["o"]))
+    """Has the household a budget of its own? (budget.budgets_set — the
+    stored row, never the provisional seed.)"""
+    from ..engine import budget
+    return budget.budgets_set(conn)
 
 
 def _today(conn) -> dt.date:
@@ -310,9 +387,11 @@ def _same_site_download(request: Request) -> None:
                                  "from inside the app")
     ref = request.headers.get("referer", "")
     if ref and not site:
-        from urllib.parse import urlsplit
-        r, h = urlsplit(ref), request.headers.get("host", "")
-        if r.netloc and h and r.netloc.lower() != h.lower():
+        from .security import claim_netloc
+        # A Referer that does not parse (None) cannot name this host, so it
+        # is refused like any other foreign one rather than raising a 500.
+        netloc, h = claim_netloc(ref), request.headers.get("host", "")
+        if netloc is None or (netloc and h and netloc.lower() != h.lower()):
             raise HTTPException(403, "cross-site download refused — open "
                                      "it from inside the app")
 
@@ -370,10 +449,7 @@ def today_full(user: dict = Depends(_user()), date: str = ""):
     from ..engine import budget
     from . import report, todayview
     if date:
-        try:
-            day = dt.date.fromisoformat(date)
-        except ValueError:
-            raise HTTPException(400, "date must be an ISO date (YYYY-MM-DD)")
+        day = _iso_date(date, "date must be an ISO date (YYYY-MM-DD)")
     conn = tenancy.tenant_connect(user["tenant_id"])
     try:
         real_today = _today(conn)
@@ -416,14 +492,24 @@ def today_full(user: dict = Depends(_user()), date: str = ""):
                "expected": round(v["expected"], 2),
                "month_budget": round(v["month_budget"], 2)}
         if "children" in v:     # food/other: custom-bucket carve-outs
+            # `paced_budget`: the share of the budget the month may spend
+            # (the whole of it unless the ledger began inside the month) —
+            # what a money-map row measures its "$X left" against, the
+            # tiles' own money. month_budget stays for the plan line.
+            out["paced_budget"] = round(
+                todayview.paced_budget(st, v["month_budget"]), 2)
             out["children"] = [{"name": c["name"],
                                 "actual": round(c["actual"], 2),
                                 "expected": round(c["expected"], 2),
-                                "month_budget": round(c["month_budget"], 2)}
+                                "month_budget": round(c["month_budget"], 2),
+                                "paced_budget": round(todayview.paced_budget(
+                                    st, c["month_budget"]), 2)}
                                for c in v["children"]]
             out["display_actual"] = round(v["display_actual"], 2)
             out["display_expected"] = round(v["display_expected"], 2)
             out["remaining_budget"] = round(v["remaining_budget"], 2)
+            out["paced_remaining_budget"] = round(
+                todayview.paced_budget(st, v["remaining_budget"]), 2)
         return out
 
     scale = st.get("variable_scale")
@@ -454,6 +540,13 @@ def today_full(user: dict = Depends(_user()), date: str = ""):
         "variable_actual": round(st["variable_actual"], 2),
         "variable_budget": round(b["food"]["month_budget"]
                                  + b["other"]["month_budget"], 2),
+        # the hero's "$X of $Y left": the month's spendable share (the
+        # whole month unless the ledger began inside it) and what is left
+        # of it — composed once in month_status, read by the web, the app
+        # and both email renders, equal to the tiles times the days left
+        "month_share": round(st["month_share"], 6),
+        "variable_budget_paced": round(st["variable_budget_paced"], 2),
+        "month_remaining_paced": round(st["month_remaining_paced"], 2),
         # "This month's plan" card (today_body.html) — all straight
         # from budget.month_status
         "income": (round(st["income"], 2)
@@ -461,6 +554,9 @@ def today_full(user: dict = Depends(_user()), date: str = ""):
         "plan_surplus": (round(st["plan_surplus"], 2)
                          if st.get("plan_surplus") is not None else None),
         "avg_bills": round(st.get("avg_bills") or 0, 2),
+        # this month's own bill schedule (what is due this month, not the
+        # evened average) — the daily email's "bills due" figure
+        "scheduled_month": round(st.get("scheduled_month") or 0, 2),
         "savings_plan": round(st.get("savings_plan") or 0, 2),
         # sweep goals: the plan cap, month-to-date availability, and the
         # server-composed sentence (identical in the email HTML and plain)
@@ -517,7 +613,10 @@ def today_full(user: dict = Depends(_user()), date: str = ""):
                     "card_debt": round(st["runway"]["card_debt"], 2),
                     "due_total": round(st["runway"]["due_total"], 2),
                     "balance_unreliable":
-                        bool(st["runway"].get("balance_unreliable"))}
+                        bool(st["runway"].get("balance_unreliable")),
+                    # no checking account to start cash from: headroom and
+                    # forecast are null, and the client asks for the account
+                    "no_checking": bool(st["runway"].get("no_checking"))}
                    if st.get("runway") else None),
         # unpaid bill occurrences through month end — the
         # "after paying cards and remaining bills" tile; null on past days
@@ -568,6 +667,22 @@ def _ck_year(y: int | None, field: str = "y") -> None:
     turns year=0 or year=99999 into an opaque 500 instead of a 400."""
     if y is not None and not 1900 <= y <= 2100:
         raise HTTPException(400, f"{field} out of range")
+
+
+def _iso_date(v: str, msg: str) -> dt.date:
+    """A caller's ISO date, parsed strictly AND inside the years the app
+    can read (1900-2100, as `_ck_ym`). `date.fromisoformat` alone takes
+    0001-01-01 and 9999-12-31: stored, they poison every later reader
+    (goal pacing, the receipt matcher's day window, `as_date`), and a
+    day stepped past either end of the calendar raises OverflowError —
+    a 500, or a write that commits half way. Refused here as a 400."""
+    try:
+        d = dt.date.fromisoformat(v)
+    except (TypeError, ValueError):
+        raise HTTPException(400, msg)
+    if not 1900 <= d.year <= 2100:
+        raise HTTPException(400, msg)
+    return d
 
 
 def _body_text(body: dict, *keys: str, default: str = "") -> str:
@@ -751,6 +866,9 @@ def budget_snapshots(user: dict = Depends(_user())):
         first = conn.execute("SELECT MIN(date) AS d FROM transactions "
                              "WHERE removed = 0").fetchone()
         cfg = budget.load_config(conn)
+        # a saved budget, never the loader's unsaved first-month guess —
+        # the backfill refuses to freeze that guess, so it is not offered
+        has_budget = budget.budgets_set(conn)
     finally:
         conn.close()
     from .. import localtime
@@ -788,8 +906,9 @@ def budget_snapshots(user: dict = Depends(_user())):
                 entry[k] = round(float(v), 2)
         months.append(entry)
     return {"months": months, "missing": missing,
-            "budget_set": bool((cfg.get("food_monthly") or 0) > 0
-                               or (cfg.get("other_monthly") or 0) > 0)}
+            "budget_set": bool(has_budget
+                               and ((cfg.get("food_monthly") or 0) > 0
+                                    or (cfg.get("other_monthly") or 0) > 0))}
 
 
 @router.post("/budget/snapshots/backfill")
@@ -815,6 +934,14 @@ def _stamp_recurring(conn, rows: list[dict]) -> None:
     history page's ✓: the row's merchant is one the bill pays (its text
     tokens only for a bill with no identity) AND the amount is inside the
     bill's tolerance (envelopes take any spend row on their merchant)."""
+    _recurring_stamper(conn)(rows)
+
+
+def _recurring_stamper(conn):
+    """_stamp_recurring with the active bills read once: the returned
+    function stamps any number of row lists against the same bills, so a
+    download stamping its rows a slice at a time reads the bills table
+    once, not once per slice."""
     from ..engine import budget
     from ..engine.compat import as_dict
     bills = []
@@ -824,31 +951,63 @@ def _stamp_recurring(conn, rows: list[dict]) -> None:
     ids = budget.bill_merchant_ids(conn, active) if active else {}
     for b in active:
         raw = as_dict(b["raw"])
-        ref = abs(b["amount"] or 0)
         bills.append((b["payee"],
                       budget.merchant_matcher(b["merchant"],
                                               budget._key_token(b["payee"]),
                                               ids.get(b["payee"] or "")),
                       raw.get("bill_type", "occurrence"),
                       (b["amount"] or 0) > 0,          # income series
-                      ref, budget.bill_tolerance(ref)))
-    for r in rows:
-        r["recurring_bill"] = None
-        if not bills:
-            continue
-        text = (r.get("payee") or "").lower()
-        amt = r.get("amount") or 0
-        for payee, match, btype, income, ref, tol in bills:
-            if not match(text, None, r.get("merchant_id")):
+                      # the current amount and the ones before it, so a
+                      # price change keeps the earlier payments marked
+                      budget.bill_amount_bands(b["amount"], raw)))
+
+    def stamp(rows: list[dict]) -> None:
+        for r in rows:
+            r["recurring_bill"] = None
+            if not bills:
                 continue
-            if btype == "envelope":
-                if amt > 0:
+            text = (r.get("payee") or "").lower()
+            amt = r.get("amount") or 0
+            # the row's tokens and merchant id once, not once per bill:
+            # every matcher would otherwise re-split the same text and
+            # re-format the same id for each bill it is tested against
+            toks = budget._tokens(text)
+            mid = budget.row_merchant_id(r)
+            for payee, match, btype, income, bands in bills:
+                if not match(text, toks, mid):
+                    continue
+                if btype == "envelope":
+                    if amt > 0:
+                        r["recurring_bill"] = payee
+                        break
+                elif ((amt < 0 if income else amt > 0)
+                      and budget.amount_fits(bands, amt, r.get("date"))):
                     r["recurring_bill"] = payee
                     break
-            elif ((amt < 0 if income else amt > 0)
-                  and abs(abs(amt) - ref) <= tol):
-                r["recurring_bill"] = payee
-                break
+    return stamp
+
+
+def _decorated(conn, rows, chunk: int):
+    """The ledger rows as the page renders them: serialised, with the
+    category's 'why' and the bill pill. With `chunk` the rows arrive as a
+    generator of slices (search_transactions' chunked form) and come back
+    the same way, each slice decorated only as it is read."""
+    if not chunk:
+        out = [_ser(r) for r in rows]
+        for o in out:
+            o["category_why"] = _category_why(o)
+        _stamp_recurring(conn, out)
+        return out
+    stamp = _recurring_stamper(conn)
+
+    def _gen():
+        for part in rows:
+            out = [_ser(r) for r in part]
+            for o in out:
+                o["category_why"] = _category_why(o)
+            stamp(out)
+            yield out
+    return _gen()
 
 
 def _per_day(total, start, end, today: dt.date):
@@ -868,22 +1027,46 @@ def _per_day(total, start, end, today: dt.date):
     return round(total / days, 2), days
 
 
-def _per_day_over_months(total, year: int, months, today: dt.date):
-    """Average daily spend over the named months of `year`: each month's
-    days up to today (a month in progress counts its elapsed days, a
-    closed one all of them). (None, None) when nothing was spent or no
-    named month has begun."""
+def _ledger_first(conn, *, budget_view: bool = True):
+    """The ledger's first day. `budget_view` leaves out the accounts the
+    budget excludes, the way the month's pace reads it; a raw search can
+    list those accounts' rows too, so it counts from the first row of any
+    account."""
+    from ..engine import budget as _budget
+    excluded = (_budget.excluded_account_ids(_budget.load_config(conn))
+                if budget_view else None)
+    return _budget.ledger_start(conn, excluded)
+
+
+def _per_seen_day(total, windows):
+    """Average daily spend over the days a ledger has seen of one or more
+    months, each read through its pace window (budget.pace_window,
+    specs/short-ledger-pacing.md): from the later of the 1st and the
+    ledger's first day, through the day read on (today included) or month
+    end once it is closed — the days the Why's "running $X/day" divides
+    by. Days before the ledger are no data, not days of no spending. A
+    month the ledger had not reached adds nothing. (None, None) when
+    nothing was spent or no day was seen."""
     if not total:
         return None, None
-    days = 0
-    for m in months:
-        first = dt.date(year, m, 1)
-        last = dt.date(year, m, calendar.monthrange(year, m)[1])
-        if first <= today:
-            days += (min(last, today) - first).days + 1
+    days = sum(w["seen_days"] for w in windows if w["paced_days"] > 0)
     if days <= 0:
         return None, None
     return round(total / days, 2), days
+
+
+def _month_windows(first, year: int, months, today: dt.date) -> list[dict]:
+    """The pace windows of the named months of `year` up to `today`: the
+    month of `today` live, earlier ones closed, later ones left out."""
+    from ..engine import budget as _budget
+    out = []
+    for m in months:
+        if (year, m) > (today.year, today.month):
+            continue
+        closed = (year, m) < (today.year, today.month)
+        out.append(_budget.pace_window_for(
+            first, dt.date(year, m, 1) if closed else today, closed=closed))
+    return out
 
 
 def _json_default(v):
@@ -919,6 +1102,338 @@ def transactions(user: dict = Depends(_user()), y: int = 0, m: int = 0,
                  reimb: int = 0, owner: str = "", scope: str = "all",
                  channel: str = "", checks: int = 0, bucket: str = "",
                  as_of: str = "", counted: int = 0):
+    conn = _conn(user)
+    try:
+        return _transactions_payload(conn, y=y, m=m, q=q, acct=acct, cat=cat, date_from=date_from, date_to=date_to, page=page, reimb=reimb, owner=owner, scope=scope, channel=channel, checks=checks, bucket=bucket, as_of=as_of, counted=counted)
+    finally:
+        conn.close()
+
+
+# The download door answers with the page's whole row set at once; a
+# household's entire history is a few tens of thousands of rows, and a
+# wider answer than this is a sign of a filter that means "everything",
+# which the full export (Settings) is for.
+TRANSACTIONS_EXPORT_CAP = 50_000
+
+# the columns a person reads, in the order the page shows them; the
+# ledger's own keys stay out (ids are last, for anyone matching rows back)
+_EXPORT_COLUMNS = (
+    ("date", "date"), ("payee", "payee"), ("amount", "amount"),
+    ("category", "category"), ("account", "account"), ("mask", "account_mask"),
+    ("pending", "pending"), ("note", "note"), ("owner", "owner"),
+    ("entity", "business"), ("reimb", "reimbursable"),
+    ("payment_channel", "channel"), ("check_number", "check_number"),
+    ("location_city", "city"), ("location_region", "region"),
+    ("item_summary", "items"), ("recurring_bill", "bill"),
+    ("bank_text", "bank_text"), ("id", "id"),
+)
+
+
+# How many rows a download reads, decorates and writes out at a time: big
+# enough that the per-slice query is not the cost, small enough that a
+# slice of the wide ledger row is a few megabytes rather than the whole
+# history.
+_EXPORT_CHUNK = 1_000
+
+# Downloads being built. One per household — a second click (or CSV then
+# XLSX) while the first is still being written would only build the same
+# file twice — and a few for the whole process, so households exporting
+# at the same moment queue at the door instead of stacking up their
+# working sets in one process. A slot covers BUILDING the file only, which
+# the server does at its own pace; the transfer that follows holds no slot
+# and no connection, so a client that reads slowly can neither starve the
+# shared connection pool nor keep other households at the door. A slot
+# that outlives _EXPORT_SLOT_TTL is treated as abandoned, so a leak can
+# never lock a household out.
+# The gate lives in this process because the server is one process:
+# `oikonome serve` starts a single uvicorn worker and the image runs
+# nothing else. Running several workers would need a database-backed
+# per-household lock here instead.
+_EXPORT_MAX = 2
+_EXPORT_SLOT_TTL = 15 * 60
+_EXPORT_SLOTS: dict[object, tuple[str, float]] = {}
+_EXPORT_SLOTS_LOCK = _threading.Lock()
+# A built file stays in memory up to this size and spills to a temporary
+# file past it, so a whole history is never held in memory at once; it is
+# sent in pieces of _EXPORT_SEND_PIECE.
+_EXPORT_SPOOL_MEMORY = 4 * 1024 * 1024
+_EXPORT_SEND_PIECE = 64 * 1024
+# Files built and not yet fully sent. The slot is given back once a file
+# is built, but the file itself lives until the client has read it or
+# left, and how fast that happens is up to the client — so without a
+# bound of their own, readers that stall after the headers would pile up
+# spooled files (4 MiB of memory each, then disk) in the one process
+# every household shares. A household may hold _EXPORT_HELD_PER_HOUSEHOLD
+# of them and the process _EXPORT_HELD_MAX; past that the next download
+# is refused up front, before anything is built. The hold is given back
+# when the send ends, however it ends, and no send may run longer than
+# _EXPORT_SEND_MAX_S: a reader that takes the headers and then stalls is
+# cut off and its place given back, so two stalled households cannot hold
+# the door shut for everyone else. _EXPORT_HELD_TTL is only a safety net
+# behind that deadline, and the process cap is several households' worth.
+_EXPORT_HELD_MAX = 16
+_EXPORT_HELD_PER_HOUSEHOLD = 2
+_EXPORT_SEND_MAX_S = 20 * 60
+_EXPORT_HELD_TTL = 2 * _EXPORT_SEND_MAX_S
+_EXPORT_HELD: dict[object, tuple[str, float]] = {}
+
+
+def _export_slot(tenant_id: str):
+    """Take a download slot for this household, or answer 429. Returns
+    the release function (safe to call more than once)."""
+    import time as _time
+    now = _time.monotonic()
+    token = object()
+    tenant_id = str(tenant_id)
+    with _EXPORT_SLOTS_LOCK:
+        for k, (_t, began) in list(_EXPORT_SLOTS.items()):
+            if now - began > _EXPORT_SLOT_TTL:
+                del _EXPORT_SLOTS[k]
+        if any(t == tenant_id for t, _b in _EXPORT_SLOTS.values()):
+            raise HTTPException(429, "an export is already running — wait "
+                                     "for it to finish, then try again")
+        if len(_EXPORT_SLOTS) >= _EXPORT_MAX:
+            raise HTTPException(429, "other downloads are being prepared "
+                                     "right now — try again in a minute")
+        _EXPORT_SLOTS[token] = (tenant_id, now)
+
+    def release():
+        with _EXPORT_SLOTS_LOCK:
+            _EXPORT_SLOTS.pop(token, None)
+    return release
+
+
+def _export_hold(tenant_id: str):
+    """Take a place for one built-but-unsent download file, or refuse:
+    429 when this household already holds its share, 503 when the
+    process is full. Returns the release function (safe to call more than
+    once)."""
+    import time as _time
+    now = _time.monotonic()
+    token = object()
+    tenant_id = str(tenant_id)
+    with _EXPORT_SLOTS_LOCK:
+        for k, (_t, began) in list(_EXPORT_HELD.items()):
+            if now - began > _EXPORT_HELD_TTL:
+                del _EXPORT_HELD[k]
+        mine = sum(1 for t, _b in _EXPORT_HELD.values() if t == tenant_id)
+        if mine >= _EXPORT_HELD_PER_HOUSEHOLD:
+            raise HTTPException(
+                429, "earlier downloads are still being sent — let them "
+                     "finish, then try again", headers={"Retry-After": "30"})
+        if len(_EXPORT_HELD) >= _EXPORT_HELD_MAX:
+            raise HTTPException(
+                503, "other downloads are being sent right now — try again "
+                     "in a minute", headers={"Retry-After": "30"})
+        _EXPORT_HELD[token] = (tenant_id, now)
+
+    def release():
+        with _EXPORT_SLOTS_LOCK:
+            _EXPORT_HELD.pop(token, None)
+    return release
+
+
+class _ClosingStream(StreamingResponse):
+    """A streamed download that closes its body generator the moment the
+    response ends, however it ends.
+
+    Starlette only stops iterating when the client leaves: the body's
+    generator is left suspended at its last `yield`, and its `finally` —
+    which gives back what the body holds (the built file) — would run only
+    when the garbage collector reached it. So the close is done here, in
+    the thread pool, shielded from the cancellation that a disconnect
+    delivers."""
+
+    def __init__(self, content, close, **kw):
+        super().__init__(content, **kw)
+        self._close_body = close
+
+    async def __call__(self, scope, receive, send):
+        import anyio
+        try:
+            # a send has a deadline: a client that stalls after the headers
+            # is cut off here, and the finally below gives the file back
+            with anyio.fail_after(_EXPORT_SEND_MAX_S):
+                await super().__call__(scope, receive, send)
+        except TimeoutError:
+            import logging
+            logging.getLogger("oikonome.api").info("export send cut off after %ss: the client stalled",
+                                                    _EXPORT_SEND_MAX_S)
+        finally:
+            with anyio.CancelScope(shield=True):
+                await anyio.to_thread.run_sync(self._close_body)
+
+
+@router.get("/transactions/export")
+def transactions_export(request: Request, user: dict = Depends(_user()),
+                        format: str = "csv",
+                        y: int = 0, m: int = 0, q: str = "", acct: str = "",
+                        cat: str = "", date_from: str = "", date_to: str = "",
+                        reimb: int = 0, owner: str = "", scope: str = "all",
+                        channel: str = "", checks: int = 0, bucket: str = "",
+                        as_of: str = "", counted: int = 0):
+    """The ledger page as a file: the same filters GET /api/transactions
+    takes, the same rows it would list (every page of them), as CSV or a
+    one-sheet .xlsx. Amounts are signed the way the page reads them —
+    money in positive, money out negative.
+
+    The filters are matched once up front (so a bad filter is still a
+    plain 400), then the rows are read, decorated and written a slice at a
+    time on one connection into a spooled file (memory, then disk), so a
+    whole history is never held in memory at once. The connection and the
+    household's download slot are given back once the file is built,
+    BEFORE the first byte is sent: the connection is pooled and shared by
+    every household, and how fast a download is read is up to the client.
+    The built file is counted until the send ends (_export_hold), so
+    readers that stall cannot pile files up in the process."""
+    _same_site_download(request)
+    if format not in ("csv", "xlsx"):
+        raise HTTPException(400, "format must be csv or xlsx")
+    release = _export_slot(user["tenant_id"])
+    try:
+        unhold = _export_hold(user["tenant_id"])
+    except BaseException:
+        release()
+        raise
+    conn = None
+    try:
+        conn = _conn(user)
+        payload = _transactions_payload(
+            conn, y=y, m=m, q=q, acct=acct, cat=cat, date_from=date_from,
+            date_to=date_to, page=1, reimb=reimb, owner=owner, scope=scope,
+            channel=channel, checks=checks, bucket=bucket, as_of=as_of,
+            counted=counted, per_page=TRANSACTIONS_EXPORT_CAP,
+            chunk=_EXPORT_CHUNK)
+    except BaseException:
+        if conn is not None:
+            conn.close()
+        release()
+        unhold()
+        raise
+    rows = payload.get("rows") or []
+    # the month browse answers with one list; a search with slices
+    batches = iter([rows]) if isinstance(rows, list) else rows
+    total = payload.get("total")
+
+    def _value(r, key):
+        v = r.get(key)
+        if key == "amount":
+            return -v if isinstance(v, (int, float)) else v
+        if key in ("pending", "reimb"):
+            return "yes" if v else ""
+        if isinstance(v, (int, float)) or v is None:
+            return v
+        return _csv_safe(str(v))
+
+    header = [label for _k, label in _EXPORT_COLUMNS]
+
+    def _tables():
+        written = 0
+        for part in batches:
+            written += len(part)
+            yield [[_value(r, k) for k, _l in _EXPORT_COLUMNS]
+                   for r in part]
+        if total is not None and total > written:
+            yield [[f"{total - written} more rows were not included "
+                    f"(a download holds up to {TRANSACTIONS_EXPORT_CAP:,}); "
+                    "narrow the filters or use the full export"]]
+
+    try:
+        # name the file after what was asked for, the way a person would
+        if payload.get("mode") == "month":
+            stem = f"transactions-{payload['year']}-{payload['month']:02d}"
+        else:
+            bits = [b for b in (q.strip(), cat, bucket, acct and "account",
+                                date_from, date_to) if b]
+            stem = "transactions-" + _filename_safe("-".join(bits) or "search",
+                                                    "search")
+        import tempfile as _tempfile
+        out = _tempfile.SpooledTemporaryFile(max_size=_EXPORT_SPOOL_MEMORY)
+        try:
+            if format == "csv":
+                import io as _io
+                buf = _io.StringIO()
+                w = _csv_writer(buf)
+                w.writerow(header)
+                out.write(buf.getvalue().encode())
+                for table in _tables():
+                    buf.seek(0)
+                    buf.truncate()
+                    w.writerows(table)
+                    out.write(buf.getvalue().encode())
+                media, ext_ = "text/csv", "csv"
+            else:
+                from . import xlsx as _xlsx
+                for part in _xlsx.stream_workbook("Transactions", header,
+                                                  _tables()):
+                    out.write(part)
+                media, ext_ = _xlsx.MEDIA_TYPE, "xlsx"
+            out.seek(0)
+        except BaseException:
+            out.close()
+            raise
+    except BaseException:
+        unhold()
+        raise
+    finally:
+        # the file is built (or the build failed): nothing the client does
+        # from here holds the shared connection or the household's slot
+        try:
+            try:
+                if hasattr(batches, "close"):
+                    batches.close()
+            finally:
+                conn.close()
+        finally:
+            release()
+
+    def _send():
+        try:
+            while True:
+                piece = out.read(_EXPORT_SEND_PIECE)
+                if not piece:
+                    return
+                yield piece
+        finally:
+            # closing a spooled file that spilled to disk removes it
+            try:
+                out.close()
+            finally:
+                unhold()
+    import itertools as _it
+    body = _send()
+    # Start the generator here, so its cleanup is armed: a generator that
+    # was never started runs no `finally` when it is discarded, and a
+    # client that leaves before the first byte would otherwise leave the
+    # built file open until the collector reached it.
+    try:
+        first = next(body)
+    except BaseException:
+        body.close()
+        out.close()
+        unhold()
+        raise
+    return _ClosingStream(_it.chain([first], body), body.close,
+                          media_type=media, headers={
+        "Content-Disposition": f'attachment; filename="{stem}.{ext_}"',
+        "Cache-Control": "no-store"})
+
+
+def _transactions_payload(conn, *, y: int = 0, m: int = 0, q: str = "",
+                          acct: str = "", cat: str = "", date_from: str = "",
+                          date_to: str = "", page: int = 1, reimb: int = 0,
+                          owner: str = "", scope: str = "all",
+                          channel: str = "", checks: int = 0,
+                          bucket: str = "", as_of: str = "", counted: int = 0,
+                          per_page: int = 100, chunk: int = 0) -> dict:
+    """The ledger page's answer for one set of filters: month browse, a
+    search, a bucket's or a counted category's row set. The page reads it
+    through GET /api/transactions a page at a time; the download door
+    reads the same answer with `per_page` wide enough for the whole set,
+    so what is exported is exactly what the page would list. `chunk`
+    turns a search's "rows" into a generator of row slices read on
+    `conn` (see search_transactions); the month browse, one month of
+    rows, stays a list either way."""
     # bound like _ck_ym bounds y/m: an unbounded page multiplies into an
     # OFFSET past bigint inside the driver (NumericValueOutOfRange → 500)
     page = min(max(1, page), 10_000_000)
@@ -928,229 +1443,237 @@ def transactions(user: dict = Depends(_user()), y: int = 0, m: int = 0,
         raise HTTPException(400, "scope must be all, personal or business")
     if channel and channel not in ("in store", "online", "other"):
         raise HTTPException(400, "channel must be in store, online or other")
-    conn = _conn(user)
-    try:
-        today = _today(conn)
-        _ck_ym(y or today.year, m or today.month)
-        for _label, _v in (("date_from", date_from), ("date_to", date_to)):
-            if _v:
-                # as_date, not fromisoformat: a well-formed year the ledger
-                # cannot read (0001, 9999) must be a 400 here, not a 500 in
-                # the search below
-                from ..engine.compat import as_date as _as_date
+    today = _today(conn)
+    _ck_ym(y or today.year, m or today.month)
+    for _label, _v in (("date_from", date_from), ("date_to", date_to)):
+        if _v:
+            # as_date, not fromisoformat: a well-formed year the ledger
+            # cannot read (0001, 9999) must be a 400 here, not a 500 in
+            # the search below
+            from ..engine.compat import as_date as _as_date
+            try:
+                _as_date(_v[:10])
+            except ValueError:
+                raise HTTPException(400, f"{_label} must be YYYY-MM-DD")
+    yy, mm = y or today.year, m or today.month
+    # `bucket` opens the rows behind ONE of the month verdict's own
+    # numbers — Food, Everything else, or a custom carve-out. The set
+    # cannot be expressed as a category filter (Food is a category OR
+    # two override strings, minus every bill-shaped row, plus envelope
+    # overflow; a carve-out is a plan label matched by merchant AND
+    # category rules), so the engine names the rows and the search
+    # surface renders them. Every other filter stands down: this is a
+    # listing of a number, not a query.
+    if bucket:
+        from ..engine import budget as _budget
+        from . import lenses as _lenses
+        # a year's bucket — the year lens's money map — is `y` with no
+        # `m`: the union of that bucket over the year's elapsed budgeted
+        # months, the months the map summed. Its rows run to today.
+        year_scope = bool(y) and not m
+        read_on = today
+        if year_scope:
+            if as_of:
+                raise HTTPException(400, "as_of belongs to a month's bucket")
+            info = _lenses.year_bucket_ledger(conn, bucket, yy, today)
+        else:
+            # the month lens' own state: a closed month is judged against
+            # its frozen snapshot there, so the listing matches the tile
+            # that month actually shows, not today's budget applied back.
+            # `as_of` is the day a Today page was read on: a past day of
+            # the month shows that day's figures, so its rows stop there.
+            if as_of:
                 try:
-                    _as_date(_v[:10])
+                    read_on = dt.date.fromisoformat(as_of[:10])
                 except ValueError:
-                    raise HTTPException(400, f"{_label} must be YYYY-MM-DD")
-        yy, mm = y or today.year, m or today.month
-        # `bucket` opens the rows behind ONE of the month verdict's own
-        # numbers — Food, Everything else, or a custom carve-out. The set
-        # cannot be expressed as a category filter (Food is a category OR
-        # two override strings, minus every bill-shaped row, plus envelope
-        # overflow; a carve-out is a plan label matched by merchant AND
-        # category rules), so the engine names the rows and the search
-        # surface renders them. Every other filter stands down: this is a
-        # listing of a number, not a query.
-        if bucket:
-            from ..engine import budget as _budget
-            from . import lenses as _lenses
-            # a year's bucket — the year lens's money map — is `y` with no
-            # `m`: the union of that bucket over the year's elapsed budgeted
-            # months, the months the map summed. Its rows run to today.
-            year_scope = bool(y) and not m
-            read_on = today
-            if year_scope:
-                if as_of:
-                    raise HTTPException(400, "as_of belongs to a month's bucket")
-                info = _lenses.year_bucket_ledger(conn, bucket, yy, today)
-            else:
-                # the month lens' own state: a closed month is judged against
-                # its frozen snapshot there, so the listing matches the tile
-                # that month actually shows, not today's budget applied back.
-                # `as_of` is the day a Today page was read on: a past day of
-                # the month shows that day's figures, so its rows stop there.
-                if as_of:
-                    try:
-                        read_on = dt.date.fromisoformat(as_of[:10])
-                    except ValueError:
-                        raise HTTPException(400, "as_of must be YYYY-MM-DD")
-                    if (read_on.year, read_on.month) != (yy, mm) or read_on > today:
-                        raise HTTPException(
-                            400, "as_of must be a day of that month, not after today")
-                info = _budget.bucket_ledger(
-                    _lenses.month_state(conn, yy, mm, read_on), bucket)
-            if info is None:
-                raise HTTPException(400, "unknown bucket")
-            rows, total, amount_sum, amazon_items, spend, account_hits = \
-                data.search_transactions(conn, "", ids=info["txn_ids"],
-                                         page=max(1, page), scope="all")
-            out = [_ser(r) for r in rows]
-            for o in out:
-                o["category_why"] = _category_why(o)
-            _stamp_recurring(conn, out)
-            avg = (round(spend["sum"] / spend["count"], 2)
-                   if spend["count"] else None)
-            # A bucket is one month's (or one year's) number, and its daily
-            # pace is THAT number — the figure the label wore, reimbursements
-            # netted and envelope overflow counted only past the envelope —
-            # over the days it was counted across, up to the day it was read
-            # on. The listed rows' raw sum is neither: an overflowing
-            # purchase is listed whole. A year's figure sums only its
-            # budgeted months, so its days are those months' days, not every
-            # day since January 1.
-            if year_scope:
-                per_day, per_day_days = _per_day_over_months(
-                    info["amount"], yy, info.get("months") or [], read_on)
-            else:
-                per_day, per_day_days = _per_day(
-                    info["amount"], dt.date(yy, mm, 1),
-                    dt.date(yy, mm, calendar.monthrange(yy, mm)[1]), read_on)
-            return {"mode": "search", "rows": out,
-                    "total": total, "amount_sum": amount_sum,
-                    "amazon_items": amazon_items, "page": page,
-                    "spend_count": spend["count"], "spend_sum": spend["sum"],
-                    "spend_avg": avg, "biz_count": spend["biz_count"],
-                    "per_day": per_day, "per_day_days": per_day_days,
-                    "account_hits": account_hits,
-                    # what the chip over the list says it is showing, and
-                    # the figure the label wore: reimbursements netted and
-                    # envelope overflow counted the way the plan counts
-                    # them, which the listed rows' raw sum is not
-                    "bucket": info["bucket"], "bucket_label": info["label"],
-                    "bucket_amount": info["amount"],
-                    "bucket_scope": "year" if year_scope else "month"}
-        # `counted` is a lens CATEGORY label's link: the rows that label
-        # summed (personal spend, money out, reimbursements netted) for one
-        # month or one whole year — not every row filed under the category.
-        # Like a bucket, the engine names the rows and the other lenses
-        # stand down, and the total is the label's own number.
-        if counted and cat:
-            from . import lenses as _lenses
-            if date_from or date_to:
-                yr = date_from[:4]
-                if not (yr.isdigit() and date_from[:10] == f"{yr}-01-01"
-                        and date_to[:10] == f"{yr}-12-31"):
+                    raise HTTPException(400, "as_of must be YYYY-MM-DD")
+                if (read_on.year, read_on.month) != (yy, mm) or read_on > today:
                     raise HTTPException(
-                        400, "a counted category is one month or one whole year")
-                info = _lenses.year_category_ledger(conn, cat, int(yr))
-            else:
-                info = _lenses.month_category_ledger(
-                    _lenses.month_state(conn, yy, mm, today), cat)
-            rows, total, _gross, amazon_items, spend, account_hits = \
-                data.search_transactions(conn, "", ids=info["txn_ids"],
-                                         page=max(1, page), scope="all")
-            out = [_ser(r) for r in rows]
-            for o in out:
-                o["category_why"] = _category_why(o)
-            _stamp_recurring(conn, out)
-            avg = (round(spend["sum"] / spend["count"], 2)
-                   if spend["count"] else None)
-            # the label's own number per day over the month or year it counts
-            if date_from:
-                window = (dt.date(int(yr), 1, 1), dt.date(int(yr), 12, 31))
-            else:
-                window = (dt.date(yy, mm, 1),
-                          dt.date(yy, mm, calendar.monthrange(yy, mm)[1]))
-            per_day, per_day_days = _per_day(info["amount"], *window, today)
-            return {"mode": "search", "rows": out,
-                    "total": total, "amount_sum": info["amount"],
-                    "amazon_items": amazon_items, "page": page,
-                    "spend_count": spend["count"], "spend_sum": spend["sum"],
-                    "spend_avg": avg, "biz_count": spend["biz_count"],
-                    "per_day": per_day, "per_day_days": per_day_days,
-                    "account_hits": account_hits, "counted": True}
-        # a channel or checks-only lens is a search (the month browse has
-        # no way to express it), like a category or an account is
-        searching = bool(q.strip() or acct or cat or date_from or date_to
-                         or channel or checks)
-        # A month link ("Food, July") sends y/m beside the filter, but a
-        # search reads neither, so the same link would open a category's
-        # ALL-TIME history. The month's span is derived server-side, so every
-        # client gets the month it asked for. An explicit range
-        # still wins: it is the more specific instruction.
-        if searching and (y or m) and not (date_from or date_to):
-            date_from = dt.date(yy, mm, 1).isoformat()
-            date_to = dt.date(yy, mm,
-                              calendar.monthrange(yy, mm)[1]).isoformat()
-        if searching:
-            rows, total, amount_sum, amazon_items, spend, account_hits = \
-                data.search_transactions(
-                    conn, q, account_id=acct or None, category=cat or None,
-                    date_from=date_from or None, date_to=date_to or None,
-                    reimb_only=bool(reimb), page=max(1, page), scope=scope,
-                    channel=channel or None, checks_only=bool(checks))
-            out = [_ser(r) for r in rows]
-            for o in out:
-                o["category_why"] = _category_why(o)
-            _stamp_recurring(conn, out)
-            # A total answers "how much have I given them"; the average
-            # answers "what does a visit cost", which is the question a
-            # merchant search is usually really asking. Sent only when
-            # there is spending to average — a search matching nothing but
-            # income or transfers has no average, and 0 would read as one.
-            avg = round(spend["sum"] / spend["count"], 2) if spend["count"] else None
-            # the average per DAY answers "what is this costing me" over the
-            # window asked for — a month's category, a date range. A search
-            # with no start date has no window to divide by.
-            per_day, per_day_days = _per_day(spend["sum"], date_from or None,
-                                             date_to or None, today)
-            return {"mode": "search", "rows": out,
-                    "total": total, "amount_sum": amount_sum,
-                    "amazon_items": amazon_items, "page": page,
-                    "spend_count": spend["count"], "spend_sum": spend["sum"],
-                    "spend_avg": avg,
-                    "per_day": per_day, "per_day_days": per_day_days,
-                    # matched rows that are a business's (not in amount_sum
-                    # unless scope=business)
-                    "biz_count": spend["biz_count"],
-                    # accounts the term matched by name — via_bank marks a
-                    # renamed account found through the bank's own name, so
-                    # the page can explain a result that shows neither word
-                    "account_hits": account_hits}
-        rows = data.transactions(conn, y or today.year, m or today.month,
-                                 reimb_only=bool(reimb), owner=owner or None,
-                                 scope=scope)
-        out = [_ser(r) for r in rows]
-        for o in out:
-            o["category_why"] = _category_why(o)
-        _stamp_recurring(conn, out)
-        # The month header states the month's CASH FLOW — income in, spend
-        # out, net — by the same definitions the Cash Flow page uses, not a
-        # raw sum of the listed rows. Raw sums would count a credit-card
-        # payment as money out on top of the card swipes it paid for, and
-        # count transfers between own accounts on both sides, so the
-        # header would show an "overspent" month that was actually
-        # positive. Transfers, card payments, linked
-        # shadow rows and business-entity money are all excluded; the
-        # owner/reimb quick-filters narrow the LIST but the headline stays
-        # the month's — a display filter must not change what the month
-        # cost. `biz_count` says how many listed rows are a business's.
-        # In and net are null for a month before the bank feed starts:
-        # its income is unknown (the Month lens says the same), and $0 in
-        # would read the month's whole spend as a loss.
-        from ..engine import entities as _ent, reporting as _reporting
-        combined = _ent.is_combined(conn)
-        flows = _reporting.month_flows(conn, y or today.year,
-                                       m or today.month)
-        per_day, per_day_days = _per_day(
-            flows["out"], dt.date(yy, mm, 1),
-            dt.date(yy, mm, calendar.monthrange(yy, mm)[1]), today)
-        return {"mode": "month", "year": y or today.year,
-                "month": m or today.month, "rows": out,
-                "out_sum": flows["out"], "in_sum": flows["in"],
-                "net_sum": flows["net"],
-                # the month's spending per day so far (every day, once closed)
+                        400, "as_of must be a day of that month, not after today")
+            mst = _lenses.month_state(conn, yy, mm, read_on)
+            info = _budget.bucket_ledger(mst, bucket)
+        if info is None:
+            raise HTTPException(400, "unknown bucket")
+        rows, total, amount_sum, amazon_items, spend, account_hits = \
+            data.search_transactions(conn, "", ids=info["txn_ids"],
+                                     page=max(1, page), per_page=per_page, scope="all",
+                                     chunk=chunk)
+        out = _decorated(conn, rows, chunk)
+        avg = (round(spend["sum"] / spend["count"], 2)
+               if spend["count"] else None)
+        # A bucket is one month's (or one year's) number, and its daily
+        # pace is THAT number — the figure the label wore, reimbursements
+        # netted and envelope overflow counted only past the envelope —
+        # over the days it was counted across, up to the day it was read
+        # on. The listed rows' raw sum is neither: an overflowing
+        # purchase is listed whole. A year's figure sums only its
+        # budgeted months, so its days are those months' days, not every
+        # day since January 1. Either way the days are the ones the
+        # ledger has seen: a ledger that began on the 10th divides from
+        # the 10th, the way the Why's "running $X/day" does.
+        if year_scope:
+            per_day, per_day_days = _per_seen_day(
+                info["amount"], _month_windows(
+                    _ledger_first(conn), yy, info.get("months") or [],
+                    read_on))
+        else:
+            per_day, per_day_days = _per_seen_day(info["amount"],
+                                                  [mst["pace"]])
+        return {"mode": "search", "rows": out,
+                "total": total, "amount_sum": amount_sum,
+                "amazon_items": amazon_items, "page": page,
+                "spend_count": spend["count"], "spend_sum": spend["sum"],
+                "spend_avg": avg, "biz_count": spend["biz_count"],
                 "per_day": per_day, "per_day_days": per_day_days,
-                # zero under the combined toggle: the rows ARE household
-                # money then, and the label the client hangs on this says
-                # otherwise
-                "biz_count": 0 if combined else
-                             sum(1 for r in out if r.get("entity"))}
-    finally:
-        conn.close()
+                "account_hits": account_hits,
+                # what the chip over the list says it is showing, and
+                # the figure the label wore: reimbursements netted and
+                # envelope overflow counted the way the plan counts
+                # them, which the listed rows' raw sum is not
+                "bucket": info["bucket"], "bucket_label": info["label"],
+                "bucket_amount": info["amount"],
+                "bucket_scope": "year" if year_scope else "month"}
+    # `counted` is a lens CATEGORY label's link: the rows that label
+    # summed (personal spend, money out, reimbursements netted) for one
+    # month or one whole year — not every row filed under the category.
+    # Like a bucket, the engine names the rows and the other lenses
+    # stand down, and the total is the label's own number.
+    if counted and cat:
+        from . import lenses as _lenses
+        if date_from or date_to:
+            yr = date_from[:4]
+            if not (yr.isdigit() and date_from[:10] == f"{yr}-01-01"
+                    and date_to[:10] == f"{yr}-12-31"):
+                raise HTTPException(
+                    400, "a counted category is one month or one whole year")
+            info = _lenses.year_category_ledger(conn, cat, int(yr))
+        else:
+            mst = _lenses.month_state(conn, yy, mm, today)
+            info = _lenses.month_category_ledger(mst, cat)
+        rows, total, _gross, amazon_items, spend, account_hits = \
+            data.search_transactions(conn, "", ids=info["txn_ids"],
+                                     page=max(1, page), per_page=per_page, scope="all",
+                                     chunk=chunk)
+        out = _decorated(conn, rows, chunk)
+        avg = (round(spend["sum"] / spend["count"], 2)
+               if spend["count"] else None)
+        # the label's own number per day over the days of the month or
+        # year it counts that the ledger has seen
+        if date_from:
+            windows = _month_windows(_ledger_first(conn), int(yr),
+                                     range(1, 13), today)
+        else:
+            windows = [mst["pace"]]
+        per_day, per_day_days = _per_seen_day(info["amount"], windows)
+        return {"mode": "search", "rows": out,
+                "total": total, "amount_sum": info["amount"],
+                "amazon_items": amazon_items, "page": page,
+                "spend_count": spend["count"], "spend_sum": spend["sum"],
+                "spend_avg": avg, "biz_count": spend["biz_count"],
+                "per_day": per_day, "per_day_days": per_day_days,
+                "account_hits": account_hits, "counted": True}
+    # a channel or checks-only lens is a search (the month browse has
+    # no way to express it), like a category or an account is
+    searching = bool(q.strip() or acct or cat or date_from or date_to
+                     or channel or checks)
+    # A month link ("Food, July") sends y/m beside the filter, but a
+    # search reads neither, so the same link would open a category's
+    # ALL-TIME history. The month's span is derived server-side, so every
+    # client gets the month it asked for. An explicit range
+    # still wins: it is the more specific instruction.
+    if searching and (y or m) and not (date_from or date_to):
+        date_from = dt.date(yy, mm, 1).isoformat()
+        date_to = dt.date(yy, mm,
+                          calendar.monthrange(yy, mm)[1]).isoformat()
+    if searching:
+        rows, total, amount_sum, amazon_items, spend, account_hits = \
+            data.search_transactions(
+                conn, q, account_id=acct or None, category=cat or None,
+                date_from=date_from or None, date_to=date_to or None,
+                reimb_only=bool(reimb), page=max(1, page), per_page=per_page, scope=scope,
+                channel=channel or None, checks_only=bool(checks),
+                chunk=chunk)
+        out = _decorated(conn, rows, chunk)
+        # A total answers "how much have I given them"; the average
+        # answers "what does a visit cost", which is the question a
+        # merchant search is usually really asking. Sent only when
+        # there is spending to average — a search matching nothing but
+        # income or transfers has no average, and 0 would read as one.
+        avg = round(spend["sum"] / spend["count"], 2) if spend["count"] else None
+        # the average per DAY answers "what is this costing me" over the
+        # window asked for — a month's category, a date range. A search
+        # with no start date has no window to divide by. The window starts
+        # no earlier than the ledger: days before its first row are no
+        # data, not days of no spending (the pace window's boundary rule).
+        start = date_from or None
+        if start and spend["sum"]:
+            from ..engine.compat import as_date as _as_date
+            first = _ledger_first(conn, budget_view=False)
+            if first and first > _as_date(start[:10]):
+                start = first
+        per_day, per_day_days = _per_day(spend["sum"], start,
+                                         date_to or None, today)
+        return {"mode": "search", "rows": out,
+                "total": total, "amount_sum": amount_sum,
+                "amazon_items": amazon_items, "page": page,
+                "spend_count": spend["count"], "spend_sum": spend["sum"],
+                "spend_avg": avg,
+                "per_day": per_day, "per_day_days": per_day_days,
+                # matched rows that are a business's (not in amount_sum
+                # unless scope=business)
+                "biz_count": spend["biz_count"],
+                # accounts the term matched by name — via_bank marks a
+                # renamed account found through the bank's own name, so
+                # the page can explain a result that shows neither word
+                "account_hits": account_hits}
+    rows = data.transactions(conn, y or today.year, m or today.month,
+                             reimb_only=bool(reimb), owner=owner or None,
+                             scope=scope)
+    out = [_ser(r) for r in rows]
+    for o in out:
+        o["category_why"] = _category_why(o)
+    _stamp_recurring(conn, out)
+    # The month header states the month's CASH FLOW — income in, spend
+    # out, net — by the same definitions the Cash Flow page uses, not a
+    # raw sum of the listed rows. Raw sums would count a credit-card
+    # payment as money out on top of the card swipes it paid for, and
+    # count transfers between own accounts on both sides, so the
+    # header would show an "overspent" month that was actually
+    # positive. Transfers, card payments, linked
+    # shadow rows and business-entity money are all excluded; the
+    # owner/reimb quick-filters narrow the LIST but the headline stays
+    # the month's — a display filter must not change what the month
+    # cost. `biz_count` says how many listed rows are a business's.
+    # In and net are null for a month before the bank feed starts:
+    # its income is unknown (the Month lens says the same), and $0 in
+    # would read the month's whole spend as a loss.
+    from ..engine import entities as _ent, reporting as _reporting
+    combined = _ent.is_combined(conn)
+    flows = _reporting.month_flows(conn, y or today.year,
+                                   m or today.month)
+    # per day over the days of the month the ledger has seen, the way the
+    # month's pace counts them (from the ledger's first day when it began
+    # inside the month)
+    per_day, per_day_days = _per_seen_day(
+        flows["out"], _month_windows(_ledger_first(conn), yy, [mm], today))
+    return {"mode": "month", "year": y or today.year,
+            "month": m or today.month, "rows": out,
+            "out_sum": flows["out"], "in_sum": flows["in"],
+            "net_sum": flows["net"],
+            # the month's spending per day so far (every day, once closed)
+            "per_day": per_day, "per_day_days": per_day_days,
+            # zero under the combined toggle: the rows ARE household
+            # money then, and the label the client hangs on this says
+            # otherwise
+            "biz_count": 0 if combined else
+                         sum(1 for r in out if r.get("entity"))}
 
 
-@router.post("/transactions/{txn_id}/category")
+# Every door naming a transaction takes its id as a `path` segment: a
+# file-import or bridge id carries the source's own reference, which can
+# hold a '/', and the server decodes the clients' %2F before it matches a
+# route — a plain segment would stop at the slash and 404 the request.
+@router.post("/transactions/{txn_id:path}/category")
 def set_category(txn_id: str, user: dict = Depends(_user()),
                  body: dict = Body(...)):
     category = _category_text(body, "category", user=user)
@@ -1209,7 +1732,7 @@ def set_category(txn_id: str, user: dict = Depends(_user()),
 # ledger row (engine/splits.py holds the rules). PUT replaces, DELETE
 # removes; the ledger row carries the result as `split`, so a client that
 # refetches its list sees it, and the category rollups read the parts.
-@router.put("/transactions/{txn_id}/split")
+@router.put("/transactions/{txn_id:path}/split")
 def set_split_api(txn_id: str, user: dict = Depends(_user()),
                   body: dict = Body(...)):
     _may_edit(user)
@@ -1235,7 +1758,7 @@ def set_split_api(txn_id: str, user: dict = Depends(_user()),
         conn.close()
 
 
-@router.delete("/transactions/{txn_id}/split")
+@router.delete("/transactions/{txn_id:path}/split")
 def clear_split_api(txn_id: str, user: dict = Depends(_user())):
     _may_edit(user)
     from ..engine import splits as _splits
@@ -1246,10 +1769,18 @@ def clear_split_api(txn_id: str, user: dict = Depends(_user())):
             txn_id = data.live_edit_ids(conn, [txn_id]).get(txn_id)
             if not txn_id:
                 raise HTTPException(404, "transaction not found")
-            had = conn.execute(
-                "SELECT 1 FROM transaction_splits WHERE txn_id=%s LIMIT 1",
-                (txn_id,)).fetchone() is not None
-            _splits.clear_split(conn, txn_id)
+            had = _splits.clear_split(conn, txn_id)
+            if had and had != "user":
+                # the parts were a store receipt's reading, and the store
+                # matcher writes them again on its next run unless the row
+                # reads as answered: pin the row's category as the person's
+                # (the whole charge under it), exactly what removing a
+                # split means. Clearing that pin later brings the parts back.
+                cat = conn.execute(
+                    "SELECT COALESCE(category_override, category_primary) AS c "
+                    "FROM transactions WHERE id = %s", (txn_id,)).fetchone()
+                if cat and cat["c"]:
+                    data.set_category(conn, txn_id, cat["c"])
         if had:
             _activity.record(conn, user, "split", "cleared", target=txn_id,
                              label=_activity.txn_label(conn, txn_id))
@@ -1619,7 +2150,7 @@ def _live_txn_for_edit(conn, txn_id: str) -> str | None:
     return twin["id"] if twin else None
 
 
-@router.post("/transactions/{txn_id}/note")
+@router.post("/transactions/{txn_id:path}/note")
 def set_txn_note(txn_id: str, user: dict = Depends(_user()),
                  body: dict = Body(...)):
     """Set (or clear, when empty) a free-text note on a transaction."""
@@ -1647,7 +2178,7 @@ def set_txn_note(txn_id: str, user: dict = Depends(_user()),
         conn.close()
 
 
-@router.post("/transactions/{txn_id}/owner")
+@router.post("/transactions/{txn_id:path}/owner")
 def set_txn_owner_api(txn_id: str, user: dict = Depends(_user()),
                       body: dict = Body(...)):
     _may_edit(user)
@@ -2444,7 +2975,7 @@ def reimburse_pairs(user: dict = Depends(_user()), page: int = 1,
         conn.close()
 
 
-@router.get("/reimburse/{txn_id}/candidates")
+@router.get("/reimburse/{txn_id:path}/candidates")
 def reimburse_candidates(txn_id: str, user: dict = Depends(_user()),
                          q: str = ""):
     conn = _conn(user)
@@ -2525,7 +3056,7 @@ def reimburse_unlink(user: dict = Depends(_user()), body: dict = Body(...)):
         conn.close()
 
 
-@router.post("/reimburse/{txn_id}/flag")
+@router.post("/reimburse/{txn_id:path}/flag")
 def reimburse_flag(txn_id: str, user: dict = Depends(_user()),
                    body: dict | None = Body(default=None)):
     body = body or {}
@@ -2570,7 +3101,7 @@ def reimburse_flag(txn_id: str, user: dict = Depends(_user()),
         conn.close()
 
 
-@router.post("/reimburse/{txn_id}/unflag")
+@router.post("/reimburse/{txn_id:path}/unflag")
 def reimburse_unflag(txn_id: str, user: dict = Depends(_user())):
     conn = _conn(user)
     try:
@@ -2668,9 +3199,20 @@ def _month_bill_stats(conn, cfg: dict, today: dt.date) -> dict[str, dict]:
     rows = [match_rows[i] for i in in_month]
     ny, nm = ((today.year, today.month + 1) if today.month < 12
               else (today.year + 1, 1))
+    py, pm = ((today.year, today.month - 1) if today.month > 1
+              else (today.year - 1, 12))
 
     def _match(bill_list, candidate_rows):
-        occs = budget.month_occurrences(bill_list, today.year, today.month)
+        # LAST month's occurrences go in front as decoys, as month_status
+        # does: a bill due the 30th paid three days late on the 3rd belongs
+        # to last month's occurrence, and without the decoy it matches
+        # nothing here (or an envelope takes it) while Today counts it as
+        # fixed spend. A decoy paid inside this month is this month's cash
+        # and stays; an unpaid one, or one settled last month, is last
+        # month's business and is dropped.
+        occs = budget.month_occurrences(bill_list, py, pm)
+        n_prev = len(occs)
+        occs += budget.month_occurrences(bill_list, today.year, today.month)
         n_this = len(occs)
         occs += budget.month_occurrences(bill_list, ny, nm)
         matched, occs = budget.match_occurrences(candidate_rows, occs)
@@ -2679,7 +3221,9 @@ def _month_bill_stats(conn, cfg: dict, today: dt.date) -> dict[str, dict]:
         # one month's Paid x/y. One that WAS paid here stays, on the same
         # cash basis the verdict uses: the money left in this month, so
         # this is the month that counts it.
-        return matched, (occs[:n_this]
+        return matched, ([o for o in occs[:n_prev] if o["txn"] is not None
+                          and as_date(o["txn"]["date"]) >= month_start]
+                         + occs[n_prev:n_this]
                          + [o for o in occs[n_this:] if o["txn"] is not None])
 
     # The budget's bills match FIRST, over every candidate row — the
@@ -2702,14 +3246,14 @@ def _month_bill_stats(conn, cfg: dict, today: dt.date) -> dict[str, dict]:
         since=month_start - dt.timedelta(days=budget.PREPAY_MATCH_DAYS),
         cfg=cfg)
     # Rows the BUDGET occurrences claimed (payment plus the fees that rode
-    # with it), translated to `rows` indices for the envelope pass. A match
-    # on a prior-month payment has no in-month row and simply drops out.
-    _at = {id(r): i for i, r in enumerate(match_rows)}
-    claimed = {_at[id(r)] for occ in occs
-               if occ["txn"] is not None and occ["bill"]["payee"] in in_budget
-               for r in [occ["txn"], *(occ.get("companions") or [])]
-               if id(r) in _at}
-    matched_idx = {_pos[i] for i in claimed if i in _pos}
+    # with it), translated to `rows` indices for the envelope pass. They come
+    # from the index set the matcher returns, never from the occurrence's
+    # `txn`: a store-split charge pays a bill as the whole charge put back
+    # together — a new row that is none of its parts — so reading ownership
+    # off `txn` would leave every part free for an envelope to draw, and the
+    # same money would count as the bill paid and as envelope spending. A
+    # match on a prior-month payment has no in-month row and drops out.
+    matched_idx = {_pos[i] for i in matched_all if i in _pos}
     # income series: paychecks are not in the bill occurrence pass —
     # _recurring_bills is amount<0 only and _spend_rows is outflows — so
     # the Bills page's received column needs its own. Same engine, deposit
@@ -2729,8 +3273,6 @@ def _month_bill_stats(conn, cfg: dict, today: dt.date) -> dict[str, dict]:
             month_start - dt.timedelta(days=budget.PREPAY_MATCH_DAYS),
             today + dt.timedelta(days=1),
             excluded=excluded)
-        py, pm = ((today.year, today.month - 1) if today.month > 1
-                  else (today.year - 1, 12))
         decoys = budget.month_occurrences(income_bills, py, pm)
         income_occs = budget.month_occurrences(income_bills,
                                                today.year, today.month)
@@ -2820,9 +3362,11 @@ def bills_list(user: dict = Depends(_user()),
     if month:
         try:
             yy, mm = (int(x) for x in month.split("-"))
-            dt.date(yy, mm, 1)
         except (TypeError, ValueError):
             raise HTTPException(400, "month must be YYYY-MM")
+        # the shared range check, not a bare dt.date(): year 1 builds a
+        # date the month arithmetic below then steps out of (a 500)
+        _ck_ym(yy, mm)
         want_month = (yy, mm)
     conn = _conn(user)
     try:
@@ -3014,17 +3558,213 @@ def _proposal_superseded(conn, pid: str) -> bool:
     return bool(row and row["status"] == "superseded")
 
 
+def _proposal_adjust(raw) -> dict:
+    """The fields a person changed on an offer before approving it, read
+    and checked the way the bill save checks them, before anything is
+    written. A blank or null field is one they left alone."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise HTTPException(400, "adjust must be an object")
+    out: dict = {}
+    name = _body_text(raw, "name")
+    if name:
+        out["name"] = name
+    if raw.get("amount") not in (None, ""):
+        if isinstance(raw["amount"], bool):
+            raise HTTPException(400, "amount must be a number")
+        amount = _money_float(raw["amount"], "amount")
+        if not amount > 0:
+            raise HTTPException(400, "amount must be a positive dollar value")
+        out["amount"] = amount
+    cadence = _body_text(raw, "cadence")
+    if cadence:
+        out["cadence"] = _parse_cadence(cadence)
+    if raw.get("due_day") not in (None, ""):
+        day = raw["due_day"]
+        if isinstance(day, bool) or not isinstance(day, int) \
+                or not 1 <= day <= 31:
+            raise HTTPException(
+                400, "due_day must be a day of the month, 1 to 31")
+        out["due_day"] = day
+    return out
+
+
+def _next_on_day(today: dt.date, day: int, freq: str, interval: int,
+                 due: dt.date | None) -> dt.date | None:
+    """The due date of a bill whose due day the person set: the day of the
+    month moved inside the cycle the bill is already due in (its due date's
+    month and year, this month when it has none, the last day of a shorter
+    month), then stepped on by the bill's own interval, in years for a
+    yearly bill, while it is still before `today`. Stepping by one month
+    instead would pull a quarterly bill into next month and a two-yearly
+    one into next year, and the plan would count a charge that is not
+    coming. A cadence with no day of the month (weekly, daily, one time)
+    keeps its date; an envelope has no due date at all."""
+    if freq == "ENVELOPE":
+        return None
+    if freq not in ("MONTHLY", "YEARLY"):
+        return due
+    step = max(1, int(interval or 1)) * (12 if freq == "YEARLY" else 1)
+    base = due or today
+    n = base.year * 12 + base.month - 1
+
+    def on(n: int) -> dt.date:
+        y, m = divmod(n, 12)
+        return dt.date(y, m + 1, min(day, calendar.monthrange(y, m + 1)[1]))
+    d = on(n)
+    if d < today:
+        # whole cycles to the first one on or after today, not a loop: a
+        # long-stale due date must not cost one iteration per cycle
+        behind = (today.year * 12 + today.month - 1) - n
+        n += max(0, behind // step) * step
+        d = on(n)
+        if d < today:
+            d = on(n + step)
+    return d
+
+
+def _adjust_approved_bill(conn, payee: str, adj: dict) -> str:
+    """Apply what the person changed to the bill an approval just created,
+    inside the approval's transaction, and return the bill's name.
+
+    The approval creates the bill exactly as an unadjusted one would, so
+    the merchants it was found from and the history it was read from are
+    attached by the same code. The changes are then an edit of that bill:
+    a rename takes everything that names it along, and the schedule save
+    carries the identity forward. A changed amount counts as a hand edit,
+    so the drift check leaves it alone for its grace window."""
+    try:
+        return _adjust_bill_now(conn, payee, adj)
+    except psycopg.errors.UniqueViolation:
+        # the existence checks and the writes are separate statements, so a
+        # rename or a save racing onto the same name can still trip the
+        # (tenant_id, id) key at the write: the same answer as a name
+        # already taken, and the caller's transaction leaves the offer
+        # pending, not approved under values the person did not choose
+        raise HTTPException(
+            409, f"a bill named {adj.get('name') or payee!r} already exists")
+
+
+def _adjust_bill_now(conn, payee: str, adj: dict) -> str:
+    from .. import localtime
+    from ..engine import bills
+    from ..engine.compat import as_dict
+    new = adj.get("name") or payee
+    if new != payee:
+        # the offer was checked against the bills already tracked under its
+        # own name; a new name is checked again, by the token it would
+        # match on, so a rename cannot slip a second tracker onto charges
+        # another bill already claims
+        by = bills.covering_bill(conn, new, besides=payee)
+        if by is not None:
+            raise HTTPException(409, f"'{by}' already tracks these charges")
+        # an archived bill's name, or a spelling of it, is refused as the
+        # Bills page's rename refuses it: rename_bill counts every bill
+        if (bills.get_bill(conn, new) is not None
+                or bills.rename_bill(conn, payee, new) == 0):
+            raise HTTPException(409, f"a bill named {new!r} already exists")
+    if not any(k in adj for k in ("amount", "cadence", "due_day")):
+        return new
+    bill = conn.execute("SELECT * FROM bills WHERE payee = %s FOR UPDATE",
+                        (new,)).fetchone()
+    raw = as_dict(bill["raw"])
+    if "cadence" in adj:
+        freq, interval = adj["cadence"]
+    else:
+        f, _, i = _bill_cadence(raw).partition(":")
+        freq, interval = f.upper(), int(i or 1)
+    rec = raw.get("recurrence") or {}
+    bmd = rec.get("byMonthDay") if isinstance(rec, dict) else None
+    # the day a monthly bill is anchored to, kept unless the person moved
+    # it: re-read from a due date clamped into a short month it would slide
+    # a bill due on the 31st to the 30th for good
+    anchor = (bmd[0] if isinstance(bmd, list) and bmd
+              and isinstance(bmd[0], int) else None)
+    next_due = bill["due_on"]
+    if "due_day" in adj:
+        next_due = _next_on_day(localtime.household_day(conn),
+                                adj["due_day"], freq, interval,
+                                bill["due_on"])
+        anchor = adj["due_day"]
+    try:
+        bills.save_bill(
+            conn, payee=new,
+            amount=adj.get("amount") or abs(bill["amount"] or 0),
+            bill_type="envelope" if freq == "ENVELOPE" else "occurrence",
+            frequency=None if freq in ("ONE_TIME", "ENVELOPE") else freq,
+            interval=interval, next_due=next_due,
+            category=bill["category"],
+            source=raw.get("source", "detected"),
+            last_seen=raw.get("lastDueOn"),
+            by_month_day=anchor if freq == "MONTHLY" else None,
+            income=(bill["amount"] or 0) > 0,
+            manual_touch="amount" in adj)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    # what the bill matches moved with its amount: stamp its rows now, as
+    # the bill save does, not on the next nightly pass
+    bills.apply_txn_categories(conn, bill_id=bills._slug(new))
+    return new
+
+
+def _hold_bill_claims(conn) -> None:
+    """Inside the caller's transaction: wait until no other approval in
+    the household is between its check for a bill already claiming these
+    charges and the commit of the bill it creates. Two approvals of
+    different offers (one renamed onto the other's charges) would each
+    check before the other's bill was visible and both create one, and
+    the plan would count the charge twice. Household-wide rather than per
+    charge: what a bill claims includes its merchant's names, which are
+    not known until the check reads them."""
+    conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtext('oikonome:bill-claims:' ||"
+        " COALESCE(current_setting('app.tenant_id', true), '')))")
+
+
+def _decide_proposal(conn, pid: str, action: str, adj: dict) -> dict:
+    """Approve or dismiss one offer; an approval applies `adj` too."""
+    from ..engine import bills
+    if action != "approve":
+        return bills.apply_proposal(conn, pid, action)
+    # one transaction: an adjustment that cannot be applied (the new name
+    # is taken) leaves the offer pending, not approved under the values
+    # the person just declined; and the claim lock is held until the bill
+    # this approval makes is committed
+    with conn.transaction():
+        _hold_bill_claims(conn)
+        if adj:
+            p = conn.execute(
+                "SELECT kind, status FROM bill_proposals WHERE id = %s "
+                "FOR UPDATE", (pid,)).fetchone()
+            if p is not None and p["status"] == "pending" \
+                    and p["kind"] != "add":
+                raise HTTPException(
+                    400, "only an offer to add a bill or income can be "
+                         "adjusted")
+        r = bills.apply_proposal(conn, pid, action)
+        if adj and not r.get("error"):
+            r["approved"] = _adjust_approved_bill(conn, r["approved"], adj)
+    return r
+
+
 @router.post("/bills/proposal")
 def bills_proposal_api(user: dict = Depends(_user()),
                            body: dict = Body(...)):
-    from ..engine import bills
+    """Approve or dismiss one offer. An approval may carry `adjust`
+    ({name, amount, cadence, due_day}, each optional) — what the person
+    changed on an offer to add a bill before saying yes; the bill is
+    created with those values and keeps everything else the offer found.
+    `adjust` is ignored on a dismissal."""
     action = body.get("action") or ""
     if action not in ("approve", "reject"):
         raise HTTPException(400, "action must be approve or reject")
+    adj = (_proposal_adjust(body.get("adjust")) if action == "approve"
+           else {})
     conn = _conn(user)
     try:
         pid = body.get("pid") or ""
-        r = bills.apply_proposal(conn, pid, action)
+        r = _decide_proposal(conn, pid, action, adj)
         if not r.get("error"):
             _log_proposal(conn, user, pid, action, r)
         superseded = bool(r.get("error")) and _proposal_superseded(conn, pid)
@@ -3038,8 +3778,12 @@ def bills_proposal_api(user: dict = Depends(_user()),
                             status_code=400)
     if r.get("error"):
         raise HTTPException(400, r["error"])
-    return {"ok": True,
-            "payee": r.get("approved") or r.get("rejected")}
+    out = {"ok": True, "payee": r.get("approved") or r.get("rejected")}
+    if r.get("note"):
+        # an approve can undo something the person set (a pinned amount);
+        # the client shows this so the change is never silent
+        out["note"] = r["note"]
+    return out
 
 
 @router.post("/bills/proposals/approve-all")
@@ -3052,26 +3796,28 @@ def bills_proposals_approve_all(user: dict = Depends(_user())):
     approve cannot double-create; one that fails to apply (slug
     collision, bad amount) stays pending and is reported, the rest still
     land."""
-    from ..engine import bills
     conn = _conn(user)
     try:
         pids = [r["id"] for r in conn.execute(
             "SELECT id FROM bill_proposals WHERE status='pending' "
             "ORDER BY created_at, id").fetchall()]
-        approved, failed = [], []
+        approved, failed, notes = [], [], []
         for pid in pids:
-            r = bills.apply_proposal(conn, pid, "approve")
+            r = _decide_proposal(conn, pid, "approve", {})
             if r.get("error"):
                 failed.append({"pid": pid, "error": r["error"],
                                "superseded": _proposal_superseded(conn,
                                                                   pid)})
             else:
                 approved.append(r.get("approved"))
+                if r.get("note"):
+                    notes.append({"payee": r.get("approved"),
+                                  "note": r["note"]})
                 _log_proposal(conn, user, pid, "approve", r)
     finally:
         conn.close()
     return {"ok": True, "approved": len(approved), "payees": approved,
-            "failed": failed}
+            "failed": failed, "notes": notes}
 
 
 # ---- recurring management (bill CRUD — /bills/{save,delete,restore,
@@ -3087,6 +3833,34 @@ CADENCES = [("DAILY:1", "daily"),
             ("ONE_TIME:1", "one-time"),
             ("ENVELOPE:1", "envelope (monthly pool)"),
             ("ENVELOPE:12", "envelope (annual pool)")]
+
+
+def _parse_cadence(value: str) -> tuple[str, int]:
+    """A CADENCES value ("<FREQ>:<interval>") → (FREQ, interval), or a 400.
+    Both doors that write a bill's schedule read it here: the bill save and
+    an approved offer the person adjusted first."""
+    from ..engine import bills
+    freq, _, iv = str(value or "").partition(":")
+    freq = freq.strip().upper()
+    # Allowlist the frequency BEFORE any mutation: an unknown token (e.g.
+    # "HOURLY") is not ONE_TIME/ENVELOPE, so it reaches PER_YEAR[freq] in
+    # recurring._monthly and raises KeyError → a 500 that lands AFTER the
+    # rename/config migration has already committed (partial mutation).
+    if freq not in ("DAILY", "WEEKLY", "MONTHLY", "YEARLY",
+                    "ONE_TIME", "ENVELOPE"):
+        raise HTTPException(400, "bad cadence frequency")
+    try:
+        interval = int(iv or 1)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "bad cadence interval")
+    # Bound the cycle, not the count: an unbounded value later overflows
+    # dt.timedelta in the occurrence expansion (a persistent 500 on every
+    # Today render), and a count that is modest for MONTHLY is centuries for
+    # YEARLY — the nightly roll would carry the due date past any date the
+    # product can read. Twenty years is well past any real bill cadence.
+    if interval < 1 or bills.cadence_too_long(freq, interval):
+        raise HTTPException(400, "cadence interval out of range")
+    return freq, interval
 
 
 def _bill_cadence(raw: dict) -> str:
@@ -3185,26 +3959,8 @@ def bills_save_api(user: dict = Depends(_user()), body: dict = Body(...)):
     # up front so a failing edit never leaves a half-applied rename behind.
     if not amount > 0:
         raise HTTPException(400, "amount must be a positive dollar value")
-    freq, _, iv = _body_text(body, "cadence",
-                             default="MONTHLY:1").partition(":")
-    freq = freq.upper()
-    # Allowlist the frequency BEFORE any mutation: an unknown token (e.g.
-    # "HOURLY") is not ONE_TIME/ENVELOPE, so it reaches PER_YEAR[freq] in
-    # recurring._monthly and raises KeyError → a 500 that lands AFTER the
-    # rename/config migration below has already committed (partial mutation).
-    if freq not in ("DAILY", "WEEKLY", "MONTHLY", "YEARLY",
-                    "ONE_TIME", "ENVELOPE"):
-        raise HTTPException(400, "bad cadence frequency")
-    try:
-        interval = int(iv or 1)
-    except (TypeError, ValueError):
-        raise HTTPException(400, "bad cadence interval")
-    # Bound the interval: an unbounded value later overflows dt.timedelta in
-    # the occurrence expansion (recurring._next_due / plan render), turning
-    # every Today-page and daily-email render into a persistent 500 for the
-    # tenant. 240 = every 20 years, well past any real bill cadence.
-    if not 1 <= interval <= 240:
-        raise HTTPException(400, "cadence interval out of range")
+    freq, interval = _parse_cadence(
+        _body_text(body, "cadence", default="MONTHLY:1"))
     orig_payee = _body_text(body, "orig_payee")
     cap_n = None
     if "cap" in body:                   # validate before any mutation
@@ -3296,12 +4052,23 @@ def bills_save_api(user: dict = Depends(_user()), body: dict = Body(...)):
     # half-applied rename behind (same partial-mutation window as amount).
     next_due_in = _body_text(body, "next_due")
     if next_due_in:
-        try:
-            dt.date.fromisoformat(next_due_in)
-        except ValueError:
-            raise HTTPException(400, "next_due must be an ISO date")
+        # the same year range save_bill's as_date enforces, or a year it
+        # refuses would raise there after the rename committed
+        _iso_date(next_due_in, "next_due must be an ISO date")
     conn = _conn(user)
     try:
+        if orig_payee and bills.get_bill(conn, orig_payee) is None:
+            # The form carries the bill's name as the list showed it, and
+            # names are read trimmed here, so a stored name that carries
+            # stray whitespace never matches by string and the edit reads
+            # as "deleted" though the row is right there. The slug ignores
+            # whitespace: resolve the row by it and edit under the name
+            # the row really holds — which makes this save a rename onto
+            # the trimmed name, so the stray whitespace leaves with it.
+            stored = conn.execute("SELECT payee FROM bills WHERE id=%s",
+                                  (bills._slug(orig_payee),)).fetchone()
+            if stored is not None and (stored["payee"] or "").strip() == orig_payee:
+                orig_payee = stored["payee"]
         # what the bill was before this edit, for the log's sentence — read
         # under the name the client edited (a rename moves it below)
         _was = _activity.bill_snapshot(
@@ -3403,7 +4170,11 @@ def bills_save_api(user: dict = Depends(_user()), body: dict = Body(...)):
                     _n = 0
                 if (_f.upper() in ("DAILY", "WEEKLY", "MONTHLY", "YEARLY",
                                    "ENVELOPE", "ONE_TIME")
-                        and 1 <= _n <= 240):
+                        and 1 <= _n <= 240
+                        # the count cap is not the length cap: a legacy
+                        # YEARLY:21+ would make save_bill refuse the Accept
+                        # until a new cadence was picked by hand
+                        and not bills.cadence_too_long(_f.upper(), _n)):
                     freq, interval = _f.upper(), _n
             src, last_seen = "manual", None
             if old is not None:
@@ -3786,7 +4557,9 @@ def bills_history_api(user: dict = Depends(_user()), payee: str = "",
         # highlight: rows the bill/proposal matcher would count
         ref = (abs(bill["amount"]) if bill is not None else
                props[0]["amount"] if props else None)
-        tol = budget.bill_tolerance(ref) if ref else None
+        bands = (budget.bill_amount_bands(bill["amount"], bill["raw"])
+                 if bill is not None else
+                 [(ref, budget.bill_tolerance(ref), None)] if ref else None)
         want_inflow = bool(bill_info and bill_info["income"])
         hint_dismissed = bills.fit_matches_dismissal(
             hist["fit"],
@@ -3807,9 +4580,9 @@ def bills_history_api(user: dict = Depends(_user()), payee: str = "",
         row["hit"] = bool(
             (bill_info is not None and bill_info["bill_type"] == "envelope"
              and row["amount"] > 0)
-            or (tol is not None
+            or (bands is not None
                 and (row["amount"] < 0 if want_inflow else row["amount"] > 0)
-                and abs(abs(row["amount"]) - ref) <= tol))
+                and budget.amount_fits(bands, row["amount"], row.get("date"))))
     return {"payee": payee, "txns": txns, "monthly": hist["monthly"],
             "logo": hist.get("logo"),
             "fit": hist["fit"], "lifetime": _ser(hist["lifetime"]),
@@ -4030,9 +4803,11 @@ def rules_delete_api(user: dict = Depends(_user()), body: dict = Body(...)):
         conn.close()
 
 
-# local conversational assistant over your own ledger. Read-only,
-# tool-routed, runs on the bundled LLM (data never leaves the box). Hidden
-# when no LLM is configured.
+# local conversational assistant over your own ledger. Tool-routed, and
+# every tool only reads the ledger; the one row an ask writes is its own
+# entry in the household's question log (assistant.record_turn, trimmed
+# per asker so no one asker can push out another's). Runs on the
+# household's configured LLM. Hidden when no LLM is configured.
 
 @router.get("/assistant")
 def assistant_status_api(user: dict = Depends(_user())):
@@ -4047,13 +4822,69 @@ def assistant_status_api(user: dict = Depends(_user())):
 @router.post("/assistant",
              dependencies=[Depends(limit("assistant", 30, 3600))])
 def assistant_ask_api(user: dict = Depends(_user()), body: dict = Body(...)):
+    """Answer a question; `thread_id` in the body makes it a follow-up of
+    that conversation (404 when the household has none such, 400 when it
+    is not a uuid).
+
+    The reply is the answer (`answer`, `blocks`, `tools_used`) plus what
+    became of it in the log:
+      `id`        the kept turn's id, or null when nothing was kept;
+      `thread_id` the conversation it belongs to — its own id for a new
+                  question — or null when no conversation holds it;
+      `saved`     true when the turn was kept;
+      `removed`   true when this was a follow-up and its conversation was
+                  deleted while the answer was being written: the answer
+                  still comes back (it was waited for), nothing is kept,
+                  and `thread_id` is null, so a client starts the next
+                  question as a new conversation rather than following
+                  up on one that is gone.
+    An answer that could not be kept for any other reason has `saved`
+    false, and `thread_id` null on a new question (there is no
+    conversation to follow up on) or the conversation's id on a
+    follow-up (that conversation is still there)."""
     from ..engine import assistant
     question = _body_text(body, "question")
     if not question:
         raise HTTPException(400, "question required")
+    # a follow-up names the conversation it continues; the model then
+    # sees that thread's earlier turns — and only that thread's
+    thread_id = body.get("thread_id") or None
+    if thread_id is not None:
+        try:
+            thread_id = str(uuid.UUID(str(thread_id)))
+        except ValueError:
+            raise HTTPException(400, "bad thread id")
     conn = _conn(user)
     try:
-        return assistant.ask(conn, question)
+        context: list[dict] = []
+        if thread_id:
+            context = assistant.thread_context(conn, thread_id)
+            if not context:
+                raise HTTPException(404, "no such conversation")
+        out = assistant.ask(conn, question, context=context)
+        # an answered question joins the household's log; a reply that
+        # could not be kept still reaches the asker, and says so — a
+        # silent null thread would turn the next "follow-up" into a fresh
+        # question with no context and nothing telling anyone why
+        removed = False
+        try:
+            out["id"] = assistant.record_turn(conn, user, question, out,
+                                              thread_id=thread_id)
+        except assistant.ThreadRemoved:
+            conn.rollback()
+            out["id"], removed = None, True
+        except Exception as e:                            # noqa: BLE001
+            import logging
+            conn.rollback()
+            logging.getLogger("oikonome.api").warning(
+                "assistant: answer not kept: %s", type(e).__name__)
+            out["id"] = None
+        out["saved"] = out["id"] is not None
+        out["removed"] = removed
+        out["thread_id"] = None if removed else (thread_id or out["id"])
+        return out
+    except HTTPException:
+        raise
     except assistant.AssistantUnavailable:
         raise HTTPException(503, "the assistant needs a local LLM configured")
     except assistant.AssistantBusy:
@@ -4061,6 +4892,123 @@ def assistant_ask_api(user: dict = Depends(_user()), body: dict = Body(...)):
                                  "moment")
     except Exception as e:                # LLM/network failure → friendly 502
         raise HTTPException(502, f"assistant error: {type(e).__name__}")
+    finally:
+        conn.close()
+
+
+@router.post("/assistant/report",
+             dependencies=[Depends(limit("assistant_report", 60, 3600))])
+def assistant_report_api(user: dict = Depends(_user()),
+                         body: dict = Body(...)):
+    """One answer as a self-contained HTML page (inline SVG + CSS, no
+    script) to save or share. The client sends the turn back — nothing
+    is stored server-side — and every block is re-validated here, so a
+    client can no more smuggle markup into the file than the model can."""
+    from ..engine import assistant, assistant_blocks
+    question = _body_text(body, "question")
+    blocks = assistant_blocks.clean(body.get("blocks"))
+    if not blocks:
+        raise HTTPException(400, "nothing to report")
+    conn = _conn(user)
+    try:
+        if not assistant.available(conn):
+            raise HTTPException(503, "the assistant needs a local LLM configured")
+        today = _today(conn)
+    finally:
+        conn.close()
+    page = assistant_blocks.report_html(question, blocks, today.isoformat())
+    name = f"oikonome-answer-{today.isoformat()}.html"
+    return Response(page, media_type="text/html; charset=utf-8",
+                    headers={"content-disposition":
+                             f'attachment; filename="{name}"',
+                             "cache-control": "no-store"})
+
+
+@router.get("/assistant/history")
+def assistant_history_api(user: dict = Depends(_user()),
+                          limit: int = Query(assistant.HISTORY_PAGE),
+                          before: str | None = Query(None),
+                          before_id: str | None = Query(None)):
+    """The household's answered questions, newest first — every member
+    reads the same log, so a chart drawn on the phone is on the web too.
+    The shared demonstration login is shown its own address only: every
+    visitor holds it, so who asked what would hand each of them the
+    household's people."""
+    conn = _conn(user)
+    try:
+        out = assistant.history(conn, limit=limit, before=before,
+                                before_id=before_id)
+    except ValueError:
+        raise HTTPException(400, "bad cursor")
+    finally:
+        conn.close()
+    if demoguard.people_hidden(user):
+        for t in out["turns"]:
+            t["asked_by"] = demoguard.own_address_only(user, t["asked_by"])
+    return out
+
+
+@router.delete("/assistant/history/{turn_id}")
+def assistant_forget_api(turn_id: str, user: dict = Depends(_user())):
+    """Drop one turn — the question and answer with this id — and nothing
+    else of its conversation. The apps already installed send a turn's
+    id here to remove that one answer, so this door keeps that meaning;
+    a whole conversation goes through /assistant/threads/{thread_id}.
+    A turn already gone answers 200 with deleted 0, never 404: the
+    installed apps read a 404 here as "could not remove it" and leave the
+    row on screen, when the row is in fact gone. 400 for a bad id.
+
+    A conversation's OPENING turn (its id is the thread's) goes only as
+    the conversation's last row: while follow-ups remain, the door keeps
+    it and answers 200 {ok, deleted: 0, reason}. Refused rather than
+    widened to the whole conversation — the installed apps mean one answer
+    by this id and expect exactly {ok, deleted}, so taking the follow-ups
+    with it would remove rows nobody chose; and deleting the opening alone
+    would leave those follow-ups headless."""
+    # the shared demonstration login is every visitor at once: deleting
+    # from the log as it would remove what other visitors asked
+    demoguard.deny_shared_log(user)
+    try:
+        turn_id = str(uuid.UUID(str(turn_id)))
+    except ValueError:
+        raise HTTPException(400, "bad id")
+    conn = _conn(user)
+    try:
+        out = assistant.forget_turn(conn, turn_id)
+    finally:
+        conn.close()
+    return {"ok": True, **out}
+
+
+@router.delete("/assistant/threads/{thread_id}")
+def assistant_forget_thread_api(thread_id: str,
+                                user: dict = Depends(_user())):
+    """Drop one conversation: every turn of the thread named, whoever in
+    the household asked it — the log is the household's, read alike by
+    every member, and a member may tidy it (a viewer may not: the role
+    gate refuses the write). 404 when the household has no such
+    conversation, 400 when the id is not a uuid."""
+    demoguard.deny_shared_log(user)    # see assistant_forget_api
+    try:
+        thread_id = str(uuid.UUID(str(thread_id)))
+    except ValueError:
+        raise HTTPException(400, "bad id")
+    conn = _conn(user)
+    try:
+        gone = assistant.forget_thread(conn, thread_id)
+    finally:
+        conn.close()
+    if not gone:
+        raise HTTPException(404, "no such conversation")
+    return {"ok": True, "deleted": gone}
+
+
+@router.delete("/assistant/history")
+def assistant_clear_api(user: dict = Depends(_user())):
+    demoguard.deny_shared_log(user)    # see assistant_forget_api
+    conn = _conn(user)
+    try:
+        return {"ok": True, "deleted": assistant.forget(conn)}
     finally:
         conn.close()
 
@@ -4434,7 +5382,23 @@ _SETTINGS_FIELDS = ("food_monthly", "other_monthly", "custom_buckets",
                     # already handled without the user retyping it
                     "merchant_cities_seen",
                     # {daily,monthly,yearly} local-time schedule
-                    "email_schedule")
+                    "email_schedule",
+                    # the Net Worth page's investment fee estimate and
+                    # money-in anchors (Settings → Connections → Investment
+                    # fees & basis): {institution fragment: yearly fraction},
+                    # [account masks that pay no advisory fee], {account
+                    # mask: dollars put in}
+                    "advisory_fees", "advisory_fee_exempt_masks",
+                    "investment_basis_override",
+                    # how far back the ledger reaches (1/3/6/12 months;
+                    # absent = everything a source has): shortens a new bank
+                    # link's backfill and trims file imports
+                    "history_months",
+                    # how the household set up its bills: "auto" (the
+                    # finder proposes) or "manual" (typed in by hand), and
+                    # whether the nightly finder proposes new bills and
+                    # income at all (amount drift is not affected)
+                    "setup_mode", "bill_detection_auto")
 
 
 # resolved-address cache for the locality verdict below: a settings GET
@@ -4666,6 +5630,18 @@ def _apply_email_pref(cfg: dict, change, user: dict) -> None:
 
 def _settings_view(cfg: dict) -> dict:
     out = {k: cfg.get(k) for k in _SETTINGS_FIELDS}
+    # Publish the toggle the budget engine actually obeys: a household
+    # whose config never stored the key runs with dynamic budgeting ON.
+    # Sent raw it would arrive as null, read as off, and the next bucket
+    # save would post that false back and switch the feature off unasked.
+    out["dynamic_variable_budget"] = bool(
+        cfg.get("dynamic_variable_budget", True))
+    # the same for the setup choices: what the worker and the importers
+    # obey, never a null a client has to guess the meaning of
+    from ..sync.base import history_months_of
+    out["history_months"] = history_months_of(cfg)
+    out["setup_mode"] = _setup_mode_of(cfg)
+    out["bill_detection_auto"] = cfg.get("bill_detection_auto") is not False
     # publish the schedule the worker actually runs, so no client has to
     # invent a default for a household that never saved one. Here, not in
     # one handler: the read and the save reply both build from this view,
@@ -4873,10 +5849,31 @@ def _recipient_status(tenant_id, configured: list[str],
     # Settings is the page you'd fix it from
     muted_set = ({str(m).lower() for m in muted}
                  if isinstance(muted, list) else set())
+    # A delivery row is keyed on the ADDRESS, instance-wide: the failure
+    # it records may have come from another household's mail. Its details
+    # (bounce vs complaint, the provider's own words about the mailbox)
+    # belong to whoever that mailbox answers to. This household sees them
+    # for an address it has a standing with — one of its own accounts, or
+    # a recipient who accepted its invitation — and for any other address
+    # only that mail to it is held. A single-household box has no one else
+    # whose record it could be, so the tenant count is asked only when an
+    # address actually carries a row — and then once for the whole grid,
+    # since each ask is an admin connection.
+    # The rule itself lives in one place so Resend and this grid cannot
+    # drift apart (recipient_invites.delivery_detail_visible).
+    from ..notify import recipient_invites as _invites
+    multi_tenant = None
     for e in ordered:
         m = members.get(e.lower())
         state = failing.get(e.lower())
         inv = invites.get(e.lower())
+        if state and multi_tenant is None:
+            multi_tenant = _invites.multi_household()
+        if state and not _invites.delivery_detail_visible(
+                tenant_id, e, member=bool(m),
+                invite_state=inv and inv.get("state"),
+                multi_tenant=multi_tenant):
+            state = {"state": "bouncing", "reason": None}
         is_owner = bool(owner_email and e.lower() == owner_email.lower())
         rows.append({
             "email": e,
@@ -5107,6 +6104,29 @@ def _outbound_repointed(conn, before: dict, after: dict) -> list[str]:
     return changed
 
 
+# Investment fee / basis settings: a household names a handful of
+# institutions and accounts, so the cap only stops a runaway client.
+_INVEST_MAX_ROWS = 50
+
+
+def _invest_mask(v, field: str) -> str:
+    """One account mask as stored: the tail of the account number, which
+    is all an aggregator reports and what the net-worth engine compares
+    against. Plaid's masks are 2-4 characters and some banks put letters
+    in them, so letters are accepted and stored upper-case — the case the
+    feeds report them in, so the engine's exact comparison still matches.
+    Blank comes back blank for the caller to skip."""
+    if isinstance(v, bool) or not isinstance(v, (str, int)):
+        raise HTTPException(
+            400, f"{field}: an account mask must be letters or digits")
+    m = str(v).strip().upper()
+    if m and not (m.isascii() and m.isalnum() and 2 <= len(m) <= 8):
+        raise HTTPException(
+            400, f"{field}: an account mask is the account's last 2 to 8 "
+                 "letters or digits")
+    return m
+
+
 @router.post("/settings")
 def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
     # The demo instance is READ-ONLY: its credentials
@@ -5128,6 +6148,14 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
     # the SPA posts the whole settings document on every save — refusing
     # would mean a member could never change a budget either.
     body = permissions.settings_for(user["role"], body)
+
+    def _refuse_member_change(key, requested, stored):
+        # the owner-only keys a member is refused for changing rather than
+        # having them dropped (permissions.OWNER_REFUSED_SETTINGS)
+        why = permissions.refused_setting_change(user["role"], key,
+                                                 requested, stored)
+        if why:
+            raise HTTPException(403, why)
     from ..engine import budget
     conn = _conn(user)
     try:
@@ -5259,7 +6287,7 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                     raise HTTPException(400, "wizard_steps must be an object")
                 steps = dict(cfg.get("wizard_steps") or {})
                 for k, v in raw.items():
-                    if k not in ("connect", "sync", "import",
+                    if k not in ("appearance", "connect", "sync", "import",
                                  "bills", "budgets", "email", "finish"):
                         raise HTTPException(400, f"unknown wizard step: {k}")
                     if v in (None, ""):
@@ -5445,6 +6473,59 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                     cfg.pop("theme", None)
                 else:
                     cfg["theme"] = t
+            if "history_months" in body:
+                # a whole number of months from the offered choices, or
+                # null for everything. Strict: "6" or 6.5 is a client bug,
+                # and guessing would quietly narrow what the next import
+                # or bank link keeps.
+                from ..sync.base import HISTORY_MONTHS, history_months_of
+                hm = body["history_months"]
+                if hm == "":
+                    hm = None
+                if hm is not None and (isinstance(hm, bool)
+                                       or not isinstance(hm, int)
+                                       or hm not in HISTORY_MONTHS):
+                    raise HTTPException(
+                        400, "history_months must be 1, 3, 6, 12 or null")
+                # owner-only and refused rather than dropped (see
+                # permissions.OWNER_REFUSED_SETTINGS); a stored value outside
+                # the choices reads as null, as the settings GET publishes it
+                _refuse_member_change("history_months", hm,
+                                      history_months_of(cfg))
+                if hm is None:
+                    cfg.pop("history_months", None)
+                else:
+                    cfg["history_months"] = hm
+            if "bill_detection_auto" in body:
+                v = body["bill_detection_auto"]
+                if not isinstance(v, bool):
+                    raise HTTPException(
+                        400, "bill_detection_auto must be true or false")
+                _refuse_member_change(
+                    "bill_detection_auto", v,
+                    cfg.get("bill_detection_auto") is not False)
+                cfg["bill_detection_auto"] = v
+            if "setup_mode" in body:
+                sm = body["setup_mode"]
+                if sm is not None and sm != "" \
+                        and sm not in ("auto", "manual"):
+                    raise HTTPException(
+                        400, "setup_mode must be auto or manual")
+                was = _setup_mode_of(cfg)
+                _refuse_member_change("setup_mode", sm or "auto", was)
+                if not sm:
+                    cfg.pop("setup_mode", None)       # absent = auto
+                else:
+                    cfg["setup_mode"] = sm
+                    # someone who enters their bills by hand has said they
+                    # do not want the finder's offers every morning; the
+                    # body may still say otherwise in the same save. Only
+                    # on the move to manual: a save echoing the stored
+                    # choice must not undo detection the owner turned back
+                    # on since
+                    if sm == "manual" and was != "manual" \
+                            and "bill_detection_auto" not in body:
+                        cfg["bill_detection_auto"] = False
             if "today_view" in body:
                 tv = str(body["today_view"] or "summary")
                 # advanced/simple are accepted as aliases
@@ -5718,11 +6799,8 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                 if not v:
                     cfg.pop("birthdate", None)      # cleared → age falls back
                 else:
-                    try:
-                        bd = dt.date.fromisoformat(v)
-                    except ValueError:
-                        raise HTTPException(
-                            400, "birthdate must be an ISO date (YYYY-MM-DD)")
+                    bd = _iso_date(
+                        v, "birthdate must be an ISO date (YYYY-MM-DD)")
                     if bd >= _today(conn):
                         raise HTTPException(400, "birthdate must be in the past")
                     cfg["birthdate"] = bd.isoformat()
@@ -5878,12 +6956,8 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                         goal["mode"] = "sweep"
                     td = str(g.get("target_date") or "").strip()
                     if td:
-                        try:
-                            goal["target_date"] = dt.date.fromisoformat(
-                                td).isoformat()
-                        except ValueError:
-                            raise HTTPException(
-                                400, "target_date must be YYYY-MM-DD")
+                        goal["target_date"] = _iso_date(
+                            td, "target_date must be YYYY-MM-DD").isoformat()
                     out_goals.append(goal)
                 if out_goals:
                     cfg["savings_goals"] = out_goals
@@ -5949,6 +7023,156 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                                                 "ss_estimates ages must be 62-70")
                         sched[str(a)] = max(0.0, _num(amt, f"ss_estimates[{a}]"))
                     cfg["ss_estimates"] = sched     # JSON keys are strings
+            # The three investment keys are owner settings, like every
+            # other knob in the Connections section (the bank-connection
+            # ones are owner-only on the server too). Refused rather than
+            # dropped: no client shows these to a member, so only a direct
+            # call sends them, and a silent drop would answer it "saved".
+            _invest_keys = ("advisory_fees", "advisory_fee_exempt_masks",
+                            "investment_basis_override")
+            if user.get("role") != "owner" and any(
+                    k in body or k + "_base" in body for k in _invest_keys):
+                raise HTTPException(403, "owner only")
+
+            def _invest_base_check(key: str) -> None:
+                """Each section replaces its stored key whole, so a tab
+                that loaded the section before another device changed it
+                would put back its stale copy of the rows it never
+                touched. A save that names the section as it was read
+                (`<key>_base`) is refused when the stored section has
+                moved since; a save without a base replaces as before."""
+                if key + "_base" not in body:
+                    return
+                base = body[key + "_base"]
+                if base is not None and not isinstance(base, (dict, list)):
+                    raise HTTPException(
+                        400, f"{key}_base must be the section as last read")
+
+                def _norm(v):
+                    if not v:
+                        return None
+                    if isinstance(v, list):
+                        return sorted(str(x) for x in v)
+                    if isinstance(v, dict):
+                        return {str(k): v[k] for k in v}
+                    return v
+                if _norm(base) != _norm(cfg.get(key)):
+                    raise HTTPException(
+                        409, "These settings were changed on another device "
+                             "since this page loaded. The current ones are "
+                             "shown now — make your change again.")
+
+            for _k in _invest_keys:
+                if _k in body:
+                    _invest_base_check(_k)
+            if "advisory_fees" in body:
+                # {institution-name fragment: yearly rate as a fraction}.
+                # The fee estimate matches the fragment against institution
+                # names with LIKE, so it is stored lowercase and trimmed —
+                # a blank fragment would match every institution and
+                # charge the rate on the whole portfolio. A rate is a
+                # fraction (0.0025 = 0.25%); one above 1 is a percentage
+                # typed into the wrong box and would estimate a fee larger
+                # than the balance, so it is refused rather than guessed at.
+                fees_in = body["advisory_fees"]
+                if not fees_in:
+                    cfg.pop("advisory_fees", None)
+                elif not isinstance(fees_in, dict):
+                    raise HTTPException(
+                        400, "advisory_fees must be an object "
+                             "{institution: yearly rate}")
+                else:
+                    if len(fees_in) > _INVEST_MAX_ROWS:
+                        raise HTTPException(400, "too many advisory fees")
+                    fees_out = {}
+                    for frag, rate in fees_in.items():
+                        frag = str(frag or "").strip().lower()
+                        if not frag:
+                            raise HTTPException(
+                                400, "every advisory fee needs an institution")
+                        if len(frag) > 60:
+                            raise HTTPException(
+                                400, "advisory fee institution is too long")
+                        if not _stated(rate):
+                            raise HTTPException(
+                                400, f"advisory fee for {frag} needs a rate")
+                        r = _num(rate, "advisory fee rate")
+                        if not 0 <= r <= 1:
+                            raise HTTPException(
+                                400, "advisory fee rate must be a fraction "
+                                     "between 0 and 1 (0.0025 = 0.25%)")
+                        fees_out[frag] = r
+                    if fees_out:
+                        cfg["advisory_fees"] = fees_out
+                    else:
+                        cfg.pop("advisory_fees", None)
+            if "advisory_fee_exempt_masks" in body:
+                # the last characters of self-directed accounts at a
+                # fee-charging institution. Compared exactly against the
+                # account's mask, so anything that is not a mask could never
+                # match and would leave the account silently charged.
+                masks_in = body["advisory_fee_exempt_masks"]
+                if isinstance(masks_in, str):
+                    # separators at either end split off empty pieces that
+                    # are not masks and must not count against the cap
+                    masks_in = [p for p in re.split(r"[,;\s]+", masks_in)
+                                if p]
+                if not masks_in:
+                    cfg.pop("advisory_fee_exempt_masks", None)
+                elif not isinstance(masks_in, list):
+                    raise HTTPException(
+                        400, "advisory_fee_exempt_masks must be a list of "
+                             "account masks")
+                else:
+                    # refused before the scan, like the other two maps: a
+                    # body near the size limit carries a six-figure list,
+                    # and checking it entry by entry would hold the
+                    # household's config row locked while it ran
+                    if len(masks_in) > _INVEST_MAX_ROWS:
+                        raise HTTPException(400, "too many exempt accounts")
+                    # dict.fromkeys drops repeats in one pass and keeps the
+                    # order they were typed in
+                    masks_out = list(dict.fromkeys(
+                        m for m in (_invest_mask(x, "advisory_fee_exempt_masks")
+                                    for x in masks_in) if m))
+                    if masks_out:
+                        cfg["advisory_fee_exempt_masks"] = masks_out
+                    else:
+                        cfg.pop("advisory_fee_exempt_masks", None)
+            if "investment_basis_override" in body:
+                # {account mask: dollars actually put in} — replaces the
+                # feed's cost basis where in-kind transfers arrived with a
+                # near-zero one. Money in cannot be negative; zero is a
+                # real answer (an account funded only by transfers in).
+                bo_in = body["investment_basis_override"]
+                if not bo_in:
+                    cfg.pop("investment_basis_override", None)
+                elif not isinstance(bo_in, dict):
+                    raise HTTPException(
+                        400, "investment_basis_override must be an object "
+                             "{account mask: dollars}")
+                else:
+                    if len(bo_in) > _INVEST_MAX_ROWS:
+                        raise HTTPException(400, "too many basis overrides")
+                    bo_out = {}
+                    for m, amt in bo_in.items():
+                        m = _invest_mask(m, "investment_basis_override")
+                        if not m:
+                            raise HTTPException(
+                                400, "every basis override needs an "
+                                     "account mask")
+                        if not _stated(amt):
+                            raise HTTPException(
+                                400, f"basis override for {m} needs an amount")
+                        v = _num(amt, "basis override")
+                        if v < 0:
+                            raise HTTPException(
+                                400, "basis override must not be negative")
+                        bo_out[m] = round(v, 2)
+                    if bo_out:
+                        cfg["investment_basis_override"] = bo_out
+                    else:
+                        cfg.pop("investment_basis_override", None)
             if "llm_url" in body or "llm_model" in body or "llm_api_key" in body:
                 # smart-categorization LLM backend — same rules as the setup
                 # wizard: URL+model together, key optional (encrypted at rest,
@@ -7048,7 +8272,7 @@ def _parse_receipt_async(tenant_id: str, receipt_id: str) -> None:
     threading.Thread(target=_run, daemon=True).start()
 
 
-@router.post("/transactions/{txn_id}/receipt",
+@router.post("/transactions/{txn_id:path}/receipt",
              dependencies=[Depends(limit("receipt", 60, 3600))])
 async def receipt_upload(txn_id: str, user: dict = Depends(_user()),
                          file: UploadFile = File(...),
@@ -7224,10 +8448,8 @@ def receipt_details(rid: str, user: dict = Depends(_user()),
     # typing one would save details that silently never match
     if total > receipt_match.MAX_TOTAL:
         raise HTTPException(400, "total is too large")
-    try:
-        day = dt.date.fromisoformat(str(body.get("date") or "").strip())
-    except ValueError:
-        raise HTTPException(400, "date must be YYYY-MM-DD")
+    day = _iso_date(str(body.get("date") or "").strip(),
+                    "date must be YYYY-MM-DD")
     merchant = body.get("merchant")
     if merchant is not None and not isinstance(merchant, str):
         raise HTTPException(400, "merchant must be text")
@@ -7271,7 +8493,7 @@ def receipt_details(rid: str, user: dict = Depends(_user()),
         conn.close()
 
 
-@router.get("/transactions/{txn_id}/receipts")
+@router.get("/transactions/{txn_id:path}/receipts")
 def receipt_list(txn_id: str, user: dict = Depends(_user())):
     import math
 
@@ -7426,7 +8648,6 @@ def receipt_report(request: Request, user: dict = Depends(_user()),
                    tag: str = "business",
                    y: int = 0, m: int = 0, format: str = "json"):
     _same_site_download(request)
-    import csv as _csv
     import io as _io
 
     from ..engine import receipts
@@ -7441,7 +8662,7 @@ def receipt_report(request: Request, user: dict = Depends(_user()),
     if format == "csv":
         from fastapi.responses import Response as _Resp
         buf = _io.StringIO()
-        w = _csv.writer(buf)
+        w = _csv_writer(buf)
         w.writerow(["date", "payee", "description", "qty", "amount", "tag",
                     "txn_id", "receipt_id"])
         for r in rep["rows"]:
@@ -7908,10 +9129,12 @@ async def import_api(user: dict = Depends(_user()),
                     with _push_write(conn, user):
                         # the pairing and identity locks before the first
                         # row this transaction writes (see there). A PDF
-                        # takes them inside import_pdf, after its slow
-                        # sandboxed read: taken here, every edit in the
-                        # household would wait out the extraction.
-                        if not filename.lower().endswith(".pdf"):
+                        # or OFX/QFX file takes them inside its importer,
+                        # after its slow sandboxed read: taken here, every
+                        # edit in the household would wait out the slot
+                        # wait and the parse.
+                        if not filename.lower().endswith(
+                                (".pdf", ".ofx", ".qfx")):
                             from .bulk_import import hold_ledger_write_locks
                             hold_ledger_write_locks(conn)
                         dest = account_id
@@ -8184,6 +9407,7 @@ def import_rollback_api(user: dict = Depends(_user()),
 def onboarding_api(user: dict = Depends(_user())):
     """Fresh-instance progress for the SPA's guided checklist."""
     from ..engine import budget
+    from ..sync.base import history_months_of
     conn = _conn(user)
     try:
         counts = conn.execute(
@@ -8216,12 +9440,23 @@ def onboarding_api(user: dict = Depends(_user())):
             # done or the user dismisses it for good
             "wizard_done": bool(cfg.get("wizard_done")),
             # explicit per-step done/skipped marks (strict flow)
-            "wizard_steps": cfg.get("wizard_steps") or {}}
+            "wizard_steps": cfg.get("wizard_steps") or {},
+            # the setup choices, read-only here, for the wizard's summary
+            # (written through the settings save)
+            "history_months": history_months_of(cfg),
+            "setup_mode": _setup_mode_of(cfg),
+            "bill_detection_auto": cfg.get("bill_detection_auto") is not False}
 
 
-# The historical window Plaid backfills after a link, in months — the
-# denominator of the wizard's import bar.
-BACKFILL_WINDOW_MONTHS = 24
+def _setup_mode_of(cfg: dict) -> str:
+    """The household's bill setup choice; anything but "manual" is auto."""
+    return "manual" if cfg.get("setup_mode") == "manual" else "auto"
+
+
+# The historical window Plaid backfills after a link, in days — the
+# denominator of the wizard's import bar for an Item that predates the
+# per-Item record of the window it asked for (those all asked for two years).
+BACKFILL_WINDOW_DAYS = 730
 
 
 def _backfill_status(conn) -> tuple[dict, list]:
@@ -8236,6 +9471,9 @@ def _backfill_status(conn) -> tuple[dict, list]:
     long ago)."""
     rows = conn.execute(
         """SELECT i.id, i.institution_name, i.status, i.tx_update_status,
+                  CASE WHEN jsonb_typeof(i.raw->'days_requested') = 'number'
+                       THEN (i.raw->>'days_requested')::numeric END
+                      AS days_requested,
                   (i.tx_update_status IS NULL
                    AND i.linked_at < now() - interval '24 hours')
                       AS legacy_done,
@@ -8250,7 +9488,9 @@ def _backfill_status(conn) -> tuple[dict, list]:
                   (SELECT MAX(ran_at) FROM sync_log s
                    WHERE s.item_id = i.id
                      AND s.ran_at > now() - interval '45 seconds')
-                      AS recent_attempt
+                      AS recent_attempt,
+                  EXISTS (SELECT 1 FROM sync_log s WHERE s.item_id = i.id)
+                      AS ever_pulled
            FROM items i
            WHERE i.aggregator = 'plaid'
              AND COALESCE(i.status,'') != 'archived'
@@ -8262,10 +9502,27 @@ def _backfill_status(conn) -> tuple[dict, list]:
         (SYNC_STALE_AFTER,)).fetchone() is not None
     items = []
     today = _today(conn)
+    first_pending = False
     for r in rows:
+        # Each Item fills against the window ITS link asked Plaid for, not
+        # the household's current choice: the window cannot be changed on
+        # an Item once it is made, so an Item linked for two years keeps
+        # backfilling two years after the household picks three months,
+        # and measured against three months it would read full long before
+        # its history is in.
+        window_days = (float(r["days_requested"])
+                       if r["days_requested"] and r["days_requested"] > 0
+                       else BACKFILL_WINDOW_DAYS)
         stalled = (r["status"] or "").startswith("error")
         ready = (r["tx_update_status"] == "HISTORICAL_UPDATE_COMPLETE"
                  or bool(r["legacy_done"]))
+        # no pull has finished yet: the Item's first sync is queued or
+        # running on the worker (the link saved it and queued the pull),
+        # which writes nothing a reader can see until it ends — so the
+        # household counts as syncing, and the nudge does not start another
+        waits_first = (not r["ever_pulled"] and not r["transactions"]
+                       and not ready and not stalled)
+        first_pending = first_pending or waits_first
         # A bar the client can draw. Plaid never says how many rows are
         # coming, only that the two-year window is complete, so the fill
         # is how much of that window the oldest landed row already
@@ -8277,8 +9534,7 @@ def _backfill_status(conn) -> tuple[dict, list]:
             progress = 1.0
         elif r["earliest"]:
             days = (today - r["earliest"]).days
-            progress = max(0.02, min(0.95, days / (BACKFILL_WINDOW_MONTHS
-                                                   * 30.4)))
+            progress = max(0.02, min(0.95, days / window_days))
         else:
             progress = 0.0
         items.append({
@@ -8295,7 +9551,8 @@ def _backfill_status(conn) -> tuple[dict, list]:
             # the client shows "pulling from your bank" against the
             # quieter "waiting for the bank to send more" — the
             # difference between working and stuck, from the outside
-            "active": r["recent_attempt"] is not None and not ready,
+            "active": (r["recent_attempt"] is not None or waits_first)
+                      and not ready,
             "ready": ready,
             # a broken connection will not finish its backfill —
             # surfaced so the UI can say "needs attention" instead of
@@ -8305,7 +9562,8 @@ def _backfill_status(conn) -> tuple[dict, list]:
     waiting = [r for r, it in zip(rows, items)
                if not it["ready"] and not it["stalled"]]
     all_ready = all(it["ready"] or it["stalled"] for it in items)
-    return ({"items": items, "all_ready": all_ready, "syncing": running},
+    return ({"items": items, "all_ready": all_ready,
+             "syncing": running or first_pending},
             waiting)
 
 
@@ -8333,13 +9591,20 @@ def onboarding_backfill(user: dict = Depends(_user())):
              dependencies=[Depends(limit("backfill_nudge", 30, 600))])
 def onboarding_backfill_nudge(user: dict = Depends(_user())):
     """The self-driving half of the backfill wait: when an unfinished item
-    has not been pulled recently and no sync is running, kick the
-    background tenant sync. Hosted installs hear HISTORICAL_UPDATE by
-    webhook, but a self-host without a public webhook URL would otherwise
-    sit until the hourly cron. Owner-only and demo-denied like every other
-    door that starts a sync (it pulls new transactions, moves cursors and
-    spends aggregator quota). Returns the same status shape as the GET."""
-    import threading
+    has not been pulled recently and no sync is running, queue a pull of it
+    on the worker. Hosted installs hear HISTORICAL_UPDATE by webhook, but a
+    self-host without a public webhook URL would otherwise sit until the
+    hourly cron. Owner-only and demo-denied like every other door that
+    starts a sync (it pulls new transactions, moves cursors and spends
+    aggregator quota). Returns the same status shape as the GET.
+
+    Never pulls in the web process: a first two-year pull can hold a
+    pooled web connection and the sync lock for minutes, which is why the
+    link poll hands that work to the worker. An Item whose first pull has
+    not finished gets that first-sync job queued again under its one job
+    id (a no-op while it is queued or running; a re-queue if Redis lost
+    it); any other waiting Item gets one pull per minute at most."""
+    from ..jobs import worker
 
     demoguard.deny(user)
     if user["role"] != "owner":
@@ -8348,68 +9613,23 @@ def onboarding_backfill_nudge(user: dict = Depends(_user())):
     conn = _conn(user)
     try:
         payload, waiting = _backfill_status(conn)
-        # nudge: an unfinished, unbroken item with no pull in the last 45 s
-        # and no sync running → start one. 45, not 90: the wizard re-nudges
-        # every 30 s while it waits, and a 90 s window would decline the
-        # first two nudges after a link and leave the history over two
-        # minutes away; the bank's window is usually ready
-        # within a minute of the link (same claim as /jobs/sync/start,
-        # so cron and button clicks can never double-run)
-        if waiting and not payload["syncing"] \
-                and all(r["recent_attempt"] is None for r in waiting):
-            claimed = conn.execute(
-                """INSERT INTO job_progress (id, state, progress)
-                   VALUES ('sync', 'running', '{}'::jsonb)
-                   ON CONFLICT (tenant_id, id) DO UPDATE SET
-                       state='running', progress='{}'::jsonb,
-                       started_at=now(), updated_at=now()
-                   WHERE job_progress.state != 'running'
-                      OR job_progress.updated_at < now() - %s::interval
-                   RETURNING id""", (SYNC_STALE_AFTER,)).fetchone()
-            if claimed is not None:
-                payload["syncing"] = True
-
-                def _pull():
-                    from ..engine.compat import jsonb as _jsonb
-                    from ..jobs import worker
-                    wconn = tenancy.tenant_connect(tid)
-                    try:
-                        results = worker.sync_tenant(tid)
-                        # Another door's sync beat this nudge to the
-                        # per-tenant advisory lock: nothing was pulled, so
-                        # 'done' would be a lie. The lock holder owns the
-                        # row and will settle its state; just note it.
-                        if results.get("_status") == "already-running":
-                            wconn.execute(
-                                "UPDATE job_progress "
-                                "SET progress=COALESCE(progress,"
-                                "'{}'::jsonb) || %s::jsonb, "
-                                "updated_at=now() WHERE id='sync'",
-                                (_jsonb({"already_running": True}),))
-                            return
-                        wconn.execute(
-                            "UPDATE job_progress SET state='done', "
-                            "progress=COALESCE(progress,'{}'::jsonb) || "
-                            "%s::jsonb, updated_at=now() WHERE id='sync'",
-                            (_jsonb({"results": results}),))
-                    except Exception as e:          # noqa: BLE001
-                        try:
-                            wconn.execute(
-                                "UPDATE job_progress SET state='error', "
-                                "progress=COALESCE(progress,'{}'::jsonb) "
-                                "|| %s::jsonb, updated_at=now() "
-                                "WHERE id='sync'",
-                                (_jsonb({"error":
-                                         f"{type(e).__name__}: {e}"}),))
-                        except Exception:           # noqa: BLE001
-                            pass
-                    finally:
-                        wconn.close()
-
-                threading.Thread(target=_pull, daemon=True,
-                                 name=f"backfill-sync-{tid[:8]}").start()
     finally:
         conn.close()
+    first = [r["id"] for r in waiting
+             if not r["ever_pulled"] and not r["transactions"]]
+    for iid in first:
+        worker.queue_first_sync(tid, iid)
+    # 45 s, not 90: the wizard re-nudges every 30 s while it waits, and a
+    # 90 s window would decline the first two nudges after a pull and leave
+    # the history minutes away; the bank's window is usually ready within
+    # a minute of the link
+    later = [r for r in waiting
+             if r["ever_pulled"] or r["transactions"]]
+    if later and not first and not payload["syncing"] \
+            and all(r["recent_attempt"] is None for r in later):
+        for r in later:
+            worker.queue_backfill_sync(tid, r["id"])
+        payload["syncing"] = True
     return payload
 
 
@@ -8475,7 +9695,7 @@ def _require_record_id(record_id: str, what: str) -> str:
     return record_id
 
 
-@router.post("/business/{txn_id}/flag")
+@router.post("/business/{txn_id:path}/flag")
 def business_flag(txn_id: str, user: dict = Depends(_user())):
     conn = _conn(user)
     try:
@@ -8491,7 +9711,7 @@ def business_flag(txn_id: str, user: dict = Depends(_user())):
         conn.close()
 
 
-@router.post("/business/{txn_id}/unflag")
+@router.post("/business/{txn_id:path}/unflag")
 def business_unflag(txn_id: str, user: dict = Depends(_user())):
     conn = _conn(user)
     try:
@@ -8540,7 +9760,6 @@ def business_export(request: Request, user: dict = Depends(_user()),
                     year: int | None = None):
     _same_site_download(request)
     """The Schedule C worksheet: flagged transactions as CSV."""
-    import csv as _c
     import io as _io
 
     from fastapi.responses import Response
@@ -8552,7 +9771,7 @@ def business_export(request: Request, user: dict = Depends(_user()),
     finally:
         conn.close()
     buf = _io.StringIO()
-    w = _c.writer(buf)
+    w = _csv_writer(buf)
     w.writerow(["date", "payee", "category", "account", "amount"])
     for row in r["rows"]:
         w.writerow([row["date"].isoformat(), _csv_safe(row["payee"]),
@@ -9025,7 +10244,7 @@ def business_txns(entity_id: str, user: dict = Depends(_user()),
         conn.close()
 
 
-@router.post("/business/entities/{entity_id}/transactions/{txn_id}/class")
+@router.post("/business/entities/{entity_id}/transactions/{txn_id:path}/class")
 def business_classify(entity_id: str, txn_id: str,
                       user: dict = Depends(_user()), body: dict = Body(...)):
     _require_entity_id(entity_id)
@@ -9039,6 +10258,10 @@ def business_classify(entity_id: str, txn_id: str,
             entities.require_active(conn, entity_id)   # archived = read-only
         except ValueError as _e:
             raise HTTPException(409 if "archived" in str(_e) else 404, str(_e))
+        # A body that names `sched_c_line` sets it, and null or "" clears
+        # it; a body without the key (the Books tab's bucket change) keeps
+        # whatever line is stored.
+        names_line = "sched_c_line" in body
         line = _body_text(body, "sched_c_line") or None
         # free text bound straight into the row: anything but a string is
         # the client's mistake (400), never a driver error (500)
@@ -9087,8 +10310,10 @@ def business_classify(entity_id: str, txn_id: str,
                         "WHERE txn_id=%s", (txn_id,)).fetchone()
                     if have is not None and have["bucket"]:
                         bucket = have["bucket"]
-                books.classify(conn, txn_id, bucket, sched_c_line=line,
-                               note=note)
+                books.classify(
+                    conn, txn_id, bucket,
+                    sched_c_line=line if names_line else books.KEEP,
+                    note=note)
         except ValueError as e:
             raise HTTPException(400, str(e))
         return {"ok": True}
@@ -9214,7 +10439,6 @@ def business_year_package(entity_id: str, request: Request,
     to retype. A README states what the figures are and, importantly, what
     they are not.
     """
-    import csv as _c
     import io as _io
     import zipfile as _z
 
@@ -9247,7 +10471,7 @@ def business_year_package(entity_id: str, request: Request,
 
     def _csv(rows) -> str:
         buf = _io.StringIO()
-        w = _c.writer(buf)
+        w = _csv_writer(buf)
         for r in rows:
             w.writerow(r)
         return buf.getvalue()
@@ -9365,7 +10589,6 @@ def business_pnl_csv(entity_id: str, request: Request,
                      year: int | None = None):
     _same_site_download(request)
     """A CPA-consumable export: entity, P&L summary, and every classified line."""
-    import csv as _c
     import io as _io
 
     from fastapi.responses import Response
@@ -9389,7 +10612,7 @@ def business_pnl_csv(entity_id: str, request: Request,
     finally:
         conn.close()
     buf = _io.StringIO()
-    w = _c.writer(buf)
+    w = _csv_writer(buf)
     w.writerow(["Oikonome business books export", _csv_safe(ent["name"]),
                 _csv_safe(ent.get("structure", "")),
                 f"EIN •••••{ent.get('ein_last4') or ''}"])
@@ -9789,7 +11012,7 @@ def _refuse_moving_a_fronted_expense(conn, txn_id: str,
             "movement first")
 
 
-@router.post("/transactions/{txn_id}/entity")
+@router.post("/transactions/{txn_id:path}/entity")
 def txn_assign_entity(txn_id: str, user: dict = Depends(_user()),
                       body: dict = Body(...)):
     """Per-transaction business override (or null → clear)."""

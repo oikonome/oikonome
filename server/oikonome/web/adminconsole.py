@@ -518,6 +518,7 @@ def _dashboard(request: Request, minted_link: str | None = None,
                    reboot_armed=reboot_armed, reboot_nonce=reboot_nonce,
                    command_results=_command_results(),
                    cmd_watcher_ready=_cmd_dir_writable(),
+                   cmd_watcher_behind=command_watcher_behind(),
                    reboot_watcher_ready=_reboot_watcher_ready(),
                    cmd_armed=cmd_armed, cmd_nonce=cmd_nonce,
                    # operator access
@@ -1956,17 +1957,34 @@ def sync_now(request: Request, tenant_id: str = Form(...)):
 
 # ---- host state, broadcast, jobs, logs, drill-down --------------
 
+def backup_dir_label() -> str:
+    """The host folder the backup card is watching, as the operator named
+    it. Compose binds OIKONOME_BACKUP_DIR (default the install's backups/)
+    at /state/backups and hands the same value in, so a card reading "no
+    backup in over 30h" says which folder it looked in — a schedule
+    writing anywhere else is the usual cause."""
+    configured = (os.environ.get("OIKONOME_BACKUP_DIR") or "").strip()
+    return configured or "backups/ in the install folder"
+
+
 def _host_state() -> dict:
     """Backup + host-health snapshots via the read-only binds (compose
-    mounts <install>/backups and <install>/ops-state at /state). Missing
+    mounts the backup folder and <install>/ops-state at /state). Missing
     paths read as 'not configured' — never an error."""
     import json as _json
     from pathlib import Path
     base = Path(os.environ.get("OIKONOME_STATE_DIR", "/state"))
-    out: dict = {"backups": [], "backups_available": False, "host": None}
+    out: dict = {"backups": [], "backups_available": False, "host": None,
+                 "backup_dir": backup_dir_label()}
     bdir = base / "backups"
     if bdir.is_dir():
         out["backups_available"] = True
+        # A folder the app's uid cannot list globs as empty, which would
+        # read as "no backup taken yet" while the dumps sit right there —
+        # the usual cause is a 0700 folder an older scripts/backup.sh made
+        # for OIKONOME_BACKUP_DIR. Say which it is.
+        out["backups_readable"] = os.access(bdir, os.R_OK | os.X_OK)
+    if out.get("backups_readable"):
         now_ts = dt.datetime.now().timestamp()
         # Snapshot each dump's stat ONCE. The nightly backup job rotates
         # (deletes) old dumps, so a file present at glob() can vanish before a
@@ -2485,7 +2503,9 @@ def tenant_export(request: Request, tenant_id: str = Form(...),
         content=data, media_type="application/zip",
         headers={"Content-Disposition":
                  f'attachment; filename="oikonome-export-'
-                 f'{tenant_id[:8]}-{stamp}.zip"'})
+                 f'{tenant_id[:8]}-{stamp}.zip"',
+                 # a household's whole archive: no HTTP cache may keep it
+                 "Cache-Control": "no-store"})
 
 
 # Single-use confirmation nonces for the reboot flow — a browser replaying
@@ -2604,6 +2624,51 @@ _CMD_LABELS = {"backup": "Back up now", "status": "Status",
 # this arm/confirm pair is the ONLY server-side friction before the root
 # host-agent, so it has to confirm exactly the operation that was armed.
 _CMD_NONCES: dict[str, tuple[str, float]] = {}
+
+
+# The revision of scripts/install-host-command-watcher.sh's generated
+# checker that the console's operations need. The root installer records
+# what it installed in the command watcher's marker; an existing host keeps
+# the copy its last installer run wrote, so a newer console can sit on an
+# older checker. Keep in step with the installer's `revision=` line.
+COMMAND_WATCHER_REVISION = 2
+# what each revision added that the console depends on
+_WATCHER_REVISION_FOR = {"restore_moved_backup_dir": 2}
+WATCHER_RERUN = "sudo sh scripts/install-host-command-watcher.sh <install-dir>"
+
+
+def command_watcher_revision() -> int:
+    """The checker revision the command watcher's marker records. A marker
+    without one was written before revisions existed: revision 1."""
+    from pathlib import Path
+    mark = (Path(os.environ.get("OIKONOME_STATE_DIR", "/state"))
+            / "ops" / "watchers" / "command")
+    rev = 1
+    try:
+        for line in mark.read_text().splitlines():
+            key, _, val = line.strip().partition("=")
+            if key == "revision" and val.strip().isdigit():
+                rev = max(rev, int(val.strip()))
+    except OSError:
+        pass
+    return rev
+
+
+def command_watcher_behind() -> str:
+    """Why the installed command watcher is too old for this console, or ''.
+    Only a host that relies on what the newer checker adds is flagged: with
+    the backups in their default folder every revision restores fine."""
+    if not _cmd_dir_writable():
+        return ""
+    if not (os.environ.get("OIKONOME_BACKUP_DIR") or "").strip():
+        return ""
+    if command_watcher_revision() >= _WATCHER_REVISION_FOR[
+            "restore_moved_backup_dir"]:
+        return ""
+    return ("The host command watcher predates OIKONOME_BACKUP_DIR: a "
+            "restore from the console will not find backups in "
+            f"{backup_dir_label()}. Re-run, as root on the host: "
+            f"{WATCHER_RERUN}")
 
 
 def _reboot_watcher_ready() -> bool:

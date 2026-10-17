@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime as dt
 
 from ..engine import budget, links, merchant_dedup, merchant_sql, reporting
+from ..engine import categories as _cats
 from ..engine.compat import as_date
 
 _ACCT_FULL = budget.ACCT_LABEL_SQL   # single definition, shared with _spend_rows
@@ -101,6 +102,31 @@ def _scope_sql(scope: str) -> str:
 # rename is visible on the ledger, not only on the Merchants page.
 from ..engine.splits import SPLITTABLE_SQL as _SPLITTABLE_SQL  # noqa: E402
 
+# Whether the verdict counts a row as spending: budget.SPEND_ONLY_SQL and
+# PERSONAL_ONLY_SQL verbatim, minus the accounts its spend rows leave out.
+# Each copy takes the excluded-account list as one positional parameter.
+_COUNTS_AS_SPEND = (f"TRUE{budget.SPEND_ONLY_SQL}{budget.PERSONAL_ONLY_SQL}"
+                    " AND NOT (t.account_id = ANY(%s::text[]))")
+_COUNTS_AS_SPEND_2 = _COUNTS_AS_SPEND
+
+
+def _spend_excluded(conn) -> list[str]:
+    """The accounts whose rows the verdict never counts as spending — the
+    Accounts page's exclusions plus linked shadows and hidden accounts, the
+    same list budget._spend_rows filters on. The ledger's per-row spend
+    flag and figure, and the search's spend totals, read it so a day
+    subtotal or a search average cannot disagree with the month hero."""
+    return (budget.excluded_account_ids(budget.load_config(conn))
+            + links.shadow_ids(conn))
+
+
+def _txn_args(conn) -> list:
+    """The parameters _TXN_FIELDS itself takes, in order — they lead every
+    query that selects it, since the field list comes first."""
+    ex = _spend_excluded(conn)
+    return [ex, ex]
+
+
 _TXN_FIELDS = f"""t.id, t.date, t.amount, {_DISPLAY_MERCHANT} AS payee,
                   {merchant_dedup.MERCHANT_LOGO} AS merchant_logo,
                   {merchant_dedup.MERCHANT_ID} AS merchant_id,
@@ -112,7 +138,21 @@ _TXN_FIELDS = f"""t.id, t.date, t.amount, {_DISPLAY_MERCHANT} AS payee,
                   -- — the verdict carries PERSONAL_ONLY_SQL, so a day
                   -- subtotal must too, or listing a business account's
                   -- rows would inflate the day they sit in)
-                  (TRUE{budget.SPEND_ONLY_SQL}{budget.PERSONAL_ONLY_SQL}) AS counts_as_spend,
+                  -- The Accounts page's "excl" toggle, linked shadows and
+                  -- hidden accounts (see _spend_excluded)
+                  -- leave the verdict too, so they leave here as well.
+                  ({_COUNTS_AS_SPEND}) AS counts_as_spend,
+                  -- what the row adds to the day's spending: the verdict's
+                  -- own figure (net of a partial reimbursement), 0 for a
+                  -- row the verdict does not count. Clients sum THIS, not
+                  -- `amount`, so a day subtotal agrees with the month hero.
+                  -- The figure is budget.NET_AMOUNT, or under
+                  -- the search's category filter the matching split
+                  -- parts' share of it — the same expression the search's
+                  -- spend_sum totals, so a day header cannot show the
+                  -- whole charge beside a hero that counts only the share.
+                  (CASE WHEN {_COUNTS_AS_SPEND_2} THEN {{spend}}
+                        ELSE 0 END) AS spend_amount,
                   -- DISPLAY form: the override is prettified like the primary
                   -- (a picked standard category is stored as its raw key), so
                   -- no consumer — page, email, mobile — sees FOOD_AND_DRINK
@@ -185,10 +225,24 @@ _TXN_FIELDS = f"""t.id, t.date, t.amount, {_DISPLAY_MERCHANT} AS payee,
                                                        'amount', sp.amount)
                                     ORDER BY sp.line)
                      FROM transaction_splits sp WHERE sp.txn_id = t.id) AS split,
+                  -- whose parts: 'user' for a hand split, the store's kind
+                  -- ('amazon' / 'costco') for a receipt's reading; NULL
+                  -- when the row is not split
+                  (SELECT sp.source FROM transaction_splits sp
+                     WHERE sp.txn_id = t.id ORDER BY sp.line LIMIT 1) AS split_source,
                   -- would the split door take this row: the spend test
                   -- the rollups use, so a client offers Split exactly
                   -- where the server will accept it
                   (""" + _SPLITTABLE_SQL + """) AS splittable"""
+
+
+def _txn_fields(spend: str | None = None) -> str:
+    """_TXN_FIELDS ready to select. `spend` replaces the row's spend figure
+    (its %s parameters follow _txn_args); the default is the verdict's
+    whole-row net amount."""
+    return _TXN_FIELDS.format(acct=_ACCT_FULL, spend=spend or budget.NET_AMOUNT)
+
+
 # the manual_categories join every ledger query needs for provenance
 _TXN_JOINS = "LEFT JOIN manual_categories mcat ON mcat.transaction_id = t.id"
 
@@ -198,13 +252,13 @@ def transactions_by_ids(conn, ids: list[str]):
     Today recent pane renders the same table component as the page."""
     if not ids:
         return []
-    q = f"""SELECT {_TXN_FIELDS.format(acct=_ACCT_FULL)}
+    q = f"""SELECT {_txn_fields()}
            FROM transactions t LEFT JOIN accounts a ON a.id = t.account_id
                 LEFT JOIN items i ON i.id = a.item_id
                 {_MC_JOIN} {_TXN_JOINS}
            WHERE t.removed = 0 AND t.id = ANY(%s)
            ORDER BY t.date DESC, ABS(t.amount) DESC, t.id"""
-    return conn.execute(q, [ids]).fetchall()
+    return conn.execute(q, [*_txn_args(conn), ids]).fetchall()
 
 
 # reimbursement-related rows: a linked pair (either side) or an
@@ -233,13 +287,13 @@ def transactions(conn, year: int, month: int, *, search: str = "",
     # caller narrows the scope; they never count as household spend
     # (counts_as_spend), so the day and month figures stay personal. Same
     # rule in both modes of this page.
-    q = f"""SELECT {_TXN_FIELDS.format(acct=_ACCT_FULL)}
+    q = f"""SELECT {_txn_fields()}
            FROM transactions t LEFT JOIN accounts a ON a.id = t.account_id
                 LEFT JOIN items i ON i.id = a.item_id
                 {_MC_JOIN} {_TXN_JOINS}
            WHERE t.removed = 0{_scope_sql(scope)}
              AND t.date >= %s AND t.date < %s"""
-    args: list = [start, end]
+    args: list = [*_txn_args(conn), start, end]
     if account_id:
         q += " AND t.account_id = %s"
         args.append(account_id)
@@ -358,7 +412,7 @@ def search_transactions(conn, search: str, *, account_id: str | None = None,
                         page: int = 1, per_page: int = 100,
                         scope: str = "all", channel: str | None = None,
                         checks_only: bool = False,
-                        ids: list[str] | None = None):
+                        ids: list[str] | None = None, chunk: int = 0):
     """Universal search: EVERY account, the FULL history, newest first,
     PAGINATED. Returns (rows, total_count, amount_sum, amazon_items) —
     amount_sum is the Plaid-signed sum over the WHOLE result set;
@@ -374,7 +428,13 @@ def search_transactions(conn, search: str, *, account_id: str | None = None,
     of the account visibility rules (see below). It is how a caller that
     already KNOWS its row set — the budget engine, handing over the rows
     behind one of its bucket tiles — gets that set back in the shape the
-    search surface renders."""
+    search surface renders.
+
+    `chunk` > 0 makes the first element a generator of row lists, each
+    at most `chunk` rows, in the same order, fetched only as it is read.
+    A download asks for every page at once; holding all of those wide
+    rows together is what would size its memory, so it reads them a
+    slice at a time on the caller's still-open connection instead."""
     search = (search or "").strip()
     account_hits: list[dict] = []
     # Business-entity rows are listed with their `entity` name unless the
@@ -387,6 +447,10 @@ def search_transactions(conn, search: str, *, account_id: str | None = None,
     # what each matched row contributes to the sums: the whole charge,
     # unless a category filter narrows a split row to one of its parts
     amount_expr, amount_args = "t.amount", []
+    # …and what it contributes to the SPEND figures: the verdict's own
+    # amount (net of a partial reimbursement), or the matching part's share
+    # of it when the category filter narrows a split row
+    spend_expr, spend_args = budget.NET_AMOUNT, []
     # An explicit id list is the caller saying WHICH rows these are — the
     # budget engine handing over the rows behind one of its own numbers.
     # It is the whole predicate: the hidden/shadow filters below would
@@ -433,7 +497,13 @@ def search_transactions(conn, search: str, *, account_id: str | None = None,
         args.extend([category, category])
         amount_expr = ("COALESCE((SELECT SUM(sp.amount) FROM transaction_splits sp"
                        " WHERE sp.txn_id = t.id AND sp.category = %s), t.amount)")
-        amount_args = [category, category]      # one per SUM below
+        amount_args = [category]
+        spend_expr = ("COALESCE((SELECT SUM("
+                      + _cats.part_net(budget.NET_AMOUNT)
+                      + ") FROM transaction_splits sp"
+                      " WHERE sp.txn_id = t.id AND sp.category = %s), "
+                      + budget.NET_AMOUNT + ")")
+        spend_args = [category]
     if date_from:
         where.append("t.date >= %s"); args.append(as_date(date_from))
     if date_to:
@@ -534,17 +604,19 @@ def search_transactions(conn, search: str, *, account_id: str | None = None,
     ids = [r["id"] for r in conn.execute(
         f"SELECT t.id FROM transactions t WHERE {where_sql} "
         f"ORDER BY t.date DESC, ABS(t.amount) DESC, t.id", args).fetchall()]
+    # The spend figures also drop the accounts the verdict drops (the
+    # Accounts page's exclusions, shadows, hidden accounts): a search scoped
+    # to an excluded card lists its rows, but they are not spending.
+    excl = _spend_excluded(conn)
     row = conn.execute(
         f"SELECT COUNT(*) AS n, "
         f"       COALESCE(SUM({amount_expr}) FILTER (WHERE TRUE {money_scope}), 0) AS s, "
         f"       COUNT(*) FILTER (WHERE NOT (TRUE {budget.PERSONAL_ONLY_SQL})) AS biz_n, "
-        f"       COUNT(*) FILTER (WHERE TRUE {budget.SPEND_ONLY_SQL}"
-        f"                        {budget.PERSONAL_ONLY_SQL}) AS spend_n, "
-        f"       COALESCE(SUM({amount_expr}) FILTER "
-        f"                (WHERE TRUE {budget.SPEND_ONLY_SQL}"
-        f"                       {budget.PERSONAL_ONLY_SQL}), 0) AS spend_sum "
+        f"       COUNT(*) FILTER (WHERE {_COUNTS_AS_SPEND}) AS spend_n, "
+        f"       COALESCE(SUM({spend_expr}) FILTER "
+        f"                (WHERE {_COUNTS_AS_SPEND}), 0) AS spend_sum "
         f"FROM transactions t WHERE t.id = ANY(%s)",
-        (*amount_args, ids)).fetchone()
+        (*amount_args, excl, *spend_args, excl, ids)).fetchone()
     total, amount_sum = row["n"], row["s"]
     spend_n = row["spend_n"]
     spend_sum = round(float(row["spend_sum"]), 2)
@@ -579,14 +651,25 @@ def search_transactions(conn, search: str, *, account_id: str | None = None,
                             "unpriced": arow["unpriced"]}
     offset = max(0, (page - 1) * per_page)
     page_ids = ids[offset:offset + per_page]
-    rows = conn.execute(
-        f"""SELECT {_TXN_FIELDS.format(acct=_ACCT_FULL)}
+    # Each row's spend_amount is its share by the SAME expression spend_sum
+    # just totalled, so under a category filter a split row's day subtotal
+    # carries the matching part, not the whole charge.
+    page_sql = f"""SELECT {_txn_fields(spend_expr if spend_args else None)}
             FROM transactions t LEFT JOIN accounts a ON a.id = t.account_id
                  LEFT JOIN items i ON i.id = a.item_id
                  {_MC_JOIN} {_TXN_JOINS}
             WHERE t.id = ANY(%s)
-            ORDER BY t.date DESC, ABS(t.amount) DESC, t.id""",
-        (page_ids,)).fetchall() if page_ids else []
+            ORDER BY t.date DESC, ABS(t.amount) DESC, t.id"""
+    lead = (*_txn_args(conn), *spend_args)
+    if chunk > 0:
+        def _chunks(ids_left=page_ids, step=chunk):
+            for i in range(0, len(ids_left), step):
+                yield conn.execute(page_sql,
+                                   (*lead, ids_left[i:i + step])).fetchall()
+        rows = _chunks()
+    else:
+        rows = conn.execute(page_sql, (*lead, page_ids)).fetchall() \
+            if page_ids else []
     return (rows, total, round(amount_sum, 2), amazon_items,
             {"count": spend_n, "sum": spend_sum, "biz_count": biz_n},
             account_hits)
@@ -640,7 +723,14 @@ def all_accounts(conn):
                      COALESCE(a.display_name, a.name)""").fetchall()
 
 
-def accounts_detail(conn):
+def accounts_detail(conn, *, counts: bool = True):
+    """Every account with its connection, branding and card figures.
+    `counts=False` leaves `txns` NULL: the per-account row count is an
+    index walk over each account's whole history, and a reader that
+    never shows it (the integrations summary) should not pay for it."""
+    txns = ("""(SELECT COUNT(*) FROM transactions t
+                   WHERE t.account_id=a.id AND t.removed=0)"""
+            if counts else "NULL::bigint")
     return conn.execute(
         """SELECT a.id, COALESCE(a.display_name, a.name) AS name, a.mask,
                   -- the aggregator's own name, kept under any rename so the
@@ -656,8 +746,7 @@ def accounts_detail(conn):
                        THEN '/api/institutions/' || i.id || '/logo' END
                     AS inst_logo_url,
                   i.brand_color AS inst_color, i.url AS inst_url,
-                  (SELECT COUNT(*) FROM transactions t
-                   WHERE t.account_id=a.id AND t.removed=0) AS txns,
+                  """ + txns + """ AS txns,
                   -- a card's next due date + statement balance, straight
                   -- from the liabilities pull — shown beside the card row
                   l.raw ->> 'next_payment_due_date' AS card_due,
@@ -795,6 +884,84 @@ def retire_pending(conn, txn_id: str, today: dt.date | None = None) -> dict:
 # ---- categorization overrides ---------------------------------------------
 
 
+def _relabel_buckets(cfg: dict, old: str, new: str) -> int:
+    """Replace the category name `old` with `new` in the config's custom
+    buckets (bucket name and category matchers), in place. Returns how many
+    entries changed."""
+    lst = cfg.get("custom_buckets")
+    if not isinstance(lst, list) or not lst:
+        return 0
+    changed = 0
+    out = []
+    for b in lst:
+        if not isinstance(b, dict):
+            out.append(b)
+            continue
+        bb = dict(b)
+        if (bb.get("name") or "") == old:
+            bb["name"] = new
+            changed += 1
+        cats = bb.get("categories")
+        if isinstance(cats, list) and old in cats:
+            bb["categories"] = [new if c == old else c for c in cats]
+            changed += 1
+        out.append(bb)
+    if changed:
+        cfg["custom_buckets"] = out
+    return changed
+
+
+def _relabel_snapshots(conn, old: str, new: str) -> None:
+    """Carry a category rename into every frozen month.
+
+    A closed month is not stored as a verdict: it is recomputed from the
+    live ledger under the settings and bill rows frozen for it. The ledger
+    rows now carry the new name, so a snapshot still matching on the old one
+    would show its custom bucket and category envelopes at $0 and push the
+    spend into everything else. The snapshot freezes the budget, not the
+    spelling of a category, so this is a pure relabel: amounts, caps and
+    the bill schedule stay exactly as the month closed under them."""
+    from ..engine.compat import jsonb
+    for snap in conn.execute(
+            "SELECT year, month, config, bills FROM budget_snapshots "
+            "ORDER BY year, month FOR UPDATE").fetchall():
+        cfg, sched = snap["config"], snap["bills"]
+        new_cfg = new_sched = None
+        if isinstance(cfg, dict):
+            c = dict(cfg)
+            if _relabel_buckets(c, old, new):
+                new_cfg = c
+        if isinstance(sched, dict) and isinstance(sched.get("rows"), list):
+            rows, moved = [], False
+            for r in sched["rows"]:
+                if isinstance(r, dict):
+                    rr = dict(r)
+                    if rr.get("category") == old:
+                        rr["category"] = new
+                        moved = True
+                    raw = rr.get("raw")
+                    if isinstance(raw, dict) \
+                            and raw.get("txn_category") == old:
+                        rr["raw"] = {**raw, "txn_category": new}
+                        moved = True
+                    r = rr
+                rows.append(r)
+            if moved:
+                new_sched = {**sched, "rows": rows}
+        # each column is written only when it changed, so a snapshot
+        # frozen before bill rows were frozen keeps its NULL schedule
+        if new_cfg is not None:
+            conn.execute(
+                "UPDATE budget_snapshots SET config=%s "
+                "WHERE year=%s AND month=%s",
+                (jsonb(new_cfg), snap["year"], snap["month"]))
+        if new_sched is not None:
+            conn.execute(
+                "UPDATE budget_snapshots SET bills=%s "
+                "WHERE year=%s AND month=%s",
+                (jsonb(new_sched), snap["year"], snap["month"]))
+
+
 def rename_category(conn, old: str, new: str) -> dict:
     """Rename a **user/custom** category everywhere it appears.
 
@@ -806,7 +973,9 @@ def rename_category(conn, old: str, new: str) -> dict:
       * manual_categories.category
       * merchant_categories.category_primary
       * transaction_splits.category (hand-split parts)
+      * bills.category (a category-pool envelope's matcher)
       * config custom_buckets name + categories[] matchers
+      * the same bucket matchers and bill rows frozen in budget_snapshots
 
     **Standard Plaid primaries are not renamable** (FOOD_AND_DRINK,
     TRANSFER_OUT, … — the full ``PLAID_PRIMARIES`` set). Renaming those
@@ -852,7 +1021,7 @@ def rename_category(conn, old: str, new: str) -> dict:
         # stamps that bill's charges, so a rename that rewrote the charges
         # first and reached for the bill after would close a cycle with it.
         conn.execute("SELECT 1 FROM bills WHERE raw->>'txn_category' = %s "
-                     "ORDER BY id FOR UPDATE", (old,))
+                     "OR category = %s ORDER BY id FOR UPDATE", (old, old))
         overrides = conn.execute(
             "UPDATE transactions SET category_override=%s "
             "WHERE category_override=%s", (new, old)).rowcount
@@ -881,29 +1050,19 @@ def rename_category(conn, old: str, new: str) -> dict:
         conn.execute(
             """UPDATE bills SET raw = COALESCE(raw, '{}'::jsonb) || jsonb_build_object('txn_category', %s::text)
                 WHERE raw->>'txn_category' = %s""", (new, old))
+        # a category-pool envelope claims the rows whose effective category
+        # equals its own: the rows were just renamed, so a bill left on the
+        # old name would stop claiming any of them and its charges would
+        # fall to variable spend. Exact match, like every rewrite above —
+        # the envelope keeps claiming exactly the rows that moved.
+        conn.execute("UPDATE bills SET category=%s WHERE category=%s",
+                     (new, old))
         splits = _rename_split_parts(conn, old, new)
 
         buckets = 0
         with budget.config_txn(conn) as cfg:
-            lst = list(cfg.get("custom_buckets") or [])
-            if lst:
-                out = []
-                for b in lst:
-                    if not isinstance(b, dict):
-                        out.append(b)
-                        continue
-                    bb = dict(b)
-                    if (bb.get("name") or "") == old:
-                        bb["name"] = new
-                        buckets += 1
-                    cats = bb.get("categories")
-                    if isinstance(cats, list) and old in cats:
-                        bb["categories"] = [
-                            new if c == old else c for c in cats]
-                        buckets += 1
-                    out.append(bb)
-                if buckets:
-                    cfg["custom_buckets"] = out
+            buckets = _relabel_buckets(cfg, old, new)
+        _relabel_snapshots(conn, old, new)
 
     return {"old": old, "new": new, "overrides": overrides,
             "primaries": primaries, "manual": manual, "rules": rules,
@@ -920,22 +1079,47 @@ def _rename_split_parts(conn, old: str, new: str) -> int:
     category twice, so where the row already has a part under the new name
     the old part's amount folds into it; a split that folds down to a single
     part is the whole row in that category, which is what an override says,
-    so the split gives way to one."""
+    so the split gives way to one.
+
+    Only a PERSON's parts (source 'user'). A store's split is its matcher's
+    reading of the receipt, recomputed from scratch on every run, so one
+    naming the old category is dropped whole for the matcher to read again
+    — the row meanwhile counts under its whole-row category, renamed above.
+    Renamed in place instead, a merge could fold a store split to one part
+    and pin the row as the person's answer, an edit they never made.
+
+    The charges whose parts name the old category are locked first, in id
+    order, before any part is touched — the standing order of every split
+    writer (transactions, then their transaction_splits). A fold below
+    pins its charge's row after rewriting its parts; with the parts taken
+    first, a store matcher holding that row and reaching for the parts
+    would close a cycle with the rename."""
+    conn.execute(
+        """SELECT 1 FROM transactions WHERE id IN (
+               SELECT txn_id FROM transaction_splits WHERE category = %s)
+            ORDER BY id FOR UPDATE""", (old,))
+    conn.execute(
+        """DELETE FROM transaction_splits s
+            WHERE s.source <> 'user' AND s.txn_id IN (
+                  SELECT o.txn_id FROM transaction_splits o
+                   WHERE o.category = %s AND o.source <> 'user')""", (old,))
     merged = conn.execute(
         """WITH o AS (
                DELETE FROM transaction_splits s
-                WHERE s.category = %s AND EXISTS (
+                WHERE s.category = %s AND s.source = 'user' AND EXISTS (
                       SELECT 1 FROM transaction_splits n
-                       WHERE n.txn_id = s.txn_id AND n.category = %s)
+                       WHERE n.txn_id = s.txn_id AND n.category = %s
+                         AND n.source = 'user')
             RETURNING s.txn_id, s.amount)
            UPDATE transaction_splits n
               SET amount = round((n.amount + o.amount)::numeric, 2)::float8
              FROM o
             WHERE n.txn_id = o.txn_id AND n.category = %s
+              AND n.source = 'user'
         RETURNING n.txn_id""", (old, new, new)).fetchall()
     renamed = conn.execute(
-        "UPDATE transaction_splits SET category=%s WHERE category=%s",
-        (new, old)).rowcount
+        "UPDATE transaction_splits SET category=%s WHERE category=%s "
+        "AND source = 'user'", (new, old)).rowcount
     for r in merged:
         left = conn.execute(
             "SELECT count(*) AS n FROM transaction_splits WHERE txn_id=%s",
@@ -961,6 +1145,26 @@ def _rename_split_parts(conn, old: str, new: str) -> int:
                 "override_source='user' WHERE id=%s",
                 (new, r["txn_id"]))
     return len(merged) + renamed
+
+
+def _drop_store_parts(conn, txn_id: str) -> None:
+    """A person's whole-row answer replaces a store's split of the row.
+    The parts outrank the row's category in every rollup, so left in place
+    the answer reads as ignored until the next match run — which, seeing
+    the row pinned, would drop them anyway. A person's own split stays:
+    it is theirs to remove.
+
+    The charge's row is locked before its parts are touched: every writer
+    of a split (splits.set_split, splits.clear_split, the store matcher)
+    takes the row first and the parts after, and a person's edit taking
+    them the other way round deadlocks against a receipt push re-matching
+    the same charge — with the edit as the likely victim. Called inside
+    the caller's transaction, so the lock is held through its own
+    `transactions` UPDATE."""
+    conn.execute("SELECT 1 FROM transactions WHERE id=%s FOR UPDATE",
+                 (txn_id,))
+    conn.execute("DELETE FROM transaction_splits WHERE txn_id=%s "
+                 "AND source <> 'user'", (txn_id,))
 
 
 def set_category(conn, txn_id: str, category: str,
@@ -992,6 +1196,7 @@ def set_category(conn, txn_id: str, category: str,
     if scope not in ("one", "all"):
         raise ValueError(f"unknown category scope: {scope!r}")
     with conn.transaction():
+        _drop_store_parts(conn, txn_id)
         conn.execute(
             # bill_id NULL: this is a PERSON's answer now, even if a bill's
             # transaction category had stamped the row before — the bill
@@ -1093,6 +1298,35 @@ def _canonical_of(conn, payee: str) -> str:
     return r["canonical"] if r else payee
 
 
+def _canonicals_of(conn, payees) -> dict[str, str]:
+    """`_canonical_of` for many names in one lookup: name -> canonical, a
+    name with no alias row standing for itself."""
+    names = sorted({p for p in payees if p})
+    out = {p: p for p in names}
+    if names:
+        for r in conn.execute(
+                "SELECT raw_merchant, canonical FROM merchant_canonical "
+                "WHERE raw_merchant = ANY(%s)", (names,)).fetchall():
+            out[r["raw_merchant"]] = r["canonical"]
+    return out
+
+
+def _merchant_rows_of(conn, canons: list[str]) -> list[dict]:
+    """`_merchant_rows` for a whole set of canonicals in ONE ledger scan.
+    The display key cannot be served by an index, so a per-canonical loop
+    costs a full scan of the ledger per member of the family, inside the
+    transaction that holds the merchant-identity lock. A row has exactly one
+    display key, so the union never repeats a row."""
+    if not canons:
+        return []
+    return conn.execute(f"""
+        SELECT t.id, t.category_primary, t.category_override
+        FROM transactions t
+        {_MC_JOIN}
+        WHERE t.removed = 0 AND {_DISPLAY_MERCHANT} = ANY(%s)
+    """, (sorted(set(canons)),)).fetchall()
+
+
 def _merchant_rows(conn, canon: str) -> list[dict]:
     """Every live transaction of the canonical merchant, with its category
     and per-row override. Grouped by the DISPLAY key (outlet first, via the
@@ -1106,12 +1340,7 @@ def _merchant_rows(conn, canon: str) -> list[dict]:
     The ONE merchant-scan predicate: the preview's count, its flow /
     override disclosure and the undo snapshot all derive from this list,
     so they cannot drift apart."""
-    return conn.execute(f"""
-        SELECT t.id, t.category_primary, t.category_override
-        FROM transactions t
-        {_MC_JOIN}
-        WHERE t.removed = 0 AND {_DISPLAY_MERCHANT} = %s
-    """, (canon,)).fetchall()
+    return _merchant_rows_of(conn, [canon])
 
 
 def _merchant_targets(conn, canon: str) -> list[dict]:
@@ -1254,9 +1483,9 @@ def _token_family(conn, payee: str) -> list[str]:
 
 
 def _family_canons(conn, payee: str) -> list[str]:
-    return sorted({_canonical_of(conn, raw)
-                   for raw in _token_family(conn, payee)}
-                  | {_canonical_of(conn, payee)})
+    # one alias lookup for the whole family, not one per raw descriptor
+    return sorted(set(_canonicals_of(
+        conn, [*_token_family(conn, payee), payee]).values()))
 
 
 def merchant_category_preview(conn, payee: str, category: str,
@@ -1284,13 +1513,16 @@ def merchant_category_preview(conn, payee: str, category: str,
     else:
         canons = ([payee] if merchant_dedup.display_in_use(conn, payee)
                   else [_canonical_of(conn, payee)])
+    # one scan for every canonical; the count, the flow / override
+    # disclosure below and the undo snapshot all read this one row list
+    rows = _merchant_rows_of(conn, canons)
     seen: set[str] = set()
     n = 0
-    for c in canons:
-        for r in _merchant_targets(conn, c):
-            if r["id"] not in seen and r["category_primary"] != category:
-                seen.add(r["id"])
-                n += 1
+    for r in rows:
+        if r["category_override"] is None and r["id"] not in seen \
+                and r["category_primary"] != category:
+            seen.add(r["id"])
+            n += 1
     # The write is canonical-granular (rules key on the canonical), so it can
     # move sibling descriptors of a covered canonical that the page's own
     # match never displayed (a wallet-prefixed descriptor pulling in the
@@ -1320,16 +1552,15 @@ def merchant_category_preview(conn, payee: str, category: str,
     # makes "apply to all" look broken.
     flow_rows = skipped_override = 0
     counted: set[str] = set()
-    for c in canons:
-        for r in _merchant_rows(conn, c):
-            if r["id"] in counted:
-                continue
-            counted.add(r["id"])
-            if r["category_override"] is not None:
-                if r["category_override"] != category:
-                    skipped_override += 1
-            elif r["id"] in seen and (r["category_primary"] or "") in _BULK_FLOW:
-                flow_rows += 1
+    for r in rows:
+        if r["id"] in counted:
+            continue
+        counted.add(r["id"])
+        if r["category_override"] is not None:
+            if r["category_override"] != category:
+                skipped_override += 1
+        elif r["id"] in seen and (r["category_primary"] or "") in _BULK_FLOW:
+            flow_rows += 1
     # the merchant the confirm names is the one the write will be keyed on
     return {"merchant": _canonical_of(conn, payee) if family else canons[0],
             "count": n,
@@ -1439,12 +1670,12 @@ def set_merchant_category(conn, payee: str, category: str,
                   else _display_names_of(conn, canon))
         seen: set[str] = set()
         affected = []
-        for c in canons:
-            for r in _merchant_targets(conn, c):
-                if r["id"] not in seen and r["category_primary"] != category:
-                    seen.add(r["id"])
-                    affected.append({"id": r["id"],
-                                     "prev": r["category_primary"]})
+        for r in _merchant_rows_of(conn, canons):
+            if r["category_override"] is None and r["id"] not in seen \
+                    and r["category_primary"] != category:
+                seen.add(r["id"])
+                affected.append({"id": r["id"],
+                                 "prev": r["category_primary"]})
         priors = []
         rules_snap = []
         for c in canons:
@@ -1470,7 +1701,10 @@ def set_merchant_category(conn, payee: str, category: str,
             # canonical rule → target; duplicate spellings go (the undo
             # snapshot above already holds them)
             _write_user_rule(conn, c, category)
-            _llm.apply(conn, canon=c)                   # past rows now
+        # past rows now, every canonical in one sweep: each rule is written
+        # by here, so the single pass lands the same answers a pass per
+        # canonical would, without re-scanning the ledger once per member
+        _llm.apply(conn, canons=canons)
         # Honest count: rows that ACTUALLY landed on the new category, not a
         # pre-write estimate — success is never reported when nothing moved.
         ids = [a["id"] for a in affected]
@@ -1869,6 +2103,7 @@ def clear_category(conn, txn_id: str) -> None:
         mine = row["pinned"] and not row["bill_id"]
         if mine and row["pin"] == _CLEARED:
             return
+        _drop_store_parts(conn, txn_id)
         if not mine and (row["bill_id"]
                          or row["override_source"] not in (None, "user")):
             conn.execute(

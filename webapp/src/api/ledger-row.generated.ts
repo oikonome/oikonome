@@ -26,6 +26,8 @@ export interface Txn {
   pending: number;
   /** the verdict's own rule: does this row count as household spend */
   counts_as_spend?: boolean | null;
+  /** what this row adds to spending by the verdict's own math (net of a partial reimbursement; under the search's category filter, a split row's matching parts' share — the same figure the search's spend sum totals); 0 when it does not count. Day subtotals sum this, not amount */
+  spend_amount?: number | null;
   /** paired with a reimbursing deposit */
   reimb: boolean;
   /** flagged as reimbursement expected */
@@ -81,8 +83,10 @@ export interface Txn {
   override_manual?: boolean | null;
   /** true when the row is a companion charge — the fee that rides with override_bill's payment */
   override_is_fee?: boolean | null;
-  /** a hand split of this charge across categories, in order — stored category keys and cent-exact amounts summing to `amount`; null when the row is not split. `category` stays the whole row's own; the rollups count the parts */
+  /** a split of this charge across categories, in order — stored category keys and cent-exact amounts summing to `amount`; null when the row is not split. `category` stays the whole row's own; the rollups count the parts. `split_source` says whether a person or a store receipt wrote them */
   split?: { category: string; amount: number }[] | null;
+  /** who wrote `split`: 'user' for a hand split, 'amazon' / 'costco' for the parts a matched store receipt's items name (recomputed on every match; a person's edit replaces them, a person's remove pins the row whole); null when the row is not split */
+  split_source?: string | null;
   /** true when the split door will take this row — the spend test the rollups use (money out, not a transfer, not a card payment, not on a loan account); clients offer Split and Edit split only when true */
   splittable?: boolean | null;
 }

@@ -5,9 +5,8 @@ over web/data + sync importers.
 
 from __future__ import annotations
 
-import csv as csvmod
-import io
 import logging
+import threading as _threading
 import time
 
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Request, \
@@ -24,7 +23,7 @@ import datetime as _dt
 
 
 from ..engine import bills, budget
-from ..engine.compat import as_dict
+from ..engine.compat import as_date, as_dict
 from ..sync import base as sync_base
 from ..sync import batches, competitors, csvimport, mintimport, \
     ofximport, pdfimport, plaid, qifimport, simplefin, ynabimport
@@ -534,8 +533,10 @@ def export_dump(user: dict = Depends(_user()), t: str = ""):
 
     return StreamingResponse(
         stream(), media_type="application/gzip",
+        # the whole instance in one file: no HTTP cache may keep a copy
         headers={"Content-Disposition":
-                 f'attachment; filename="oikonome-{stamp}.sql.gz"'})
+                 f'attachment; filename="oikonome-{stamp}.sql.gz"',
+                 "Cache-Control": "no-store"})
 
 
 # /export table membership is SCHEMA-DRIVEN: every RLS-enabled tenant_id
@@ -558,6 +559,9 @@ EXPORT_SKIP = {
     "feedback_reports",  # operational ring buffer (may embed log lines)
     "sync_log",          # sync history (may embed provider error text)
     "script_heartbeats",  # collector liveness, meaningless off-instance
+    # the assistant's question-and-answer log: a conversation held on this
+    # instance, not the books — the figures in it are the ledger's own
+    "assistant_turns",
     # learned categorizer overlay — a binary model artifact, not user-
     # legible data; derived from merchant_categories (which exports fully)
     # and retrained nightly, so the export carries the source, not the cache
@@ -669,8 +673,12 @@ def export_data(user: dict = Depends(_user()), t: str = ""):
                 yield chunk
         finally:
             fh.close()
+    # the household's whole ledger: no HTTP cache may keep a copy (the
+    # middleware says the same; stated here so the download is right on
+    # its own, as the continuity packet is)
     headers = {"Content-Disposition":
-               'attachment; filename="oikonome-export.zip"'}
+               'attachment; filename="oikonome-export.zip"',
+               "Cache-Control": "no-store"}
     if warnings:
         # An archive a restore would refuse is still the household's copy,
         # so it downloads; the reasons ride a header (the body is the ZIP
@@ -953,6 +961,95 @@ _PLAID_LINK_MAX = 20
 # Plaid's own hosted-link tokens expire in hours; anything older than this is
 # an abandoned tab, and evicting by age beats evicting the oldest survivor.
 _PLAID_LINK_TTL = 6 * 3600
+# How long an unfinished ADD session keeps holding a place under the
+# institution cap. The hosted URL can be opened for 30 minutes (the
+# url_lifetime_seconds create_hosted_link asks for), and a user inside
+# Link can take a while longer to finish; past this the session is taken
+# as abandoned, so a closed tab never locks the household out for the
+# whole session TTL. The exchange re-checks the cap either way — this is
+# the door that stops parallel sessions from getting that far.
+_PLAID_ADD_HOLD = 3600
+# ...and only while its client is still waiting on it. Both clients poll
+# status every few seconds (backing off to 30 s on errors) and stop when
+# the person closes or cancels the bank window, so an add session nobody
+# has polled for this long belongs to a window that is gone. Without this,
+# a closed tab would hold the last slot for the whole hour above, and no
+# client could give it back.
+_PLAID_ADD_LIVE = 90
+# The count of open add sessions and the insert of a new one happen under
+# this lock: sync routes run on a thread pool, and two starts reading the
+# count together would both pass.
+_PLAID_LINK_GUARD = _threading.Lock()
+
+
+def _add_session_live(v: dict, now: float) -> bool:
+    """An unfinished add session whose client is still waiting on it —
+    not one the person said they closed (set aside)."""
+    return (not v["item_id"] and not v.get("done")
+            and not v.get("cancelled")
+            and now - v.get("at", now) <= _PLAID_ADD_HOLD
+            and now - v.get("polled_at", v.get("at", now))
+            <= _PLAID_ADD_LIVE)
+
+
+def _open_add_sessions(tid: str, now: float,
+                       recorded: frozenset | set = frozenset()) -> int:
+    """This tenant's add-mode link sessions still able to complete.
+    `recorded` is the tenant's live sessions on record
+    (plaid_links.recent_open): one not in this process's memory — it
+    opened before a restart and its client has not polled since — still
+    counts."""
+    return sum(1 for v in _PLAID_LINK.values()
+               if v["tenant_id"] == tid and _add_session_live(v, now)) \
+        + sum(1 for k in recorded if k not in _PLAID_LINK)
+
+
+def _drop_abandoned_adds(tid: str, now: float, cap, held: int,
+                         recorded: frozenset | set = frozenset()) -> list:
+    """Forget just enough of this tenant's unfinished add sessions whose
+    client stopped waiting to leave room for the one being started.
+
+    Not counting them is not enough: a session left in the table could
+    still be polled later and exchange a token next to the session that
+    took its slot. Dropped, its poll gets the unknown-session answer and
+    can never create an Item. But a client that stopped polling is not
+    always gone — a phone backgrounded through a long bank sign-in comes
+    back and exchanges — and a dropped session leaves the Item it created
+    at Plaid with nothing here to record it. So nothing is dropped while
+    every session can still finish under the cap, and when one must go it
+    is the oldest; a session whose client is still polling is never one.
+    Returns the link tokens dropped: the caller takes them off the record
+    too, or the webhook or the sweep would finish them all the same."""
+    dropped: list = []
+    if cap is None:
+        return dropped
+    stale = sorted((k for k, v in _PLAID_LINK.items()
+                    if v["tenant_id"] == tid and not v["item_id"]
+                    and not v.get("done") and not _add_session_live(v, now)),
+                   key=lambda k: _PLAID_LINK[k].get("at", now))
+    # the new session plus every open one, live or not, must fit
+    while stale and held + _open_add_sessions(tid, now, recorded) \
+            + len(stale) + 1 > cap:
+        k = stale.pop(0)
+        _PLAID_LINK.pop(k, None)
+        dropped.append(k)
+    return dropped
+
+
+def _refuse_add_over_cap(cap, held: int, pending: int) -> None:
+    """Raise the cap refusal when the institutions held plus the add
+    sessions already open leave no slot for one more. Each open session
+    can still finish and create a billed Item, so a household at one
+    below the cap could otherwise open several and complete them all."""
+    if cap is None or held + pending < cap:
+        return
+    if held >= cap:
+        from .. import ext
+        raise ValueError(ext.gate.institution_cap_message(cap, held))
+    raise ValueError(
+        "Another bank link is still in progress and would use this "
+        "instance's last connection slot — finish it first, or close that "
+        "window and try again in a couple of minutes.")
 
 
 def _start_plaid_session(user: dict, item_id: str = "",
@@ -974,6 +1071,8 @@ def _start_plaid_session(user: dict, item_id: str = "",
     conn = tenancy.tenant_connect(user["tenant_id"])
     try:
         access_token, inst, kind = None, None, "add"
+        cap, held = None, 0
+        recorded: set = set()
         if item_id:
             row = conn.execute(
                 "SELECT id, institution_name, status, webhook_status "
@@ -1008,6 +1107,17 @@ def _start_plaid_session(user: dict, item_id: str = "",
             # hosted soft-cap on connected institutions — only the
             # ADD door; update/re-auth of an existing item is always allowed
             sync_base.check_institution_cap(conn)
+            cap = sync_base.institution_cap(conn)
+            held = sync_base.institutions_held(conn) if cap is not None \
+                else 0
+            if cap is not None:
+                from ..jobs import plaid_links
+                recorded = plaid_links.recent_open(user["tenant_id"],
+                                                   _PLAID_ADD_LIVE)
+            # an early look, so a refused start never mints a link token;
+            # the binding check is the one under the guard below
+            _refuse_add_over_cap(cap, held, _open_add_sessions(
+                str(user["tenant_id"]), time.time(), recorded))
         # While a credential rotation's bank-link hold stands, the
         # household's own Plaid client may be one a hijacker saved: a new
         # link AND a re-auth would both hand it the bank login typed into
@@ -1023,22 +1133,41 @@ def _start_plaid_session(user: dict, item_id: str = "",
     finally:
         conn.close()
     tid = str(user["tenant_id"])
-    now = time.time()
-    # drop anything expired, whoever owns it
-    for k in [k for k, v in _PLAID_LINK.items()
-              if now - v.get("at", now) > _PLAID_LINK_TTL]:
-        _PLAID_LINK.pop(k, None)
-    # then trim THIS tenant's own oldest, never anyone else's
-    mine = [k for k, v in _PLAID_LINK.items() if v["tenant_id"] == tid]
-    while len(mine) >= _PLAID_LINK_MAX:
-        _PLAID_LINK.pop(mine.pop(0), None)
     lt = created["link_token"]
     url = created["hosted_link_url"]
-    _PLAID_LINK[lt] = {"tenant_id": tid,
-                       "item_id": item_id or None, "kind": kind,
-                       "manage_accounts": bool(item_id and manage_accounts),
-                       "institution": inst, "at": now,
-                       "url": url, "done": False}
+    dropped: list = []
+    with _PLAID_LINK_GUARD:
+        now = time.time()
+        if not item_id:
+            # an unused link token costs nothing, so refusing after
+            # creating it is safe; refusing before, unlocked, is not enough
+            _refuse_add_over_cap(cap, held,
+                                 _open_add_sessions(tid, now, recorded))
+            # only then does an abandoned session give up its place, and
+            # only when the new one would not fit beside it
+            dropped = _drop_abandoned_adds(tid, now, cap, held, recorded)
+        # drop anything expired, whoever owns it
+        for k in [k for k, v in _PLAID_LINK.items()
+                  if now - v.get("at", now) > _PLAID_LINK_TTL]:
+            _PLAID_LINK.pop(k, None)
+        # then trim THIS tenant's own oldest, never anyone else's
+        mine = [k for k, v in _PLAID_LINK.items() if v["tenant_id"] == tid]
+        while len(mine) >= _PLAID_LINK_MAX:
+            _PLAID_LINK.pop(mine.pop(0), None)
+        _PLAID_LINK[lt] = {"tenant_id": tid,
+                           "item_id": item_id or None, "kind": kind,
+                           "manage_accounts": bool(item_id
+                                                   and manage_accounts),
+                           "institution": inst, "at": now,
+                           "url": url, "done": False}
+    # on record too, so a session nobody is polling when it finishes — a
+    # closed tab, a restarted web process — is still finished by the LINK
+    # webhook or the worker's sweep (jobs/plaid_links.py)
+    from ..jobs import plaid_links
+    for k in dropped:
+        plaid_links.forget(k, tid)
+    plaid_links.record(tid, lt, kind, item_id or None,
+                       bool(item_id and manage_accounts), inst)
     return {"link_token": lt, "hosted_link_url": url,
             "kind": kind, "institution": inst}
 
@@ -1080,7 +1209,7 @@ def _plaid_session(link_token: str, user: dict) -> dict | None:
     # The POST that starts a session is owner-only via the global write
     # gate (bank connections are the owner's, members included); these
     # completion routes are GETs, which that gate waves through — yet the
-    # status poll is where the token exchange, first sync and item-status
+    # status poll is where the token exchange, the item row and item-status
     # writes actually happen. Same role rule, enforced here where the gate
     # can't see it.
     if user.get("role") != "owner":
@@ -1095,7 +1224,7 @@ def _plaid_session(link_token: str, user: dict) -> dict | None:
 @router.get("/accounts/plaid/link/{link_token}")
 def plaid_link_page(link_token: str, user: dict = Depends(_user())):
     sess = _plaid_session(link_token, user)
-    if not sess:
+    if not sess or not sess.get("url"):
         return RedirectResponse("/accounts", status_code=303)
     return _tpl("link.html", title="Link account", link_token=link_token, centered=False,
                 url=sess["url"], kind=sess["kind"],
@@ -1140,39 +1269,108 @@ def _apply_account_selection(conn, client, token, item_id: str) -> None:
         _links.set_shadow_scope(conn)
 
 
+@router.get("/accounts/plaid/links/open")
+def plaid_links_open(user: dict = Depends(_user())):
+    """This household's bank links still able to finish, so a client that
+    was closed, reloaded or killed while the person was in the bank's
+    window picks them up again and polls each to its answer. The server
+    finishes them without a client too (the LINK webhook and the worker's
+    sweep); this is what lets the person SEE the outcome. Owner-only, like
+    the doors that start and finish a link."""
+    if user.get("role") != "owner":
+        raise HTTPException(
+            403, "connecting a bank is owner-only — ask the account owner")
+    from ..jobs import plaid_links
+    return {"sessions": plaid_links.open_sessions(user["tenant_id"])}
+
+
+@router.delete("/accounts/plaid/link/{link_token}")
+def plaid_link_set_aside(link_token: str, user: dict = Depends(_user())):
+    """The person closed the bank window: stop holding a place under the
+    institution cap for this add session, and stop offering it to a
+    returning client. A closed tab tells Plaid nothing, so without this a
+    session the person abandoned would keep the household's last slot and
+    the next Connect would be refused. The session stays on record and is still
+    finished server-side if Plaid reports a bank after all.
+
+    Refused to the demonstration like the door that starts a session: the
+    demo never holds one, and the link family answers it in one voice."""
+    demoguard.deny_shared_credentials(user)
+    from ..jobs import plaid_links
+    with _PLAID_LINK_GUARD:
+        sess = _plaid_session(link_token, user)
+        if sess is not None and not sess.get("item_id") \
+                and not sess.get("done"):
+            sess["cancelled"] = True
+    if sess is None and plaid_links.load(link_token,
+                                         user["tenant_id"]) is None:
+        raise HTTPException(404, "unknown link session")
+    plaid_links.set_aside(link_token, user["tenant_id"])
+    return {"ok": True}
+
+
 @router.get("/accounts/plaid/link/{link_token}/status")
-def plaid_link_status(link_token: str, user: dict = Depends(_user())):
-    """Polled by the link page. Completes the exchange + first sync (add)
-    or verifies the item and clears its error status (update) the moment
+def plaid_link_status(link_token: str, user: dict = Depends(_user()),
+                      resume: int = 0):
+    """Polled by the link page. Completes the exchange and queues the
+    first sync on the worker (add) or verifies the item and clears its error status (update) the moment
     Plaid reports the session finished.
+
+    ``resume=1`` is a client picking up a session it was not watching
+    (plaid_links_open). That poll finishes the session the same way but
+    does not keep it counted under the institution cap: a page that
+    resumes on every visit would otherwise hold an abandoned session's
+    place for as long as it stays open, and Connect on the same page
+    would be refused.
 
     This GET writes the exchange and the item, so the request gate's
     write-only credential check never sees it; the shared demonstration
     login cannot start a link, and must not finish one an owner of the
     same household started either."""
     demoguard.deny_shared_credentials(user)
-    sess = _plaid_session(link_token, user)
+    from ..jobs import plaid_links
+    with _PLAID_LINK_GUARD:
+        sess = _plaid_session(link_token, user)
+    if sess is None:
+        # Not in this process's memory: the web process restarted since
+        # the session opened (a deploy), so the poll that would have got a
+        # 404 — which both clients take as final — picks the recorded
+        # session up instead and finishes it as if nothing had happened.
+        found = plaid_links.load(link_token, user["tenant_id"])
+        if found is not None:
+            with _PLAID_LINK_GUARD:
+                sess = _PLAID_LINK.setdefault(link_token, found)
+    if sess is not None and not resume:
+        with _PLAID_LINK_GUARD:
+            # the client is still waiting on this window: it keeps its
+            # place under the institution cap (_add_session_live)
+            sess["polled_at"] = time.time()
     if not sess:
         raise HTTPException(404, "unknown link session")
     # The billing read-only gate is METHOD-based (app.current_user only
-    # applies it to non-GET), and this GET is where the token exchange, the
-    # item row and the first sync are actually written. A session started
-    # while the tenant was in good standing stays pollable for its whole TTL,
+    # applies it to non-GET), and this GET is where the token exchange and
+    # the item row are actually written (and the first sync queued). A
+    # session started while the tenant was in good standing stays pollable for its whole TTL,
     # so a lapse mid-session would otherwise add a billed Plaid item to a
     # read-only account. Same rule as the POST that opened the session.
     if sess["done"]:
         # nothing left to write — the exchange already happened while
         # the tenant was in good standing, so a lapse since then must not
         # turn a finished link into an error
-        return {"done": True, "kind": sess["kind"],
-                "institution": sess.get("institution")}
+        return plaid_links.done_reply(sess)
     from .app import _billing_write_blocked
     if _billing_write_blocked({"tenant_id": user["tenant_id"]}):
         raise HTTPException(402, "this account is read-only right now")
     from ..sync.base import tenant_sync_lock
+    # Items this poll saved, whose first pull goes to the worker once the
+    # lock is let go: run here, a multi-year first pull holds a pooled
+    # connection and the household's sync lock for minutes, long after
+    # the edge proxy has stopped waiting for the answer, and a handful of
+    # households finishing Link together would take every connection
+    first_syncs: list[str] = []
     conn = tenancy.tenant_connect(user["tenant_id"])
     try:
-      # the exchange + first sync (and the adopt-onto-restored path inside
+      # the exchange (and the adopt-onto-restored path inside
       # it) write item/account/transaction state — under the same
       # per-tenant lock every scheduled sync and the background restore
       # take, or a link landing during a restore interleaves with its
@@ -1180,67 +1378,39 @@ def plaid_link_status(link_token: str, user: dict = Depends(_user())):
       with tenant_sync_lock(conn, user["tenant_id"]) as held:
         if not held:
             return {"done": False, "kind": "busy"}
+        # Looked at again under the lock: the check above ran before it, so
+        # a poll that queued behind the one finishing this session would
+        # otherwise exchange the same public token a second time — Plaid
+        # refuses a used token, and that refusal would overwrite the
+        # finished link's answer with a failure. The record is read too:
+        # the LINK webhook or the worker's sweep may have finished the
+        # session, or exchanged one of its tokens, while nobody polled.
+        plaid_links.refresh(sess, link_token)
+        if sess["done"]:
+            return plaid_links.done_reply(sess)
         client = plaid.Client.for_tenant(conn)
         try:
             data = client.get_link_session(link_token)
         except plaid.PlaidError as e:
             return {"done": False, "error": str(e)}
         sessions = data.get("link_sessions") or []
-        add_results = [
-            (s.get("link_session_id"), r) for s in sessions
-            for r in ((s.get("results") or {}).get("item_add_results") or [])]
-        if add_results:
-            names = []
-            err = None
-            for lsid, r in add_results:
-                # link_session_id rides along: it is the identifier Plaid
-                # support asks for when a link is investigated
-                try:
-                    iid = plaid.link_item(conn, r["public_token"],
-                                          link_session_id=lsid)
-                except plaid.PlaidError as e:
-                    # Mark done so the waiting page stops polling; never 500
-                    # (a raised error is re-tried every 3s and hammers Plaid).
-                    err = f"{e.code}: {e.message}"
-                    continue
-                except ValueError as e:
-                    # institution cap, re-checked at exchange time.
-                    # Same "stop polling, show why" contract as a PlaidError —
-                    # link_item has already handed the Item back to Plaid.
-                    err = str(e)
-                    continue
-                row = conn.execute(
-                    "SELECT institution_name FROM items WHERE id=%s",
-                    (iid,)).fetchone()
-                names.append(row["institution_name"] if row else None)
-            sess["done"] = True
-            sess["institution"] = (", ".join(n for n in names if n)
-                                   or sess.get("institution"))
-            if not names and err:
-                sess["kind"] = "add_failed"
-                return {"done": True, "kind": "add_failed",
-                        "institution": sess.get("institution"),
-                        "error": err}
-            return {"done": True, "kind": "add",
-                    "institution": sess["institution"]}
-        if (not sess["item_id"]
-                and any(s.get("finished_at") for s in sessions)):
-            # ADD mode, session finished, nothing added: the user exited
-            # Link without connecting a bank (the exit button stamps
-            # finished_at too). Without this the poll falls through to
-            # {"done": False} forever and the add-account button sits on
-            # "Connecting…" for its full 15-minute deadline. Results can
-            # lag the finished stamp by a beat, so require a second look
-            # a few seconds later before declaring the session abandoned.
-            now = time.time()
-            first = sess.get("finished_empty_at")
-            if first is None:
-                sess["finished_empty_at"] = now
-            elif now - first > 6:
-                sess["done"] = True
-                sess["kind"] = "exited"
-                return {"done": True, "kind": "exited",
-                        "institution": sess.get("institution")}
+        # ADD mode: exchange each public token Plaid reports and finish
+        # the session (jobs/plaid_links.complete_add — the same code the
+        # webhook and the sweep run). Never a 500 for a Plaid refusal: a
+        # raised error is re-tried by the client every few seconds and
+        # hammers Plaid.
+        added = plaid_links.complete_add(conn, sess, link_token, sessions,
+                                         defer_sync=first_syncs)
+        if added is not None:
+            return added
+        # ADD mode, session finished, nothing added: the user exited
+        # Link without connecting a bank (the exit button stamps
+        # finished_at too). Without this the poll falls through to
+        # {"done": False} forever and the add-account button sits on
+        # "Connecting…" until the client's deadline.
+        left = plaid_links.exited(sess, link_token, sessions)
+        if left is not None:
+            return left
         if sess["item_id"] and any(s.get("finished_at") for s in sessions):
             # finished_at alone doesn't mean SUCCESS — Plaid stamps it when
             # the user abandons/errors out of the Link flow too. Verify
@@ -1291,15 +1461,22 @@ def plaid_link_status(link_token: str, user: dict = Depends(_user())):
                                              sync_base.get_access_token(
                                                  conn, sess["item_id"]),
                                              sess["item_id"])
-                return {"done": True, "kind": "update",
-                        "institution": sess.get("institution")}
-            sess["kind"] = "update_failed"
-            return {"done": True, "kind": "update_failed",
-                    "institution": sess.get("institution"),
-                    "error": (item_err or {}).get("error_code")}
+                return plaid_links.mark_done(
+                    sess, link_token,
+                    {"done": True, "kind": "update",
+                     "institution": sess.get("institution")})
+            return plaid_links.mark_done(
+                sess, link_token,
+                {"done": True, "kind": "update_failed",
+                 "institution": sess.get("institution"),
+                 "error": (item_err or {}).get("error_code")})
         return {"done": False}
     finally:
         conn.close()
+        if first_syncs:
+            from ..jobs import worker
+            for iid in first_syncs:
+                worker.queue_first_sync(user["tenant_id"], iid)
 
 
 def _when_phrase(ts) -> str:
@@ -1385,6 +1562,24 @@ def _account_sync(user: dict, item_id: str) -> tuple[str, str]:
             # way; the next sweep's own before-snapshot already holds these
             # rows and would never name them.
             from ..jobs import worker as _worker
+            if row["aggregator"] == "plaid" \
+                    and _worker.never_pulled(conn, item_id):
+                # A bank no pull has finished yet is owed its first pull,
+                # up to two years of history over several minutes. Only the
+                # worker's first-sync job runs that, a few at a time, so a
+                # burst of new households cannot fill the web pool, and so
+                # the backfill is not announced to webhooks as new charges.
+                # The button is shown while the first sync is pending, so
+                # pressing it queues that job (one id per Item: a repeat
+                # press adds nothing) and does not run the pull here.
+                # The queue is asked off the request (a Redis that is down
+                # must not hold the page), so this answer cannot know the
+                # job landed; it says only what holds either way: the
+                # hourly sync queues a first sync still owed.
+                _worker.queue_first_sync(user["tenant_id"], item_id)
+                return "ok", (f"{name}: its history is still arriving. Its "
+                              "first sync has been asked for; if it cannot "
+                              "start now, the hourly sync starts it.")
             pulls = row["aggregator"] in ("plaid", "simplefin")
             before_ids = _worker._recent_txn_ids(conn) if pulls else None
             try:
@@ -1628,6 +1823,11 @@ def _proposal_summary(p) -> str:
         n = ev.get("n") or 0
         bits.append(f"Plaid sees this recurring — {n} charge{'' if n == 1 else 's'}"
                     + (" (early)" if ev.get("status") == "EARLY_DETECTION" else ""))
+    if ev.get("charged_on") and ev.get("old") is not None and ev.get("new") is not None:
+        # a price change: the charge that arrived at the new amount
+        bits.append(f"charged ${float(ev['new']):,.2f} on "
+                    f"{as_date(ev['charged_on']).strftime('%m/%d/%y')}, "
+                    f"the bill says ${float(ev['old']):,.2f}")
     if ev.get("hits"):
         bits.append(f"{ev['hits']} charges on a {ev.get('cycle_days','?')}-day cycle")
     if ev.get("monthly_totals"):
@@ -1941,7 +2141,7 @@ def _dispatch_import_unlocked(conn, account_id: str, amount_sign: str,
                     "apply to PDFs — for a CSV pick bank or positive=out "
                     "CSV, or investment for brokerage activity CSVs")
             text = upload_text(data)
-            header = next(csvmod.reader(io.StringIO(text)), [])
+            header = csvimport.read_header(text)
             from ..sync import plan_csv as _plan
             # Never auto-import a workplace-plan CSV here: the generic path
             # cannot know which retirement plan the file belongs to, and
@@ -1987,9 +2187,7 @@ def _dispatch_import_unlocked(conn, account_id: str, amount_sign: str,
                     # column mapping blind — at the one moment the file's own
                     # rows are the answer. Ship a few of them; the text is
                     # already parsed and in hand.
-                    rdr = csvmod.reader(io.StringIO(text))
-                    next(rdr, None)              # the header, already sent
-                    sample = [r for _, r in zip(range(5), rdr)]
+                    sample = csvimport.sample_rows(text, header)
                     return {}, {"token": token, "header": header,
                                 "sample": sample,
                                 "filename": filename}

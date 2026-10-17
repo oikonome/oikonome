@@ -65,7 +65,7 @@ class OverruleLapsesTests(unittest.TestCase):
         self.conn = make_db()
         write_config(self.conn, plaid_client_id="cid", plaid_secret="sec",
                      plaid_env="sandbox")
-        for d in range(merchant_identity.ESTABLISHED_ROWS):
+        for d in range(3):
             add_txn(self.conn, f"2026-08-{d + 1:02d}", 20.0 + d, LINE,
                     merchant=USUAL, txn_id=f"h{d}")
         add_txn(self.conn, "2026-04-14", 7.40, LINE, merchant=STRAY,

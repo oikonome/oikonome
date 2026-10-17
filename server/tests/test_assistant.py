@@ -50,6 +50,41 @@ class AssistantTests(unittest.TestCase):
         self.assertEqual(r["answer"], "Hello!")
         self.assertEqual(r["tools_used"], [])
 
+    def _final(self, text):
+        t = _seq_transport([{"content": text, "tool_calls": []}])
+        return assistant.ask(self.conn, "q", transport=t, backend=_BE)
+
+    def test_a_chart_that_fails_validation_is_a_notice_not_raw_json(self):
+        # a JSON block that is not a drawable spec: neither the fence nor
+        # the JSON reaches the reader, and the answer still says something
+        r = self._final('```chart\n{"type": "bar", "title": "t"}\n```')
+        self.assertNotIn("```", r["answer"])
+        self.assertNotIn('"type"', r["answer"])
+        self.assertTrue(r["answer"].strip())
+        self.assertEqual([b["kind"] for b in r["blocks"]], ["text"])
+        self.assertEqual(r["blocks"][0]["text"], r["answer"])
+
+    def test_a_fenced_block_that_is_not_json_stays_visible(self):
+        # a table the model quoted inside a bare fence is part of the
+        # answer, not a chart that failed to parse
+        quoted = "Month | Spent\nJan   | 412\nFeb   | 388"
+        r = self._final(f"Here it is:\n```\n{quoted}\n```\nThat's all.")
+        self.assertIn("Jan   | 412", r["answer"])
+        self.assertIn("That's all.", r["answer"])
+        self.assertNotIn("```", r["answer"])
+        texts = " ".join(b["text"] for b in r["blocks"]
+                         if b["kind"] == "text")
+        self.assertIn("Feb   | 388", texts)
+
+    def test_an_answer_that_is_only_a_chart_does_not_carry_the_fence(self):
+        spec = ('{"type": "bar", "title": "t", "labels": ["x"], '
+                '"series": [{"name": "s", "values": [1]}]}')
+        r = self._final(f"```chart\n{spec}\n```")
+        self.assertNotIn("```", r["answer"])
+        self.assertNotIn('"series"', r["answer"])
+        self.assertTrue(r["answer"].strip())
+        self.assertEqual([b["kind"] for b in r["blocks"]], ["bar"])
+
     def test_routes_tool_then_answers(self):
         t = _seq_transport([
             _tool_call("net_worth"),

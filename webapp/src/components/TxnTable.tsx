@@ -30,17 +30,27 @@ const money = (v: number | null | undefined) => money$(v, true);  // cents on tr
 // with the verdict, the daily email and the Business worksheet — three
 // surfaces that all already exclude exactly these.
 //
-// The server decides which rows count (counts_as_spend, computed from the
-// same SQL the verdict uses) — the client must not re-derive spend
-// semantics: the display category can't see overrides collapsing to
-// transfers or loan-account rows, so any local rule diverges. The category
-// fallback below exists only for a NEW client against an OLD server that
-// doesn't send the field yet — without it every day would total $0.
-const daySpend = (group: Txn[]) => group.reduce((sum, t) =>
-  sum + ((typeof t.counts_as_spend === "boolean"
-          ? t.counts_as_spend
-          : t.amount > 0 && !(t.category || "").includes("TRANSFER"))
-         ? t.amount : 0), 0);
+// The server sends each row's share of spending (spend_amount) by the
+// verdict's own math — net of a partial reimbursement, a split row's
+// matching parts' share under the search's category filter, 0 for rows the
+// verdict does not count (excluded or hidden accounts, linked shadows
+// included). Summing that, not `amount`,
+// is what makes a day subtotal agree with the month hero; the client must
+// not re-derive spend semantics, because the display category can't see
+// overrides collapsing to transfers or loan-account rows. The fallbacks
+// exist only for a NEW client against an OLDER server: counts_as_spend
+// with the gross amount, then a category rule — without them every day
+// would total $0. Mirrored by mobile's rowSpend/daySpend in lib/pure.ts.
+const rowSpend = (t: Pick<Txn, "amount" | "category"
+                                 | "counts_as_spend" | "spend_amount">) => {
+  if (typeof t.spend_amount === "number") return t.spend_amount;
+  const counts = typeof t.counts_as_spend === "boolean"
+    ? t.counts_as_spend
+    : t.amount > 0 && !(t.category || "").includes("TRANSFER");
+  return counts ? t.amount : 0;
+};
+const daySpend = (group: Txn[]) =>
+  group.reduce((sum, t) => sum + rowSpend(t), 0);
 
 // "Thu · Aug 13". The weekday is the reason this exists — MM/DD never says
 // whether an expensive day was a Saturday, and the row's own date column
@@ -292,14 +302,19 @@ const Row = memo(function Row({ t, viewer, showAccount, picked, armed,
             come free with it. The reimbursement flag lives in the ⋯
             strip instead; two doors to one action is how they drift
             apart. */}
-        {/* a hand-split row shows its parts where the category goes —
+        {/* a split row shows its parts where the category goes —
             the rollups count those, not the row's own category — and
             the picker steps aside: recategorizing a split is editing the
-            split. Viewers read the same parts, plain. */}
+            split. Viewers read the same parts, plain. A receipt's split
+            (the store matcher carved the charge the way its items read)
+            says so on the pill; editing it makes it the person's. */}
         {t.split?.length ? (
           <span className="txn-split" role={viewer ? undefined : "button"}
                 tabIndex={viewer ? undefined : 0}
-                title={viewer ? "split across categories" : "edit the split"}
+                title={viewer ? "split across categories"
+                       : t.split_source && t.split_source !== "user"
+                         ? "split by the receipt's items — edit to make it yours"
+                         : "edit the split"}
                 aria-label={`split across ${t.split.length} categories${viewer ? "" : " — edit"}`}
                 style={{ cursor: viewer ? undefined : "pointer",
                          display: "inline-flex", flexDirection: "column",
@@ -314,7 +329,8 @@ const Row = memo(function Row({ t, viewer, showAccount, picked, armed,
                 {" "}{catLabel(p.category)}
               </span>
             ))}
-            <span className="pill b" style={{ alignSelf: "flex-start" }}>✂ split</span>
+            <span className="pill b" style={{ alignSelf: "flex-start" }}>
+              {t.split_source && t.split_source !== "user" ? "✂ split by receipt" : "✂ split"}</span>
           </span>
         ) : viewer ? (
           <span style={{ fontSize: 12, color: "var(--mut)" }}>
@@ -510,7 +526,7 @@ export default memo(function TxnTable({ rows, showAccount = true,
     flushSync(() => setArmed((s) => s.has(id) ? s : new Set(s).add(id)));
   }, []);
   const navigate = useNavigate();
-  const cats = useQuery({ queryKey: ["cats"], queryFn: api.categories });
+  const cats = useQuery({ queryKey: ["categories"], queryFn: api.categories });
   // anything in use that isn't a standard Plaid primary — i.e. what this
   // tenant named itself via the custom prompt
   const customCats = useMemo(() => {

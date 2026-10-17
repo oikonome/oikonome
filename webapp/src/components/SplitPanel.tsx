@@ -77,6 +77,10 @@ export default function SplitPanel({ t, catGroups, known, onDone }:
       <div className="sub">
         Split <b>{fmt(total)}</b> at <b>{t.payee}</b> across categories —
         the parts must add up to the charge.
+        {t.split_source && t.split_source !== "user" && (
+          <> These parts follow the receipt's items; saving makes them yours,
+             and removing them keeps the whole charge under its category.</>
+        )}
       </div>
       {parts.map((p, i) => (
         <div key={i} style={{ display: "flex", gap: ".5rem", alignItems: "center",
@@ -128,7 +132,9 @@ export default function SplitPanel({ t, catGroups, known, onDone }:
         <span style={{ marginLeft: "auto", display: "flex", gap: ".5rem" }}>
           {t.split?.length ? (
             <button disabled={busy} onClick={() => clear.mutate()}
-                    title="drop the parts — the row counts whole under its own category again">
+                    title={t.split_source && t.split_source !== "user"
+                      ? "drop the receipt's parts — the row counts whole under its own category, pinned so the receipt does not split it again"
+                      : "drop the parts — the row counts whole under its own category again"}>
               remove split</button>
           ) : null}
           <button disabled={busy} onClick={onDone}>Cancel</button>

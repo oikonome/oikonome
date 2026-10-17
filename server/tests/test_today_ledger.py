@@ -1,7 +1,7 @@
 """The spend-at-most card's today-ledger.
 
-The /day rate amortizes today's spending over the whole rest of the month,
-so buying lunch barely moves it and it never answers "can I spend more
+The /day rate amortizes today's spending over the rest of the month, so
+buying lunch barely moves it and it never answers "can I spend more
 TODAY?". The today-ledger does: each category's allowance is FIXED at the
 start of the day (remaining at midnight ÷ days left) and today's spend
 deducts from it in full. Negative = over for today; tomorrow's allowance
@@ -14,7 +14,8 @@ import unittest
 from oikonome.engine import budget
 from oikonome.web import report, todayview
 
-from .util import TODAY, add_bill, add_txn, make_db, write_config
+from .util import (TODAY, add_bill, add_ledger_history, add_txn, make_db,
+                   write_config)
 
 # util config: food_monthly=1000, other_monthly=1000. TODAY = 2026-07-15,
 # July has 31 days -> days_left = 17.
@@ -24,6 +25,9 @@ DAYS_LEFT = 17
 class TodayLedgerTests(unittest.TestCase):
     def setUp(self):
         self.conn = make_db()
+        # an established household: the tiles spread the whole month's
+        # budget only for a ledger that predates the month
+        add_ledger_history(self.conn, TODAY)
         write_config(self.conn)
 
     def tearDown(self):
@@ -46,9 +50,14 @@ class TodayLedgerTests(unittest.TestCase):
         self.assertAlmostEqual(f["spent_today"], 30.0, 2)
         # ...and today's $30 comes off it dollar for dollar
         self.assertAlmostEqual(f["left_today"], 800 / DAYS_LEFT - 30, 2)
-        # while the /day rate amortizes the same $30 over 17 days — the
-        # difference is the entire point of the feature
-        self.assertAlmostEqual(f["rate"], 770 / DAYS_LEFT, 2)
+        # while the /day rate charges today its whole allowance ($30 is
+        # under it) and spreads the rest over the 16 days after today, so
+        # spending within the day's allowance leaves the daily where it was
+        allowance = 800 / DAYS_LEFT
+        self.assertAlmostEqual(f["rate"],
+                               (800 - allowance) / (DAYS_LEFT - 1), 2)
+        self.assertAlmostEqual(f["rate"], allowance, 2)
+        self.assertEqual(f["rate_days"], DAYS_LEFT - 1)
         # the tile meter's month scope: full track = month budget, fill =
         # month-to-date spend (the pace tick renders at today client-side)
         self.assertAlmostEqual(f["month_budget"], 1000.0, 2)

@@ -205,6 +205,23 @@ def own_addresses_only(user: dict, addresses) -> list:
     return [a for a in addresses if str(a or "").strip().lower() == mine]
 
 
+SHARED_LOG_DENIED = ("This is a shared demonstration login — it can't "
+                     "delete questions from the household's log, since "
+                     "other visitors asked them too")
+
+
+def deny_shared_log(user: dict) -> None:
+    """403 for the shared demonstration login at the doors that delete
+    from a log every holder of the login writes to (the assistant's
+    questions). One visitor clearing it would erase what the others asked;
+    a demonstration household's other logins, which are each one person's,
+    keep the door. Not `deny`: the demo instance is editable, and a log of
+    synthetic questions is the visitor's to tidy unless the login is
+    shared."""
+    if is_shared_login(user):
+        raise HTTPException(403, SHARED_LOG_DENIED)
+
+
 SHARED_PEOPLE_DENIED = ("This is a shared demonstration login — the "
                         "household's own notes about its people are not "
                         "shown to it or changed by it")

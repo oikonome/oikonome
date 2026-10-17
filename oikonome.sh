@@ -231,6 +231,13 @@ app_port() {
   echo "${p:-8042}"
 }
 
+# app_host — the host part of every probe URL: the address the port is
+# published on (OIKONOME_BIND_ADDRESS, environment first like app_port),
+# localhost for a wildcard or unset bind. See probe_host.
+app_host() {
+  probe_host "${OIKONOME_BIND_ADDRESS:-$(env_get OIKONOME_BIND_ADDRESS)}"
+}
+
 # Rootless Podman hides client addresses: every published-port connection
 # reaches the app through a user-space forwarder, so the app sees its own
 # pod-network address as the peer of every client. Auto-ban, the per-IP
@@ -264,12 +271,35 @@ warn_rootless_podman() {
   echo "      See docs/reverse-proxy.md."
 }
 
-# every artifact stays inside the install folder — backups included.
-# (External schedulers that want a shared spot call scripts/backup.sh
-# with their own destination.)
+# backups stay inside the install folder unless OIKONOME_BACKUP_DIR moves
+# them — the one setting this script, the console's restore lookup and the
+# compose bind behind the console's backup card all read, so a scheduled
+# scripts/backup.sh aimed there is seen and restorable from the console.
 backup_dir() {
-  echo "$ROOT/backups"
+  if [ -n "${OIKONOME_BACKUP_DIR:-$(env_get OIKONOME_BACKUP_DIR)}" ]; then
+    backup_dir_resolve "$ROOT/docker"
+  else
+    echo "$ROOT/backups"
+  fi
 }
+
+# A folder OIKONOME_BACKUP_DIR moved is also the source of the console
+# backup card's read-only bind, and the app container runs under another
+# uid: a 0700 folder (what scripts/backup.sh used to create) shows there as
+# no backups at all. So whenever this script prepares it, the folder is
+# opened to go=rx — listable, never writable; the dumps inside stay 0600 —
+# but only when it belongs to whoever owns the install, so a folder someone
+# else shares with us keeps the mode they chose. The default backups/
+# folder is never touched here.
+backup_dir_open() {
+  local d
+  [ -n "${OIKONOME_BACKUP_DIR:-$(env_get OIKONOME_BACKUP_DIR)}" ] || return 0
+  d=$(backup_dir)
+  [ -d "$d" ] || return 0
+  [ "$(owner_uid "$d")" = "$(owner_uid "$ROOT")" ] || return 0
+  chmod u=rwx,go=rx "$d" 2>/dev/null || true
+}
+owner_uid() { stat -c %u "$1" 2>/dev/null || stat -f %u "$1" 2>/dev/null; }
 
 newest_backup() {
   ls -1t "$(backup_dir)"/oikonome-*.sql.gz 2>/dev/null | head -1 || true
@@ -315,13 +345,14 @@ human_age() { # seconds → "5m" / "3h" / "2d"
 }
 
 wait_ready() { # wait_ready [tries] — poll /readyz until the app answers
-  local port tries i fill
+  local port host tries i fill
   port=$(app_port)
+  host=$(app_host)
   tries=${1:-60}
   for i in $(seq 1 "$tries"); do
-    if curl -sf "http://localhost:${port}/readyz" >/dev/null 2>&1; then
+    if curl -sf "http://${host}:${port}/readyz" >/dev/null 2>&1; then
       [ -t 1 ] && printf '\r\033[K'
-      ok "Healthy: http://localhost:${port}/readyz answers."
+      ok "Healthy: http://${host}:${port}/readyz answers."
       return 0
     fi
     # progress bar when on a terminal, plain dots otherwise (logs/CI)
@@ -374,6 +405,7 @@ pre_upgrade_snapshot() {
   # by the restore picker as the newest way back
   part="$(backup_dir)/.$(basename "$snap").partial"
   shared_umask mkdir -p "$(backup_dir)"
+  backup_dir_open
   say "Snapshotting the database before the upgrade…"
   if ( umask 077; ( cd "$ROOT/docker" && pg_dump_db 2>/dev/null ) | gzip > "$part" ) \
       && dump_looks_real "$part" && mv -f "$part" "$snap"; then
@@ -690,8 +722,9 @@ pick_instance() {
 cmd_status() {
   find_compose
   cd "$ROOT/docker"
-  local port ver last size age
+  local port host ver last size age
   port=$(app_port)
+  host=$(app_host)
 
   echo
   say "Services"
@@ -724,7 +757,7 @@ cmd_status() {
   echo
   say "Instance"
   echo "  Folder:   $ROOT"
-  echo "  Port:     $port  (http://localhost:${port})"
+  echo "  Port:     $port  (http://${host}:${port})"
   ver=$(describe_version "$ROOT" --dirty)
   echo "  Version:  ${ver:-unknown (not a git checkout)}"
 
@@ -737,7 +770,7 @@ cmd_status() {
     echo "  Backup:   none yet  (run: ./oikonome.sh backup)"
   fi
 
-  if curl -sf "http://localhost:${port}/readyz" >/dev/null 2>&1; then
+  if curl -sf "http://${host}:${port}/readyz" >/dev/null 2>&1; then
     ok "Health:   /readyz answers — app is up."
   else
     warn "Health:   /readyz NOT answering on port ${port}."
@@ -753,7 +786,7 @@ cmd_status() {
   local tok host_ip loc
   tok=$(env_get OIKONOME_SETUP_TOKEN)
   loc=$(curl -s -o /dev/null -w '%{redirect_url}' --max-time 5 \
-             "http://localhost:${port}/" 2>/dev/null || echo "")
+             "http://${host}:${port}/" 2>/dev/null || echo "")
   if [ -n "$tok" ] && case "$loc" in */setup) true ;; *) false ;; esac; then
     if [ -n "${OIKONOME_ASSUME_YES:-}" ] || [ ! -t 1 ]; then
       # the host agent captures this to a world-readable log and the admin
@@ -765,7 +798,7 @@ cmd_status() {
       echo "            withheld from this log on purpose)."
     else
       warn "Setup:    no account yet — create it with this one-time link:"
-      echo "            http://localhost:${port}/setup?token=${tok}"
+      echo "            http://${host}:${port}/setup?token=${tok}"
       host_ip=$(lan_ip)
       [ -n "$host_ip" ] && \
         echo "            http://${host_ip}:${port}/setup?token=${tok}  (from another machine)"
@@ -829,6 +862,7 @@ cmd_backup() {
   [ -f "$ROOT/scripts/backup.sh" ] || die "No scripts/backup.sh in $ROOT."
   dest=$(backup_dir)
   say "Backing up to $dest …"
+  backup_dir_open
   "$ROOT/scripts/backup.sh" "$ROOT" "$dest"
 }
 
@@ -1039,13 +1073,13 @@ cmd_restore() {
   # lands next to the other dumps, so it's restorable like any backup.
   local pre had_users
   pre="$dest/oikonome-pre-restore-$(date +%Y%m%d-%H%M%S).sql.gz"
-  # The backups DIRECTORY deliberately keeps the conventional mode: unlike
-  # backup.sh's external destination, this one is bind-mounted read-only
-  # into the app container (../backups:/state/backups) so the admin
+  # The backups DIRECTORY deliberately keeps the conventional mode: it is
+  # bind-mounted read-only into the app container (../backups:/state/backups) so the admin
   # console's backup card can list it, and uid 10001 cannot traverse an
   # 0700 directory owned by the host user. The protection that matters is
   # on the dumps themselves, which are 0600 whoever can open the folder.
   shared_umask mkdir -p "$dest"
+  backup_dir_open
   # How much this restore is risking, measured BEFORE the drop: an
   # instance with accounts on it must never end up with none. Any error
   # (fresh database, no schema yet) reads as zero.
@@ -1241,6 +1275,7 @@ cmd_reset() {
              "$old_key" > "$saved" ) \
       || die "Couldn't save the master key to $saved — nothing deleted."
     chmod 600 "$saved"
+    backup_dir_open   # the key file stays 0600; the folder only lists
     ok "Master key saved: $saved"
   fi
 
@@ -1406,9 +1441,91 @@ cmd_https() {
 		header_up X-Forwarded-For {client_ip}
 	}"
   fi
+  # The "back in a moment" page, in two forms that share their markup.
+  # A GET is safe to repeat, so that page simply meta-refreshes. A form
+  # POST is not: a refresh re-requests the action URL as a bare GET with
+  # none of the form fields, and the one-time-link doors carry their token
+  # in a hidden field, so the person would be told a link that was never
+  # spent is invalid. That page instead waits for /readyz and then goes
+  # back to the page the form was on, where pressing the button works.
+  # (Lines keep the Caddy heredoc's three-tab indent; no \$ in the HTML.)
+  back_head=$(cat <<'HTML'
+			<!doctype html>
+			<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+HTML
+)
+  back_body=$(cat <<'HTML'
+			<title>Oikonome — back in a moment</title>
+			<style>
+			:root{color-scheme:dark}
+			body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b0f14;color:#dbe3ea;font:17px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+			main{max-width:30rem;padding:2.5rem 1.5rem;text-align:center}
+			.mark{width:72px;height:72px;margin:0 auto 1.25rem;animation:spin 2.4s linear infinite}
+			@keyframes spin{to{transform:rotate(360deg)}}
+			h1{font-size:1.5rem;margin:0 0 .75rem;font-weight:650;letter-spacing:-.01em}
+			p{margin:.5rem 0;color:#8b98a3}
+			p b{color:#dbe3ea;font-weight:600}
+			.bar{height:3px;width:12rem;margin:1.5rem auto 0;background:#1a212b;border-radius:3px;overflow:hidden}
+			.bar i{display:block;height:100%;width:40%;background:#4f9bd6;border-radius:3px;animation:sweep 1.6s ease-in-out infinite}
+			@keyframes sweep{0%{transform:translateX(-120%)}100%{transform:translateX(300%)}}
+			.fine{font-size:.9rem;margin-top:1.25rem}
+			@media (prefers-reduced-motion:reduce){.mark,.bar i{animation:none}}
+			</style></head>
+			<body><main>
+			<svg class="mark" viewBox="0 0 100 100" aria-hidden="true"><path d="M39.7 78.2 A30 30 0 1 1 60.3 78.2" fill="none" stroke="#4f9bd6" stroke-width="11" stroke-linecap="round"/></svg>
+			<h1>Back in a moment</h1>
+			<p>Oikonome is <b>adding capacity</b> or installing an update.</p>
+HTML
+)
+  back_tail=$(cat <<'HTML'
+			<div class="bar"><i></i></div>
+			<p class="fine">Your data and your sign-in are safe. Nothing to do but wait.</p>
+			</main></body></html>
+HTML
+)
   cat > "$ROOT/docker/Caddyfile" <<CADDY
 ${cf_global}${domain} {
 	reverse_proxy app:8080${cf_rp}
+	# When the app is restarting (a deploy, more capacity) or down, show a
+	# page that says so and refreshes itself, instead of a bare 502. 503 so
+	# monitors still count it; Retry-After so polite clients wait. Only a
+	# GET or HEAD gets the plain refresh: refreshing a form POST would
+	# re-request its URL without the form, so that page waits for the app
+	# and then goes back to the form instead.
+	handle_errors 502 503 504 {
+		header Retry-After 5
+		header Content-Type "text/html; charset=utf-8"
+		header Cache-Control "no-store"
+		@repeatable method GET HEAD
+		handle @repeatable {
+			respond <<HTML
+${back_head}
+			<meta http-equiv="refresh" content="5">
+${back_body}
+			<p>This page refreshes itself and takes you back to where you were as soon as the work is done — usually seconds, a few minutes at most.</p>
+${back_tail}
+			HTML 503
+		}
+		handle {
+			respond <<HTML
+${back_head}
+${back_body}
+			<p>This page refreshes itself and takes you back to where you were as soon as the work is done — usually seconds, a few minutes at most.</p>
+			<p>What you just sent did not arrive, so nothing was used up. Once you are back, press the button again.</p>
+			<noscript><p>When the work is done, press your browser's Back button and send it again.</p></noscript>
+			<script>
+			(function(){
+			function check(){fetch("/readyz",{cache:"no-store"}).then(function(r){
+			if(!r.ok){setTimeout(check,5000);return}
+			if(history.length>1){history.back()}else{location.replace("/")}
+			},function(){setTimeout(check,5000)})}
+			setTimeout(check,5000)
+			})()
+			</script>
+${back_tail}
+			HTML 503
+		}
+	}
 	encode zstd gzip
 	# security headers at the edge too. The app sets the same
 	# set itself (SecurityHeadersMiddleware); this covers responses Caddy
@@ -2059,7 +2176,7 @@ menu() {
     echo
     if [ -f "$ROOT/docker/.env" ]; then
       # live health dot: green = /readyz answers, red = installed but down
-      if curl -sf --max-time 1 "http://localhost:$(app_port)/readyz" >/dev/null 2>&1; then
+      if curl -sf --max-time 1 "http://$(app_host):$(app_port)/readyz" >/dev/null 2>&1; then
         health=$(printf '\033[32m●\033[0m running')
       else
         health=$(printf '\033[31m●\033[0m down')

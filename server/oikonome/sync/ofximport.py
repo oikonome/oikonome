@@ -18,7 +18,15 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import io
+import itertools
+import json
+import logging
+import os
 import re
+import subprocess
+import sys
+import tempfile
+import threading
 
 from ofxtools.Parser import OFXTree
 
@@ -26,10 +34,14 @@ from ..engine.compat import as_date
 from . import flowmap
 from .base import (FileImportIds, Transaction, _descriptor,
                    ensure_split_account, mask_long_digits,
-                   upsert_transactions)
+                   drop_before_history, upsert_transactions)
+from . import rowcap
 from .rowcap import check_len
 from .dedup import WINDOW_DAYS as DEDUP_WINDOW_DAYS  # noqa: F401 (re-export)
 from .dedup import Deduper
+from .pdf_sandbox import _kill, _tail
+
+log = logging.getLogger(__name__)
 
 
 # ofxtools reads OFX (both the SGML v1 and the XML v2 flavour) with its own
@@ -52,6 +64,42 @@ def _refuse_dtd(data: bytes) -> None:
                          "which is refused as unsafe")
 
 
+# ofxtools reads a CDATA section with `<!\[CDATA\[(.+)\]\]>` in a regex
+# compiled without DOTALL, after every start tag: the greedy `.+` runs to
+# the end of the line and backs off to the line's LAST `]]>`. So each
+# CDATA opener costs the parse the rest of its line — and a line packed
+# with openers (closed or not) costs the square of its length: a few
+# hundred KB on one line held a parse slot for the whole deadline. The
+# same greediness means two sections on one line are read as one value
+# running from the first opener to the last closer, so ofxtools never
+# read such a file correctly anyway. CDATA itself is allowed (some
+# exports wrap NAME/MEMO in it); refused is any opener with no closer on
+# its own line, and a second opener on a line that already has one —
+# which bounds the parser's CDATA work by the file's length.
+_CDATA_OPEN = b"<![CDATA["
+_CDATA_CLOSE = b"]]>"
+_CDATA_MSG = ("this OFX/QFX file has a CDATA section that is not closed on "
+              "its own line, or several on one line — no bank statement is "
+              "written that way, so it is refused unread")
+
+
+def _refuse_costly_cdata(data: bytes) -> None:
+    """One linear pass: each step scans only past the bytes the previous
+    one stopped at."""
+    pos = data.find(_CDATA_OPEN)
+    while pos != -1:
+        eol = data.find(b"\n", pos)
+        if eol == -1:
+            eol = len(data)
+        close = data.find(_CDATA_CLOSE, pos + len(_CDATA_OPEN), eol)
+        if close == -1:
+            raise ValueError(_CDATA_MSG)
+        nxt = data.find(_CDATA_OPEN, close + len(_CDATA_CLOSE))
+        if nxt != -1 and nxt < eol:
+            raise ValueError(_CDATA_MSG)
+        pos = nxt
+
+
 def _posted_date(t) -> dt.date | None:
     """DTPOSTED as a date, or None — which import_ofx already skips. A
     well-formed year the rest of the app cannot read (0001, 9999) is
@@ -65,10 +113,57 @@ def _posted_date(t) -> dt.date | None:
         return None
 
 
-def parse_ofx(data: bytes) -> list[dict]:
+# What one OFX/QFX upload may be before it is parsed at all. ofxtools
+# builds the whole element tree, then an object per element, then this
+# module a dict per row — about 65 bytes of memory per byte of a file made
+# of minimal records — so a row cap applied after the parse is too late on
+# its own: a file of a few tens of MB would exceed a typical container
+# memory limit. A real statement export is KB to low MB; a
+# decade of history from one bank stays well inside this.
+MAX_OFX_BYTES = 10 * 1024 * 1024
+
+_TOO_BIG_MSG = ("this OFX/QFX file is too large to import in one piece "
+                f"(max {MAX_OFX_BYTES // (1024 * 1024)} MB) — export a "
+                "shorter date range and import the files one at a time")
+
+# Every transaction aggregate this importer can be handed: a bank or card
+# line (<STMTTRN>, which an investment statement's cash lines also wrap)
+# and an investment line (every buy/sell/income/... aggregate carries one
+# <INVTRAN>). `\b` keeps <STMTTRNRS>, the response wrapper, out.
+_ROW_MARKER = re.compile(rb"<(?:STMTTRN|INVTRAN)\b", re.IGNORECASE)
+
+
+def _refuse_oversize(data: bytes) -> None:
+    """Refuse a file the parse would be too costly for, from its bytes:
+    one linear scan, nothing built. The count stops one past the cap."""
+    if len(data) > MAX_OFX_BYTES:
+        raise ValueError(_TOO_BIG_MSG)
+    cap = rowcap.MAX_IMPORT_ROWS
+    found = sum(1 for _ in itertools.islice(_ROW_MARKER.finditer(data),
+                                            cap + 1))
+    check_len(range(found), what="transactions")
+
+
+def parse_ofx(data: bytes, tenant: str | None = None) -> list[dict]:
     """Raw statement transactions from an OFX/QFX blob (bank + credit-card
-    statements both)."""
+    statements both).
+
+    The checks above are an estimate made from outside the parser; the
+    parse itself runs in a child process under an address-space ceiling
+    (`_run_child`), so whatever a file makes ofxtools allocate — a shape
+    the estimate misses included — costs at most that child, never the
+    server or the worker it shares with every household. `tenant` names
+    the household the file belongs to: it may hold one parse slot at a
+    time, so one household can never occupy every slot."""
     _refuse_dtd(data)
+    _refuse_oversize(data)
+    _refuse_costly_cdata(data)
+    if IN_PROCESS:
+        return _parse_tree(data)
+    return [_from_wire(r) for r in _run_child(data, tenant)]
+
+
+def _parse_tree(data: bytes) -> list[dict]:
     tree = OFXTree()
     tree.parse(io.BytesIO(data))
     ofx = tree.convert()
@@ -96,6 +191,223 @@ def parse_ofx(data: bytes) -> list[dict]:
                 "window": window,
             })
     return out
+
+
+# ---- the child process ------------------------------------------------------
+
+# Tests only: parse in this process, so a substitute inside the parse is
+# seen. Never switched on by the app.
+IN_PROCESS = False
+
+# The child's address-space allowance over what its interpreter maps at
+# start-up (counted the same way as the PDF child's, for the same reason).
+# Measured: a file at the row cap made of minimal records grows the parse
+# by about 250 MB, so a legitimate file fits with room while a
+# pathological one is cut off well short of the container limit.
+CHILD_MEMORY = 640 * 1024 * 1024
+PARSE_SECONDS = 60.0
+# Parses one process runs at once; past that an upload waits, then is
+# told to retry, rather than stacking allowances on a small container.
+CHILD_SLOTS = 2
+MAX_RESULT_BYTES = 64 * 1024 * 1024
+
+_BUSY_MSG = ("too many OFX/QFX files are being read right now — try again "
+             "in a minute")
+_FAILED_MSG = ("could not read this OFX/QFX file within the limits for one "
+               "statement — export a shorter date range from your bank")
+
+_BUSY_HOUSEHOLD_MSG = ("another OFX/QFX file from this household is being "
+                       "read right now — try again when it has finished")
+
+_slots = threading.BoundedSemaphore(CHILD_SLOTS)
+# Households holding a slot now. A household gets at most one, refused at
+# once rather than queued: with two slots in the process, one household's
+# two uploads would otherwise hold both and make every other wait.
+_slot_holders: set[str] = set()
+_holders_lock = threading.Lock()
+
+_PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
+
+# Run with -I (no environment, no user site, not the working directory on
+# sys.path); the limits are set before anything else is imported.
+_BOOT = """\
+import sys
+root, src, dst, mem, cpu = sys.argv[1:6]
+mem, cpu = int(mem), int(cpu)
+try:
+    with open("/proc/self/status") as f:
+        mem += next(int(ln.split()[1]) * 1024 for ln in f
+                    if ln.startswith("VmSize:"))
+except (OSError, StopIteration, ValueError):
+    mem += 256 * 1024 * 1024
+try:
+    with open("/proc/self/oom_score_adj", "w") as f:
+        f.write("1000")
+except OSError:
+    pass
+try:
+    import resource
+except ImportError:
+    pass
+else:
+    def _cap(kind, soft, hard):
+        _, h = resource.getrlimit(kind)
+        if h != resource.RLIM_INFINITY:
+            soft, hard = min(soft, h), min(hard, h)
+        resource.setrlimit(kind, (soft, hard))
+    _cap(resource.RLIMIT_AS, mem, mem)
+    _cap(resource.RLIMIT_CPU, cpu, cpu + 2)
+    _cap(resource.RLIMIT_CORE, 0, 0)
+sys.path.insert(0, root)
+from oikonome.sync.ofximport import _child_main
+sys.exit(_child_main(src, dst))
+"""
+
+
+def _to_wire(r: dict) -> dict:
+    out = dict(r)
+    out["date"] = r["date"].isoformat() if r["date"] else None
+    out["window"] = ([d.isoformat() for d in r["window"]]
+                     if r["window"] else None)
+    for k in ("fitid", "name", "memo", "type", "acct", "accttype"):
+        if out[k] is not None:
+            out[k] = str(out[k])
+    return out
+
+
+def _from_wire(r) -> dict:
+    """A row back from the child, rebuilt only from the fields expected,
+    with the types they had in the parse."""
+    if not isinstance(r, dict):
+        raise ValueError(_FAILED_MSG)
+    try:
+        def _text(k):
+            v = r.get(k)
+            if v is not None and not isinstance(v, str):
+                raise TypeError(k)
+            return v
+        w = r.get("window")
+        amount = r.get("amount")
+        if amount is not None and not isinstance(amount, (int, float)):
+            raise TypeError("amount")
+        return {
+            "fitid": _text("fitid"),
+            "date": (dt.date.fromisoformat(r["date"]) if r.get("date")
+                     else None),
+            "amount": None if amount is None else float(amount),
+            "name": _text("name") or "?",
+            "memo": _text("memo"),
+            "type": _text("type"),
+            "acct": _text("acct"),
+            "accttype": _text("accttype"),
+            "cc": bool(r.get("cc")),
+            "window": ((dt.date.fromisoformat(w[0]),
+                        dt.date.fromisoformat(w[1])) if w else None),
+        }
+    except (TypeError, ValueError, IndexError, KeyError):
+        raise ValueError(_FAILED_MSG) from None
+
+
+def _child_main(src: str, dst: str) -> int:
+    """The child's whole life: read the file, parse, write the rows. A
+    parse error travels back as its message; running out of memory exits
+    non-zero, which the parent reads as the file being too big."""
+    logging.disable(logging.WARNING)
+    try:
+        with open(src, "rb") as f:
+            data = f.read()
+        try:
+            result = {"rows": [_to_wire(r) for r in _parse_tree(data)]}
+        except MemoryError:
+            raise
+        except Exception as e:               # malformed: the parent words it
+            result = {"error": f"{e.__class__.__name__}: {e}"[:500]}
+        with open(dst, "w", encoding="utf-8") as f:
+            json.dump(result, f)
+    except MemoryError:
+        return 3
+    return 0
+
+
+def _claim_household(tenant: str | None) -> None:
+    if not tenant:
+        return
+    with _holders_lock:
+        if tenant in _slot_holders:
+            raise ValueError(_BUSY_HOUSEHOLD_MSG)
+        _slot_holders.add(tenant)
+
+
+def _release_household(tenant: str | None) -> None:
+    if tenant:
+        with _holders_lock:
+            _slot_holders.discard(tenant)
+
+
+def _run_child(data: bytes, tenant: str | None = None) -> list:
+    wait = PARSE_SECONDS
+    # the household's claim comes first, so its second file is refused
+    # without ever waiting in line for a slot
+    _claim_household(tenant)
+    try:
+        if not _slots.acquire(timeout=wait):
+            raise ValueError(_BUSY_MSG)
+    except BaseException:
+        _release_household(tenant)
+        raise
+    try:
+        with tempfile.TemporaryDirectory(prefix="oikonome-ofx-") as tmp:
+            src = os.path.join(tmp, "in.ofx")
+            dst = os.path.join(tmp, "out.json")
+            err_path = os.path.join(tmp, "err.txt")
+            with open(src, "wb") as f:
+                f.write(data)
+            cmd = [sys.executable, "-I", "-c", _BOOT, _PACKAGE_ROOT, src,
+                   dst, str(CHILD_MEMORY), str(int(PARSE_SECONDS) + 1)]
+            with open(err_path, "wb") as err:
+                # a fixed argv (this interpreter, a constant script, paths
+                # made here): no shell and nothing from the request
+                proc = subprocess.Popen(  # noqa: S603
+                    cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=err, cwd=tmp,
+                    env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                         "LC_ALL": "C.UTF-8"},
+                    close_fds=True, start_new_session=True)
+                try:
+                    code = proc.wait(timeout=wait)
+                except subprocess.TimeoutExpired:
+                    _kill(proc)
+                    log.warning("OFX parse child passed its %.0f s deadline",
+                                wait)
+                    raise ValueError(_FAILED_MSG) from None
+                except BaseException:
+                    _kill(proc)
+                    raise
+            if code != 0:
+                log.warning("OFX parse child exited %s: %s", code,
+                            _tail(err_path))
+                raise ValueError(_FAILED_MSG)
+            try:
+                if os.path.getsize(dst) > MAX_RESULT_BYTES:
+                    raise ValueError(_FAILED_MSG)
+                with open(dst, encoding="utf-8") as f:
+                    result = json.load(f)
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError,
+                    RecursionError):
+                raise ValueError(_FAILED_MSG) from None
+    finally:
+        _slots.release()
+        _release_household(tenant)
+    if not isinstance(result, dict):
+        raise ValueError(_FAILED_MSG)
+    if "error" in result:
+        raise ValueError(f"could not read this OFX/QFX file "
+                         f"({str(result['error'])[:200]})")
+    rows = result.get("rows")
+    if not isinstance(rows, list):
+        raise ValueError(_FAILED_MSG)
+    return rows
 
 
 def _statement_window(stmt) -> tuple[dt.date, dt.date] | None:
@@ -137,10 +449,24 @@ def import_ofx(conn, account_id: str, data: bytes,
     multiple <STMTRS>/<CCSTMTRS> blocks in one file, and merging them into
     the one selected account corrupts transfers and spend. >1 distinct
     ACCTID → split per statement (the same pattern as the competitor
-    split), with per-account counts in the result."""
-    rows = check_len([r for r in parse_ofx(data)
+    split), with per-account counts in the result.
+
+    The file is parsed first and the household's pairing and identity
+    locks taken after, as import_pdf does: the parse waits for a slot and
+    then runs in a child for up to a minute each, and every edit and
+    rename in the household waits on those two locks. Callers do not take
+    them early for an OFX file."""
+    tid = conn.execute("SELECT current_setting('app.tenant_id', true) AS t"
+                       ).fetchone()
+    tid = (tid["t"] if tid else None) or None
+    rows = check_len([r for r in parse_ofx(data, tenant=tid)
                       if r["date"] is not None and r["amount"] is not None],
                      what="transactions")
+    # Before the first ledger row, in the order every writer takes them;
+    # re-entrant for a caller that already holds them. Imported lazily:
+    # the sync package carries no load-time dependency on the web layer.
+    from ..web.bulk_import import hold_ledger_write_locks
+    hold_ledger_write_locks(conn)
     by_acct: dict = {}
     for r in rows:
         by_acct.setdefault(r["acct"], []).append(r)
@@ -466,9 +792,13 @@ def _import_into(conn, account_id: str, rows: list[dict], *,
             id=tid, account_id=account_id, date=r["date"], amount=amount,
             name=name, category_primary=primary, raw=raw))
     txns = ids.resolve(conn, txns)
+    # the household's history window (Settings → how far back): rows
+    # dated before it are left out and counted, never written
+    txns, skipped_older = drop_before_history(conn, txns)
     if batch_id:
         from . import batches
         batches.tag(conn, txns, batch_id)
     added = upsert_transactions(conn, txns)
     return {"imported": added, "rows": len(txns),
-            "skipped_duplicates": skipped_dupes}
+            "skipped_duplicates": skipped_dupes,
+            "skipped_older": skipped_older}

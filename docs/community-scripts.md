@@ -24,7 +24,9 @@ stable doors to push through.
    (`{plan, csv, balance?, mask?, provider?, institution?}`) for a
    workplace plan's activity CSV,
    `POST /api/import/costco` (`{receipts: […]}`) for Costco receipts with
-   their line items, `POST /api/import/coinbase`
+   their line items (an item's `category` and `amount` are what splits a
+   mixed receipt's charge across categories once matched; Amazon items
+   get their `category` from the categorization LLM backend), `POST /api/import/coinbase`
    (`{items: […], accounts: […], transactions: […]}`) for a normalized
    Coinbase snapshot — rows the source stopped reporting are retired
    inside the pushed prefix — and `POST /api/import/amazon`

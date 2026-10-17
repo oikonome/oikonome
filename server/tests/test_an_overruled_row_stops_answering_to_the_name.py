@@ -48,7 +48,7 @@ class OverruledRowKeysOnItsLineTests(unittest.TestCase):
     # ---- fixtures ---------------------------------------------------------
 
     def _habit(self, conn=None, line=LINE, name=USUAL,
-               n=merchant_identity.ESTABLISHED_ROWS):
+               n=3):
         """The line and the aggregator agreeing about one payee, n times."""
         conn = conn or self.conn
         return [add_txn(conn, f"2026-08-{d + 1:02d}", 20.0 + d, line,
@@ -356,58 +356,97 @@ class OverruledRowKeysOnItsLineTests(unittest.TestCase):
         self.assertEqual(at_once, row_by_row)
         self.assertEqual(len(set(at_once.values())), 1)
 
-    def test_the_same_name_under_a_second_line_is_not_a_one_off(self):
-        """A name the aggregator has used under ANOTHER descriptor too is a
-        payee it knows, not a slip of this line — so a pass that sees both
-        rows at once leaves the name alone. The doubt is about a name that
-        appears nowhere but under this one line.
-
-        A row already moved is not re-examined, so the order the two rows
-        arrive in decides which answer this ledger ends up with; nothing
-        here is retroactive."""
+    def test_each_line_answers_for_its_own_rows(self):
+        """A stray name under two lines is judged line by line. The line
+        with an agreeing habit takes its own charge back; the other line
+        has no history to overrule anything with, so its charge keeps the
+        name — the aggregator knows that payee there. Neither row's answer
+        depends on the other being in the ledger."""
         self._habit()
         self._stray("both")
         self._real_business("realboth")
         merchant_identity.resolve(self.conn)
-        self.assertEqual(self._merchant_of("both")["name"], STRAY)
-        self.assertIsNone(self._set_aside("both"))
+        self.assertEqual(self._merchant_of("both")["name"], USUAL_MERCHANT)
+        self.assertEqual(self._set_aside("both"), STRAY)
+        self.assertEqual(self._merchant_of("realboth")["name"], STRAY)
+        self.assertIsNone(self._set_aside("realboth"))
+
+    # ---- the answer is the ledger's, not the syncs' -----------------------
+
+    def _three_orders(self, build, rows, ids):
+        """Resolve two rows (inserters) in separate syncs either way round
+        and in one sync together; each must give the same answer."""
+        seen = {}
+        orders = {"first-then-second": [[rows[0]], [rows[1]]],
+                  "second-then-first": [[rows[1]], [rows[0]]],
+                  "together": [list(rows)]}
+        for label, syncs in orders.items():
+            with self.subTest(order=label):
+                self.tearDown()
+                self.setUp()
+                build()
+                for sync in syncs:
+                    made = [insert() for insert in sync]
+                    merchant_identity.resolve(self.conn, txn_ids=made)
+                merchant_identity.resolve(self.conn)
+                seen[label] = {t: (self._merchant_of(t)["name"],
+                                   self._set_aside(t)) for t in ids}
+        self.assertEqual(len({repr(v) for v in seen.values()}), 1, seen)
+        return next(iter(seen.values()))
 
     def test_a_row_at_a_time_reads_the_second_line_too(self):
-        """The two-lines test is a question about the LEDGER, and the
-        answer cannot depend on how the rows were delivered. A sync that
-        resolves each row as it arrives sees one of them at a time; asked
-        of that batch alone, each row's name looks like a one-off of its
-        own line, and the one whose line has the habit would be moved —
-        for a ledger a single pass files under one new merchant. The other
-        row never brings it back: a resolved row is not revisited."""
+        """However the syncs bundled a stray name's two rows — one sync
+        each, either way round, or one sync for both — each row ends where
+        its own line puts it. Counting lines over the rows still keyed on
+        the name could not do that: a row moved by an earlier sync is no
+        longer keyed on it, so the later row saw one line alone, while the
+        same two rows delivered together saw two and both kept the name."""
         second_line = "SQ *BEACON POINT 77"
 
         def build():
             self._habit()
-            # the habit is settled history: earlier syncs resolved it
             merchant_identity.resolve(self.conn)
-            self._stray("p")
-            add_txn(self.conn, "2026-09-19", 4.00, second_line, merchant=STRAY,
-                    txn_id="q")
 
-        build()
-        merchant_identity.resolve(self.conn)
-        at_once = {t: self._merchant_of(t)["name"] for t in ("h0", "p", "q")}
-        self.assertEqual(at_once["p"], STRAY)
-        self.assertEqual(at_once["q"], STRAY)
+        got = self._three_orders(build, (
+            lambda: self._stray("p"),
+            lambda: add_txn(self.conn, "2026-09-19", 4.00, second_line,
+                            merchant=STRAY, txn_id="q")), ("h0", "p", "q"))
+        self.assertEqual(got["p"], (USUAL_MERCHANT, STRAY))
+        self.assertEqual(got["q"], (STRAY, None))
 
-        for order in (("p", "q"), ("q", "p")):
-            with self.subTest(order=order):
-                self.tearDown()
-                self.setUp()
-                build()
-                for tid in order:
-                    merchant_identity.resolve(self.conn, txn_ids=[tid])
-                merchant_identity.resolve(self.conn)
-                self.assertEqual(
-                    {t: self._merchant_of(t)["name"] for t in ("h0", "p", "q")},
-                    at_once)
-                self.assertIsNone(self._set_aside("p"))
+    def test_a_name_neither_line_overrules_stays_one_merchant(self):
+        """Two lines, neither of which has ever agreed with the aggregator:
+        the name is a payee it knows under both, so both rows stay on the
+        name and are one merchant, whichever way they arrived."""
+        got = self._three_orders(lambda: None, (
+            lambda: add_txn(self.conn, "2026-09-18", 3.00,
+                            "SQ *TIDEWATER STALL 12", merchant=STRAY,
+                            txn_id="a"),
+            lambda: self._real_business("b")), ("a", "b"))
+        self.assertEqual(got["a"], (STRAY, None))
+        self.assertEqual(got["b"], (STRAY, None))
+        self.assertEqual(self._merchant_of("a")["id"],
+                         self._merchant_of("b")["id"])
+
+    def test_two_lines_each_with_a_habit_each_take_their_own_row(self):
+        """Both lines have agreed with the aggregator about a payee of
+        their own: each takes its own charge, in every order."""
+        other_line, other_name = "OSPREY HARDWARE 0041", "Osprey Hardware"
+
+        def build():
+            self._habit()
+            for d in range(2):
+                add_txn(self.conn, f"2026-08-1{d}", 30.0 + d, other_line,
+                        merchant=other_name, txn_id=f"o{d}")
+            merchant_identity.resolve(self.conn)
+
+        got = self._three_orders(build, (
+            lambda: self._stray("x"),
+            lambda: add_txn(self.conn, "2026-09-21", 8.00, other_line,
+                            merchant=STRAY, txn_id="y")), ("h0", "o0", "x", "y"))
+        self.assertEqual(got["x"], (USUAL_MERCHANT, STRAY))
+        self.assertEqual(got["y"], (got["o0"][0], STRAY))
+        self.assertNotIn(STRAY, {v[0] for v in got.values()})
 
     def test_a_name_that_spreads_later_leaves_the_judgement_alone(self):
         """The other way round: the second line turns up after the charge

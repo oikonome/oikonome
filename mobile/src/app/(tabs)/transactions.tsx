@@ -428,6 +428,32 @@ export default function Transactions() {
   };
   // every filter change starts back at page 1 and leaves that scope
   const refilter = () => { setPage(1); leaveScope(); };
+  // A large ledger takes a few seconds before the file arrives; until it
+  // does the chip stands down, so a second tap cannot start a second
+  // export beside the first (the server answers one with 429 anyway).
+  const [exporting, setExporting] = useState(false);
+  const exportRows = () => {
+    if (exporting) return;
+    const pairs = Object.entries(params)
+      .filter(([k, v]) => k !== "page" && v !== undefined) as [string, string][];
+    const qs = new URLSearchParams(pairs).toString();
+    const pick = (format: "csv" | "xlsx") => async () => {
+      setExporting(true);
+      try {
+        await client!.download(`/api/transactions/export?${qs}&format=${format}`,
+                               `transactions.${format}`);
+      } catch (e) {
+        Alert.alert("Download failed", errText(e));
+      } finally {
+        setExporting(false);
+      }
+    };
+    Alert.alert("Download these transactions",
+                "Every row the current filters match, as a file.",
+                [{ text: "CSV", onPress: pick("csv") },
+                 { text: "XLSX", onPress: pick("xlsx") },
+                 { text: "Cancel", style: "cancel" }]);
+  };
   const clearAll = () => {
     setAcct(""); setCat(""); setBucket(""); setAsOf(""); setCounted(false);
     setMonthScope(false); setYearScope(false);
@@ -471,6 +497,20 @@ export default function Transactions() {
       {(waiting.data?.count ?? 0) > 0 && (
         <View style={{ flexDirection: "row" }}>
           <WaitingBadge />
+        </View>
+      )}
+      {/* the page as a file, filters included: the share sheet takes it,
+          since a browser tab cannot carry the bearer token */}
+      {d0 && (
+        <View style={{ flexDirection: "row", justifyContent: "flex-end",
+                       paddingHorizontal: 12 }}>
+          <Pressable style={s.chip} onPress={exportRows} disabled={exporting}
+                     accessibilityLabel="download these transactions"
+                     accessibilityState={{ busy: exporting, disabled: exporting }}>
+            <Text style={s.chipText(false)}>
+              {exporting ? "preparing download…" : "download CSV / XLSX"}
+            </Text>
+          </Pressable>
         </View>
       )}
       {active.length > 0 && (

@@ -16,7 +16,7 @@ import AreaChart from "../components/AreaChart";
 import MoneyMap, { Track } from "../components/MoneyMap";
 import { planRows } from "../components/PlanBars";
 import { canEdit } from "../role";
-import { monthSavings } from "../moneymath";
+import { isPlanSavingsGoal, monthSavings } from "../moneymath";
 
 /** Card autopays as chart marks: the series is one point per day starting
  *  today, so a due date is found by its own index. A date the window does
@@ -121,8 +121,20 @@ export default function Today({ date = null }: { date?: string | null }) {
       });
   };
   const v = VERDICT[d.verdict as keyof typeof VERDICT] ?? VERDICT["ON BUDGET"];
-  const remaining = d.variable_budget - d.variable_actual;
-  const fc = d.forecast;
+  // the hero's month figure: the spendable share and what is left of it,
+  // composed once on the server (the tiles hand it out a day at a time);
+  // an older payload falls back to the whole month
+  const heroBudget = d.variable_budget_paced ?? d.variable_budget;
+  const remaining = d.month_remaining_paced
+    ?? d.variable_budget - d.variable_actual;
+  const rw = d.runway;
+  // no checking account (card-only or savings-only): cash ahead is
+  // unknown, not $0 — the forecast's walk starts from nothing, so it is
+  // not shown and no alarm is drawn from it. The server says so outright;
+  // an older payload by its null checking balance. (mobile: noCheckingLinked)
+  const noChecking = !!d.forecast?.no_checking || !!rw?.no_checking
+    || (!!rw && rw.checking == null);
+  const fc = noChecking ? null : d.forecast;
 
   // setup is the owner's work — every step behind the checklist and
   // the wizard is a 403 for a viewer, so the card could only dead-end them
@@ -139,9 +151,9 @@ export default function Today({ date = null }: { date?: string | null }) {
     (new Date(iso).getTime() - new Date(d.date).getTime()) / 86400000);
   const negIn = p0?.negative_date ? daysTo(p0.negative_date) : null;
   const paycheckish = d.income ? d.income / 2 : 1000;
-  const cashCritical = (d.headroom !== null && d.headroom < 0) ||
-    (negIn !== null && negIn <= 14);
-  const cashTight = !cashCritical &&
+  const cashCritical = !noChecking && ((d.headroom !== null && d.headroom < 0) ||
+    (negIn !== null && negIn <= 14));
+  const cashTight = !noChecking && !cashCritical &&
     ((d.headroom !== null && d.headroom < paycheckish) ||
      (negIn !== null || !!(p0 && p0.min < 0)));
   // the shortfall quoted beside negative_date is the balance ON that day
@@ -154,8 +166,6 @@ export default function Today({ date = null }: { date?: string | null }) {
   // "slow spending to $X/day": the daily burn that clears the shown dip
   const slowTo = firstNeg !== null && firstNeg < 0 && negIn && negIn > 0
     ? Math.max(0, (p0!.rate ?? 0) + firstNeg / negIn) : null;
-
-  const rw = d.runway;
 
   // per-category tiles: X / Y — what's left TODAY of the daily rate that
   // finishes the month on budget — one framing, combined
@@ -386,7 +396,7 @@ export default function Today({ date = null }: { date?: string | null }) {
           <span className="hv-month sub">
             <b className={remaining < 0 ? "neg" : ""}>
               {money(Math.abs(remaining))}</b>
-            {remaining < 0 ? " over the " : " of "}{money(d.variable_budget)}
+            {remaining < 0 ? " over the " : " of "}{money(heroBudget)}
             {remaining < 0 ? "" : " left"} · {d.days_left}{" "}
             day{d.days_left === 1 ? "" : "s"}
           </span>
@@ -538,6 +548,14 @@ export default function Today({ date = null }: { date?: string | null }) {
             yet. <Link to="/accounts">Set today's checking balance on
             Accounts</Link> and everything here comes alive.
           </div>
+        ) : noChecking ? (
+          <div style={{ marginTop: ".6rem", borderTop: "1px solid var(--line)",
+                        paddingTop: ".5rem", fontSize: ".85rem" }}>
+            <b>No checking account linked</b> — cash ahead starts from your
+            checking balance, so there is nothing to forecast yet.{" "}
+            <Link to="/accounts">Link your checking account on
+            Accounts</Link> to see cash ahead.
+          </div>
         ) : cashCritical ? (
           <div className="hero-watch bad"><span className="wdot" />
             <span>
@@ -619,7 +637,9 @@ export default function Today({ date = null }: { date?: string | null }) {
             <span className="sub">Plan:</span>
             <span className="sub"><b style={{ color: "var(--ink)" }}>{money(d.income)}</b> in</span>
             <span style={{ color: "var(--line)" }}>→</span>
-            <span className="sub"><b style={{ color: "var(--ink)" }}>{money(d.buckets.fixed.month_budget)}</b> bills</span>
+            {/* scheduled bills, not the fixed bar's cash basis, so the
+                chain balances (same figure and words as the email) */}
+            <span className="sub"><b style={{ color: "var(--ink)" }}>{money(d.scheduled_month ?? d.buckets.fixed.month_budget)}</b> bills due</span>
             <span style={{ color: "var(--line)" }}>→</span>
             <span className="sub"><b style={{ color: "var(--ink)" }}>{money(d.variable_budget)}</b> to spend</span>
             <span style={{ color: "var(--line)" }}>→</span>
@@ -720,7 +740,7 @@ export default function Today({ date = null }: { date?: string | null }) {
             fixedBudget: d.buckets.fixed.month_budget,
             fixedPending: d.fixed_unpaid_due,
             savings: (() => {
-              const g = (d.savings_goals ?? []).find((x) => x.name === "Savings");
+              const g = (d.savings_goals ?? []).find((x) => isPlanSavingsGoal(x.name));
               // this month's posted contribution when the payload has it;
               // otherwise the trailing 90-day average, labelled as one
               return g ? monthSavings(g, g.saved_this_month) : null;
@@ -895,15 +915,17 @@ export default function Today({ date = null }: { date?: string | null }) {
                       style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.label}</td>
                   <td className={`num c-amt ${r.bal_now === null ? "mut" : r.amount > 0 ? "pos" : ""}`}
                       style={{ whiteSpace: "nowrap" }}>{money(r.amount)}</td>
+                  {/* without checking the walk's balances start from
+                      nothing — the events stand, their balances do not */}
                   {converged ? (
                     <td className={`num c-bal ${r.bal_stmt !== null && r.bal_stmt < 0 ? "neg" : "mut"}`}
                         style={{ whiteSpace: "nowrap" }}>{r.bal_stmt !== null ? money(r.bal_stmt) : "·"}</td>
                   ) : (
                     <>
-                      <td className={`num hide-m ${r.bal_now !== null && r.bal_now < 0 ? "neg" : "mut"}`}
-                          style={{ whiteSpace: "nowrap" }}>{r.bal_now !== null ? money(r.bal_now) : "·"}</td>
-                      <td className={`num c-bal ${r.bal_stmt !== null && r.bal_stmt < 0 ? "neg" : "mut"}`}
-                          style={{ whiteSpace: "nowrap" }}>{r.bal_stmt !== null ? money(r.bal_stmt) : "·"}</td>
+                      <td className={`num hide-m ${!noChecking && r.bal_now !== null && r.bal_now < 0 ? "neg" : "mut"}`}
+                          style={{ whiteSpace: "nowrap" }}>{!noChecking && r.bal_now !== null ? money(r.bal_now) : "·"}</td>
+                      <td className={`num c-bal ${!noChecking && r.bal_stmt !== null && r.bal_stmt < 0 ? "neg" : "mut"}`}
+                          style={{ whiteSpace: "nowrap" }}>{!noChecking && r.bal_stmt !== null ? money(r.bal_stmt) : "·"}</td>
                     </>
                   )}
                 </tr>

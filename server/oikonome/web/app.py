@@ -51,6 +51,15 @@ _TS_FIELD = turnstile.FIELD
 from .security import AutoBanMiddleware, BodySizeLimitMiddleware, \
     OriginCheckMiddleware, forwarded_host, limit, request_scheme
 
+# Per-client-IP backstops on the two credential doors. Turnstile is the bot
+# gate and the per-address caps (account lockout, per-mailbox mail quotas)
+# stop a targeted attack; these only bound one address's raw volume. They are
+# sized for a carrier's CGNAT, where a crowd of phones shares one public IP:
+# a cap of a few signups an hour would refuse most of a crowd sharing one
+# carrier address.
+_SIGNUP_PER_IP = (30, 3600)
+_LOGIN_PER_IP = (40, 300)
+
 # Precomputed once so an unknown-email login runs exactly ONE argon2
 # verify — same work as a known email. Hashing "dummy" per request would be
 # two argon2 ops (hash + verify) and a timing/cost oracle for user enumeration.
@@ -118,9 +127,21 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         # sets its own header and keeps it — the polls that answer 304 to
         # a matching ETag say "private, no-cache" (store, but always ask
         # again first), and a merchant logo is an immutable image.
-        if request.url.path == "/api" or request.url.path.startswith("/api/"):
+        if _never_cached(request.url.path):
             h.setdefault("Cache-Control", "no-store")
         return resp
+
+
+# Every path whose reply carries a household's (or the operator's) data,
+# not only the JSON API: the export downloads (a whole ledger in one
+# file), the one-click mail actions, the operator console and the metrics
+# scrape. Each prefix also covers everything beneath it.
+NO_STORE_PREFIXES = ("/api", "/export", "/act", "/admin/console", "/metrics")
+
+
+def _never_cached(path: str) -> bool:
+    return any(path == p or path.startswith(p + "/")
+               for p in NO_STORE_PREFIXES)
 
 
 DEV_MODE = os.environ.get("OIKONOME_DEV") == "1"
@@ -398,6 +419,64 @@ def _reserve_step_up_guess(user_id):
     return slot
 
 
+def _verify_holding_guess(slot, hashed: str, password: str) -> bool:
+    """verify_password for a caller already holding a guess slot. A busy
+    hasher (passwords.HasherBusy, answered 503 "try again") verified
+    nothing, so it is no guess: the slot goes back before the refusal
+    travels on. Kept, every 503 of a sign-in burst would count as a wrong
+    password against the session's step-up lock."""
+    try:
+        return passwords.verify_password(hashed, password)
+    except passwords.HasherBusy:
+        security.release_step_up_guess(slot)
+        raise
+
+
+def _sign_in_verify(email: str, hashed: str, password: str,
+                    checked_at: float) -> bool:
+    """verify_password at a sign-in door whose human check has already
+    passed. That check may have been answered by spending the account's
+    emailed unlock — the only way through it a native app has. A busy
+    hasher (passwords.HasherBusy, answered 503 "try again") verified
+    nothing, so the attempt the unlock paid for never happened: an unlock
+    this request spent is put back before the refusal travels on. Kept
+    spent, every 503 of a burst would cost the person another unlock mail,
+    and those are capped per hour. `checked_at` is `time.monotonic()`
+    taken just before the human check."""
+    try:
+        return passwords.verify_password(hashed, password)
+    except passwords.HasherBusy:
+        import time
+        _unspend_unlock(email, time.monotonic() - checked_at)
+        raise
+
+
+def _unspend_unlock(email: str, within_s: float) -> None:
+    """Re-arm an emailed unlock spent in the last `within_s` seconds (the
+    span of the request asking, measured on one clock and applied to the
+    database's, plus a second of slack). Unlike `turnstile.refund_unlock`
+    this leaves `refunded_at` alone: that one refund belongs to the
+    two-step TOTP sign-in, and an attempt the hasher never ran must not
+    use it up. Best-effort — failing here leaves the unlock spent, which
+    is what happened before."""
+    if not email:
+        return
+    try:
+        with _control_conn() as conn:
+            conn.execute(
+                """UPDATE login_unlocks u SET consumed_at = NULL
+                     FROM users usr
+                    WHERE usr.id = u.user_id AND lower(usr.email) = %s
+                      AND u.consumed_at IS NOT NULL
+                      AND u.consumed_at > now() - make_interval(secs => %s)
+                      AND u.unlocked_until IS NOT NULL
+                      AND u.unlocked_until > now()""",
+                (email.strip().lower(), max(0.0, within_s) + 1.0))
+    except Exception:                    # noqa: BLE001 — best-effort
+        log.warning("could not re-arm an emailed unlock after a busy "
+                    "hasher", exc_info=True)
+
+
 def _in_session_password_ok(user_id, row, password: str, email: str,
                             route: str) -> bool:
     """Verify a password offered from INSIDE a session — at elevate, at a
@@ -424,8 +503,8 @@ def _in_session_password_ok(user_id, row, password: str, email: str,
                                      route=route)
         return False
     slot = _reserve_step_up_guess(user_id)
-    ok = passwords.verify_password(
-        row["password_hash"] if row else _DUMMY_HASH, password)
+    ok = _verify_holding_guess(
+        slot, row["password_hash"] if row else _DUMMY_HASH, password)
     if row and ok:
         security.release_step_up_guess(slot)
         return True
@@ -664,7 +743,8 @@ def _read_token_allowed(method: str, path: str) -> bool:
 
 def _script_token_ratelimit(request: Request, scope: str = "push") -> None:
     n, window = READ_TOKEN_RATE if scope == "read" else SCRIPT_TOKEN_RATE
-    key = (f"script-token-{scope}", security.client_ip(request))
+    key = (f"script-token-{scope}",
+           security.rate_key(security.client_ip(request)))
     store = security._shared_store()
     ok = store.check(key, n, window) if store else None
     if ok is None:                       # no Redis, or Redis down
@@ -992,7 +1072,7 @@ def login_page(request: Request):
         turnstile_wait=challenged))
 
 
-@app.post("/login", dependencies=[Depends(limit("login", 10, 300))])
+@app.post("/login", dependencies=[Depends(limit("login", *_LOGIN_PER_IP))])
 def login_form(request: Request, email: str = Form(...),
                password: str = Form(...), totp_code: str = Form(""),
                cf_token: str = Form("", alias=_TS_FIELD)):
@@ -1003,6 +1083,8 @@ def login_form(request: Request, email: str = Form(...),
     # with recent failures behind it (see turnstile.verify_login). No-JS
     # door: one submit, one token. A rejected token re-renders the form
     # rather than 4xx-ing, so the widget gets a fresh challenge.
+    import time
+    checked_at = time.monotonic()
     if not turnstile.verify_login(cf_token, security.client_ip(request), email):
         # show_unlock is load-bearing HERE above all: this is the
         # response a user gets when they cannot complete the widget — script
@@ -1036,8 +1118,8 @@ def login_form(request: Request, email: str = Form(...),
             "SELECT id, tenant_id, password_hash, totp_secret, "
             "totp_last_counter FROM users WHERE email=%s",
             (email.strip().lower(),)).fetchone()
-    ok = passwords.verify_password(
-        u["password_hash"] if u else _DUMMY_HASH, password)
+    ok = _sign_in_verify(email, u["password_hash"] if u else _DUMMY_HASH,
+                         password, checked_at)
     err = None
     # Only reveal that TOTP is needed AFTER the password verifies —
     # showing the code field on a wrong password (for a known email) is an
@@ -1200,10 +1282,13 @@ def _log_link(kind: str, email: str, path: str) -> None:
                     extra={"no_capture": True})
 
 
-def _smtp_for(email: str):
+def _smtp_for(email: str, tenant_id=None):
     """The relay for an account-recovery mail to an address, or None. Never
     raises — every caller is an out-of-band delivery whose response must not
     vary with what happened in here.
+
+    `tenant_id` names the household when the address no longer does — the
+    notice to the address an account just moved away from.
 
     The operator's own relay whenever one is configured, and the
     household's Settings relay only on an instance that has none. These
@@ -1223,12 +1308,14 @@ def _smtp_for(email: str):
     except Exception:                            # noqa: BLE001
         pass
     try:
-        with _control_conn() as _c:
-            row = _c.execute("SELECT tenant_id FROM users WHERE email=%s",
-                             (email,)).fetchone()
-        if not row:
-            return None
-        tc = _tn.tenant_connect(row["tenant_id"])
+        if tenant_id is None:
+            with _control_conn() as _c:
+                row = _c.execute("SELECT tenant_id FROM users WHERE email=%s",
+                                 (email,)).fetchone()
+            if not row:
+                return None
+            tenant_id = row["tenant_id"]
+        tc = _tn.tenant_connect(tenant_id)
         try:
             return _report.resolve_smtp(tc)
         finally:
@@ -1533,9 +1620,9 @@ def _reset_needs_recovery(conn, row) -> bool:
     There are NO exemptions, and there is no second flavour of reset link.
     A waiver for links minted by the signup-reclaim door would have to rest
     on reading `verified_at` as "this household never proved a mailbox",
-    and it does not mean that: a hosted email change clears `verified_at`
-    on a fully verified household, so such a waiver reads a real,
-    long-lived account as an unproven squat and lets a reset strip every
+    and it does not mean that: `verified_at` can be empty on a
+    long-established, fully verified household, so such a waiver would read
+    a real, long-lived account as an unproven squat and let a reset strip every
     factor with no recovery code — whoever receives mail at the new address
     could then take it. The rule is unconditional, which is the only form
     of it that cannot be misread at a call site.
@@ -1602,6 +1689,11 @@ def reset_submit(token: str = Form(...), password: str = Form(...),
                 error=err.capitalize() + ".", needs_recovery=needs,
                 support_email=support_email()),
             status_code=400)
+    # Hashed before the recovery code is redeemed: a busy hasher answers
+    # 503 "try again", and a retry must find the code it carried still
+    # unused — redeemed first, the code would be gone for good while
+    # nothing was reset, and the retry would be told it did not match.
+    new_hash = passwords.hash_password(password)
     # the code is redeemed BEFORE the reset consumes anything: a wrong
     # code leaves the link live (the person can try another code), and
     # a right one is burned exactly like it would be at sign-in
@@ -1645,7 +1737,6 @@ def reset_submit(token: str = Form(...), password: str = Form(...),
             return True
         return not _reset_needs_recovery(tx, row)
 
-    new_hash = passwords.hash_password(password)
     with _control_conn() as conn:
         try:
             ok = reset_mod.consume(
@@ -1791,6 +1882,259 @@ def recover_cancel_pending(user: dict = Depends(current_user)):
     return {"ok": True, "cancelled": n}
 
 
+def _security_fan_out(email: str, tenant_id, title: str, short: str, *,
+                      neutral: str | None = None,
+                      what: str = "security") -> None:
+    """Carry an account-security notice to the account's push channels and
+    the household's verified SMS number. NEVER raises.
+
+    Push goes to THIS account's own browsers and devices. Only it can act
+    on the notice, and the rest of the household reading about someone
+    else's factors would take it as an attack on their own account.
+
+    `neutral`, when given, is the household fallback: with no push
+    destination of its own the household's devices get that line instead,
+    and the SMS carries it whenever the account is not the sole owner's.
+    That is for a notice whose silence is the worse answer (a recovery
+    still able to land). Without it, a notice about a change already made
+    reaches the account's own devices and, only for the sole owner, the
+    owner's phone — the mail to the account address is the main channel."""
+    sole_owner = False
+    try:
+        from ..auth import device_tokens as _devices
+        from ..notify import push as _push
+        from ..notify import push_native as _native
+        own_web = own_native = False
+        # Who to tell is read here; the sends below open their own
+        # connections only around their database steps. Each push waits on
+        # an outside service, and holding a control connection across them
+        # takes it from every signed-in request's session check.
+        with _control_conn() as cc:
+            me = cc.execute(
+                "SELECT id, role FROM users WHERE tenant_id=%s "
+                "AND lower(email)=lower(%s)", (tenant_id, email)).fetchone()
+            if me is not None:
+                sole_owner = me["role"] == "owner" and cc.execute(
+                    "SELECT count(*) AS n FROM users WHERE tenant_id=%s "
+                    "AND role='owner'", (tenant_id,)).fetchone()["n"] == 1
+                own_web = cc.execute(
+                    "SELECT 1 FROM push_subscriptions WHERE tenant_id=%s "
+                    f"AND user_id=%s AND {_push.LIVE} LIMIT 1",
+                    (tenant_id, me["id"])).fetchone() is not None
+                own_native = bool(_devices.push_targets(cc, tenant_id,
+                                                        me["id"]))
+        if own_web:
+            _push.send_tenant(None, tenant_id, title, short,
+                              url="/app/settings",
+                              user_id=me["id"], connect=_control_conn)
+        if own_native:
+            _native.send_tenant(None, tenant_id, "alert",
+                                user_id=me["id"], connect=_control_conn)
+        # A browser subscription on the account is not proof the
+        # account's owner will see it: whoever held the session could
+        # have added their own browser. So only the account's own
+        # phones stand in for the household notice; without one, the
+        # household's devices get the neutral line as well.
+        if neutral is not None and not own_native:
+            _push.send_tenant(None, tenant_id, "Security notice", neutral,
+                              url="/app/settings", connect=_control_conn)
+            _native.send_tenant(None, tenant_id, "alert",
+                                connect=_control_conn)
+    except Exception:                                    # noqa: BLE001
+        log.warning("%s push notice failed", what, exc_info=True)
+    if neutral is None and not sole_owner:
+        return
+    try:
+        from ..engine import budget
+        from ..notify import sms as _sms
+        tconn = tenancy.tenant_connect(tenant_id)
+        try:
+            phone = budget.load_config(tconn).get("notify_phone")
+        finally:
+            tconn.close()
+        # An account-security notice to a number an owner verified; not
+        # one of the opt-in summary programs. The number is the owner's
+        # phone, so it carries the full notice only when the account is
+        # the sole owner's; for anyone else (a co-owner, a member) it
+        # carries the neutral line, which still tells the household's
+        # owner to look.
+        if isinstance(phone, dict) and phone.get("verified") \
+                and phone.get("number"):
+            _sms.send(phone["number"], short if sole_owner else neutral)
+    except Exception:                                    # noqa: BLE001
+        log.warning("%s SMS notice failed", what, exc_info=True)
+
+
+def _not_you_line() -> str:
+    return (f"write to {support_email()} straight away." if support_email()
+            else "tell whoever runs this instance straight away.")
+
+
+# What each account-security change is called in its notice. The sentence
+# is what the person did (or someone holding their session did); the
+# advice after it is the same for all of them.
+_SECURITY_CHANGES = {
+    "password": "The password on your Oikonome account was changed.",
+    "totp_enrolled": "An authenticator app was set up as a sign-in code "
+                     "for your Oikonome account.",
+    "totp_replaced": "The authenticator app that gives your Oikonome "
+                     "sign-in codes was replaced with a new one.",
+    "totp_disabled": "Sign-in codes from an authenticator app were turned "
+                     "off on your Oikonome account.",
+    "passkey_added": "A passkey was added to your Oikonome account.",
+    "passkey_removed": "A passkey was removed from your Oikonome account.",
+    "recovery_codes": "A new set of recovery codes was made for your "
+                      "Oikonome account, and the old ones no longer work.",
+}
+
+
+def _deliver_security_notice(email: str, tenant_id, change: str) -> None:
+    """Tell the account, at its own address, that one of its sign-in
+    credentials just changed. A change made from a hijacked session is
+    otherwise silent: the owner finds out only when a sign-in fails. No
+    link in it — the remedy is a reset, which the person starts from the
+    sign-in page they already know, never from a mail. NEVER raises."""
+    from . import report as _report
+    first = _SECURITY_CHANGES.get(change)
+    if not first or not email:
+        return
+    body = (f"{first} Other signed-in browsers and devices were signed "
+            f"out. If this was you, there is nothing to do. If it was NOT "
+            f"you, reset your password from the sign-in page now, then ")
+    body += _not_you_line()
+    smtp = _smtp_for(email, tenant_id)
+    sent = False
+    if smtp and smtp["configured"]:
+        try:
+            _report.send("Security change on your account — Oikonome", body,
+                         f"<p>{_htmlmod.escape(body)}</p>", [email],
+                         smtp=smtp, bcc=False)
+            sent = True
+        except Exception:                                # noqa: BLE001
+            log.exception("security notice (%s) to %s failed", change, email)
+    if not sent:
+        log.warning("security change (%s) on %s: no mail sent", change, email)
+    _security_fan_out(email, tenant_id, "Security change",
+                      "Oikonome: " + first + " Not you? Reset your password.",
+                      what="security-change")
+
+
+def _notify_security_change(user: dict, change: str) -> None:
+    """Hand the notice to a daemon thread, after the change committed: the
+    response must not wait on a relay, and must not vary with it."""
+    import threading
+    threading.Thread(target=_deliver_security_notice,
+                     args=(user.get("email") or "", user.get("tenant_id"),
+                           change), daemon=True).start()
+
+
+def _deliver_email_change_notice(old_email: str, new_email: str, tenant_id,
+                                 token: str | None) -> None:
+    """Tell the address the account just LEFT that it left, with the one
+    link that undoes it (none when that address was never verified: it is
+    told, but has no say). The old inbox is the one place a hijacker who
+    moved the account cannot silence. The new address is shown masked:
+    whoever reads the old inbox learns enough to recognise the change, not
+    the account's new login name. Same link doctrine as the reset mail —
+    a pinned base URL or no link in the mail, the log line as the
+    link's delivery when it cannot be mailed. NEVER raises."""
+    from ..auth import email_revert
+    from . import report as _report
+    path = f"/account/email-revert?token={token}"
+    shown = email_revert.mask(new_email)
+    hours = int(email_revert.REVERT_TTL.total_seconds() // 3600)
+    base = os.environ.get("OIKONOME_BASE_URL", "").rstrip("/")
+    smtp = _smtp_for(old_email, tenant_id)
+    configured = bool(smtp and smtp["configured"])
+    mailed = maybe_mailed = False
+    if token is not None and configured and not base:
+        log.warning("SMTP is configured but OIKONOME_BASE_URL is not set — "
+                    "refusing to email a Host-derived email-revert link")
+    if token is not None and configured and base:
+        url = f"{base}{path}"
+        plain = (f"The sign-in email of the Oikonome account that used "
+                 f"this address was changed to {shown}. This address no "
+                 f"longer signs in to it.\n\nIf this was you, there is "
+                 f"nothing to do.\n\nIf it was NOT you, this link puts the "
+                 f"account back on this address, signs every browser and "
+                 f"device out, and sends a password reset here (valid "
+                 f"{hours} hours, one use):\n\n{url}\n\nThen "
+                 + _not_you_line() + "\n")
+        html = (f"<p>The sign-in email of the Oikonome account that used "
+                f"this address was changed to <b>{_htmlmod.escape(shown)}"
+                f"</b>. This address no longer signs in to it.</p>"
+                f"<p>If this was you, there is nothing to do.</p>"
+                f"<p>If it was <b>not</b> you, <a href=\"{url}\">put the "
+                f"account back on this address</a>. That signs every "
+                f"browser and device out and sends a password reset here "
+                f"(link valid {hours} hours, one use).</p>"
+                f"<p>Then {_htmlmod.escape(_not_you_line())}</p>")
+        try:
+            _report.send("Your sign-in email was changed — Oikonome", plain,
+                         html, [old_email], smtp=smtp, bcc=False)
+            mailed = True
+        except Exception as e:                           # noqa: BLE001
+            # a failure during or after the hand-over may still have
+            # delivered the link mail; the plain notice must not follow it
+            maybe_mailed = bool(getattr(e, "maybe_delivered", False))
+            log.exception("email-change notice to %s failed; logging the "
+                          "revert link instead", old_email)
+    if configured and not mailed and not maybe_mailed:
+        # No link could go out (never-verified address, no pinned public
+        # address, or the link mail failed): the old inbox is still told,
+        # because it is the one place a hijacker cannot silence. When a
+        # revert link exists it is in the log, so whoever runs the
+        # instance can hand it over.
+        ask = (f" Ask them for the link that puts the account back on "
+               f"this address (valid {hours} hours, one use)."
+               if token is not None else "")
+        plain = (f"The sign-in email of the Oikonome account that used "
+                 f"this address was changed to {shown}. This address no "
+                 f"longer signs in to it.\n\nIf this was you, there is "
+                 f"nothing to do. If it was NOT you, "
+                 + _not_you_line() + ask + "\n")
+        html = (f"<p>The sign-in email of the Oikonome account that used "
+                f"this address was changed to <b>{_htmlmod.escape(shown)}"
+                f"</b>. This address no longer signs in to it.</p>"
+                f"<p>If this was you, there is nothing to do. If it was "
+                f"<b>not</b> you, "
+                f"{_htmlmod.escape(_not_you_line() + ask)}</p>")
+        try:
+            _report.send("Your sign-in email was changed — Oikonome",
+                         plain, html, [old_email], smtp=smtp, bcc=False)
+        except Exception:                                # noqa: BLE001
+            log.exception("email-change notice to %s failed", old_email)
+    if token is not None and not mailed:
+        _log_link("email-change revert link", old_email, path)
+    _security_fan_out(new_email, tenant_id, "Sign-in email changed",
+                      f"Oikonome: your sign-in email was changed to "
+                      f"{shown}. Not you? Use the link sent to your old "
+                      f"address.", what="email-change")
+
+
+def _deliver_email_reverted_notice(gone_email: str, tenant_id) -> None:
+    """The address the account was moved TO hears that it was moved back:
+    if the change was the owner's own (away from an inbox someone else
+    reads), this is how they learn that inbox undid it. NEVER raises."""
+    from . import report as _report
+    body = ("The Oikonome account that used this address was moved back "
+            "to its previous sign-in email, using the link sent there, and "
+            "every browser and device was signed out. This address no "
+            "longer signs in to it. If you did not expect this, ")
+    body += _not_you_line()
+    smtp = _smtp_for(gone_email, tenant_id)
+    if smtp and smtp["configured"]:
+        try:
+            _report.send("Your sign-in email was changed back — Oikonome",
+                         body, f"<p>{_htmlmod.escape(body)}</p>",
+                         [gone_email], smtp=smtp, bcc=False)
+            return
+        except Exception:                                # noqa: BLE001
+            log.exception("email-revert notice to %s failed", gone_email)
+    log.warning("sign-in email of an account on %s reverted (no mail sent)",
+                gone_email)
+
+
 def _deliver_factor_cleared_notice(email: str) -> None:
     """After the operator clears an account's second factor: the account is
     told, so a clear the person did not ask for is not silent. NEVER
@@ -1862,78 +2206,10 @@ def _deliver_factor_reset_notice(email: str, tenant_id: str, lands_at,
     short = (f"Oikonome: a reset that removes your authenticator and "
              f"recovery codes was requested and lands {when}. Not you? "
              f"Cancel it in Settings, or with the link in the email we sent.")
-    # Push goes to THIS account's own browsers and devices. Only it can
-    # cancel the request, and the rest of the household reading "your
-    # authenticator is about to be removed" would take it as an attack on
-    # their own account. When the account has no push destination of its
-    # own, the household's devices get a neutral notice instead — the
-    # out-of-band channels are the ones most likely to reach someone whose
-    # inbox is the thing in question, so silence is the worse answer.
     neutral = ("Oikonome: a security action on a household account needs "
                "attention. Open Settings to check it.")
-    sole_owner = False
-    try:
-        from ..auth import device_tokens as _devices
-        from ..notify import push as _push
-        from ..notify import push_native as _native
-        own_web = own_native = False
-        # Who to tell is read here; the sends below open their own
-        # connections only around their database steps. Each push waits on
-        # an outside service, and holding a control connection across them
-        # takes it from every signed-in request's session check.
-        with _control_conn() as cc:
-            me = cc.execute(
-                "SELECT id, role FROM users WHERE tenant_id=%s "
-                "AND lower(email)=lower(%s)", (tenant_id, email)).fetchone()
-            if me is not None:
-                sole_owner = me["role"] == "owner" and cc.execute(
-                    "SELECT count(*) AS n FROM users WHERE tenant_id=%s "
-                    "AND role='owner'", (tenant_id,)).fetchone()["n"] == 1
-                own_web = cc.execute(
-                    "SELECT 1 FROM push_subscriptions WHERE tenant_id=%s "
-                    f"AND user_id=%s AND {_push.LIVE} LIMIT 1",
-                    (tenant_id, me["id"])).fetchone() is not None
-                own_native = bool(_devices.push_targets(cc, tenant_id,
-                                                        me["id"]))
-        if own_web:
-            _push.send_tenant(None, tenant_id,
-                              "Account recovery requested",
-                              short, url="/app/settings",
-                              user_id=me["id"], connect=_control_conn)
-        if own_native:
-            _native.send_tenant(None, tenant_id, "alert",
-                                user_id=me["id"], connect=_control_conn)
-        # A browser subscription on the account is not proof the
-        # account's owner will see it: whoever held the session could
-        # have added their own browser. So only the account's own
-        # phones stand in for the household notice; without one, the
-        # household's devices get the neutral line as well.
-        if not own_native:
-            _push.send_tenant(None, tenant_id, "Security notice", neutral,
-                              url="/app/settings", connect=_control_conn)
-            _native.send_tenant(None, tenant_id, "alert",
-                                connect=_control_conn)
-    except Exception:                                    # noqa: BLE001
-        log.warning("factor-reset push notice failed", exc_info=True)
-    try:
-        from ..engine import budget
-        from ..notify import sms as _sms
-        tconn = tenancy.tenant_connect(tenant_id)
-        try:
-            phone = budget.load_config(tconn).get("notify_phone")
-        finally:
-            tconn.close()
-        # An account-security notice to a number an owner verified; not
-        # one of the opt-in summary programs. The number is the owner's
-        # phone, so it carries the full notice only when the account under
-        # recovery is the sole owner's; for anyone else (a co-owner, a
-        # member) it carries the neutral line, which still tells the
-        # household's owner to look.
-        if isinstance(phone, dict) and phone.get("verified") \
-                and phone.get("number"):
-            _sms.send(phone["number"], short if sole_owner else neutral)
-    except Exception:                                    # noqa: BLE001
-        log.warning("factor-reset SMS notice failed", exc_info=True)
+    _security_fan_out(email, tenant_id, "Account recovery requested",
+                      short, neutral=neutral, what="factor-reset")
 
 
 # ---- signup page + email verification -----------------------------
@@ -1954,8 +2230,8 @@ def _verification_body(url: str) -> tuple[str, str]:
 
 
 # How many reclaim mails one ADDRESS may receive per hour, whatever IP asks.
-# The route's only throttle is `limit("signup", 5, 3600)`, which security.limit
-# keys on (route, client IP) — so a distributed caller could mint an unbounded
+# The route's only throttle is the signup limit (_SIGNUP_PER_IP), which
+# security.limit keys on (route, client IP) — so a distributed caller could mint an unbounded
 # number of these into a chosen victim's inbox: the instance's sender
 # reputation and mail allowance burnt, and a live one-hour link kept permanently fresh in an
 # inbox the caller is hoping someone clicks. Every sibling mail door already
@@ -2098,7 +2374,12 @@ def _deliver_verification(email: str, token: str, tenant_id) -> None:
     path = f"/verify-email?token={token}"
     from . import report as _report
     smtp = None
-    if not DEV_MODE:
+    if not DEV_MODE and env_flag("OIKONOME_HOSTED"):
+        # hosted always sends through the operator's relay, and a household
+        # created a moment ago has no relay of its own — so no database
+        # connection is needed, and a busy pool cannot stop this mail.
+        smtp = _report._env_smtp()
+    elif not DEV_MODE:
         try:
             tc = tenancy.tenant_connect(tenant_id)
             try:
@@ -2106,7 +2387,14 @@ def _deliver_verification(email: str, token: str, tenant_id) -> None:
             finally:
                 tc.close()
         except Exception:                        # noqa: BLE001
-            smtp = None
+            # the household's relay could not be read (pool starved, the
+            # database refusing connections): the operator's relay still
+            # carries the mail. Said loudly — an unsent confirmation leaves
+            # a signup half-finished with nothing on screen to show it.
+            log.exception("verification email to %s: could not read the "
+                          "household's mail settings; using the operator "
+                          "relay", email)
+            smtp = _report._env_smtp()
     base = os.environ.get("OIKONOME_BASE_URL", "").rstrip("/")
     if smtp and smtp["configured"] and not base:
         log.warning("SMTP is configured but OIKONOME_BASE_URL is not set — "
@@ -2548,7 +2836,7 @@ def signup_page(invite: str = "", email: str = "", ref: str = ""):
         invite_required=_signup_needs_invite()))
 
 
-@app.post("/signup", dependencies=[Depends(limit("signup", 5, 3600)),
+@app.post("/signup", dependencies=[Depends(limit("signup", *_SIGNUP_PER_IP)),
                               Depends(_not_demo_instance)])
 def signup_submit(request: Request, email: str = Form(...),
                   password: str = Form(...), invite: str = Form(""),
@@ -2558,9 +2846,22 @@ def signup_submit(request: Request, email: str = Form(...),
     re-render the form instead of raw JSON."""
     from fastapi.responses import HTMLResponse
     from . import todayview
+    busy = False
     try:
-        resp = signup(request, email=email, password=password, invite=invite,
-                      ref=ref, cf_token=cf_token)
+        try:
+            resp = signup(request, email=email, password=password,
+                          invite=invite, ref=ref, cf_token=cf_token)
+        except Exception as e:                   # noqa: BLE001
+            # the server out of capacity (database slots, a starved pool,
+            # password hashing queued out) keeps what was typed and says
+            # to submit again, rather than a 500 that loses the form
+            if isinstance(e, (PoolTimeout, passwords.HasherBusy)) \
+                    or _db_unreachable(e):
+                busy = True
+                raise HTTPException(
+                    503, "The server is briefly busy — wait a few seconds "
+                    "and submit again.", headers={"Retry-After": "15"})
+            raise
     except HTTPException as e:
         # 503 is the capacity wall and nothing else on this door: the
         # template then renders the sentence with its mail link live,
@@ -2569,11 +2870,11 @@ def signup_submit(request: Request, email: str = Form(...),
             todayview._env.get_template("signup.html").render(
                 centered=True, title="Create your account", invite=invite,
                 email=email, ref=ref, error=e.detail,
-                at_capacity=(e.status_code == 503),
+                at_capacity=(e.status_code == 503 and not busy),
                 support_email=support_email(),
                 turnstile_key=turnstile.render_key(),
                 invite_required=_signup_needs_invite()),
-            status_code=e.status_code)
+            status_code=e.status_code, headers=e.headers)
     resp.status_code = 303
     # every signup is a brand-new tenant — send them to the setup wizard
     # rather than straight to the dashboard, which is how an invited user
@@ -2624,6 +2925,10 @@ _RECLAIM_NOT_OCCUPANCY = frozenset({
     # identity, not records: other PEOPLE are counted separately, and a
     # squatter's own sign-ins must never count (that is the squat)
     "users", "sessions", "device_tokens",
+    # credential bookkeeping for the login address (spent or live undo
+    # links), not anything the household made; the replace road burns
+    # every live one before the row moves
+    "email_change_reverts",
     # machinery the server writes on a household's behalf. A shell account
     # accumulates worker runs, sync attempts, snapshots and its per-tenant
     # key while nobody touches it, so none of it says the account is used.
@@ -2757,8 +3062,8 @@ def _reclaim_road(admin, r) -> str:
     against that same account — on the reasoning that the clicker proved
     the mailbox and the account never did — hides a takeover in every
     corner, not least because "never proved a mailbox" would be read off
-    `verified_at`, which a hosted email change clears on a fully verified
-    household. An in-use household gets one answer, and it is no.
+    `verified_at`, which can be empty on a fully verified household. An
+    in-use household gets one answer, and it is no.
     """
     if (r["role"] or "owner") != "owner":
         return "move_out"
@@ -2867,6 +3172,11 @@ def signup_reclaim_finish(request: Request, token: str = Form(""),
         err = passwords.password_error(password)
         if err:
             return _reclaim_page(token, email=email, error=err, status=400)
+        # Hashed here, before the spend and the wipe: a busy hasher
+        # (passwords.HasherBusy, answered "try again") must find nothing
+        # irreversible done yet, or the retry meets a spent link and, on
+        # the owner road, an account already erased.
+        password_hash = passwords.hash_password(password)
         wiped = False
         if is_owner:
             # Spending here, before the wipe, is forced: signup_reclaims
@@ -2938,6 +3248,25 @@ def signup_reclaim_finish(request: Request, token: str = Form(""),
                 def before_user():
                     if is_owner:
                         return                # already wiped, above
+                    # The household being left keeps the member's
+                    # questions to the assistant but stops naming them,
+                    # the same as every other way of leaving. Their row
+                    # is locked first: an answer still being recorded
+                    # holds it (record_turn), so this waits for that row
+                    # to land and then blanks it too, and an answer that
+                    # comes later waits for the move and finds them gone.
+                    admin.execute("SELECT 1 FROM users WHERE id=%s "
+                                  "FOR UPDATE", (uid,))
+                    from ..engine import assistant as _assistant
+                    prev = admin.execute(
+                        "SELECT current_setting('app.tenant_id', true) "
+                        "AS t").fetchone()["t"]
+                    _assistant.forget_asker(admin, old_tid, uid)
+                    # forget_asker pins the OLD household for the rest of
+                    # the transaction; the rows provisioned after this
+                    # take their tenant from that setting's default
+                    admin.execute("SELECT set_config('app.tenant_id', %s, "
+                                  "true)", (prev or "",))
                     for sql in (
                             "DELETE FROM sessions WHERE user_id=%s",
                             "DELETE FROM passkeys WHERE user_id=%s",
@@ -2958,6 +3287,16 @@ def signup_reclaim_finish(request: Request, token: str = Form(""),
                             "UPDATE email_verifications SET used_at=now() "
                             "WHERE user_id=%s AND used_at IS NULL"):
                         admin.execute(sql, (uid,))
+                    # a link back to an address this row left: the row now
+                    # carries the clicker's credentials into a household
+                    # of their own, and the old inbox has no say over that
+                    from ..auth import email_revert
+                    email_revert.burn_all(admin, uid)
+                    # and a cooling-off factor-clearing recovery: it would
+                    # otherwise follow the person into the new household
+                    # and land there, on credentials set by this reclaim
+                    from ..auth import factor_reset
+                    factor_reset.cancel_for_user(admin, uid, reason="moved")
 
                 if not is_owner and not signup_reclaim.spend(admin, r["id"]):
                     # Nothing irreversible happens on the member road — the
@@ -2970,7 +3309,7 @@ def signup_reclaim_finish(request: Request, token: str = Form(""),
                                          status=400)
                 new_uid, tid, owed_to, _ = _provision_household(
                     admin, email=email,
-                    password_hash=passwords.hash_password(password),
+                    password_hash=password_hash,
                     hosted=True, inv=inv, ref=None,
                     move_uid=None if is_owner else uid, verified=True,
                     before_user=before_user)
@@ -3236,7 +3575,7 @@ def verify_email_confirm(token: str = Form("")):
 
     It takes an emailed token — typically the one the GET that drew the
     button just spent, but any unexpired link that mailbox was sent
-    counts, a superseded one included (jobs/unverified.reopen says why).
+    counts, a spent one included (jobs/unverified.reopen says why).
     What it may reopen is only that token's own household, only while
     that household is frozen, and only once its user is verified. Its defence against a
     forged cross-site submit is the app's Origin check on every write,
@@ -3244,8 +3583,16 @@ def verify_email_confirm(token: str = Form("")):
     return _verify_email_act(token, reopen=True)
 
 
+# Keyed on the ACCOUNT, with a wide per-address backstop: a carrier's CGNAT
+# puts a crowd of new households on one public address, and a tight
+# per-address cap would leave a household behind a shared address unable to
+# get a second link after the first went to spam — and with it unable to
+# connect a bank.
+_VERIFY_RESEND_PER_ACCOUNT = (3, 3600)
+
+
 @app.post("/api/verify-email/resend",
-          dependencies=[Depends(limit("verify_resend", 3, 3600))])
+          dependencies=[Depends(limit("verify_resend", 30, 3600))])
 def verify_email_resend(user: dict = Depends(current_user)):
     """Mail a fresh confirmation link.
 
@@ -3258,6 +3605,9 @@ def verify_email_resend(user: dict = Depends(current_user)):
     verified, nothing sent" there would dead-end the ONE door a frozen
     session may open, on a household that is days from being erased —
     so a frozen household is always mailed a fresh link."""
+    security.account_limit_or_429(
+        ("verify_resend", str(user["user_id"])), *_VERIFY_RESEND_PER_ACCOUNT,
+        what="too many confirmation emails")
     with _control_conn() as conn:
         u = conn.execute("SELECT verified_at FROM users WHERE id=%s",
                          (user["user_id"],)).fetchone()
@@ -3408,13 +3758,15 @@ async def _auth_redirect(request: Request, exc: StarletteHTTPException):
 # signal that clients can back off on and that an edge proxy's maintenance
 # page can key on (those trigger on 502/503/504, never on "slow", so a
 # brown-out serving raw 500s would sail past one).
+import psycopg  # noqa: E402
 from psycopg_pool import PoolTimeout  # noqa: E402
 from psycopg import DataError  # noqa: E402
 from psycopg.errors import InvalidTextRepresentation  # noqa: E402
 
 
 @app.exception_handler(PoolTimeout)
-async def _pool_starved(request: Request, exc: PoolTimeout):
+@app.exception_handler(passwords.HasherBusy)
+async def _pool_starved(request: Request, exc: Exception):
     from fastapi.responses import JSONResponse
     if _machine_path(request.url.path):
         return JSONResponse(
@@ -3447,6 +3799,35 @@ async def _lock_busy(request: Request, exc: LockNotAvailable):
                        "Another change to this account is in progress. "
                        "Wait a moment and try again.",
                        headers={"Retry-After": "2"})
+
+
+def _db_unreachable(exc: BaseException) -> bool:
+    """An OperationalError that means "no connection to be had right now":
+    the server out of slots (class 53, 53300 too_many_connections), the
+    server starting up or shutting down (57P03 and kin), a connection
+    exception (class 08), or a failure before the server said anything at
+    all (no sqlstate: refused, timed out, reset). Any of them clears up on
+    its own; none is a bug in the request."""
+    import psycopg
+    if not isinstance(exc, psycopg.OperationalError):
+        return False
+    code = getattr(exc, "sqlstate", None)
+    return (code is None or code.startswith(("53", "08"))
+            or code in ("57P01", "57P02", "57P03"))
+
+
+@app.exception_handler(psycopg.OperationalError)
+async def _db_refused(request: Request, exc: psycopg.OperationalError):
+    """The unpooled admin connections (signup, email confirmation, reclaim)
+    meet a full database as a raised OperationalError at connect, where a
+    pooled request meets a PoolTimeout — the same brown-out, so the same
+    503 with Retry-After. Any other operational error is a real fault and
+    is re-raised to the 500 handler and the log."""
+    if not _db_unreachable(exc):
+        raise exc
+    log.warning("database refused a connection on %s: %s",
+                request.url.path, exc)
+    return await _pool_starved(request, exc)
 
 
 # A statement stopped by its time cap is the load-shed case, not a bug in
@@ -3556,6 +3937,7 @@ def access_info():
     self-service signup (OIKONOME_OPEN_SIGNUP, the open-signup switch), or
     none — in which case the operator's site is the door. Self-host has no signup door at all
     (accounts are made by the operator's setup link / invites)."""
+    from . import todayview
     hosted = env_flag("OIKONOME_HOSTED")
     # the demo box closes every account-creating door with a 404
     # (_not_demo_instance); advertising one here would send the native
@@ -3573,7 +3955,13 @@ def access_info():
             "site_url": site_url() if hosted else None,
             # where a locked-out person can write; the sign-in screens'
             # recovery prompts name it next to the self-serve door
-            "support_email": (support_email() or None) if hosted else None}
+            "support_email": (support_email() or None) if hosted else None,
+            # where a tester gets THIS instance's Android build — a Play
+            # internal-testing link, an App Tester invite, anything the
+            # operator chooses (OIKONOME_ANDROID_TEST_URL). Unset on an
+            # instance with no test build; the sign-in screen then shows
+            # nothing. Only https links are offered.
+            "android_test_url": todayview.android_test_url()}
 
 
 @app.get("/readyz")
@@ -3817,7 +4205,12 @@ def _provision_household(admin, *, email: str, password_hash: str,
     return row["id"], tid, owed_to, vtoken
 
 
-@app.post("/api/signup", dependencies=[Depends(limit("signup", 5, 3600)),
+# How long after a signup the same address and password, sent again, are
+# read as the same person repeating the form (see `signup`).
+_SIGNUP_REPEAT_WINDOW = dt.timedelta(minutes=15)
+
+
+@app.post("/api/signup", dependencies=[Depends(limit("signup", *_SIGNUP_PER_IP)),
                                   Depends(_not_demo_instance)])
 def signup(request: Request, email: str = Form(...),
            password: str = Form(...), invite: str = Form(""),
@@ -3869,6 +4262,8 @@ def signup(request: Request, email: str = Form(...),
     # set when this signup redeemed someone's referral; settled off the
     # request once the tenant is committed
     owed_to = None
+    # set when this request repeats a signup that has just succeeded
+    repeat = False
     admin = tenancy.admin_connect()
     try:
         # Capacity first, cheaply and outside every lock, so an instance at
@@ -3883,8 +4278,9 @@ def signup(request: Request, email: str = Form(...),
         # ~100 ms and 64 MiB by design) and it is computed ONCE, here,
         # before any advisory lock is held: inside the instance-wide intake
         # lock it would serialize every hosted signup on the box. Every road
-        # out of this handler pays exactly one hash at the same point, so
-        # the taken-address answers stay indistinguishable from each other.
+        # out of this handler pays this hash at the same point, and every
+        # taken address one more check against the stored hash, so the
+        # taken-address answers stay indistinguishable from each other.
         password_hash = passwords.hash_password(password)
         # The check and the insert must not straddle a TOCTOU window — two
         # concurrent signups for one email would both pass the exists-check,
@@ -3904,12 +4300,55 @@ def signup(request: Request, email: str = Form(...),
             inv = None
             if hosted and invite:
                 inv = signup_invites.lookup(admin, invite, email)
+            # On a gated instance the one invite-less request that may go
+            # on is the same form sent twice: the first request spent this
+            # very invite on the household it created. Anything else that
+            # carries a spent invite gets the gate's answer below, after
+            # the repeat check has had its say.
+            spent_for = None
             if invite_gate and inv is None:
-                raise HTTPException(403, INVITE_MSG)
+                spent_for = signup_invites.spent_by(admin, invite, email) \
+                    if invite else None
+                if spent_for is None:
+                    raise HTTPException(403, INVITE_MSG)
             existing = admin.execute(
-                "SELECT id, tenant_id, verified_at FROM users WHERE email=%s",
-                (email,)).fetchone()
-            if existing is not None and hosted and existing["verified_at"] is None:
+                "SELECT u.id, u.tenant_id, u.verified_at, u.password_hash, "
+                "(u.created_at > now() - %s) AS fresh, "
+                "(u.totp_secret IS NULL AND NOT EXISTS (SELECT 1 FROM "
+                " passkeys p WHERE p.user_id = u.id)) AS factorless "
+                "FROM users u WHERE u.email=%s",
+                (_SIGNUP_REPEAT_WINDOW, email)).fetchone()
+            # Every taken address pays the same second hash, verified or
+            # not, so the two 409s below stay as alike in time as they are
+            # in words; the answer it feeds is only ever different for a
+            # caller who typed this account's own password.
+            same_password = existing is not None and \
+                passwords.verify_password(existing["password_hash"], password)
+            if (existing is not None and hosted
+                    and existing["verified_at"] is None and same_password
+                    and existing["fresh"] and existing["factorless"]
+                    and (spent_for is None
+                         or spent_for == existing["tenant_id"])):
+                # The same form sent twice. A double click, or a second
+                # submit after the human check refused the first one's
+                # spent token, reaches here a moment after the first
+                # request created this very account: same address, same
+                # password, minutes old, nothing enrolled yet. That is the
+                # person who just signed up, and they get the session the
+                # first answer would have given them — not "this address
+                # is taken" and a reclaim mail about their own account.
+                # Knowing the password is what the sign-in door asks too,
+                # and an account with a second factor still goes through
+                # that door, never this one.
+                taken, pending, repeat = False, None, True
+                row, tid, owed_to, vtoken = (
+                    {"id": existing["id"]}, existing["tenant_id"], None,
+                    None)
+            elif spent_for is not None:
+                # a spent invite that is not a repeat of its own signup
+                # admits nothing: the gate's answer, as before
+                raise HTTPException(403, INVITE_MSG)
+            elif existing is not None and hosted and existing["verified_at"] is None:
                 # Taken but never proven. NOTHING is created and no
                 # session is opened: any immediate reclaim — resetting
                 # the row's credentials, or wiping its tenant and starting
@@ -3994,6 +4433,9 @@ def signup(request: Request, email: str = Form(...),
             threading.Thread(target=_deliver_reclaim, args=pending,
                              daemon=True).start()
         raise HTTPException(409, TAKEN_MSG)
+    if repeat:
+        # the first request already mailed the link and told the operator
+        return _login_response(row["id"], tid, request=request)
     if vtoken:
         # out-of-band like the reset mail: a synchronous SMTP send would
         # add a timing oracle and slow every signup on a wobbly relay
@@ -4007,7 +4449,7 @@ def signup(request: Request, email: str = Form(...),
     return _login_response(row["id"], tid, request=request)
 
 
-@app.post("/api/login", dependencies=[Depends(limit("login", 10, 300))])
+@app.post("/api/login", dependencies=[Depends(limit("login", *_LOGIN_PER_IP))])
 def login(request: Request, email: str = Form(...), password: str = Form(...),
           totp_code: str = Form(""),
           cf_token: str = Form("", alias=_TS_FIELD)):
@@ -4019,6 +4461,8 @@ def login(request: Request, email: str = Form(...), password: str = Form(...),
     # single-use, so pages.js resets the widget after each response.
     # Risk-gated: an IP and account with no recent failures are not asked for
     # a token at all (turnstile.verify_login).
+    import time
+    checked_at = time.monotonic()
     if not turnstile.verify_login(cf_token, security.client_ip(request), email):
         raise HTTPException(403, "human_check_failed")
     # account-scoped lockout: source-IP-
@@ -4032,8 +4476,8 @@ def login(request: Request, email: str = Form(...), password: str = Form(...),
             "totp_last_counter FROM users WHERE email=%s",
             (email.strip().lower(),)).fetchone()
     # verify against a dummy hash on unknown users — uniform timing
-    ok = passwords.verify_password(
-        u["password_hash"] if u else _DUMMY_HASH, password)
+    ok = _sign_in_verify(email, u["password_hash"] if u else _DUMMY_HASH,
+                         password, checked_at)
     if not u or not ok:
         # NB: a wrong PASSWORD does NOT feed the account lock (that would
         # let anyone with the email DoS the owner) — only second-factor
@@ -4182,6 +4626,16 @@ def _proof_still_stands(conn, user_id, proof: dict) -> bool:
     return True
 
 
+def _set_signin_passkey(conn, passkey_id) -> None:
+    """Name the passkey a sign-in was signed by for the rest of the
+    caller's transaction. The sessions and device_tokens rows inserted in
+    it take that id through their signin_passkey_id default (migration
+    187), so removing the key can end them; None or no call leaves it
+    NULL. Transaction-local, so a pooled connection never carries it on."""
+    conn.execute("SELECT set_config('oikonome.signin_passkey', %s, true)",
+                 (str(passkey_id) if passkey_id else "",))
+
+
 def _login_response(user_id, tenant_id, user_agent: str = "",
                     request: Request | None = None,
                     proof: dict | None = None) -> Response:
@@ -4214,6 +4668,10 @@ def _login_response(user_id, tenant_id, user_agent: str = "",
         if proof is not None and not _proof_still_stands(conn, user_id,
                                                          proof):
             raise ReauthRefused("bad credentials")
+        # The key that signed this sign-in is written on the session it
+        # opens, so removing the key can end it (passkey_delete). The
+        # column's default reads it from this transaction-local setting.
+        _set_signin_passkey(conn, (proof or {}).get("passkey_id"))
         token = sessions.create_session(conn, user_id, tenant_id, user_agent,
                                         ip=ip)
         ticket = device_tokens.issue_mint_ticket(conn, user_id, token)
@@ -4330,8 +4788,9 @@ def _started_by_a_person(request: Request) -> bool:
     claim = (request.headers.get("origin")
              or request.headers.get("referer") or "")
     if claim:
-        from urllib.parse import urlsplit
-        return urlsplit(claim).netloc == request.headers.get("host", "")
+        # claim_netloc answers None for a claim that does not parse; that
+        # is a claim naming some other host, so it compares unequal.
+        return security.claim_netloc(claim) == request.headers.get("host", "")
     return True
 
 
@@ -4634,13 +5093,23 @@ def password_change(request: Request, user: dict = Depends(current_user),
     # the ONE key the eviction below may keep — the credential that proved
     # this caller, not merely one that was used recently
     keep_passkey = None
+    # argon2id is ~100 ms and 64 MiB by design, so it is paid before the
+    # rotation's transaction opens: nothing expensive runs while a lock is
+    # held.
+    new_hash = None
     if "totp_code" in body or "recovery_code" in body:
         # LEGACY: the store apps send the code / recovery-code KEY with
         # the change (empty until their totp_required prompt fills it) —
         # run the same checks, with the same 401s, as before
+        if u["totp_secret"] and not code:
+            raise ReauthRefused("totp_required")
+        # Hashed before any of those one-time proofs is spent, for the
+        # reason the new password is validated first: a busy hasher
+        # answers 503 "try again", and the retry must find the
+        # authenticator step, recovery code or passkey ticket it carries
+        # still unspent.
+        new_hash = passwords.hash_password(new)
         if u["totp_secret"]:
-            if not code:
-                raise ReauthRefused("totp_required")
             if not _totp_consume(user["user_id"], u["totp_secret"], code):
                 raise ReauthRefused("bad one-time code")
         # passkey-only accounts present a recovery code instead of TOTP
@@ -4659,10 +5128,10 @@ def password_change(request: Request, user: dict = Depends(current_user),
     # refuse before a single row is written (see _proved_passkey_or_refuse).
     keep_passkey = _proved_passkey_or_refuse(user["user_id"], keep_passkey)
     token = request.cookies.get(sessions.COOKIE_NAME, "")
-    # argon2id is ~100 ms and 64 MiB by design, so it is paid BEFORE the
-    # transaction below opens — the same rule the intake lock records:
-    # nothing expensive runs while a lock is held.
-    new_hash = passwords.hash_password(new)
+    if new_hash is None:
+        # the elevation road spends nothing single-use, so its hash waits
+        # until the window has been checked — a refused elevation pays none
+        new_hash = passwords.hash_password(new)
     with _control_conn() as conn:
         # ONE transaction for the whole rotation. Every statement here is
         # part of a single act — the new password and the eviction of
@@ -4738,12 +5207,10 @@ def password_change(request: Request, user: dict = Depends(current_user),
             # must not keep arriving where the session just died
             _drop_web_push(conn, user["user_id"],
                            str(body.get("keep_push_endpoint") or ""))
-            # and any unspent reset link: one minted to the OLD mailbox by
-            # whoever held it would otherwise outlive this rotation and strip
-            # every factor an hour later
-            conn.execute("UPDATE password_resets SET used_at=now() "
-                         "WHERE user_id=%s AND used_at IS NULL",
-                         (user["user_id"],))
+            # and any unspent reset link or pending cooling-off recovery:
+            # one started from the OLD mailbox by whoever held it would
+            # otherwise outlive this rotation and strip every factor later
+            _end_pending_recoveries(conn, user["user_id"])
             # (pending family invites went with the members, above: a
             # hijacker who minted one before the rotation would otherwise
             # keep a claimable member slot. The owner re-mints; a real
@@ -4752,6 +5219,7 @@ def password_change(request: Request, user: dict = Depends(current_user),
             # the operator for up to a week, so a window a hijacker opened
             # must not outlive the rotation any more than a recovery's
             support_revoked = _revoke_support_grants(conn, user["user_id"])
+    _notify_security_change(user, "password")
     # The counts let the client say what the rotation actually cost —
     # a passkey that stops working with no explanation reads as a bug.
     return {"ok": True, "passkeys_removed": passkeys_removed,
@@ -5083,6 +5551,12 @@ def elevate(user: dict = Depends(current_user), body: dict = Body(...)):
     if not ticket and recovery_code.startswith("pkstep-"):
         ticket, recovery_code = recovery_code, ""
     proved_by_passkey = None
+    # Set when the proof included a real second factor — a passkey, a live
+    # authenticator code or a recovery code. Whoever holds one does not
+    # need a factor-clearing recovery, and if it was not them who asked for
+    # it, it must not land. A bare password on a factorless account proves
+    # nothing a recovery would take away, so it stops nothing.
+    proved_factor = False
     if ticket:
         from ..auth import passkeys
         with _control_conn() as conn:
@@ -5095,6 +5569,7 @@ def elevate(user: dict = Depends(current_user), body: dict = Body(...)):
             raise ReauthRefused(
                 "passkey check failed: that confirmation is expired "
                 "or already used — confirm with your passkey again")
+        proved_factor = True
     elif recovery_code and _passkey_only_hosted(user["user_id"]):
         if "password" not in body:
             # A store build older than the password-beside-the-code rule
@@ -5109,6 +5584,7 @@ def elevate(user: dict = Depends(current_user), body: dict = Body(...)):
             raise ReauthRefused(OLD_CLIENT_RECOVERY_REFUSAL)
         _require_elevate_password(user, password)
         _redeem_recovery_or_fail(user, recovery_code)
+        proved_factor = True
     elif password:
         u = _check_password(user["user_id"], password, route="elevate")
         if u["totp_secret"]:
@@ -5120,6 +5596,7 @@ def elevate(user: dict = Depends(current_user), body: dict = Body(...)):
                                    totp_code, route="elevate"):
                 # the miss was counted inside, lock bucket included
                 raise ReauthRefused("bad one-time code")
+            proved_factor = True
         # for a passkey-only hosted account this refuses (recovery_required)
         # exactly as every door did: the password is not the factor such an
         # account signs in with, and password + recovery code is handled above
@@ -5135,6 +5612,12 @@ def elevate(user: dict = Depends(current_user), body: dict = Body(...)):
             "password_required: confirm your password or passkey to "
             "continue")
     _stamp_elevation(user, proved_by_passkey)
+    if proved_factor:
+        from ..auth import factor_reset
+        with _control_conn() as conn:
+            if factor_reset.cancel_for_user(conn, user["user_id"],
+                                            reason="step-up"):
+                log.info("pending factor reset cancelled by a step-up")
     return _elevation_state(user)
 
 
@@ -5177,8 +5660,8 @@ def _require_elevate_password(user: dict, password: str) -> None:
         u = conn.execute("SELECT email, password_hash FROM users "
                          "WHERE id=%s", (user["user_id"],)).fetchone()
     slot = _reserve_step_up_guess(user["user_id"])
-    if not passwords.verify_password(
-            u["password_hash"] if u else _DUMMY_HASH, password):
+    if not _verify_holding_guess(
+            slot, u["password_hash"] if u else _DUMMY_HASH, password):
         _step_up_factor_miss(user["user_id"],
                              (u or {}).get("email", "") or
                              user.get("email", ""), "elevate", slot)
@@ -5202,6 +5685,24 @@ def _redeem_recovery_or_fail(user: dict, recovery_code: str) -> None:
         raise ReauthRefused(
             "recovery_required: that recovery code is not valid — "
             "each one works once")
+
+
+def _end_pending_recoveries(conn, user_id) -> None:
+    """Void every recovery still waiting to land on this account: unspent
+    mailed reset links AND a cooling-off factor-clearing reset.
+
+    Every door that rotates a credential or re-enrols a factor calls this
+    inside its rotation transaction. Both kinds of recovery strip the
+    account's factors when they land; one started before the rotation —
+    by whoever read the old mailbox, or by the owner who has since found
+    their authenticator — would otherwise land afterwards and take away
+    the credentials the owner has just put on. The two are voided together
+    so a door cannot remember one and forget the other."""
+    conn.execute("UPDATE password_resets SET used_at=now() "
+                 "WHERE user_id=%s AND used_at IS NULL", (user_id,))
+    from ..auth import factor_reset
+    if factor_reset.cancel_for_user(conn, user_id, reason="rotation"):
+        log.info("pending factor reset cancelled by a credential rotation")
 
 
 def _revoke_bearer_persistence(conn, user: dict) -> dict:
@@ -5235,10 +5736,10 @@ def _revoke_bearer_persistence(conn, user: dict) -> dict:
     # exactly as long as this caller's session, which these doors keep
     _drop_web_push(conn, user["user_id"],
                    keep_session_id=user.get("session_id"))
-    # an unspent reset link minted to the mailbox a hijacker read would
-    # otherwise strip every factor this door just put on, an hour later
-    conn.execute("UPDATE password_resets SET used_at=now() "
-                 "WHERE user_id=%s AND used_at IS NULL", (user["user_id"],))
+    # an unspent reset link minted to the mailbox a hijacker read — or a
+    # cooling-off recovery started before this door — would otherwise
+    # strip every factor this door just put on
+    _end_pending_recoveries(conn, user["user_id"])
     from ..notify import outbound_pause as _outbound
     from ..notify import webhooks as _webhooks
     _webhooks.pause_for_rotation(conn, user["user_id"])
@@ -5428,6 +5929,9 @@ def totp_confirm(request: Request, user: dict = Depends(current_user),
     finally:
         if admin is not None:
             admin.close()
+    _notify_security_change(
+        user, "totp_replaced" if row0 and row0["totp_secret"]
+        else "totp_enrolled")
     return {"ok": True, "recovery_codes": codes,
             "sms_number_needs_verify": sms_needs_verify, **revoked}
 
@@ -5455,8 +5959,11 @@ def recovery_regenerate(user: dict = Depends(current_user),
             _lock_user_factors(conn, user["user_id"])
             _caller_still_signed_in(conn, user)
             codes = recovery.issue(admin, user["user_id"])
+            # a recovery landing later would void this fresh batch
+            _end_pending_recoveries(conn, user["user_id"])
     finally:
         admin.close()
+    _notify_security_change(user, "recovery_codes")
     return {"ok": True, "recovery_codes": codes}
 
 
@@ -5569,6 +6076,7 @@ def totp_disable(request: Request, user: dict = Depends(current_user),
                 "DELETE FROM sessions WHERE user_id=%s AND token_hash != %s",
                 (user["user_id"], hashlib.sha256(token.encode()).hexdigest()))
             revoked = _revoke_bearer_persistence(conn, user)
+    _notify_security_change(user, "totp_disabled")
     return {"ok": True, "sms_number_needs_verify": sms_needs_verify,
             **revoked}
 
@@ -5601,6 +6109,7 @@ def _delivery_state_for(email: str) -> dict | None:
 @app.get("/api/me")
 def me(user: dict = Depends(current_user)):
     with _control_conn() as conn:
+        pending_change = _pending_email_change(conn, user["user_id"])
         u = conn.execute(
             "SELECT totp_secret, verified_at, created_at, "
             "second_factor_waived FROM users "
@@ -5680,6 +6189,12 @@ def me(user: dict = Depends(current_user)):
                 # so "N left" on screen is the number the ADD door allows.
                 features["institutions_used"] = \
                     _sync_base.institutions_held(tc)
+            # Whether the cap is 0 for the one reason a confirmed address
+            # lifts. The clients close their add-a-bank doors on this, not
+            # on "unconfirmed": a household that pays may be unconfirmed
+            # and still connect, and an uncapped one always may.
+            features["bank_awaits_confirm"] = (
+                _cap == 0 and bool(ext.gate.bank_awaits_confirm(tc)))
         finally:
             tc.close()
     except Exception:                            # noqa: BLE001
@@ -5786,6 +6301,15 @@ def me(user: dict = Depends(current_user)):
             # sweep is off, not hosted, or anyone here ever confirmed.
             "verify_deadline": (verify_deadline.isoformat()
                                 if verify_deadline else None),
+            # a login-email change waiting for its new mailbox: the address
+            # asked for and when the link to it lapses (ISO). null when
+            # there is none — the account is still on "email" until the
+            # link mailed to the new address is confirmed.
+            "pending_email": (pending_change["new_email"]
+                              if pending_change else None),
+            "pending_email_expires_at": (
+                pending_change["expires_at"].isoformat()
+                if pending_change else None),
             # null while there is no reason to think this address
             # is broken. Non-null means the mail provider has reported it
             # could not deliver, the scheduled sends are HELD, and the SPA
@@ -6148,6 +6672,10 @@ def user_remove(user_id: str, user: dict = Depends(current_user),
         if gone is None:
             # nothing removed, so nothing revoked either
             raise HTTPException(404, "no such member")
+        # the assistant's log keeps what they asked — the household's
+        # record — but stops naming someone who no longer belongs here
+        from ..engine import assistant as _assistant
+        _assistant.forget_asker(conn, user["tenant_id"], target_uuid)
     # Membership was their only reason to get the household's mail; leaving
     # them on the recipient list would keep the balances and spending going
     # to someone who no longer holds an account here (on self-host no
@@ -6506,6 +7034,10 @@ def passkey_register(request: Request, user: dict = Depends(current_user),
 
             if not first_factor:
                 result = bind()
+                # an added key is a re-enrolment like the first one: a
+                # recovery still waiting to land would strip it with the
+                # rest (the first-factor path does this in the eviction)
+                _end_pending_recoveries(conn, user["user_id"])
             else:
                 # The first strong factor is the same posture change as
                 # totp_confirm and gets the same eviction: every other
@@ -6570,6 +7102,7 @@ def passkey_register(request: Request, user: dict = Depends(current_user),
     finally:
         if admin is not None:
             admin.close()
+    _notify_security_change(user, "passkey_added")
     return result
 
 
@@ -6655,6 +7188,17 @@ def passkey_delete(pk_id: str, user: dict = Depends(current_user),
                     400, "last_factor: this is your only two-factor method "
                          "— add another passkey or an authenticator app "
                          "before removing it")
+            # what this key signed in goes with it — see the helper
+            signed_out = False
+            if conn.execute(
+                    "SELECT 1 FROM passkeys WHERE id = %s AND user_id = %s",
+                    (pk_uuid, user["user_id"])).fetchone():
+                # Asked before the helper deletes the row: if the caller's
+                # own session or device token was opened by this key, the
+                # removal ends it too, and the client must say so rather
+                # than meet a bare 401 on its next request.
+                signed_out = _caller_signed_in_by(conn, user, pk_uuid)
+                _end_what_a_passkey_opened(conn, user["user_id"], pk_uuid)
             n = conn.execute(
                 "DELETE FROM passkeys WHERE id = %s AND user_id = %s",
                 (pk_uuid, user["user_id"])).rowcount
@@ -6684,7 +7228,8 @@ def passkey_delete(pk_id: str, user: dict = Depends(current_user),
                     (user["user_id"], pk_uuid))
     if not n:
         raise HTTPException(404, "no such passkey")
-    return {"ok": True}
+    _notify_security_change(user, "passkey_removed")
+    return {"ok": True, "signed_out": signed_out}
 
 
 # Inline step-up assertion for destructive actions on a passkey
@@ -6726,8 +7271,10 @@ def stepup_passkey(request: Request, user: dict = Depends(current_user),
     return {"stepup_ticket": ticket}
 
 
+# Per address only as a wide backstop (a CGNAT crowd signs in from one
+# address); the sign-in itself is counted per account in `passkey_login`.
 @app.post("/api/login/passkey/options",
-          dependencies=[Depends(limit("passkey_login", 20, 3600))])
+          dependencies=[Depends(limit("passkey_login", 120, 3600))])
 def passkey_login_options(request: Request, body: dict = Body(default=None)):
     """email is optional. Empty → discoverable (usernameless) passkey login;
     with email → allow-list that user's credentials (helps non-resident keys)."""
@@ -6740,7 +7287,7 @@ def passkey_login_options(request: Request, body: dict = Body(default=None)):
 
 
 @app.post("/api/login/passkey",
-          dependencies=[Depends(limit("passkey_login", 20, 3600))])
+          dependencies=[Depends(limit("passkey_login", 120, 3600))])
 def passkey_login(request: Request, body: dict = Body(...)):
     _require_hosted()
     from ..auth import passkeys
@@ -6763,6 +7310,9 @@ def passkey_login(request: Request, body: dict = Body(...)):
                         msg[:200], rp_id, origin, extra={"no_capture": True})
             raise ReauthRefused(f"passkey sign-in failed: "
                                 f"{type(e).__name__}")
+    security.account_limit_or_429(
+        ("passkey_login", str(r["user_id"])), 20, 3600,
+        what="too many passkey sign-ins")
     return _login_response(r["user_id"], r["tenant_id"],
                            request.headers.get("user-agent", ""),
                            request=request,
@@ -6911,7 +7461,73 @@ def sessions_revoke(request: Request, user: dict = Depends(current_user),
 _DEVICE_MINT_FRESH_AUTH = dt.timedelta(minutes=5)
 
 
-@app.post("/api/devices", dependencies=[Depends(limit("device_mint", 20, 3600))])
+def _mint_ticket_passkey(conn, ticket: str):
+    """The passkey that signed in the session this mint ticket was issued
+    with, or None (another kind of sign-in, or no such ticket)."""
+    if not ticket.startswith(device_tokens.MINT_TICKET_PREFIX):
+        return None
+    row = conn.execute(
+        "SELECT s.signin_passkey_id FROM webauthn_challenges c "
+        "JOIN sessions s ON s.token_hash = c.session_hash "
+        "WHERE c.purpose='device-mint-ticket' AND c.challenge=%s",
+        (device_tokens._h(ticket),)).fetchone()
+    return row["signin_passkey_id"] if row else None
+
+
+def _caller_signed_in_by(conn, user, passkey_id) -> bool:
+    """Whether the session or device token this caller authenticated with
+    was opened by `passkey_id` — the credential _end_what_a_passkey_opened
+    is about to end."""
+    if user.get("device_id"):
+        row = conn.execute(
+            "SELECT signin_passkey_id FROM device_tokens WHERE id=%s",
+            (user["device_id"],)).fetchone()
+    elif user.get("session_id"):
+        row = conn.execute(
+            "SELECT signin_passkey_id FROM sessions WHERE id=%s",
+            (user["session_id"],)).fetchone()
+    else:
+        return False
+    return bool(row and row["signin_passkey_id"]
+                and str(row["signin_passkey_id"]) == str(passkey_id))
+
+
+def _end_what_a_passkey_opened(conn, user_id, passkey_id) -> None:
+    """End every credential a passkey's sign-ins left live: the sessions
+    it signed in, the device tokens minted from them and their unspent
+    mint tickets. Run inside the removal's transaction, under the factor
+    lock, and in this order: a ticket is found through the session it was
+    issued with, so the tickets go before the sessions do.
+
+    The current session is not spared, which is the console's rule for
+    its own keys: removing a key means it can no longer act, and a
+    session it signed in is that key acting. Someone removing the key
+    they are signed in with is signed out and signs in with what they
+    have left; someone removing a stolen one ends the thief's session."""
+    conn.execute(
+        "DELETE FROM webauthn_challenges "
+        "WHERE purpose='device-mint-ticket' AND user_id=%s "
+        "AND session_hash IN ("
+        "    SELECT token_hash FROM sessions "
+        "    WHERE user_id=%s AND signin_passkey_id=%s)",
+        (user_id, user_id, passkey_id))
+    conn.execute(
+        "UPDATE device_tokens SET revoked_at=now() "
+        "WHERE user_id=%s AND signin_passkey_id=%s AND revoked_at IS NULL",
+        (user_id, passkey_id))
+    conn.execute(
+        "DELETE FROM sessions WHERE user_id=%s AND signin_passkey_id=%s",
+        (user_id, passkey_id))
+
+
+# Per address only as a wide backstop — every app sign-in mints one, and a
+# carrier address carries many phones; the mint is counted per account
+# below (the ticket's owner, or the signed-in user).
+_DEVICE_MINT_PER_ACCOUNT = (20, 3600)
+
+
+@app.post("/api/devices",
+          dependencies=[Depends(limit("device_mint", 120, 3600))])
 def device_mint_ticketed(request: Request, body: dict = Body(...)):
     """The cookie-free half of the mint, for native apps.
 
@@ -6924,7 +7540,10 @@ def device_mint_ticketed(request: Request, body: dict = Body(...)):
     """
     ticket = body.get("mint_ticket")
     if not isinstance(ticket, str) or not ticket:
-        return _device_mint_session(request, current_user(request), body)
+        user = current_user(request)
+        security.account_limit_or_429(
+            ("device_mint", str(user["user_id"])), *_DEVICE_MINT_PER_ACCOUNT)
+        return _device_mint_session(request, user, body)
     # One transaction for the whole exchange. Redeeming is a DELETE, so
     # anything that raises below — a closed account, the device ceiling,
     # a dropped connection — rolls the redemption back and the phone can
@@ -6945,9 +7564,16 @@ def device_mint_ticketed(request: Request, body: dict = Body(...)):
     # redeem re-checks it under the lock.
     with _control_conn() as conn:
         owner = device_tokens.mint_ticket_owner_hint(conn, ticket)
+        if owner is not None:
+            security.account_limit_or_429(
+                ("device_mint", str(owner)), *_DEVICE_MINT_PER_ACCOUNT)
         with conn.transaction():
             if owner is not None:
                 _lock_user_factors(conn, owner)
+            # read before the redeem spends the ticket and closes its
+            # session: a passkey sign-in passes its key on to the device
+            # token minted from it
+            _set_signin_passkey(conn, _mint_ticket_passkey(conn, ticket))
             user_id = device_tokens.redeem_mint_ticket(conn, ticket)
             if user_id is None or str(user_id) != str(owner):
                 raise HTTPException(401, "sign in again on the device")
@@ -7176,6 +7802,13 @@ def _device_mint_session(request: Request, user: dict, body: dict):
             with conn.transaction():
                 _lock_user_factors(conn, user["user_id"])
                 _caller_still_signed_in(conn, user)
+                # a token minted from a passkey's session answers to that
+                # key, exactly as the session does
+                srow = conn.execute(
+                    "SELECT signin_passkey_id FROM sessions "
+                    "WHERE token_hash=%s", (sessions._h(token),)).fetchone()
+                _set_signin_passkey(
+                    conn, srow["signin_passkey_id"] if srow else None)
                 _replace_device(
                     conn, user["user_id"], body,
                     shared=bool(user.get("second_factor_waived")))
@@ -7541,6 +8174,12 @@ def account_leave(request: Request, user: dict = Depends(current_user),
                 "DELETE FROM users WHERE id=%s AND role != 'owner' "
                 "RETURNING email",
                 (user["user_id"],)).fetchone()
+            if gone:
+                # their questions stay in the household's log, without
+                # their name (the same as a member the owner removes)
+                from ..engine import assistant as _assistant
+                _assistant.forget_asker(admin, user["tenant_id"],
+                                        user["user_id"])
     finally:
         admin.close()
     # Off the mail lists only AFTER the row is gone, as user_remove does.
@@ -7555,6 +8194,17 @@ def account_leave(request: Request, user: dict = Depends(current_user),
     return resp
 
 
+# `verify_sent` on a pending change's answer. The installed store apps from
+# before the address waited for its new mailbox read `verify_sent: true` as
+# "the sign-in address moved and is now unverified": they mark the cached
+# account unverified and raise a verify banner about the OLD address, whose
+# Resend then answers "already verified". A pending change leaves the
+# sign-in address where it was, still verified, and current clients read
+# `pending_email` instead — so the answer says no verification went to the
+# sign-in address, which is also simply true.
+_PENDING_VERIFY_SENT = False
+
+
 @app.post("/api/email/change",
           dependencies=[Depends(limit("email_change", 5, 3600))])
 def email_change(request: Request, user: dict = Depends(current_user),
@@ -7566,8 +8216,26 @@ def email_change(request: Request, user: dict = Depends(current_user),
     goes through the ADMIN connection on purpose: the app role is
     column-scoped OUT of users.email precisely so injected SQL cannot
     rewrite it, so this legitimate path uses admin and nothing reopens that
-    grant. On a hosted instance the new address starts unverified and a
-    verification mail goes out (the banner returns)."""
+    grant.
+
+    On a hosted instance the address does not move here. The request is
+    recorded and the confirmation link mailed to the NEW address; the
+    account moves when that link's confirm button is pressed
+    (`email_change_confirm_finish`), so no account can hold an address
+    whose mailbox it never proved. The rotation below — sessions, tokens,
+    devices, passkeys, push, invites — still happens now: the caller has
+    just proved full step-up to move the login, and what it revokes is
+    only ever taken away. A self-hosted instance (one household, often no
+    mail at all) moves at once, as it always did.
+
+    The confirmation mail is capped (see `_email_change_mail_wait`), and
+    the answer is honest about it: past the account's own cap a 429 with
+    the real wait and nothing recorded or rotated; past the recipient's
+    cap the request is recorded WITHOUT the rotation, and the 429 says a
+    confirmation went to that address recently and when to ask again
+    (`POST /api/email/change/resend` then mails it and runs the rotation).
+    Asking again for the address this credential's live request already
+    mailed is a resend: a fresh link, and nothing rotated a second time."""
     demoguard.deny_shared_login(user)
     new_email = new_email.strip().lower()
     from .mailguard import valid_address
@@ -7606,6 +8274,32 @@ def email_change(request: Request, user: dict = Depends(current_user),
     # its entry: change away and it is dropped, mute and it is silenced.
     # So only an owner may move onto an address already on either list.
     _refuse_listed_address_unless_owner(user, new_email)
+    hosted = env_flag("OIKONOME_HOSTED")
+    if hosted:
+        from ..auth import email_change as _email_change
+        admin = tenancy.admin_connect()
+        try:
+            live = _email_change.live(admin, user["user_id"])
+            # Changing to it again while its mail is out is asking for the
+            # mail again. A second full rotation would only cost the owner
+            # the passkeys and devices they re-added since the first one.
+            if (live is not None and live["mail_sent_at"] is not None
+                    and live["new_email"].lower() == new_email
+                    and _email_change_asked_by(live, user)):
+                return _resend_email_change(request, user,
+                                            keep_push_endpoint,
+                                            new_email=new_email)
+            # Before any single-use factor is spent. The authoritative
+            # count re-runs under the address lock below.
+            kind, wait = _email_change_mail_wait(admin, user["user_id"],
+                                                 new_email)
+        finally:
+            admin.close()
+        if kind == "account" or (kind and legacy):
+            # (a recipient-capped request from a store app that re-proves
+            # per request is not recorded: recording it would cost the
+            # caller a one-time code for a mail that cannot go yet)
+            raise _email_change_cap_refusal(kind, wait)
     # The email IS the login identifier and the verdict-email /
     # recovery channel — rotating it is a posture change. For a passkey-only
     # account the password alone is insufficient (mirrors password_change /
@@ -7625,7 +8319,11 @@ def email_change(request: Request, user: dict = Depends(current_user),
     # …and only while that key still exists: a name whose row was deleted
     # in the meantime would evict every OTHER key and leave none.
     keep_passkey = _proved_passkey_or_refuse(user["user_id"], keep_passkey)
-    hosted = env_flag("OIKONOME_HOSTED")
+    if hosted and not (user.get("session_id") or user.get("device_id")):
+        # the pending change lives as long as the credential that asked
+        raise HTTPException(
+            403, "change the sign-in email from a signed-in browser or "
+                 "the app")
     token = request.cookies.get(sessions.COOKIE_NAME, "")
     # ONE transaction for the whole rotation, on ONE connection — the same
     # rule password_change records, for the same reason. The email IS the
@@ -7669,68 +8367,47 @@ def email_change(request: Request, user: dict = Depends(current_user),
             if admin.execute("SELECT 1 FROM users WHERE email=%s AND id!=%s",
                              (new_email, user["user_id"])).fetchone():
                 raise HTTPException(409, "that email is already in use")
-            # webhooks go the way of the script tokens below — paused
-            # BEFORE the address changes, because they are recorded under
-            # the address their creator had
-            from ..notify import webhooks as _webhooks
-            _webhooks.pause_for_rotation(admin, user["user_id"])
-            # and the household's SMS number, as on a password change,
-            # with the relay, extra recipients and AI endpoint
-            sms_needs_verify = reset_mod._unverify_sms_number(
-                admin, user["user_id"])
-            from ..notify import outbound_pause as _outbound
-            _outbound.pause_for_rotation(admin, user["user_id"])
-            # pending family invites — a share URL that needs no mailbox —
-            # and the members this owner's recent invites created, as on a
-            # password change; before the users row, as there
-            invites_removed, members_removed = \
-                reset_mod.evict_invite_footholds(admin, user["user_id"])
-            admin.execute(
-                "UPDATE users SET email=%s, verified_at=%s WHERE id=%s",
-                (new_email,
-                 None if hosted else dt.datetime.now(dt.timezone.utc),
-                 user["user_id"]))
-            vtoken = email_verify.create(admin, user["user_id"]) if hosted \
-                else None
-            # the email IS the login identifier — rotate it like a
-            # credential. Other sessions (a hijacker's, most importantly)
-            # and script tokens don't get to ride through the change; this
-            # session stays, same shape as password_change.
-            sessions.revoke_all_others(admin, user["user_id"], token)
-            admin.execute("UPDATE api_tokens SET revoked_at=now() "
-                          "WHERE created_by=%s AND revoked_at IS NULL",
-                          (user["user_id"],))
-            # keep the CALLING device, like password_change and every other
-            # posture-change door — a phone that just proved full step-up
-            # must not sign itself out by changing its own email
-            device_tokens.revoke_all_for_user(
-                admin, user["user_id"],
-                keep_device_id=user.get("device_id"))
-            device_tokens.revoke_mint_tickets(admin, user["user_id"])
-            # and any unspent reset link: one minted to the OLD mailbox by
-            # whoever held it would otherwise outlive this rotation and
-            # strip every factor an hour later
-            admin.execute("UPDATE password_resets SET used_at=now() "
-                          "WHERE user_id=%s AND used_at IS NULL",
-                          (user["user_id"],))
-            # Passkeys die with the rotation too, mirroring password_change
-            # and the reset path: a hijacked session could have enrolled its
-            # own passkey, and WebAuthn login would keep working for the
-            # attacker no matter how many sessions and tokens are revoked
-            # above. The owner re-adds passkeys after; the count comes back
-            # in the response so the client can say what happened. Same
-            # last-factor rule as password_change — the key that PROVED this
-            # caller survives when it is the only factor left, or the
-            # rotation would re-enable password-only login. Only that key: a
-            # stranger's freshly-used one is not a proof of anything.
-            passkeys_removed, passkeys_kept = _evict_passkeys(
-                admin, user["user_id"], keep_passkey)
-            # and a support-access grant, as on a password change: an
-            # operator access window a hijacker opened must not outlive
-            # the rotation the owner made to shut them out
-            support_revoked = _revoke_support_grants(admin, user["user_id"])
-            # and the other browsers' web push, as on a password change
-            _drop_web_push(admin, user["user_id"], keep_push_endpoint)
+            withheld = None
+            if hosted:
+                # counted before this request's own row, under the address
+                # lock, so two racing requests cannot both read "room left"
+                kind, wait = _email_change_mail_wait(
+                    admin, user["user_id"], new_email)
+                if kind == "account":
+                    raise _email_change_cap_refusal(kind, wait)
+                if kind:
+                    withheld = (kind, wait)
+            from ..auth import email_change as _email_change
+            if withheld:
+                # Recorded, so the settings card shows it and the resend
+                # door can mail it once the cap allows — but no rotation:
+                # nothing was sent, the address cannot move yet, and the
+                # resend runs the rotation when it does send the link.
+                _email_change.request(
+                    admin, user["user_id"], u["email"], new_email,
+                    session_id=None if user.get("device_id")
+                    else user.get("session_id"),
+                    device_id=user.get("device_id"), mail_sent=False)
+            else:
+                sms_needs_verify, invites_removed, members_removed = \
+                    _rotation_before_move(admin, user["user_id"])
+                if hosted:
+                    # the address waits for its mailbox (docstring); the
+                    # request answers only while the credential making it
+                    # stays signed in
+                    change_token = _email_change.request(
+                        admin, user["user_id"], u["email"], new_email,
+                        session_id=None if user.get("device_id")
+                        else user.get("session_id"),
+                        device_id=user.get("device_id"))
+                    revert_token = None
+                else:
+                    change_token = None
+                    revert_token = _move_login_email(
+                        admin, user["user_id"], u["email"], new_email)
+                passkeys_removed, passkeys_kept, support_revoked = \
+                    _rotation_after_move(admin, user, token, keep_passkey,
+                                         keep_push_endpoint)
     except UniqueViolation as e:
         # a writer that does not take the address lock (an operator's own
         # edit, a future door) got there first: still the caller's 409,
@@ -7740,14 +8417,83 @@ def email_change(request: Request, user: dict = Depends(current_user),
         raise HTTPException(409, "that email is already in use")
     finally:
         admin.close()
+    if withheld:
+        raise _email_change_cap_refusal(*withheld)
+    rotated = _rotated_answer(
+        new_email, passkeys_removed=passkeys_removed,
+        passkeys_kept=passkeys_kept, sms_needs_verify=sms_needs_verify,
+        support_revoked=support_revoked, invites_removed=invites_removed,
+        members_removed=members_removed)
+    if change_token is not None:
+        _send_email_change_confirm(new_email, change_token,
+                                   user["tenant_id"])
+        # "email" is still the sign-in address: nothing moved yet
+        return {"ok": True, "email": u["email"], "pending_email": new_email,
+                "verify_sent": _PENDING_VERIFY_SENT,
+                "mail_list_entry_dropped": False, **rotated}
+    mail_list_entry_dropped = _after_login_email_moved(
+        user["tenant_id"], u["email"], new_email, revert_token,
+        proven=False)
+    return {"ok": True, "email": new_email, "pending_email": None,
+            "verify_sent": False,
+            "mail_list_entry_dropped": mail_list_entry_dropped, **rotated}
+
+
+def _move_login_email(admin, user_id, old_email: str, new_email: str):
+    """Write the new login address, verified, inside the caller's
+    transaction (address lock and factor lock already held). Returns the
+    raw revert token for the address being left, or None when that
+    address never proved its mailbox."""
+    # read before the write: whether the address being left ever proved
+    # its mailbox decides if it gets a way back
+    before = admin.execute(
+        "SELECT verified_at IS NOT NULL AS v, tenant_id FROM users "
+        "WHERE id=%s", (user_id,)).fetchone()
+    old_verified = before["v"]
+    # the gate hears of the move while the row still holds the address
+    # being left (and whether it was verified)
+    ext.gate.on_login_email_moved(admin, before["tenant_id"], user_id,
+                                  old_email, new_email)
+    # Verified on both roads: self-host trusts its one household, and on
+    # hosted this runs only from the new mailbox's own confirm button.
+    admin.execute(
+        "UPDATE users SET email=%s, verified_at=now(), "
+        "first_verified_at=coalesce(first_verified_at, now()) WHERE id=%s",
+        (new_email, user_id))
+    ext.gate.on_email_verified(admin, before["tenant_id"], user_id)
+    # Every recovery still on its way to the address being left ends with
+    # the move: a reset link or a cooling-off factor reset minted to that
+    # mailbox while a hosted change waited for its confirm would otherwise
+    # land on the account at its new address and strip its credentials.
+    _end_pending_recoveries(admin, user_id)
+    # the address is the account's now; nothing else may still be on its
+    # way to it
+    from ..auth import email_change as _email_change
+    _email_change.cancel(admin, user_id)
+    # and the way back, for the address being left: minted in the same
+    # transaction, so a change that commits always has one. Only for an
+    # address that proved its mailbox: a typo made at signup or an inbox
+    # since handed to someone else is told the account left, but must not
+    # be able to take it back.
+    from ..auth import email_revert
+    return email_revert.create(admin, user_id, old_email, new_email) \
+        if old_verified else None
+
+
+def _after_login_email_moved(tenant_id, old_email: str, new_email: str,
+                             revert_token, *, proven: bool) -> bool:
+    """What follows a committed move of the login address, outside the
+    transaction: the delivery record, the household's mail lists, and the
+    notice (with its undo link) to the address left behind. `proven`: the
+    new mailbox has just answered a link. Returns whether a mail-list
+    entry was dropped."""
     # whatever was recorded about the OLD address is now irrelevant to
     # this account, and the new one starts with a clean slate — a stale row
     # from a previous owner of the same address would otherwise pause the
-    # first send before it was ever tried. No upstream reactivation here:
-    # nobody has proved this mailbox works yet, the verification mail about
-    # to go out is that proof, and reactivating on an unproven address would
-    # hand anyone a way to scrub the provider's suppression list by typing
-    # an address into a form.
+    # first send before it was ever tried. Upstream reactivation only when
+    # the mailbox has answered a link: reactivating on an address merely
+    # typed into a form would hand anyone a way to scrub the provider's
+    # suppression list.
     #
     # `email_delivery_state` is keyed on the ADDRESS with no tenant column,
     # so this clear is global. That it cannot wipe somebody ELSE's live
@@ -7765,31 +8511,623 @@ def email_change(request: Request, user: dict = Depends(current_user),
     # household's daily-email recipient, say) must not have its complaint
     # wiped by an account that merely renamed itself to it.
     from ..notify import delivery as _delivery
-    _delivery.clear(new_email, reactivate=False, keep_complaint=True)
+    _delivery.clear(new_email, reactivate=proven, keep_complaint=True)
     # the household's mail lists are keyed by address: the person's mute
     # follows them, and the old address stops being mailed
-    mail_list_entry_dropped = _move_mail_lists(
-        user["tenant_id"], u["email"], new_email)
-    if vtoken:
-        import threading
-        threading.Thread(target=_deliver_verification,
-                         args=(new_email, vtoken, user["tenant_id"]),
-                         daemon=True).start()
-    # a "did you mean…?" for an address that looks like a typo of a
-    # major provider. Advisory ONLY — the change has already been saved by
-    # the time this is computed, because a form that refuses your own email
-    # is worse than a rare undelivered message, and some real domains do look
-    # like typos of big ones.
+    dropped = _move_mail_lists(tenant_id, old_email, new_email)
+    # The old address hears about it, with the link that undoes it. The
+    # change revoked everything else the old login reached, so a change
+    # made from a hijacked session would otherwise be silent: the owner is
+    # simply signed out, and the address they know names no account.
+    import threading
+    threading.Thread(target=_deliver_email_change_notice,
+                     args=(old_email, new_email, tenant_id, revert_token),
+                     daemon=True).start()
+    return dropped
+
+
+def _pending_email_change(conn, user_id) -> dict | None:
+    """The account's login-email change waiting for its new mailbox, or
+    None. Read on the caller's pooled control connection, through the app
+    role's column grant (never the token): /api/me runs on every page load
+    and must not open a connection of its own. A request whose mail a send
+    cap held back is not waiting for anything the person can act on, so it
+    is not reported (see `email_change.pending`)."""
+    if not env_flag("OIKONOME_HOSTED"):
+        return None
+    from ..auth import email_change as _email_change
+    row = _email_change.pending(conn, user_id)
+    return row if row is not None and row["mailed"] else None
+
+
+@app.post("/api/email/change/cancel")
+def email_change_cancel(user: dict = Depends(current_user)):
+    """Withdraw a pending login-email change. Only takes something away,
+    so it asks for no step-up."""
+    demoguard.deny_shared_login(user)
+    from ..auth import email_change as _email_change
+    admin = tenancy.admin_connect()
+    try:
+        n = _email_change.cancel(admin, user["user_id"])
+    finally:
+        admin.close()
+    return {"ok": True, "cancelled": n > 0}
+
+
+@app.post("/api/email/change/resend",
+          dependencies=[Depends(limit("email_change_resend", 5, 3600))])
+def email_change_resend(request: Request,
+                        user: dict = Depends(current_user),
+                        keep_push_endpoint: str = Form("")):
+    """Mail the pending login-email change's confirmation link again — for
+    a first mail that went to spam or never arrived, so the fix is not
+    pressing Change again. Only from the browser or app that asked (the
+    request lives as long as that credential). The same caps as the change
+    door, with the same honest 429s. The new mail carries a fresh link and
+    the earlier one stops working.
+
+    A request whose first mail a cap withheld was recorded without the
+    credential rotation; mailing it now runs that rotation, so it needs
+    the same open step-up window the change door does (403
+    `elevation_required` otherwise) and answers the same rotation fields.
+    Answers `{ok, email, pending_email, verify_sent: false, resent: true,
+    …rotation counts}`; 409 when no change is waiting."""
+    demoguard.deny_shared_login(user)
+    if not env_flag("OIKONOME_HOSTED"):
+        raise HTTPException(409, "there is no email change waiting to be "
+                                 "confirmed")
+    return _resend_email_change(request, user, keep_push_endpoint)
+
+
+def _email_change_asked_by(live: dict, user: dict) -> bool:
+    """Whether this caller is the credential the live request was made
+    from (a phone's device token, else the browser session)."""
+    if live["device_id"] is not None:
+        return str(live["device_id"]) == str(user.get("device_id") or "")
+    return (live["session_id"] is not None and not user.get("device_id")
+            and str(live["session_id"]) == str(user.get("session_id") or ""))
+
+
+def _resend_email_change(request: Request, user: dict,
+                         keep_push_endpoint: str = "", *,
+                         new_email: str | None = None) -> dict:
+    """The resend door's body, shared with the change door's "same address
+    again" case. `new_email`: the address the caller asked for, which the
+    live request must still name."""
+    from ..auth import email_change as _email_change
+    uid = user["user_id"]
+    gone = HTTPException(409, "there is no email change waiting to be "
+                              "confirmed")
+    token = request.cookies.get(sessions.COOKIE_NAME, "")
+    rotated = None
+    admin = tenancy.admin_connect()
+    try:
+        with admin.transaction():
+            live = _email_change.live(admin, uid)
+            if live is None or (new_email is not None
+                                and live["new_email"].lower() != new_email):
+                raise gone
+            if not _email_change_asked_by(live, user):
+                raise HTTPException(
+                    409, "send it again from the browser or app that asked "
+                         "for the change")
+            # the change door's lock order: the address, then the factors
+            admin.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                          ("oikonome:signup:" + live["new_email"].lower(),))
+            _lock_user_factors(admin, uid)
+            _caller_still_signed_in(admin, user)
+            again = _email_change.live(admin, uid, for_update=True)
+            if again is None or again["id"] != live["id"]:
+                raise gone
+            if admin.execute(
+                    "SELECT 1 FROM users WHERE lower(email)=lower(%s) "
+                    "AND id<>%s", (live["new_email"], uid)).fetchone():
+                raise HTTPException(409, "that email is already in use")
+            kind, wait = _email_change_mail_wait(admin, uid,
+                                                 live["new_email"])
+            if kind:
+                raise _email_change_cap_refusal(kind, wait)
+            if live["mail_sent_at"] is None:
+                # never mailed, so never rotated: the change door's rotation,
+                # proved the way that door proves it
+                _require_elevation(user)
+                keep_passkey = _proved_passkey_or_refuse(
+                    uid, _elevation_passkey(user))
+                sms, invites, members = _rotation_before_move(admin, uid)
+                change_token = _email_change.resend(admin, live)
+                removed, kept, support = _rotation_after_move(
+                    admin, user, token, keep_passkey, keep_push_endpoint)
+                rotated = _rotated_answer(
+                    live["new_email"], passkeys_removed=removed,
+                    passkeys_kept=kept, sms_needs_verify=sms,
+                    support_revoked=support, invites_removed=invites,
+                    members_removed=members)
+            else:
+                change_token = _email_change.resend(admin, live)
+    finally:
+        admin.close()
+    _send_email_change_confirm(live["new_email"], change_token,
+                               user["tenant_id"])
+    return {"ok": True, "email": live["old_email"],
+            "pending_email": live["new_email"],
+            "verify_sent": _PENDING_VERIFY_SENT,
+            "resent": True, "mail_list_entry_dropped": False,
+            **(rotated or _rotated_answer(live["new_email"]))}
+
+
+def _rotation_before_move(admin, user_id) -> tuple[bool, int, list]:
+    """The half of a login-email rotation that must land before the users
+    row changes. Returns (sms_needs_verify, invites_removed,
+    members_removed)."""
+    # webhooks go the way of the script tokens — paused BEFORE the address
+    # changes, because they are recorded under the address their creator
+    # had
+    # a recovery started before the address moves — a mailed reset link,
+    # a cooling-off factor clear — must not outlive the move: void it
+    # before the users row changes, in the same transaction
+    _end_pending_recoveries(admin, user_id)
+    from ..notify import webhooks as _webhooks
+    _webhooks.pause_for_rotation(admin, user_id)
+    # and the household's SMS number, as on a password change, with the
+    # relay, extra recipients and AI endpoint
+    sms_needs_verify = reset_mod._unverify_sms_number(admin, user_id)
+    from ..notify import outbound_pause as _outbound
+    _outbound.pause_for_rotation(admin, user_id)
+    # pending family invites — a share URL that needs no mailbox — and the
+    # members this owner's recent invites created, as on a password change;
+    # before the users row, as there
+    invites_removed, members_removed = \
+        reset_mod.evict_invite_footholds(admin, user_id)
+    return sms_needs_verify, invites_removed, members_removed
+
+
+def _rotation_after_move(admin, user: dict, token: str, keep_passkey,
+                         keep_push_endpoint: str) -> tuple[int, int, int]:
+    """The rest of the rotation: the email IS the login identifier, so it
+    is rotated like a credential. Returns (passkeys_removed,
+    passkeys_kept, support_access_revoked)."""
+    uid = user["user_id"]
+    # Other sessions (a hijacker's, most importantly) and script tokens
+    # don't get to ride through the change; this session stays, same shape
+    # as password_change.
+    sessions.revoke_all_others(admin, uid, token)
+    admin.execute("UPDATE api_tokens SET revoked_at=now() "
+                  "WHERE created_by=%s AND revoked_at IS NULL", (uid,))
+    # keep the CALLING device, like password_change and every other
+    # posture-change door — a phone that just proved full step-up must not
+    # sign itself out by changing its own email
+    device_tokens.revoke_all_for_user(admin, uid,
+                                      keep_device_id=user.get("device_id"))
+    device_tokens.revoke_mint_tickets(admin, uid)
+    # and any unspent reset link or pending cooling-off recovery: one
+    # started from the OLD mailbox by whoever held it would otherwise
+    # outlive this rotation and strip every factor later
+    _end_pending_recoveries(admin, uid)
+    # Passkeys die with the rotation too, mirroring password_change and the
+    # reset path: a hijacked session could have enrolled its own passkey,
+    # and WebAuthn login would keep working for the attacker no matter how
+    # many sessions and tokens are revoked above. The owner re-adds
+    # passkeys after; the count comes back in the response so the client
+    # can say what happened. Same last-factor rule as password_change — the
+    # key that PROVED this caller survives when it is the only factor left,
+    # or the rotation would re-enable password-only login. Only that key: a
+    # stranger's freshly-used one is not a proof of anything.
+    passkeys_removed, passkeys_kept = _evict_passkeys(admin, uid,
+                                                      keep_passkey)
+    # and a support-access grant, as on a password change: an operator
+    # access window a hijacker opened must not outlive the rotation the
+    # owner made to shut them out
+    support_revoked = _revoke_support_grants(admin, uid)
+    # and the other browsers' web push, as on a password change
+    _drop_web_push(admin, uid, keep_push_endpoint)
+    return passkeys_removed, passkeys_kept, support_revoked
+
+
+def _rotated_answer(new_email: str, *, passkeys_removed=0, passkeys_kept=0,
+                    sms_needs_verify=False, support_revoked=0,
+                    invites_removed=0, members_removed=()) -> dict:
+    """What a login-email change answers about the rotation it ran (all
+    zeros when it ran none)."""
     from ..notify import emailhint as _emailhint
-    return {"ok": True, "email": new_email, "verify_sent": bool(vtoken),
-            "passkeys_removed": passkeys_removed,
+    return {"passkeys_removed": passkeys_removed,
             "passkeys_kept": passkeys_kept,
-            "mail_list_entry_dropped": mail_list_entry_dropped,
             "sms_number_needs_verify": sms_needs_verify,
             "support_access_revoked": support_revoked,
             "invites_removed": invites_removed,
-            "members_removed": _members_public(members_removed),
+            "members_removed": _members_public(list(members_removed)),
+            # a "did you mean…?" for an address that looks like a typo of a
+            # major provider. Advisory ONLY — a form that refuses your own
+            # email is worse than a rare undelivered message, and some real
+            # domains do look like typos of big ones.
             "hint": _emailhint.suggest(new_email)}
+
+
+def _send_email_change_confirm(new_email: str, token: str,
+                               tenant_id) -> None:
+    import threading
+    threading.Thread(target=_deliver_email_change_confirm,
+                     args=(new_email, token, tenant_id),
+                     daemon=True).start()
+
+
+# The confirmation goes to an address the caller TYPED, which may belong to
+# anyone. Like the reset and reclaim mail, it is capped per recipient — so
+# neither a pool of IPs nor a pool of throwaway accounts can mail-bomb one
+# inbox through the instance's relay — and per account, so one account
+# cannot spray the mail at a list of strangers. Generous for a person
+# fixing a typo: three tries in an hour.
+#
+# Only mail that was SENT counts (`email_change_requests.mail_sent_at`): a
+# withheld request is not a mail. The recipient cap never counts the
+# caller's own account — its own mail is the account cap's business — or
+# another household could fill it with five requests and silence the
+# address's real owner for a day. What it still tells a caller is that
+# someone had that address mailed several times in the last hour or day;
+# the refusal reads the same whoever that was.
+_CHANGE_MAIL_PER_RECIPIENT_HOUR = 3
+_CHANGE_MAIL_PER_RECIPIENT_DAY = 5
+_CHANGE_MAIL_PER_ACCOUNT_DAY = 5
+
+
+def _email_change_mail_wait(admin, user_id,
+                            new_email: str) -> tuple[str | None, int]:
+    """Whether one more confirmation mail to `new_email` may go out for
+    this account: (None, 0) when it may, else ("account" | "recipient",
+    seconds until it may). The change door runs it again inside its
+    transaction, under the target address's lock."""
+    import math
+    e = new_email.strip().lower()
+    rows = admin.execute(
+        """SELECT user_id = %(u)s AS own, lower(new_email) = %(e)s AS to_e,
+                  extract(epoch FROM now() - mail_sent_at)::float AS age
+             FROM email_change_requests
+            WHERE mail_sent_at > now() - interval '24 hours'
+              AND (user_id = %(u)s OR lower(new_email) = %(e)s)""",
+        {"e": e, "u": user_id}).fetchall()
+
+    def wait(ages, cap, window):
+        # until enough of the oldest mails leave the window to make room
+        if len(ages) < cap:
+            return 0
+        ages = sorted(ages, reverse=True)
+        return max(1, math.ceil(window - ages[len(ages) - cap]))
+
+    own = [r["age"] for r in rows if r["own"]]
+    w = wait(own, _CHANGE_MAIL_PER_ACCOUNT_DAY, 86400)
+    if w:
+        return "account", w
+    theirs = [r["age"] for r in rows if r["to_e"] and not r["own"]]
+    w = max(wait([a for a in theirs if a < 3600],
+                 _CHANGE_MAIL_PER_RECIPIENT_HOUR, 3600),
+            wait(theirs, _CHANGE_MAIL_PER_RECIPIENT_DAY, 86400))
+    return ("recipient", w) if w else (None, 0)
+
+
+def _wait_words(seconds: int) -> str:
+    minutes = -(-seconds // 60)
+    if minutes <= 1:
+        return "a minute"
+    if minutes < 90:
+        return f"{minutes} minutes"
+    return f"about {round(minutes / 60)} hours"
+
+
+def _email_change_cap_refusal(kind: str, wait: int) -> HTTPException:
+    """The 429 a capped confirmation mail answers, with the real wait."""
+    if kind == "account":
+        text = ("this account has asked for as many confirmation emails as "
+                "it may in a day — you can ask again in "
+                f"{_wait_words(wait)}")
+    else:
+        # The recipient cap counts only OTHER accounts' mail to the
+        # address (the caller's own is the account cap's business), so
+        # nothing in that inbox is this caller's: say none was sent,
+        # never "check that inbox".
+        text = ("that address has been sent as many confirmation emails "
+                "as it may for now, so none was sent for this change — you "
+                f"can ask again in {_wait_words(wait)}")
+    return HTTPException(429, text, headers={"Retry-After": str(wait)})
+
+
+def _deliver_email_change_confirm(new_email: str, token: str,
+                                  tenant_id) -> None:
+    """Mail the confirm link to the address the account asked to move to —
+    the _deliver_reset doctrine (the operator's relay first, a pinned base
+    URL or no link in the mail, the log line as the delivery when it
+    cannot be mailed). Written for a reader who may not have asked: the
+    one thing a stranger must not do is press the button. NEVER raises."""
+    from ..auth import email_change as _email_change
+    from . import report as _report
+    from . import spamdefense
+    # the intake gate signup runs, not just the list lookup: the address
+    # here is typed by the caller, exactly like a signup's. Off the request
+    # path (this runs on its own thread), so its live check costs no one.
+    if spamdefense.check("email_change", new_email)["blocked"]:
+        log.info("skipping email-change confirmation to blocked recipient "
+                 "%s", new_email)
+        return
+    path = f"/account/email-change?token={token}"
+    hours = int(_email_change.CHANGE_TTL.total_seconds() // 3600)
+    base = os.environ.get("OIKONOME_BASE_URL", "").rstrip("/")
+    smtp = _smtp_for(new_email, tenant_id)
+    if smtp and smtp["configured"] and not base:
+        log.warning("SMTP is configured but OIKONOME_BASE_URL is not set — "
+                    "refusing to email a Host-derived email-change link")
+    if smtp and smtp["configured"] and base:
+        url = f"{base}{path}"
+        plain = (f"Someone asked to make this address the sign-in email of "
+                 f"an Oikonome account. If it was you, confirm it here "
+                 f"(link valid {hours} hours, one use):\n\n{url}\n\n"
+                 f"If it was not you, ignore this mail: nothing changes "
+                 f"unless the button on that page is pressed.\n")
+        html = (f"<p>Someone asked to make this address the sign-in email "
+                f"of an Oikonome account. If it was you, "
+                f"<a href=\"{url}\">confirm the new email</a> (link valid "
+                f"{hours} hours, one use).</p><p>If it was not you, ignore "
+                f"this mail: nothing changes unless the button on that "
+                f"page is pressed.</p>")
+        try:
+            _report.send("Confirm your new sign-in email — Oikonome", plain,
+                         html, [new_email], smtp=smtp, bcc=False)
+            return
+        except Exception:                                # noqa: BLE001
+            log.exception("email-change confirmation to %s failed; logging "
+                          "the link instead", new_email)
+    _log_link("email-change confirmation link", new_email, path)
+
+
+def _email_change_page(**ctx):
+    from fastapi.responses import HTMLResponse
+    from . import todayview
+    status = ctx.pop("status", 200)
+    return HTMLResponse(
+        todayview._env.get_template("email_change_confirm.html").render(
+            centered=True, title="Confirm your new sign-in email",
+            support_email=support_email(), **ctx), status_code=status)
+
+
+_EMAIL_CHANGE_GONE = (
+    "This link is invalid, has expired, or has already been used — or the "
+    "change was withdrawn. Sign in and ask for the change again.")
+
+
+@app.get("/account/email-change",
+         dependencies=[Depends(limit("email_change_confirm", 30, 3600)),
+                       Depends(_not_demo_instance)])
+def email_change_confirm_page(token: str = ""):
+    """The mailed link lands on a confirm page; the POST behind its one
+    button is what moves the account. A mail scanner fetches every link in
+    a message, and a GET that moved the login would let one confirm, for
+    a stranger's account, the address it is guarding."""
+    from ..auth import email_change as _email_change
+    from ..auth import email_revert
+    admin = tenancy.admin_connect()
+    try:
+        r = _email_change.lookup(admin, token)
+    finally:
+        admin.close()
+    if r is None:
+        return _email_change_page(state="gone", error=_EMAIL_CHANGE_GONE,
+                                  status=400)
+    return _email_change_page(state="confirm", token=token,
+                              new_email=r["new_email"],
+                              shown=email_revert.mask(r["old_email"]))
+
+
+@app.post("/account/email-change",
+          dependencies=[Depends(limit("email_change_confirm", 30, 3600)),
+                        Depends(_not_demo_instance)])
+def email_change_confirm_finish(token: str = Form("")):
+    """Move the account onto the address this link was mailed to. The
+    press proves the mailbox, so the address arrives verified; the address
+    left behind is told and gets its undo link, exactly as a self-hosted
+    change does.
+
+    One transaction under the address lock signup, the claim and the
+    revert take, then the per-user factor lock (the canonical order), and
+    the request re-read under both: an address someone signed up with in
+    the meantime is theirs, and a request the account has since ended
+    (a reset, a revert, the session that asked signed out) moves nothing."""
+    from ..auth import email_change as _email_change
+    from ..auth import email_revert
+    admin = tenancy.admin_connect()
+    try:
+        with admin.transaction():
+            r = _email_change.lookup(admin, token)
+            if r is None:
+                return _email_change_page(state="gone",
+                                          error=_EMAIL_CHANGE_GONE,
+                                          status=400)
+            new = r["new_email"]
+            admin.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                          ("oikonome:signup:" + new.lower(),))
+            _lock_user_factors(admin, r["user_id"])
+            r = _email_change.lookup(admin, token, for_update=True)
+            if r is None or not _email_change.spend(admin, r["id"]):
+                return _email_change_page(state="gone",
+                                          error=_EMAIL_CHANGE_GONE,
+                                          status=400)
+            if admin.execute(
+                    "SELECT 1 FROM users WHERE lower(email)=lower(%s) "
+                    "AND id<>%s", (new, r["user_id"])).fetchone():
+                # spent, so the refusal is final: the address went to
+                # whoever proved it first
+                return _email_change_page(state="taken", new_email=new,
+                                          status=409)
+            revert_token = _move_login_email(
+                admin, r["user_id"], r["old_email"], new)
+    except UniqueViolation as e:
+        # a writer that does not take the address lock got there first
+        if "email" not in (e.diag.constraint_name or ""):
+            raise
+        return _email_change_page(state="taken", new_email=r["new_email"],
+                                  status=409)
+    except ext.GateUnavailable:
+        # rolled back whole, the link unspent: pressing again later works
+        return _email_change_page(
+            state="confirm", token=token, new_email=r["new_email"],
+            shown=email_revert.mask(r["old_email"]),
+            error="This can't be done right now — please try again in a "
+                  "few minutes.", status=503)
+    finally:
+        admin.close()
+    _after_login_email_moved(r["tenant_id"], r["old_email"], new,
+                             revert_token, proven=True)
+    return _email_change_page(state="done", new_email=new)
+
+
+def _email_revert_page(**ctx):
+    from fastapi.responses import HTMLResponse
+    from . import todayview
+    status = ctx.pop("status", 200)
+    return HTMLResponse(todayview._env.get_template("email_revert.html").render(
+        centered=True, title="Undo an email change",
+        support_email=support_email(), **ctx), status_code=status)
+
+
+_EMAIL_REVERT_GONE = (
+    "This link is invalid, has expired, or has already been used — or the "
+    "account is already back on this address. If you still cannot sign "
+    "in, use Reset password on the sign-in page.")
+
+
+@app.get("/account/email-revert",
+         dependencies=[Depends(limit("email_revert", 30, 3600)),
+                       Depends(_not_demo_instance)])
+def email_revert_page(token: str = ""):
+    """The mailed link lands on a confirm page; the POST behind its one
+    button is what spends the token. Mail scanners follow links, and a GET
+    that signed the account out would let any of them undo a change the
+    owner meant to make."""
+    from ..auth import email_revert
+    admin = tenancy.admin_connect()
+    try:
+        r = email_revert.lookup(admin, token)
+    finally:
+        admin.close()
+    if r is None:
+        return _email_revert_page(state="gone", error=_EMAIL_REVERT_GONE,
+                                  status=400)
+    return _email_revert_page(state="confirm", token=token,
+                              old_email=r["old_email"],
+                              shown=email_revert.mask(r["current_email"]))
+
+
+@app.post("/account/email-revert",
+          dependencies=[Depends(limit("email_revert", 30, 3600)),
+                        Depends(_not_demo_instance)])
+def email_revert_finish(token: str = Form("")):
+    """Put the account back on the address the link was mailed to, sign
+    every session and device out, and mail that address a password reset.
+
+    What it deliberately does NOT do is touch a factor. The old inbox may
+    be exactly why the owner moved away from it, so reading it must not
+    amount to owning the account: the reset this starts keeps the usual
+    rule (an account with a second factor also needs a recovery code), and
+    it is the reset, once completed, that clears whatever a hijacker
+    enrolled. Everything else here only takes access away — sessions,
+    devices, script tokens, push, webhooks, a support window, a pending
+    recovery — which is the safe direction for whoever clicks.
+
+    One transaction under the address lock signup and the email change
+    take, then the per-user factor lock (the canonical order), so a signup
+    or a second change aimed at the same address queues behind it."""
+    from ..auth import email_revert
+    admin = tenancy.admin_connect()
+    try:
+        with admin.transaction():
+            r = email_revert.lookup(admin, token)
+            if r is None:
+                return _email_revert_page(state="gone",
+                                          error=_EMAIL_REVERT_GONE,
+                                          status=400)
+            old = r["old_email"]
+            admin.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                          ("oikonome:signup:" + old.lower(),))
+            _lock_user_factors(admin, r["user_id"])
+            # re-read under the locks: a twin click, or a change that
+            # landed meanwhile, decides what this one finds
+            r = email_revert.lookup(admin, token, for_update=True)
+            if r is None or not email_revert.spend(admin, r["id"]):
+                return _email_revert_page(state="gone",
+                                          error=_EMAIL_REVERT_GONE,
+                                          status=400)
+            # and every link minted after this one: those went to
+            # addresses the account only held after the change being
+            # undone, which is where a hijacker's second change sends its
+            # link — left live, it would move the account back again and
+            # void the reset this mails. Burnt even when the refusal below
+            # ends the revert, for the same reason.
+            email_revert.burn_later(admin, r["id"])
+            if admin.execute(
+                    "SELECT 1 FROM users WHERE lower(email)=lower(%s) "
+                    "AND id<>%s", (old, r["user_id"])).fetchone():
+                # Another account holds the address now. Taking it from
+                # that account is not something a link to it can decide;
+                # the token is spent so the refusal is final, and the
+                # operator is who can sort it out.
+                return _email_revert_page(
+                    state="taken", old_email=old, status=409)
+            uid = r["user_id"]
+            from ..notify import webhooks as _webhooks
+            _webhooks.pause_for_rotation(admin, uid)
+            # any reset link or cooling-off recovery started meanwhile —
+            # by whoever held the account — goes before the fresh reset
+            # below is minted, so that one is the only one that works
+            _end_pending_recoveries(admin, uid)
+            # the address the revert leaves is reported like any other
+            # move, but the undo of a hijack never waits on the add-on: a
+            # gate that cannot record it — absent, or failing in the
+            # database — is logged, not fatal. A savepoint, so a failed
+            # statement inside the hook rolls back only the hook's own
+            # writes and leaves this transaction usable.
+            try:
+                with admin.transaction():
+                    left = admin.execute(
+                        "SELECT email FROM users WHERE id=%s",
+                        (uid,)).fetchone()
+                    ext.gate.on_login_email_moved(
+                        admin, r["tenant_id"], uid,
+                        left["email"] if left else None, old)
+            except Exception as e:                       # noqa: BLE001
+                log.warning("email revert: address left not recorded: %s", e)
+            # the click proves this mailbox, so the address is verified
+            admin.execute("UPDATE users SET email=%s, verified_at=now() "
+                          "WHERE id=%s", (old, uid))
+            # same rule for the verification hook: the undo of a hijack
+            # never fails on the add-on's bookkeeping
+            try:
+                with admin.transaction():
+                    ext.gate.on_email_verified(admin, r["tenant_id"], uid)
+            except Exception as e:                       # noqa: BLE001
+                log.warning("email revert: verification not recorded: %s", e)
+            admin.execute("DELETE FROM sessions WHERE user_id=%s", (uid,))
+            device_tokens.revoke_all_for_user(admin, uid)
+            device_tokens.revoke_mint_tickets(admin, uid)
+            admin.execute("UPDATE api_tokens SET revoked_at=now() "
+                          "WHERE created_by=%s AND revoked_at IS NULL",
+                          (uid,))
+            _revoke_support_grants(admin, uid)
+            admin.execute("DELETE FROM push_subscriptions WHERE user_id=%s",
+                          (uid,))
+            reset_token = reset_mod.create_reset(admin, uid)
+    except UniqueViolation as e:
+        # a writer that does not take the address lock got there first
+        if "email" not in (e.diag.constraint_name or ""):
+            raise
+        return _email_revert_page(state="taken", old_email=r["old_email"],
+                                  status=409)
+    finally:
+        admin.close()
+    # the person's own mute follows them back, as it followed them away
+    _move_mail_lists(r["tenant_id"], r["current_email"], old)
+    import threading
+    threading.Thread(target=_deliver_reset, args=(old, reset_token),
+                     daemon=True).start()
+    threading.Thread(target=_deliver_email_reverted_notice,
+                     args=(r["current_email"], r["tenant_id"]),
+                     daemon=True).start()
+    return _email_revert_page(state="done", old_email=old)
 
 
 @app.get("/today")

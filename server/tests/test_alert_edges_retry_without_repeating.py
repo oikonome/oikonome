@@ -44,8 +44,9 @@ class LinkAlertRetryTests(unittest.TestCase):
         accept_recipient_invite(self.tid, "me@x.dev")
         self.conn.execute(
             "INSERT INTO items (id, aggregator, institution_name, "
-            "access_token, status) VALUES "
-            "('pl-1','plaid','Demo Bank','enc-tok','ok')")
+            "access_token, status, linked_at) VALUES "
+            "('pl-1','plaid','Demo Bank','enc-tok','ok', "
+            "now() - interval '30 days')")
 
     def tearDown(self):
         self.conn.close()

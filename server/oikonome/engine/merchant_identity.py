@@ -577,10 +577,18 @@ def _merchant_by_bank_descriptor(conn, bank_name: str, asking=(),
     if len(survivors) != 1:
         return None
     mid = next(iter(survivors))
-    # and only when the descriptor names that payee — see _descriptor_names
+    # and only when the descriptor names that payee — see _descriptor_names.
+    # The merchant's display name may have come from elsewhere (a reviewed
+    # merge, a longer spelling under another line) and outrun a line the
+    # bank cuts short; the one name the aggregator gave the line's own rows
+    # is the same evidence in the words the line was read against.
     got = conn.execute("SELECT name FROM merchants WHERE id=%s",
                        (mid,)).fetchone()
-    if got is None or not _descriptor_names(bank_name, got["name"]):
+    if got is None:
+        return None
+    if not (_descriptor_names(bank_name, got["name"])
+            or (len(seen["named"]) == 1
+                and _descriptor_names(bank_name, next(iter(seen["named"]))))):
         return None
     return mid
 
@@ -695,6 +703,48 @@ def _related(a: str, b: str) -> bool:
             or _truncates(a, b) or _truncates(b, a))
 
 
+def _repeats_hold_guess(name: str | None, set_aside: str | None) -> bool:
+    """Is a posted charge's aggregator name exactly the stray name its own
+    hold had set aside? Compared raw (case aside), never through the string
+    clean: the hold's line answered for that guess, not for every name that
+    tidies to the same word."""
+    return bool(name and set_aside and name.lower() == set_aside.lower())
+
+
+def _hold_followers(conn, ids) -> dict:
+    """The rows among `ids` that follow their hold: each a posted charge
+    whose OWN linked hold set aside the very name the charge carries, filed
+    under an ordinary merchant. Maps row id -> that merchant (survivor).
+
+    Decided per row. A sync can deliver the posted charge beside an
+    unrelated charge the feed gave the same stray name under another line;
+    the two share a key, but the hold vouches for only one of them. A row
+    with no bank line of its own is left out — its moved alias would have
+    nowhere to go."""
+    out: dict = {}
+    if not ids:
+        return out
+    for r in conn.execute(
+            """SELECT t.id, t.name AS line, t.merchant_name AS n,
+                      p.merchant_id AS mid, p.merchant_name_set_aside AS s
+                 FROM transactions t
+                 JOIN transactions p ON p.id = t.pending_transaction_id
+                WHERE t.id = ANY(%s) AND p.id <> t.id
+                  AND p.merchant_id IS NOT NULL
+                  AND p.merchant_name_set_aside IS NOT NULL""",
+            (list(ids),)).fetchall():
+        if not (r["line"] or "").strip() or not _repeats_hold_guess(r["n"], r["s"]):
+            continue
+        mid = _survivor(conn, r["mid"])
+        got = conn.execute("SELECT kind FROM merchants WHERE id=%s",
+                           (mid,)).fetchone() if mid is not None else None
+        # a payment app or an institution fronts many payees
+        if got is None or (got["kind"] or "merchant") != "merchant":
+            continue
+        out[r["id"]] = mid
+    return out
+
+
 def identity_answers(conn, asks: list[dict], evidence: dict | None = None) -> list:
     """The merchant each of these questions' rows already belongs to, by
     the ledger's own evidence, or None. One answer per ask, in order; every
@@ -708,10 +758,22 @@ def identity_answers(conn, asks: list[dict], evidence: dict | None = None) -> li
       ids      the asking rows, left out of every piece of evidence
       pending  whether they are all pending holds
       name     the aggregator's name for them, or None when it gave none
+      clean    that name as the string clean reads it, when the caller has
+               it: "10 Harbor" is "Harbor" wearing a number, and a line
+               that names the clean form names the payee
       ignore   merchant ids that are not evidence (the merchant a repair is
                asking about must not vote for itself)
       skip     read with the rest but not answered (None): a caller asking
                a varying subset keeps the reads the same shape every pass
+
+    An ask answered by its hold's SET-ASIDE name — the feed guessed the
+    same stray name for the posted charge it had guessed for the hold, and
+    the hold's line already overruled it — comes back with `set_aside` on
+    the ask dict listing the asking rows whose OWN hold set aside that
+    exact name (`_repeats_hold_guess`). Only those rows are vouched for:
+    another row under the same name is a different purchase, and the hold
+    says nothing about it. `resolve` files such rows before it asks
+    (`_hold_followers`), one row at a time, so it never reads this.
 
     The evidence, strongest first:
 
@@ -725,7 +787,11 @@ def identity_answers(conn, asks: list[dict], evidence: dict | None = None) -> li
          when the feed resolved the hold to an entity and then named the
          posted charge differently, without one. Only when the two names
          are recognisably one payee (`_related`): links joining two
-         unrelated purchases exist, and the link alone is not trusted.
+         unrelated purchases exist, and the link alone is not trusted. A
+         hold whose own name was set aside by its line vouches for a
+         posted charge carrying that very name: the feed repeated its
+         guess for the same purchase, and the line's answer is the
+         charge's too.
 
     When the aggregator DID name the rows, a line answer counts only when
     that name is also a reading of the line (`_reads_as`) AND a respelling
@@ -747,12 +813,20 @@ def identity_answers(conn, asks: list[dict], evidence: dict | None = None) -> li
     want = [i for a in asks for i in a["ids"]]
     if want:
         for r in conn.execute(
-                """SELECT t.id, p.merchant_id, p.merchant_name
+                """SELECT t.id, p.merchant_id, p.merchant_name,
+                          p.merchant_name_set_aside AS set_aside
                      FROM transactions t
                      JOIN transactions p ON p.id = t.pending_transaction_id
                     WHERE t.id = ANY(%s) AND p.id <> t.id
                       AND p.merchant_id IS NOT NULL""", (want,)).fetchall():
-            linked[r["id"]] = (r["merchant_id"], r["merchant_name"])
+            linked[r["id"]] = (r["merchant_id"], r["merchant_name"],
+                               r["set_aside"])
+
+    def _readings(ask):
+        """The names the ask may be read under: the aggregator's, and the
+        string clean's form of it when the caller supplied one."""
+        return [n for n in dict.fromkeys((ask.get("name"), ask.get("clean")))
+                if n]
 
     def _ok(mid, ask, line, before=()):
         """`before`: the names the aggregator gave the line's other rows."""
@@ -765,10 +839,11 @@ def identity_answers(conn, asks: list[dict], evidence: dict | None = None) -> li
         if got is None or (got["kind"] or "merchant") != "merchant":
             return None
         if line is not None:
-            new = ask["name"]
-            if not _reads_as(line, new):
+            news = _readings(ask)
+            if not any(_reads_as(line, new) for new in news):
                 return None
-            if not any(_respells(old, new) for old in [got["name"], *before]):
+            if not any(_respells(old, new)
+                       for old in [got["name"], *before] for new in news):
                 return None
         return mid
 
@@ -801,24 +876,34 @@ def identity_answers(conn, asks: list[dict], evidence: dict | None = None) -> li
                 # joining two unrelated purchases; so the posted row must
                 # also be recognisably the same payee as its hold — its name
                 # (or, unnamed, its line) and the hold's merchant or the
-                # hold's own name, one inside the other.
-                probe = ask.get("name") or bank
+                # hold's own name, one inside the other. A name the hold
+                # carried and had SET ASIDE is the strongest of these: the
+                # feed guessed it twice for one purchase, and the hold's
+                # line has already answered for it. That is a fact about
+                # each row and ITS hold, and about the exact name the feed
+                # repeated — never the clean form, which would let a
+                # different guess that merely tidies to the same word ride
+                # the hold's answer.
+                probes = _readings(ask) or ([bank] if bank else [])
                 if mid is not None:
-                    got = conn.execute("SELECT name FROM merchants WHERE id=%s",
-                                       (mid,)).fetchone()
-                    held = [got["name"] if got else None,
-                            *(linked[i][1] for i in ids if i in linked)]
-                    if not probe or not any(h and _related(probe, h)
-                                            for h in held):
-                        mid = None
+                    following = [i for i in ids if i in linked
+                                 and _repeats_hold_guess(ask.get("name"),
+                                                         linked[i][2])]
+                    if following:
+                        ask["set_aside"] = following
+                    else:
+                        got = conn.execute(
+                            "SELECT name FROM merchants WHERE id=%s",
+                            (mid,)).fetchone()
+                        held = [got["name"] if got else None,
+                                *(linked[i][1] for i in ids if i in linked)]
+                        if not probes or not any(
+                                h and _related(p, h)
+                                for h in held for p in probes):
+                            mid = None
         out[n] = mid
     return out
 
-
-# how many times a bank line and the aggregator must already have AGREED on
-# one payee before the line may overrule the aggregator — a habit, not a
-# coincidence
-ESTABLISHED_ROWS = 5
 
 
 def _agreement_evidence(conn, asks) -> dict:
@@ -837,15 +922,36 @@ def _agreement_evidence(conn, asks) -> dict:
     out["lower"] = {r["e"]: r["l"] for r in conn.execute(
         "SELECT e, lower(e) AS l FROM unnest(%s::text[]) AS e",
         (names,)).fetchall()}
+    # A settled hold is a witness here for the reason it is one in
+    # `_descriptor_evidence`: what it said about its line was true and
+    # still is, and the posted charge that retired it often carries a
+    # different spelling of the line (a wallet prefix, a dropped location
+    # tail), so the hold is the only row that ever agreed under THIS line.
+    #
+    # A row whose aggregator name is the PROCESSOR — the feed listing that
+    # very name as a payment-app or terminal counterparty — is not agreement
+    # about a payee either. A processor's line ("PAYLOOP INST XFER") reads
+    # as the processor's name, and taking that as the line's habit would
+    # fold every payee the processor ever carries into it. The feed's own
+    # word for what the name is decides, not a list of processors.
     for r in conn.execute(
-            """SELECT t.name AS bank, t.merchant_id AS mid,
+            f"""SELECT t.name AS bank, t.merchant_id AS mid,
                       lower(t.merchant_name) AS n, count(*) AS c
                  FROM transactions t
                 WHERE t.name = ANY(%s) AND t.merchant_id IS NOT NULL
-                  AND t.removed = 0
+                  AND {_LIVE_OR_SETTLED}
                   AND t.merchant_outlet IS NULL
                   AND t.merchant_name IS NOT NULL
-                GROUP BY 1, 2, 3""", (banks,)).fetchall():
+                  AND NOT EXISTS (
+                      SELECT 1 FROM jsonb_array_elements(
+                          CASE WHEN jsonb_typeof(t.raw -> 'counterparties')
+                                    = 'array'
+                               THEN t.raw -> 'counterparties'
+                               ELSE '[]'::jsonb END) AS c
+                       WHERE c ->> 'type' = ANY(%s)
+                         AND lower(c ->> 'name') = lower(t.merchant_name))
+                GROUP BY 1, 2, 3""",
+            (banks, list(CONTEXT_KINDS))).fetchall():
         out["rows"][r["bank"]].append((r["mid"], r["n"], r["c"]))
     return out
 
@@ -868,11 +974,19 @@ def _descriptor_overrules_enrichment(conn, bank_name: str, enriched: str,
       - nor may the new name contain the descriptor. A deposit line with a
         payer's name appended to it is the aggregator ADDING detail to a
         bank's constant, not misreading a payee;
-      - and the line must have a HABIT: ESTABLISHED_ROWS rows under this
-        exact descriptor where the aggregator named the payee and the line
-        NAMES that name — the two sources agreeing, over and over, about
-        who this is — resolved to one ordinary merchant (survivors
-        compared, so a merge does not read as disagreement).
+      - and the line must already have AGREED with the aggregator: a row
+        under this exact descriptor (a settled hold counts) where the
+        aggregator named the payee and the line NAMES that name — the two
+        sources saying the same thing about who this is — resolved to one
+        ordinary merchant (survivors compared, so a merge does not read as
+        disagreement). ONE such row is enough. The bank's line is its own
+        word for the terminal, and a name it contains outranks a name it
+        does not, however confident the aggregator sounds about the
+        latter. A count is not used: a rule that waits for N agreeing rows
+        leaves the household with twin merchants until it acts, and a
+        threshold can stay unmet for good — when every posted charge on a
+        line carries a wallet prefix, or when the feed withdraws and
+        re-posts a line's rows.
 
     Agreement, rather than the mere presence of rows, is what makes the
     answer both trustworthy and stable. A bank's constant ("POS DEBIT
@@ -914,7 +1028,7 @@ def _descriptor_overrules_enrichment(conn, bank_name: str, enriched: str,
                             (enriched,)).fetchone()["l"]
     agreed = [(mid, n, c) for mid, n, c in evidence["rows"].get(bank_name) or ()
               if n != mine and _descriptor_names(bank, n)]
-    if sum(c for _mid, _n, c in agreed) < ESTABLISHED_ROWS:
+    if not agreed:
         return None
     survivors = {_survivor(conn, mid) for mid, _n, _c in agreed}
     survivors.discard(None)
@@ -1036,14 +1150,15 @@ def resolve(conn, *, txn_ids: list[str] | None = None,
         # How many bank lines carry a key, WHICH line, and whether the key
         # is an outlet are facts about the LEDGER, not about this batch.
         # Read off the batch they made an incremental pass disagree with a
-        # whole-ledger one over the same data: a name the aggregator has
-        # used under two different lines is a payee it knows rather than a
-        # slip of either line, but a sync delivering one of those rows on
-        # its own sees a single line and lets the descriptor overrule it —
-        # and only_unresolved never brings the row back to find out
-        # otherwise, so the nightly pass cannot correct it either. One
-        # grouped query over the live rows carrying these keys answers
-        # both passes the same way.
+        # whole-ledger one over the same data — an outlet seen in one sync
+        # and not the next, a minter asking about one line or about none.
+        # The overrule itself reads none of them: it is judged per (name,
+        # line) pair on that line's own history (see `doubt` in _prepare),
+        # since a count of lines changes with which of a stray name's rows
+        # are still keyed on it — and that depends on how the syncs bundled
+        # them, not on the ledger. One grouped query
+        # over the live rows carrying these keys answers both passes the
+        # same way.
         #
         # A row whose name was already set aside is absent from its old
         # key by construction — it carries its bank line now — so a later
@@ -1051,18 +1166,25 @@ def resolve(conn, *, txn_ids: list[str] | None = None,
         # re-open that judgement: it is judged on its own evidence, and a
         # whole-ledger re-resolve, reading the same two keys, reaches the
         # same two answers rather than flipping either.
-        facts = {r["raw_key"]: r for r in conn.execute(
-            f"""SELECT {merchant_sql.RAW_KEY} AS raw_key,
-                       count(DISTINCT t.name) FILTER (
-                           WHERE btrim(coalesce(t.name, '')) <> '') AS lines,
-                       min(t.name) FILTER (
-                           WHERE btrim(coalesce(t.name, '')) <> '') AS line,
-                       bool_or(t.merchant_outlet IS NOT NULL) AS outlet
-                  FROM transactions t
-                 WHERE t.removed = 0
-                   AND {merchant_sql.RAW_KEY} = ANY(%s::text[])
-                 GROUP BY 1""",
-            ([k for k in by_key if k != "?"],)).fetchall()}
+        def _ledger_facts(keys, exclude=()):
+            """Per key: how many bank lines carry it, WHICH line, and
+            whether it is an outlet — over the live ledger, less the rows
+            in `exclude` (see the hold followers below)."""
+            return {r["raw_key"]: r for r in conn.execute(
+                f"""SELECT {merchant_sql.RAW_KEY} AS raw_key,
+                           count(DISTINCT t.name) FILTER (
+                               WHERE btrim(coalesce(t.name, '')) <> '') AS lines,
+                           min(t.name) FILTER (
+                               WHERE btrim(coalesce(t.name, '')) <> '') AS line,
+                           bool_or(t.merchant_outlet IS NOT NULL) AS outlet
+                      FROM transactions t
+                     WHERE t.removed = 0
+                       AND {merchant_sql.RAW_KEY} = ANY(%s::text[])
+                       AND NOT (t.id = ANY(%s))
+                     GROUP BY 1""",
+                ([k for k in keys if k != "?"], list(exclude))).fetchall()}
+
+        facts = _ledger_facts(by_key)
         # manual + llm aliases first: a person's answer, then a reviewed one.
         # Scoped to the keys in hand when the caller named transactions —
         # an incremental sync of a dozen rows has no business reading a
@@ -1124,9 +1246,9 @@ def resolve(conn, *, txn_ids: list[str] | None = None,
         #      phase 1 left — so no adopter can see another adopter, and
         #      the answers cannot depend on the adopters' order either;
         #   3. the adopters' writes.
-        prepared = []
-        for raw_key in sorted(by_key):
-            group = by_key[raw_key]
+        def _prepare(raw_key, group, f):
+            """One group's own evidence, judged against `f`, the ledger
+            facts for its key."""
             alias = aliases.get(raw_key)
             # Plaid identity from the FIRST row of the group that has one.
             # NOT for a fuel-arm outlet ("Northwind Club Gas") — its rows carry the
@@ -1136,7 +1258,6 @@ def resolve(conn, *, txn_ids: list[str] | None = None,
             ident = None
             # the ledger's answer where it has one; a key of its own
             # (a row with no bank line at all) falls back to the batch
-            f = facts.get(raw_key)
             outlet = (bool(f["outlet"]) if f
                       else any(r["is_outlet"] for r in group))
             if not outlet and " — " not in raw_key:
@@ -1171,35 +1292,53 @@ def resolve(conn, *, txn_ids: list[str] | None = None,
                       and " — " not in raw_key
                       and bank is not None and bank == raw_key)
             # The mirror case: the aggregator DID name the group, with no
-            # entity behind the name, and every row of it sits under one
-            # bank descriptor. Whether that descriptor overrules the name
-            # is asked in phase 2 with the adopters, for the same reason —
-            # the rows it would follow may be settled in this very pass. A
-            # layer-1 alias with no merchant is the nightly string clean
-            # having seen the key, not anyone having answered for it.
-            unspoken = alias is None or (alias[1] == "layer1" and alias[2] is None)
-            # ONE bank line, counted over the LEDGER: a name the aggregator
-            # has also used under another line is a payee it knows, not a
-            # misreading of either.
+            # entity behind the name. Whether a row's descriptor overrules
+            # the name is asked in phase 2 with the adopters, for the same
+            # reason — the rows it would follow may be settled in this very
+            # pass. Only a person's rename or a reviewed merge has answered
+            # for the name. A layer-1 alias is the nightly string clean
+            # having seen the key, or this pass filing an EARLIER row of the
+            # name under another line — and letting that filing shield this
+            # row would make its answer depend on which line's charge the
+            # feed delivered first.
+            unspoken = machine
             lines = (f["lines"] if f
                      else len({(r["bank_name"] or "").strip() for r in group
                                if (r["bank_name"] or "").strip()}))
-            overrulable = (unspoken and ident is None and not outlet
-                           and " — " not in raw_key and not adopts
-                           and lines == 1 and bank is not None
-                           and bank != raw_key
-                           # the pure half of the test, asked here so a name
-                           # the descriptor does contain settles in phase 1,
-                           # where the adopters of that descriptor can see it.
-                           # The CLEANED name counts as contained too: "The
-                           # Juniper Market", "Juniper Market #12" and
-                           # "Juniper Market Inc" are all the line's own
-                           # payee wearing the noise the string clean exists
-                           # to remove, not a stray guess about it.
-                           and not _descriptor_names(bank, raw_key)
-                           and not _descriptor_names(
-                               bank, merchant_dedup.canonical_merchant(
-                                   raw_key, cities) or ""))
+            # Judged per (name, line) pair, never per name: whether a line
+            # outranks the aggregator's name for ITS rows is a question about
+            # that line's own history, so it cannot depend on which other
+            # lines' rows the feed happened to deliver in the same sync:
+            # delivering [u] then [v] must land the same as [u, v], and a
+            # verdict over the whole name would not. A name the aggregator
+            # also uses under another line is still a payee it knows there:
+            # every line that cannot overrule it keeps the name's own path,
+            # so a name under two lines neither of which has agreed with the
+            # aggregator stays one merchant.
+            doubt: dict = {}
+            if (unspoken and ident is None and not outlet
+                    and " — " not in raw_key and not adopts):
+                clean = merchant_dedup.canonical_merchant(raw_key, cities) or ""
+                for r in group:
+                    line = r["bank_name"]
+                    if not (line or "").strip() or line == raw_key:
+                        continue
+                    if line not in doubt:
+                        # the pure half of the test, asked here so a name
+                        # the descriptor does contain settles in phase 1,
+                        # where the adopters of that descriptor can see it.
+                        # The CLEANED name counts as contained too: "The
+                        # Juniper Market", "Juniper Market #12" and
+                        # "Juniper Market Inc" are all the line's own payee
+                        # wearing the noise the string clean exists to
+                        # remove, not a stray guess about it.
+                        doubt[line] = (None if (_descriptor_names(line, raw_key)
+                                                or _descriptor_names(line, clean))
+                                       else [])
+                    if doubt[line] is not None:
+                        doubt[line].append(r)
+                doubt = {k: v for k, v in doubt.items() if v}
+            overrulable = bool(doubt)
             # About to MINT: nothing authoritative has spoken for the key,
             # and no merchant answers to the name it cleans to — the shape
             # a feed renaming a payee it already knew arrives in. Before a
@@ -1215,23 +1354,31 @@ def resolve(conn, *, txn_ids: list[str] | None = None,
                 fam = manual_family.get(canon)
                 if fam and len({c for c, _ in fam}) == 1:
                     canon = None          # the person already named it
-            prepared.append({"raw_key": raw_key, "group": group, "alias": alias,
+            return {"raw_key": raw_key, "group": group, "alias": alias,
                              "ident": ident, "outlet": outlet, "bank": bank,
                              "adopts": adopts, "overrulable": overrulable,
-                             "lines": lines, "canon": canon, "minter": False})
-        named = {r["l"] for r in conn.execute(
-            "SELECT DISTINCT lower(name) AS l FROM merchants "
-            " WHERE merged_into IS NULL AND lower(name) = ANY(%s)",
-            ([g["canon"].lower() for g in prepared if g["canon"]],)).fetchall()}
-        for g in prepared:
-            g["minter"] = bool(g["canon"]) and g["canon"].lower() not in named \
-                and _abbreviates_plaid_merchant(conn, g["canon"]) is None
+                             "lines": lines, "canon": canon, "minter": False,
+                             "doubt": doubt}
+
+        prepared = [_prepare(k, by_key[k], facts.get(k)) for k in sorted(by_key)]
+        def _mark_minters(groups):
+            named = {r["l"] for r in conn.execute(
+                "SELECT DISTINCT lower(name) AS l FROM merchants "
+                " WHERE merged_into IS NULL AND lower(name) = ANY(%s)",
+                ([g["canon"].lower() for g in groups if g["canon"]],)).fetchall()}
+            for g in groups:
+                g["minter"] = bool(g["canon"]) and g["canon"].lower() not in named \
+                    and _abbreviates_plaid_merchant(conn, g["canon"]) is None
+
+        _mark_minters(prepared)
 
         def _ask(g):
+            named = g["bank"] != g["raw_key"]
             return {"bank": g["bank"] if g["lines"] == 1 else None,
                     "ids": [r["id"] for r in g["group"]],
                     "pending": all(r["is_pending"] for r in g["group"]),
-                    "name": g["raw_key"] if g["bank"] != g["raw_key"] else None}
+                    "name": g["raw_key"] if named else None,
+                    "clean": g["canon"] if named else None}
 
         def _settle(g, adopted, overruled=False):
             """Give one group its merchant, and record the decision.
@@ -1333,8 +1480,9 @@ def resolve(conn, *, txn_ids: list[str] | None = None,
                 # restored without its merchants, and leaving the key
                 # mapping to nothing while rows carry it is the very gap
                 # this write exists to close. Where it already names a live
-                # merchant the rows were filed under THAT one
-                # (see `_line_merchant`), so the update is a no-op; a
+                # merchant, every caller that overrules (the hold followers
+                # and the doubted groups alike) filed the rows under THAT
+                # one (see `_line_merchant`), so the update is a no-op; a
                 # person's rename and a reviewed merge are never touched,
                 # here as everywhere else in this module.
                 conn.execute(
@@ -1372,27 +1520,102 @@ def resolve(conn, *, txn_ids: list[str] | None = None,
                     (mid, ids))
             stats["rows"] += len(ids)
 
+        # A posted charge repeating the stray name its own hold set aside is
+        # the same purchase as the hold, and the hold's line has answered
+        # for that name: the charge is filed as the hold was, name set
+        # aside, its OWN line aliased. Decided row by row and before
+        # anything else, because a key is not a purchase — a sync can carry
+        # an unrelated charge the feed gave the same stray name under a line
+        # of its own, and moving the group would file that one under the
+        # hold's merchant too and alias its line there for good. Asked of
+        # every group that is not already spoken for, minter or not, so the
+        # answer is the same whichever of the two charges arrives first.
+        followers = _hold_followers(
+            conn, [r["id"] for g in prepared
+                   if g["canon"] and g["bank"] != g["raw_key"]
+                   for r in g["group"]])
         for g in prepared:
-            if not (g["adopts"] or g["overrulable"] or g["minter"]):
-                _settle(g, None)
+            follow: dict = {}
+            for r in g["group"]:
+                if r["id"] in followers:
+                    follow.setdefault((r["bank_name"], followers[r["id"]]),
+                                      []).append(r)
+            if not follow:
+                continue
+            g["group"] = [r for r in g["group"] if r["id"] not in followers]
+            for (line, mid), part in sorted(follow.items(),
+                                            key=lambda kv: (kv[0][0], str(kv[0][1]))):
+                # The hold decides THAT the charge's name comes off; where
+                # it lands is a question about the key it carries from
+                # then on, its own line. A line already filed under another
+                # merchant keeps that answer, exactly as an overruled group
+                # below does: filing the charge under the hold's merchant
+                # would re-point the line's alias while the line's earlier
+                # rows stayed behind.
+                mid = _line_merchant(conn, line) or mid
+                _settle({**g, "group": part, "bank": line}, mid, overruled=True)
+        prepared = [g for g in prepared if g["group"]]
+        # The followers have left their groups, so their lines must leave
+        # the groups' evidence too. Still counted, a follower's line made
+        # the stray name look like one the feed uses under two lines — a
+        # payee it knows — so an unrelated charge sharing the sync was
+        # minted under the stray name, where arriving in a sync of its own
+        # (either side of the follower) it yields to its line. The
+        # follower has by now moved to its own line's key, which is where
+        # a separate sync would have found it; re-judging on the ledger
+        # without it makes the answer the same whichever way the sync
+        # bundled them.
+        touched = {g["raw_key"] for g in prepared
+                   if any(r["id"] in followers for r in by_key[g["raw_key"]])}
+        if touched:
+            refacts = _ledger_facts(touched, exclude=followers)
+            prepared = [_prepare(g["raw_key"], g["group"], refacts.get(g["raw_key"]))
+                        if g["raw_key"] in touched else g for g in prepared]
+            _mark_minters([g for g in prepared if g["raw_key"] in touched])
+
+        def _rest(g):
+            """The group less the rows a line of their own may claim: they
+            settle where the group would have had no line doubted it."""
+            ids = {r["id"] for part in g["doubt"].values() for r in part}
+            return {**g, "group": [r for r in g["group"] if r["id"] not in ids]}
+
+        for g in prepared:
+            if not (g["adopts"] or g["minter"]):
+                rest = _rest(g)
+                if rest["group"]:
+                    _settle(rest, None)
         # The would-be minters next, their questions asked together against
         # what phase 1 left, before anything that reads their rows.
         minters = [g for g in prepared if g["minter"]]
+        asked = [_ask(g) for g in minters]
         known = dict(zip((id(g) for g in minters),
-                         identity_answers(conn, [_ask(g) for g in minters])))
+                         identity_answers(conn, asked)))
+        # An answer that came from a hold's set-aside name is a row's, not
+        # the group's: the rows it vouches for were filed above, and any
+        # left here (refused there) must not carry the whole group — and
+        # the stray name's alias — into the hold's merchant.
+        for g, a in zip(minters, asked):
+            if a.get("set_aside"):
+                known[id(g)] = None
         for g in minters:
-            if not g["overrulable"]:
-                _settle(g, known[id(g)])
+            rest = _rest(g)
+            if rest["group"]:
+                _settle(rest, known[id(g)])
         # The overrulable groups next, and before the adopters: one that is
         # refused mints a merchant under its descriptor, which an adopter of
         # that descriptor has to see. Lookups together, then writes, as below.
-        doubted = [g for g in prepared if g["overrulable"]]
+        # One question per (name, line): each line answers for its own rows
+        # (see `doubt` in _prepare), and a line that refuses leaves its rows
+        # on the name's own path — the minter's answer, as the rest had.
+        doubted = [({**g, "group": part, "bank": line}, id(g))
+                   for g in prepared if g["overrulable"]
+                   for line, part in sorted(g["doubt"].items())]
         agreement = _agreement_evidence(
-            conn, [(g["bank"], g["raw_key"]) for g in doubted])
-        verdicts = [_descriptor_overrules_enrichment(conn, g["bank"], g["raw_key"],
+            conn, [(d["bank"], d["raw_key"]) for d, _ in doubted])
+        verdicts = [_descriptor_overrules_enrichment(conn, d["bank"], d["raw_key"],
                                                      evidence=agreement)
-                    for g in doubted]
-        for g, verdict in zip(doubted, verdicts):
+                    for d, _ in doubted]
+        for (d, gid), verdict in zip(doubted, verdicts):
             if verdict is not None:
                 # The verdict decides THAT the rows move; where they land
                 # is then a question about the key they will carry. Read
@@ -1400,10 +1623,10 @@ def resolve(conn, *, txn_ids: list[str] | None = None,
                 # doubted groups on one line can only read the same answer
                 # — the first writes the line's alias with the merchant the
                 # second would have found anyway.
-                verdict = _line_merchant(conn, g["bank"]) or verdict
-                _settle(g, verdict, overruled=True)
+                verdict = _line_merchant(conn, d["bank"]) or verdict
+                _settle(d, verdict, overruled=True)
             else:
-                _settle(g, known.get(id(g)))
+                _settle(d, known.get(gid))
         adopters = [g for g in prepared if g["adopts"]]
         # every lookup before every adopter write, so the answers describe
         # the same state and none of them is an artefact of going second

@@ -110,10 +110,24 @@ def shadow_ids_sql() -> str:
 """
 
 
+# A connect to a database that has stopped answering otherwise waits on the
+# driver's default (over two minutes), holding a request thread — or, from an
+# async handler, the whole event loop — for all of it. A DSN that names its
+# own connect_timeout keeps it.
+ADMIN_CONNECT_TIMEOUT_S = 10
+
+
 def admin_connect(dsn: str | None = None) -> psycopg.Connection:
-    """Owner/superuser connection: migrations + tenant/user lifecycle only."""
-    return psycopg.connect(dsn or ADMIN_DSN, row_factory=dict_row,
-                           autocommit=True)
+    """Owner/superuser connection: migrations + tenant/user lifecycle only.
+
+    Unpooled: when the server is out of connection slots this raises
+    psycopg.OperationalError at connect, which the web layer answers as a
+    503 with Retry-After (the same brown-out as a starved pool)."""
+    dsn = dsn or ADMIN_DSN
+    kw = {}
+    if "connect_timeout" not in dsn:
+        kw["connect_timeout"] = ADMIN_CONNECT_TIMEOUT_S
+    return psycopg.connect(dsn, row_factory=dict_row, autocommit=True, **kw)
 
 
 # ---- app-role connection pool ----------------------------------------------
@@ -178,12 +192,23 @@ def _pool(dsn: str) -> ConnectionPool:
 # Control-plane queries (users/sessions/tenants — no RLS, no tenant SET)
 # come from this small shared pool.
 #
-# Keep OIKONOME_POOL_MAX + OIKONOME_CONTROL_POOL_MAX (plus the worker's
-# share) under your database's connection limit. The worker's pools use
-# the same env caps, but min_size=0 + max_idle shrink them to what jobs
-# actually hold (hourly sync touches tenants serially), plus short-lived
-# admin_connect() connections; leave headroom for migrations, the admin
-# console and psql.
+# The connection budget, per instance, all of it under the database's
+# connection limit:
+#   web     OIKONOME_POOL_MAX + OIKONOME_CONTROL_POOL_MAX (10 + 4)
+#   worker  the same two caps as the worker process sees them — compose
+#           maps OIKONOME_WORKER_POOL_MAX / OIKONOME_WORKER_CONTROL_POOL_MAX
+#           onto them, falling back to the web's. The worker really fills
+#           its pool: it runs up to WORKER_THREADS - 2 jobs at once, each
+#           holding a tenant connection (a new bank's first pull holds one
+#           for minutes; at most OIKONOME_FIRST_SYNC_CONCURRENCY of those).
+#           min_size=0 + max_idle shrink it again when the queue is quiet.
+#   admin   admin_connect() is unpooled: signup, confirmation, reclaim,
+#           webhooks and link finishes each open one, bounded only by the
+#           web threadpools — up to ~40 in a burst.
+#   other   migrations, the admin console, psql, and — on a managed
+#           database — the slots the provider reserves for its own agents.
+#           Count those against the limit too; the plan's documentation
+#           (or its connection view) gives the number.
 #
 # Checkout timeout is deliberately SHORT (default 5 s vs psycopg_pool's
 # 30 s): a starved control pool means every request is queueing for the
@@ -290,6 +315,11 @@ class _Discardable:
             self._memo.clear()
             return
         hit = {m.lower() for m in _WRITE_TARGET_RE.findall(q)}
+        # A write a statement never names: deleting a business entity
+        # rewrites accounts.entity_id and transactions.entity_id through
+        # ON DELETE SET NULL, so a memo over either must go with it.
+        for t in list(hit):
+            hit |= _CASCADES_INTO.get(t, frozenset())
         if hit:
             for k in [k for k, (deps, _) in self._memo.items() if deps & hit]:
                 del self._memo[k]
@@ -367,6 +397,11 @@ def control_connect(dsn: str | None = None) -> _ControlConn:
 _WRITE_TARGET_RE = re.compile(
     r"\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM|TRUNCATE(?:\s+TABLE)?|MERGE\s+INTO)"
     r"\s+(?:ONLY\s+)?([a-z_][a-z0-9_]*)", re.I)
+# Tables whose rows a delete in the key rewrites by foreign-key action.
+_CASCADES_INTO = {
+    "business_entity": frozenset({"accounts", "compliance_obligation", "entity_membership", "equity_movement", "mileage_log", "transactions"}),
+}
+
 _DDL_RE = re.compile(r"\b(ALTER|DROP|CREATE|CALL|DO)\b", re.I)
 
 
@@ -564,6 +599,15 @@ def delete_tenant_rows(admin: psycopg.Connection, tenant_id) -> None:
     Table list is discovered, so tables added later are covered. Used by
     the CCPA delete-account door and the demo hourly reset."""
     from psycopg import sql
+    # The household's members are locked FIRST. Every other writer that
+    # touches users and a per-member table takes users before the table
+    # (the assistant log records an answer under a share lock on the
+    # asker's row and trims the log in the same transaction); the sweep
+    # below reaches users last, through the tenants cascade, so without
+    # this an erasure racing an in-flight answer deadlocked, and an answer
+    # recorded after the sweep had passed its table outlived the household.
+    admin.execute("SELECT 1 FROM users WHERE tenant_id = %s FOR UPDATE",
+                  (tenant_id,))
     rows = admin.execute(
         """SELECT DISTINCT table_name FROM information_schema.columns
            WHERE table_schema='public' AND column_name='tenant_id'""").fetchall()
@@ -693,4 +737,13 @@ def delete_tenant_rows(admin: psycopg.Connection, tenant_id) -> None:
         for t in ordered:
             admin.execute(sql.SQL("DELETE FROM {} WHERE tenant_id = %s")
                           .format(sql.Identifier(t)), (tenant_id,))
+        # keyed `tenant`, not tenant_id (the webhook that reads it arrives
+        # with no tenant), so the discovery above cannot see it; the
+        # household's bank-link sessions go with it — any still open were
+        # finished and their Items handed back by the erasure's external
+        # release (erasure.release_external) first. plaid_release_queue
+        # is keyed the same way and deliberately stays: it is what removes
+        # the household's Items at Plaid after the rows are gone.
+        admin.execute("DELETE FROM plaid_link_sessions WHERE tenant = %s",
+                      (str(tenant_id),))
         admin.execute("DELETE FROM tenants WHERE id = %s", (tenant_id,))

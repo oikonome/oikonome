@@ -39,7 +39,8 @@ import httpx
 
 from ..engine.compat import MAX_AMOUNT, as_date
 from .adopt import stored_account_id
-from .base import DEBT_TYPES, Account, Transaction, \
+from .base import DEBT_TYPES, Account, Transaction, _finite_or_none, \
+    bound_first_pull, \
     filter_import_duplicates, log_sync, reconcile_vanished_pendings, \
     upsert_accounts, upsert_item, upsert_transactions, user_set_types
 
@@ -259,23 +260,47 @@ def fetch(access_url: str, since: dt.date | None = None,
     return _well_formed(payload)
 
 
+def _text(v) -> str | None:
+    """A bridge text field as a string: a number is spelled as one (an id
+    of 42 is the id "42"), anything else (an object, a list, a boolean) is
+    absent. Everything downstream — the last-4 regex, the type heuristic,
+    the text columns — assumes a string, and a bridge URL is the tenant's
+    own, so the reply's types are not ours to trust."""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return str(v)
+    return None
+
+
+def _texts(d: dict, keys) -> dict:
+    """`d` with each of `keys` it carries passed through _text."""
+    return {**d, **{k: _text(d[k]) for k in keys if k in d}}
+
+
 def _well_formed(payload) -> dict:
     """The reply with every account that has no id, and every account or
-    row that is not an object, left out. One bridge token carries every
-    bank, so one malformed entry must cost that entry, not the pull."""
+    row that is not an object, left out, and every text field it reads
+    spelled as a string or dropped. One bridge token carries every bank,
+    so one malformed entry must cost that entry, not the pull."""
     if not isinstance(payload, dict):
         raise ValueError("the SimpleFIN bridge reply is not an object")
     accounts = []
     raw_accounts = payload.get("accounts")
     for a in raw_accounts if isinstance(raw_accounts, list) else []:
-        if not isinstance(a, dict) or a.get("id") in (None, ""):
+        aid = _text(a.get("id")) if isinstance(a, dict) else None
+        if not aid:
             log.warning("SimpleFIN account skipped (malformed)")
             continue
         rows = a.get("transactions")
-        a = {**a, "transactions": [t for t in rows if isinstance(t, dict)]
-             if isinstance(rows, list) else []}
-        if not isinstance(a.get("org"), dict):
-            a["org"] = {}
+        rows = [_texts(t, ("id", "description", "payee"))
+                for t in rows if isinstance(t, dict)] \
+            if isinstance(rows, list) else []
+        a = {**_texts(a, ("name", "currency")), "id": aid,
+             "transactions": rows}
+        org = a.get("org")
+        a["org"] = (_texts(org, ("name", "domain"))
+                    if isinstance(org, dict) else {})
         accounts.append(a)
     return {**payload, "accounts": accounts}
 
@@ -371,6 +396,35 @@ def _resync_owed(conn, item_id: str, payload: dict,
     return min(r["resync_from"] for r in owed), [r["id"] for r in owed]
 
 
+def _write_bank_signed_balances(conn, account_id: str, bal, avail) -> None:
+    """Store the bank-signed balances under the account's type AS IT IS
+    NOW, decided in the statement that writes them.
+
+    The sign the pull computes above comes from a read of the classified
+    types taken at the start of the pull. A person classifying the account
+    while the pull runs re-signs the stored balance in the classify
+    statement; a balance this pull then wrote with the sign it chose from
+    its earlier read would undo that, leaving a card read as an asset (or
+    a deposit as a debt) until the next pull. Decided here, from the row's
+    type at write time, the two orders give one answer: a classify that
+    commits first is read here, and one that commits after re-signs what
+    this wrote. A hidden account keeps no balance, as upsert_accounts
+    keeps none."""
+    bal = _finite_or_none(bal, account_id)
+    avail = _finite_or_none(avail, account_id)
+    conn.execute(
+        "UPDATE accounts SET "
+        "balance_current = CASE WHEN type = ANY(%(debt)s) "
+        "    THEN -(%(bal)s::double precision) "
+        "    ELSE %(bal)s::double precision END, "
+        "balance_available = CASE WHEN type = ANY(%(debt)s) "
+        "    THEN -(%(avail)s::double precision) "
+        "    ELSE %(avail)s::double precision END "
+        "WHERE id = %(id)s AND user_removed_at IS NULL",
+        {"debt": list(DEBT_TYPES), "bal": bal, "avail": avail,
+         "id": account_id})
+
+
 def sync(conn, item_id: str, access_url: str, *, since: dt.date | None = None,
          institution_name: str = "SimpleFIN",
          account_types: dict[str, str] | None = None,
@@ -384,14 +438,27 @@ def sync(conn, item_id: str, access_url: str, *, since: dt.date | None = None,
     bank added later at the bridge still gets its initial history. The
     upserts are idempotent, so the extra depth for already-known orgs in
     the same payload is harmless."""
+    # the household's history window bounds a deep pull (the claim's first
+    # pull, an unbounded one, a bank's first appearance), as it bounds a
+    # Plaid link's backfill; a routine refresh is left as asked
+    since = bound_first_pull(conn, since)
     try:
         payload = fetch(access_url, since=since, transport=transport)
         deep = _first_pull_since(conn, item_id, payload, since,
                                  institution_name)
+        if deep is not None:
+            deep = bound_first_pull(conn, deep)
+            if since is not None and deep >= since:
+                deep = None         # the window is no deeper than this pull
         # a bank a new token brought back reaches back over the time it was
         # disconnected, which the routine window never would
         owed, owed_items = _resync_owed(conn, item_id, payload,
                                         institution_name)
+        # the bridge takes one start date for every bank, so the gap is
+        # filled only as far back as the household's history window: past
+        # it, every other bank's pre-window rows would land as well
+        if owed is not None:
+            owed = bound_first_pull(conn, owed)
         if (owed is not None and since is not None
                 and owed < (deep or since)):
             deep = owed
@@ -443,6 +510,9 @@ def sync(conn, item_id: str, access_url: str, *, since: dt.date | None = None,
     pulled_ids: set[str] = set()
     org_of: dict[str, str] = {}
     renamed_ids: dict[str, str] = {}
+    # the balances as the bank signed them, written last by
+    # _write_bank_signed_balances, which decides the sign at write time
+    bank_signed: dict[str, tuple[float | None, float | None]] = {}
     for a in payload.get("accounts") or []:
         # the bridge's id is any string; a comma would be refused by the
         # accounts table and fail this whole pull, so it is spelled the way
@@ -454,6 +524,7 @@ def sync(conn, item_id: str, access_url: str, *, since: dt.date | None = None,
         typ, sub = _classify(a, types.get(aid, types.get(a["id"])))
         bal = _amount(a.get("balance"))
         avail = _amount(a.get("available-balance"))
+        bank_signed[aid] = (bal, avail)
         if pinned.get(aid, typ) in DEBT_TYPES:
             # SimpleFIN reports debt negative (a card's and a loan's alike);
             # the engine wants the amount owed positive
@@ -526,6 +597,7 @@ def sync(conn, item_id: str, access_url: str, *, since: dt.date | None = None,
     txns = [t for t in txns if org_of.get(t.account_id) not in archived]
     for a in accounts:
         upsert_accounts(conn, org_of[a.id], [a])
+        _write_bank_signed_balances(conn, a.id, *bank_signed[a.id])
     # reverse dedup: rows already covered by earlier FILE IMPORTS (window-
     # scoped, one-to-one — see base.ImportOverlapGuard) must not re-insert
     txns, skipped_imports = filter_import_duplicates(conn, txns)

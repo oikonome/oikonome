@@ -18,6 +18,9 @@ TODAY = dt.date.today()                    # API path uses the real today
 # deliberately collapses UNDER into ON BUDGET (EARLY_MONTH_FRAC), so a
 # floating past day would fail this suite three days of every month
 PAST = (TODAY - dt.timedelta(days=40)).replace(day=15)
+# the ledger's floor: the 1st of that month, so on PAST the verdict has two
+# weeks of ledger behind it (a days-old ledger is never read as UNDER)
+FLOOR = PAST.replace(day=1)
 
 
 class TodayBacknavTests(unittest.TestCase):
@@ -43,7 +46,10 @@ class TodayBacknavTests(unittest.TestCase):
         try:
             seed_accounts(conn)
             write_config(conn, food_monthly=2725, other_monthly=1900)
-            add_txn(conn, PAST, 100.0, "OLD SPEND")     # the ledger's floor
+            # an established household: the ledger predates the month, so
+            # the verdict paces the whole month, not a days-old ledger
+            add_txn(conn, FLOOR, -0.01, "INTEREST PAID", primary="INCOME")
+            add_txn(conn, PAST, 100.0, "OLD SPEND")     # the month's only spend
             add_txn(conn, TODAY, 42.5, "SAFEWAY",
                     primary="FOOD_AND_DRINK")
         finally:
@@ -54,7 +60,7 @@ class TodayBacknavTests(unittest.TestCase):
         self.assertEqual(r["date"], TODAY.isoformat())
         self.assertTrue(r["is_today"])
         self.assertEqual(r["real_today"], TODAY.isoformat())
-        self.assertEqual(r["min_date"], PAST.isoformat())
+        self.assertEqual(r["min_date"], FLOOR.isoformat())
 
     def test_past_day_verdict_without_now_facts(self):
         r = self.client.get("/api/today/full",
@@ -87,7 +93,7 @@ class TodayBacknavTests(unittest.TestCase):
     def test_clamps_to_ledger_floor_and_real_today(self):
         r = self.client.get("/api/today/full",
                             params={"date": "1990-01-01"}).json()
-        self.assertEqual(r["date"], PAST.isoformat())   # ledger floor
+        self.assertEqual(r["date"], FLOOR.isoformat())  # ledger floor
         self.assertFalse(r["is_today"])
         fut = (TODAY + dt.timedelta(days=5)).isoformat()
         r2 = self.client.get("/api/today/full", params={"date": fut}).json()

@@ -62,6 +62,11 @@ class LinkPrefetchTests(unittest.TestCase):
         appmod.DEV_MODE = True
         cls.appmod = appmod
 
+    def setUp(self):
+        # every test signs up afresh; the signup limiter counts per client
+        from oikonome.web import security
+        security._limiter._hits.clear()
+
     def _account(self):
         client = TestClient(self.appmod.app)
         email = f"pf-{uuid.uuid4().hex[:8]}@example.dev"
@@ -102,20 +107,72 @@ class LinkPrefetchTests(unittest.TestCase):
         self.assertIn("Email confirmed",
                       bare.get("/login?verified=1").text)
 
-    def test_spent_verification_link_still_refuses_when_unverified(self):
-        # a link burned by minting a NEWER one (resend) belongs to a user
-        # who is not verified — that one must not read as confirmed
-        email, client = self._account()
+    def _unverified_account(self):
+        email, _ = self._account()
         admin = tenancy.admin_connect()
         try:
             uid = _user_row(email)["id"]
             admin.execute("UPDATE users SET verified_at=NULL WHERE id=%s",
                           (uid,))
+        finally:
+            admin.close()
+        return email, uid
+
+    def test_a_link_superseded_by_a_resend_still_verifies(self):
+        """A link proves the MAILBOX it was sent to, and every link mailed
+        there proves it equally — so a resend leaves the earlier link live.
+        Mails arrive out of order; the first one is the one most people
+        open, and it must not read as already used."""
+        email, uid = self._unverified_account()
+        admin = tenancy.admin_connect()
+        try:
+            first = email_verify.create(admin, uid)
+            email_verify.create(admin, uid)          # the resend
+        finally:
+            admin.close()
+        r = TestClient(self.appmod.app).get(f"/verify-email?token={first}",
+                                            follow_redirects=False)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("Email confirmed", r.text)
+        self.assertIsNotNone(_user_row(email)["verified_at"])
+
+    def test_a_link_to_an_address_the_account_left_refuses(self):
+        """A link speaks for its mailbox only while the account is still at
+        that address: once the login moves, a link mailed to the old one
+        proves nothing about the new one and must not verify it."""
+        email, uid = self._unverified_account()
+        admin = tenancy.admin_connect()
+        try:
             old = email_verify.create(admin, uid)
-            email_verify.create(admin, uid)          # burns `old`
+            moved = f"moved-{uuid.uuid4().hex[:8]}@example.dev"
+            admin.execute("UPDATE users SET email=%s WHERE id=%s",
+                          (moved, uid))
         finally:
             admin.close()
         r = TestClient(self.appmod.app).get(f"/verify-email?token={old}")
+        self.assertEqual(r.status_code, 400)
+        self.assertIsNone(_user_row(moved)["verified_at"])
+
+    def test_a_spent_link_refuses_while_the_account_is_unverified(self):
+        """Spent-and-unexpired reads as confirmed only for an account that
+        IS verified (the scanner-then-human case). For an account that is
+        not, a spent link is just spent."""
+        email, uid = self._unverified_account()
+        admin = tenancy.admin_connect()
+        try:
+            token = email_verify.create(admin, uid)
+        finally:
+            admin.close()
+        with self.appmod._control_conn() as conn:
+            vid = email_verify.lookup(conn, token)["id"]
+        admin = tenancy.admin_connect()
+        try:
+            self.assertTrue(email_verify.consume(admin, vid, uid))
+            admin.execute("UPDATE users SET verified_at=NULL WHERE id=%s",
+                          (uid,))
+        finally:
+            admin.close()
+        r = TestClient(self.appmod.app).get(f"/verify-email?token={token}")
         self.assertEqual(r.status_code, 400)
 
     def test_a_prefetch_confirms_the_address_but_reopens_nothing(self):

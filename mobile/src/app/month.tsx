@@ -15,7 +15,7 @@ import { useRefetchWhenShown } from "../lib/focus";
 import { useSession } from "../lib/session";
 import { C, mmddyy, money } from "../lib/theme";
 import { VERDICT } from "../lib/verdict";
-import { catLabel, routeYm } from "../lib/pure";
+import { catLabel, isPlanSavingsGoal, routeYm } from "../lib/pure";
 import { labelSavingsRow, monthSavings } from "../lib/planner";
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -47,7 +47,7 @@ export default function MonthLens() {
   // refetch to whoever shows it — this screen does, on the way back
   useRefetchWhenShown(today, TODAY_KEY);
   const goal = (today.data?.savings_goals ?? [])
-    .find((g) => g.name === "Savings");
+    .find((g) => isPlanSavingsGoal(g.name));
   const d = query.data;
   // the lens's own month figure only — the goal's saved_this_month is
   // TODAY's month and would be wrong on any other
@@ -144,22 +144,26 @@ export default function MonthLens() {
         </Text>
       )}
       {d && (() => {
-        const left = d.variable_budget - d.variable_actual;
+        // an unjudged month (verdict null, budget_set false) still carries
+        // a numeric variable_budget; the ?? only covers an older server's
+        // null (web: MonthLens)
+        const budget = d.variable_budget ?? 0;
+        const left = budget - d.variable_actual;
         const dim = query.isPlaceholderData ? { opacity: 0.5 } : null;
         // the web's exact threshold (remaining < 0) — a 30¢ overage
         // must read "over" on both clients, not "over" on one
         const over = left < 0;
         const dayN = Number(d.as_of?.slice(8, 10)) || 0;
-        const inProg = d.status === "in_progress";
-        const frac = d.variable_budget > 0
-          ? Math.min(1, d.variable_actual / d.variable_budget)
+        const frac = budget > 0
+          ? Math.min(1, d.variable_actual / budget)
           : d.variable_actual > 0.005 ? 1 : 0;
-        const pace = inProg && d.days_in_month
-          ? dayN / d.days_in_month : null;
         const tol = d.tolerance ?? 0;
         const withinTol = !over && Math.abs(d.variance) <= tol;
         const net = d.income.actual !== null
           ? d.income.actual - d.spend_total : null;
+        // no budget the household saved stands behind the month: no
+        // verdict (web: MonthLens unjudged)
+        const unjudged = d.verdict === null;
         return (
         <View style={dim}
               pointerEvents={query.isPlaceholderData ? "none" : "auto"}>
@@ -167,9 +171,10 @@ export default function MonthLens() {
             <View style={{ flexDirection: "row", alignItems: "center",
                            gap: 8 }}>
               <Text style={[s.verdict,
-                            { color: VERDICT[d.verdict]?.color
-                                ?? C.text }]}>
-                {VERDICT[d.verdict]?.label ?? d.verdict}
+                            { color: d.verdict === null ? C.mut
+                                : VERDICT[d.verdict]?.color ?? C.text }]}>
+                {d.verdict === null ? "No budget set"
+                  : VERDICT[d.verdict]?.label ?? d.verdict}
               </Text>
               <Pill text={d.status === "final" ? "final"
                 : d.status === "future" ? "planned"
@@ -177,6 +182,14 @@ export default function MonthLens() {
                 : "so far"} />
             </View>
             {/* the headline the page exists for */}
+            {unjudged ? (
+              <Text style={s.hero}>
+                <Text style={{ color: C.text }}>
+                  {money(d.variable_actual, false)}
+                </Text>
+                <Text style={s.heroSub}> variable spend</Text>
+              </Text>
+            ) : (<>
             <Text style={s.hero}>
               <Text style={{ color: over ? C.bad : C.text }}>
                 {money(Math.abs(left), false)}
@@ -184,11 +197,11 @@ export default function MonthLens() {
               <Text style={s.heroSub}>
                 {/* the web's exact branch: "left unspent of" is the
                     FINAL month's phrasing; future months read like a plan */}
-                {over ? ` over ${money(d.variable_budget, false)} to spend`
+                {over ? ` over ${money(budget, false)} to spend`
                   : d.status === "final"
                     ? ` left unspent of ${
-                        money(d.variable_budget, false)} to spend`
-                    : ` left of ${money(d.variable_budget, false)} to spend`}
+                        money(budget, false)} to spend`
+                    : ` left of ${money(budget, false)} to spend`}
               </Text>
             </Text>
             {/* the web hero's Track: caret at EXPECTED spend
@@ -196,7 +209,14 @@ export default function MonthLens() {
             <Track paceLabel row={{ label: "", judged: true,
                           actual: d.variable_actual,
                           expected: d.variable_actual - d.variance,
-                          budget: d.variable_budget }} />
+                          budget }} />
+            </>)}
+            {unjudged ? (
+              <Text style={[s.mut, { fontSize: 13, marginTop: 4 }]}>
+                No budget saved yet, so this month gets no verdict — set
+                one on the Budget page.
+              </Text>
+            ) : (
             <Text style={{ fontSize: 13, marginTop: 4 }}>
               {d.variance > tol ? (
                 <Text style={{ color: C.bad, fontWeight: "700" }}>
@@ -215,6 +235,7 @@ export default function MonthLens() {
                 {d.status !== "final" ? " so far" : ""}
               </Text>
             </Text>
+            )}
             {/* a closed month with no frozen snapshot is judged against
                 TODAY's budget — say so (matches the web) */}
             {d.status === "final" && d.budget_source === "live" && (

@@ -1,6 +1,6 @@
 import { startAuthentication } from "@simplewebauthn/browser";
 import { useEffect, useState } from "react";
-import { api } from "../api/client";
+import { api, busyText, BusyError, errText } from "../api/client";
 
 // passkeys are offered in hosted mode and need a secure context
 // (https). Self-hosted LAN installs run over http, so this is already
@@ -35,9 +35,15 @@ export default function Login({ onDone }: { onDone: () => void }) {
   // codes — is sent: the reset page's cooling-off door, and the support
   // inbox the server names (hosted only; self-host has no such inbox).
   const [supportEmail, setSupportEmail] = useState<string | null>(null);
+  // an instance with an Android test build (a Play internal-testing link,
+  // an App Tester invite) names it under the form; most instances have
+  // none and show nothing
+  const [androidTestUrl, setAndroidTestUrl] = useState<string | null>(null);
   useEffect(() => {
-    api.access().then((a) => setSupportEmail(a.support_email ?? null))
-      .catch(() => {});
+    api.access().then((a) => {
+      setSupportEmail(a.support_email ?? null);
+      setAndroidTestUrl(a.android_test_url ?? null);
+    }).catch(() => {});
   }, []);
 
   // a demo instance shares its (synthetic-data) credentials pre-auth, so
@@ -66,7 +72,10 @@ export default function Login({ onDone }: { onDone: () => void }) {
       await api.passkeyLogin(o.challenge_id, cred);
       onDone();
     } catch (err) {
-      if (!String(err).includes("NotAllowedError"))
+      // a restart the proxy answered for is not load: it has its own line
+      if (err instanceof BusyError)
+        setError(err.restarting ? errText(err) : busyText(err.retryAfter));
+      else if (!String(err).includes("NotAllowedError"))
         setError("Passkey sign-in didn't work. Use password"
           + (needTotp ? " + authenticator code" : "")
           + ", or try again from the device that has your passkey.");
@@ -96,7 +105,15 @@ export default function Login({ onDone }: { onDone: () => void }) {
         if (passkeysAvailable() && !totp.trim()) {
           try { await passkey(); return; } catch { /* fall through */ }
         }
-      } else setError("Wrong email or password" + (needTotp ? " or code" : ""));
+      } else if (err instanceof BusyError)
+        setError(err.restarting ? errText(err) : busyText(err.retryAfter));
+      // a throttle or a server fault is not a wrong password: saying so
+      // would send someone with the right one off to reset it
+      else if (/^Error: 429:/.test(msg))
+        setError("Too many failed attempts — try again in a few minutes.");
+      else if (/^Error: 5\d\d:/.test(msg) || err instanceof TypeError)
+        setError("Couldn't reach the server — try again.");
+      else setError("Wrong email or password" + (needTotp ? " or code" : ""));
     } finally {
       setBusy(false);
     }
@@ -252,6 +269,29 @@ export default function Login({ onDone }: { onDone: () => void }) {
           </p>
         )}
       </form>
+      <AndroidTestLink url={androidTestUrl} />
     </div>
+  );
+}
+
+/** A small, muted line under the sign-in card pointing at this instance's
+ *  Android test build. Deliberately quiet: it is for this instance's
+ *  testers, not a store badge, and the Play glyph is the only colour. */
+function AndroidTestLink({ url }: { url: string | null }) {
+  if (!url) return null;
+  return (
+    <a href={url} target="_blank" rel="noopener noreferrer"
+       style={{ display: "flex", alignItems: "center", justifyContent: "center",
+                gap: ".4rem", margin: ".8rem auto 0", width: "23rem",
+                fontSize: ".78rem", color: "var(--mut)", textDecoration: "none",
+                opacity: .85 }}>
+      <svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true">
+        <path fill="#34a853" d="M3.6 2.2 13.3 12 3.6 21.8c-.4-.3-.6-.8-.6-1.4V3.6c0-.6.2-1.1.6-1.4z" />
+        <path fill="#fbbc04" d="m16.6 8.7 3.4 2c1.1.6 1.1 2 0 2.6l-3.4 2L13.3 12z" />
+        <path fill="#4285f4" d="M3.6 2.2c.5-.3 1.1-.3 1.7 0l11.3 6.5L13.3 12z" />
+        <path fill="#ea4335" d="M13.3 12l3.3 3.3-11.3 6.5c-.6.3-1.2.3-1.7 0z" />
+      </svg>
+      <span>Android test build on Google Play</span>
+    </a>
   );
 }

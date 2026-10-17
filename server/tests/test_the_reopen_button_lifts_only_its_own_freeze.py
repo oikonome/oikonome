@@ -5,12 +5,13 @@ presses "Reopen this account" — a POST carrying a link that mailbox was
 sent. Holding such a link is the proof, so the door is exactly as wide
 as the mailbox: it lifts the freeze on the token's OWN household, only
 while that household is frozen, only once the address is verified, and
-only while the token is inside its week. Any unexpired link counts,
-including one a later resend superseded, because minting burns the older
-link and that shape cannot be told from a link a scanner spent. An
-expired or foreign token reopens nothing, an unproved address reopens
-nothing, and a household nobody presses the button for is erased on the
-date its notice named.
+only while the token is inside its week. Any unexpired link mailed to
+the account's current address counts, including one a later resend
+superseded, because the mailbox is what is proved and every link sent
+there proves it equally. An expired or foreign token reopens nothing, a
+link mailed to an address the account has since left reopens nothing,
+an unproved address reopens nothing, and a household nobody presses the
+button for is erased on the date its notice named.
 """
 
 import os
@@ -144,16 +145,53 @@ class ReopenButtonTests(unittest.TestCase):
         self.assertEqual(r.status_code, 400, r.text)
         self.assertEqual(_tenant(email)["status"], unverified.STATUS)
 
-    def test_a_link_superseded_before_the_address_was_proved_reopens_nothing(
-            self):
-        """Spent-but-unexpired is not enough on its own: minting a link
-        burns the older one, so that shape also belongs to a link nobody
-        ever opened. The address is what has to be proved, and here it
-        never was."""
-        email, token = self._frozen_household()
+    def test_a_link_superseded_by_a_resend_still_reopens(self):
+        """A resend does not burn the earlier link: both were mailed to the
+        same address and prove it equally, so the first mail's link
+        confirms the address and its button reopens the household."""
+        email, first = self._frozen_household()
         admin = _admin()
         try:
-            email_verify.create(admin, _user(email)["id"])   # burns `token`
+            email_verify.create(admin, _user(email)["id"])   # the resend
+        finally:
+            admin.close()
+        r = TestClient(self.appmod.app).post(
+            "/verify-email", data={"token": first}, follow_redirects=False)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIsNotNone(_user(email)["verified_at"])
+        self.assertEqual(_tenant(email)["status"], "active")
+
+    def test_a_link_to_an_address_the_account_left_reopens_nothing(self):
+        """The link speaks for the mailbox it was sent to, and only while
+        the account is still at that address. Once the login has moved,
+        holding the old mail proves nothing about the account."""
+        email, token = self._frozen_household()
+        moved = f"moved-{uuid.uuid4().hex[:8]}@example.dev"
+        admin = _admin()
+        try:
+            admin.execute("UPDATE users SET email=%s WHERE email=%s",
+                          (moved, email))
+        finally:
+            admin.close()
+        r = TestClient(self.appmod.app).post(
+            "/verify-email", data={"token": token}, follow_redirects=False)
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertIsNone(_user(moved)["verified_at"])
+        self.assertEqual(_tenant(moved)["status"], unverified.STATUS)
+
+    def test_a_spent_link_reopens_nothing_while_the_address_is_unproved(
+            self):
+        """Spent-but-unexpired stands in for a proof only when the address
+        IS proved; for an account that is not verified it is just spent."""
+        email, token = self._frozen_household()
+        uid = _user(email)["id"]
+        with self.appmod._control_conn() as conn:
+            vid = email_verify.lookup(conn, token)["id"]
+        admin = _admin()
+        try:
+            self.assertTrue(email_verify.consume(admin, vid, uid))
+            admin.execute("UPDATE users SET verified_at=NULL WHERE id=%s",
+                          (uid,))
         finally:
             admin.close()
         r = TestClient(self.appmod.app).post(
@@ -165,13 +203,11 @@ class ReopenButtonTests(unittest.TestCase):
         """A person who presses Resend twice and then opens the FIRST of
         the two mails is not turned away.
 
-        Minting burns the older link, so by the time the second mail
-        arrives the first reads as spent — the same shape a scanner's
-        fetch leaves. The door is deliberately as wide as the mailbox and
-        no wider: every one of these links was sent to that address, none
-        outlives its week, and the address must already be verified
-        before any of them lifts anything. Narrowing it to the newest
-        link would strand whoever opens the mail that arrived first."""
+        The door is deliberately as wide as the mailbox and no wider:
+        every one of these links was sent to that address, none outlives
+        its week, and the address must already be verified before any of
+        them lifts anything. Narrowing it to the newest link would strand
+        whoever opens the mail that arrived first."""
         email, first = self._frozen_household()
         admin = _admin()
         try:

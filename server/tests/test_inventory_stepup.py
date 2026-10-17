@@ -88,6 +88,16 @@ STEPUP_EXEMPT = {
         "ends an operator's access early — strictly a de-escalation",
     "POST /api/recovery/cancel-pending":
         "stops a pending factor-clearing recovery — removes a path to access, cannot grant one",
+    "POST /api/email/change/cancel":
+        "withdraws a pending login-email change — restores the address the "
+        "account already holds, cannot move it; the request it withdraws "
+        "was itself stepped up, and withdrawing must work before a factor "
+        "is enrolled",
+    "POST /api/email/change/resend":
+        "re-mails the link of a change the same credential already stepped "
+        "up for, to the same address; a request whose first mail a cap "
+        "withheld was recorded without its rotation, and the resend runs "
+        "_require_elevation before that rotation (_resend_email_change)",
 
     # Pre-auth: there is no session to step up FROM. These carry their own
     # protection (rate limits, single-use tokens, WebAuthn challenges).

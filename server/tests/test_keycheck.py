@@ -39,6 +39,8 @@ class _KeyFixture(unittest.TestCase):
             # the instance web-push key is a CP ciphertext too (probed and
             # re-wrapped like TOTP); an earlier suite may have minted one
             admin.execute("DELETE FROM push_vapid")
+            # so are queued Plaid releases, sealed under earlier suites' keys
+            admin.execute("DELETE FROM plaid_release_queue")
         finally:
             admin.close()
 
@@ -219,6 +221,47 @@ class RotateMasterKeyTests(_KeyFixture):
             self.assertEqual(priv, push.vapid_keys(admin)[0])
         finally:
             admin.close()
+
+    def test_a_queued_bank_release_still_runs_after_a_rotation(self):
+        """A Plaid Item waiting in the release queue holds its access token
+        and the household's own Plaid secret directly under the master key.
+        A rotation that skipped them would leave the Item billing at Plaid
+        with nothing able to remove it once the old key is dropped — and
+        keycheck, which says the old key can go, must count them."""
+        import httpx
+        from unittest import mock
+
+        from oikonome.jobs import reaper
+        from oikonome.sync import plaid
+        item = f"pl-rot-{uuid.uuid4().hex[:10]}"
+        client = plaid.Client("byo-rot-cid", "byo-rot-sec",
+                              plaid.ENV_URLS["sandbox"])
+        self.assertTrue(plaid.queue_release(
+            str(uuid.uuid4()), item, "access-sandbox-rot", client,
+            "erasure"))
+        old = os.environ["OIKONOME_MASTER_KEY"]
+        os.environ["OIKONOME_MASTER_KEY"] = Fernet.generate_key().decode()
+        self.assertFalse(cli.keycheck())
+        os.environ["OIKONOME_MASTER_KEY_OLD"] = old
+        try:
+            self.assertTrue(cli.rotate_master_key())
+        finally:
+            os.environ.pop("OIKONOME_MASTER_KEY_OLD")
+        self.assertTrue(cli.keycheck())
+        seen = []
+
+        def handler(request):
+            import json
+            if request.url.path == "/item/remove":
+                body = json.loads(request.content.decode())
+                seen.append((body["access_token"], body["secret"]))
+                return httpx.Response(200, text="{}")
+            return httpx.Response(404, text="{}")
+        with mock.patch.dict(os.environ, {"OIKONOME_PLAID_CLIENT_ID": ""}):
+            out = reaper.retry_queued_releases(
+                transport=httpx.MockTransport(handler))
+        self.assertIn(item, out["released"])
+        self.assertEqual(seen, [("access-sandbox-rot", "byo-rot-sec")])
 
     def test_wrong_old_key_changes_nothing(self):
         self._store_tenant_secret()

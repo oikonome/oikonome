@@ -56,7 +56,14 @@ def set_shadow_scope(conn) -> None:
 
 
 def _rows(conn) -> list[dict]:
-    return conn.execute(
+    # One request resolves link groups many times over (every savings goal
+    # asks which copy of its account counts, once per figure it shows), and
+    # the rows move only with a write to the tables they are read from —
+    # so the checkout remembers them until one is written.
+    hit = getattr(conn, "memo_get", lambda k: None)("link_rows")
+    if hit is not None:
+        return [dict(r) for r in hit]
+    rows = conn.execute(
         """SELECT l.group_id, l.account_id, l.home_rank, l.failover_alerted,
                   i.aggregator, COALESCE(i.status,'ok') AS status,
                   a.updated_at, a.user_removed_at
@@ -64,6 +71,10 @@ def _rows(conn) -> list[dict]:
            JOIN accounts a ON a.id = l.account_id
            LEFT JOIN items i ON i.id = a.item_id
            ORDER BY l.group_id, l.home_rank""").fetchall()
+    if hasattr(conn, "memo_put"):
+        conn.memo_put("link_rows", [dict(r) for r in rows],
+                      "account_links", "accounts", "items")
+    return rows
 
 
 def _healthy(r: dict) -> bool:

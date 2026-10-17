@@ -664,7 +664,14 @@ class RecipientStatusTests(unittest.TestCase):
         tid = self._tenant([(o, "owner", True)])
         delivery.record_failure(bad, bounce_type="HardBounce",
                                 reason="unknown user")
-        rows = self.api._recipient_status(tid, [bad])
+        # a free-form recipient on a single-household box: the record can
+        # only be this household's (the shared test database holds many;
+        # on a multi-household box another household's details are held
+        # back — tests/test_mail_delivery_state_stays_with_its_household.py)
+        from unittest import mock
+        with mock.patch("oikonome.web.pages._tenant_count",
+                        return_value=1):
+            rows = self.api._recipient_status(tid, [bad])
         got = {r["email"]: r for r in rows}
         self.assertEqual(got[bad]["delivery"], "bouncing")
         self.assertIn("unknown user", got[bad]["delivery_reason"])

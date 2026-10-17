@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import { Linking, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput,
          View } from "react-native";
 import PullRefresh from "../components/pull-refresh";
+import { VerifyEmailCard } from "../components/verify-email-card";
 
 import { Card, H, SharedLock } from "../components/ui";
 import { errText, Client, EmailSchedule, Me, SettingsView } from "../lib/api";
@@ -148,6 +149,8 @@ export default function Notifications() {
   if (viewer)
     return (
       <ScrollView style={s.wrap}>
+        <VerifyEmailCard me={me.data}
+          note="Household email reaches you once the address is confirmed." />
         <Text style={s.center}>
           The summary schedule is the owner&apos;s. Whether the email
           reaches your inbox is yours — Settings → Daily email.
@@ -161,6 +164,10 @@ export default function Notifications() {
                                       progressBackgroundColor={C.card}
                                       onRefresh={() => query.refetch()} />}>
       {query.isPending && <Text style={s.center}>Loading…</Text>}
+      {/* hosted mail goes to confirmed addresses only — the way to a
+          fresh link sits with the schedule it holds up, from day one */}
+      <VerifyEmailCard me={me.data}
+        note="Household email reaches you once the address is confirmed." />
       {sched && (
         <Text style={[s.center, { fontSize: 11, paddingBottom: 0 }]}>
           times are {effective ? zoneLabel(effective) : "local time"}

@@ -35,7 +35,7 @@ class BudgetOrderTests(unittest.TestCase):
         term, whose absence made the email's flow land on a number its own
         terms could not produce."""
         hero = self.page[:self.page.index("This month")]
-        for term in ("in", "bills", "to spend", "saved", "excess"):
+        for term in ("in", "bills due", "to spend", "saved", "excess"):
             self.assertIn(f"> {term}</span>", hero.replace('"', ""),
                           f"the flow line is missing {term!r}")
 

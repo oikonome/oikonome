@@ -168,10 +168,16 @@ def vapid_keys(conn) -> tuple[str, str]:
 # receiving the household's verdict lines and alert text after the cookie
 # that made it stopped working. Rows from before subscriptions named their
 # session have none to check and stay live until their browser subscribes
-# again (which binds them). Every read that counts or sends uses this.
+# again (which binds them). A subscription also speaks for the household
+# it was made in only while its person still belongs to it: someone moved
+# to another household must not keep receiving the old one's notices on a
+# browser subscribed before the move (a legacy row has no session whose
+# end would retire it). Every read that counts or sends uses this.
 LIVE = ("dead_at IS NULL AND (session_id IS NULL OR EXISTS ("
         "SELECT 1 FROM sessions ps WHERE ps.id = push_subscriptions.session_id"
-        " AND ps.expires_at > now()))")
+        " AND ps.expires_at > now())) AND EXISTS ("
+        "SELECT 1 FROM users pu WHERE pu.id = push_subscriptions.user_id"
+        " AND pu.tenant_id = push_subscriptions.tenant_id)")
 
 
 @contextlib.contextmanager
