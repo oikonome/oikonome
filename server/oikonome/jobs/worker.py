@@ -1499,6 +1499,17 @@ def nightly_tenant(tenant_id: str) -> dict:
                 stats["reanchor_ambiguous"] = ra["ambiguous"]
         except Exception as e:                       # noqa: BLE001
             log.warning("re-anchor sweep failed tenant=%s: %s", tenant_id, e)
+        # a primary-checking pin left on an account a relink renumbered or
+        # a disconnect removed is re-pinned where the forecast already
+        # anchors, so the Today checklist does not reopen a settled choice
+        try:
+            from ..engine import forecast as _forecast
+            repinned = _forecast.auto_pin_primary_checking(conn)
+            if repinned:
+                stats["primary_checking_pinned"] = repinned
+        except Exception as e:                       # noqa: BLE001
+            log.warning("primary checking re-pin failed tenant=%s: %s",
+                        tenant_id, e)
         from ..engine import amazon_match as _am
         from ..engine import costco_match as _cm
         from ..engine import llm_categorize as _llm
@@ -3196,6 +3207,15 @@ def _sync_item_body(tenant_id: str, item_id: str,
                 plaid.sync_products(conn, item_id)
             except Exception as e:               # noqa: BLE001
                 log.warning("plaid first products failed item=%s: %s",
+                            item_id, e)
+            # the first bank in: with one checking account the cash
+            # forecast's anchor is obvious, so it is pinned here rather
+            # than left as an open step on the Today checklist
+            try:
+                from ..engine import forecast as _forecast
+                _forecast.auto_pin_primary_checking(conn)
+            except Exception as e:               # noqa: BLE001
+                log.warning("primary checking auto-pick failed item=%s: %s",
                             item_id, e)
         from ..sync import base as _sync_base
         with _sync_base.categorize_lock(conn, tenant_id) as _held:

@@ -191,10 +191,15 @@ class ReconnectGapStaysInsideTheWindowTests(unittest.TestCase):
     def tearDown(self):
         self.conn.close()
 
-    def _owe(self, item_like, days):
-        self.conn.execute(
+    def _owe(self, item_like, days) -> str:
+        """Owe the bank `days` of history; returns the date owed, read back
+        from the row so the expectation shares the database's clock (the
+        test host's local date is one day behind CURRENT_DATE every
+        evening west of UTC)."""
+        return self.conn.execute(
             "UPDATE items SET resync_from = CURRENT_DATE - %s::int"
-            " WHERE id LIKE %s", (days, item_like))
+            " WHERE id LIKE %s RETURNING resync_from::text",
+            (days, item_like)).fetchone()["resync_from"]
 
     def test_an_mx_reconnect_does_not_reach_past_the_window(self):
         from .test_mx import PAYLOAD, _capturing_transport, _save_creds
@@ -212,11 +217,10 @@ class ReconnectGapStaysInsideTheWindowTests(unittest.TestCase):
         _save_creds(self.conn)
         mx.sync(self.conn, transport=_capturing_transport(PAYLOAD, []))
         _choose(self.conn, 6)
-        self._owe("mx-%", 60)
+        owed = self._owe("mx-%", 60)
         seen: list = []
         mx.sync(self.conn, transport=_capturing_transport(PAYLOAD, seen))
-        self.assertEqual(seen, [
-            (dt.date.today() - dt.timedelta(days=60)).isoformat()])
+        self.assertEqual(seen, [owed])
 
     def test_a_simplefin_reconnect_does_not_reach_past_the_window(self):
         from .test_simplefin_first_pull_depth import _Bridge

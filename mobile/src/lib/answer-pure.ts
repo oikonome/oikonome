@@ -343,8 +343,9 @@ export function mergeTurns<T extends TurnBase & { id: string }>(
   const noted = (t: T): T & { note?: string } =>
     lent.has(t.id) ? { ...t, note: lent.get(t.id) } : t;
   const seen = new Set(first.map((t) => t.id));
-  const rest = older.filter((t) => !seen.has(t.id));
-  rest.forEach((t) => seen.add(t.id));
+  // a row read twice (two reads of one older page) shows once
+  const rest: T[] = [];
+  for (const t of older) if (!seen.has(t.id)) { seen.add(t.id); rest.push(t); }
   const mine = local.filter((t) => t.id === null || !seen.has(t.id));
   return [...[...mine].reverse(), ...first.map(noted), ...rest.map(noted)];
 }

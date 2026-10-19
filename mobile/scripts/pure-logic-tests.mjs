@@ -23,6 +23,8 @@ import { accountTheme, billToggleNote, categoryForServer, CLEAR_CATEGORY, compos
          money, moneyParam, numv, pyround, resolveFace, span, whatIfQuery,
          withDayHeads, SIGN_IN_AGAIN, twoFactorRecheck }
   from "../src/lib/pure.ts";
+import { LINK_POLL_FAST_MS, LINK_POLL_MS, linkPollWait, pendingLinkLine }
+  from "../src/lib/pure.ts";
 
 import * as pureModule from "../src/lib/pure.ts";
 import { FIRST_SYNC_RUNNING, firstSyncPending, linkedLine }
@@ -34,7 +36,9 @@ import { accountsSummary, adjustOf, billLine, billsSummary, budgetsSummary,
          nextDueForDay, ordinal, parseDueDay, proposalCadenceValue,
          recipientRole, WIZARD_STEPS, wizardThemeChoice, cadenceTakesDueDay,
          latestWins, proposalAdjustable, keptBudget, manualBudgetsBody,
-         manualBudgetsPrefill, manualBudgetsRefusal }
+         manualBudgetsPrefill, manualBudgetsRefusal, billsContinue,
+         checklistOpen, checklistSteps, checklistSummary, connectDoneHint,
+         historyRowNote, windowNarrower }
   from "../src/components/wizard-logic.ts";
 
 import { clockLabel, glanceFace, STALE_AFTER_MS, wideEnoughForChips,
@@ -2374,6 +2378,16 @@ test("numberDraft: blank clears, a typo is refused, never NaN", () => {
 // ---- the bank-link poll survives a lost request ----
 test("linkPollMayRetry: only a definite refusal ends the wait", () => {
   const { linkPollMayRetry } = pureModule;
+  // the poll ticks fast for a while after the app comes back to the
+  // foreground — the bank step just ended — else at the normal tick
+  assert.equal(linkPollWait(1000, 5000), LINK_POLL_FAST_MS);
+  assert.equal(linkPollWait(5000, 5000), LINK_POLL_MS);
+  assert.equal(linkPollWait(9000, 0), LINK_POLL_MS);
+  assert.equal(pendingLinkLine("add", false), "Finish signing in at your bank…");
+  assert.equal(pendingLinkLine("relink", false),
+               "Relinking at your bank for more history…");
+  assert.equal(pendingLinkLine("fix", true),
+               "Finishing the sign-in at your bank… (closing)");
   assert.equal(linkPollMayRetry(new TypeError("Network request failed")), true);
   for (const status of [200, 500, 502, 503, 524, 408, 429])
     assert.equal(linkPollMayRetry({ status }), true, String(status));
@@ -4785,4 +4799,120 @@ test("manual budgets: a save with no food or everything-else is refused", () => 
   assert.ok(src.includes("(kept)"));
   assert.ok(!/food_monthly: numv\(food\)/.test(src),
             "a blank box must never be sent as $0 over a stored budget");
+});
+
+// ---- the Today checklist: data facts, never wizard marks ----
+test("checklist: five steps from the household's data, the web's order", () => {
+  const ob = { accounts: 2, transactions: 78, bills: 0, budgets_set: true,
+               primary_checking_set: false };
+  const steps = checklistSteps(ob);
+  assert.deepEqual(steps.map((s) => s.key),
+                   ["accounts", "history", "bills", "budgets", "checking"]);
+  assert.deepEqual(steps.map((s) => s.done), [true, true, false, true, false]);
+  assert.equal(checklistOpen(ob), true);
+  assert.equal(checklistSummary(ob),
+               "3/5 done — still open: Confirm recurring bills, "
+               + "Pick your primary checking");
+  const all = { ...ob, bills: 4, primary_checking_set: true };
+  assert.equal(checklistOpen(all), false);
+  assert.equal(checklistSummary(all), "5/5 done");
+});
+
+test("checklist: the checking step is done when there is nothing to pin", () => {
+  const base = { accounts: 1, transactions: 5, bills: 2, budgets_set: true,
+                 primary_checking_set: false };
+  const none = { ...base, checking_candidates: [] };
+  assert.equal(checklistSteps(none).find((s) => s.key === "checking").done, true);
+  assert.equal(checklistOpen(none), false);
+  assert.equal(checklistSummary(none), "5/5 done");
+  const some = { ...base, checking_candidates: ["a1", "a2"] };
+  assert.equal(checklistSteps(some).find((s) => s.key === "checking").done, false);
+  assert.equal(checklistOpen(some), true);
+  // an older server omits the field: only a pin closes the step
+  assert.equal(checklistOpen(base), true);
+  assert.equal(checklistOpen({ ...base, primary_checking_set: true }), false);
+});
+
+test("checklist: the bills step leaves skipped while proposals are pending", () => {
+  assert.deepEqual(billsContinue(0), { label: "Continue →", state: "done" });
+  const two = billsContinue(2);
+  assert.equal(two.label, "Leave 2 pending →");
+  assert.equal(two.state, "skipped");
+  assert.match(two.hint, /^2 proposals still await/);
+  assert.match(billsContinue(1).hint, /^1 proposal still/);
+});
+
+test("checklist: the connect step asks for the primary checking only between two", () => {
+  assert.equal(connectDoneHint(0, false), undefined);
+  assert.equal(connectDoneHint(1, false), undefined);
+  assert.equal(connectDoneHint(2, false), "pick your primary checking below");
+  assert.equal(connectDoneHint(2, true), undefined);
+});
+
+// ---- a bank keeps the window it was linked with ----
+test("history window: a bank linked narrower than the household's choice", () => {
+  assert.equal(windowNarrower(1, null), true);     // last month vs everything
+  assert.equal(windowNarrower(3, 12), true);
+  assert.equal(windowNarrower(12, 12), false);
+  assert.equal(windowNarrower(12, 3), false);      // wider is never narrower
+  assert.equal(windowNarrower(null, 1), false);    // everything is the widest
+  assert.equal(windowNarrower(undefined, null), false);  // no window stamped
+  assert.equal(historyRowNote(1), "history: last month");
+  assert.equal(historyRowNote(null), "history: everything available");
+});
+
+// ---- lib/richtext.ts: the little markdown the assistant writes ----
+import { inlineRuns, itemLabel, parseRich, plainText } from "../src/lib/richtext.ts";
+
+test("mergeTurns: a row read twice from older pages shows once", () => {
+  const row = (id, at) => ({ id, question: id, answer: "", blocks: [], tools_used: [],
+                             asked_at: at, asked_by: "", thread_id: id });
+  const first = [row("a", "2026-10-19T10:00:00Z")];
+  const older = [row("b", "2026-10-18T10:00:00Z"), row("b", "2026-10-18T10:00:00Z"),
+                 row("a", "2026-10-19T10:00:00Z")];
+  assert.deepEqual(mergeTurns([], first, older).map((t) => t.id), ["a", "b"]);
+});
+
+test("richtext: **bold** is a bold run and nothing else is markup", () => {
+  assert.deepEqual(inlineRuns("Worth **$12,345.67** now 2 * 3"),
+    [{ bold: false, text: "Worth " }, { bold: true, text: "$12,345.67" },
+     { bold: false, text: " now 2 * 3" }]);
+  assert.deepEqual(inlineRuns("<b>no</b> ACH__REF__1 __x__"),
+    [{ bold: false, text: "<b>no</b> ACH__REF__1 __x__" }]);
+  assert.deepEqual(inlineRuns(""), [{ bold: false, text: "" }]);
+});
+
+test("richtext: bullets, numbered lists, headings and paragraphs come apart", () => {
+  const got = parseRich("Intro line\nsecond line\n\n- **A** one\n* B two\n\n1. first\n2) second\n# Head\ntail");
+  assert.deepEqual(got.map((b) => b.kind), ["p", "list", "list", "p", "p"]);
+  assert.deepEqual(got[0], { kind: "p", runs: [{ bold: false, text: "Intro line" },
+    { bold: false, text: "\n" }, { bold: false, text: "second line" }] });
+  assert.equal(got[1].kind === "list" && got[1].ordered, false);
+  assert.equal(got[1].kind === "list" && got[1].items.length, 2);
+  assert.deepEqual(got[1].kind === "list" && got[1].items[0],
+    { runs: [{ bold: true, text: "A" }, { bold: false, text: " one" }], n: null });
+  assert.equal(got[2].kind === "list" && got[2].ordered, true);
+  assert.deepEqual(got[2].kind === "list" && got[2].items.map((it) => it.n), [1, 2]);
+  assert.deepEqual(got[3], { kind: "p", runs: [{ bold: true, text: "Head" }] });
+  assert.deepEqual(parseRich(""), []);
+  assert.deepEqual(parseRich("\n\n"), []);
+});
+
+test("richtext: a numbered item keeps its own number", () => {
+  // a sub-bullet is not the next rank; a blank line does not restart
+  // at 1; a list going on after a chart still reads 4, 5
+  const got = parseRich("1. Rent\n   - paid\n2. Groceries\n\n3. Dining");
+  assert.deepEqual(got.map((b) => b.kind === "list" ? [b.ordered, b.items.map((it) => it.n)] : b.kind),
+    [[true, [1]], [false, [null]], [true, [2]], [true, [3]]]);
+  const later = parseRich("4. Utilities\n5. Fuel");
+  assert.equal(later[0].kind === "list" && later[0].items.map((it) => itemLabel(it, 0)).join(" "), "4. 5.");
+  assert.equal(itemLabel({ runs: [], n: null }, 2), "3.");
+  // a digit run past nine digits is prose, as on the server
+  assert.equal(parseRich("1234567890. ten")[0].kind, "p");
+  assert.equal(parseRich("123456789. nine")[0].kind, "list");
+});
+
+test("richtext: copy carries the words without the asterisks, numbers kept", () => {
+  assert.equal(plainText("**Cash** is small.\n\n- **A** x\n- B\n\n1. one\n\n2. two"),
+    "Cash is small.\n\n- A x\n- B\n\n1. one\n\n2. two");
 });

@@ -101,36 +101,38 @@ def _checking_start(conn, cfg: dict) -> tuple[float | None, bool, bool]:
     if acct_id and (acct_id in set(links.shadow_ids(conn))
                     or acct_id in set(excluded)):
         acct_id = None
+    # the one rule for a pin the forecast honours (pin_is_live): the
+    # checklist, the wizard and the auto-pin read the same answer
+    if acct_id and not pinned_account_live(conn, cfg, acct_id):
+        acct_id = None
     if acct_id:
         # a pinned account that was since assigned to a business entity
         # is business money — the personal runway must not start from it
         # unless the household combines entities (the auto-pick below
         # applies the same rule)
+        # …and a pin on an account whose bank was since disconnected (a
+        # relink whose adoption did not land, a reaped Item) is a frozen
+        # balance: the auto-pick below takes over until it is re-pinned
         row = conn.execute(
             """SELECT COALESCE(balance_available, balance_current) AS bal,
                       balance_available IS NOT NULL AS has_avail
-               FROM accounts WHERE id = %s
-                 AND (NULLIF((SELECT current_setting('app.combine_entities', true)),'')='true'
-                      OR entity_id IS NULL)""", (acct_id,)).fetchone()
+               FROM accounts WHERE id = %s""", (acct_id,)).fetchone()
         if row and row["bal"] is not None:
             return row["bal"], bool(row["has_avail"]), False
     # Only a row that carries a balance may win the pick: every file
     # import (Mint, QIF, OFX, a competitor export) creates a checking row
     # nobody has set a balance on, and sorting it as $0 would let it beat a
     # real overdrawn account and silence every cash alarm.
+    # the same eligibility the wizard's pick and the auto-pin use (no
+    # excluded, business, shadow, hidden or disconnected-bank account)
+    eligible = eligible_checking_ids(conn, cfg)
     rows = conn.execute(
         """SELECT COALESCE(balance_available, balance_current) AS bal,
                   balance_available IS NOT NULL AS has_avail
-           FROM accounts WHERE type = 'depository' AND subtype = 'checking'
-             AND NOT (id = ANY(%s))   -- the Accounts page's "excl" toggle
-             AND (NULLIF((SELECT current_setting('app.combine_entities', true)),'')='true' OR entity_id IS NULL)  -- don't auto-pick a business account
-             -- never auto-pick a shadow (non-primary linked) source
-             AND (NULLIF((SELECT current_setting('app.shadow_ids', true)), '') IS NULL
-                  OR NOT (id = ANY(string_to_array(
-                          (SELECT current_setting('app.shadow_ids', true)), ','))))
+           FROM accounts WHERE id = ANY(%s)
            ORDER BY COALESCE(balance_available, balance_current) IS NULL,
                     COALESCE(balance_current, 0) DESC LIMIT 1""",
-        (excluded,)).fetchall()
+        (eligible,)).fetchall() if eligible else []
     if not rows:
         return None, False, False
     row = rows[0]
@@ -140,6 +142,123 @@ def _checking_start(conn, cfg: dict) -> tuple[float | None, bool, bool]:
     # balance the household has not set, not a missing account — $0 here
     # lets the surfaces ask for today's balance instead of for an account
     return 0.0, False, True
+
+
+def eligible_checking_ids(conn, cfg: dict) -> list[str]:
+    """The accounts the household could anchor its cash forecast on: a
+    depository checking account that is not excluded, not a business
+    entity's (unless entities are combined) and not a linked group's
+    shadow. The one rule: _checking_start's auto-pick picks among these."""
+    from . import links
+    excluded = set(budget.excluded_account_ids(cfg))
+    shadows = set(links.shadow_ids(conn))
+    # the combined-entities choice read from the settings document, so a
+    # worker's or an import's connection answers the same as a request's
+    combined = bool(cfg.get("combine_entities"))
+    rows = conn.execute(
+        """SELECT a.id FROM accounts a
+           LEFT JOIN items i ON i.id = a.item_id
+           WHERE a.type = 'depository' AND a.subtype = 'checking'
+             AND a.user_removed_at IS NULL
+             -- a disconnected or restored-shell BANK's accounts are history,
+             -- not a place the forecast can anchor; a manual or file-import
+             -- account carries the same status after a restore and is live
+             AND NOT (i.aggregator IN ('plaid','mx','simplefin','simplefin-org')
+                      AND COALESCE(i.status, '') IN ('archived', 'restored'))
+             AND (%s OR a.entity_id IS NULL)
+           ORDER BY COALESCE(a.balance_current, 0) DESC, a.id""",
+        (combined,)).fetchall()
+    return [r["id"] for r in rows
+            if r["id"] not in excluded and r["id"] not in shadows]
+
+
+def pinned_account_live(conn, cfg: dict, acct_id: str) -> bool:
+    """Does the forecast honour a pin on `acct_id`? The pin may sit on any
+    account type (the Accounts editor offers the switch on every row), so
+    the rule is not "eligible checking" but: the row is there and not
+    hidden, its bank is not a disconnected or restored shell, and it is
+    personal money unless the household combines entities. A pin that
+    fails here is kept in the settings but anchors nothing: the checklist
+    reads it as unset and the auto-pin may replace it."""
+    row = conn.execute(
+        """SELECT 1 FROM accounts a LEFT JOIN items i ON i.id = a.item_id
+           WHERE a.id = %s AND a.user_removed_at IS NULL
+             AND NOT (i.aggregator IN ('plaid','mx','simplefin','simplefin-org')
+                      AND COALESCE(i.status, '') IN ('archived', 'restored'))
+             AND (%s OR a.entity_id IS NULL)""",
+        (acct_id, bool(cfg.get("combine_entities")))).fetchone()
+    return row is not None
+
+
+def pin_is_live(conn, cfg: dict) -> bool:
+    """Is the household's pinned primary checking one the forecast honours
+    (pinned_account_live)? The one answer the checklist, the wizard and
+    the auto-pin read."""
+    pin = cfg.get("checking_account_id")
+    return bool(pin) and pinned_account_live(conn, cfg, pin)
+
+
+def pickable_checking_ids(conn, cfg: dict) -> list[str]:
+    """The accounts the household is ASKED to choose between: the eligible
+    checking accounts that carry a balance, largest first. A closed
+    account kept for its history (a Mint or bank-export import, a manual
+    row nobody set a balance on) is eligible — the forecast may still fall
+    through to it — but it is no answer to "which account does the cash
+    forecast anchor on?", so it is not offered next to a live one. When
+    no eligible account carries a balance yet (a files-only household's
+    first import) they are all offered, so one is still pinned by itself
+    and two are still a question."""
+    ids = eligible_checking_ids(conn, cfg)
+    if len(ids) < 2:
+        return ids
+    rows = conn.execute(
+        """SELECT id FROM accounts WHERE id = ANY(%s)
+             AND COALESCE(balance_available, balance_current) IS NOT NULL""",
+        (ids,)).fetchall()
+    with_balance = {r["id"] for r in rows}
+    return [i for i in ids if i in with_balance] or ids
+
+
+def pin_row_gone(conn, acct_id: str) -> bool:
+    """Is the pinned account's row gone for good — deleted, or removed by
+    the household? A row that still exists on an archived, restored or
+    tokenless bank Item is NOT gone: a reconnect adopts it onto the new
+    Item and carries the pin with it (sync/adopt), so the pin must wait
+    there, dead but kept, rather than be moved to another bank."""
+    row = conn.execute(
+        "SELECT user_removed_at IS NOT NULL AS removed FROM accounts WHERE id = %s",
+        (acct_id,)).fetchone()
+    return row is None or bool(row["removed"])
+
+
+def auto_pin_primary_checking(conn) -> str | None:
+    """Pin the household's primary checking when the choice is obvious:
+    no pin yet and exactly one pickable checking account. With two or
+    more the household is asked (the wizard's connect step, the Today
+    checklist); with none there is nothing to pin. A pin the forecast
+    honours is never moved. A pin the forecast no longer honours is
+    replaced by the account the forecast already falls through to (the
+    largest balance) only when its row is gone for good — no row carries
+    the id (a pin carried over from an export whose accounts were
+    re-created, or left by a purge), or the row was removed by the
+    household. A dead pin whose row still exists (its bank
+    disconnected, reaped or restored as a shell) is kept — even when one
+    other account is the only pickable one: the reconnect's adoption
+    carries it to the new Item, and moving it meanwhile would lose the
+    household's choice for good. Returns the id pinned, else None."""
+    with budget.config_txn(conn) as cfg:
+        pin = cfg.get("checking_account_id")
+        if pin and pin_is_live(conn, cfg):
+            return None
+        # a dead pin whose row survives waits for the reconnect — however
+        # many other accounts are pickable, one included
+        if pin and not pin_row_gone(conn, pin):
+            return None
+        ids = pickable_checking_ids(conn, cfg)
+        if not ids or (len(ids) > 1 and not pin):
+            return None
+        cfg["checking_account_id"] = ids[0]
+        return ids[0]
 
 
 def next_paycheck(conn, today: dt.date | None = None, *,

@@ -11,14 +11,35 @@ import Svg, { Circle, Line, Polyline, Rect, Text as SvgText } from "react-native
 
 import { type AnswerBlock, type SeriesSpec, barLayout, cellText, chartRows,
          lineLayout, PALETTE, ringLayout } from "../lib/answer-pure";
+import { itemLabel, parseRich } from "../lib/richtext";
 import { C, money } from "../lib/theme";
+
+/** model prose drawn: **bold** bold, "- " lines a list, the rest
+ *  paragraphs (lib/richtext.ts; the web twin is AssistantBlocks'
+ *  RichText). selectable = long-press copies */
+export function RichText({ text }: { text: string }) {
+  const runs = (rs: { bold: boolean; text: string }[]) => rs.map((r, k) =>
+    r.bold ? <Text key={k} style={s.bold}>{r.text}</Text> : r.text);
+  return (
+    <View style={{ gap: 6 }}>
+      {parseRich(text).map((b, i) => b.kind === "p"
+        ? <Text key={i} style={s.text} selectable>{runs(b.runs)}</Text>
+        : <View key={i} style={{ gap: 2, paddingLeft: 4 }}>
+            {b.items.map((it, j) => (
+              <View key={j} style={{ flexDirection: "row", gap: 6 }}>
+                <Text style={s.text}>{b.ordered ? itemLabel(it, j) : "\u2022"}</Text>
+                <Text style={[s.text, { flex: 1 }]} selectable>{runs(it.runs)}</Text>
+              </View>))}
+          </View>)}
+    </View>
+  );
+}
 
 export function AnswerBlocks({ blocks, width }: { blocks: AnswerBlock[]; width: number }) {
   return (
     <>
       {blocks.map((b, i) => {
-        if (b.kind === "text")
-          return <Text key={i} style={s.text} selectable>{b.text}</Text>;
+        if (b.kind === "text") return <RichText key={i} text={b.text} />;
         if (b.kind === "table")
           return (
             <Figure key={i} title={b.title}>
@@ -184,6 +205,7 @@ function Ring({ labels, values }: { labels: string[]; values: number[] }) {
 
 const s = StyleSheet.create({
   text: { color: C.text, fontSize: 14, lineHeight: 20 },
+  bold: { fontWeight: "700" },
   fig: { marginTop: 8, padding: 8, borderRadius: C.rs, borderWidth: 1,
          borderColor: C.border },
   title: { color: C.text, fontSize: 13, fontWeight: "600" },

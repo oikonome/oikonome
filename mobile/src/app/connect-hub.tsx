@@ -17,7 +17,10 @@ import StaleBanner from "../components/stale-banner";
 import { Card, H, Pill, SharedLock } from "../components/ui";
 import { patchQuery } from "../lib/cache";
 import { ago } from "../lib/dates";
-import { PLAID_LINK_WAIT_MS, plaidHostedLink, type PlaidLinkOutcome,
+import { PendingLinkRows } from "../components/pending-links";
+import { isPendingCancelled, markPendingResumed, PLAID_LINK_WAIT_MS,
+         type PlaidLinkOutcome, resolvePending, setPlaidLinkAside,
+         startPlaidLink,
          useFirstSyncLanding } from "../lib/plaid";
 import { bankAwaitsConfirm, bankLinkHoldNote, FIRST_SYNC_RUNNING,
          institutionAllowance, linkedLine, linkPollMayRetry, showsProviderDoor, type BankLinkHoldView } from "../lib/pure";
@@ -45,12 +48,21 @@ export function usePlaidLinkResume(onDone: (r: PlaidLinkOutcome) => void) {
     if (!client || !owner) return;
     let live = true;
     const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-    const watch = async (token: string) => {
+    const watch = async (token: string, relinkOf?: string | null) => {
+      const kind = relinkOf ? "relink" : "add";
+      // a row another poller owns (a link started here, the other
+      // screen's watcher) is theirs to answer and to remove
+      if (!markPendingResumed(token, kind, relinkOf ?? undefined)) return;
       const deadline = Date.now() + PLAID_LINK_WAIT_MS;
       let wait = 2500;
+      try {
       while (live && Date.now() < deadline) {
         await sleep(wait);
         if (!live) return;
+        if (isPendingCancelled(token)) {
+          void setPlaidLinkAside(client, token);
+          return;
+        }
         try {
           // resume=1: a session picked up here is watched for its answer
           // only, and the server does not keep it counted under the
@@ -61,6 +73,7 @@ export function usePlaidLinkResume(onDone: (r: PlaidLinkOutcome) => void) {
             + "/status?resume=1");
           wait = 2500;
           if (s.done) {
+            resolvePending(token, s, kind);
             if (live) done.current(s);
             return;
           }
@@ -69,10 +82,14 @@ export function usePlaidLinkResume(onDone: (r: PlaidLinkOutcome) => void) {
           wait = Math.min(wait * 2, 30_000);
         }
       }
+      } finally {
+        // the row never outlives its poller; the next visit resumes it
+        resolvePending(token);
+      }
     };
-    client.req<{ sessions?: { link_token: string }[] }>(
+    client.req<{ sessions?: { link_token: string; relink_of?: string | null }[] }>(
       "/accounts/plaid/links/open")
-      .then((r) => { for (const s of r.sessions ?? []) void watch(s.link_token); })
+      .then((r) => { for (const s of r.sessions ?? []) void watch(s.link_token, s.relink_of); })
       .catch(() => { /* nothing to resume */ });
     return () => { live = false; };
   }, [client, owner]);
@@ -253,9 +270,12 @@ function HostedHub({ bankLink, me, cap, used }: {
   // a link the app stopped watching (killed mid-OAuth, screen closed)
   // reports here when the screen comes back
   usePlaidLinkResume(onLinked);
+  // busy only while the bank's browser opens: the session is then a
+  // pending row under the button, and the button is free for the next
   const link = useMutation({
-    mutationFn: () => plaidHostedLink(client!, ""),
-    onSuccess: onLinked,
+    mutationFn: () => startPlaidLink(client!, qc, { kind: "add" },
+                                     (r) => { if (r.kind !== "cancelled") onLinked(r); }),
+    onMutate: () => setMsg(null),
     onError: (e) => setMsg(errText(e)),
   });
   const disc = useMutation({
@@ -327,12 +347,13 @@ function HostedHub({ bankLink, me, cap, used }: {
                   are all accounts; once one is in, the button invites
                   the next */}
               <Text style={s.btnText}>
-                {link.isPending ? "waiting for your bank…"
+                {link.isPending ? "Opening your bank…"
                   : linked.length ? "+ Connect another account ↗"
                                   : "+ Connect an account ↗"}
               </Text>
             </Pressable>
             </SharedLock>
+            <PendingLinkRows />
             <Text style={s.mut}>
               Opens your bank&apos;s sign-in (Plaid). When you finish, the
               connection appears below so you can link another or carry
@@ -488,12 +509,12 @@ function PlaidFlow({ d }: { d?: Record<string, unknown> }) {
       qc.invalidateQueries({ queryKey: ["settings"] }); },
     onError: (e) => setErr(errText(e)),
   });
-  const link = useMutation({
-    mutationFn: () => plaidHostedLink(client!, ""),
-    onSuccess: (r) => {
+  // the answer, whenever it lands (the session is a pending row until)
+  const onLinked2 = (r: PlaidLinkOutcome) => {
+    if (r.kind !== "cancelled") {
       setMsg(
         r.kind === "add" ? linkedLine(r.institution, r.first_sync)
-        : r.kind === "exited" || r.kind === "cancelled"
+        : r.kind === "exited"
           ? "No change — the sign-in window was closed."
           : String(r.error ?? "link failed"));
       // without this the wizard's step-2 wait reads the backfill BEFORE
@@ -510,7 +531,11 @@ function PlaidFlow({ d }: { d?: Record<string, unknown> }) {
         qc.invalidateQueries({ queryKey: ["me"] });
         qc.invalidateQueries({ queryKey: ["accounts"] });
       }
-    },
+    }
+  };
+  const link = useMutation({
+    mutationFn: () => startPlaidLink(client!, qc, { kind: "add" }, onLinked2),
+    onMutate: () => setMsg(null),
     onError: (e) => setMsg(errText(e)),
   });
   const keysReady = !!d?.plaid_secret_set;
@@ -568,7 +593,7 @@ function PlaidFlow({ d }: { d?: Record<string, unknown> }) {
                      disabled={link.isPending || !!held}
                      onPress={() => link.mutate()}>
             <Text style={s.btnText}>
-              {link.isPending ? "waiting for your bank…"
+              {link.isPending ? "Opening your bank…"
                               : "+ Link a bank via Plaid ↗"}
             </Text>
           </Pressable>

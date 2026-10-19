@@ -6,28 +6,33 @@
 // configured.
 //
 // Answered questions are the household's log, kept on the server as
-// CONVERSATIONS: every question opens one, and "follow up" continues it —
-// the model then sees that thread's earlier turns, and only that
-// thread's. The page shows the conversations newest-first under the
-// asker, a question asked on the phone is here too, and anyone who can
+// CONVERSATIONS: every question opens one, and typing into an open
+// conversation continues it — the model then sees that thread's earlier
+// turns, and only that thread's. The page is a chat: a rail of
+// conversations (newest first; one asked on the phone is here too) and
+// the open one as messages with the box to continue it at the bottom.
+// `?c=` names the open conversation (`new` for a fresh one), so a
+// conversation is a link and the back button leaves it. Anyone who can
 // edit may tidy them. Only the question in flight, one that failed, and
 // an answer the log does not carry (a server that predates it, or a turn
 // it could not keep) live in this tab alone.
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
-import { Link } from "react-router";
+import { useEffect, useRef, useState } from "react";
+import { Link, useSearchParams } from "react-router";
 import { api, assistant, errText, type AssistantCursor, type AssistantTurn } from "../api/client";
-import AssistantBlocks, { type AnswerBlock } from "../components/AssistantBlocks";
+import AssistantBlocks, { type AnswerBlock, RichText } from "../components/AssistantBlocks";
+import { plainText } from "../richtext";
 import { canEdit } from "../role";
 
 /** a question in flight (or one that failed); `thread` is the
  *  conversation it continues, null for a new one; `note` says why it
  *  is no longer the follow-up it was asked as */
 interface Pending { key: number; q: string; thread: string | null; err?: string; note?: string }
-/** the conversation the asker continues; null = a new question.
- *  `last_at` is its latest turn when the chip was set, which tells a
- *  removed thread from one that has merely slid past the first page */
+/** the conversation that is open; `last_at` is its latest turn when it
+ *  was opened, which tells a removed thread from one that has merely
+ *  slid past the first page */
 interface FollowUp { id: string; question: string; last_at: string }
+
 
 // ---- answered questions this tab keeps itself (the same rules as the
 // mobile screen's lib/answer-pure.ts). The household's log lives on the
@@ -155,8 +160,9 @@ function mergeTurns(local: LocalTurn[], first: AssistantTurn[],
   const noted = (t: AssistantTurn): Turn =>
     lent.has(t.id) ? { ...t, note: lent.get(t.id) } : t;
   const seen = new Set(first.map((t) => t.id));
-  const rest = older.filter((t) => !seen.has(t.id));
-  rest.forEach((t) => seen.add(t.id));
+  // a row read twice (two reads of one older page) shows once
+  const rest: AssistantTurn[] = [];
+  for (const t of older) if (!seen.has(t.id)) { seen.add(t.id); rest.push(t); }
   const mine = local.filter((t) => t.id === null || !seen.has(t.id));
   return [...[...mine].reverse(), ...first.map(noted), ...rest.map(noted)];
 }
@@ -202,10 +208,10 @@ function historyNotKept(e: unknown): boolean {
 
 // ---- a conversation that went away (mobile: conversationGone /
 // followUpGone in lib/answer-pure.ts). Another member, or this person on
-// another device, can remove the conversation the asker is following up
-// on. The server then answers the follow-up with a 404; the question is
-// asked again as a new conversation, once, and the chip naming the dead
-// thread is cleared — resending its id could only fail the same way.
+// another device, can remove the conversation that is open here. The
+// server then answers the next question in it with a 404; the question
+// is asked again as a new conversation, once, and the dead thread is
+// closed — resending its id could only fail the same way.
 
 const RESTARTED_NOTE =
   "the earlier conversation was removed, so this was asked as a new question";
@@ -217,10 +223,10 @@ const REMOVED_NOTE =
 /** the ask call's 404: the conversation named no longer exists */
 const conversationGone = (e: unknown) => historyNotKept(e);
 
-/** after a log read, is the followed conversation gone? Only when the
+/** after a log read, is the open conversation gone? Only when the
  *  read still covers the time of its latest turn (the page reaches back
  *  that far, or there is no more) and no loaded turn belongs to it; a
- *  thread that slid past the first page keeps its chip — the ask's 404
+ *  thread that slid past the first page stays open — the ask's 404
  *  covers that case if it was removed too */
 function followUpGone(f: FollowUp, turns: Turn[],
                       page: { turns: { asked_at: string }[]; more: boolean }): boolean {
@@ -295,8 +301,15 @@ const when = (iso: string) => {
   return `${mm}/${dd}/${yy} ${((h + 11) % 12) + 1}:${m} ${h < 12 ? "am" : "pm"}`;
 };
 
+/** `?c=`: nothing = the list (on a phone) or a fresh conversation (on a
+ *  wide screen, beside the list); `new` = a fresh conversation; else the
+ *  key of the open one */
+const NEW = "new";
+
 export default function Assistant() {
   const qc = useQueryClient();
+  const [sp, setSp] = useSearchParams();
+  const openKey = sp.get("c");
   const status = useQuery({ queryKey: ["assistant-status"], queryFn: assistant.status });
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   // `denied` is the server refusing the shared login all the same
@@ -306,14 +319,40 @@ export default function Assistant() {
                              queryFn: () => assistant.history(),
                              enabled: !!status.data?.available });
   const [q, setQ] = useState("");
-  const [followUp, setFollowUp] = useState<FollowUp | null>(null);
   const [pending, setPending] = useState<Pending[]>([]);
   const [older, setOlder] = useState<AssistantTurn[]>([]);
   const [mine, setMine] = useState<LocalTurn[]>([]);
   const [notes, setNotes] = useState<TurnNotes>({});
   const [lastOlder, setLastOlder] = useState<HistoryPage | null>(null);
   const [noMore, setNoMore] = useState(false);
+  // a page read that failed: the automatic paging back (below) stops,
+  // and "older conversations" is the retry; cleared when the open
+  // conversation changes
+  const [pageFailed, setPageFailed] = useState(false);
+  const paging = useRef(false);
   const [err, setErr] = useState<string | null>(null);
+  const msgsRef = useRef<HTMLDivElement>(null);
+  const boxRef = useRef<HTMLTextAreaElement>(null);
+  // the open conversation's latest turn as last seen, by key: a thread
+  // that slid past the first page (other members asking) is told from a
+  // removed one by whether the page still reaches back to it
+  const openLast = useRef<{ key: string; last_at: string } | null>(null);
+  // what is open right now, for the ask's landing: an answer must never
+  // switch the view away from a conversation the person moved to
+  const openKeyRef = useRef<string | null>(null);
+  openKeyRef.current = openKey;
+  // the conversations on screen, for the same check: a key no loaded
+  // conversation answers to (a cold link to one on an older page) is
+  // not a view a landing answer must respect
+  const threadsRef = useRef<Set<string>>(new Set());
+
+  const show = (key: string | null) => {
+    setSp((prev) => {
+      const next = new URLSearchParams(prev);
+      if (key === null) next.delete("c"); else next.set("c", key);
+      return next;
+    });
+  };
 
   // a 404 is a server older than the shared log: this tab's own turns
   // are all there is, and that is not an error
@@ -327,19 +366,35 @@ export default function Assistant() {
     setNotes((n) => keepNotes(n, mine, page.turns));
     setMine((m) => pruneLocal(m, page.turns, page.more));
   }, [page, mine]);
-  // a conversation removed elsewhere drops out of the log: the chip that
-  // names it goes too, so the next question is not sent to a dead thread
+
+  const turns = mergeTurns(mine, history.data?.turns ?? [], older, notes);
+  const threads = groupThreads(turns);
+  const open = openKey && openKey !== NEW ? threads.find((th) => th.key === openKey) ?? null : null;
+  if (open) openLast.current = { key: open.key, last_at: open.last_at };
+  threadsRef.current = new Set(threads.map((th) => th.key));
+  // a conversation removed elsewhere drops out of the log: the one open
+  // here closes too, so the next question is not sent to a dead thread.
+  // One that merely slid past the first page stays open (its latest turn
+  // is older than the page reaches); a cold link to one never seen
+  // closes only when there is no older page it could be on — the ask's
+  // 404 covers a removed thread either way
+  const olderToLoad = !noMore && nextCursor(lastOlder ?? history.data) !== null;
   useEffect(() => {
-    if (!page) return;
-    setFollowUp((f) => f && followUpGone(f, mergeTurns(mine, page.turns, older, notes), page)
-      ? null : f);
-  }, [page, mine, older, notes]);
+    if (!page || !openKey || openKey === NEW || open) return;
+    const seen = openLast.current?.key === openKey ? openLast.current.last_at : null;
+    // every older page read and still no such conversation: it is gone
+    const gone = !olderToLoad || (seen !== null
+      && followUpGone({ id: openKey, question: "", last_at: seen }, turns, page));
+    if (gone) show(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page, openKey, open, olderToLoad]);
+  useEffect(() => { setPageFailed(false); }, [openKey]);
   // a conversation the server no longer has: its rows leave the page and
-  // the chip naming it is cleared
+  // it closes if it was the open one
   const dropThread = (threadId: string) => {
     setOlder((o) => o.filter((t) => (t.thread_id ?? t.id) !== threadId));
     setMine((m) => m.filter((t) => t.thread_id !== threadId));
-    setFollowUp((f) => f?.id === threadId ? null : f);
+    if (openKey === threadId) show(null);
   };
 
   const ask = useMutation({
@@ -367,26 +422,36 @@ export default function Assistant() {
     // so it is still there once the answer lands
     onSuccess: ({ reply, thread, note }, { key, q: question }) => {
       setPending((p) => p.filter((t) => t.key !== key));
-      setMine((m) => [...m, localTurn(`local-${key}`, question, reply, new Date(),
-                                      thread, note)]);
+      const turn = localTurn(`local-${key}`, question, reply, new Date(), thread, note);
+      setMine((m) => [...m, turn]);
       // the thread went away while the answer was being written
       if (reply.removed && thread) dropThread(thread);
+      // a fresh conversation becomes the open one as soon as it exists —
+      // unless the person has since moved to another conversation, whose
+      // draft must not be sent to the new one
+      if (!thread && (openKeyRef.current === null || openKeyRef.current === NEW
+                      || !threadsRef.current.has(openKeyRef.current))) show(threadKey(turn));
       void qc.invalidateQueries({ queryKey: ["assistant-history"] });
     },
     onError: (e, { key }) => setPending((p) =>
       p.map((t) => t.key === key ? { ...t, err: errText(e) } : t)),
   });
-  // the asker continues the conversation named in the chip, or opens a
-  // new one when there is none; the chips always open a new one
-  const submit = (question: string, thread: string | null = followUp?.id ?? null) => {
+  // the box continues the open conversation, or opens a new one when
+  // none is (or the open one was never kept); the chips always open one
+  const submit = (question: string, thread: string | null = open?.id ?? null) => {
     const v = question.trim();
     if (v && !ask.isPending) ask.mutate({ key: Date.now(), q: v, thread });
   };
 
   const report = useMutation({
-    mutationFn: (t: Turn) =>
-      assistant.report(t.question, t.blocks.length ? t.blocks
-        : [{ kind: "text", text: t.answer }] as AnswerBlock[]),
+    // an answer the log kept empty still has a line in the page, so a
+    // turn never vanishes from the file without a trace
+    mutationFn: (th: Thread) =>
+      assistant.report(th.turns.map((t) => ({
+        question: t.question,
+        blocks: t.blocks.length ? t.blocks
+          : [{ kind: "text", text: t.answer || "(no answer was kept)" }] as AnswerBlock[],
+      })), th.partial),
     onMutate: () => setErr(null),
     onError: (e) => setErr(errText(e)),
   });
@@ -426,7 +491,7 @@ export default function Assistant() {
     mutationFn: () => assistant.clear(),
     onMutate: () => setErr(null),
     onSuccess: () => { setOlder([]); setMine([]); setNotes({}); setLastOlder(null); setNoMore(true);
-                       setFollowUp(null);
+                       show(null);
                        void qc.invalidateQueries({ queryKey: ["assistant-history"] }); },
     onError: (e) => sharedLogDenied(e) ? setDenied(errText(e)) : setErr(errText(e)),
   });
@@ -434,8 +499,33 @@ export default function Assistant() {
     mutationFn: (cursor: AssistantCursor) => assistant.history(cursor),
     onSuccess: (r) => { setOlder((o) => [...o, ...r.turns]); setLastOlder(r);
                         if (!r.more) setNoMore(true); },
-    onError: (e) => setErr(errText(e)),
+    onError: (e) => { setPageFailed(true); setErr(errText(e)); },
+    onSettled: () => { paging.current = false; },
   });
+
+  // a cold link to a conversation that is not on the first page: page
+  // back until it is found or there is no older page (then the close
+  // effect above lets it go)
+  const unresolved = !!openKey && openKey !== NEW && !open && !!page;
+  const pageCursor = noMore ? null : nextCursor(lastOlder ?? history.data);
+  // keyed by the cursor's VALUE, with one request in flight at a time: a
+  // server that hands no `next` makes a fresh cursor object every render
+  const pageKey = pageCursor ? `${pageCursor.before}|${pageCursor.before_id ?? ""}` : null;
+  useEffect(() => {
+    if (!unresolved || !pageCursor || pageFailed || paging.current) return;
+    paging.current = true;
+    more.mutate(pageCursor);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [unresolved, pageKey, pageFailed]);
+
+  // the newest message is the one to read: the open conversation scrolls
+  // to its end when a turn lands or a question goes out
+  const openTurnCount = open?.turns.length ?? 0;
+  const pendingCount = pending.length;
+  useEffect(() => {
+    const el = msgsRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [openKey, openTurnCount, pendingCount]);
 
   if (status.isPending) return <p className="mut" style={{ marginTop: "2rem" }}>loading…</p>;
   if (!status.data?.available) {
@@ -452,196 +542,203 @@ export default function Assistant() {
     );
   }
 
-  const turns = mergeTurns(mine, history.data?.turns ?? [], older, notes);
-  const threads = groupThreads(turns);
   const rowKey = (t: Turn) => "local" in t ? t.key : t.id;
   // a conversation the server never kept has nothing to delete there
   const remove = (th: Thread) => {
     if (th.id === null) setMine((m) => m.filter((x) => !th.turns.includes(x)));
     else forget.mutate(th.id);
   };
-  // a question in flight draws inside its conversation; a new one on top
-  const pendingFor = (th: Thread) => pending.filter((p) => p.thread === th.id);
+  // a question in flight draws inside its conversation; a new one in the
+  // fresh pane
+  const pendingFor = (th: Thread) => pending.filter((p) => p.thread === th.id && th.id !== null);
   const pendingNew = pending.filter((p) => p.thread === null
     || !threads.some((th) => th.id === p.thread));
-  const pendingCards = (rows: Pending[]) => [...rows].reverse().map((t) => (
-    <div className="card" key={t.key}>
-      <div style={{ fontWeight: 600 }}>{t.q}</div>
-      {t.note && <div className="sub" style={{ marginTop: ".3rem", fontSize: 12 }}>{t.note}</div>}
-      {t.err
-        ? <div className="note bad" style={{ marginTop: ".4rem" }}>{t.err}</div>
-        : <div className="mut" style={{ marginTop: ".4rem" }}>…</div>}
-      {t.err && (
-        <div style={{ marginTop: ".5rem", display: "flex", gap: ".5rem" }}>
-          <button style={{ fontSize: 12 }} onClick={() => submit(t.q, t.thread)}>try again</button>
-          <button style={{ fontSize: 12 }}
-                  onClick={() => setPending((p) => p.filter((x) => x.key !== t.key))}>
-            dismiss</button>
-        </div>
-      )}
+  const pendingRows = (rows: Pending[]) => rows.map((t) => (
+    <div key={t.key} className="chat-turn">
+      <div className="chat-msg me"><div className="b">{t.q}</div></div>
+      <div className="chat-msg ai"><div className="b">
+        {t.note && <div className="sub" style={{ fontSize: 12, marginBottom: ".3rem" }}>{t.note}</div>}
+        {t.err
+          ? <>
+              <div className="note bad">{t.err}</div>
+              <div style={{ marginTop: ".5rem", display: "flex", gap: ".5rem" }}>
+                <button style={{ fontSize: 12 }} onClick={() => submit(t.q, t.thread)}>try again</button>
+                <button style={{ fontSize: 12 }}
+                        onClick={() => setPending((p) => p.filter((x) => x.key !== t.key))}>
+                  dismiss</button>
+              </div>
+            </>
+          : <span className="chat-typing" aria-label="thinking"><i /><i /><i /></span>}
+      </div></div>
     </div>
   ));
   // paging walks the log by (asked_at, id), from the cursor the last page
   // read handed back; a page with no more ends it
   const cursor = noMore ? null : nextCursor(lastOlder ?? history.data);
+  const title = (th: Thread) => th.turns[0]?.question ?? "";
+  const whereLine = status.data.local
+    ? "answered by the model on this server — read-only tools, nothing leaves the box"
+    : `read-only tools — your questions and the figures they return go to ${
+        status.data.host || "the model host this instance is configured with"}`;
+  const onKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(q); }
+  };
+  const composer = (placeholder: string) => (
+    <div className="chat-compose">
+      <div className="box">
+        <textarea ref={boxRef} rows={1} value={q} placeholder={placeholder}
+                  onChange={(e) => { setQ(e.target.value);
+                                     e.target.style.height = "auto";
+                                     e.target.style.height = `${Math.min(e.target.scrollHeight, 160)}px`; }}
+                  onKeyDown={onKey} />
+        <button className="pri" disabled={ask.isPending || !q.trim()} onClick={() => submit(q)}>
+          {ask.isPending ? "thinking…" : "Send"}</button>
+      </div>
+      <div className="hint"><span>Enter to send · Shift+Enter for a new line</span><span>{whereLine}</span></div>
+    </div>
+  );
+  const mode = openKey === NEW ? "new" : open ? "open" : "list";
 
   return (
     <>
       <h1>Assistant</h1>
-      {/* the asker sticks: turns render newest-first BELOW it, and the
-          input must stay in view on the one page whose entire purpose is
-          asking another. */}
-      <div className="card asker">
-        {/* the chip names the conversation the asker continues; without
-            it the question opens a new one */}
-        {followUp && (
-          <div className="sub" style={{ marginBottom: ".4rem", display: "flex", gap: ".5rem",
-                                        alignItems: "center", flexWrap: "wrap" }}>
-            <span>following up on “{followUp.question}”</span>
-            <button style={{ fontSize: 12 }} onClick={() => setFollowUp(null)}>new question</button>
+      {err && <div className="note bad" style={{ marginBottom: ".6rem" }}>{err}</div>}
+      <div className={`chat chat-${mode}`}>
+        <aside className="chat-rail">
+          <div className="head">
+            <button className="pri" style={{ flex: 1 }} onClick={() => { show(NEW); boxRef.current?.focus(); }}>
+              + New conversation</button>
           </div>
-        )}
-        <div style={{ display: "flex", gap: ".5rem", flexWrap: "wrap" }}>
-          <input value={q} onChange={(e) => setQ(e.target.value)}
-                 onKeyDown={(e) => e.key === "Enter" && submit(q)}
-                 placeholder={followUp ? "ask a follow-up…"
-                   : "e.g. how much did I spend on groceries this year?"}
-                 style={{ flex: 1, minWidth: "18rem" }} />
-          <button className="pri" disabled={ask.isPending || !q.trim()} onClick={() => submit(q)}>
-            {ask.isPending ? "thinking…" : "Ask"}
-          </button>
-        </div>
-        {/* the chips stay after the first question — exactly when
-            someone has learned what this can answer and wants another */}
-        <div style={{ marginTop: ".55rem", display: "flex", gap: ".4rem",
-                      flexWrap: "wrap" }}>
-          {EXAMPLES.map((ex) => (
-            <button key={ex} onClick={() => submit(ex, null)}
-                    disabled={ask.isPending}
-                    style={{ fontSize: 12.5, borderRadius: 999,
-                             padding: ".25rem .75rem" }}>{ex}</button>
-          ))}
-        </div>
-        <div className="sub" style={{ marginTop: ".5rem", display: "flex",
-              gap: ".5rem", alignItems: "center", flexWrap: "wrap" }}>
-          {status.data.local ? (<>
-            <span className="pill g">local</span>
-            <span>answered by the model on this server — read-only tools only,
-              and nothing leaves the box.</span>
-          </>) : (
-            <span>read-only tools only — your questions and the figures they
-              return go to {status.data.host
-                || "the model host this instance is configured with"}.</span>
-          )}
-        </div>
-      </div>
-
-      {err && <div className="note bad" style={{ marginTop: ".6rem" }}>{err}</div>}
-
-      {pendingCards(pendingNew)}
-
-      {threads.length > 0 && (
-        <div className="sub" style={{ margin: ".8rem 0 .2rem", display: "flex",
-                                      justifyContent: "space-between", alignItems: "center" }}>
-          <span>{noLog
-            ? "This session's conversations — this server keeps no shared history"
-            : "Conversations — every one is kept for the household"}</span>
-          {mayEdit && !noLog && (
-            <button style={{ fontSize: 12 }} disabled={clear.isPending}
-                    onClick={() => { if (window.confirm("Clear every conversation?")) clear.mutate(); }}>
-              clear all</button>
-          )}
-        </div>
-      )}
-      {denied && <p className="mut" style={{ fontSize: 12, margin: ".2rem 0" }}>{denied}</p>}
-      {threads.map((th) => (
-        <div className="card" key={th.key}
-             style={followUp?.id === th.id && th.id !== null
-               ? { borderColor: "var(--accent)" } : undefined}>
-          {/* the log pages by turn, so a conversation can straddle a page:
-              its first loaded question is then not its first — and when
-              no older page is left, its start is gone */}
-          {partialNote(th.partial, cursor !== null) && (
-            <div className="sub" style={{ fontSize: 12, marginBottom: ".4rem" }}>
-              {partialNote(th.partial, cursor !== null)}</div>
-          )}
-          {th.turns.map((t, i) => (
-            <div key={rowKey(t)}
-                 style={i ? { marginTop: ".7rem", paddingTop: ".6rem",
-                              borderTop: "1px dashed var(--line)" } : undefined}>
-              <div style={{ display: "flex", justifyContent: "space-between", gap: ".5rem",
-                            flexWrap: "wrap", alignItems: "baseline" }}>
-                <div style={{ fontWeight: 600 }}>{t.question}</div>
-                <div className="sub" style={{ fontSize: 12 }}>
-                  {when(t.asked_at)}{t.asked_by ? ` · ${t.asked_by}` : ""}
-                </div>
+          <div className="list">
+            {threads.map((th) => (
+              <div key={th.key} className={`row${th.key === openKey ? " on" : ""}`}
+                   role="button" tabIndex={0}
+                   onClick={() => show(th.key)}
+                   onKeyDown={(e) => e.key === "Enter" && show(th.key)}>
+                <div className="q">{th.partial ? "… " : ""}{title(th)}</div>
+                <div className="m">{when(th.last_at)} · {th.turns.length}{" "}
+                  {th.turns.length === 1 ? "question" : "questions"}
+                  {th.turns[0]?.asked_by ? ` · ${th.turns[0].asked_by}` : ""}</div>
               </div>
-              {/* why this answer is not the follow-up it was asked as */}
-              {t.note && <div className="sub" style={{ marginTop: ".3rem", fontSize: 12 }}>{t.note}</div>}
-              {/* answers carry typed blocks — prose, charts, tables — drawn
-                  in order; a turn kept by an older server has the prose alone */}
-              {t.blocks.length
-                ? <AssistantBlocks blocks={t.blocks} />
-                : <div style={{ marginTop: ".4rem", whiteSpace: "pre-wrap" }}>{t.answer}</div>}
-              {/* which read-only tools fed the answer, as on mobile;
-                  provenance beats a bare paragraph */}
-              {t.tools_used.length > 0 && (
-                <div className="sub" style={{ marginTop: ".3rem", fontSize: 12 }}>
-                  from {t.tools_used.join(" · ")}
-                </div>
+            ))}
+            {history.isPending && <p className="mut" style={{ padding: ".6rem .75rem" }}>loading history…</p>}
+            {history.isError && !noLog && (
+              <div className="note bad" style={{ margin: ".5rem" }}>
+                Couldn&apos;t load the history: {errText(history.error)}{" "}
+                <button style={{ fontSize: 12 }} onClick={() => void history.refetch()}>
+                  try again</button>
+              </div>
+            )}
+            {!history.isPending && (!history.isError || noLog) && threads.length === 0 && (
+              <p className="mut" style={{ padding: ".6rem .75rem", fontSize: 13 }}>
+                {noLog ? "Nothing asked yet."
+                  : "Nothing asked yet. Every conversation is kept here for the household."}
+              </p>
+            )}
+            {cursor && (
+              <button style={{ fontSize: 12.5, margin: ".5rem .75rem" }} disabled={more.isPending}
+                      onClick={() => more.mutate(cursor)}>
+                {more.isPending ? "loading…" : "older conversations"}</button>
+            )}
+          </div>
+          <div className="foot">
+            <span>{noLog ? "this session only" : "kept for the household"}</span>
+            {mayEdit && !noLog && threads.length > 0 && (
+              <button style={{ fontSize: 12 }} disabled={clear.isPending}
+                      onClick={() => { if (window.confirm("Clear every conversation?")) clear.mutate(); }}>
+                clear all</button>
+            )}
+          </div>
+          {denied && <p className="mut" style={{ fontSize: 12, margin: ".2rem .75rem .5rem" }}>{denied}</p>}
+        </aside>
+
+        {open ? (
+          <section className="chat-pane">
+            <div className="head">
+              <button className="back" style={{ fontSize: 12 }} onClick={() => show(null)}>‹ Conversations</button>
+              <div className="t" title={title(open)}>{title(open)}</div>
+              {status.data.local && <span className="pill g">local</span>}
+              {/* the whole conversation — every answer, charts included,
+                  every figure also as a table — as one self-contained
+                  HTML file to keep or send */}
+              <button style={{ fontSize: 12 }} disabled={report.isPending}
+                      onClick={() => report.mutate(open)}>
+                {report.isPending ? "saving…" : "save as report"}</button>
+              {mayEdit && (
+                <button style={{ fontSize: 12 }} disabled={forget.isPending}
+                        onClick={() => remove(open)}>remove</button>
               )}
-              <div style={{ marginTop: ".4rem", display: "flex", gap: ".5rem", flexWrap: "wrap" }}>
-                <button style={{ fontSize: 12 }}
-                        onClick={() => void navigator.clipboard?.writeText(t.answer)}>
-                  copy</button>
-                {/* the whole answer — charts included, every figure also as
-                    a table — as one self-contained HTML file to keep or send */}
-                <button style={{ fontSize: 12 }} disabled={report.isPending}
-                        onClick={() => report.mutate(t)}>
-                  {report.isPending ? "saving…" : "save as report"}</button>
-              </div>
             </div>
-          ))}
-          {pendingCards(pendingFor(th))}
-          <div style={{ marginTop: ".5rem", paddingTop: ".4rem",
-                        borderTop: "1px dashed var(--line)", display: "flex",
-                        gap: ".5rem", flexWrap: "wrap" }}>
-            {/* a conversation the server kept can be continued; the model
-                is then handed this thread and no other */}
-            {th.id !== null && (
-              <button style={{ fontSize: 12 }}
-                      onClick={() => { setFollowUp({ id: th.id!, question: th.turns[0].question,
-                                                     last_at: th.last_at });
-                                       window.scrollTo({ top: 0, behavior: "smooth" }); }}>
-                {followUp?.id === th.id ? "following up…" : "follow up"}</button>
-            )}
-            {mayEdit && (
-              <button style={{ fontSize: 12, marginLeft: "auto" }} disabled={forget.isPending}
-                      onClick={() => remove(th)}>remove</button>
-            )}
-          </div>
-        </div>
-      ))}
-      {history.isPending && <p className="mut">loading history…</p>}
-      {history.isError && !noLog && (
-        <div className="note bad" style={{ marginTop: ".6rem" }}>
-          Couldn&apos;t load the history: {errText(history.error)}{" "}
-          <button style={{ fontSize: 12 }} onClick={() => void history.refetch()}>
-            try again</button>
-        </div>
-      )}
-      {!history.isPending && (!history.isError || noLog) && threads.length === 0
-        && pending.length === 0 && (
-        <p className="mut" style={{ marginTop: ".8rem" }}>
-          {noLog ? "Nothing asked yet."
-            : "Nothing asked yet. Every conversation is kept here for the household."}
-        </p>
-      )}
-      {cursor && (
-        <button style={{ fontSize: 12.5, marginTop: ".4rem" }} disabled={more.isPending}
-                onClick={() => more.mutate(cursor)}>
-          {more.isPending ? "loading…" : "older conversations"}</button>
-      )}
+            <div className="chat-msgs" ref={msgsRef}>
+              {/* the log pages by turn, so a conversation can straddle a page:
+                  its first loaded question is then not its first — and when
+                  no older page is left, its start is gone */}
+              {partialNote(open.partial, cursor !== null) && (
+                <div className="sub" style={{ fontSize: 12, textAlign: "center" }}>
+                  {partialNote(open.partial, cursor !== null)}</div>
+              )}
+              {open.turns.map((t) => (
+                <div key={rowKey(t)} className="chat-turn">
+                  <div className="chat-msg me">
+                    <div className="b">{t.question}</div>
+                    <div className="meta">{when(t.asked_at)}{t.asked_by ? ` · ${t.asked_by}` : ""}</div>
+                  </div>
+                  <div className="chat-msg ai">
+                    <div className="b">
+                      {/* why this answer is not the follow-up it was asked as */}
+                      {t.note && <div className="sub" style={{ fontSize: 12, marginBottom: ".3rem" }}>{t.note}</div>}
+                      {/* answers carry typed blocks — prose, charts, tables — drawn
+                          in order; a turn kept by an older server has the prose alone */}
+                      {t.blocks.length
+                        ? <AssistantBlocks blocks={t.blocks} />
+                        : <RichText text={t.answer} />}
+                      <div className="acts">
+                        <button style={{ fontSize: 12 }}
+                                onClick={() => void navigator.clipboard?.writeText(plainText(t.answer))}>
+                          copy</button>
+                        {/* which read-only tools fed the answer, as on mobile;
+                            provenance beats a bare paragraph */}
+                        {t.tools_used.length > 0 && (
+                          <span className="from">from {t.tools_used.join(" · ")}</span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+              {pendingRows(pendingFor(open))}
+            </div>
+            {/* the box continues THIS conversation; one the server never
+                kept cannot be continued, and its box opens a new one */}
+            {composer(open.id !== null ? "Continue the conversation…" : "Ask a new question…")}
+          </section>
+        ) : (
+          <section className="chat-pane">
+            <div className="head">
+              <button className="back" style={{ fontSize: 12 }} onClick={() => show(null)}>‹ Conversations</button>
+              <div className="t">New conversation</div>
+              {status.data.local && <span className="pill g">local</span>}
+            </div>
+            <div className="chat-msgs" ref={msgsRef}>
+              {unresolved && cursor && !pageFailed ? (
+                <div className="chat-empty"><div className="mut">loading the conversation…</div></div>
+              ) : pendingNew.length === 0 ? (
+                <div className="chat-empty">
+                  <h2>Ask about your money</h2>
+                  <div className="mut">Plain questions, answered from your own ledger.
+                    {!noLog && " Every conversation is kept for the household."}</div>
+                  <div className="chips">
+                    {EXAMPLES.map((ex) => (
+                      <button key={ex} onClick={() => submit(ex, null)} disabled={ask.isPending}>{ex}</button>
+                    ))}
+                  </div>
+                </div>
+              ) : pendingRows(pendingNew)}
+            </div>
+            {composer("Ask anything…")}
+          </section>
+        )}
+      </div>
     </>
   );
 }

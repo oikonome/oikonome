@@ -79,49 +79,56 @@ Configure a backend (or run the bundled model) and it appears.
 
 ## Asking
 
-Type a question and press **Enter** or **Ask**. Example questions sit
-under the box as one-click chips and stay there after every question,
-so a second one is one click away. Every question opens a
-**conversation**; conversations stack newest-first below the input.
-Under each answer a small **from net_worth · spending_summary** line
-names the summaries that fed it, **copy** puts the text on the
-clipboard and **save as report** keeps the whole answer as a file. A
-question that fails stays on screen with **try again** until you
-dismiss it.
-
-**follow up** under a conversation continues it: the box then says which
-conversation it is continuing, and the model is handed that
-conversation's earlier questions and answers — and nothing from any
-other — so "and last year?" means what you meant. **new question** beside
-the box, or any example chip, starts a fresh conversation. A follow-up
-sees the newest eight turns of its thread, each answer trimmed to a
+The page is a chat. On the left (on a phone: the first screen) is the
+list of **conversations**, newest first; **+ New conversation** opens a
+fresh one, with example questions as one-tap chips. Type a question
+into the box at the bottom and press **Enter** or **Send**
+(Shift+Enter for a new line). Your question appears as a message, the
+answer under it, and the box now reads **Continue the conversation…**:
+anything you type next continues that same conversation, and the model
+is handed its earlier questions and answers — and nothing from any
+other — so "and last year?" means what you meant. A follow-up sees the
+newest eight turns of its conversation, each answer trimmed to a
 readable length; charts are not re-read, the prose is.
 
-If someone removes a conversation while you are following up on it, your
+Under each answer a small **from net_worth · spending_summary** line
+names the summaries that fed it, and **copy** puts the text on the
+clipboard (without the bold markers). The conversation's header has
+**save as report** and **remove**. A question that fails stays in the
+conversation with **try again** until you dismiss it. Each conversation
+is a link (`?c=` in the address bar), so the browser's back button
+leaves it; on the phone the device's back button does.
+
+If someone removes a conversation while you are continuing it, your
 question is asked again as a new one, and its answer carries a note:
 "the earlier conversation was removed, so this was asked as a new
-question". If the conversation is removed while your follow-up is being
+question". If the conversation is removed while your question is being
 answered, the answer is still shown, on that screen only, with the note
 "the conversation was removed while this was answered, so this answer was
 not kept". An answer the app could not keep in the history (it was
 answered, but saving it failed) is still shown, on that screen only, and
-has no **follow up** of its own; a follow-up that could not be kept stays
-in its conversation, which you can go on following up.
+cannot be continued — its box opens a new conversation; a follow-up that
+could not be kept stays in its conversation, which you can go on
+continuing.
+
+Answers are written in plain prose; the model may bold a key figure or
+use a short bullet list, and the page draws those as bold and bullets
+(so does the mobile app and the saved report).
 
 ## History
 
 Every conversation is kept on your instance, with its answers, their
-charts and the time each was asked, and shown newest-first under the
-question box, each one's questions in the order they were asked — on the web and in the mobile app alike, so a chart drawn
-on the phone is on the web too. The log is the **household's**: everyone
+charts and the time each was asked, and listed newest-first, each one's
+questions in the order they were asked — on the web and in the mobile
+app alike, so a chart drawn on the phone is on the web too. The log is the **household's**: everyone
 who can sign in reads the same one, each entry naming who asked. When a
 member is removed, their questions stay but lose their name. The shared
 demonstration login sees its own questions under its address and
 everyone else's as "a household member". A question that failed (a
 model timeout, a busy instance) is not kept.
 
-**remove** under a conversation drops it — every turn of it; **clear
-all** drops every conversation. Both are edits, so a view-only login
+**remove** in an open conversation's header drops it — every turn of
+it; **clear all** under the list drops every conversation. Both are edits, so a view-only login
 reads the log but cannot tidy it. The log keeps about each person's
 newest 200 answered questions; as they ask new ones, their own questions
 in their least recently active conversations go. A conversation never
@@ -159,13 +166,19 @@ bounded number of points, numbers where numbers belong) and never draws
 anything that doesn't fit. What you see is drawn by the app, from
 figures the engine produced.
 
-**save as report** (under any answer) downloads the whole answer — the
-prose, the charts, every chart's figures as a table — as one
-self-contained HTML file: inline graphics and styles, no scripts, no
-links out, so it opens the same from a Downloads folder, a mail
-attachment or a phone's share sheet. On mobile it goes straight to the
-share sheet. The file is built on the spot from the answer as it was
-kept in the history.
+**save as report** (in an open conversation's header) downloads the
+whole conversation — every question, its answer's prose, the charts,
+every chart's figures as a table, in order — as one self-contained HTML
+file: inline graphics and styles, no scripts, no links out, so it opens
+the same from a Downloads folder, a mail attachment or a phone's share
+sheet. On mobile it goes straight to the share sheet. The file is built
+on the spot from the conversation as it was kept in the history. A very
+long conversation keeps its newest fifty questions (fewer when they
+carry many charts), and the page says how many earlier ones it left
+out; a conversation whose start is not loaded says so too.
+
+The running app links to its source code in the footer (**source**),
+as free software should.
 
 ## Gotchas
 

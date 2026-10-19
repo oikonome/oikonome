@@ -19,6 +19,21 @@ you save them.
 sends at any time, if you want to see what the message looks like
 before then.)
 
+## The setup checklist
+
+Until setup is complete, Today opens with a five-step checklist (owners
+only; the phone app shows the same one): connect a bank or add an
+account, bring in history, find your recurring bills, set your two
+budgets, pick your primary checking. Each step is ticked by what is in
+the household's data, not by having walked past it in the wizard — at
+least one account, one transaction, one approved bill, a saved budget,
+and a primary checking account pinned (a household with no checking
+account at all has nothing to pin, so that step counts as done). The
+checking step lists your checking accounts right on the card — tap the
+one your bills and paychecks run through; closed accounts kept only for
+their history are not offered. The card goes away once all five are
+done; the wizard's last step shows where it stands.
+
 ## The verdict card
 
 The card opens with the verdict as a sentence — **On budget**, **Over

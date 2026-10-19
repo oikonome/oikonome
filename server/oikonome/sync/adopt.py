@@ -198,7 +198,14 @@ def _candidates(conn, institution_id, institution_name, new_item_id):
     return conn.execute(
         """SELECT a.id, a.mask, a.type, a.subtype, a.name, a.item_id
              FROM accounts a JOIN items i ON i.id = a.item_id
-            WHERE COALESCE(i.access_token, '') = ''
+            -- tokenless, or the one Item THIS link replaced (a relink for
+            -- more history) that kept its token for a release Plaid has
+            -- not yet confirmed: archived never syncs, and its accounts
+            -- are what the new link should carry on
+            WHERE (COALESCE(i.access_token, '') = ''
+                   OR (i.aggregator = 'plaid'
+                       AND COALESCE(i.status, '') = 'archived'
+                       AND i.raw->>'relinked_by' = %s))
               AND i.id <> %s
               AND (i.aggregator = 'plaid'
                    OR (i.aggregator IN ('simplefin-org', 'mx')
@@ -225,7 +232,7 @@ def _candidates(conn, institution_id, institution_name, new_item_id):
                         ELSE lower(i.institution_name)
                              = lower(%s::text) END)
               AND a.user_removed_at IS NULL""",
-        (new_item_id, mx_live, institution_id, institution_id,
+        (new_item_id, new_item_id, mx_live, institution_id, institution_id,
          institution_name)).fetchall()
 
 

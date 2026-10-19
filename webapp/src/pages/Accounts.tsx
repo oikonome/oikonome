@@ -4,7 +4,8 @@
 // row), an Archived collapsible for closed/historical accounts, Top holdings.
 // Also SimpleFIN connect, Plaid hosted link and manual accounts.
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { openPlaidHostedLink, plaidLinkOutcome, usePlaidLinkResume,
+import { openPlaidHostedLink, PendingLinkRows, plaidLinkOutcome,
+         startPlaidLink, usePlaidLinkResume, useRelinkPending,
          firstSyncPending, useFirstSyncLanding }
   from "../components/ConnectHub";
 import DemoLock from "../components/DemoLock";
@@ -12,11 +13,13 @@ import { bankAwaitsConfirm, CONFIRM_TO_CONNECT, VerifyEmailCard }
   from "../components/VerifyEmailCard";
 import { sharedLock } from "../sharedlogin";
 import ImportPage from "./Import";
-import { Fragment, useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { ext } from "../ext";
 import { Link, useSearchParams } from "react-router";
 import { ago, api, errText, linkCardVisible, mmdd, money, type Account,
-         type Connection, type Me, type Settings } from "../api/client";
+         type Connection, type HistoryMonths, type Me, type Settings }
+  from "../api/client";
+import { historyRowNote, windowNarrower } from "../components/HistoryChoice";
 import { signedBalance } from "../moneymath";
 import { patchList, removeFromList } from "../api/cache";
 import { canEdit, isOwner, isViewer } from "../role";
@@ -318,6 +321,7 @@ export default function Accounts({ embedded }: { embedded?: boolean } = {}) {
   const bizCategories = buildCategories((a) => !!a.entity_id);
 
   const rowProps = { mayEdit, owner, primary, excluded, editId, setEditId,
+                     historyWindow: settings.data?.history_months ?? null,
                      onDone: done };
   // every hero figure derives from payloads this page already loads
   const liveAccts = groups.flatMap((g) => g.accounts)
@@ -564,11 +568,13 @@ function OwnerImport({ onDone }: { onDone: DoneFn }) {
 }
 
 function GroupRows({ g, archived, hidden, mayEdit, owner, primary, excluded,
-                     editId, setEditId,
+                     editId, setEditId, historyWindow,
                      onDone, onSync, syncing }: {
   g: Group; archived?: boolean; hidden?: boolean;
   mayEdit: boolean; owner: boolean; primary: string | null;
   excluded: Set<string>;
+  // the household's history choice, to tell a bank linked narrower
+  historyWindow?: HistoryMonths | null;
   editId: string | null; setEditId: (id: string | null) => void;
   onDone: DoneFn;
   onSync?: (itemId: string) => void; syncing?: boolean;
@@ -581,15 +587,20 @@ function GroupRows({ g, archived, hidden, mayEdit, owner, primary, excluded,
   // are shown switched off, the refusal's sentence on hover
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const credLock = sharedLock(me.data, "credential");
+  // a relink of this bank started from another door (the connect hub)
+  // leaves the bank listed until the new link is in: no second one
+  const relinking = useRelinkPending(g.itemId);
+  const qcRows = useQueryClient();
   // a fresh link for a removed connection is a new one, which a trial
   // still waiting on confirmation cannot make (the ConnectCard's reason)
   const relinkLock = credLock
     ?? (bankAwaitsConfirm(me.data) ? CONFIRM_TO_CONNECT : null);
-  const openLink = (itemId?: string, manageAccounts = false) => {
+  const openLink = (itemId?: string, manageAccounts = false,
+                    relinkItemId = "") => {
     setLinking(true);
     // a closed window or a refused re-auth resolves too — only a real
     // update (or a fresh link, for a reaped connection) is "reconnected"
-    void openPlaidHostedLink(itemId, { manageAccounts })
+    void openPlaidHostedLink(itemId, { manageAccounts, relinkItemId })
       .then((s) => onDone(plaidLinkOutcome(s, itemId ? "fix" : "add").text))
       .catch((e) => onDone(errText(e)))
       .finally(() => setLinking(false));
@@ -666,6 +677,37 @@ function GroupRows({ g, archived, hidden, mayEdit, owner, primary, excluded,
         <>{" "}<span className="pill m"
           title="Plaid last received data from this bank then. Sync reads that copy; it does not make the bank send more.">
           bank sent data {ago(g.conn.bank_updated_at)}</span></>
+      )}
+      {/* the window this bank was linked with, when it is less than
+          everything — fixed at Plaid, so a wider choice made later only
+          reaches it through "more history" (a fresh link of the same
+          bank; what is in is kept) */}
+      {!quiet && !reaped && g.conn?.aggregator === "plaid"
+        && g.conn.history_months != null && (
+        <>{" "}<span className="pill m"
+          title="how much history this bank was asked for when it was linked">
+          {historyRowNote(g.conn.history_months)}</span>
+          {owner && !needsFix
+            && windowNarrower(g.conn.history_months, historyWindow) && (
+            <>{" "}<button style={{ padding: ".05rem .45rem", fontSize: 12 }}
+              disabled={linking || relinking || !!credLock}
+              title={credLock ?? (relinking ? "relinking at your bank…" : null) ?? "relink this bank with the household's wider history window; what is already in is kept"}
+              onClick={() => {
+                if (!window.confirm(
+                  `Pull more history from ${g.conn?.institution_name ?? "this bank"}? `
+                  + "You sign in at the bank again; what is already in is kept."))
+                  return;
+                // the pending-row path, like the hub's door: the session
+                // is in the store, so every "more history" door for this
+                // bank waits on it, and the outcome lands under the
+                // Connect card's rows
+                setLinking(true);
+                void startPlaidLink(qcRows, { mode: "relink", relinkItemId: g.itemId })
+                  .catch((e) => onDone(errText(e)))
+                  .finally(() => setLinking(false));
+              }}>
+              more history ↗</button></>)}
+        </>
       )}
       {hidden && <>{" "}<span className="pill m"
         title="excluded from every total — the connection is still live">
@@ -1335,9 +1377,7 @@ function ConnectCard({ onDone, me, hosted = false, used, cap }: {
   // the bank tab is slow to come back; a second click would open a second
   // Link session in the meantime
   const [linking, setLinking] = useState(false);
-  // a closed bank TAB tells nobody: the person says so, the wait ends and
-  // the server stops holding a connection slot for that window
-  const cancelLink = useRef(false);
+  const qcCard = useQueryClient();
   const connect = useMutation({
     mutationFn: () => api.simplefinConnect(token),
     onSuccess: (r) => {
@@ -1377,24 +1417,17 @@ function ConnectCard({ onDone, me, hosted = false, used, cap }: {
             ?? (full ? "you are at this account's institution limit"
                      : undefined)}
           onClick={() => {
+            // busy only while the bank tab opens: the session is then a
+            // pending row below, and the button is free for the next bank
             setLinking(true);
-            cancelLink.current = false;
-            void openPlaidHostedLink("",
-              { cancelled: () => cancelLink.current })
-            .then((s) => onDone(plaidLinkOutcome(s, "add").text))
+            void startPlaidLink(qcCard, { mode: "add" })
             .catch((e) => onDone(errText(e)))
             .finally(() => setLinking(false));
           }}>
-          {linking ? "connecting…"
+          {linking ? "opening your bank…"
             : hosted ? "+ Connect an account ↗" : "+ Add via Plaid ↗"}</button>
-        {linking && (
-          <button type="button" className="linklike mut"
-            style={{ fontSize: 13 }}
-            onClick={() => { cancelLink.current = true; }}>
-            cancel — I closed the bank window
-          </button>
-        )}
       </div>
+      <PendingLinkRows />
       {/* The two cards are peers, so they carry the same SHAPE: a
           heading, a line saying what this is, the action, then the
           detail you need to choose it. Without this list the bank card

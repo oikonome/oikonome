@@ -95,7 +95,12 @@ the token is the key). Then, in order:
 2. **Connect** — **Connect an account** links a bank, card, or brokerage
    (hosted goes straight to Plaid; self-host gets the provider grid —
    Plaid / MX / SimpleFIN / scripts / files). Linking pulls transactions,
-   holdings and liabilities. Everything you've linked is listed
+   holdings and liabilities. The bank's sign-in opens in its own tab and
+   the button is free again at once: each sign-in still open is a line
+   under the button (with **cancel — I closed the bank window** for a
+   tab you shut), so you can start the next bank without waiting for the
+   first, and the moment you come back to this tab the line turns into
+   the bank. Everything you've linked is listed
    underneath, one row each, with a status dot, how many accounts came
    with it, when it last pulled, and a Disconnect button. **Import a file
    instead** works just as well. Below the grid, **How much history should
@@ -105,8 +110,17 @@ the token is the key). Then, in order:
    years) and every file you import (rows older than the window are left
    out, and the import says how many). More history means better bill
    detection and a budget seeded from real months; less keeps the first
-   sync quick. To bring older history in later, widen the window and
-   import from Accounts → Import. Click **Done connecting** when you've
+   sync quick. A bank keeps the window it was linked with; its row says
+   so (**history: last month**) when that is narrower than your choice,
+   and **pull more history ↗** relinks it with the wider one — you sign
+   in at the bank again, and what is already in is kept. To bring older
+   history in from files, widen the window and import from Accounts →
+   Import. Underneath, **Primary checking** names the account the cash
+   forecast anchors on: with one checking account it is pinned for you
+   (when the first bank or file brings it in, or as you leave the step);
+   with two or more the step asks you to pick before **Done connecting**
+   (changeable later on Accounts).
+   Click **Done connecting** when you've
    added everything. When the instance enforces an institution limit, the
    card also says how many of the allowed institutions are connected, and
    the Connect button is disabled once they're spent (see the accounts
@@ -120,7 +134,12 @@ the token is the key). Then, in order:
      then **Save & approve**; the charges that proved it stay attached.
      **Approve all** takes the lot. The wait is deliberate: income, bills
      and the pre-filled budget are all derived from that history.
-     Dismissals are remembered.
+     Dismissals are remembered. The step counts as finished once every
+     proposal is approved or dismissed; with some still pending the button
+     reads **Leave N pending**: the step is marked skipped, and the pending
+     proposals wait for you on Bills & Income. (The Today page's checklist
+     ticks **Find your recurring bills** once at least one bill is
+     approved.)
    - **I'll enter them myself** — an empty list and a short form (name,
      amount, cadence, due day; bill or paycheck). Each one matches its
      charges by merchant from then on. This also turns off the nightly
@@ -146,7 +165,9 @@ the token is the key). Then, in order:
    Settings → Email & Push; until it is, nothing can be emailed.
 6. **Done** — a summary of what you set up (appearance, accounts and
    history window, bills and paychecks approved, budgets, delivery and
-   recipients), and when the first email or notification arrives. Then
+   recipients), what the Today page's setup checklist will say (**Today
+   checklist 4/5 done — still open: …**), and when the first email or
+   notification arrives. Then
    **Go to Today**. Every step but the Appearance choice and the history
    wait is skippable, and the green **Finish setup** pill in the nav
    resumes at the first unfinished step — so does **Finish setup** under

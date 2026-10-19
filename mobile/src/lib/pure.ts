@@ -1483,6 +1483,26 @@ export function queueUnrevoked<T extends { token: string; at: number }>(
  *  edge timeout while the first sync runs), a request timeout or a rate
  *  limit all keep polling. Any other 4xx, a sign-out among them, is
  *  final. */
+/** The next link poll's wait: fast for a while after a wake-up (the app
+ *  came back to the foreground — the bank step just ended), else the
+ *  normal tick. The web's plaidlinks.pollWait. */
+export const LINK_POLL_MS = 2500;
+export const LINK_POLL_FAST_MS = 1000;
+export const LINK_BURST_MS = 30_000;
+export function linkPollWait(now: number, burstUntil: number): number {
+  return now < burstUntil ? LINK_POLL_FAST_MS : LINK_POLL_MS;
+}
+
+/** The pending row's words for a session still open (the web's
+ *  plaidlinks.pendingLine). */
+export function pendingLinkLine(kind: "add" | "relink" | "fix",
+                                cancelled: boolean): string {
+  const head = kind === "fix" ? "Finishing the sign-in at your bank…"
+    : kind === "relink" ? "Relinking at your bank for more history…"
+    : "Finish signing in at your bank…";
+  return cancelled ? `${head} (closing)` : head;
+}
+
 export function linkPollMayRetry(e: unknown): boolean {
   const status = (e as { status?: unknown } | null)?.status;
   if (typeof status !== "number") return true;

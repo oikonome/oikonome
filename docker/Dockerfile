@@ -15,6 +15,8 @@ RUN npm run build
 # a minor version behind the tests means production runs code nothing
 # exercised. Bump the two together.
 FROM python:3.14-slim
+LABEL org.opencontainers.image.licenses="AGPL-3.0-or-later" \
+      org.opencontainers.image.source="https://github.com/oikonome/oikonome"
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 OIKONOME_SPA_DIST=/app/webapp/dist
 # glibc gives every thread that allocates its own malloc arena, and an

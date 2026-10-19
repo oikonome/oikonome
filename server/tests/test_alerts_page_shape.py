@@ -78,16 +78,38 @@ class AssistantShapeTests(unittest.TestCase):
         except FileNotFoundError:
             self.skipTest("webapp/ not present")
 
-    def test_the_asker_stays_put(self):
-        self.assertIn('className="card asker"', self.src)
-        self.assertIn(".card.asker{position:sticky", _src("index.css"))
+    def test_the_box_stays_put_under_the_open_conversation(self):
+        """The page is a chat: the open conversation scrolls inside its
+        pane and the box to continue it is pinned under the messages,
+        never scrolled away on the one page whose purpose is asking the
+        next question."""
+        self.assertIn('className="chat-compose"', self.src)
+        self.assertIn('className="chat-msgs"', self.src)
+        css = _src("index.css")
+        self.assertIn(".chat-msgs{flex:1;min-height:0;overflow:auto", css)
+        self.assertIn(".chat-compose{border-top", css)
+
+    def test_a_conversation_is_continued_in_place_and_is_a_link(self):
+        """No "follow up" button: typing into an open conversation continues
+        it, and the open one is named in the address (`?c=`) so it can be
+        linked and left with the back button."""
+        self.assertIn("Continue the conversation", self.src)
+        self.assertNotIn('"follow up"', self.src)
+        self.assertIn('sp.get("c")', self.src)
+
+    def test_the_prose_is_drawn_not_shown_raw(self):
+        """The model writes **bold** and "- " bullets; the page draws them
+        (RichText over richtext.ts) and copy strips the markers."""
+        self.assertIn("<RichText text={t.answer} />", self.src)
+        self.assertIn("plainText(t.answer)", self.src)
+        self.assertIn("parseRich", _src("components/AssistantBlocks.tsx"))
 
     def test_the_examples_do_not_vanish_after_the_first_question(self):
         self.assertNotIn("{log.length === 0 && (", self.src)
 
     def test_an_answer_can_be_taken_somewhere(self):
         self.assertIn("clipboard?.writeText", self.src)
-        self.assertIn("ask a follow-up", self.src)
+        self.assertIn("save as report", self.src)
 
     def test_the_unconfigured_copy_does_not_promise_a_bundled_model(self):
         """Hosted instances have no LLM, and the old copy told those users to

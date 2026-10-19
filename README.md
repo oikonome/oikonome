@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-blue" alt="License: FSL-1.1-ALv2" />
+  <img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License: AGPL-3.0" />
   <img src="https://img.shields.io/badge/self--hosted-%E2%9C%94-2ea44f" alt="Self-hosted" />
   <img src="https://img.shields.io/badge/status-live-2ea44f" alt="Status: live" />
   <img src="https://img.shields.io/badge/stack-FastAPI%20%C2%B7%20Postgres%20RLS%20%C2%B7%20React-informational" alt="Stack" />
@@ -102,7 +102,7 @@ around a single daily email, so the tool does the checking, not you.
 | Transaction provenance — check number, payment channel, location, line of business, and *why* a row has its category |
 | Split one charge across several categories by hand |
 | Ledger search with totals, the average per visit and spending per day for any month, category or date range — and a CSV or .xlsx download of exactly the rows a view shows |
-| Ask-your-ledger assistant — read-only summaries, answered by the on-box model; draws charts and tables, keeps a household history, and saves any answer as a self-contained HTML report |
+| Ask-your-ledger assistant — a chat of conversations over read-only summaries, answered by the on-box model; draws charts and tables, keeps every conversation for the household, and saves one as a self-contained HTML report |
 | Business / self-employed tracking — entities, P&L, Schedule C, mileage, estimated tax |
 | Household logins — members and view-only readers with their own second factor and email preferences, and an activity log of who changed what |
 | Continuity packet — one printable PDF of the accounts, debts, bills, income and businesses, for whoever has to run the household without you |
@@ -246,9 +246,11 @@ and [HISTORY.md](HISTORY.md).
 
 ## License
 
-[FSL-1.1-ALv2](LICENSE.md) (Functional Source License): use, modify, and
-self-host freely; each release converts to Apache-2.0 two years after
-publication. The only excluded use is running a competing hosted service.
+[GNU AGPL-3.0-or-later](LICENSE.md): free software — use, modify, self-host
+and redistribute freely; if you run a modified version as a network service,
+you make your modifications available under the same license. Releases
+that shipped under FSL-1.1-ALv2 stay available under those
+terms.
 
 Third-party data redistributed with the app is credited in
 [NOTICE.md](NOTICE.md).

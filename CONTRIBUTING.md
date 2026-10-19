@@ -1,6 +1,6 @@
 # Contributing
 
-Source-available under FSL-1.1-ALv2; contributions are accepted under the
+Open source under the GNU AGPL-3.0-or-later; contributions are accepted under the
 Developer Certificate of Origin (sign off your commits: `git commit -s`).
 
 **Each commit here is a release** (see [HISTORY.md](HISTORY.md)), so

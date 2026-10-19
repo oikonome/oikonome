@@ -306,6 +306,9 @@ _SYSTEM = (
     "then answer concisely in plain language with the actual figures (US "
     "dollars). Say which period a figure covers. If the tools don't cover "
     "the question, say so briefly. Do not mention the tools or JSON. "
+    "Write plain prose; **bold** for the key figures and short \"- \" "
+    "bullet lists are fine, but no headings and no markdown tables (use a "
+    "table block for a table). "
     "Today is {today}.\n\n{charts}"
 )
 

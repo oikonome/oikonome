@@ -7,6 +7,7 @@ renders a cap, so the row must outlive item archival and tenant deletion."""
 import json
 import os
 import unittest
+from unittest import mock
 import uuid
 
 import httpx
@@ -206,7 +207,11 @@ class SlotLedgerTests(unittest.TestCase):
                 (f"pl-held-{uuid.uuid4().hex[:8]}",))
             before = sync_base.released_count(self.conn)
             item_id = f"pl-refused-{uuid.uuid4().hex[:10]}"
-            with self.assertRaises(ValueError):
+            # one bank held, cap of one: the gate's answer is pinned at the
+            # seam the product owns, whatever gate add-on the venv carries
+            with mock.patch.object(sync_base, "institution_cap",
+                                   return_value=1), \
+                    self.assertRaises(ValueError):
                 plaid.link_item(self.conn, "public-x",
                                 transport=_transport(item_id))
             row = self._ledger(item_id)

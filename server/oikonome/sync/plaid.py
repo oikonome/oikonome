@@ -27,13 +27,29 @@ import httpx
 
 from ..engine import budget
 from ..engine.compat import MAX_AMOUNT, as_date, jsonb
-from .base import Account, ImportOverlapGuard, Transaction, \
-    check_institution_cap, filter_import_duplicates, get_access_token, \
-    log_sync, mark_removed, upsert_accounts, upsert_item, upsert_transactions
+from .base import HISTORY_MONTHS, RELINK_LEDGER_REASON, Account, \
+    ImportOverlapGuard, Transaction, check_institution_cap, \
+    filter_import_duplicates, get_access_token, log_sync, mark_removed, \
+    upsert_accounts, upsert_item, upsert_transactions
 
 log = logging.getLogger(__name__)
 
 DAYS_REQUESTED = 730
+
+
+def history_months_from_days(days) -> int | None:
+    """The history choice an Item's stored ``days_requested`` came from
+    (days_requested): 1, 3, 6 or 12 months, or None for everything — a
+    window not made by this app (an Item older than the choice, a hand
+    edit) reads as everything too, the widest it could be."""
+    try:
+        n = int(days)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    for months in HISTORY_MONTHS:
+        if n == months * 31:
+            return months
+    return None
 
 
 def days_requested(conn=None) -> int:
@@ -115,9 +131,30 @@ class PlaidError(Exception):
         rid = f" [request_id {self.request_id}]" if self.request_id else ""
         super().__init__(f"{self.code}: {self.message}{rid}")
 
+    def public(self) -> dict:
+        """The fields a link page may show: Plaid's own error code and
+        message, and the request id support asks for. Built from the
+        typed fields, never from the exception's text, so nothing about
+        the transport or the stack rides along."""
+        out = {"error": f"{self.code}: {self.message}", "error_code": self.code}
+        if self.request_id:
+            out["request_id"] = self.request_id
+        return out
+
 
 # The code a request that never got an answer from Plaid carries.
 TRANSPORT_CODE = "HTTP_TRANSPORT"
+
+
+class LinkRefused(ValueError):
+    """A bank link the household may not keep: the institution cap, a
+    repeated login, a bank-link hold, keys that changed mid-link, a row
+    that would not save. `reason` is the sentence the page shows — a
+    fixed, user-facing string chosen here, never exception text — so a
+    link door answers with it rather than with str(e)."""
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
 
 
 class PlaidTransportError(PlaidError):
@@ -370,10 +407,10 @@ def stamp_ledger_removed(item_id: str, reason: str) -> None:
             # of the institution cap (base.released_count)
             admin.execute(
                 "UPDATE plaid_item_ledger SET removed_at=now(), "
-                "removed_reason=CASE WHEN removed_reason=%s "
+                "removed_reason=CASE WHEN removed_reason IN (%s, %s) "
                 "THEN removed_reason ELSE %s END "
                 "WHERE item_id=%s AND removed_at IS NULL",
-                (REPEAT_LEDGER_REASON, reason, item_id))
+                (REPEAT_LEDGER_REASON, RELINK_LEDGER_REASON, reason, item_id))
         finally:
             admin.close()
     except Exception as e:                                 # noqa: BLE001
@@ -723,18 +760,22 @@ def _relinkable(status: str | None) -> bool:
     return code in _FRESH_LINK_CODES
 
 
-def _live_items(conn, item_id: str, inst_id: str) -> list[dict]:
+def _live_items(conn, item_id: str, inst_id: str,
+                ignore: str | None = None) -> list[dict]:
     """The household's other Plaid Items at `inst_id` that a fresh link
     could repeat: holding a token, not archived, consent not withdrawn.
-    `synced` says whether any of its accounts are stored yet."""
+    `synced` says whether any of its accounts are stored yet. `ignore` is
+    the Item a relink is replacing: the new login IS that login, on
+    purpose, and is released the moment the new Item is saved."""
     rows = conn.execute(
         "SELECT i.id, i.status, i.webhook_status, EXISTS (SELECT 1 FROM "
         "accounts a WHERE a.item_id = i.id) AS synced FROM items i "
         "WHERE i.aggregator='plaid' AND i.id<>%s "
         "AND i.institution_id=%s "
         "AND COALESCE(i.access_token,'')<>'' "
-        "AND COALESCE(i.status,'') <> 'archived'",
-        (item_id, inst_id)).fetchall()
+        "AND COALESCE(i.status,'') <> 'archived' "
+        "AND i.id IS DISTINCT FROM %s",
+        (item_id, inst_id, ignore)).fetchall()
     return [dict(r) for r in rows
             if not _relinkable(r["status"])
             and not _relinkable(r["webhook_status"])]
@@ -747,7 +788,8 @@ def _masked_accounts(client: "Client", token: str) -> set:
 
 
 def _repeat_inputs(conn, client: "Client", access_token: str,
-                   item_id: str, inst_id: str) -> dict | None:
+                   item_id: str, inst_id: str,
+                   ignore: str | None = None) -> dict | None:
     """What the repeat check needs from Plaid, gathered BEFORE the link
     lock is taken — so no other link or key swap in the household waits on
     Plaid's network time. None when the link cannot be a repeat (no
@@ -761,7 +803,7 @@ def _repeat_inputs(conn, client: "Client", access_token: str,
     ctx = {"token": access_token, "fresh": None, "held": {}}
     try:
         with conn.transaction():
-            live = _live_items(conn, item_id, inst_id)
+            live = _live_items(conn, item_id, inst_id, ignore)
     except Exception as e:                               # noqa: BLE001
         log.warning("plaid link: repeat check skipped item=%s: %s",
                     item_id, e)
@@ -797,7 +839,7 @@ def _fetch_held(conn, client: "Client", ctx: dict, ids) -> None:
 
 
 def _already_linked(conn, item_id: str, inst_id: str,
-                    ctx: dict | None):
+                    ctx: dict | None, ignore: str | None = None):
     """Under the link lock, and without calling Plaid: does the new Item
     repeat a login this household already holds?
 
@@ -830,7 +872,7 @@ def _already_linked(conn, item_id: str, inst_id: str,
     second waiting on the lock while the first commits."""
     if not ctx or not inst_id:
         return False
-    live = _live_items(conn, item_id, inst_id)
+    live = _live_items(conn, item_id, inst_id, ignore)
     if not live:
         return False
     if ctx["fresh"] is not None and not ctx["fresh"]:
@@ -868,11 +910,81 @@ def _is_days(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool) and v > 0
 
 
+def _same_accounts(conn, client: "Client", access_token: str,
+                   old_id: str) -> bool:
+    """Every masked account the new token reports is held by `old_id`
+    (same type and mask). A Plaid failure here is no evidence."""
+    try:
+        fresh = _masked_accounts(client, access_token)
+    except PlaidError:
+        return False
+    if not fresh:
+        return False
+    held = {(r["type"], r["mask"]) for r in conn.execute(
+        "SELECT type, mask FROM accounts WHERE item_id=%s "
+        "AND COALESCE(mask,'')<>''", (old_id,)).fetchall()}
+    return fresh <= held
+
+
+def _settle_relink(conn, old_id: str, new_id: str, same_bank: bool) -> None:
+    """The new Item is held: release the one it replaces (same bank) under
+    the relink reason, or leave it live (another bank — an ordinary add).
+    Either way the binding on the old row is spent. The old Item's
+    accounts come across to the new one at its first pull (adopt), which
+    is why the release comes first: adoption takes from a tokenless Item.
+    A release Plaid did not confirm keeps the token for the nightly retry
+    and archives the row (disconnect_item), so no two Items sync at once.
+    Best-effort: the new link is already live, nothing here may fail it."""
+    from .base import disconnect_item
+    try:
+        if same_bank:
+            # the old Item names its replacement, so adoption at the new
+            # Item's first pull takes from THIS archived donor even when
+            # the release left it its token (adopt._candidates)
+            conn.execute(
+                "UPDATE items SET raw = COALESCE(raw,'{}'::jsonb) || %s "
+                "WHERE id=%s", (jsonb({"relinked_by": new_id}), old_id))
+            r = disconnect_item(conn, old_id, reason=RELINK_LEDGER_REASON)
+            if r.get("release_failed"):
+                # archived locally with its token kept for the nightly
+                # retry (disconnect_item); the ledger says relink NOW, so
+                # the retry's own stamp keeps that reason and the slot is
+                # never held under the cap for a swap
+                log.warning("relink: Plaid did not confirm the release of "
+                            "item=%s (replaced by %s); retry queued",
+                            old_id, new_id)
+                stamp_ledger_removed(old_id, RELINK_LEDGER_REASON)
+        else:
+            log.info("relink of item=%s linked another bank (%s): the old "
+                     "connection stays", old_id, new_id)
+        conn.execute(
+            "UPDATE items SET raw = COALESCE(raw,'{}'::jsonb) - 'relink_session' "
+            "WHERE id=%s", (old_id,))
+    except Exception as e:                               # noqa: BLE001
+        log.warning("relink settle failed old=%s new=%s: %s", old_id, new_id, e)
+        if same_bank:
+            # never two live Items of one login: archive the old one the
+            # way a failed disconnect does, and the reaper retries its
+            # release
+            try:
+                conn.execute(
+                    "UPDATE items SET status='archived', "
+                    "archived_reason='disconnect-release-failed', "
+                    "archived_at=COALESCE(archived_at, now()), "
+                    "raw = COALESCE(raw,'{}'::jsonb) - 'relink_session' "
+                    "WHERE id=%s", (old_id,))
+                stamp_ledger_removed(old_id, RELINK_LEDGER_REASON)
+            except Exception as e2:                      # noqa: BLE001
+                log.warning("relink archive fallback failed old=%s: %s",
+                            old_id, e2)
+
+
 def link_item(conn, public_token: str, institution_name: str = "",
               link_session_id: str | None = None, transport=None,
               outcome: dict | None = None, on_saved=None,
               first_sync: bool = True,
-              window_asked: int | None = None) -> str:
+              window_asked: int | None = None,
+              relink_of: str | None = None) -> str:
     """Exchange a public token (from a completed Link session) → item row
     (access token encrypted at rest) → first sync. With no caller-supplied
     institution_name, resolves the real name via /item/get +
@@ -935,7 +1047,7 @@ def link_item(conn, public_token: str, institution_name: str = "",
     # (a client stuck relinking the same bank) gets no more exchanges
     # until the window passes, rather than one more billed Item per pass.
     if repeats_exhausted(conn, tenant_id):
-        raise ValueError(TOO_MANY_REPEATS)
+        raise LinkRefused(TOO_MANY_REPEATS)
     ex = client.exchange_public_token(public_token)
     item_id = ex["item_id"]
     # From the exchange until the items row commits, the access token lives
@@ -975,8 +1087,40 @@ def link_item(conn, public_token: str, institution_name: str = "",
     # The repeat check's Plaid calls happen here, before the lock: under it
     # only the database is read, so no other link in the household waits
     # on Plaid's network time.
+    # A relink for a wider history window replaces `relink_of`: the old
+    # Item stays live (syncing, counted) until this one is saved, then is
+    # released under the relink reason the institution cap ignores. That
+    # holds only when the new login is the SAME bank — any other bank is
+    # an ordinary add that takes its own place under the cap, and the old
+    # Item is left exactly as it was.
+    same_bank = False
+    if relink_of:
+        old_row = conn.execute(
+            "SELECT institution_id, institution_name FROM items WHERE id=%s "
+            "AND aggregator='plaid' AND COALESCE(status,'') <> 'archived'",
+            (relink_of,)).fetchone()
+        if old_row:
+            # ids when both are known; else the names (a bank restored
+            # before ids were recorded); a new Item whose bank Plaid did
+            # not name at all is taken as the one the door was opened for
+            # — the person asked to replace it, and two live Items of one
+            # login would count every account twice
+            if inst_id and old_row["institution_id"]:
+                same_bank = old_row["institution_id"] == inst_id
+            elif institution_name and institution_name != "Plaid" \
+                    and old_row["institution_name"]:
+                same_bank = (institution_name.lower()
+                             == old_row["institution_name"].lower())
+            else:
+                # Plaid did not say which bank this is (a transient
+                # /item/get failure): the evidence is the accounts — the
+                # new login's masked accounts all held by the Item being
+                # replaced is the same login. Without that the old Item
+                # stays and this one is an ordinary add.
+                same_bank = _same_accounts(conn, client, ex["access_token"],
+                                           relink_of)
     repeat = _repeat_inputs(conn, client, ex["access_token"], item_id,
-                            inst_id)
+                            inst_id, relink_of if same_bank else None)
     for attempt in range(3):
         try:
             with conn.transaction():
@@ -984,7 +1128,7 @@ def link_item(conn, public_token: str, institution_name: str = "",
                 existing = conn.execute("SELECT 1 FROM items WHERE id=%s",
                                         (item_id,)).fetchone() is not None
                 if not _keys_unchanged(conn, client):
-                    raise ValueError(
+                    raise LinkRefused(
                         "the Plaid keys changed while this bank was linking — "
                         "link it again")
                 # a bank-link hold armed after this link's session started
@@ -993,7 +1137,10 @@ def link_item(conn, public_token: str, institution_name: str = "",
                 # on a client the owner has not confirmed, and an Item already
                 # held is left exactly as it was
                 from ..notify import outbound_pause
-                outbound_pause.refuse_if_held(budget.load_config(conn), "plaid")
+                hold_cfg = budget.load_config(conn)
+                if outbound_pause.links_held(hold_cfg, "plaid"):
+                    raise LinkRefused(outbound_pause.hold_message(hold_cfg,
+                                                                  "plaid"))
                 # the backfill window this Item was created with: an
                 # update-mode relink asks for no new window, but the save
                 # below rewrites raw, so the original is carried across it
@@ -1006,7 +1153,8 @@ def link_item(conn, public_token: str, institution_name: str = "",
                 else:
                     window = days_requested(conn)
                 if not existing:
-                    verdict = _already_linked(conn, item_id, inst_id, repeat)
+                    verdict = _already_linked(conn, item_id, inst_id, repeat,
+                                              relink_of if same_bank else None)
                     if isinstance(verdict, list) and attempt < 2:
                         # a held Item appeared (or lost its accounts) since
                         # the check's inputs were gathered: fetch its
@@ -1022,12 +1170,20 @@ def link_item(conn, public_token: str, institution_name: str = "",
                         # institution cap, since the login it repeats
                         # already holds one.
                         repeated = True
-                        raise ValueError(ALREADY_LINKED)
+                        raise LinkRefused(ALREADY_LINKED)
                     try:
-                        check_institution_cap(conn)
+                        # the Item being replaced frees its place as this
+                        # one is saved, so it counts as free here
+                        check_institution_cap(conn, spare=1 if same_bank else 0)
                     except ValueError:
                         capped = True
-                        raise
+                        # the cap's sentence is the one Settings shows;
+                        # read back from the gate rather than from the
+                        # exception, so the page gets a fixed string
+                        from .. import ext
+                        from .base import institution_cap, institutions_held
+                        raise LinkRefused(ext.gate.institution_cap_message(
+                            institution_cap(conn), institutions_held(conn)))
                 upsert_item(conn, item_id, "plaid",
                             institution_name or "Plaid", ex["access_token"],
                             raw=({"days_requested": window}
@@ -1095,7 +1251,19 @@ def link_item(conn, public_token: str, institution_name: str = "",
                                   or type(e2).__name__)
                 else:
                     if capped:
-                        stamp_ledger_removed(item_id, "link refused at the cap")
+                        # a cap refusal from the relink door is a sign-in
+                        # at ANOTHER bank (the same bank has its spare
+                        # slot), so it counts like every refused link —
+                        # stamped as a relink it would mint a billed Item
+                        # per pass, uncounted
+                        # …unless Plaid could not name the bank at all: a
+                        # transient failure must not shut this bank's
+                        # relink door for a month, so that one is bounded
+                        # like a repeat instead of holding a slot
+                        stamp_ledger_removed(
+                            item_id, REPEAT_LEDGER_REASON
+                            if relink_of and not inst_id
+                            else "link refused at the cap")
                     elif repeated:
                         stamp_ledger_removed(item_id, REPEAT_LEDGER_REASON)
                     _drop_link_hold(item_id)
@@ -1103,8 +1271,8 @@ def link_item(conn, public_token: str, institution_name: str = "",
                 _drop_link_hold(item_id)
             if refused:
                 raise
-            raise ValueError("the bank link could not be saved — link it "
-                             "again") from e
+            raise LinkRefused("the bank link could not be saved — link it "
+                               "again") from e
     # From here on the Item is held: nothing below may fail the link, or
     # a caller retrying the (spent) public token would report a failure
     # for a bank that is connected. The in-flight hold goes now; it cannot
@@ -1117,6 +1285,12 @@ def link_item(conn, public_token: str, institution_name: str = "",
         except Exception as e:                           # noqa: BLE001
             log.warning("plaid link saved-callback failed item=%s: %s",
                         item_id, e)
+    # after the exchange is on record: a Plaid round-trip (the release)
+    # ahead of that record would widen the window a crash leaves the
+    # single-use token unaccounted for. The session is marked done only
+    # once link_item returns, so no client lists both Items either way.
+    if relink_of:
+        _settle_relink(conn, relink_of, item_id, same_bank)
     try:
         refresh_branding(conn, item_id, client=client)
     except Exception as e:                               # noqa: BLE001

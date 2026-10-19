@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import threading as _threading
+import os
 import time
 
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Request, \
@@ -23,7 +24,7 @@ import datetime as _dt
 
 
 from ..engine import bills, budget
-from ..engine.compat import as_date, as_dict
+from ..engine.compat import as_date, as_dict, jsonb
 from ..sync import base as sync_base
 from ..sync import batches, competitors, csvimport, mintimport, \
     ofximport, pdfimport, plaid, qifimport, simplefin, ynabimport
@@ -97,6 +98,10 @@ def _connections(conn):
                   -- by the sync — the card explains a forecast with no
                   -- autopay line instead of leaving it silently absent
                   i.raw->'product_issues' AS product_issues,
+                  -- the history window the Item was created with: fixed
+                  -- at Plaid from then on, so a wider choice made later
+                  -- only reaches it through a relink
+                  i.raw->'days_requested' AS history_days,
                   -- Plaid's fleet-wide login health for the bank, cached
                   -- by the hourly sync; only a fresh reading counts — a
                   -- stale DEGRADED from a stopped sync would outlive the
@@ -130,6 +135,11 @@ def _connections(conn):
     for r in rows:
         d = dict(r)
         d["status_kind"] = plaid.status_kind(d.get("status"))
+        # the window as the choice it came from (1/3/6/12 months, None for
+        # everything); only a Plaid Item carries one
+        days = d.pop("history_days", None)
+        d["history_months"] = (plaid.history_months_from_days(days)
+                               if d.get("aggregator") == "plaid" else None)
         out.append(d)
     return out
 
@@ -164,6 +174,17 @@ def classify(user: dict = Depends(_user()), account_id: str = Form(...),
                     "/accounts?msg=" + quote(
                         "a business account cannot be the household's "
                         "primary checking"), status_code=303)
+            # a disconnected bank's account is a frozen balance the
+            # forecast ignores — refused here as at the API's door
+            if primary_checking and conn.execute(
+                    "SELECT 1 FROM accounts a JOIN items i ON i.id = a.item_id "
+                    "WHERE a.id=%s AND i.aggregator IN ('plaid','mx','simplefin','simplefin-org') "
+                    "AND COALESCE(i.status,'') IN ('archived','restored')",
+                    (account_id,)).fetchone():
+                return RedirectResponse(
+                    "/accounts?msg=" + quote(
+                        "that account's bank is disconnected — reconnect it, "
+                        "or pick a live checking account"), status_code=303)
             # the same door the API's classify uses: pins the type AND
             # re-signs a SimpleFIN balance when the kind crosses into or out
             # of debt — a bare UPDATE would leave the bank's sign until the next pull
@@ -1052,8 +1073,28 @@ def _refuse_add_over_cap(cap, held: int, pending: int) -> None:
         "window and try again in a couple of minutes.")
 
 
+def plaid_completion_redirect() -> str | None:
+    """Where Plaid sends the bank tab once Hosted Link finishes, or None
+    (Plaid's own "you can close this window" page). Opt-in by env:
+    OIKONOME_PLAID_COMPLETION_REDIRECT = an https URL, or `1` for this
+    install's /app/plaid/done under OIKONOME_BASE_URL. Off by default because
+    Plaid may require the URL on the dashboard's allowed list, and a
+    link token refused for an unlisted URL would close every link door;
+    the page the SPA serves there only wakes the tab that started the
+    link, which also wakes by itself when it regains focus."""
+    raw = (os.environ.get("OIKONOME_PLAID_COMPLETION_REDIRECT") or "").strip()
+    if not raw:
+        return None
+    if raw.lower() in ("1", "true", "yes"):
+        base = (os.environ.get("OIKONOME_BASE_URL") or "").strip().rstrip("/")
+        raw = f"{base}/app/plaid/done" if base else ""
+    return raw if raw.lower().startswith("https://") else None
+
+
 def _start_plaid_session(user: dict, item_id: str = "",
-                         manage_accounts: bool = False) -> dict:
+                         manage_accounts: bool = False,
+                         relink_of: dict | None = None,
+                         web_client: bool = True) -> dict:
     """Create a Hosted Link session and pin it in `_PLAID_LINK`.
 
     Returns ``{link_token, hosted_link_url, kind, institution}``. Raises
@@ -1105,11 +1146,15 @@ def _start_plaid_session(user: dict, item_id: str = "",
                 manage_accounts = True
         else:
             # hosted soft-cap on connected institutions — only the
-            # ADD door; update/re-auth of an existing item is always allowed
-            sync_base.check_institution_cap(conn)
+            # ADD door; update/re-auth of an existing item is always
+            # allowed. A relink keeps the Item it replaces live until the
+            # new one is in, so that one place counts as free here (and
+            # again at the exchange, for the same bank only)
+            spare = 1 if relink_of else 0
+            sync_base.check_institution_cap(conn, spare=spare)
             cap = sync_base.institution_cap(conn)
-            held = sync_base.institutions_held(conn) if cap is not None \
-                else 0
+            held = (max(0, sync_base.institutions_held(conn) - spare)
+                    if cap is not None else 0)
             if cap is not None:
                 from ..jobs import plaid_links
                 recorded = plaid_links.recent_open(user["tenant_id"],
@@ -1129,7 +1174,11 @@ def _start_plaid_session(user: dict, item_id: str = "",
         created = client.create_hosted_link(
             str(user["tenant_id"]), client_name="Oikonome",
             access_token=access_token,
-            account_selection=bool(item_id and manage_accounts), conn=conn)
+            account_selection=bool(item_id and manage_accounts),
+            # the completion page is the web app's: a phone's in-app
+            # browser would land on the web login there and never close
+            completion_redirect=(plaid_completion_redirect()
+                                 if web_client else None), conn=conn)
     finally:
         conn.close()
     tid = str(user["tenant_id"])
@@ -1138,6 +1187,16 @@ def _start_plaid_session(user: dict, item_id: str = "",
     dropped: list = []
     with _PLAID_LINK_GUARD:
         now = time.time()
+        if relink_of and any(
+                v["tenant_id"] == tid and _add_session_live(v, now)
+                and v.get("relink_of") == relink_of["item_id"]
+                for v in _PLAID_LINK.values()):
+            # two starts racing past the row's binding check: the second
+            # would overwrite the first's binding and the first's finisher
+            # would run it as a plain add and refuse it as a repeat
+            raise HTTPException(409, "a relink of this bank is already in "
+                                     "progress — finish it, or close that "
+                                     "bank window first")
         if not item_id:
             # an unused link token costs nothing, so refusing after
             # creating it is safe; refusing before, unlocked, is not enough
@@ -1159,7 +1218,27 @@ def _start_plaid_session(user: dict, item_id: str = "",
                            "manage_accounts": bool(item_id
                                                    and manage_accounts),
                            "institution": inst, "at": now,
-                           "url": url, "done": False}
+                           "url": url, "done": False,
+                           "relink_of": (relink_of or {}).get("item_id")}
+    if relink_of:
+        # the binding on the old row itself, so a finisher that never saw
+        # this process's memory (the webhook, the sweep after a restart)
+        # settles the relink the same way; a newer relink of the same Item
+        # replaces an older binding
+        conn2 = tenancy.tenant_connect(user["tenant_id"])
+        try:
+            conn2.execute(
+                "UPDATE items SET raw = COALESCE(raw,'{}'::jsonb) || %s "
+                "WHERE id=%s", (jsonb({"relink_session": lt}),
+                                relink_of["item_id"]))
+        except Exception:
+            # the client never gets this URL, so nothing can finish the
+            # session; the entry must not sit refusing a retry for 90 s
+            with _PLAID_LINK_GUARD:
+                _PLAID_LINK.pop(lt, None)
+            raise
+        finally:
+            conn2.close()
     # on record too, so a session nobody is polling when it finishes — a
     # closed tab, a restarted web process — is still finished by the LINK
     # webhook or the worker's sweep (jobs/plaid_links.py)
@@ -1175,8 +1254,17 @@ def _start_plaid_session(user: dict, item_id: str = "",
 @router.post("/accounts/plaid/link")
 def plaid_link_start(request: Request, user: dict = Depends(_user()),
                      item_id: str = Form(""),
-                     manage_accounts: str = Form("")):
+                     manage_accounts: str = Form(""),
+                     relink_item_id: str = Form("")):
     """Start a Hosted Link session: add mode (no item_id) or update/re-auth.
+
+    ``relink_item_id`` (add mode): the Item of a bank already linked, to be
+    replaced by a fresh link of the same bank with a wider history window
+    — the window is fixed when an Item is created. The old Item stays
+    live until the new one is saved (sync.plaid._settle_relink), then is
+    released under RELINK_LEDGER_REASON, which holds no place under the
+    institution cap; a sign-in at another bank from this door is an
+    ordinary, counted add.
 
     SPA (Accept: application/json): returns the hosted URL so the client can
     open **only** Plaid and poll /status while staying on Welcome/Accounts —
@@ -1187,8 +1275,14 @@ def plaid_link_start(request: Request, user: dict = Depends(_user()),
     """
     want_json = "application/json" in (request.headers.get("accept") or "")
     try:
-        created = _start_plaid_session(user, item_id,
-                                       manage_accounts=manage_accounts == "1")
+        relink = (_relink_binding(user, relink_item_id)
+                  if relink_item_id and not item_id else None)
+        created = _start_plaid_session(
+            user, item_id, manage_accounts=manage_accounts == "1",
+            relink_of=relink,
+            # a bearer-token caller is the phone app (its browser is the
+            # in-app one, dismissed by the app itself)
+            web_client=not (request.headers.get("authorization") or ""))
     except ValueError as e:
         if want_json:
             raise HTTPException(400, str(e))
@@ -1203,6 +1297,54 @@ def plaid_link_start(request: Request, user: dict = Depends(_user()),
         return created
     return RedirectResponse(
         f"/accounts/plaid/link/{created['link_token']}", status_code=303)
+
+
+def _relink_binding(user: dict, item_id: str) -> dict:
+    """What a relink for more history replaces: a live Plaid Item of this
+    household whose window is narrower than the household's choice. Owner
+    only. Nothing is released here — the old Item stays live and syncing
+    until the new link of the same bank is saved (sync.plaid.link_item,
+    _settle_relink); a start that is refused, a Plaid outage, or a bank
+    tab the person closes leaves it exactly as it was."""
+    demoguard.deny_shared_credentials(user)
+    if user.get("role") != "owner":
+        raise HTTPException(403, "owner only")
+    from ..sync import base as sync_base
+    conn = tenancy.tenant_connect(user["tenant_id"])
+    try:
+        it = conn.execute(
+            "SELECT aggregator, status, institution_id, "
+            "raw->>'days_requested' AS days, "
+            "raw->>'relink_session' AS pending FROM items WHERE id=%s",
+            (item_id,)).fetchone()
+        if it is None:
+            raise HTTPException(404, "no such connection")
+        # ValueError for the refusals: the door maps it to a 400 for JSON
+        # callers and to the redirect-with-message for form callers
+        if it["aggregator"] != "plaid" or (it["status"] or "") == "archived" \
+                or not sync_base.get_access_token(conn, item_id):
+            raise ValueError("only a linked Plaid bank is relinked for "
+                             "more history")
+        have = plaid.history_months_from_days(it["days"])
+        want = sync_base.history_months_of(budget.load_config(conn))
+        # None = everything: the widest there is, never wider than
+        if have is None or (want is not None and want <= have):
+            raise ValueError("this bank already has the history window you "
+                             "chose — widen the window first to pull more")
+        # one relink at a time: a second session bound to the same Item
+        # would overwrite the first's binding, and the first's finisher
+        # would then run it as a plain add and refuse it as a repeat
+        if it["pending"]:
+            from ..jobs import plaid_links
+            open_sess = plaid_links.load(it["pending"], user["tenant_id"])
+            if open_sess and not open_sess.get("done") \
+                    and not open_sess.get("cancelled"):
+                raise HTTPException(409, "a relink of this bank is already "
+                                         "in progress — finish it, or "
+                                         "close that bank window first")
+        return {"item_id": item_id, "institution_id": it["institution_id"]}
+    finally:
+        conn.close()
 
 
 def _plaid_session(link_token: str, user: dict) -> dict | None:
@@ -1392,7 +1534,9 @@ def plaid_link_status(link_token: str, user: dict = Depends(_user()),
         try:
             data = client.get_link_session(link_token)
         except plaid.PlaidError as e:
-            return {"done": False, "error": str(e)}
+            # Plaid's typed code, message and request id — never the
+            # exception's own text
+            return {"done": False, **e.public()}
         sessions = data.get("link_sessions") or []
         # ADD mode: exchange each public token Plaid reports and finish
         # the session (jobs/plaid_links.complete_add — the same code the

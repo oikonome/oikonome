@@ -1,7 +1,8 @@
 import { useIsMutating, useMutation, useQuery, useQueryClient }
   from "@tanstack/react-query";
 import { useRef, useState } from "react";
-import { api, errText, type HistoryMonths } from "../api/client";
+import { api, errText, type Connection, type HistoryMonths }
+  from "../api/client";
 import { saveSettings, SETTINGS_SAVES } from "../api/cache";
 import { isOwner } from "../role";
 
@@ -16,6 +17,23 @@ export const HISTORY_CHOICES: [HistoryMonths, string][] = [
 export function historyLabel(m: HistoryMonths | undefined): string {
   const hit = HISTORY_CHOICES.find(([v]) => v === (m ?? null));
   return (hit ? hit[1] : "Everything available").toLowerCase();
+}
+
+/** Is a bank's window narrower than the household's choice? A bank
+ *  linked with a shorter window keeps it (Plaid fixes the window when
+ *  the Item is created), so a wider choice made afterwards reaches that
+ *  bank only through a relink. null = everything. Mobile keeps the same
+ *  rule in wizard-logic.ts (windowNarrower). */
+export function windowNarrower(linked: HistoryMonths | null | undefined,
+                               household: HistoryMonths | null | undefined
+): boolean {
+  if (linked === null || linked === undefined) return false;
+  return household === null || household === undefined || linked < household;
+}
+
+/** The row's words for a bank's own window ("history: last month"). */
+export function historyRowNote(m: HistoryMonths | null | undefined): string {
+  return `history: ${historyLabel(m ?? null)}`;
 }
 
 /** The history write's key, so the doors that read the stored reach can
@@ -91,6 +109,12 @@ export default function HistoryChoice({ title = true, footnote = true }: {
   const saving = useHistorySaving();
   const current: HistoryMonths = picked !== undefined ? picked
     : (s.data?.history_months ?? null);
+  // the banks already linked keep the window they were linked with; the
+  // ones narrower than the choice shown are named, with the way out
+  const conns = useQuery({ queryKey: ["connections"], queryFn: api.connections });
+  const narrower = (conns.data?.connections ?? []).filter((c: Connection) =>
+    c.aggregator === "plaid" && (c.status || "") !== "reaped"
+    && windowNarrower(c.history_months, current));
   // The reach is the owner's: it is what the owner's next bank link asks
   // the aggregator for, and the server refuses anyone else a change. A
   // member or viewer reads where it stands rather than tapping pills that
@@ -132,6 +156,13 @@ export default function HistoryChoice({ title = true, footnote = true }: {
         <p className="mut" style={{ fontSize: 12, margin: ".2rem 0 0" }}>
           Banks share up to two years. You can pull in older history later
           from Accounts → Import.</p>)}
+      {narrower.length > 0 && (
+        <p style={{ fontSize: 13, margin: ".3rem 0 0", color: "var(--amber)" }}>
+          A bank keeps the window it was linked with:{" "}
+          {narrower.map((c) => `${c.institution_name || c.id} (${
+            historyLabel(c.history_months ?? null)})`).join(", ")}.
+          Use <b>pull more history</b> on the bank's row to relink it with
+          this window.</p>)}
       {saving && (
         <p className="mut" style={{ fontSize: 13, margin: ".3rem 0 0" }}>
           {HISTORY_SAVING}</p>)}

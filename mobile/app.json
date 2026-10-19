@@ -2,7 +2,7 @@
   "expo": {
     "name": "Oikonome",
     "slug": "oikonome",
-    "version": "1.2.33",
+    "version": "1.2.35",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "oikonome",

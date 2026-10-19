@@ -7,7 +7,7 @@ name = "oikonome"
 version = "0.1.0"
 description = "Know every morning if you are on budget."
 requires-python = ">=3.12"
-license = "LicenseRef-FSL-1.1-ALv2"
+license = "AGPL-3.0-or-later"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",

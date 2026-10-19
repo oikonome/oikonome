@@ -4896,19 +4896,32 @@ def assistant_ask_api(user: dict = Depends(_user()), body: dict = Body(...)):
         conn.close()
 
 
+# a saved conversation keeps its newest turns: this many, and this many
+# blocks in all (each block is at most a 6,000-character paragraph or a
+# bounded chart), so one request cannot ask for megabytes of SVG
+REPORT_TURNS = 50
+REPORT_BLOCKS = 120
+
+
 @router.post("/assistant/report",
              dependencies=[Depends(limit("assistant_report", 60, 3600))])
 def assistant_report_api(user: dict = Depends(_user()),
                          body: dict = Body(...)):
-    """One answer as a self-contained HTML page (inline SVG + CSS, no
-    script) to save or share. The client sends the turn back — nothing
-    is stored server-side — and every block is re-validated here, so a
-    client can no more smuggle markup into the file than the model can."""
+    """One answer — or, with `turns` (a list of {question, blocks}), a
+    whole conversation — as a self-contained HTML page (inline SVG +
+    CSS, no script) to save or share. The client sends the turns back —
+    nothing is stored server-side — and every block is re-validated
+    here, so a client can no more smuggle markup into the file than the
+    model can. A turn with nothing valid in it is left out; a report
+    with none is a 400. A conversation has no turn limit, so the page
+    keeps the NEWEST turns — the ones a person saving a long conversation
+    came for — up to REPORT_TURNS of them and REPORT_BLOCKS blocks in
+    all, and says how many earlier questions it left out; `partial` is
+    the client saying the conversation's start was not loaded on its
+    side either."""
     from ..engine import assistant, assistant_blocks
-    question = _body_text(body, "question")
-    blocks = assistant_blocks.clean(body.get("blocks"))
-    if not blocks:
-        raise HTTPException(400, "nothing to report")
+    # the cheap refusal first: nothing is parsed or drawn for an instance
+    # with no assistant
     conn = _conn(user)
     try:
         if not assistant.available(conn):
@@ -4916,8 +4929,45 @@ def assistant_report_api(user: dict = Depends(_user()),
         today = _today(conn)
     finally:
         conn.close()
-    page = assistant_blocks.report_html(question, blocks, today.isoformat())
-    name = f"oikonome-answer-{today.isoformat()}.html"
+    turns: list[tuple[str, list[dict]]] = []
+    omitted = 0
+    sent = body.get("turns")
+    if isinstance(sent, list):
+        valid: list[tuple[str, list[dict]]] = []
+        for t in sent:
+            if not isinstance(t, dict):
+                continue
+            blks = assistant_blocks.clean(t.get("blocks"))
+            if blks:
+                valid.append((_body_text(t, "question"), blks))
+        if not valid:
+            raise HTTPException(400, "nothing to report")
+        kept = valid[-REPORT_TURNS:]
+        while len(kept) > 1 and sum(len(b) for _, b in kept) > REPORT_BLOCKS:
+            kept = kept[1:]
+        omitted = len(valid) - len(kept)
+        turns = kept
+        question = turns[0][0]
+    else:
+        question = _body_text(body, "question")
+        blocks = assistant_blocks.clean(body.get("blocks"))
+        if not blocks:
+            raise HTTPException(400, "nothing to report")
+        turns.append((question, blocks))
+    partial = body.get("partial") is True
+    note = None
+    if omitted and partial:
+        note = (f"{omitted} earlier question{'s' if omitted != 1 else ''} in this "
+                "conversation not included, and the ones before them were not loaded")
+    elif omitted:
+        note = (f"{omitted} earlier question{'s' if omitted != 1 else ''} in this "
+                "conversation not included")
+    elif partial:
+        note = "earlier questions in this conversation not included (its start was not loaded)"
+    page = assistant_blocks.report_html(question, turns[0][1], today.isoformat(),
+                                        turns=turns, note=note)
+    what = "conversation" if len(turns) > 1 else "answer"
+    name = f"oikonome-{what}-{today.isoformat()}.html"
     return Response(page, media_type="text/html; charset=utf-8",
                     headers={"content-disposition":
                              f'attachment; filename="{name}"',
@@ -5155,6 +5205,16 @@ def accounts_classify_api(user: dict = Depends(_user()),
             # the runway ignores a business account unless the household
             # combines entities (forecast); a pin the forecast will not
             # honour must be refused, not saved
+            # …and a disconnected or restored-shell bank's account is a
+            # frozen balance the forecast ignores (forecast._checking_start)
+            if pin and conn.execute(
+                    "SELECT 1 FROM accounts a JOIN items i ON i.id = a.item_id "
+                    "WHERE a.id=%s AND i.aggregator IN ('plaid','mx','simplefin','simplefin-org') "
+                    "AND COALESCE(i.status,'') IN ('archived','restored')",
+                    (account_id,)).fetchone():
+                raise HTTPException(
+                    400, "that account's bank is disconnected — reconnect "
+                         "it, or pick a live checking account")
             if pin and row["entity_id"] and not cfg.get("combine_entities"):
                 raise HTTPException(
                     400, "a business account cannot be the household's "
@@ -6158,6 +6218,9 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
             raise HTTPException(403, why)
     from ..engine import budget
     conn = _conn(user)
+    # set inside the lock when the wizard's connect step is left; the pin
+    # itself takes the same lock, so it runs after this one is let go
+    pin_primary_after = False
     try:
         # The whole 500-line body is one read-modify-write
         # of the settings document, so a second save that read before
@@ -6298,6 +6361,11 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                         raise HTTPException(
                             400, "step state must be done|skipped|null")
                 cfg["wizard_steps"] = steps
+                # leaving the connect step with one checking account in:
+                # the forecast's anchor is obvious, pin it now so the
+                # Today checklist's step closes with the wizard's
+                if raw.get("connect") in ("done", "skipped"):
+                    pin_primary_after = True
             if "biz_wizard_steps" in body:
                 # The BUSINESS setup wizard's per-step marks. Separate key from
                 # wizard_steps on purpose: they are different flows with
@@ -7513,6 +7581,10 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
             _ri.carry_acceptance(user["tenant_id"], _prev_entries)
         added = mailguard.added_recipients(_prev_asked,
                                            cfg.get("email_recipients"))
+        if pin_primary_after:
+            from ..engine import forecast
+            if forecast.auto_pin_primary_checking(conn):
+                cfg = budget.load_config(conn)
         view = _settings_view(cfg)
         if added:
             mailguard.invite_added(user, added)
@@ -8798,6 +8870,16 @@ def _categorize_after_import(tenant_id: str) -> None:
             # the same single-flight lock as the pass after a pull — which
             # is also what an account erasure waits on, so a pass in flight
             # finishes before the rows go and none starts during the wipe
+            # a files-only household's first import creates its checking
+            # row: with one, the forecast's anchor is pinned here, as a
+            # bank's first pull pins it
+            try:
+                from ..engine import forecast
+                forecast.auto_pin_primary_checking(conn)
+            except Exception as e:                          # noqa: BLE001
+                logging.getLogger("oikonome.import").warning(
+                    "post-import primary checking pick failed tenant=%s: %s",
+                    tenant_id, e)
             with sync_base.categorize_lock(conn, tenant_id) as held:
                 if held:
                     llm_categorize.categorize_new(conn)
@@ -9424,6 +9506,16 @@ def onboarding_api(user: dict = Depends(_user())):
                        WHERE status='pending') AS pending_proposals""").fetchone()
         cfg = budget.load_config(conn)
         budgets_set = _budgets_set(conn)
+        # the accounts the household is asked to choose between: one is
+        # pinned by itself, two or more are a question the wizard and the
+        # Today checklist ask (closed imports without a balance are not
+        # offered next to a live account)
+        from ..engine import forecast
+        candidates = forecast.pickable_checking_ids(conn, cfg)
+        # the pin as the forecast honours it (forecast.pin_is_live): one on
+        # a disconnected bank's account reads as unset, so the checklist
+        # asks for a new one
+        pin_live = forecast.pin_is_live(conn, cfg)
     finally:
         conn.close()
     return {"accounts": counts["accounts"],
@@ -9435,7 +9527,10 @@ def onboarding_api(user: dict = Depends(_user())):
             "connections": counts["connections"],
             "pending_proposals": counts["pending_proposals"],
             "budgets_set": budgets_set,
-            "primary_checking_set": bool(cfg.get("checking_account_id")),
+            "primary_checking_set": pin_live,
+            "primary_checking_id": (cfg.get("checking_account_id") or None)
+            if pin_live else None,
+            "checking_candidates": candidates,
             # the guided wizard is offered until every step is
             # done or the user dismisses it for good
             "wizard_done": bool(cfg.get("wizard_done")),

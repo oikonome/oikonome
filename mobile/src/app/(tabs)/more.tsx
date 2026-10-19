@@ -62,6 +62,7 @@ const PAGES: [string, string, string, IconName][] = [
 
 // The version opens the release notes index on GitHub. Same as the web.
 const RELEASES = "https://github.com/oikonome/oikonome/releases";
+const SOURCE = "https://github.com/oikonome/oikonome";
 
 export default function More() {
   const router = useRouter();
@@ -140,6 +141,9 @@ export default function More() {
                 onPress={() => Linking.openURL(RELEASES)}>
             Oikonome {me.data.version}
           </Text>
+          {/* free software: the source of what is running is one tap away */}
+          {" · "}
+          <Text style={{ color: C.accent }} onPress={() => Linking.openURL(SOURCE)}>source</Text>
           {ext.legal.privacy ? (
             <>
               {" · "}

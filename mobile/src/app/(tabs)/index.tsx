@@ -14,6 +14,8 @@ import Sparkline from "../../components/sparkline";
 import StaleBanner from "../../components/stale-banner";
 import TxnRow from "../../components/txn-row";
 import { Meter } from "../../components/ui";
+import { checklistOpen, checklistSteps } from "../../components/wizard-logic";
+import { PrimaryCheckingPick } from "../../components/wizard-primary-checking";
 import { alertRoute } from "../../lib/alert-routes";
 import { consumeLaunch, launchSettled } from "../../lib/launch";
 import { errText, setHandedOffTxn, type Alert, type AlertRow, type Txn,
@@ -239,9 +241,7 @@ export default function Today() {
   // setup incomplete → the checklist card. OWNER only — the wizard
   // connects banks and configures the household, so a member's button
   // would lead to a page that turns them away (web: useSetupPending)
-  const setupOpen = owner && ob.data && (!ob.data.budgets_set
-    || ob.data.transactions === 0 || ob.data.accounts === 0
-    || ob.data.bills === 0);
+  const setupOpen = owner && ob.data && checklistOpen(ob.data);
 
   // A new account lands IN the guided setup, not on an empty dashboard —
   // the web's rule (App.tsx: wantsWizard). Signup and login both end up
@@ -396,43 +396,36 @@ export default function Today() {
           {d.is_today && setupOpen && ob.data!.wizard_done && (
             <View style={s.card}>
               <Text style={s.h2}>Welcome — let&apos;s finish setting up</Text>
-              {ob.data && (() => {
-                const steps = [ob.data.accounts > 0,
-                               ob.data.transactions > 0,
-                               ob.data.bills > 0, ob.data.budgets_set,
-                               ob.data.primary_checking_set];
-                const done = steps.filter(Boolean).length;
+              {(() => {
+                const steps = checklistSteps(ob.data!);
+                const done = steps.filter((x) => x.done).length;
                 return (
-                  <Text style={s.mut}>
-                    {done}/{steps.length} done. Every step is reversible.
-                  </Text>
+                  <>
+                    <Text style={s.mut}>
+                      {done}/{steps.length} done. Every step is reversible.
+                    </Text>
+                    {steps.map((x) => (
+                      <View key={x.key}>
+                        <Text style={{ color: x.done ? C.mut : C.accent,
+                                       fontSize: 13, paddingVertical: 2,
+                                       textDecorationLine: x.done
+                                         ? "line-through" : "none" }}
+                              onPress={x.done ? undefined
+                                : () => router.push(x.href as never)}>
+                          {x.done ? "☑" : "☐"} {x.label}
+                        </Text>
+                        {/* the choice is made here, on the tap — the
+                            Accounts edit sheet is the long way round */}
+                        {!x.done && x.key === "checking" && (
+                          <PrimaryCheckingPick compact
+                            candidates={ob.data!.checking_candidates ?? []}
+                            pinned={ob.data!.primary_checking_id ?? null} />
+                        )}
+                      </View>
+                    ))}
+                  </>
                 );
               })()}
-              {([
-                [ob.data!.accounts > 0,
-                 `Connect or add accounts (${ob.data!.accounts})`,
-                 "/accounts"],
-                [ob.data!.transactions > 0,
-                 `Bring in transactions (${ob.data!.transactions})`,
-                 "/imports"],
-                [ob.data!.bills > 0,
-                 `Confirm recurring bills (${ob.data!.bills})`,
-                 "/bills"],
-                [ob.data!.budgets_set, "Set your budgets", "/budget"],
-                [ob.data!.primary_checking_set,
-                 "Pick your primary checking", "/accounts"],
-              ] as [boolean, string, string][]).map(([done, label,
-                                                     href]) => (
-                <Text key={label}
-                      style={{ color: done ? C.mut : C.accent,
-                               fontSize: 13, paddingVertical: 2,
-                               textDecorationLine: done
-                                 ? "line-through" : "none" }}
-                      onPress={done ? undefined
-                        : () => router.push(href as never)}>
-                  {done ? "☑" : "☐"} {label}
-                </Text>
-              ))}
               {ob.data!.pending_proposals > 0 && (
                 <Text style={{ color: C.warn, fontSize: 12 }}>
                   {ob.data!.pending_proposals} detected bill

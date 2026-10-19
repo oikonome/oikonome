@@ -24,7 +24,14 @@ instead. OVER means variable spending is ahead of pace, nothing else.
 File imports don't carry balances, so a file-only account starts at $0.
 On the Accounts page, edit the account and type the real balance (manual
 accounts have an editable $ field), and tick **primary checking** so the
-cash forecast anchors on it. Connected accounts get their balance from
+cash forecast anchors on it. A household with exactly one checking
+account gets it pinned by itself when the first bank or file import
+brings it in, or when the wizard's Connect step is left; with two or
+more, the wizard asks which, and the Today checklist offers the same
+choice until one is picked. Closed accounts kept for their history (a
+file import with no balance) are not offered next to a live one. If a
+bank relink gives your pinned account a new identity, the pin moves to
+the account the forecast already uses (the largest balance) overnight. Connected accounts get their balance from
 the provider on every sync.
 
 **Can I get the summaries as a text message or a notification instead
@@ -478,6 +485,14 @@ The household's history window (Last month / 3 months / 6 months / 1 year
 it are skipped and the import says how many. To bring them in, widen the
 window on the Import page (or choose **Everything available**) and import
 the file again — rows already in are recognised, not duplicated.
+
+**A bank I linked only has a month (or a few) of history — why?**
+A bank keeps the history window that was chosen when it was linked; its
+row on Accounts says so (**history: last month**). Widen the window, then
+use **more history ↗** on the bank's row (**pull more history** in the
+setup wizard): you sign in at the same bank again, the old connection
+keeps syncing until the new one is in, and nothing already imported is
+lost. The relink does not count against an institution limit.
 
 **Bills I entered myself — why doesn't the app propose new ones?**
 Choosing **I'll enter them myself** in the setup wizard turns off the

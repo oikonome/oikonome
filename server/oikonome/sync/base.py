@@ -81,12 +81,15 @@ def released_count(conn) -> int:
     Item on the household's own keys is their bill, not the instance's.
     So is an Item handed back as a repeat of a login the household already
     holds (sync.plaid.REPEAT_LEDGER_REASON): the household reached for no
-    new institution, and the repeats are bounded by their own limit."""
+    new institution, and the repeats are bounded by their own limit. And so
+    is an Item released to link the same bank again for a wider history
+    window (RELINK_LEDGER_REASON), for the same reason."""
     row = conn.execute(
         """SELECT COUNT(*) AS n FROM plaid_item_ledger l
            WHERE l.tenant = current_setting('app.tenant_id', true)
              AND l.credential_source = 'platform'
              AND l.removed_reason IS DISTINCT FROM 'repeat'
+             AND l.removed_reason IS DISTINCT FROM 'relink'
              AND COALESCE(l.removed_at, l.created_at)
                  >= now() - make_interval(days => %s)
              AND NOT EXISTS (
@@ -103,16 +106,21 @@ def institutions_held(conn) -> int:
     return institution_count(conn) + released_count(conn)
 
 
-def check_institution_cap(conn) -> None:
+def check_institution_cap(conn, spare: int = 0) -> None:
     """Raise ValueError (friendly copy) when connecting one more
     institution would pass the instance's cap. Call before opening any
     ADD-a-connection door; update/repair flows are exempt. The cap counts
     live institutions AND Items released in the last RELEASED_HOLD_DAYS,
-    so a disconnected slot frees once that window has passed."""
+    so a disconnected slot frees once that window has passed.
+
+    `spare`: slots the caller is about to free — a relink of the same
+    bank for a wider history window keeps the old Item live until the
+    new one is in, so for that one link the old Item's place counts as
+    free; the old Item is released the moment the new one is saved."""
     cap = institution_cap(conn)
     if cap is None:
         return
-    n = institutions_held(conn)
+    n = institutions_held(conn) - max(0, spare)
     if n >= cap:
         # the installed gate words the refusal — it knows what the cap is
         # and what, if anything, lifts it
@@ -208,13 +216,26 @@ BRIDGE_DISCONNECT = "bridge-disconnect"
 DISCONNECT_KEEPS_TOKEN = ("plan_csv",)
 
 
-def disconnect_item(conn, item_id: str) -> dict:
+# The Plaid ledger reason of an Item released so the same bank can be
+# linked again with a wider history window (the window is fixed when an
+# Item is created). Not counted under the institution cap.
+RELINK_LEDGER_REASON = "relink"
+
+
+def disconnect_item(conn, item_id: str, *,
+                    reason: str = "disconnect") -> dict:
     """Archive a connection so it stops syncing; history is kept.
 
     For Plaid this ALSO releases the Item on Plaid's side (``/item/remove``)
     — a local archive alone never frees a billing slot. Returns
     ``{ok, plaid_released, release_failed, note, aggregator}``.
     Raises ``KeyError`` if the item does not exist.
+
+    `reason` is what the Plaid ledger records for the release:
+    "disconnect" (the default) holds the slot under the institution cap
+    for the hold window; RELINK_LEDGER_REASON does not — the household is
+    about to link the same bank again for a wider history window, and
+    reaches for no new institution.
     """
     it = conn.execute(
         "SELECT id, aggregator, status FROM items WHERE id=%s",
@@ -279,7 +300,7 @@ def disconnect_item(conn, item_id: str) -> dict:
             (item_id,))
         if plaid_released:
             from . import plaid as plaid_mod
-            plaid_mod.stamp_ledger_removed(item_id, "disconnect")
+            plaid_mod.stamp_ledger_removed(item_id, reason)
     elif agg == "simplefin-org":
         # One bank cut on its own is the owner's choice about that bank (a
         # duplicate of another feed, one they are done with), so it carries

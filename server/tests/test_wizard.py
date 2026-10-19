@@ -128,6 +128,260 @@ class WizardApiTests(unittest.TestCase):
         self.assertEqual(self.client.post("/api/settings", json={
             "wizard_steps": {"connect": "maybe"}}).status_code, 400)
 
+    def _add_checking(self, conn, acct_id: str, name: str, bal: float = 100.0):
+        conn.execute(
+            """INSERT INTO items (id, aggregator, institution_name, access_token)
+               SELECT 'manual','manual','Manual',NULL
+               WHERE NOT EXISTS (SELECT 1 FROM items WHERE id='manual')""")
+        conn.execute(
+            """INSERT INTO accounts (id, item_id, name, type, subtype,
+                                     balance_current, updated_at)
+               VALUES (%s,'manual',%s,'depository','checking',%s,now())""",
+            (acct_id, name, bal))
+
+    def test_one_checking_account_is_pinned_when_the_connect_step_is_left(self):
+        """Leaving the wizard's connect step with a single checking
+        account in pins it as the primary checking: the Today checklist's
+        step closes with the wizard's instead of staying open for a choice
+        that was never a choice."""
+        from oikonome.engine import budget
+        conn = self._conn()
+        try:
+            budget.save_config(conn, {k: v for k, v in budget.load_config(conn).items()
+                                      if k != "checking_account_id"})
+            conn.execute("DELETE FROM accounts")
+            self._add_checking(conn, "manual:chk-only", "Checking")
+        finally:
+            conn.close()
+        ob = self.client.get("/api/onboarding").json()
+        self.assertFalse(ob["primary_checking_set"])
+        self.assertEqual(ob["checking_candidates"], ["manual:chk-only"])
+        r = self.client.post("/api/settings",
+                             json={"wizard_steps": {"connect": "done"}})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["checking_account_id"], "manual:chk-only")
+        ob = self.client.get("/api/onboarding").json()
+        self.assertTrue(ob["primary_checking_set"])
+        self.assertEqual(ob["primary_checking_id"], "manual:chk-only")
+
+    def test_two_checking_accounts_are_a_question_not_a_guess(self):
+        """With two eligible checking accounts nothing is pinned: the
+        wizard asks, and both are offered as candidates."""
+        from oikonome.engine import budget, forecast
+        conn = self._conn()
+        try:
+            budget.save_config(conn, {k: v for k, v in budget.load_config(conn).items()
+                                      if k != "checking_account_id"})
+            conn.execute("DELETE FROM accounts")
+            self._add_checking(conn, "manual:chk-a", "Checking A", 500)
+            self._add_checking(conn, "manual:chk-b", "Checking B", 50)
+            self.assertIsNone(forecast.auto_pin_primary_checking(conn))
+        finally:
+            conn.close()
+        self.client.post("/api/settings",
+                         json={"wizard_steps": {"connect": "done"}})
+        ob = self.client.get("/api/onboarding").json()
+        self.assertFalse(ob["primary_checking_set"])
+        self.assertEqual(ob["checking_candidates"],
+                         ["manual:chk-a", "manual:chk-b"])
+        # an existing pin is never moved by the auto-pick
+        conn = self._conn()
+        try:
+            with budget.config_txn(conn) as cfg:
+                cfg["checking_account_id"] = "manual:chk-b"
+            conn.execute("DELETE FROM accounts WHERE id='manual:chk-a'")
+            self.assertIsNone(forecast.auto_pin_primary_checking(conn))
+            self.assertEqual(budget.load_config(conn)["checking_account_id"],
+                             "manual:chk-b")
+        finally:
+            conn.close()
+
+    def test_a_disconnected_banks_account_is_neither_pinned_nor_pickable(self):
+        """A bank that was disconnected (or restored as a shell) left its
+        accounts behind as history: they are not candidates, the auto-pick
+        never takes one, and the pin door refuses one — a frozen balance
+        is no anchor for the cash forecast."""
+        from oikonome.engine import budget, forecast
+        conn = self._conn()
+        try:
+            budget.save_config(conn, {k: v for k, v in budget.load_config(conn).items()
+                                      if k != "checking_account_id"})
+            conn.execute("DELETE FROM accounts")
+            conn.execute(
+                """INSERT INTO items (id, aggregator, institution_name,
+                                      access_token, status)
+                   SELECT 'pl-dead','plaid','Old Bank',NULL,'archived'
+                   WHERE NOT EXISTS (SELECT 1 FROM items WHERE id='pl-dead')""")
+            conn.execute(
+                """INSERT INTO accounts (id, item_id, name, type, subtype,
+                                         balance_current, updated_at)
+                   VALUES ('pl-dead:chk','pl-dead','Old checking','depository',
+                           'checking',900,now())""")
+            self.assertEqual(forecast.eligible_checking_ids(
+                conn, budget.load_config(conn)), [])
+            self.assertIsNone(forecast.auto_pin_primary_checking(conn))
+        finally:
+            conn.close()
+        r = self.client.post("/api/accounts/classify",
+                             json={"account_id": "pl-dead:chk",
+                                   "kind": "depository/checking",
+                                   "primary_checking": True})
+        self.assertEqual(r.status_code, 400, r.text)
+
+    def test_a_restored_manual_checking_account_is_still_live(self):
+        """An export restore leaves manual and file-import items wearing
+        'restored' too; only an aggregator's restored shell is a dead
+        bank. The manual checking stays a candidate, is auto-pinned, and
+        the pin counts on the checklist."""
+        from oikonome.engine import budget, forecast
+        conn = self._conn()
+        try:
+            budget.save_config(conn, {k: v for k, v in budget.load_config(conn).items()
+                                      if k != "checking_account_id"})
+            conn.execute("DELETE FROM accounts")
+            conn.execute(
+                """INSERT INTO items (id, aggregator, institution_name,
+                                      access_token, status)
+                   SELECT 'manual','manual','Manual',NULL,'restored'
+                   WHERE NOT EXISTS (SELECT 1 FROM items WHERE id='manual')""")
+            conn.execute("UPDATE items SET status='restored' WHERE id='manual'")
+            self._add_checking(conn, "manual:restored-chk", "Checking", 250)
+            self.assertEqual(forecast.eligible_checking_ids(
+                conn, budget.load_config(conn)), ["manual:restored-chk"])
+            self.assertEqual(forecast.auto_pin_primary_checking(conn),
+                             "manual:restored-chk")
+        finally:
+            conn.close()
+        ob = self.client.get("/api/onboarding").json()
+        self.assertTrue(ob["primary_checking_set"])
+        self.assertEqual(ob["primary_checking_id"], "manual:restored-chk")
+
+    def test_closed_imports_without_a_balance_are_not_offered_next_to_a_live_account(self):
+        """A household that imported years of history carries the closed
+        accounts those files described; none has a balance. They are
+        eligible — the forecast may fall through to them — but the
+        question "which account does the cash forecast anchor on?" offers
+        only the accounts that carry a balance, so the wizard's pills and
+        the Today checklist do not list an old import beside the live
+        checking. With every account balance-less (a files-only
+        first import) they are all offered, as before."""
+        from oikonome.engine import budget, forecast
+        conn = self._conn()
+        try:
+            budget.save_config(conn, {k: v for k, v in budget.load_config(conn).items()
+                                      if k != "checking_account_id"})
+            conn.execute("DELETE FROM accounts")
+            self._add_checking(conn, "manual:live-a", "Checking", 500)
+            self._add_checking(conn, "manual:live-b", "Cash", 50)
+            conn.execute(
+                """INSERT INTO accounts (id, item_id, name, type, subtype,
+                                         balance_current, updated_at)
+                   VALUES ('old-bank','manual','Old Bank checking',
+                           'depository','checking',NULL,now())""")
+            cfg = budget.load_config(conn)
+            self.assertIn("old-bank", forecast.eligible_checking_ids(conn, cfg))
+            self.assertEqual(forecast.pickable_checking_ids(conn, cfg),
+                             ["manual:live-a", "manual:live-b"])
+            # nothing carries a balance: every eligible account is offered
+            conn.execute("UPDATE accounts SET balance_current=NULL")
+            self.assertEqual(
+                sorted(forecast.pickable_checking_ids(conn, cfg)),
+                ["manual:live-a", "manual:live-b", "old-bank"])
+        finally:
+            conn.close()
+        ob = self.client.get("/api/onboarding").json()
+        self.assertFalse(ob["primary_checking_set"])
+        self.assertEqual(sorted(ob["checking_candidates"]),
+                         ["manual:live-a", "manual:live-b", "old-bank"])
+
+    def test_a_dead_pin_is_replaced_where_the_forecast_already_anchors(self):
+        """A pin carried over from an export whose accounts were re-created
+        (or left behind by a purge) names a row that no longer exists; a
+        removal by the household makes a row gone too. A relink keeps the
+        old row on the archived Item, so it is the KEPT case below, not
+        this one. The forecast falls through to the
+        largest balance, and the auto-pick moves the pin there — the
+        household chose once and is not asked again — while a household
+        that never pinned is still asked. A dead pin whose row STILL
+        EXISTS (its bank disconnected, reaped or restored as a shell) is
+        kept: the reconnect's adoption carries it onto the new Item, and
+        moving it meanwhile would lose the choice for good."""
+        from oikonome.engine import budget, forecast
+        conn = self._conn()
+        try:
+            conn.execute("DELETE FROM accounts")
+            self._add_checking(conn, "manual:chk-big", "Checking", 900)
+            self._add_checking(conn, "manual:chk-small", "Cash", 20)
+            # the pinned account sits on a disconnected bank: dead, kept
+            conn.execute(
+                """INSERT INTO items (id, aggregator, institution_name,
+                                      access_token, status)
+                   SELECT 'pl-away','plaid','Away Bank',NULL,'archived'
+                   WHERE NOT EXISTS (SELECT 1 FROM items WHERE id='pl-away')""")
+            conn.execute(
+                """INSERT INTO accounts (id, item_id, name, type, subtype,
+                                         balance_current, updated_at)
+                   VALUES ('pl-away:chk','pl-away','Chosen checking',
+                           'depository','checking',2000,now())""")
+            with budget.config_txn(conn) as cfg:
+                cfg["checking_account_id"] = "pl-away:chk"
+            self.assertFalse(forecast.pin_is_live(conn, budget.load_config(conn)))
+            self.assertIsNone(forecast.auto_pin_primary_checking(conn))
+            self.assertEqual(budget.load_config(conn)["checking_account_id"],
+                             "pl-away:chk")
+            # …and kept just the same when one other account is the ONLY
+            # pickable one — the case the one-account auto-pin would
+            # otherwise have taken
+            conn.execute("DELETE FROM accounts WHERE id='manual:chk-small'")
+            self.assertEqual(forecast.pickable_checking_ids(
+                conn, budget.load_config(conn)), ["manual:chk-big"])
+            self.assertIsNone(forecast.auto_pin_primary_checking(conn))
+            self.assertEqual(budget.load_config(conn)["checking_account_id"],
+                             "pl-away:chk")
+            self._add_checking(conn, "manual:chk-small", "Cash", 20)
+            # the household removes that account: the pin is gone for good
+            conn.execute("UPDATE accounts SET user_removed_at=now() "
+                         "WHERE id='pl-away:chk'")
+            self.assertEqual(forecast.auto_pin_primary_checking(conn),
+                             "manual:chk-big")
+            # a pin on an id no row carries (an export's pin, a purge)
+            with budget.config_txn(conn) as cfg:
+                cfg["checking_account_id"] = "plaid:gone-with-the-relink"
+            self.assertFalse(forecast.pin_is_live(conn, budget.load_config(conn)))
+            self.assertEqual(forecast.auto_pin_primary_checking(conn),
+                             "manual:chk-big")
+            self.assertTrue(forecast.pin_is_live(conn, budget.load_config(conn)))
+            # a live pin is never moved, even off the smaller account
+            with budget.config_txn(conn) as cfg:
+                cfg["checking_account_id"] = "manual:chk-small"
+            self.assertIsNone(forecast.auto_pin_primary_checking(conn))
+            # never pinned + two candidates: still a question
+            with budget.config_txn(conn) as cfg:
+                cfg.pop("checking_account_id", None)
+            self.assertIsNone(forecast.auto_pin_primary_checking(conn))
+        finally:
+            conn.close()
+        ob = self.client.get("/api/onboarding").json()
+        self.assertFalse(ob["primary_checking_set"])
+
+    def test_an_excluded_checking_account_is_not_pinned(self):
+        """An account the household hid from every total is not its
+        checking account — the auto-pick skips it the way the forecast's
+        own pick does."""
+        from oikonome.engine import budget, forecast
+        conn = self._conn()
+        try:
+            with budget.config_txn(conn) as cfg:
+                cfg.pop("checking_account_id", None)
+                cfg["excluded_accounts"] = ["manual:chk-x"]
+            conn.execute("DELETE FROM accounts")
+            self._add_checking(conn, "manual:chk-x", "Old checking")
+            self.assertIsNone(forecast.auto_pin_primary_checking(conn))
+            self.assertEqual(forecast.eligible_checking_ids(
+                conn, budget.load_config(conn)), [])
+        finally:
+            conn.close()
+
     def test_onboarding_counts_connections_not_children(self):
         conn = self._conn()
         try:

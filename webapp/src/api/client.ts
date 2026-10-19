@@ -1199,6 +1199,11 @@ export interface Onboarding {
   accounts: number; transactions: number; bills: number;
   connections: number; pending_proposals: number;
   budgets_set: boolean; primary_checking_set: boolean;
+  // the pinned primary checking, and the accounts the forecast could
+  // anchor on (one is pinned by itself when the wizard's connect step is
+  // left; two or more are a question the step asks)
+  primary_checking_id?: string | null;
+  checking_candidates?: string[];
   wizard_done: boolean;
   wizard_steps: Partial<Record<WizardStep, "done" | "skipped">>;
   // the setup choices the wizard made, read back so a resumed wizard and
@@ -1635,6 +1640,10 @@ export interface Connection {
                                     code?: string }> | null;
   // accounts this connection feeds (the linked-bank rows show it)
   accounts?: number;
+  // the history window this bank was linked with (1/3/6/12 months, null
+  // = everything). Fixed at Plaid when the Item was created: a wider
+  // choice made later only reaches it through a relink.
+  history_months?: HistoryMonths | null;
 }
 export interface Holding {
   acct: string; symbol: string; fund: string | null;
@@ -2378,7 +2387,12 @@ export const api = {
   // manage_accounts (update mode only) opens Link's shared-accounts
   // checklist — deselecting an account there is the only lever that stops
   // Plaid billing it; a local hide can't change what the Item shares.
-  plaidLinkStart: (item_id = "", manage_accounts = false) =>
+  // relink_item_id: a linked bank to relink with the household's (wider)
+  // history window. It stays live until the new link of the same bank is
+  // saved, and is released only then; a sign-in at another bank just adds
+  // it. A second relink of a bank already being relinked is refused (409).
+  plaidLinkStart: (item_id = "", manage_accounts = false,
+                   relink_item_id = "") =>
     req<{ link_token: string; hosted_link_url: string;
           kind: string; institution: string | null }>(
       "/accounts/plaid/link", {
@@ -2390,6 +2404,7 @@ export const api = {
         body: new URLSearchParams({
           ...(item_id ? { item_id } : {}),
           ...(manage_accounts ? { manage_accounts: "1" } : {}),
+          ...(relink_item_id ? { relink_item_id } : {}),
         }).toString(),
       }),
   plaidLinkStatus: (link_token: string) =>
@@ -3132,16 +3147,24 @@ export const assistant = {
       `/api/assistant/history/${encodeURIComponent(turnId)}`, { method: "DELETE" }),
   clear: () =>
     req<{ ok: boolean; deleted: number }>("/api/assistant/history", { method: "DELETE" }),
-  // one answer as a self-contained HTML page, handed to the browser as a
-  // download; the server re-validates the blocks and draws the charts
-  report: async (question: string, blocks: AnswerBlock[]) => {
+  // a whole conversation — its questions and answers in order — as one
+  // self-contained HTML page, handed to the browser as a download; the
+  // server re-validates every block and draws the charts
+  // `partial`: the conversation's start is not loaded, so the page says
+  // earlier questions are missing. The first turn also rides as the
+  // single-answer body (`question` + `blocks`) a server older than
+  // conversations understands — it then renders that answer alone
+  // instead of refusing with "nothing to report".
+  report: async (turns: { question: string; blocks: AnswerBlock[] }[], partial = false) => {
     const r = await rawFetch("/api/assistant/report", {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ question, blocks }), credentials: "same-origin",
+      body: JSON.stringify({ turns, partial, question: turns[0]?.question ?? "",
+                             blocks: turns[0]?.blocks ?? [] }),
+      credentials: "same-origin",
     });
     if (!r.ok) await settle<never>(r);
     const name = /filename="?([^";]+)/.exec(r.headers.get("content-disposition") ?? "")?.[1]
-      ?? "oikonome-answer.html";
+      ?? "oikonome-conversation.html";
     const url = URL.createObjectURL(await r.blob());
     const a = document.createElement("a");
     a.href = url;

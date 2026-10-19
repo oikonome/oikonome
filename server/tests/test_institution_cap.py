@@ -8,6 +8,7 @@ case."""
 
 import os
 import unittest
+from unittest import mock
 import uuid
 
 from oikonome.db import tenancy
@@ -160,7 +161,10 @@ class CapCheckTests(unittest.TestCase):
         self._ledger(self._id("p-gone1"), removed_days_ago=3, created_days_ago=4)
         self._ledger(self._id("p-gone2"), removed_days_ago=1, created_days_ago=2)
         self.assertEqual(sync_base.institutions_held(self.conn), 3)
-        with self.assertRaises(ValueError):
+        # the cap is the installed gate's answer; pin it at the seam the
+        # product owns, so the test holds whatever gate the venv carries
+        with mock.patch.object(sync_base, "institution_cap", return_value=3), \
+                self.assertRaises(ValueError):
             sync_base.check_institution_cap(self.conn)
 
     def test_a_release_frees_its_place_after_the_hold_window(self):
@@ -192,9 +196,13 @@ class PlaidDoorTests(unittest.TestCase):
         _ensure_db()
         cls._saved = {k: os.environ.get(k) for k in
                       ("OIKONOME_DEV", "OIKONOME_HOSTED",
-                       "OIKONOME_HOSTED_MAX_INSTITUTIONS")}
+                       "OIKONOME_HOSTED_MAX_INSTITUTIONS",
+                       "OIKONOME_HOSTED_BILLING")}
+        # a hosted instance with no billing add-on installed is a documented
+        # mode only when it says so; the door under test is the product's
         os.environ.update({"OIKONOME_DEV": "1", "OIKONOME_HOSTED": "1",
-                           "OIKONOME_HOSTED_MAX_INSTITUTIONS": "1"})
+                           "OIKONOME_HOSTED_MAX_INSTITUTIONS": "1",
+                           "OIKONOME_HOSTED_BILLING": "none"})
         from fastapi.testclient import TestClient
 
         from oikonome.auth import sessions

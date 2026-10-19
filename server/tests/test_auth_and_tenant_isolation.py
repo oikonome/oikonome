@@ -3,6 +3,7 @@ self-host signup gate, encrypted aggregator secrets, export scrubbing,
 single-winner invite claims, session eviction, and the SSRF policy."""
 
 import os
+import socket
 import threading
 import unittest
 import uuid
@@ -198,6 +199,10 @@ class AuthIsolationTests(unittest.TestCase):
                 netguard.check_url("http://127.0.0.1:11434", what="llm")
             with self.assertRaises(netguard.BlockedURL):
                 netguard.check_url("http://10.0.0.5:6379")
+            try:
+                socket.getaddrinfo("api.openai.com", 443)
+            except OSError:
+                self.skipTest("the public-host leg needs DNS")
             netguard.check_url("https://api.openai.com/v1")   # public: ok
         finally:
             os.environ.pop("OIKONOME_HOSTED", None)

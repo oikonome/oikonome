@@ -427,6 +427,10 @@ export interface Connection {
   product_issues?: Record<string, { cause: "consent" | "not_supported";
                                     code?: string }> | null;
   accounts?: number;
+  // the history window this bank was linked with (1/3/6/12 months, null
+  // = everything). Fixed at Plaid when the Item was created: a wider
+  // choice made later only reaches it through a relink.
+  history_months?: 1 | 3 | 6 | 12 | null;
 }
 export interface Holding {
   acct: string; symbol: string; fund: string | null;
@@ -456,6 +460,11 @@ export interface Onboarding {
   accounts: number; transactions: number; bills: number;
   connections: number; pending_proposals: number;
   budgets_set: boolean; primary_checking_set: boolean;
+  // the pinned primary checking, and the accounts the forecast could
+  // anchor on (one is pinned by itself when the wizard's connect step is
+  // left; two or more are a question the step asks)
+  primary_checking_id?: string | null;
+  checking_candidates?: string[];
   wizard_done: boolean;
   // per-step done/skipped marks — where the wizard resumes
   wizard_steps: Record<string, string>;
@@ -2988,7 +2997,11 @@ export function makeClient(baseUrl: string, token: string,
       return { ok: r.ok, message: msg ?? (r.ok ? "synced" : "sync failed") };
     },
     // Plaid Hosted Link — the app polls; there is no redirect back
-    plaidLinkStart: (itemId = "", manageAccounts = false) =>
+    // relinkItemId: a linked bank to link afresh with the household's
+    // (wider) history window; it stays live until the new link of the
+    // same bank is saved (409 while a relink of it is already open)
+    plaidLinkStart: (itemId = "", manageAccounts = false,
+                     relinkItemId = "") =>
       req<{ link_token: string; hosted_link_url: string;
             kind: "add" | "update"; institution: string | null }>(
         "/accounts/plaid/link", {
@@ -2998,6 +3011,7 @@ export function makeClient(baseUrl: string, token: string,
           body: new URLSearchParams({
             ...(itemId ? { item_id: itemId } : {}),
             ...(manageAccounts ? { manage_accounts: "1" } : {}),
+            ...(relinkItemId && !itemId ? { relink_item_id: relinkItemId } : {}),
           }).toString(),
         }),
     plaidLinkStatus: (linkToken: string) =>
@@ -3603,12 +3617,21 @@ export function makeClient(baseUrl: string, token: string,
     // the blocks and draws the charts), written to the cache and handed
     // to the share sheet like every other download — swept later, not
     // deleted under the target app
-    assistantReport: async (question: string, blocks: AnswerBlock[]) => {
+    // a whole conversation — its questions and answers in order — as
+    // one self-contained HTML file on the share sheet
+    // `partial`: the conversation's start is not loaded, so the page
+    // says earlier questions are missing. The first turn also rides as
+    // the single-answer body (`question` + `blocks`) a server older
+    // than conversations understands — it then renders that answer
+    // alone instead of refusing with "nothing to report".
+    assistantReport: async (turns: { question: string; blocks: AnswerBlock[] }[],
+                            partial = false) => {
       const r = await fetch(baseUrl + "/api/assistant/report", {
         method: "POST", signal: epochSignal(),
         headers: { Authorization: `Bearer ${token}`,
                    "Content-Type": "application/json" },
-        body: JSON.stringify({ question, blocks }),
+        body: JSON.stringify({ turns, partial, question: turns[0]?.question ?? "",
+                               blocks: turns[0]?.blocks ?? [] }),
       });
       await checkAuth(r, "POST");
       if (!r.ok) throw await parseError(r);
@@ -3617,7 +3640,7 @@ export function makeClient(baseUrl: string, token: string,
       const Sharing = await import("expo-sharing");
       const m0 = /filename="?([^";]+)/.exec(r.headers.get("content-disposition") ?? "");
       await sweepDownloads(SHARE_GRACE_S);
-      const dest = FileSystem.cacheDirectory + (m0?.[1] ?? "oikonome-answer.html");
+      const dest = FileSystem.cacheDirectory + (m0?.[1] ?? "oikonome-conversation.html");
       await FileSystem.writeAsStringAsync(dest, page);
       await Sharing.shareAsync(dest, { mimeType: "text/html", UTI: "public.html" });
     },

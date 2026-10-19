@@ -298,16 +298,23 @@ def open_sessions(tenant_id) -> list[dict]:
     admin = tenancy.admin_connect()
     try:
         rows = admin.execute(
-            "SELECT link_token, kind, institution, created_at "
-            "FROM plaid_link_sessions WHERE tenant=%s AND done_at IS NULL "
-            "AND reply IS NULL "
-            "AND kind='add' AND created_at > now() - make_interval("
-            "secs => %s) ORDER BY created_at DESC LIMIT 5",
+            "SELECT s.link_token, s.kind, s.institution, s.created_at, "
+            # the Item a relink session replaces, so a client that comes
+            # back shows the row as the relink it is and holds that
+            # bank's door
+            "(SELECT i.id FROM items i WHERE i.tenant_id = s.tenant "
+            " AND i.raw->>'relink_session' = s.link_token LIMIT 1) "
+            " AS relink_of "
+            "FROM plaid_link_sessions s WHERE s.tenant=%s "
+            "AND s.done_at IS NULL AND s.reply IS NULL "
+            "AND s.kind='add' AND s.created_at > now() - make_interval("
+            "secs => %s) ORDER BY s.created_at DESC LIMIT 5",
             (str(tenant_id), OPEN_FOR_S)).fetchall()
     finally:
         admin.close()
     return [{"link_token": r["link_token"], "kind": r["kind"],
              "institution": r["institution"],
+             "relink_of": r["relink_of"],
              "started_at": r["created_at"].isoformat()} for r in rows]
 
 
@@ -340,7 +347,7 @@ def _hand_back(conn, client, tenant_id, public_token: str,
     except plaid.PlaidTransportError:
         raise
     except plaid.PlaidError as e:
-        return {"error": f"{e.code}: {e.message}"}
+        return e.public()
     item_id = ex["item_id"]
     try:
         # the Item was created all the same, and takes its plan slot
@@ -401,6 +408,11 @@ def complete_add(conn, sess: dict, link_token: str,
             client = plaid.Client.for_tenant(conn)
     settled = sess.setdefault("exchanged", {})
     names, err, retry, pending = [], None, False, False
+    # a relink for a wider history window: the Item this session
+    # replaces, bound in memory at the start and on the old row itself
+    # (items.raw.relink_session), so a finisher after a restart — the
+    # webhook, the sweep — settles it the same way
+    relink_of = sess.get("relink_of") or _relink_of(conn, link_token)
     for lsid, r in add_results:
         key = token_key(r["public_token"])
         got = settled.get(key)
@@ -430,7 +442,8 @@ def complete_add(conn, sess: dict, link_token: str,
                 iid = plaid.link_item(conn, r["public_token"],
                                       link_session_id=lsid, outcome=outcome,
                                       on_saved=saved,
-                                      first_sync=defer_sync is None)
+                                      first_sync=defer_sync is None,
+                                      relink_of=relink_of)
                 if defer_sync is not None:
                     defer_sync.append(iid)
                 got = {"item_id": iid,
@@ -445,12 +458,13 @@ def complete_add(conn, sess: dict, link_token: str,
                 held = (_held_by_session(conn, lsid, settled)
                         if e.code == "INVALID_PUBLIC_TOKEN" else None)
                 got = ({"item_id": held, "first_sync": "pending"} if held
-                       else {"error": f"{e.code}: {e.message}"})
-            except ValueError as e:
+                       else e.public())
+            except plaid.LinkRefused as e:
                 # refused after the exchange (institution cap, key swap,
                 # bank-link hold, the row not saving) — link_item has
-                # already handed the Item back to Plaid
-                got = {"error": str(e)}
+                # already handed the Item back to Plaid; the reason is
+                # the typed sentence it chose, not the exception's text
+                got = {"error": e.reason, "error_code": "LINK_REFUSED"}
             settled[key] = got
             _save_exchange(link_token, sess["tenant_id"], key, got)
         if got.get("item_id"):
@@ -460,7 +474,10 @@ def complete_add(conn, sess: dict, link_token: str,
             names.append(row["institution_name"] if row else None)
             pending = pending or got.get("first_sync") == "pending"
         else:
-            err = got.get("error")
+            # the typed fields of the refusal (error, error_code and,
+            # from Plaid, request_id) ride into the failed answer whole
+            err = {k: v for k, v in got.items()
+                   if k in ("error", "error_code", "request_id") and v}
     if retry and not names:
         return {"done": False, "kind": "busy"}
     institution = (", ".join(n for n in names if n)
@@ -468,11 +485,19 @@ def complete_add(conn, sess: dict, link_token: str,
     if not names and err:
         return mark_done(sess, link_token,
                          {"done": True, "kind": "add_failed",
-                          "institution": institution, "error": err})
+                          "institution": institution, **err})
     reply = {"done": True, "kind": "add", "institution": institution}
     if pending:
         reply["first_sync"] = "pending"
     return mark_done(sess, link_token, reply)
+
+
+def _relink_of(conn, link_token: str) -> str | None:
+    row = conn.execute(
+        "SELECT id FROM items WHERE aggregator='plaid' "
+        "AND raw->>'relink_session' = %s "
+        "AND COALESCE(status,'') <> 'archived'", (link_token,)).fetchone()
+    return row["id"] if row else None
 
 
 def exited(sess: dict, link_token: str, sessions: list,

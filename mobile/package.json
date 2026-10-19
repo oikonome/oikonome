@@ -1,4 +1,5 @@
 {
+  "license": "AGPL-3.0-or-later",
   "name": "oikonome-mobile",
   "main": "index.js",
   "version": "1.0.0",

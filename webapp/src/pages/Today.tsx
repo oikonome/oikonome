@@ -10,6 +10,7 @@ import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router";
 import Onboarding from "./Onboarding";
+import { checklistOpen } from "../checklist";
 import { api, errText, mmdd, money, type AlertRow, type TodayFull, type Txn, catLabel } from "../api/client";
 import { patchList, patchQueries, removeFromList, saveSettings } from "../api/cache";
 import AreaChart from "../components/AreaChart";
@@ -138,8 +139,7 @@ export default function Today({ date = null }: { date?: string | null }) {
 
   // setup is the owner's work — every step behind the checklist and
   // the wizard is a 403 for a viewer, so the card could only dead-end them
-  const showChecklist = mayEdit && ob.data && (ob.data.transactions === 0 ||
-    ob.data.accounts === 0 || !ob.data.budgets_set || ob.data.bills === 0);
+  const showChecklist = mayEdit && ob.data && checklistOpen(ob.data);
 
   // ---- cash: quiet until it matters — three states ----
   // autopay-statement is the realistic with-cards trajectory.

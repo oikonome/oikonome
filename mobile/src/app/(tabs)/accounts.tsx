@@ -17,7 +17,9 @@ import { Card, H, HelpLink, KV, Pill, SharedLock } from "../../components/ui";
 import { Account, AccountRemoveMode, countsInTotals, errText,
          linkCardVisible } from "../../lib/api";
 import { patchList, patchQuery, removeFromList } from "../../lib/cache";
-import { plaidHostedLink, useFirstSyncLanding } from "../../lib/plaid";
+import { plaidHostedLink, type PlaidLinkOutcome, startPlaidLink,
+         useFirstSyncLanding, useRelinkingItems } from "../../lib/plaid";
+import { PendingLinkRows } from "../../components/pending-links";
 import { ago } from "../../lib/dates";
 import { CONFIRM_TO_CONNECT, VerifyEmailCard }
   from "../../components/verify-email-card";
@@ -25,6 +27,8 @@ import { firstSyncPending, linkedLine, accountRemoveMoved, accountRemoveNote, ba
          listPhase, monogram, purgeKeptRows, signedBalance, classifyChange }
   from "../../lib/pure";
 import { useLogosOn } from "../../components/merchant-avatar";
+import { historyMonthsOf, historyRowNote, windowNarrower }
+  from "../../components/wizard-logic";
 import { useSession } from "../../lib/session";
 import { useMe, useOwner, useSharedLock, useViewer } from "../../lib/viewer";
 import { C, money } from "../../lib/theme";
@@ -188,6 +192,9 @@ export default function Accounts() {
   const confirmFirst = bankAwaitsConfirm(me.data);
   // Plaid: add / fix / reconnect all funnel through the hosted link
   const [plaidBusy, setPlaidBusy] = useState(false);
+  // banks whose fresh link is still pending: the old row stays listed
+  // and live, so its "more history" door waits for that link to land
+  const relinking = useRelinkingItems();
   const conns = useQuery({
     queryKey: ["connections"],
     queryFn: () => client!.connections(),
@@ -219,21 +226,55 @@ export default function Accounts() {
   });
   // `manage` opens Link's account checklist, which update mode needs
   // before it offers accounts opened at the bank since the link
-  const plaid = async (itemId = "", manage = false) => {
+  // relinkItemId: the same bank linked afresh with the household's
+  // wider history window (the old link stays live until the new one of
+  // the same bank is saved; a sign-in at another bank just adds it)
+  // what a session's answer changes on this screen; the answer of an add
+  // or a relink lands whenever it does (the session is a pending row
+  // under the button until then), a fix is waited for in place
+  const afterLink = (s0: PlaidLinkOutcome) => {
+    let changed = true;
+    let added = false;
+    if (s0.kind === "exited" || s0.kind === "cancelled") {
+      // backing out is normal, never red — and nothing changed
+      setNotice("No change — the sign-in window was closed.");
+      changed = false;
+    } else if (s0.kind === "add_failed" || s0.kind === "update_failed")
+      setNotice(`Link failed: ${s0.error ?? "unknown"}`, true);
+    else if (s0.kind === "update") setNotice("Reconnected.");
+    else { setNotice(linkedLine(s0.institution, s0.first_sync)); added = true; }
+    return { changed, added };
+  };
+  const plaid = async (itemId = "", manage = false, relinkItemId = "") => {
     setPlaidBusy(true);
-    setNotice("Finish signing in at your bank…");
     let changed = true;
     let added = false;
     try {
+      if (!itemId) {
+        // busy only while the bank's browser opens; the row below carries
+        // the wait, and the button is free for the next bank
+        setNotice(null);
+        await startPlaidLink(client!, qc,
+          { kind: relinkItemId ? "relink" : "add", relinkItemId },
+          (r) => {
+            if (r.kind === "cancelled") return;
+            const out = afterLink(r);
+            if (!out.changed) return;
+            for (const k of ["connections", "me", "accounts"])
+              qc.invalidateQueries({ queryKey: [k] });
+            if (out.added) {
+              qc.invalidateQueries({ queryKey: ["onboarding"] });
+              qc.invalidateQueries({ queryKey: ["onboarding-backfill"] });
+            }
+          });
+        setPlaidBusy(false);
+        // the old row stays until the new link lands; this only refetches
+        if (relinkItemId) qc.invalidateQueries({ queryKey: ["connections"] });
+        return;
+      }
+      setNotice("Finish signing in at your bank…");
       const s0 = await plaidHostedLink(client!, itemId, manage);
-      if (s0.kind === "exited" || s0.kind === "cancelled") {
-        // backing out is normal, never red — and nothing changed
-        setNotice("No change — the sign-in window was closed.");
-        changed = false;
-      } else if (s0.kind === "add_failed" || s0.kind === "update_failed")
-        setNotice(`Link failed: ${s0.error ?? "unknown"}`, true);
-      else if (s0.kind === "update") setNotice("Reconnected.");
-      else { setNotice(linkedLine(s0.institution, s0.first_sync)); added = true; }
+      ({ changed, added } = afterLink(s0));
     } catch (e) { setNotice(errText(e), true); }
     setPlaidBusy(false);
     if (!changed) return;
@@ -329,7 +370,8 @@ export default function Accounts() {
     queryFn: () => client!.settingsFull(),
     select: (v) => ({
       checking_account_id: (v.checking_account_id as string | null) ?? null,
-      excluded_accounts: (v.excluded_accounts as string[] | null) ?? [] }),
+      excluded_accounts: (v.excluded_accounts as string[] | null) ?? [],
+      history_months: historyMonthsOf(v.history_months) }),
     enabled: !!client,
   });
   const primary = settings.data?.checking_account_id ?? null;
@@ -672,6 +714,7 @@ export default function Accounts() {
               </Pressable>
             </SharedLock>
           )}
+          <PendingLinkRows />
           <Pressable style={s.syncBtn} onPress={() => setAdding(true)}>
             <Text style={s.syncText}>＋ Add account</Text>
           </Pressable>
@@ -1002,7 +1045,40 @@ export default function Accounts() {
                   <Text style={{ color: C.mut, fontSize: 11 }}>
                     bank sent data {ago(conn.bank_updated_at)}</Text>
                 )}
+                {/* the window this bank was linked with, when it is less
+                    than everything — fixed at Plaid, so a wider choice
+                    made later only reaches it through a fresh link of
+                    the same bank (what is in is kept) */}
+                {!reaped && conn?.aggregator === "plaid"
+                  && conn.history_months != null && (
+                  <Text style={{ color: C.mut, fontSize: 11 }}>
+                    {historyRowNote(conn.history_months)}</Text>
+                )}
                 <View style={{ flex: 1 }} />
+                {owner && !broken && !reaped && conn?.aggregator === "plaid"
+                  && windowNarrower(conn.history_months,
+                                    settings.data?.history_months)
+                  && relinking.has(itemId!) && (
+                  <Text style={{ color: C.mut, fontSize: 11 }}>relinking…</Text>
+                )}
+                {owner && !broken && !reaped && conn?.aggregator === "plaid"
+                  && windowNarrower(conn.history_months,
+                                    settings.data?.history_months)
+                  && !relinking.has(itemId!) && (
+                  <Pressable style={[s.btn, { paddingVertical: 5 },
+                               (plaidBusy || !!credentialLock)
+                                 && { opacity: 0.5 }]}
+                             disabled={plaidBusy || !!credentialLock}
+                             onPress={() => Alert.alert(
+                               "Pull more history?",
+                               "You sign in at the bank again; what is "
+                               + "already in is kept.",
+                               [{ text: "Cancel", style: "cancel" },
+                                { text: "Relink",
+                                  onPress: () => plaid("", false, itemId!) }])}>
+                    <Text style={s.btnText}>more history ↗</Text>
+                  </Pressable>
+                )}
                 {owner && reaped && (
                   <Pressable style={[s.btn, { paddingVertical: 5 },
                                (plaidBusy || !!credentialLock)

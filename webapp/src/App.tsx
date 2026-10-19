@@ -30,6 +30,7 @@ import { readStore, writeStore } from "./safestorage";
 import { deviceZone } from "./devicezone";
 import { adoptsDeviceZone } from "./moneymath";
 import { hasLeftWizard } from "./wizardexit";
+import { checklistOpen } from "./checklist";
 import { isOwner, isViewer } from "./role";
 import { PAGE, warmEveryRoute } from "./pageChunks";
 
@@ -39,6 +40,7 @@ import { PAGE, warmEveryRoute } from "./pageChunks";
 // Every page except Home is a chunk of its own — the map and the warmers
 // live in pageChunks.ts so main.tsx can reach them before this module.
 const Welcome = lazy(PAGE["/welcome"]);
+const PlaidDone = lazy(() => import("./pages/PlaidDone"));
 const BusinessSetup = lazy(PAGE["/business/setup"]);
 const RetirementSetup = lazy(PAGE["/retirement/setup"]);
 const Transactions = lazy(PAGE["/transactions"]);
@@ -1000,6 +1002,10 @@ export default function App() {
           <a href={RELEASES} target="_blank"
              rel="noopener noreferrer" style={{ color: "inherit" }}>
             Oikonome {me.data.version}</a>
+          {/* free software: the source of what is running is one link away */}
+          {" · "}
+          <a href={SOURCE} target="_blank" rel="noopener noreferrer"
+             style={{ color: "inherit" }}>source</a>
           {ext.legal.privacy && (<>
             {" · "}
             <a href={ext.legal.privacy} target="_blank"
@@ -1019,6 +1025,7 @@ export default function App() {
 }
 
 const RELEASES = "https://github.com/oikonome/oikonome/releases";
+const SOURCE = "https://github.com/oikonome/oikonome";
 
 // ---- header chrome as leaves --------------------------------------
 // Each of these owns its own query, so a poll or resolve re-renders one
@@ -1209,9 +1216,11 @@ function useSetupPending(owner: boolean): boolean {
   // the pill leads into the guided setup, which connects banks and
   // configures the instance — the owner's walk, so a member is not
   // offered a shortcut into a page that tells them to ask someone else
+  // "every step done" is the Today checklist's own predicate, not a copy
+  // of it — a copy drifts the moment a step is added (mobile reads the
+  // same rule)
   const setupPending = owner && !!ob.data && !ob.data.wizard_done &&
-    !(ob.data.accounts > 0 && ob.data.transactions > 0 &&
-      ob.data.bills > 0 && ob.data.budgets_set);
+    checklistOpen(ob.data);
 
   return setupPending;
 }
@@ -1346,6 +1355,9 @@ const AppRoutes = memo(function AppRoutes({ me, homeWeb, homeKnown, homeOk }: {
           into their session — the invitee gets a fresh login */}
       <Route path="/invite" element={<InviteWhileSignedIn email={me.email} />} />
       <Route path="/welcome" element={lazyRoute(<Welcome />)} />
+      {/* where the bank tab lands after Plaid's Hosted Link, when the
+          instance asks for it: it wakes the tab that started the link */}
+      <Route path="/plaid/done" element={lazyRoute(<PlaidDone />)} />
       <Route path="/business/setup" element={lazyRoute(<BusinessSetup />)} />
       <Route path="/retirement/setup" element={lazyRoute(<RetirementSetup />)} />
       <Route path="/transactions" element={lazyRoute(<Transactions />)} />

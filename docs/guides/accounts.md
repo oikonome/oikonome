@@ -62,14 +62,32 @@ place in that count.
 They mix freely: connect for the ongoing feed, import files for older
 history — the importer deduplicates against connected sources.
 
+**Linking several banks.** Each **Connect an account** opens the bank's
+sign-in in its own tab and hands the button straight back: the sign-ins
+still open are listed under the button, one line each, and you can start
+the next bank while the first is still at the sign-in. A line turns into
+the bank's row as soon as you return to the app's tab (it checks at
+once, then every second for a while); a tab you closed without finishing
+is cleared with **cancel — I closed the bank window**.
+
 **How far back a new link reaches.** The household's history window —
 **Last month**, **3 months**, **6 months**, **1 year** or **Everything
 available** (the default), chosen in the setup wizard's Connect step or
 on the Import page — sets how much history a new Plaid link asks the
 bank for; banks share up to two years, so "Everything available" means
 two. The window is read when the link starts, so change it before
-linking; a bank already linked keeps what it brought. The same window
-applies to file imports. To bring in older history later, widen the
+linking; a bank already linked keeps what it brought — its row says so
+(**history: last month**), and the history control names any linked bank
+narrower than the current choice. To widen a linked bank's window, use
+**more history ↗** on its row (the wizard's list says **pull more
+history**): you sign in at the same bank again, and the moment the new
+connection is in, the old one is released and its accounts carry over,
+keeping everything already in. The old connection keeps syncing until
+then, so a sign-in you abandon changes nothing; the swap does not count
+against an institution limit, and it is offered only while the bank's
+window is narrower than your choice. Signing in to a different bank from
+that door simply adds that bank. The same window applies to
+file imports. To bring in older history from files instead, widen the
 window and import the older statements from Accounts → Import.
 
 ## Connection states
@@ -240,7 +258,15 @@ at read time, so flapping sources can't corrupt anything.
 Connected accounts get balances from the provider each sync. File-only
 and manual accounts start at $0 — edit the account and type the real
 balance, and mark your **primary checking** account so the cash
-forecast anchors on it. Until balances are set, forecast surfaces stay
+forecast anchors on it. With exactly one checking account the pin is
+set for you (after the first bank's pull, a file import, or the setup
+wizard's Connect step); with two or more you pick, on the Today card or
+here. An account whose bank was disconnected cannot be pinned, and a pin
+left on one is ignored — the forecast falls back to the live checking
+account with the largest balance, and the nightly pass moves the pin
+there so you are not asked again; change it here any time. Closed
+accounts kept only for their history (an import with no balance) are
+not offered as choices. Until balances are set, forecast surfaces stay
 hidden rather than show numbers seeded from $0. A checking account that
 came from a file and has no balance yet asks for one (Today's "Cash
 forecast is waiting on your balance") rather than being read as missing, and a checking row with a

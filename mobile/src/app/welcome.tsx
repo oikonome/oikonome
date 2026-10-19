@@ -33,11 +33,14 @@ import { BillsQuestion, ManualBills, ProposalsInline, type SetupMode }
   from "../components/wizard-bills";
 import { ManualBudgets } from "../components/wizard-budgets";
 import { EmailPane, recipientCount } from "../components/wizard-email";
-import { accountsSummary, billsSummary, budgetsSummary, deliverySummary,
+import { accountsSummary, billsContinue, billsSummary, budgetsSummary,
+         checklistSummary, connectDoneHint, deliverySummary, historyRowNote,
+         windowNarrower,
          finishBlurb, type HistoryMonths, historyMonthsOf,
          THEME_LABEL, type ThemeChoice, WIZARD_STEPS, type WizardStep,
          wizardThemeChoice } from "../components/wizard-logic";
 import { HistoryChoice, useLatestWins } from "../components/wizard-history";
+import { PrimaryCheckingPick } from "../components/wizard-primary-checking";
 import { TAP, ws } from "../components/wizard-ui";
 import type { Onboarding, SettingsView } from "../lib/api";
 import { patchQuery, removeFromList, saveSettings } from "../lib/cache";
@@ -48,7 +51,9 @@ import { useSession } from "../lib/session";
 import { C, setThemeMode, themeRestartPending } from "../lib/theme";
 import { useSharedLock } from "../lib/viewer";
 import { markLeftWizard } from "../lib/storage";
-import { plaidHostedLink, type PlaidLinkOutcome } from "../lib/plaid";
+import { type PlaidLinkOutcome, startPlaidLink,
+         useRelinkingItems } from "../lib/plaid";
+import { PendingLinkRows } from "../components/pending-links";
 import { usePlaidLinkResume } from "./connect-hub";
 import { ago } from "../lib/dates";
 import { Planner } from "./budget";
@@ -288,9 +293,26 @@ export default function Welcome() {
   // a link the app stopped watching (Android dropped it during the
   // bank's OAuth hop) reports here when the wizard comes back
   usePlaidLinkResume(onLinked);
+  // busy only while the bank's browser opens: the session is then a
+  // pending row under the button (PendingLinkRows) and the button is
+  // free for the next bank; the answer arrives through onLinked
   const link = useMutation({
-    mutationFn: () => plaidHostedLink(client!, ""),
-    onSuccess: onLinked,
+    mutationFn: () => startPlaidLink(client!, qc, { kind: "add" },
+                                     (r) => { if (r.kind !== "cancelled") onLinked(r); }),
+    onMutate: () => setLinkMsg(null),
+    onError: (e) => setLinkMsg(errText(e)),
+  });
+  // the same bank linked afresh with the wider window: the old link stays
+  // live until the new one of the same bank is saved (a sign-in at
+  // another bank just adds it); what is in is kept
+  const relink = useMutation({
+    mutationFn: (itemId: string) => startPlaidLink(
+      client!, qc, { kind: "relink", relinkItemId: itemId },
+      (r) => {
+        if (r.kind !== "cancelled") onLinked(r);
+        qc.invalidateQueries({ queryKey: ["accounts"] });
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["connections"] }),
     onError: (e) => setLinkMsg(errText(e)),
   });
   const disconnect = useMutation({
@@ -343,6 +365,9 @@ export default function Welcome() {
     qc.invalidateQueries({ queryKey: ["onboarding"] });
     setPlannerGen((g) => g + 1);
   };
+  const billsOut = billsContinue(d?.pending_proposals ?? 0);
+  const askChecking = connectDoneHint(d?.checking_candidates?.length ?? 0,
+                                      !!d?.primary_checking_id);
   type Primary = { label: string; disabled?: boolean; hint?: string;
                    // a pane change inside the step instead of advancing
                    onPress?: () => void } | null;
@@ -398,9 +423,10 @@ export default function Welcome() {
       go: hosted ? null
         : { label: connected ? "Connect another account" : "Connect an account",
             to: "/connect-hub" },
-      primary: { label: "Done connecting →", disabled: !connected,
-                 hint: connected ? undefined
-                   : "connect at least one source, or skip" },
+      primary: { label: "Done connecting →",
+                 disabled: !connected || !!askChecking,
+                 hint: !connected ? "connect at least one source, or skip"
+                   : askChecking },
       skippable: true },
     { key: "bills", label: "Bills & budgets", title: billsTitle,
       blurb: billsBlurb,
@@ -415,7 +441,13 @@ export default function Welcome() {
                 if (owner && storedMode !== setupMode) saveMode(setupMode);
                 setBillsPane(setupMode);
               } }
-          : { label: "Continue →" },
+          // the auto pane leaves done, or skipped with proposals still
+          // pending: the Today checklist counts approved bills, and a
+          // Continue past pending offers must not say the step is finished
+          : billsPane === "auto"
+            ? { label: billsOut.label, hint: billsOut.hint,
+                onPress: () => advance(billsOut.state) }
+            : { label: "Continue →" },
       back: billsPane !== "question" && backfillReady
         ? () => setBillsPane("question") : null,
       skippable: backfillReady },
@@ -549,13 +581,14 @@ export default function Welcome() {
                                                        : undefined}
                        onPress={() => link.mutate()}>
               <Text style={s.btnText}>
-                {link.isPending ? "Finish signing in at your bank…"
+                {link.isPending ? "Opening your bank…"
                                 : (conns.data?.connections ?? []).length
                                   ? "+ Connect another account ↗"
                                   : "+ Connect an account ↗"}
               </Text>
             </Pressable>
             </SharedLock>
+            <PendingLinkRows />
             <Text style={s.mut}>Opens your bank's sign-in (Plaid). When
               you finish, the connection appears below so you can link
               another or continue.</Text>
@@ -563,6 +596,15 @@ export default function Welcome() {
             {(conns.data?.connections ?? []).length > 0 && (
               <LinkedBanks conns={conns.data!.connections}
                            locked={!!credentialLock}
+                           household={history}
+                           onRelink={(id) => Alert.alert(
+                             "Pull more history?",
+                             "You sign in at the bank again; what is "
+                             + "already in is kept.",
+                             [{ text: "Cancel", style: "cancel" },
+                              { text: "Relink", onPress: () => relink.mutate(id) }])}
+                           relinkBusy={relink.isPending || link.isPending
+                                       || historyBusy}
                            onDisconnect={(id) => disconnect.mutate(id)}
                            busyId={disconnect.isPending
                              ? disconnect.variables ?? null : null} />
@@ -610,6 +652,12 @@ export default function Welcome() {
                          onBusy={setHistoryBusy}
                          onSaved={() => qc.invalidateQueries(
                            { queryKey: ["onboarding"] })} />
+        )}
+        {/* the forecast's anchor: one checking account is pinned on the
+            way out; two or more are asked here, before the step is left */}
+        {step.key === "connect" && (d?.checking_candidates?.length ?? 0) > 0 && (
+          <PrimaryCheckingPick candidates={d?.checking_candidates ?? []}
+                               pinned={d?.primary_checking_id ?? null} />
         )}
 
         {step.key === "email" && <EmailPane hosted={hosted} />}
@@ -677,15 +725,24 @@ export default function Welcome() {
 
 /** The web's linked-bank rows: one row per bank — status dot, name,
  *  accounts · last pull, Disconnect. */
-function LinkedBanks({ conns, onDisconnect, busyId, locked }: {
+function LinkedBanks({ conns, onDisconnect, busyId, locked, household,
+                       onRelink, relinkBusy }: {
   conns: { id: string; institution_name: string | null; status: string | null;
            last_ok: string | null; accounts?: number;
-           bank_updated_at?: string | null }[];
+           bank_updated_at?: string | null;
+           history_months?: HistoryMonths }[];
   // the one row whose disconnect is in flight — never the whole list
   onDisconnect: (id: string) => void; busyId: string | null;
   // refused to this login; the reason is stated once above the list
-  locked: boolean }) {
+  locked: boolean;
+  // the household's window: a bank linked narrower gets "pull more
+  // history", a fresh link of the same bank (the web's HubMoreHistory)
+  household?: HistoryMonths; onRelink?: (id: string) => void;
+  relinkBusy?: boolean }) {
   const total = conns.reduce((t, c) => t + (c.accounts ?? 0), 0);
+  // a bank whose fresh link is still pending stays listed and live; its
+  // door waits for that link to land (the server refuses a second one)
+  const relinking = useRelinkingItems();
   return (
     <View style={{ marginTop: 6 }}>
       <View style={{ flexDirection: "row", alignItems: "center", gap: 8,
@@ -724,8 +781,28 @@ function LinkedBanks({ conns, onDisconnect, busyId, locked }: {
                       schedule */}
                   {!bad && c.bank_updated_at
                     ? ` · bank sent data ${ago(c.bank_updated_at)}` : ""}
+                  {/* the window this bank was linked with, when it is
+                      less than everything */}
+                  {c.history_months != null
+                    ? ` · ${historyRowNote(c.history_months)}` : ""}
                 </Text>
               </View>
+              {!bad && onRelink && windowNarrower(c.history_months, household)
+                && relinking.has(c.id) && (
+                <Text style={{ color: C.mut, fontSize: 12 }}>relinking…</Text>
+              )}
+              {!bad && onRelink && windowNarrower(c.history_months, household)
+                && !relinking.has(c.id) && (
+                <Pressable disabled={relinkBusy || locked}
+                           onPress={() => onRelink(c.id)}
+                           style={{ borderWidth: StyleSheet.hairlineWidth,
+                                    borderColor: C.border, borderRadius: 8,
+                                    paddingHorizontal: 10, paddingVertical: 4,
+                                    opacity: relinkBusy || locked ? 0.55 : 1 }}>
+                  <Text style={{ color: C.accent, fontSize: 12 }}>
+                    pull more history ↗</Text>
+                </Pressable>
+              )}
               <Pressable disabled={busyId === c.id || locked}
                          onPress={() => Alert.alert(
                            `Disconnect ${c.institution_name || c.id}?`,
@@ -879,6 +956,8 @@ function FinishSummary({ d, sv, theme, ownerEmail, history }: {
     ["Email & push", deliverySummary(
       deliveryOf(daily?.on ?? true, !!daily?.push), daily?.hour ?? 7,
       recipientCount(sv, ownerEmail))],
+    // what the Today screen's checklist will say — the same list it reads
+    ["Today checklist", d ? checklistSummary(d) : "…"],
   ];
   return (
     <View style={ws.body}>

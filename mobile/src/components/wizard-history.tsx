@@ -14,7 +14,7 @@ import { useSession } from "../lib/session";
 import { useOwner } from "../lib/viewer";
 import { C } from "../lib/theme";
 import { HISTORY_CHOICES, type HistoryMonths, historyMonthsOf, historyPhrase,
-  latestWins } from "./wizard-logic";
+  latestWins, windowNarrower } from "./wizard-logic";
 import { PillRow, ws } from "./wizard-ui";
 
 /** A screen's handle on latestWins: the saver lives as long as the
@@ -79,6 +79,13 @@ export function HistoryChoice({ fallback, footnote = true, onBusy,
   const busy = saver.busy;
   useEffect(() => { onBusy?.(busy); }, [busy, onBusy]);
   const current = picked !== undefined ? picked : stored;
+  // the banks already linked keep the window they were linked with; the
+  // ones narrower than the choice shown are named, with the way out
+  const conns = useQuery({ queryKey: ["connections"],
+    queryFn: () => client!.connections(), enabled: !!client });
+  const narrower = (conns.data?.connections ?? []).filter((c) =>
+    c.aggregator === "plaid" && (c.status || "") !== "reaped"
+    && windowNarrower(c.history_months, current));
   return (
     <View style={[ws.section, style]}>
       <Text style={ws.h2}>How much history should come in?</Text>
@@ -106,6 +113,14 @@ export function HistoryChoice({ fallback, footnote = true, onBusy,
       {footnote && (
         <Text style={ws.mut}>Banks share up to two years. You can pull
           in older history later from Accounts → Import.</Text>)}
+      {narrower.length > 0 && (
+        <Text style={[ws.mut, { color: C.warn }]}>
+          A bank keeps the window it was linked with:{" "}
+          {narrower.map((c) => `${c.institution_name || c.id} (${
+            historyPhrase(c.history_months ?? null)})`).join(", ")}.
+          Use <Text style={{ fontWeight: "700" }}>pull more history</Text>
+          {" "}on the bank's row to relink it with this window.
+        </Text>)}
       {err && <Text style={[ws.mut, { color: C.warn }]}>{err}</Text>}
     </View>
   );

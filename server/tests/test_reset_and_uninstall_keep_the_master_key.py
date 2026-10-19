@@ -285,6 +285,9 @@ class UninstallClearsARootOwnedOpsStateTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
         self.assertFalse(inst.exists())
 
+    @unittest.skipIf(os.geteuid() == 0,
+                     "root can always remove the root-owned state this "
+                     "test leaves behind")
     def test_what_is_left_behind_is_named(self):
         r, inst = self._run(container_clears=False)
         self.assertNotEqual(r.returncode, 0)

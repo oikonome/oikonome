@@ -10,6 +10,8 @@ import { leftWizard } from "../wizardexit";
 import BudgetPlanner from "../components/BudgetPlanner";
 import ConnectHub, { FIRST_SYNC_RUNNING } from "../components/ConnectHub";
 import HistoryChoice, { historyLabel } from "../components/HistoryChoice";
+import PrimaryCheckingPick from "../components/PrimaryCheckingPick";
+import { billsContinue, checklistSummary, connectDoneHint } from "../checklist";
 import ManualBudgets from "../components/ManualBudgets";
 import { chooseTheme, type Theme } from "../components/themeChoice";
 import { VerifyEmailCard } from "../components/VerifyEmailCard";
@@ -626,6 +628,8 @@ function DoneStep({ d }: { d: Onboarding | undefined }) {
     ["Email & push", `${DELIVERY_WORDS[delivery]}`
       + (delivery === "off" ? "" : ` at ${hourLabel(daily?.hour ?? 7)}`)
       + ` · ${plural(nRecip, "recipient")}`],
+    // what the Today page's checklist will say — the same list it reads
+    ["Today checklist", d ? checklistSummary(d) : "…"],
   ];
   return (
     <div>
@@ -795,6 +799,11 @@ export default function Welcome() {
     : `; the first ${delivery === "push" ? "notification" : "email"} `
       + `arrives tomorrow at ${hourLabel(daily?.hour ?? 7)}`;
 
+  const billsOut = billsContinue(d?.pending_proposals ?? 0);
+  const billsPrimary = { label: billsOut.label, hint: billsOut.hint,
+                         onClick: () => advance(billsOut.state) };
+  const askChecking = connectDoneHint(d?.checking_candidates?.length ?? 0,
+                                      !!d?.primary_checking_id);
   const billsStep: StepView = billsPane === "ask" ? {
     key: "bills", label: "Bills & budgets",
     title: "Bills & budgets — how do you want to set them up?",
@@ -826,8 +835,11 @@ export default function Welcome() {
            "(and still-pending) income seeds the next step's budget. " +
            "Continue any time and revisit later.",
     // detection AND the footer wait for the full bank backfill — see
-    // BackfillGate and backfillReady above
-    primary: backfillReady ? { label: "Continue →" } : null,
+    // BackfillGate and backfillReady above. With proposals still pending
+    // the step is left as skipped, not done: the Today checklist counts
+    // approved bills, and a Continue past pending offers must not say
+    // the step is finished
+    primary: backfillReady ? { ...billsPrimary } : null,
     skippable: backfillReady,
     onBack: () => setBillsPane("ask"),
     body: <BackfillGate><AutoBillsPane /></BackfillGate>,
@@ -847,11 +859,11 @@ export default function Welcome() {
       // files-only households have no connection but DO have transactions
       // after an inline import — that also counts as "connected enough"
       primary: { label: "Done connecting →",
-                 disabled: (d?.connections ?? 0) === 0
-                   && (d?.transactions ?? 0) === 0,
+                 disabled: ((d?.connections ?? 0) === 0
+                   && (d?.transactions ?? 0) === 0) || !!askChecking,
                  hint: (d?.connections ?? 0) === 0
                        && (d?.transactions ?? 0) === 0
-                   ? "connect at least one source, or skip" : undefined },
+                   ? "connect at least one source, or skip" : askChecking },
       skippable: true,
       body: (
         <>
@@ -859,6 +871,13 @@ export default function Welcome() {
           <p style={{ margin: ".6rem 0 0" }}>
             <Link to="/import">Import a file instead</Link></p>
           <div className="wiz-sub"><HistoryChoice /></div>
+          {/* the forecast's anchor: one checking account is pinned on the
+              way out; two or more are asked here, before the step is left */}
+          {(d?.checking_candidates?.length ?? 0) > 0 && (
+            <div className="wiz-sub">
+              <PrimaryCheckingPick candidates={d?.checking_candidates ?? []}
+                                   pinned={d?.primary_checking_id ?? null} />
+            </div>)}
         </>
       ) },
     billsStep,

@@ -36,6 +36,12 @@ def _transport(state: dict):
             return httpx.Response(200, text=json.dumps(
                 {"link_token": state.get("link_token", "lt-1"),
                  "hosted_link_url": "https://hosted.plaid.com/x"}))
+        if path == "/link/token/get" and state.get("session_get_fails"):
+            return httpx.Response(400, text=json.dumps(
+                {"error_type": "INVALID_INPUT",
+                 "error_code": "INVALID_LINK_TOKEN",
+                 "error_message": "detail-from-plaid-session",
+                 "request_id": "req-session-77"}))
         if path == "/link/token/get":
             if not state.get("link_done"):
                 return httpx.Response(200, text=json.dumps(
@@ -46,6 +52,12 @@ def _transport(state: dict):
             return httpx.Response(200, text=json.dumps(
                 {"link_sessions": [{"results": {"item_add_results": [
                     {"public_token": "pub-1"}]}}]}))
+        if path == "/item/public_token/exchange" and state.get("exchange_fails"):
+            return httpx.Response(400, text=json.dumps(
+                {"error_type": "INVALID_INPUT",
+                 "error_code": "INVALID_PUBLIC_TOKEN",
+                 "error_message": "detail-from-plaid-exchange",
+                 "request_id": "req-exchange-88"}))
         if path == "/item/public_token/exchange":
             state["exchanges"] = state.get("exchanges", 0) + 1
             if state["exchanges"] > 1 and state.get("single_use"):
@@ -454,6 +466,327 @@ class PlaidLinkPagesTests(unittest.TestCase):
             self.assertEqual(r.json()["error"], want)
             for leak in ("detail-from-plaid", "req-secret", "10.9.8.7"):
                 self.assertNotIn(leak, r.text)
+
+    def _narrow_bank(self, item: str, inst: str = "ins_1", days: int = 31):
+        from oikonome.sync import base as sync_base
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            sync_base.upsert_item(conn, item, "plaid", "Narrow Bank",
+                                  f"access-prod-{item}",
+                                  raw={"days_requested": days})
+            conn.execute("UPDATE items SET institution_id=%s WHERE id=%s",
+                         (inst, item))
+        finally:
+            conn.close()
+
+    def _ledger_reason(self, item: str):
+        admin = tenancy.admin_connect()
+        try:
+            led = admin.execute("SELECT removed_reason FROM plaid_item_ledger "
+                                "WHERE item_id=%s", (item,)).fetchone()
+        finally:
+            admin.close()
+        return led["removed_reason"] if led else None
+
+    def test_a_relink_for_more_history_replaces_the_same_bank_only_once_the_new_link_is_in(self):
+        """A bank linked with a short window can only widen it through a
+        fresh Item. Starting a link with relink_item_id binds the old Item
+        to the session but leaves it live and syncing; the old Item is
+        released — under the relink reason the institution cap ignores —
+        only when the new Item of the SAME bank is saved, and the household's
+        slot count never rises for the swap. The connections list says
+        which window each bank was linked with."""
+        from oikonome.sync import base as sync_base
+        from oikonome.sync import plaid as plaid_mod
+        item = "pl-relink-old"
+        self._narrow_bank(item)
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            held_before = sync_base.institutions_held(conn)
+            rows = {c["id"]: c for c in
+                    self.client.get("/api/connections").json()["connections"]}
+            self.assertEqual(rows[item]["history_months"], 1)
+        finally:
+            conn.close()
+        state = {"link_token": "lt-relink", "item_id": "pl-relink-new"}
+        removed = []
+        with _patch_client(state), mock.patch.object(
+                plaid_mod.Client, "remove_item",
+                side_effect=lambda tok: removed.append(tok) or {"removed": True}):
+            r = self.client.post("/accounts/plaid/link",
+                                 data={"relink_item_id": item},
+                                 headers={"accept": "application/json"})
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(r.json()["kind"], "add")
+            conn = tenancy.tenant_connect(self.tid)
+            try:
+                # the start released nothing: the old bank is live and bound
+                it = conn.execute("SELECT status, raw->>'relink_session' AS b "
+                                  "FROM items WHERE id=%s", (item,)).fetchone()
+                self.assertNotEqual(it["status"], "archived")
+                self.assertEqual(it["b"], "lt-relink")
+                self.assertEqual(removed, [])
+            finally:
+                conn.close()
+            # the person finishes at the same bank (ins_1): the exchange
+            # saves the new Item, then releases the old one
+            state["link_done"] = True
+            s = self.client.get("/accounts/plaid/link/lt-relink/status").json()
+        self.assertTrue(s["done"], s)
+        self.assertEqual(s["kind"], "add", s)
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            old = conn.execute("SELECT status, raw->>'relink_session' AS b "
+                               "FROM items WHERE id=%s", (item,)).fetchone()
+            self.assertEqual(old["status"], "archived")
+            self.assertIsNone(old["b"])
+            self.assertEqual(removed, [f"access-prod-{item}"])
+            new = conn.execute("SELECT status FROM items WHERE id=%s",
+                               ("pl-relink-new",)).fetchone()
+            self.assertIsNotNone(new)
+            self.assertNotEqual(new["status"], "archived")
+            self.assertIn(self._ledger_reason(item),
+                          (None, sync_base.RELINK_LEDGER_REASON))
+            self.assertEqual(sync_base.released_count(conn), 0)
+            self.assertLessEqual(sync_base.institutions_held(conn), held_before)
+        finally:
+            conn.close()
+        # an archived Item is refused the door
+        r = self.client.post("/accounts/plaid/link",
+                             data={"relink_item_id": item},
+                             headers={"accept": "application/json"})
+        self.assertEqual(r.status_code, 400)
+
+    def test_a_relink_that_links_another_bank_keeps_the_old_one_and_takes_its_own_place(self):
+        """The relink door is not an uncounted disconnect: a sign-in at a
+        DIFFERENT bank from that door is an ordinary add — the old Item
+        stays live, nothing is released, and the new one is counted."""
+        from oikonome.sync import base as sync_base
+        from oikonome.sync import plaid as plaid_mod
+        item = "pl-relink-keep"
+        self._narrow_bank(item, inst="ins_other")
+        state = {"link_token": "lt-relink2", "item_id": "pl-relink-other"}
+        removed = []
+        with _patch_client(state), mock.patch.object(
+                plaid_mod.Client, "remove_item",
+                side_effect=lambda tok: removed.append(tok) or {"removed": True}):
+            r = self.client.post("/accounts/plaid/link",
+                                 data={"relink_item_id": item},
+                                 headers={"accept": "application/json"})
+            self.assertEqual(r.status_code, 200, r.text)
+            state["link_done"] = True      # the fake bank is ins_1 — another bank
+            s = self.client.get("/accounts/plaid/link/lt-relink2/status").json()
+        self.assertTrue(s["done"], s)
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            old = conn.execute("SELECT status, raw->>'relink_session' AS b "
+                               "FROM items WHERE id=%s", (item,)).fetchone()
+            self.assertNotEqual(old["status"], "archived")
+            self.assertIsNone(old["b"])          # the binding is spent
+            self.assertEqual(removed, [])
+            self.assertIsNone(self._ledger_reason(item))
+            self.assertEqual(sync_base.released_count(conn), 0)
+        finally:
+            conn.close()
+
+    def test_a_relink_is_refused_unless_the_window_is_wider(self):
+        """Relink is offered for more history only: a bank already on the
+        household's window (or on everything) is refused before any
+        session is minted, and a start that is refused leaves it live."""
+        item = "pl-relink-wide"
+        self._narrow_bank(item, days=730)      # everything already
+        state = {"link_token": "lt-relink3"}
+        with _patch_client(state):
+            r = self.client.post("/accounts/plaid/link",
+                                 data={"relink_item_id": item},
+                                 headers={"accept": "application/json"})
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertNotIn("create_body", state)   # no link token minted
+        # a one-month bank with the household on one month: refused too
+        self.client.post("/api/settings", json={"history_months": 1})
+        item2 = "pl-relink-same-window"
+        self._narrow_bank(item2, days=31)
+        with _patch_client(state):
+            r = self.client.post("/accounts/plaid/link",
+                                 data={"relink_item_id": item2},
+                                 headers={"accept": "application/json"})
+        self.assertEqual(r.status_code, 400, r.text)
+        self.client.post("/api/settings", json={"history_months": None})
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            for i in (item, item2):
+                st = conn.execute("SELECT status FROM items WHERE id=%s",
+                                  (i,)).fetchone()["status"]
+                self.assertNotEqual(st, "archived")
+        finally:
+            conn.close()
+
+    def test_one_relink_at_a_time_and_a_failed_release_still_counts_as_a_relink(self):
+        """A second relink start on an Item whose session is still open is
+        refused (409) rather than overwriting the binding; and when Plaid
+        does not confirm the release at the settle, the old Item is
+        archived with its token kept for the retry and the ledger already
+        says relink, so the swap never holds a slot."""
+        from oikonome.sync import base as sync_base
+        from oikonome.sync import plaid as plaid_mod
+        item = "pl-relink-twice"
+        self._narrow_bank(item)
+        state = {"link_token": "lt-relink5", "item_id": "pl-relink-twice-new"}
+        with _patch_client(state), mock.patch.object(
+                plaid_mod.Client, "remove_item",
+                side_effect=plaid_mod.PlaidError(
+                    {"error_code": "INTERNAL_SERVER_ERROR",
+                     "error_type": "API_ERROR", "error_message": "down"}, 500)):
+            r = self.client.post("/accounts/plaid/link",
+                                 data={"relink_item_id": item},
+                                 headers={"accept": "application/json"})
+            self.assertEqual(r.status_code, 200, r.text)
+            r2 = self.client.post("/accounts/plaid/link",
+                                  data={"relink_item_id": item},
+                                  headers={"accept": "application/json"})
+            self.assertEqual(r2.status_code, 409, r2.text)
+            state["link_done"] = True
+            s = self.client.get("/accounts/plaid/link/lt-relink5/status").json()
+        self.assertTrue(s["done"], s)
+        self.assertEqual(s["kind"], "add", s)
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            old = conn.execute(
+                "SELECT status, archived_reason, access_token, "
+                "raw->>'relink_session' AS b FROM items WHERE id=%s",
+                (item,)).fetchone()
+            self.assertEqual(old["status"], "archived")
+            self.assertEqual(old["archived_reason"], "disconnect-release-failed")
+            self.assertTrue(old["access_token"])     # kept for the retry
+            self.assertIsNone(old["b"])
+            self.assertIn(self._ledger_reason(item),
+                          (None, sync_base.RELINK_LEDGER_REASON))
+            self.assertEqual(sync_base.released_count(conn), 0)
+        finally:
+            conn.close()
+
+    def test_a_relink_exchange_that_cannot_name_the_bank_keeps_the_old_one(self):
+        """Releasing a live login needs positive evidence: when Plaid does
+        not say which bank the new Item is, the old Item keeps its token
+        and its status, and the new one is an ordinary add."""
+        from oikonome.sync import plaid as plaid_mod
+        item = "pl-relink-unknown"
+        self._narrow_bank(item)
+        state = {"link_token": "lt-relink6", "item_id": "pl-relink-unknown-new",
+                 "item_get_fails": "plaid"}
+        removed = []
+        with _patch_client(state), mock.patch.object(
+                plaid_mod.Client, "remove_item",
+                side_effect=lambda tok: removed.append(tok) or {"removed": True}), \
+                self.assertLogs("oikonome", level="INFO"):
+            r = self.client.post("/accounts/plaid/link",
+                                 data={"relink_item_id": item},
+                                 headers={"accept": "application/json"})
+            self.assertEqual(r.status_code, 200, r.text)
+            state["link_done"] = True
+            s = self.client.get("/accounts/plaid/link/lt-relink6/status").json()
+        self.assertTrue(s["done"], s)
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            old = conn.execute("SELECT status, access_token FROM items WHERE id=%s",
+                               (item,)).fetchone()
+            self.assertNotEqual(old["status"], "archived")
+            self.assertTrue(old["access_token"])
+            self.assertEqual(removed, [])
+        finally:
+            conn.close()
+
+    def test_a_relink_whose_start_fails_leaves_the_bank_live(self):
+        """A Plaid refusal of the link token (an outage, a bad completion
+        redirect) after the binding check releases nothing."""
+        from oikonome.sync import plaid as plaid_mod
+        item = "pl-relink-outage"
+        self._narrow_bank(item)
+        state = {"link_token": "lt-relink4"}
+        with _patch_client(state), mock.patch.object(
+                plaid_mod.Client, "create_hosted_link",
+                side_effect=plaid_mod.PlaidError(
+                    {"error_code": "INVALID_FIELD", "error_type": "INVALID_REQUEST",
+                     "error_message": "redirect uri not allowed"}, 400)):
+            r = self.client.post("/accounts/plaid/link",
+                                 data={"relink_item_id": item},
+                                 headers={"accept": "application/json"})
+        self.assertEqual(r.status_code, 400, r.text)
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            it = conn.execute("SELECT status, access_token, raw->>'relink_session' AS b "
+                              "FROM items WHERE id=%s", (item,)).fetchone()
+            self.assertNotEqual(it["status"], "archived")
+            self.assertTrue(it["access_token"])
+            self.assertIsNone(it["b"])
+        finally:
+            conn.close()
+
+    def test_the_completion_redirect_is_opt_in_and_https_only(self):
+        """The bank tab is sent back to this install only when the operator
+        asked for it: `1` builds /plaid/done under the base URL, a full
+        https URL is passed as given, anything else (unset, http) leaves
+        Plaid's own closing page."""
+        import os
+        from oikonome.web import pages
+        keys = ("OIKONOME_PLAID_COMPLETION_REDIRECT", "OIKONOME_BASE_URL")
+        cases = [({}, None),
+                 ({"OIKONOME_PLAID_COMPLETION_REDIRECT": "1",
+                   "OIKONOME_BASE_URL": "https://money.example.test/"},
+                  "https://money.example.test/app/plaid/done"),
+                 ({"OIKONOME_PLAID_COMPLETION_REDIRECT": "1"}, None),
+                 ({"OIKONOME_PLAID_COMPLETION_REDIRECT":
+                   "https://x.example.test/done"}, "https://x.example.test/done"),
+                 ({"OIKONOME_PLAID_COMPLETION_REDIRECT":
+                   "http://x.example.test/done"}, None)]
+        for env, want in cases:
+            with mock.patch.dict("os.environ", env, clear=False):
+                for k in keys:
+                    if k not in env:
+                        os.environ.pop(k, None)
+                self.assertEqual(pages.plaid_completion_redirect(), want, env)
+        state = {"link_token": "lt-redir"}
+        with _patch_client(state), mock.patch.dict(
+                "os.environ", {"OIKONOME_PLAID_COMPLETION_REDIRECT":
+                               "https://x.example.test/done"}):
+            self.client.post("/accounts/plaid/link", data={},
+                             follow_redirects=False)
+        self.assertEqual(state["create_body"]["hosted_link"]
+                         ["completion_redirect_uri"],
+                         "https://x.example.test/done")
+
+    def test_a_plaid_refusal_of_the_poll_answers_typed_fields(self):
+        """A Plaid error while the poll reads the session answers Plaid's
+        own code, message and request id as fields — never the
+        exception's text, which is where a transport detail or a trace
+        would ride."""
+        state = {"link_token": "lt-typed", "session_get_fails": True}
+        with _patch_client(state):
+            self.client.post("/accounts/plaid/link", data={},
+                             follow_redirects=False)
+            s = self.client.get("/accounts/plaid/link/lt-typed/status").json()
+        self.assertFalse(s["done"])
+        self.assertEqual(s["error_code"], "INVALID_LINK_TOKEN")
+        self.assertEqual(s["request_id"], "req-session-77")
+        self.assertEqual(s["error"],
+                         "INVALID_LINK_TOKEN: detail-from-plaid-session")
+        self.assertNotIn("[request_id", s["error"])
+
+    def test_a_failed_exchange_answers_typed_fields(self):
+        """The exchange failing finishes the session as a failed add with
+        the same typed fields."""
+        state = {"link_token": "lt-exfail", "link_done": True,
+                 "exchange_fails": True}
+        with _patch_client(state):
+            self.client.post("/accounts/plaid/link", data={},
+                             follow_redirects=False)
+            s = self.client.get("/accounts/plaid/link/lt-exfail/status").json()
+        self.assertTrue(s["done"])
+        self.assertEqual(s["kind"], "add_failed")
+        self.assertEqual(s["error_code"], "INVALID_PUBLIC_TOKEN")
+        self.assertEqual(s["request_id"], "req-exchange-88")
+        self.assertEqual(s["error"],
+                         "INVALID_PUBLIC_TOKEN: detail-from-plaid-exchange")
 
     def test_a_poll_queued_behind_the_finishing_one_reports_its_success(self):
         """Two polls of one finished session: the second passed the

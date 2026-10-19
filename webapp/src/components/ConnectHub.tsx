@@ -7,7 +7,11 @@ import { patchQuery, removeFromList } from "../api/cache";
 import { sharedLock } from "../sharedlogin";
 import { bankAwaitsConfirm, CONFIRM_TO_CONNECT, VerifyEmailCard }
   from "./VerifyEmailCard";
-import { HISTORY_SAVING, useHistorySaving } from "./HistoryChoice";
+import { HISTORY_SAVING, historyRowNote, useHistorySaving, windowNarrower }
+  from "./HistoryChoice";
+import { cancelPending, finishPending, isCancelled, isPending, markPending,
+         pendingLine, pollWait, sleepOrWake, usePlaidLinks,
+         type PendingLinkKind } from "./plaidlinks";
 // The file importer is a page of its own and opens only behind the
 // "Import files" button, so its code arrives on that click rather than
 // riding in with every screen that shows this hub.
@@ -167,9 +171,15 @@ export async function openPlaidHostedLink(itemId = "", opts?: {
   /** update mode only: open Link's shared-accounts checklist so an
    *  account can be deselected — the only way to stop Plaid billing it */
   manageAccounts?: boolean;
+  /** add mode only: a linked bank to relink with the household's (wider)
+   *  history window — it stays live and syncing until the new link of the
+   *  same bank is saved, and is released only then (a sign-in at another
+   *  bank just adds that one) */
+  relinkItemId?: string;
 }): Promise<PlaidLinkResult> {
   const started = await openTabAt(
-    () => api.plaidLinkStart(itemId, !!opts?.manageAccounts),
+    () => api.plaidLinkStart(itemId, !!opts?.manageAccounts,
+                             itemId ? "" : (opts?.relinkItemId ?? "")),
     (r) => r.hosted_link_url, "Plaid");
   const s = await pollPlaidLink(started.link_token, opts?.cancelled);
   // the person said they closed the bank window: tell the server, or the
@@ -178,6 +188,70 @@ export async function openPlaidHostedLink(itemId = "", opts?: {
   if (s.kind === "cancelled" && !itemId)
     void setPlaidLinkAside(started.link_token);
   return s;
+}
+
+/** Open Plaid Hosted Link and come back as soon as the bank tab is on
+ *  its way: the session is watched from here on as a pending row (the
+ *  plaidlinks store), with its own cancel and its own outcome line, so
+ *  the button that started it is free for the next bank. Resolves with
+ *  the session's token once the tab is open; the answer lands in the
+ *  store (and refreshes what a new bank changes).
+ *  `mode` words the outcome; relink = the same bank linked afresh for a
+ *  wider history window (relinkItemId stays live until the new link of the
+ *  same bank is in, then is released). */
+export async function startPlaidLink(qc: ReturnType<typeof useQueryClient>,
+                                     opts: { mode: PendingLinkKind;
+                                             relinkItemId?: string }
+): Promise<string> {
+  const started = await openTabAt(
+    () => api.plaidLinkStart("", false, opts.relinkItemId ?? ""),
+    (r) => r.hosted_link_url, "Plaid");
+  const token = started.link_token;
+  markPending(token, opts.mode, opts.relinkItemId);
+  void pollPlaidLink(token, () => isCancelled(token))
+    .then((s) => {
+      // the person said they closed the bank window: tell the server, or
+      // the abandoned session keeps holding a connection slot (it is
+      // still finished if Plaid reports a bank after all)
+      if (s.kind === "cancelled") void setPlaidLinkAside(token);
+      const out = plaidLinkOutcome(s, "add");
+      finishPending(token, s.kind === "cancelled" ? undefined : out);
+      if (out.ok) afterFirstPull(qc);
+      else for (const k of ["connections", "me"])
+        qc.invalidateQueries({ queryKey: [k] });
+    })
+    .catch((e) => finishPending(token, { ok: false, text: errText(e) }));
+  return token;
+}
+
+/** The sessions still open and the recent outcomes, under a connect
+ *  button: one row each, with "cancel — I closed the bank window" (the
+ *  server only learns about an exit Plaid reports, and a closed TAB
+ *  reports nothing). */
+export function PendingLinkRows() {
+  const { pending, outcomes } = usePlaidLinks();
+  if (!pending.length && !outcomes.length) return null;
+  return (
+    <div style={{ marginTop: ".4rem" }}>
+      {pending.map((p) => (
+        <p key={p.token} style={{ fontSize: 13, margin: ".2rem 0",
+                                  color: "var(--green, #4a4)" }}>
+          {pendingLine(p)}
+          {!p.cancelled && (
+            <button type="button" className="linklike mut"
+              style={{ marginLeft: ".7rem", fontSize: 13 }}
+              onClick={() => cancelPending(p.token)}>
+              cancel — I closed the bank window
+            </button>)}
+        </p>
+      ))}
+      {outcomes.map((o) => (
+        <p key={o.id} style={{ fontSize: 13, margin: ".2rem 0",
+                               color: o.ok ? "var(--green, #4a4)" : "var(--red)" }}>
+          {o.text}</p>
+      ))}
+    </div>
+  );
 }
 
 /** Stop an add session holding a place under the institution cap and
@@ -217,9 +291,12 @@ export async function pollPlaidLink(linkToken: string,
   watching.add(linkToken);
   try {
     const deadline = Date.now() + PLAID_LINK_WAIT_MS;
-    let wait = 2500;
+    // the normal tick, or the fast one for a while after a wake-up (the
+    // tab regaining focus, the completion page calling over); a failed
+    // request backs off from there
+    let backoff = 0;
     while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, wait));
+      await sleepOrWake(backoff || pollWait());
       if (cancelled?.()) return { kind: "cancelled" };
       try {
         // a resumed session is watched for its answer only: the server
@@ -229,11 +306,11 @@ export async function pollPlaidLink(linkToken: string,
               `/accounts/plaid/link/${encodeURIComponent(linkToken)}`
               + "/status?resume=1")
           : await api.plaidLinkStatus(linkToken);
-        wait = 2500;
+        backoff = 0;
         if (s.done) return s;
       } catch (e) {
         if (!pollMayRetry(e)) throw e;
-        wait = Math.min(wait * 2, 30_000);
+        backoff = Math.min((backoff || 2500) * 2, 30_000);
       }
     }
     throw new Error("Timed out waiting for the bank connection");
@@ -251,15 +328,35 @@ export function usePlaidLinkResume(enabled: boolean): void {
   useEffect(() => {
     if (!enabled) return;
     let live = true;
-    req<{ sessions: { link_token: string }[] }>("/accounts/plaid/links/open")
+    req<{ sessions: { link_token: string; relink_of?: string | null }[] }>(
+      "/accounts/plaid/links/open")
       .then(({ sessions }) => {
-        for (const { link_token } of sessions ?? []) {
-          if (watching.has(link_token)) continue;
-          void pollPlaidLink(link_token, () => !live, true).then((s) => {
-            if (s.kind === "cancelled") return;
-            afterFirstPull(qc);
-            toast(plaidLinkOutcome(s, "add").text);
-          }).catch(() => { /* the server finishes it regardless */ });
+        // an unmount before the list arrives starts nothing; the next
+        // mount asks again
+        if (!live) return;
+        for (const { link_token, relink_of } of sessions ?? []) {
+          if (watching.has(link_token) || isPending(link_token)) continue;
+          // a row like a link started here, so a reloaded tab shows what
+          // it is still waiting on (its cancel sets the session aside).
+          // The poll outlives this mount on purpose: the store is
+          // module-level, and a remount skips a token still being
+          // watched, so a poll stopped on unmount would leave the session
+          // with nobody watching it until the next full reload.
+          // a relink comes back as the relink it is, so that bank's
+          // "more history" door stays shut while it is open
+          markPending(link_token, relink_of ? "relink" : "add",
+                      relink_of ?? undefined);
+          void pollPlaidLink(link_token, () => isCancelled(link_token), true)
+            .then((s) => {
+              if (s.kind === "cancelled") {
+                void setPlaidLinkAside(link_token);
+                finishPending(link_token);
+                return;
+              }
+              finishPending(link_token);
+              afterFirstPull(qc);
+              toast(plaidLinkOutcome(s, "add").text);
+            }).catch(() => finishPending(link_token));
         }
       })
       .catch(() => { /* nothing to resume */ });
@@ -420,9 +517,8 @@ export function PlaidFlow({ onDone }: { onDone: () => void }) {
  *  rather than at the server's refusal, which on the hosted link path can
  *  land AFTER the token exchange — the household watches a bank it just
  *  authorized get removed again. */
-function PlaidConnectButton({ label, hint, itemId = "", full = false,
-                             closed }: {
-  label: string; hint: string; itemId?: string; full?: boolean;
+function PlaidConnectButton({ label, hint, full = false, closed }: {
+  label: string; hint: string; full?: boolean;
   // a sentence saying why the door is shut ahead of the server (an
   // address still to confirm); the button stays visible, disabled
   closed?: string | null;
@@ -433,77 +529,94 @@ function PlaidConnectButton({ label, hint, itemId = "", full = false,
   // the link token asks Plaid for the stored history window, which can
   // never be narrowed afterwards — a history choice still saving waits
   const saving = useHistorySaving();
-  const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState<string | null>(null);
-  // backing out of the bank tab is normal, not an error — it gets its own
-  // muted line so it never renders red
-  const [note, setNote] = useState<string | null>(null);
+  // busy only while the bank tab is on its way: from then on the session
+  // is a pending row below, and the button is free for the next bank
+  const [starting, setStarting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const cancelRef = useRef(false);
   const run = async () => {
-    cancelRef.current = false;
-    setBusy(true); setErr(null); setNote(null);
-    setMsg("Finish signing in at your bank…");
+    setStarting(true); setErr(null);
     try {
-      const s = await openPlaidHostedLink(itemId,
-        { cancelled: () => cancelRef.current });
-      if (s.kind === "cancelled") {
-        setMsg(null);
-      } else if (s.kind === "exited") {
-        setMsg(null);
-        setNote("No bank was linked — the sign-in window was closed. "
-                + "Connect again whenever you're ready.");
-      } else if (s.kind === "add_failed" || s.kind === "update_failed") {
-        setErr(s.error || "Link failed");
-        setMsg(null);
-      } else {
-        // the confirmation is the bank appearing in the linked list
-        // below; the message only covers the moment before that list
-        // has refetched, then goes — two green lines naming the same
-        // bank read as two connections
-        setMsg(`Linked ${s.institution || "bank"} ✓`
-               + (s.first_sync === "pending" ? ` — ${FIRST_SYNC_RUNNING}` : ""));
-        await Promise.all([
-          qc.invalidateQueries({ queryKey: ["connections"] }),
-          // the institutions-used figure rides /api/me
-          qc.invalidateQueries({ queryKey: ["me"] }),
-          qc.invalidateQueries({ queryKey: ["accounts"] }),
-        ]);
-        setMsg(null);
-      }
+      await startPlaidLink(qc, { mode: "add" });
     } catch (e) {
-      setErr(errText(e)); setMsg(null);
+      setErr(errText(e));
     } finally {
-      setBusy(false);
+      setStarting(false);
     }
   };
   return (
     <div>
       <button className="pri" style={{ fontSize: 15 }}
-        disabled={busy || full || !!held || !!closed || saving}
+        disabled={starting || full || !!held || !!closed || saving}
         title={closed ?? (saving ? HISTORY_SAVING
           : full ? "you are at this account's institution limit" : undefined)}
         onClick={() => void run()}>
-        {busy ? "Connecting…" : label}
+        {starting ? "Opening your bank…" : label}
       </button>
       {held && <p style={{ fontSize: 13, color: "var(--amber)" }}>{held}</p>}
-      {saving && !busy && <p className="mut" style={{ fontSize: 13 }}>
+      {saving && !starting && <p className="mut" style={{ fontSize: 13 }}>
         {HISTORY_SAVING}</p>}
-      {/* the escape hatch: the server only learns about an exit Plaid
-          reports, and a closed TAB reports nothing — without this the
-          button sat on "Connecting…" for 15 minutes after a back-out */}
-      {busy && (
-        <button type="button" className="linklike mut"
-          style={{ marginLeft: ".7rem", fontSize: 13 }}
-          onClick={() => { cancelRef.current = true; }}>
-          cancel — I closed the bank window
-        </button>
-      )}
       <p className="mut" style={{ marginTop: ".5rem", fontSize: 13 }}>{hint}</p>
-      {msg && <p style={{ fontSize: 13, color: "var(--green, #4a4)" }}>{msg}</p>}
-      {note && <p className="mut" style={{ fontSize: 13 }}>{note}</p>}
+      <PendingLinkRows />
       {err && <p style={{ fontSize: 13, color: "var(--red)" }}>{err}</p>}
     </div>
+  );
+}
+
+/** True while a relink of this bank for more history is still open in
+ *  this tab. The old bank no longer leaves when the session starts, so
+ *  its "more history" door would otherwise stay live beside the pending
+ *  row (and the server refuses a second relink of the same bank). */
+export function useRelinkPending(itemId: string | undefined): boolean {
+  const { pending } = usePlaidLinks();
+  return !!itemId
+    && pending.some((p) => p.kind === "relink" && p.itemId === itemId);
+}
+
+/** "pull more history ↗" on a hosted-hub row whose bank was linked with a
+ *  narrower window than the household's choice. Plaid fixes the window
+ *  when an Item is created, so widening it means a fresh Item: the same
+ *  bank is linked again while the old one stays live and syncing, and the
+ *  old one is released (under a reason the institution cap ignores) only
+ *  once the new link of the same bank is saved; the history already in
+ *  is kept. Mobile: welcome.tsx LinkedBanks / accounts.tsx keep the same
+ *  door. */
+function HubMoreHistory({ c }: { c: Connection }) {
+  const qc = useQueryClient();
+  const st = useQuery({ queryKey: ["settings"], queryFn: api.settings });
+  const held = bankLinkHoldNote(st.data, "plaid");
+  const saving = useHistorySaving();
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const relinking = useRelinkPending(c.id);
+  const name = c.institution_name || c.id;
+  const run = async () => {
+    if (!window.confirm(`Pull more history from ${name}? You sign in at `
+                        + "the bank again; what is already in is kept."))
+      return;
+    setBusy(true); setMsg(null);
+    try {
+      // the old bank stays listed and syncing until the new link is in;
+      // this is only a refetch of what the session start may have moved
+      await startPlaidLink(qc, { mode: "relink", relinkItemId: c.id });
+      for (const k of ["connections", "me", "accounts"])
+        qc.invalidateQueries({ queryKey: [k] });
+    } catch (e) {
+      setMsg(errText(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  if (relinking)
+    return <small className="mut" style={{ marginLeft: ".4rem" }}>relinking…</small>;
+  return (
+    <>
+      <button className="linked-x" disabled={busy || !!held || saving}
+        title={held ?? (saving ? HISTORY_SAVING
+          : "relink this bank with the wider history window — the window is fixed when a bank is linked")}
+        onClick={() => void run()}>
+        {busy ? "opening…" : "pull more history ↗"}</button>
+      {msg && <small className="mut" style={{ marginLeft: ".4rem" }}>{msg}</small>}
+    </>
   );
 }
 
@@ -700,6 +813,8 @@ export default function ConnectHub({ onDone }: { onDone?: () => void }) {
   const hosted = !!me.data?.hosted;
   const done = () => { setOpen(null); onDone?.(); };
   const qc2 = useQueryClient();
+  // the household's window, to tell which linked bank was linked narrower
+  const hubSettings = useQuery({ queryKey: ["settings"], queryFn: api.settings });
   const disc = useMutation({
     mutationFn: (id: string) => api.connectionDisconnect(id),
     onSuccess: (r, id) => {
@@ -845,9 +960,17 @@ export default function ConnectHub({ onDone }: { onDone?: () => void }) {
                             sync which found nothing. */}
                         {!bad && c.bank_updated_at && (
                           <> · bank sent data {ago(c.bank_updated_at)}</>)}
+                        {/* the window this bank was linked with, when it
+                            is less than everything: a choice widened
+                            later does not reach it by itself */}
+                        {c.history_months != null && (
+                          <> · {historyRowNote(c.history_months)}</>)}
                       </small>
                     </span>
                     {bad && <HubFixButton c={c} />}
+                    {!bad && windowNarrower(c.history_months,
+                                            hubSettings.data?.history_months) && (
+                      <HubMoreHistory c={c} />)}
                     <button className="linked-x"
                       title="disconnect — stops syncing, keeps history"
                       disabled={disc.isPending}

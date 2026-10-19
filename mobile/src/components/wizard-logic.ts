@@ -50,6 +50,22 @@ export function historyPhrase(m: HistoryMonths): string {
   return label.charAt(0).toLowerCase() + label.slice(1);
 }
 
+/** Is a bank's window narrower than the household's choice? A bank
+ *  linked with a shorter window keeps it (Plaid fixes the window when
+ *  the Item is created), so a wider choice made afterwards reaches that
+ *  bank only through a relink. null = everything. The web's
+ *  HistoryChoice.windowNarrower. */
+export function windowNarrower(linked: HistoryMonths | undefined,
+                               household: HistoryMonths | undefined): boolean {
+  if (linked === null || linked === undefined) return false;
+  return household === null || household === undefined || linked < household;
+}
+
+/** The row's words for a bank's own window ("history: last month"). */
+export function historyRowNote(m: HistoryMonths | undefined): string {
+  return `history: ${historyPhrase(m ?? null)}`;
+}
+
 /** The manual add form's cadences — the four the web's form offers, in
  *  the server's FREQ:interval wire format, never the words. */
 export const MANUAL_CADENCES: [string, string][] = [
@@ -241,6 +257,78 @@ export function finishBlurb(delivery: Delivery, hour: number): string {
       : `; the first ${delivery === "push" ? "notification" : "email"} `
         + `arrives tomorrow at ${clockHour(hour)}`)
     + ".";
+}
+
+/** The Today screen's first-run checklist — ONE definition, read by the
+ *  Today card, by the wizard's Done step (so what the card will say is
+ *  shown before the wizard is left) and by Today's decision to show the
+ *  card at all. Each step is a fact about the household's data, never a
+ *  wizard mark: a step walked past with nothing done stays open here.
+ *  The web's src/checklist.ts, same five steps in the same order. */
+export type ChecklistInput = {
+  accounts: number; transactions: number; bills: number;
+  budgets_set: boolean; primary_checking_set: boolean;
+  /** the checking accounts that could be pinned as primary; absent from
+   *  an older server */
+  checking_candidates?: string[];
+};
+export type ChecklistStep = { key: string; done: boolean; label: string;
+                              href: string };
+export function checklistSteps(ob: ChecklistInput): ChecklistStep[] {
+  return [
+    { key: "accounts", done: ob.accounts > 0,
+      label: `Connect or add accounts (${ob.accounts})`, href: "/accounts" },
+    { key: "history", done: ob.transactions > 0,
+      label: `Bring in transactions (${ob.transactions})`, href: "/imports" },
+    { key: "bills", done: ob.bills > 0,
+      label: `Confirm recurring bills (${ob.bills})`, href: "/bills" },
+    { key: "budgets", done: ob.budgets_set, label: "Set your budgets",
+      href: "/budget" },
+    // a household with no checking account has nothing to pin, and the
+    // step must not hold the checklist (and the wizard) open forever
+    { key: "checking",
+      done: ob.primary_checking_set
+        || (Array.isArray(ob.checking_candidates)
+            && ob.checking_candidates.length === 0),
+      label: "Pick your primary checking", href: "/accounts" },
+  ];
+}
+
+/** Is any step still open? Today shows the card while one is. */
+export function checklistOpen(ob: ChecklistInput): boolean {
+  return checklistSteps(ob).some((s) => !s.done);
+}
+
+/** The Done step's one-line account of the checklist: "5/5 done", or
+ *  what is still open, by name. */
+export function checklistSummary(ob: ChecklistInput): string {
+  const steps = checklistSteps(ob);
+  const open = steps.filter((s) => !s.done);
+  if (!open.length) return `${steps.length}/${steps.length} done`;
+  return `${steps.length - open.length}/${steps.length} done — still open: `
+    + open.map((s) => s.label.replace(/ \(\d+\)$/, "")).join(", ");
+}
+
+/** The wizard's bills step leaves either done or, with proposals still
+ *  pending, skipped — so the Today checklist and the wizard's own marks
+ *  agree. The button says which. The web's words. */
+export function billsContinue(pending: number):
+  { label: string; state: "done" | "skipped"; hint?: string } {
+  if (pending <= 0) return { label: "Continue →", state: "done" };
+  return {
+    label: `Leave ${pending} pending →`, state: "skipped",
+    hint: `${pending} proposal${pending === 1 ? "" : "s"} still await`
+      + " your approve or dismiss — this step finishes when none are left",
+  };
+}
+
+/** The connect step's way out when the primary checking is a question:
+ *  with two or more eligible checking accounts and no pin, the step asks
+ *  before it is left; with one, the server pins it on the way out. */
+export function connectDoneHint(candidates: number, pinned: boolean):
+  string | undefined {
+  return candidates > 1 && !pinned
+    ? "pick your primary checking below" : undefined;
 }
 
 /** Done step: the Accounts line. */

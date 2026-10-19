@@ -9,6 +9,9 @@ anything the model could not have produced."""
 
 import json
 import os
+import pathlib
+import shutil
+import subprocess
 import unittest
 import uuid
 from unittest import mock
@@ -210,6 +213,73 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("<svg onload", page)
         self.assertIn("&lt;script&gt;", page)
 
+    def test_prose_bold_and_bullets_are_drawn_not_shown_as_asterisks(self):
+        """The model writes **bold** and "- " bullets; the report draws
+        them, exactly as the web and mobile screens do, and a bare
+        asterisk, a double underscore or a tag inside the prose is still
+        text."""
+        page = ab.prose_html("Net worth is **$12,345.67** today.\n\n"
+                             "- **Alpha** is most of it\n"
+                             "- Beta is small, 2 * 3 = 6, ACH__REF__1\n\n"
+                             "1. first\n2. second <b>no</b>\n# Heading")
+        self.assertIn("<strong>$12,345.67</strong>", page)
+        self.assertNotIn("**", page)
+        self.assertEqual(page.count("<li"), 4)
+        self.assertIn("<ul><li><strong>Alpha</strong> is most of it</li>", page)
+        self.assertIn('<ol><li value="1">first</li>', page)
+        self.assertIn("2 * 3 = 6, ACH__REF__1", page)
+        self.assertIn("&lt;b&gt;no&lt;/b&gt;", page)
+        self.assertIn("<p><strong>Heading</strong></p>", page)
+
+    def test_a_numbered_item_keeps_its_own_number(self):
+        """A ranking keeps the model's numbers: a sub-bullet under an item
+        does not become the next rank, a blank line between items does not
+        restart at 1, and a list that goes on after a chart (its own text
+        block) still reads 4, 5."""
+        page = ab.prose_html("1. Rent\n   - paid on the 1st\n2. Groceries\n\n3. Dining")
+        self.assertIn('<li value="1">Rent</li>', page)
+        self.assertIn("<ul><li>paid on the 1st</li></ul>", page)
+        self.assertIn('<li value="2">Groceries</li>', page)
+        self.assertIn('<li value="3">Dining</li>', page)
+        later = ab.prose_html("4. Utilities\n5. Fuel")
+        self.assertIn('<li value="4">Utilities</li><li value="5">Fuel</li>', later)
+
+    def test_the_server_parses_prose_exactly_as_the_clients_do(self):
+        """The HTML report and the two screens must draw one answer the
+        same way: parse_rich and the clients' parseRich (one file, copied)
+        agree on every shared fixture, run here under node."""
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not installed")
+        root = pathlib.Path(__file__).resolve().parents[2]
+        web = (root / "webapp/src/richtext.ts").read_text().splitlines()
+        mob = (root / "mobile/src/lib/richtext.ts").read_text().splitlines()
+        code = lambda lines: [l for l in lines if not l.lstrip().startswith("//")]
+        self.assertEqual(code(web), code(mob), "the two client parsers drifted apart")
+        fixtures = [
+            "Plain **bold** line\nsecond line\n\n- a\n* **b** c\n\n1. one\n2) two\n# Head\ntail",
+            "1. Rent\n   - paid\n2. Groceries\n\n3. Dining\n\n   \n4. Fuel\r\n- x",
+            "__under__ 2 * 3 ** not closed\n\n\n\n•  dot bullet\n10. ten\n",
+            "", "   ", "**only**", "- ", "1. ",
+            ("9" * 4400) + ". not a number\n123456789. nine digits\n1234567890. ten",
+        ]
+        script = ("import('./src/lib/richtext.ts').then(m => "
+                  "process.stdout.write(JSON.stringify(JSON.parse(process.argv[1]).map(m.parseRich))))")
+        out = subprocess.run([node, "--experimental-strip-types", "-e", script, json.dumps(fixtures)],
+                             cwd=root / "mobile", capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout), [ab.parse_rich(f) for f in fixtures])
+
+    def test_a_whole_conversation_reports_in_order(self):
+        turns = [("Net worth?", [{"kind": "text", "text": "A lot."}]),
+                 ("And <last> year?", [{"kind": "text", "text": "Less."}])]
+        page = ab.report_html("ignored", [], "2026-10-19", turns=turns)
+        self.assertIn("<h1>Net worth?</h1>", page)
+        self.assertIn('<h2 class="q">And &lt;last&gt; year?</h2>', page)
+        self.assertLess(page.index("A lot."), page.index("And &lt;last&gt;"))
+        self.assertLess(page.index("And &lt;last&gt;"), page.index("Less."))
+        self.assertEqual(page.count('class="q"'), 1)
+
     def test_multi_series_bar_and_line_have_a_legend(self):
         two = ab.validate({**_BAR, "series": [
             {"name": "2024", "values": [1, 2, 3]},
@@ -267,6 +337,66 @@ class ReportRouteTests(unittest.TestCase):
                         "series": [{"name": "s", "values": [10 ** 400]}]}]})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertIn("Here.", r.text)
+
+    def test_a_conversation_downloads_as_one_file(self):
+        r = self._post({"turns": [
+            {"question": "Groceries?", "blocks": [{"kind": "text", "text": "Here."}]},
+            {"question": "junk", "blocks": [{"kind": "html", "html": "<b>"}]},
+            {"question": "And last year?",
+             "blocks": [{"kind": "text", "text": "**Less.**"}]}]})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("oikonome-conversation-", r.headers["content-disposition"])
+        self.assertIn("<h1>Groceries?</h1>", r.text)
+        self.assertIn('<h2 class="q">And last year?</h2>', r.text)
+        self.assertIn("<strong>Less.</strong>", r.text)
+        self.assertNotIn("junk", r.text)
+        self.assertNotIn("not included", r.text)
+
+    def test_a_long_conversation_keeps_its_newest_turns_and_says_so(self):
+        """The newest answers are the ones a person saving a long
+        conversation came for; the page keeps those and names what it
+        left out — and a client whose loaded conversation has no start
+        says so too."""
+        from oikonome.web import api as web_api
+        n = web_api.REPORT_TURNS + 7
+        turns = [{"question": f"q{i}", "blocks": [{"kind": "text", "text": f"a{i}"}]}
+                 for i in range(n)]
+        r = self._post({"turns": turns})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn(f"a{n - 1}", r.text)
+        self.assertNotIn(">a0<", r.text)
+        self.assertIn("7 earlier questions in this conversation not included", r.text)
+        self.assertIn("<h1>q7</h1>", r.text)
+        r = self._post({"turns": turns[:2], "partial": True})
+        self.assertIn("earlier questions in this conversation not included (its start was not loaded)",
+                      r.text)
+        r = self._post({"turns": turns, "partial": True})
+        self.assertIn("7 earlier questions in this conversation not included, and the ones "
+                      "before them were not loaded", r.text)
+        # a digit run no integer parses is prose, never a 500
+        r = self._post({"question": "n", "blocks": [{"kind": "text", "text": ("9" * 4400) + ". x"}]})
+        self.assertEqual(r.status_code, 200, r.text[:200])
+        # many charts are bounded by blocks, not only by turns
+        chart = {"kind": "bar", **{k: v for k, v in _BAR.items() if k != "type"}}
+        heavy = [{"question": f"q{i}", "blocks": [chart] * 4} for i in range(40)]
+        r = self._post({"turns": heavy})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertLessEqual(r.text.count("<svg"), web_api.REPORT_BLOCKS)
+        self.assertIn("earlier questions in this conversation not included", r.text)
+
+    def test_the_single_answer_body_still_works_beside_turns(self):
+        """Clients send both shapes so a server older than conversations
+        renders the first answer; this server prefers `turns`."""
+        r = self._post({"question": "Q?", "blocks": [{"kind": "text", "text": "first"}],
+                        "turns": [{"question": "Q?", "blocks": [{"kind": "text", "text": "first"}]},
+                                  {"question": "More?", "blocks": [{"kind": "text", "text": "second"}]}]})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("second", r.text)
+
+    def test_a_conversation_with_nothing_valid_is_a_400(self):
+        r = self._post({"turns": [{"question": "x",
+                                   "blocks": [{"kind": "html", "html": "<b>"}]}]})
+        self.assertEqual(r.status_code, 400)
 
     def test_nothing_valid_is_a_400(self):
         r = self._post({"question": "x",

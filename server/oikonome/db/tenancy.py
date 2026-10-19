@@ -136,6 +136,9 @@ def admin_connect(dsn: str | None = None) -> psycopg.Connection:
 # wrapper's close() RESETs the scope and returns it to the pool — callers
 # keep the exact conn.close() discipline they always had.
 
+# seconds an idle pooled connection is kept before the pool closes it
+POOL_MAX_IDLE_S = 120.0
+
 _pools: dict[str, ConnectionPool] = {}
 _pools_lock = threading.Lock()
 
@@ -172,8 +175,13 @@ def _pool(dsn: str) -> ConnectionPool:
             p = ConnectionPool(
                 dsn, min_size=0,
                 max_size=int(os.environ.get("OIKONOME_POOL_MAX") or "10"),
+                # An idle handle still holds one of the server's connection
+                # slots, so a shorter max_idle (two minutes, against the
+                # pool's default ten) gives slots back soon after a burst;
+                # reconnecting on the next burst is cheap.
+                max_idle=POOL_MAX_IDLE_S,
                 kwargs={"row_factory": dict_row, "autocommit": True},
-                # A managed provider restarts the server under us (weekly
+                # A managed provider may restart the server under the app (weekly
                 # maintenance, major upgrades, failover). Without a check,
                 # every idle connection the pool kept across the restart is
                 # handed out dead and the first request on each one fails.
@@ -257,6 +265,7 @@ def _control_pool(dsn: str) -> ConnectionPool:
                 dsn, min_size=0,
                 max_size=int(os.environ.get("OIKONOME_CONTROL_POOL_MAX")
                              or "4"),
+                max_idle=POOL_MAX_IDLE_S,  # see _pool
                 # set at connect, so they hold for every checkout and a
                 # RESET on the way back to the pool cannot drop them
                 kwargs={"row_factory": dict_row, "autocommit": True,

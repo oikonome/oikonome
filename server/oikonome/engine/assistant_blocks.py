@@ -250,6 +250,9 @@ h1{font-size:20px;margin:0 0 4px}
 padding:16px 18px;margin:0 0 14px}
 .card h2{font-size:15px;margin:0 0 10px;font-weight:600}
 p{margin:0 0 10px;white-space:pre-wrap}
+p:last-child{margin-bottom:0}
+ul,ol{margin:0 0 10px 20px;padding:0} li{margin:3px 0}
+h2.q{font-size:16px;margin:22px 0 8px;font-weight:600}
 svg{display:block;max-width:100%;height:auto}
 table{border-collapse:collapse;width:100%;font-size:14px}
 th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #d8dfe6}
@@ -393,10 +396,113 @@ def _data_table(spec: dict) -> str:
     return _table_html(cols, rows, fmt=_money)
 
 
+_BULLET_RE = re.compile(r"^\s*(?:([-*\u2022])|(\d{1,9})[.)])\s+(.*)$")
+_HEADING_RE = re.compile(r"^\s*#{1,6}\s+(.*)$")
+_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+
+
+def _runs(line: str, bold: bool = False) -> list[dict]:
+    """One line as runs: the text between the bold spans, and the bold
+    spans. Only **so** is bold; a stray asterisk or an underscore in a
+    name stays text."""
+    out, pos = [], 0
+    for m in _BOLD_RE.finditer(line):
+        if m.start() > pos:
+            out.append({"bold": bold, "text": line[pos:m.start()]})
+        out.append({"bold": True, "text": m.group(1)})
+        pos = m.end()
+    if pos < len(line) or not out:
+        out.append({"bold": bold, "text": line[pos:]})
+    return out
+
+
+def parse_rich(text: str) -> list[dict]:
+    """Model prose as the SAME structure the clients parse it into
+    (webapp/src/richtext.ts, mobile/src/lib/richtext.ts — the suite
+    compares the two on shared fixtures): a blank line ends a paragraph,
+    a line led by "- ", "* " or "1. " is a list item (a bullet after
+    numbered items, or the reverse, starts a new list; a numbered item
+    keeps its own number), a "# heading" line is a bold paragraph, and
+    **bold** is bold. Line breaks inside a paragraph are kept. Lines are
+    split on newlines only, as the clients split them."""
+    out: list[dict] = []
+    para: list[list[dict]] = []
+    items: list[dict] = []
+    ordered = False
+
+    def flush_para():
+        if para:
+            runs: list[dict] = []
+            for k, r in enumerate(para):
+                if k:
+                    runs.append({"bold": False, "text": "\n"})
+                runs.extend(r)
+            out.append({"kind": "p", "runs": runs})
+            para.clear()
+
+    def flush_list():
+        nonlocal ordered
+        if items:
+            out.append({"kind": "list", "ordered": ordered, "items": list(items)})
+            items.clear()
+        ordered = False
+
+    for raw in re.split(r"\r?\n", text or ""):
+        line = raw.strip()
+        if not line:
+            flush_para(); flush_list()
+            continue
+        m = _BULLET_RE.match(line)
+        if m:
+            flush_para()
+            numbered = m.group(2) is not None
+            if items and numbered != ordered:
+                flush_list()
+            if not items:
+                ordered = numbered
+            items.append({"runs": _runs(m.group(3).strip()),
+                          "n": int(m.group(2)) if numbered else None})
+            continue
+        flush_list()
+        h = _HEADING_RE.match(line)
+        if h:
+            flush_para()
+            out.append({"kind": "p", "runs": _runs(h.group(1).strip(), True)})
+            continue
+        para.append(_runs(line))
+    flush_para(); flush_list()
+    return out
+
+
+def _runs_html(runs: list[dict]) -> str:
+    return "".join(f"<strong>{html.escape(r['text'])}</strong>" if r["bold"]
+                   else html.escape(r["text"]) for r in runs)
+
+
+def prose_html(text: str) -> str:
+    """Model prose as HTML paragraphs and lists, from `parse_rich`: the
+    same subset the web and mobile clients draw. A numbered item carries
+    its own number (`<li value>`), so a ranking split around a chart
+    still reads 1, 2, 3."""
+    out: list[str] = []
+    for b in parse_rich(text):
+        if b["kind"] == "p":
+            out.append("<p>" + _runs_html(b["runs"]) + "</p>")
+            continue
+        if b["ordered"]:
+            out.append("<ol>" + "".join(
+                (f'<li value="{it["n"]}">' if it["n"] is not None else "<li>")
+                + _runs_html(it["runs"]) + "</li>" for it in b["items"]) + "</ol>")
+        else:
+            out.append("<ul>" + "".join("<li>" + _runs_html(it["runs"]) + "</li>"
+                                        for it in b["items"]) + "</ul>")
+    return "".join(out)
+
+
 def render_block(b: dict) -> str:
     kind = b.get("kind")
     if kind == "text":
-        return f'<div class="card"><p>{html.escape(b["text"])}</p></div>'
+        return f'<div class="card">{prose_html(b["text"])}</div>'
     title = html.escape(b.get("title") or "")
     head = f"<h2>{title}</h2>" if title else ""
     if kind == "table":
@@ -414,20 +520,33 @@ def render_block(b: dict) -> str:
     return ""
 
 
-def report_html(question: str, blocks: list[dict], today: str) -> str:
-    """A self-contained page for one answer: the question, the prose and
-    the charts, every number also in a table. Inline CSS + SVG only —
-    it opens the same from a Downloads folder, a mail attachment or a
-    phone's share sheet."""
-    q = html.escape((question or "").strip()[:1000]) or "Assistant"
-    body = "".join(render_block(b) for b in blocks)
+def report_html(question: str, blocks: list[dict], today: str,
+                turns: list[tuple[str, list[dict]]] | None = None,
+                note: str | None = None) -> str:
+    """A self-contained page for one answer — or, with `turns`, a whole
+    conversation: each (question, blocks) in order, the first question
+    as the title, every later question as a heading over its answer.
+    The prose and the charts, every number also in a table. Inline CSS
+    + SVG only — it opens the same from a Downloads folder, a mail
+    attachment or a phone's share sheet. `note` is a line under the title
+    saying what the page does NOT carry (earlier questions left out)."""
+    turns = list(turns) if turns else [(question, blocks)]
+    q = html.escape((turns[0][0] or "").strip()[:1000]) or "Assistant"
+    parts = []
+    for i, (ask, blks) in enumerate(turns):
+        if i:
+            parts.append('<h2 class="q">'
+                         f'{html.escape((ask or "").strip()[:1000])}</h2>')
+        parts.append("".join(render_block(b) for b in blks))
+    body = "".join(parts)
     return (
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
         f"<title>{q}</title><style>{_CSS}</style></head>"
         f"<body><main><h1>{q}</h1>"
         f"<div class=\"sub\">Oikonome assistant · {html.escape(today)}</div>"
-        f"{body}"
+        + (f"<div class=\"sub\">{html.escape(note)}</div>" if note else "")
+        + f"{body}"
         "<div class=\"foot\">Figures come from the ledger as it stood when "
         "the question was asked; the model phrased them and drew the "
         "charts from them.</div></main></body></html>")

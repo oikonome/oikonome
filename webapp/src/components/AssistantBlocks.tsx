@@ -7,6 +7,7 @@
 // it); two or more always do.
 import { useState } from "react";
 import { money } from "../api/client";
+import { parseRich } from "../richtext";
 
 export interface SeriesSpec { name: string; values: number[] }
 export type AnswerBlock =
@@ -37,8 +38,7 @@ export default function AssistantBlocks({ blocks }: { blocks: AnswerBlock[] }) {
   return (
     <>
       {blocks.map((b, i) => {
-        if (b.kind === "text")
-          return <div key={i} style={{ marginTop: ".4rem", whiteSpace: "pre-wrap" }}>{b.text}</div>;
+        if (b.kind === "text") return <RichText key={i} text={b.text} />;
         if (b.kind === "table")
           return <Figure key={i} title={b.title}>
             <DataTable columns={b.columns} rows={b.rows} />
@@ -52,6 +52,25 @@ export default function AssistantBlocks({ blocks }: { blocks: AnswerBlock[] }) {
         </Figure>;
       })}
     </>
+  );
+}
+
+/** model prose drawn: **bold** bold, "- " lines a list, the rest
+ *  paragraphs (richtext.ts; the mobile twin is answer-blocks' RichText) */
+export function RichText({ text }: { text: string }) {
+  const runs = (rs: { bold: boolean; text: string }[]) =>
+    rs.map((r, k) => r.bold ? <strong key={k}>{r.text}</strong> : r.text);
+  return (
+    <div className="rich">
+      {parseRich(text).map((b, i) => b.kind === "p"
+        ? <p key={i}>{runs(b.runs)}</p>
+        : b.ordered
+          // a numbered item keeps its own number: a ranking split around
+          // a chart, or spaced by blank lines, still reads 1, 2, 3
+          ? <ol key={i}>{b.items.map((it, j) =>
+              <li key={j} value={it.n ?? j + 1}>{runs(it.runs)}</li>)}</ol>
+          : <ul key={i}>{b.items.map((it, j) => <li key={j}>{runs(it.runs)}</li>)}</ul>)}
+    </div>
   );
 }
 
