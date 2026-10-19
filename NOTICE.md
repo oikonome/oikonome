@@ -1,6 +1,8 @@
 # Third-party notices
 
-Oikonome is licensed under the GNU AGPL-3.0-or-later — see [LICENSE.md](LICENSE.md).
+Oikonome is licensed under the GNU AGPL-3.0-or-later — see
+[LICENSE.md](LICENSE.md). Releases that shipped under the FSL-1.1-ALv2 remain
+available under those terms.
 It redistributes data derived from the project below, under that project's
 own terms.
 

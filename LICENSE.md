@@ -1,12 +1,5 @@
 Copyright (C) 2026 Theron Pappas
 
-Oikonome is free software: you can redistribute it and/or modify it under the
-terms of the GNU Affero General Public License as published by the Free
-Software Foundation, either version 3 of the License, or (at your option) any
-later version. Releases that shipped under the FSL-1.1-ALv2 remain
-available under those terms; this and every later
-release is AGPL-3.0-or-later.
-
                     GNU AFFERO GENERAL PUBLIC LICENSE
                        Version 3, 19 November 2007
 
