@@ -1,6 +1,8 @@
 """The assistant keeps what it was asked and answered — per household,
-newest first, every member reading the same log, a member able to tidy it,
-a viewer able to read but not delete, and never another household's rows."""
+newest first, the owner and every member reading the same log, a member
+able to tidy it, a viewer shown only their own questions (and able to
+continue only their own conversations), and never another household's
+rows."""
 
 import os
 import unittest
@@ -219,15 +221,43 @@ class HistoryRouteTests(unittest.TestCase):
         self.assertEqual(h["turns"][0]["answer"], "Fine, thanks.")
         # another household sees nothing of it
         self.assertEqual(self.other.get("/api/assistant/history").json()["turns"], [])
-        # the viewer reads the same log, and cannot tidy it
+        # the viewer is shown its own questions only — the owner's is not
+        # in its log, and a follow-up on the owner's thread reads as no
+        # such conversation
         viewer = self._claim("viewer")
+        self.assertEqual(viewer.get("/api/assistant/history").json()["turns"], [])
+        owner_thread = h["turns"][0]["thread_id"]
+        with mock.patch.object(assistant, "_llm") as llm:
+            llm._backend.return_value = _BE
+            llm.chat_tools.return_value = {"content": "x", "tool_calls": []}
+            llm.configured.return_value = True
+            r = viewer.post("/api/assistant", json={
+                "question": "and last month?", "thread_id": owner_thread})
+        self.assertEqual(r.status_code, 404, r.text)
+        r = self._ask(viewer, "what do I spend on coffee?", "Little.")
+        self.assertEqual(r.status_code, 200, r.text)
         v = viewer.get("/api/assistant/history").json()
-        self.assertEqual(v["turns"][0]["id"], h["turns"][0]["id"])
+        self.assertEqual([t["question"] for t in v["turns"]],
+                         ["what do I spend on coffee?"])
+        # ...and may continue its own conversation
+        with mock.patch.object(assistant, "_llm") as llm:
+            llm._backend.return_value = _BE
+            llm.chat_tools.return_value = {"content": "Less.", "tool_calls": []}
+            llm.configured.return_value = True
+            r = viewer.post("/api/assistant", json={
+                "question": "and tea?", "thread_id": v["turns"][0]["thread_id"]})
+        self.assertEqual(r.status_code, 200, r.text)
+        # the owner's log holds everyone's, the viewer's questions named
+        o = self.owner.get("/api/assistant/history").json()
+        self.assertIn("and tea?", [t["question"] for t in o["turns"]])
+        self.assertIn("how am I doing?", [t["question"] for t in o["turns"]])
         self.assertEqual(viewer.delete(
             f"/api/assistant/history/{h['turns'][0]['id']}").status_code, 403)
         self.assertEqual(viewer.delete("/api/assistant/history").status_code, 403)
-        # a member may
+        # a member reads the whole log and may tidy it
         member = self._claim("member")
+        m = member.get("/api/assistant/history").json()
+        self.assertIn("and tea?", [t["question"] for t in m["turns"]])
         self.assertEqual(member.delete(
             f"/api/assistant/history/{h['turns'][0]['id']}").json()["deleted"], 1)
         self._ask(self.owner, "again?")
@@ -236,6 +266,63 @@ class HistoryRouteTests(unittest.TestCase):
         self.assertGreaterEqual(
             member.delete("/api/assistant/history").json()["deleted"], 1)
         self.assertEqual(self.owner.get("/api/assistant/history").json()["turns"], [])
+
+    def _follow_up(self, client, thread_id, q, text="Fine."):
+        """Ask a follow-up; returns (response, every message list the
+        model was handed)."""
+        with mock.patch.object(assistant, "_llm") as llm:
+            llm._backend.return_value = _BE
+            llm.chat_tools.return_value = {"content": text, "tool_calls": []}
+            llm.configured.return_value = True
+            r = client.post("/api/assistant", json={
+                "question": q, "thread_id": thread_id})
+            sent = repr([c.args + tuple(c.kwargs.values())
+                         for c in llm.chat_tools.call_args_list])
+        return r, sent
+
+    def test_a_viewer_s_follow_up_never_carries_another_person_s_turn(self):
+        """The model's context for a view-only login's follow-up holds
+        only what that login asked. The owner reads the viewer's
+        conversation and may continue it; if the viewer's next follow-up
+        then sent the whole thread, the owner's question and answer — not
+        in the viewer's log — would reach the model, and the viewer could
+        ask it to repeat them."""
+        self.addCleanup(self.owner.delete, "/api/assistant/history")
+        viewer = self._claim("viewer")
+        r = self._ask(viewer, "viewer-opening-q", "viewer-opening-a")
+        self.assertEqual(r.status_code, 200, r.text)
+        thread = viewer.get("/api/assistant/history").json()["turns"][0][
+            "thread_id"]
+        r, _ = self._follow_up(self.owner, thread, "owner-private-q",
+                               "owner-private-a")
+        self.assertEqual(r.status_code, 200, r.text)
+        # the viewer's log still shows only what it asked
+        self.assertEqual(
+            [t["question"] for t in
+             viewer.get("/api/assistant/history").json()["turns"]],
+            ["viewer-opening-q"])
+        r, sent = self._follow_up(viewer, thread, "what was asked last?")
+        self.assertNotIn("owner-private-q", sent)
+        self.assertNotIn("owner-private-a", sent)
+        # refused exactly as a thread that does not exist
+        self.assertEqual(r.status_code, 404, r.text)
+
+    def test_a_viewer_cannot_tell_a_household_thread_from_a_missing_one(self):
+        """A view-only login's follow-up on a conversation someone else
+        opened gets the same status and body as one on an id that names
+        nothing — otherwise the refusal would confirm which ids exist."""
+        self.addCleanup(self.owner.delete, "/api/assistant/history")
+        r = self._ask(self.owner, "owner-only-q")
+        self.assertEqual(r.status_code, 200, r.text)
+        thread = self.owner.get("/api/assistant/history").json()["turns"][0][
+            "thread_id"]
+        viewer = self._claim("viewer")
+        theirs, sent = self._follow_up(viewer, thread, "and then?")
+        self.assertNotIn("owner-only-q", sent)
+        missing, _ = self._follow_up(viewer, str(uuid.uuid4()), "and then?")
+        self.assertEqual(theirs.status_code, 404, theirs.text)
+        self.assertEqual((theirs.status_code, theirs.json()),
+                         (missing.status_code, missing.json()))
 
     def _rows_by_question(self):
         return {t["question"]: t for t in

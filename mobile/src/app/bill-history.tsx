@@ -22,7 +22,8 @@ import { useSession } from "../lib/session";
 import { useDemo, useViewer } from "../lib/viewer";
 import { C, mmddyy, money } from "../lib/theme";
 import MerchantAvatar from "../components/merchant-avatar";
-import { ADD_CADENCES, CUSTOM_UNITS, cadenceChoices, cadenceWords, catLabel,
+import { ADD_CADENCES, CATEGORY_MAX, CUSTOM_UNITS, cadenceChoices, cadenceWords, catLabel,
+         dominantCategory,
          customCadence, customMax, filterCategories, missedBillPill,
          proposalSuperseded, RANGE_LABEL, TREND_RANGES, type TrendRange } from "../lib/pure";
 
@@ -260,7 +261,8 @@ export default function BillHistory() {
           </Card>
 
           {!viewer && !demo && (
-            <MerchantCategory payee={d.payee} onDone={afterRecategorize} />
+            <MerchantCategory payee={d.payee} current={dominantCategory(d.txns)}
+                              onDone={afterRecategorize} />
           )}
 
           {d.proposals.length > 0 && (
@@ -667,9 +669,13 @@ function AddAsBill({ payee, fit, inflow, onDone }: {
 }
 
 // bulk category override for the whole (canonical) merchant — the count
-// is the TRUE merchant-wide scope, so the user consents before the write
-function MerchantCategory({ payee, onDone }: {
-  payee: string; onDone: () => void;
+// is the TRUE merchant-wide scope, so the user consents before the write.
+// The picker is the transaction screen's: it rests on the current
+// category, and the filter doubles as a NEW custom name ("✎ Create …"), so
+// a merchant that belongs under a category nobody has used yet never sends
+// the person to the ledger to find a row.
+function MerchantCategory({ payee, current, onDone }: {
+  payee: string; current: string | null; onDone: () => void;
 }) {
   const { client } = useSession();
   const [picking, setPicking] = useState(false);
@@ -694,8 +700,8 @@ function MerchantCategory({ payee, onDone }: {
   // re-filtered on every keystroke of `filter` — memoized so a tenant
   // with hundreds of categories doesn't re-run the dedupe+filter chain
   // (and re-render the whole unvirtualized picker list) per character
+  const flow = useMemo(() => new Set(cats.data?.plaid_flow ?? []), [cats.data]);
   const catList = useMemo(() => {
-    const flow = new Set(cats.data?.plaid_flow ?? []);
     // filterCategories matches the typed text against each option's
     // DISPLAY label, which is what the rows below render — matching the
     // raw constant instead, typing "general services" exactly as shown
@@ -704,7 +710,13 @@ function MerchantCategory({ payee, onDone }: {
       ...(cats.data?.plaid_spend ?? []),
       ...(cats.data?.categories ?? []),
     ])].filter((c) => !flow.has(c)), filter);
-  }, [cats.data, filter]);
+  }, [cats.data, flow, filter]);
+  // a typed name that is no listed option (and no flow name, which the
+  // server refuses for a merchant rule) is offered as a new category
+  const typed = filter.trim();
+  const creatable = typed.length > 1
+    && !flow.has(typed.replace(/\s+/g, "_").toUpperCase())
+    && !catList.some((c) => catLabel(c).toLowerCase() === typed.toLowerCase());
 
   const preview = async (c: string) => {
     setErr(null); setBusy(true); setCat(c); setPicking(false);
@@ -734,14 +746,21 @@ function MerchantCategory({ payee, onDone }: {
     <Card>
       <H>Categorize this merchant</H>
       <Text style={s.mut}>
-        Set one category for every past and future transaction of this
+        One category for every past and future transaction of this
         merchant.
       </Text>
-      <Pressable style={[s.btn, { alignSelf: "flex-start", marginTop: 8 },
-                   busy && { opacity: 0.5 }]}
+      {/* the resting label is the current category, like the ledger
+          row's chip; tapping opens the picker */}
+      <Pressable style={[s.chip, { alignSelf: "flex-start", marginTop: 8,
+                                   flexDirection: "row", gap: 6 },
+                         busy && { opacity: 0.5 }]}
                  disabled={busy}
+                 accessibilityLabel={`category: ${catLabel(current)} — change for the whole merchant`}
                  onPress={() => setPicking(true)}>
-        <Text style={s.btnText}>Apply to whole merchant…</Text>
+        <Text style={{ color: C.mut, fontSize: 13 }}>filed under</Text>
+        <Text style={{ color: C.text, fontSize: 13, fontWeight: "600" }}>
+          {busy ? "checking…" : catLabel(current)}</Text>
+        <Text style={{ color: C.mut, fontSize: 13 }}>▾</Text>
       </Pressable>
       {confirm && (
         <View style={{ marginTop: 8, gap: 6 }}>
@@ -826,15 +845,25 @@ function MerchantCategory({ payee, onDone }: {
                           onPress={() => setPicking(false)}>
                  <Text style={[s.btnText, { color: C.mut }]}>Close</Text>
                </Pressable>}>
-            <TextInput style={s.input} placeholder="filter…"
+            {/* the filter doubles as a new custom name ("✎ Create …") */}
+            <TextInput style={s.input} placeholder="filter, or type a new category…"
                        placeholderTextColor={C.mut} autoCapitalize="none"
+                       maxLength={CATEGORY_MAX}
                        value={filter} onChangeText={setFilter} />
             <ScrollView style={{ maxHeight: 420 }}>
               {cats.isPending && <Text style={s.mut}>Loading…</Text>}
+              {creatable && (
+                <Pressable style={s.catRow} onPress={() => preview(typed)}>
+                  <Text style={{ color: C.accent, fontSize: 15 }}>
+                    ✎ Create “{typed}”
+                  </Text>
+                </Pressable>
+              )}
               {catList.map((c) => (
                 <Pressable key={c} style={s.catRow}
                            onPress={() => preview(c)}>
-                  <Text style={{ color: C.text, fontSize: 15 }}>
+                  <Text style={{ color: catLabel(c) === catLabel(current)
+                                   ? C.accent : C.text, fontSize: 15 }}>
                     {catLabel(c)}
                   </Text>
                 </Pressable>

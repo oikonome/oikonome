@@ -137,6 +137,16 @@ export default function Budget() {
               </>
             )}
           </Text>
+          {/* this month's income is what landed plus what is still due
+              (mirrors the web sub-line) */}
+          {d.income_expected != null && (
+            <Text style={st.mut}>
+              income <Text style={{ color: C.text }}>{m$(d.income_received ?? 0)}</Text> landed
+              {d.income_expected > 0 ? (
+                <> · <Text style={{ color: C.text }}>{m$(d.income_expected)}</Text> still due</>
+              ) : null}
+            </Text>
+          )}
           {/* "variable spending $0 of $0" is arithmetic, not news, and it
               reads as progress against a plan nobody has made, so it is
               hidden when budgets are unset, as on the Today hero.
@@ -197,7 +207,7 @@ export default function Budget() {
               bucket rules, mirroring the web — hidden, never unmounted,
               so an open draft survives a toggle */}
           <CollapsiblePane title="Income scenarios"
-            sub="take-home per paycheck; the active one powers the plan">
+            sub="take-home per paycheck; the active one drives the cash forecast">
             <IncomeScenarios key={`i${gens.i}`} s0={s0}
                              onSaved={refresh("i")}
                              onDirty={markDirty("i")} />
@@ -578,7 +588,17 @@ export function Planner({ s0, viewer, onSaved, onDirty, wizard }: {
 
       <Text style={[st.secHead, { color: C.good }]}>Money in</Text>
       <Text style={st.lbl}>
-        Expected income / month (take-home; powers the cash forecast)
+        Expected income / month (take-home; used only when no paycheck is tracked and no scenario is active)
+      </Text>
+      {/* the web planner's note: what the field is, and what reads it */}
+      <Text style={st.mut}>
+        Suggested from the paychecks in your ledger: the average of what
+        landed over the last twelve months. The plan&apos;s monthly
+        &ldquo;in&rdquo; does not read this field once a paycheck is tracked
+        on Bills — it counts this month&apos;s checks, landed plus still due,
+        each at your latest deposit. It sets the plan&apos;s income only
+        while no paycheck is tracked and no income scenario is active; the
+        cash forecast never reads it.
       </Text>
       <TextInput style={st.input} keyboardType="decimal-pad"
                  editable={!viewer}
@@ -838,8 +858,11 @@ function IncomeScenarios({ s0, onSaved, onDirty }: {
       <Text style={st.mut}>
         {activeRow && monthly > 0
           ? `Active now: ${m$(monthly)}/mo (${activeRow.name}). ` : ""}
-        Applies to the plan, cash forecast, and daily email. No
-        scenarios → the plan&apos;s own income figure is used.
+        Applies to the cash forecast and daily email: the paycheck it
+        describes is walked in at no more than its take-home. It sets the
+        plan&apos;s income only until a paycheck is tracked on Bills — from
+        then the plan counts this month&apos;s own checks. No scenarios →
+        the plan&apos;s own income figure is used.
       </Text>
       {msg ? (
         <Text style={{ color: msg.includes("saved") ? C.good : C.bad,

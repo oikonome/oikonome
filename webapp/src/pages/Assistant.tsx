@@ -22,7 +22,7 @@ import { Link, useSearchParams } from "react-router";
 import { api, assistant, errText, type AssistantCursor, type AssistantTurn } from "../api/client";
 import AssistantBlocks, { type AnswerBlock, RichText } from "../components/AssistantBlocks";
 import { plainText } from "../richtext";
-import { canEdit } from "../role";
+import { canEdit, isViewer } from "../role";
 
 /** a question in flight (or one that failed); `thread` is the
  *  conversation it continues, null for a new one; `note` says why it
@@ -208,13 +208,14 @@ function historyNotKept(e: unknown): boolean {
 
 // ---- a conversation that went away (mobile: conversationGone /
 // followUpGone in lib/answer-pure.ts). Another member, or this person on
-// another device, can remove the conversation that is open here. The
+// another device, can remove the conversation that is open here — and a
+// view-only login cannot continue one someone else has added to. The
 // server then answers the next question in it with a 404; the question
 // is asked again as a new conversation, once, and the dead thread is
 // closed — resending its id could only fail the same way.
 
 const RESTARTED_NOTE =
-  "the earlier conversation was removed, so this was asked as a new question";
+  "the earlier conversation can no longer be continued here, so this was asked as a new question";
 /** the note an answer carries when its conversation was removed while it
  *  was being written: the server kept it nowhere, so it stands alone */
 const REMOVED_NOTE =
@@ -357,6 +358,10 @@ export default function Assistant() {
   // a 404 is a server older than the shared log: this tab's own turns
   // are all there is, and that is not an error
   const noLog = history.isError && historyNotKept(history.error);
+  // a view-only login is shown its own conversations only; the owner (and
+  // a member) reads the household's whole log — the words say which
+  const ownOnly = isViewer(me);
+  const keptFor = ownOnly ? "kept for you" : "kept for the household";
   // once the log carries a turn this tab kept, the log's row is the one;
   // the local turn hands over only its note, so it cannot come back as a
   // live conversation when its row later leaves the log
@@ -632,6 +637,7 @@ export default function Assistant() {
             {!history.isPending && (!history.isError || noLog) && threads.length === 0 && (
               <p className="mut" style={{ padding: ".6rem .75rem", fontSize: 13 }}>
                 {noLog ? "Nothing asked yet."
+                  : ownOnly ? "Nothing asked yet. Your conversations are kept here."
                   : "Nothing asked yet. Every conversation is kept here for the household."}
               </p>
             )}
@@ -642,7 +648,7 @@ export default function Assistant() {
             )}
           </div>
           <div className="foot">
-            <span>{noLog ? "this session only" : "kept for the household"}</span>
+            <span>{noLog ? "this session only" : keptFor}</span>
             {mayEdit && !noLog && threads.length > 0 && (
               <button style={{ fontSize: 12 }} disabled={clear.isPending}
                       onClick={() => { if (window.confirm("Clear every conversation?")) clear.mutate(); }}>
@@ -726,7 +732,8 @@ export default function Assistant() {
                 <div className="chat-empty">
                   <h2>Ask about your money</h2>
                   <div className="mut">Plain questions, answered from your own ledger.
-                    {!noLog && " Every conversation is kept for the household."}</div>
+                    {!noLog && (ownOnly ? " Your conversations are kept for you."
+                                        : " Every conversation is kept for the household.")}</div>
                   <div className="chips">
                     {EXAMPLES.map((ex) => (
                       <button key={ex} onClick={() => submit(ex, null)} disabled={ask.isPending}>{ex}</button>

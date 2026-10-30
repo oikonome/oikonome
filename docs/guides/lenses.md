@@ -100,7 +100,9 @@ variable budgets were auto-scaled (see the Budget guide).
 Every row of the Monthly budget map — Food, Everything else, a carve-out,
 and Bills — opens the transactions it counted for that month; on the
 Year lens the same rows open the year's. Each category in the spending
-table opens that month's rows in the category.
+table opens that month's rows in the category. In a ledger's first,
+partial month the variable rows show the same share of each budget the
+verdict judges; bills are shown in full.
 
 ## Year: the twelve-cell grid
 

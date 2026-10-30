@@ -93,6 +93,7 @@ def month_state(conn, y: int, m: int, today: dt.date, *,
     st["budget_source"] = "snapshot" if snap is not None else "live"
     st["bills_source"] = "snapshot" if frozen is not None else "live"
     st["bill_rows"] = frozen    # the schedule the month was judged under
+    st["snapshot_config"] = snap   # …and the budget (None = the live one)
     return st
 
 
@@ -124,6 +125,17 @@ def _projection(st: dict) -> dict:
         pace_total, variance, verdict = var_budget, 0.0, "ON BUDGET"
     return {"pace_total": _R(pace_total), "variance": _R(variance),
             "tolerance": _R(tolerance), "verdict": verdict}
+
+
+def _paced(st: dict, amount: float) -> float:
+    """A variable budget figure at the month's spendable share. A ledger
+    that began inside the month may spend only the budget's share from
+    its first day to month end (budget.pace_window); the hero judges
+    that share (variable_budget_paced), so every row beneath it — a
+    bucket, its remainder, a carve-out — and every sum of months reads
+    the same share, or the rows add up to money the hero says the month
+    never had. Bills are not paced: they are owed on their schedule."""
+    return amount * st.get("month_share", 1.0)
 
 
 def _judged(conn, st: dict) -> bool:
@@ -406,7 +418,7 @@ def _year_detail(conn, year: int, today: dt.date, memo: dict,
                                                      "month_budget": 0.0,
                                                      "parent": k})
                 e["actual"] += c["actual"]
-                e["month_budget"] += c["month_budget"]
+                e["month_budget"] += _paced(st, c["month_budget"])
         for env in b["fixed"].get("envelopes") or []:
             e = envelopes.setdefault(env["payee"], {
                 "used": 0.0, "monthly": 0.0, "overflow": 0.0,
@@ -486,16 +498,19 @@ def month_summary(conn, year: int, month: int,
 
     def bucket(k):
         v = b[k]
+        # the variable buckets at the hero's paced share (_paced); the
+        # bills bucket is owed whole
+        pace = (lambda x: _paced(st, x)) if k != "fixed" else (lambda x: x)
         out = {"actual": _R(v["actual"]), "expected": _R(v["expected"]),
-               "month_budget": _R(v["month_budget"])}
+               "month_budget": _R(pace(v["month_budget"]))}
         if "children" in v:     # decomposition, carried like Today
             out["children"] = [{"name": c["name"], "actual": _R(c["actual"]),
                                 "expected": _R(c["expected"]),
-                                "month_budget": _R(c["month_budget"])}
+                                "month_budget": _R(pace(c["month_budget"]))}
                                for c in v["children"]]
             out["display_actual"] = _R(v["display_actual"])
             out["display_expected"] = _R(v["display_expected"])
-            out["remaining_budget"] = _R(v["remaining_budget"])
+            out["remaining_budget"] = _R(pace(v["remaining_budget"]))
         return out
 
     mtd, amazon_subs, amazon_total = _by_category(st["rows"])
@@ -654,7 +669,7 @@ def year_summary(conn, year: int, today: dt.date | None = None,
               for k in ("food", "other", "fixed")}
     # standing monthly plan surplus, from the latest elapsed month's state
     # (None when nothing has elapsed — a future year has no excess to map)
-    plan_surplus = None
+    plan_surplus = surplus_st = None
     snap_months = budget.snapshot_months(conn, year)
     # bank coverage decides whether a cell's income is a number or unknown,
     # month by month (the Month lens hero's rule); the annual totals below
@@ -716,12 +731,14 @@ def year_summary(conn, year: int, today: dt.date | None = None,
                                   if inc is not None else None)})
             continue
         if st.get("plan_surplus") is not None:
-            plan_surplus = st["plan_surplus"]
+            surplus_st = st
         for k in ("food", "other", "fixed"):
             b = st["buckets"][k]
             annual[k]["actual"] += b["actual"]
             annual[k]["expected"] += b["expected"]
-            annual[k]["month_budget"] += b["month_budget"]
+            # a first month counts the share its cell judged (_paced)
+            annual[k]["month_budget"] += (b["month_budget"] if k == "fixed"
+                                          else _paced(st, b["month_budget"]))
         var_budget = _R(st["variable_budget_paced"])
         # the cash-flow fact beside the verdict, the way the Month lens
         # hero reads it (income from the bank series, spend = the month's
@@ -888,6 +905,18 @@ def year_summary(conn, year: int, today: dt.date | None = None,
                           "net": _R(inc - spend) if inc is not None else None})
         detail["years"] = years
 
+    if surplus_st is not None:
+        # the standing figure, not that month's own: a month with a third
+        # paycheck or a refund is no measure of every other one
+        from ..engine import forecast as _forecast
+        as_of = surplus_st.get("as_of") or today
+        closed = (as_of.year, as_of.month) < (today.year, today.month)
+        # a closed month under the schedule and budget it was judged under
+        plan_surplus = _forecast.standing_surplus(
+            conn, surplus_st, as_of, memo=memo,
+            cfg=surplus_st.get("snapshot_config") if closed else None,
+            bill_rows=surplus_st.get("bill_rows") if closed else None,
+            closed=closed)
     return {"y": year, "cells": cells, "detail": detail,
             "totals": totals(year), "prev_totals": totals(year - 1),
             "categories": categories, "saved_ytd": saved_ytd,

@@ -149,8 +149,18 @@ def _num(x, limit: float = MAX_AMOUNT):
     is not finite or exceeds `limit` refuses the whole CSV (ValueError →
     400): this door writes its own INSERTs, so it holds the same bound
     the shared transaction funnel enforces."""
+    # Either separator convention, read the way the CSV importer reads it:
+    # the door takes a portal export that may have passed through a
+    # spreadsheet in a decimal-comma locale, where stripping every comma
+    # would read "1.234,56" as 1.23456 and "12,5" shares as 125.
+    from .csvimport import parse_money_text
+    if x is None:
+        return None
+    s = str(x).strip()
+    if not s:
+        return None
     try:
-        v = float(str(x).replace(",", "").strip())
+        v = parse_money_text(s)
     except (ValueError, TypeError):
         return None
     if not math.isfinite(v) or abs(v) > limit:

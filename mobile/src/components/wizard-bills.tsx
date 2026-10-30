@@ -10,7 +10,7 @@ import { Pressable, Text, TextInput, View } from "react-native";
 import { errText } from "../lib/api";
 import type { BillsData, Proposal } from "../lib/api";
 import { removeFromList } from "../lib/cache";
-import { cadenceChoices, cadenceWords, localYmd, money,
+import { cadenceChoices, cadenceWords, localYmd, money, parseMoneyDraft,
          proposalSuperseded } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { C, mmddyy } from "../lib/theme";
@@ -374,7 +374,7 @@ function AddBillForm() {
   });
   const submit = (income: boolean) => {
     if (!name.trim()) { setMsg({ text: "Give it a name.", bad: true }); return; }
-    if (!(Number(amount.replace(/[$,\s]/g, "")) > 0)) {
+    if (!((parseMoneyDraft(amount) ?? 0) > 0)) {
       setMsg({ text: "Enter an amount above zero.", bad: true }); return;
     }
     if (due.trim() && parseDueDay(due) === null) {

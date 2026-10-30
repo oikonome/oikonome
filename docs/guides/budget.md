@@ -9,10 +9,25 @@ language.
 ## The planner
 
 - **Income** — one field, "Expected income / month" (take-home),
-  prefilled from the paychecks detected in your ledger. Named scenarios
+  suggested from the paychecks in your ledger as the average of what
+  landed over the last twelve months (the same figure the Bills page
+  shows). Once an income series is tracked on the Bills page, the plan's
+  **in** figure is this month's actual income instead: the deposits that
+  have landed plus the paychecks still due before month end, each at
+  your latest deposit amount (the line under the plan shows the two
+  halves), so a three-paycheck month shows three checks and a check that
+  changed carries its new size forward. A check counts for the month
+  it pays, not the day it lands: a paycheck due Sunday the 1st that the
+  bank deposits on Friday the 30th is the next month's income. The
+  budgeted field stands in
+  for households with no income series. Named scenarios
   ("full salary", "sabbatical") live in the collapsed **Income
-  scenarios** card below the planner; the one marked Active powers
-  budgeted income, the cash forecast, and excess cash.
+  scenarios** card below the planner. The one marked Active drives the
+  cash forecast and the daily email: the paycheck it describes is walked
+  in at no more than its take-home, so a lower take-home applies at
+  once. It sets the plan's income (and with it excess cash) only while
+  no income series is tracked on the Bills page; once one is, the plan
+  counts this month's own checks.
 - **Bills** — read-only here, averaged over the year (a $600 annual
   premium shows as $50/mo). Bills are edited on the Bills page —
   one owner for bill data.
@@ -174,7 +189,8 @@ Each goal has a **contribution mode**:
   in one and the other refreshes.
 - Bills shown here are the evened yearly average; the actual heavy and
   light months show up in Today's irregular-bills list and the
-  forecast, not as a broken plan.
+  forecast, not as a broken plan. Income is the month's own, so the
+  **excess** line moves with it — a third paycheck is excess that month.
 - A charge split by hand on the Transactions page lands in the buckets
   part by part — the grocery half of a big-box run is Food, the rest is
   Everything else (or a custom bucket that names its category).

@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import re
 
+from ..sync import flowmap
+
 # processor prefixes that imply the business type
 PREFIXES: list[tuple[str, str]] = [
     ("TST*", "FOOD_AND_DRINK"),        # Toast POS — restaurants
@@ -299,6 +301,48 @@ def flow_match(merchant: str | None) -> tuple[str, str | None] | None:
     if loan:
         return loan
     if _TRANSFER_RE.search(up):
+        return ("TRANSFER_OUT", None)
+    return None
+
+
+# The statement-line reading (flow_match_line). A row with no merchant
+# name carries the bank's whole line as its payee, and on such a line the
+# loose words above name any debit: a credit union prints "WITHDRAWAL POS
+# #123 NORTHWIND GROCERY" for a purchase and a utility's online bill reads
+# "FABRIKAM WATER E-PAYMENT". So the line is read by an allow-list of
+# explicit wording instead, and nothing is cut out of it — an issuer's
+# "<issuer> E-PAYMENT" carries its card signal only through brand and
+# E-PAYMENT together, and stripping the word would leave a card
+# settlement counted as spend.
+_LINE_CARD_PAYMENT_RE = re.compile(
+    r"\b(CREDIT CARD|CREDIT CRD|CC PAYMENT|CARDMEMBER SERV\w*|"
+    r"PAYMENT THANK YOU)\b")
+# a bare WITHDRAWAL is how some banks spell every debit; only the explicit
+# cash wording, or the word transfer itself, is a movement of money
+_LINE_TRANSFER_RE = re.compile(
+    r"\b(TRANSFER|XFER|ATM WITHDRAWAL|CASH WITHDRAWAL)\b")
+
+
+def flow_match_line(line: str | None) -> tuple[str, str | None] | None:
+    """flow_match for a bank's whole statement line (a row with no
+    merchant name). Routes only on explicit wording, in this order: a card
+    payment the tight name detector sees, an issuer's E-PAYMENT, explicit
+    card-payment words, a loan payment, then TRANSFER / XFER / ATM or CASH
+    WITHDRAWAL. A debit-card purchase line is never a card payment, and a
+    bare WITHDRAWAL or E-PAYMENT routes nothing. None for everything
+    else."""
+    if not line:
+        return None
+    up = line.upper()
+    if not flowmap.is_debit_card_line(up) and (
+            flowmap.looks_like_card_payment(up)
+            or flowmap.looks_like_issuer_e_payment(up)
+            or _LINE_CARD_PAYMENT_RE.search(up)):
+        return ("LOAN_PAYMENTS", "LOAN_PAYMENTS_CREDIT_CARD_PAYMENT")
+    loan = loan_match(up)
+    if loan:
+        return loan
+    if _LINE_TRANSFER_RE.search(up):
         return ("TRANSFER_OUT", None)
     return None
 

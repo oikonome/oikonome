@@ -1189,13 +1189,30 @@ def set_category(conn, txn_id: str, category: str,
     Returns None for "one" (and for an "all" that writes no rule — a flow
     category, or a row with no merchant); otherwise the same shape the
     history page's bulk write returns: the canonical taught and an `undo`
-    snapshot undo_merchant_category accepts. The teach deletes
-    duplicate-spelling user rules (_write_user_rule), so without a snapshot
-    that delete would be silent and unrecoverable from this door.
+    reference to the snapshot the server holds, which
+    undo_merchant_category spends. The teach deletes duplicate-spelling
+    user rules (_write_user_rule), so without a snapshot that delete would
+    be silent and unrecoverable from this door.
     """
     if scope not in ("one", "all"):
         raise ValueError(f"unknown category scope: {scope!r}")
+    from ..engine import llm_categorize as _llm
+    teaches = scope == "all" and bool(category) \
+        and category not in _cats.FLOW
+    # One transaction for the row and the teach: the canonical is resolved
+    # and the snapshot taken under the same identity lock the write holds,
+    # and the per-row answer never commits without the teach it asked for.
     with conn.transaction():
+        if teaches:
+            # The merchant-identity lock FIRST, before the row's lock below:
+            # the documented order is pairing, then identity, then rows. A
+            # rename or merge holds identity and then locks this merchant's
+            # rows and rules; a teach that held this row and then wrote the
+            # rule and re-filed the rows outside identity crossed that
+            # writer, and one side was killed as a deadlock. The pairing
+            # lock the route took before calling in holds no row, so
+            # identity here is still second.
+            _lock_identity_first(conn)
         _drop_store_parts(conn, txn_id)
         conn.execute(
             # bill_id NULL: this is a PERSON's answer now, even if a bill's
@@ -1211,64 +1228,67 @@ def set_category(conn, txn_id: str, category: str,
             (txn_id, category))
         conn.execute("UPDATE transactions SET category_override=%s, "
                      "override_source='user' WHERE id=%s", (category, txn_id))
-    # a correction teaches the merchant map, merchant-WIDE — every
-    # past row of this merchant updates right now (apply() below) and every
-    # future row lands pre-categorized, even where the aggregator had its
-    # own sharp idea. Custom category names propagate the same way. The
-    # only exclusions are flow categories (transfers/income/loan payments —
-    # the spend-exclusion machinery's domain) and rows carrying their own
-    # per-transaction override, which stay sacred.
-    from ..engine import categories as _cats, llm_categorize as _llm
-    if scope == "all" and category and category not in _cats.FLOW:
-        # "Whole merchant" is the merchant this row is FILED under — the one
-        # the page shows beside it, read through the display join, never a
-        # string retyped from the row's columns. Retyped, the two part
-        # company for exactly the rows identity work has touched: a fuel
-        # arm's row would hand its parent brand's name to the write (the
-        # brand's own rows recategorized, the pump's left alone), and a
-        # renamed merchant would be taught under the name it no longer
-        # displays as. The display name IS the bucket key _merchant_targets
-        # matches on, so it needs no second resolution.
-        row = conn.execute(
-            f"""SELECT {_DISPLAY_MERCHANT} AS m
-                  FROM transactions t {_MC_JOIN} WHERE t.id=%s""",
-            (txn_id,)).fetchone()
-        if row and row["m"]:
-            canon = row["m"]
-            with conn.transaction():
-                # Snapshot BEFORE the write, exactly as set_merchant_category
-                # does for the history page: the rows this teach will move
-                # and every rule resolving to the canonical (including the
-                # duplicate spellings _write_user_rule is about to delete),
-                # so the caller gets a real undo instead of a silent,
-                # unrecoverable rule delete. The corrected row itself is
-                # not in `affected` — it carries a per-row override now, so
-                # undoing the teach leaves the single-row correction alone.
-                affected = [{"id": r["id"], "prev": r["category_primary"]}
-                            for r in _merchant_targets(conn, canon)
-                            if r["category_primary"] != category]
-                prior = conn.execute(
-                    "SELECT category_primary, source, disabled "
-                    "FROM merchant_categories WHERE merchant=%s",
-                    (canon,)).fetchone()
-                rules_snap = [{"merchant": pr["merchant"], "prior": dict(pr)}
-                              for pr in conn.execute(
-                                  f"""SELECT merchant, category_primary,
-                                             source, disabled
-                                        FROM merchant_categories AS m
-                                       WHERE {_llm._RULE_CANON} = %s""",
-                                  (canon,)).fetchall()]
-                _write_user_rule(conn, canon, category)
-                # scoped: the full-table sweep runs minutes on a big ledger
-                # and this HTTP request waits on it
-                _llm.apply(conn, canon=canon)
-            return {"merchant": canon,
-                    "undo": {"canons": [{"canon": canon,
-                                         "prior_rule": (dict(prior)
-                                                        if prior else None)}],
-                             "rules": rules_snap, "affected": affected,
-                             "category": category}}
+        if teaches:
+            return _teach_merchant(conn, txn_id, category, _llm)
     return None
+
+
+def _teach_merchant(conn, txn_id: str, category: str, _llm) -> dict | None:
+    """set_category's scope="all" half, inside its transaction and under
+    the identity lock it took first.
+
+    A correction teaches the merchant map, merchant-WIDE — every past row
+    of this merchant updates right now (apply() below) and every future row
+    lands pre-categorized, even where the aggregator had its own sharp
+    idea. Custom category names propagate the same way. Flow categories
+    never get here (the spend-exclusion machinery's domain), and rows
+    carrying their own per-transaction override stay sacred."""
+    # "Whole merchant" is the merchant this row is FILED under — the one
+    # the page shows beside it, read through the display join, never a
+    # string retyped from the row's columns. Retyped, the two part company
+    # for exactly the rows identity work has touched: a fuel arm's row
+    # would hand its parent brand's name to the write (the brand's own rows
+    # recategorized, the pump's left alone), and a renamed merchant would
+    # be taught under the name it no longer displays as. The display name
+    # IS the bucket key _merchant_targets matches on, so it needs no second
+    # resolution.
+    row = conn.execute(
+        f"""SELECT {_DISPLAY_MERCHANT} AS m
+              FROM transactions t {_MC_JOIN} WHERE t.id=%s""",
+        (txn_id,)).fetchone()
+    if not (row and row["m"]):
+        return None
+    canon = row["m"]
+    # Snapshot BEFORE the write, exactly as set_merchant_category does for
+    # the history page: the rows this teach will move and every rule
+    # resolving to the canonical (including the duplicate spellings
+    # _write_user_rule is about to delete), so the caller gets a real undo
+    # instead of a silent, unrecoverable rule delete. The corrected row
+    # itself is not in `affected` — it carries a per-row override now, so
+    # undoing the teach leaves the single-row correction alone.
+    affected = [{"id": r["id"], "prev": r["category_primary"]}
+                for r in _merchant_targets(conn, canon)
+                if r["category_primary"] != category]
+    prior = conn.execute(
+        "SELECT category_primary, source, disabled "
+        "FROM merchant_categories WHERE merchant=%s",
+        (canon,)).fetchone()
+    rules_snap = [{"merchant": pr["merchant"], "prior": dict(pr)}
+                  for pr in conn.execute(
+                      f"""SELECT merchant, category_primary, source, disabled
+                            FROM merchant_categories AS m
+                           WHERE {_llm._RULE_CANON} = %s""",
+                      (canon,)).fetchall()]
+    _write_user_rule(conn, canon, category)
+    # scoped: the full-table sweep runs minutes on a big ledger and this
+    # HTTP request waits on it
+    _llm.apply(conn, canon=canon)
+    return {"merchant": canon,
+            "undo": _hold_undo(conn, {
+                "canons": [{"canon": canon,
+                            "prior_rule": dict(prior) if prior else None}],
+                "rules": rules_snap, "affected": affected,
+                "category": category})}
 
 
 # bulk category override from a merchant's summary page — set a
@@ -1713,11 +1733,13 @@ def set_merchant_category(conn, payee: str, category: str,
             "WHERE id = ANY(%s) AND category_primary=%s "
             "AND category_override IS NULL", (ids, category)
         ).fetchone()["n"] if ids else 0
-    # `category` names what this write set, so an undo can tell its own
-    # write apart from a later one it must not clobber
-    return {"merchant": canon, "count": count,
-            "undo": {"canons": priors, "rules": rules_snap,
-                     "affected": affected, "category": category}}
+        # `category` names what this write set, so an undo can tell its
+        # own write apart from a later one it must not clobber. Held on the
+        # server in the write's own transaction: no snapshot without the
+        # write, and no write whose undo was lost.
+        undo = _hold_undo(conn, {"canons": priors, "rules": rules_snap,
+                                 "affected": affected, "category": category})
+    return {"merchant": canon, "count": count, "undo": undo}
 
 
 def _display_names_of(conn, canon: str) -> list[str]:
@@ -1838,27 +1860,117 @@ def delete_rule(conn, merchant: str) -> int:
     return cur.rowcount
 
 
-# An undo snapshot is client-held state: the apply response hands it to the
-# SPA, which posts it back. Nothing ties it to a prior apply, so it is
-# validated like any other body — a wrong shape is a 400, not a 500, and
-# every value it writes is bounded to what a genuine snapshot can hold.
+# A merchant-wide write's undo is held on the server (category_undo): the
+# write stores its full snapshot and answers with {"ref", "category"}, and
+# the undo loads the snapshot back by that ref. The snapshot is as large as
+# the merchant is — one entry per moved row, the merchant's own name — so
+# it is never bounded: a cap on the snapshot would hand a large merchant's
+# write an undo the undo door then rejects, and a cap on the write would
+# reject the edit itself.
+#
+# A snapshot posted INLINE is still accepted: a client may hold a response
+# that carries one rather than a reference. That one is client-held state
+# with nothing tying it to a prior apply, so it is validated like any other
+# body — a wrong shape is a 400, not a 500, and every value it writes is
+# bounded to what an inline snapshot may hold.
 UNDO_MAX_AFFECTED = 5000
 UNDO_MAX_RULES = 200
 UNDO_MAX_CANONS = 200
 _NAME_MAX = 200
 
+# How long a held undo lasts, and how many a household keeps: the toast
+# that offers it is gone long before either bound bites.
+UNDO_KEEP_DAYS = 7
+UNDO_KEEP_NEWEST = 20
 
-def _undo_name(v, what: str, max_len: int = _NAME_MAX) -> str:
+# the current household, spelled out beside RLS: the prune and the lookup
+# must never reach another household's snapshots, whatever role runs them
+_THIS_TENANT = "NULLIF(current_setting('app.tenant_id', true), '')::uuid"
+
+
+class UndoNotFound(LookupError):
+    """An undo reference this household does not hold (never issued here,
+    pruned, or another household's) — the API's 404."""
+
+
+def _hold_undo(conn, snapshot: dict) -> dict:
+    """Store a write's undo snapshot and return what the client is handed:
+    an opaque reference plus the category the write set. Called inside the
+    write's transaction. Prunes as it goes, so the table stays a handful of
+    rows per household."""
+    import json
+    row = conn.execute(
+        "INSERT INTO category_undo (payload) VALUES (%s::jsonb) "
+        "RETURNING id", (json.dumps(snapshot),)).fetchone()
+    conn.execute(
+        f"""DELETE FROM category_undo
+             WHERE tenant_id = {_THIS_TENANT}
+               AND (created_at < now() - make_interval(days => %s)
+                    OR id IN (SELECT id FROM category_undo
+                               WHERE tenant_id = {_THIS_TENANT}
+                               ORDER BY created_at DESC, id DESC
+                               OFFSET %s))""",
+        (UNDO_KEEP_DAYS, UNDO_KEEP_NEWEST))
+    return {"ref": str(row["id"]), "category": snapshot.get("category")}
+
+
+def held_undo(conn, undo: dict) -> dict:
+    """The snapshot a write's `undo` reference names, read without spending
+    it — what the undo would restore. Raises UndoNotFound when this
+    household holds no such reference."""
+    import json
+    import uuid
+    row = conn.execute(
+        f"""SELECT payload FROM category_undo
+             WHERE tenant_id = {_THIS_TENANT} AND id = %s""",
+        (str(uuid.UUID(str(undo["ref"]))),)).fetchone()
+    if not row:
+        raise UndoNotFound("undo: no such change to undo")
+    p = row["payload"]
+    return json.loads(p) if isinstance(p, str) else p
+
+
+def _claim_undo(conn, ref) -> dict:
+    """Load a held snapshot by its reference and spend it, in the caller's
+    transaction (so a refused undo leaves it unspent). Raises UndoNotFound
+    for a reference this household does not hold, ValueError for a
+    malformed or already-used one."""
+    import uuid
+    if not isinstance(ref, str):
+        raise ValueError("undo: ref must be a string")
+    try:
+        ref = str(uuid.UUID(ref))
+    except ValueError:
+        raise ValueError("undo: ref is not a valid reference") from None
+    row = conn.execute(
+        f"""SELECT payload, used_at FROM category_undo
+             WHERE tenant_id = {_THIS_TENANT} AND id = %s
+             FOR UPDATE""", (ref,)).fetchone()
+    if not row:
+        raise UndoNotFound("undo: no such change to undo")
+    if row["used_at"] is not None:
+        raise ValueError("undo: this change was already undone")
+    conn.execute(f"UPDATE category_undo SET used_at = now() "
+                 f"WHERE tenant_id = {_THIS_TENANT} AND id = %s", (ref,))
+    payload = row["payload"]
+    if isinstance(payload, str):
+        import json
+        payload = json.loads(payload)
+    return payload
+
+
+def _undo_name(v, what: str, max_len: int | None = _NAME_MAX) -> str:
     if not isinstance(v, str) or not v.strip():
         raise ValueError(f"undo: {what} must be a non-empty string")
-    if len(v) > max_len:
+    if max_len is not None and len(v) > max_len:
         raise ValueError(f"undo: {what} too long ({max_len} chars max)")
     if any(ord(ch) < 32 or 127 <= ord(ch) <= 159 for ch in v):
         raise ValueError(f"undo: {what} contains control characters")
     return v
 
 
-def _undo_rule_prior(p, what: str, default_source: str = "user") -> dict:
+def _undo_rule_prior(p, what: str, default_source: str = "user",
+                     max_len: int | None = _NAME_MAX) -> dict:
     """A snapshotted rule row: a bounded category name, provenance from the
     known set (a forged `source` would dress a user's rule up as the
     aggregator's or the model's), and a boolean disabled flag.
@@ -1874,7 +1986,7 @@ def _undo_rule_prior(p, what: str, default_source: str = "user") -> dict:
     if not isinstance(p, dict):
         raise ValueError(f"undo: {what} must be an object")
     cat_name = _undo_name(p.get("category_primary"),
-                          f"{what}.category_primary")
+                          f"{what}.category_primary", max_len)
     source = p.get("source", default_source)
     if source not in RULE_SOURCES:
         raise ValueError(f"undo: {what}.source must be one of "
@@ -1883,12 +1995,17 @@ def _undo_rule_prior(p, what: str, default_source: str = "user") -> dict:
             "disabled": bool(p.get("disabled"))}
 
 
-def _validate_undo(conn, undo) -> tuple[list[dict], list[dict],
-                                        list[dict] | None]:
+def _validate_undo(conn, undo, caps: bool = True
+                   ) -> tuple[list[dict], list[dict], list[dict] | None]:
     """Normalise an undo body into (canons, affected, rules) — every entry
-    a dict of the expected keys with bounded, known-good values — or raise
+    a dict of the expected keys with known-good values — or raise
     ValueError. Accepts the multi-canonical shape ({"canons": [...]}, the
-    token-family write) and the legacy single-canon shape."""
+    token-family write) and the legacy single-canon shape.
+
+    `caps` bounds counts and name lengths: on for a snapshot the client
+    posted, off for one the server held (written by the server itself, as
+    large as the merchant is — still shape-checked, never trusted blind)."""
+    name_max = _NAME_MAX if caps else None
     if not isinstance(undo, dict):
         raise ValueError("undo must be an object")
     canons_in = undo.get("canons")
@@ -1904,17 +2021,18 @@ def _validate_undo(conn, undo) -> tuple[list[dict], list[dict],
                             UNDO_MAX_RULES)):
         if not isinstance(lst, list):
             raise ValueError(f"undo: {name} must be a list")
-        if len(lst) > cap:
+        if caps and len(lst) > cap:
             raise ValueError(f"undo: too many {name} ({cap} max)")
 
     canons: list[dict] = []
     for i, entry in enumerate(canons_in):
         if not isinstance(entry, dict):
             raise ValueError(f"undo: canons[{i}] must be an object")
-        c = _undo_name(entry.get("canon"), f"canons[{i}].canon")
+        c = _undo_name(entry.get("canon"), f"canons[{i}].canon", name_max)
         prior = entry.get("prior_rule")
         if prior is not None:
-            prior = _undo_rule_prior(prior, f"canons[{i}].prior_rule", "llm")
+            prior = _undo_rule_prior(prior, f"canons[{i}].prior_rule", "llm",
+                                     name_max)
         canons.append({"canon": c, "prior_rule": prior})
     canon_set = {c["canon"] for c in canons}
 
@@ -1924,7 +2042,8 @@ def _validate_undo(conn, undo) -> tuple[list[dict], list[dict],
         for i, r in enumerate(rules_in):
             if not isinstance(r, dict):
                 raise ValueError(f"undo: rules[{i}] must be an object")
-            merchant = _undo_name(r.get("merchant"), f"rules[{i}].merchant")
+            merchant = _undo_name(r.get("merchant"), f"rules[{i}].merchant",
+                                  name_max)
             # a snapshot only ever holds rules that resolve to a touched
             # canonical; anything else is not this undo's to restore
             if _canonical_of(conn, merchant) not in canon_set:
@@ -1932,7 +2051,8 @@ def _validate_undo(conn, undo) -> tuple[list[dict], list[dict],
                     f"undo: rules[{i}] does not belong to a touched merchant")
             rules.append({"merchant": merchant,
                           "prior": _undo_rule_prior(r.get("prior"),
-                                                    f"rules[{i}].prior")})
+                                                    f"rules[{i}].prior",
+                                                    max_len=name_max)})
 
     # A prior category is RESTORED, not authored: the write displaced it,
     # so putting it back is always legitimate, flow categories included
@@ -1945,30 +2065,47 @@ def _validate_undo(conn, undo) -> tuple[list[dict], list[dict],
     for i, a in enumerate(affected_in):
         if not isinstance(a, dict):
             raise ValueError(f"undo: affected[{i}] must be an object")
-        tid = _undo_name(a.get("id"), f"affected[{i}].id")
+        tid = _undo_name(a.get("id"), f"affected[{i}].id", name_max)
         prev = a.get("prev")
         if prev is not None:
-            prev = _undo_name(prev, f"affected[{i}].prev")
+            prev = _undo_name(prev, f"affected[{i}].prev", name_max)
         affected.append({"id": tid, "prev": prev})
     return canons, affected, rules
 
 
-def _undo_written(undo) -> str | None:
+def _undo_written(undo, caps: bool = True) -> str | None:
     """The category the undone write set, or None for a snapshot minted
     before snapshots carried it (those undo unconditionally, as before)."""
     wrote = undo.get("category") if isinstance(undo, dict) else None
-    return None if wrote is None else _undo_name(wrote, "category")
+    return None if wrote is None else _undo_name(
+        wrote, "category", _NAME_MAX if caps else None)
 
 
 def undo_merchant_category(conn, undo: dict) -> int:
-    """Reverse a set_merchant_category: restore each row's prior category and
-    every touched canonical's prior rule (or remove a rule that didn't
-    exist). Accepts the multi-canonical shape ({"canons": [...]}, the
-    token-family write) and the legacy single-canon shape. A malformed
-    body raises ValueError (the API's 400), never a 500."""
+    """Reverse a set_merchant_category (or set_category's teach): restore
+    each row's prior category and every touched canonical's prior rule (or
+    remove a rule that didn't exist).
+
+    `undo` is what the write answered: {"ref": ..., "category": ...}, whose
+    snapshot the server holds and spends here, once. A snapshot posted
+    inline (the multi-canonical {"canons": [...]} shape or the legacy
+    single-canon one) is still accepted through the capped path. A
+    malformed body raises ValueError (the API's 400), an unknown ref
+    UndoNotFound (404), never a 500."""
+    if isinstance(undo, dict) and "ref" in undo:
+        with conn.transaction():
+            # identity first, as every merchant-wide write; the held row
+            # is spent in the same transaction as the restore it drives
+            _lock_identity_first(conn)
+            snapshot = _claim_undo(conn, undo.get("ref"))
+            return _apply_undo(conn, snapshot, caps=False)
+    return _apply_undo(conn, undo, caps=True)
+
+
+def _apply_undo(conn, undo, caps: bool) -> int:
     from ..engine import llm_categorize as _llm
-    canons, affected, rules = _validate_undo(conn, undo)
-    wrote = _undo_written(undo)
+    canons, affected, rules = _validate_undo(conn, undo, caps=caps)
+    wrote = _undo_written(undo, caps=caps)
     if not canons:
         return 0
     restored = 0

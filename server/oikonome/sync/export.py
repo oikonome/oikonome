@@ -236,6 +236,12 @@ def build_zip(conn, out=None, *,
         "This ZIP restores into any Oikonome instance (Settings -> Your\n"
         "data on self-host or hosted); credentials never travel in it, so\n"
         "bank connections are re-linked on the destination.\n\n"
+        # restore reads this line to know how the cells were guarded
+        # (restore.GUARD_MARK); keep it word for word
+        "Spreadsheet guard: v2 — a cell, or a piece after ';', a tab or a\n"
+        "line break, that would open with = + - or @ starts with an extra\n"
+        "apostrophe so a spreadsheet shows it as text; a restore removes\n"
+        "exactly that apostrophe.\n\n"
         "What each file is. Files marked (records only) are written for\n"
         "your own reading and are NOT loaded by a restore — they hold\n"
         "this instance's operating state (alerts, sync logs, staged\n"

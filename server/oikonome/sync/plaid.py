@@ -781,10 +781,15 @@ def _live_items(conn, item_id: str, inst_id: str,
             and not _relinkable(r["webhook_status"])]
 
 
-def _masked_accounts(client: "Client", token: str) -> set:
-    """(type, mask) of every masked account Plaid reports for a token."""
-    return {(a.type, a.mask) for a in _norm_accounts(
-        client.post("/accounts/get", {"access_token": token})) if a.mask}
+def _masked_accounts(client: "Client", token: str) -> list:
+    """(type, mask) of every masked account Plaid reports for a token.
+
+    A list, not a set: two accounts sharing a type and a mask must stay
+    two, or a check that asks whether a mask names ONE account (the
+    unknown-type fallback of the repeat check) would see one and call it
+    unique where adoption refuses to pair it."""
+    return [(a.type, a.mask) for a in _norm_accounts(
+        client.post("/accounts/get", {"access_token": token})) if a.mask]
 
 
 def _repeat_inputs(conn, client: "Client", access_token: str,
@@ -794,8 +799,8 @@ def _repeat_inputs(conn, client: "Client", access_token: str,
     lock is taken — so no other link or key swap in the household waits on
     Plaid's network time. None when the link cannot be a repeat (no
     institution). Otherwise {"token": the new Item's token, "fresh": its
-    masked (type, mask) set, or None while nothing here made it worth
-    asking, "held": {item id: (type, mask) set}} for held Items whose first
+    masked (type, mask) list, or None while nothing here made it worth
+    asking, "held": {item id: (type, mask) list}} for held Items whose first
     sync has not landed. Plaid is asked only when the institution already
     has a live Item here. Any trouble reads as "not a repeat"."""
     if not inst_id:
@@ -824,11 +829,11 @@ def _fetch_held(conn, client: "Client", ctx: dict, ids) -> None:
             ctx["fresh"] = _masked_accounts(client, ctx["token"])
         except Exception as e:                           # noqa: BLE001
             log.warning("plaid link: new item accounts unread: %s", e)
-            ctx["fresh"] = set()
+            ctx["fresh"] = []
     if not ctx["fresh"]:
         return
     for iid in ids:
-        ctx["held"].setdefault(iid, set())
+        ctx["held"].setdefault(iid, [])
         try:
             token = get_access_token(conn, iid)
             if token:
@@ -857,9 +862,10 @@ def _already_linked(conn, item_id: str, inst_id: str,
     * A held account the person removed still counts as held: the login
       it came through is here.
     * A type the person reclassified by hand no longer says what Plaid
-      calls the account, so there the mask alone decides. It can only
-      cover a new account at the same bank with the same last digits, and
-      only refuses when every other account is covered too.
+      calls the account, so a held account is compared by the bank's own
+      type (`adopt.feed_identity`, read from the feed's raw record). Where
+      that is unknown the mask alone decides, and only when it names one
+      account on each side.
     * Accounts without a mask are never compared.
     * A held Item whose first sync has not landed is judged by the
       accounts Plaid reported for it before the lock (`ctx["held"]`).
@@ -881,20 +887,34 @@ def _already_linked(conn, item_id: str, inst_id: str,
                if not r["synced"] and r["id"] not in ctx["held"]]
     if missing or ctx["fresh"] is None:
         return missing
+    from .adopt import feed_identity
     held: set = set()
-    by_hand: set = set()
+    untyped: list = []
     for iid in (r["id"] for r in live if not r["synced"]):
-        held |= ctx["held"].get(iid, set())
+        held |= set(ctx["held"].get(iid, ()))
     ids = [r["id"] for r in live if r["synced"]]
     if ids:
         for r in conn.execute(
-                "SELECT type, mask, type_user_set FROM accounts "
+                "SELECT type, mask, type_user_set, raw->>'type' AS feed_type "
+                "FROM accounts "
                 "WHERE item_id = ANY(%s) AND COALESCE(mask,'')<>''",
                 (ids,)).fetchall():
-            held.add((r["type"], r["mask"]))
-            if r["type_user_set"]:
-                by_hand.add(r["mask"])
-    return all(acct in held or acct[1] in by_hand for acct in ctx["fresh"])
+            typ, mask = feed_identity(r)
+            if typ is None:
+                untyped.append(mask)
+            else:
+                held.add((typ, mask))
+    fresh_masks = [m for _t, m in ctx["fresh"]]
+
+    def covered(acct) -> bool:
+        typ, mask = acct
+        if ((typ or "").strip().lower(), mask) in held:
+            return True
+        # a held account whose bank type is unknown answers for a mask
+        # only when the mask names one account on each side — the same
+        # fallback adoption pairs by (`adopt.pair_accounts`)
+        return untyped.count(mask) == 1 and fresh_masks.count(mask) == 1
+    return all(covered(acct) for acct in ctx["fresh"])
 
 
 class _RepeatRefetch(Exception):
@@ -915,20 +935,141 @@ def _same_accounts(conn, client: "Client", access_token: str,
     """Every masked account the new token reports is held by `old_id`
     (same type and mask). A Plaid failure here is no evidence."""
     try:
-        fresh = _masked_accounts(client, access_token)
+        fresh = set(_masked_accounts(client, access_token))
     except PlaidError:
         return False
     if not fresh:
         return False
-    held = {(r["type"], r["mask"]) for r in conn.execute(
-        "SELECT type, mask FROM accounts WHERE item_id=%s "
-        "AND COALESCE(mask,'')<>''", (old_id,)).fetchall()}
-    return fresh <= held
+    # held accounts by the bank's type: one the person retyped by hand
+    # still answers for the feed's word; one whose bank type is unknown
+    # answers for nothing, so it can only keep the old Item, never release it
+    from .adopt import feed_identity
+    held = set()
+    for r in conn.execute(
+            "SELECT type, mask, type_user_set, raw->>'type' AS feed_type "
+            "FROM accounts WHERE item_id=%s AND COALESCE(mask,'')<>''",
+            (old_id,)).fetchall():
+        typ, mask = feed_identity(r)
+        if typ is not None:
+            held.add((typ, mask))
+    return {((t or "").strip().lower(), (m or "").strip())
+            for t, m in fresh} <= held
+
+
+# A status a login can no longer get past: Plaid's login-required, the
+# consent codes only a fresh link restores, and an Item that is gone. The
+# other re-auth words (new accounts available, consent expiring soon,
+# disconnect pending) ride on Items that still sign in and sync, so they
+# never make a connection "dead" for the moved-login test.
+_MOVED_LOGIN_CODES = frozenset({"ITEM_LOGIN_REQUIRED"}) | _FRESH_LINK_CODES
+
+
+def _cannot_sign_in(status: str | None) -> bool:
+    """True when `status` (an Item's own, or the webhook's) says the login
+    is dead: only a fresh sign-in brings the connection back."""
+    st = (status or "").strip()
+    if not st:
+        return False
+    if status_kind(st) == "gone":
+        return True
+    code = _WEBHOOK_WORDS.get(st) or (
+        st.split(":", 1)[1] if st.startswith("error:") else st.upper())
+    return code in _MOVED_LOGIN_CODES
+
+
+def _moved_login(conn, client: "Client", access_token: str, inst_id: str,
+                 only: str | None = None) -> str | None:
+    """The connection a sign-in at ANOTHER bank continues, if any.
+
+    Banks merge, and a card book moves to the buyer's login: the person's
+    old connection stops signing in,
+    and the only way forward is a fresh link at the new bank — which Plaid
+    sees as a different institution, so nothing here would otherwise tie
+    the two together. Left alone the new link mints a second copy of the
+    same account and backfills two years of charges the old one already
+    holds.
+
+    So a new login is the old connection MOVED when, and only when:
+
+    * the old connection is a Plaid Item here at a different institution
+      that can no longer sign in: its status, or the webhook's, carries a
+      code only a fresh login clears (login required, consent revoked or
+      never granted) or says the Item is gone. Not the flags a working
+      Item wears while it syncs (new accounts available, consent expiring,
+      disconnect pending) — a connection that still signs in is never
+      adopted away from, whatever a new login shows;
+    * the masked accounts line up: EVERY account of the old connection
+      the person still keeps reappears at the new login (type and mask;
+      an account whose type the person set by hand is compared by the
+      bank's type, and the pairing is `adopt.pair_accounts` itself, so a
+      connection released here is one adoption carries over whole; one
+      they removed by hand is not part of the connection — adoption skips
+      it too). Extra
+      accounts at the new bank (the buyer's own) do not break it; a kept
+      account the new login does not show does — a connection that still
+      serves an account elsewhere is not moved, and the new bank is an
+      ordinary add;
+    * exactly one old connection matches. Two would mean a coincidence of
+      masks, and welding the wrong history onto a live feed is far worse
+      than the duplicate account a person can merge by hand.
+
+    `only` restricts the search to one Item (the relink door's binding).
+    Plaid is asked for the new login's accounts only when a candidate
+    exists. Any trouble reads as "nothing moved"."""
+    if not inst_id:
+        return None                 # another bank cannot be told from this one
+    rows = conn.execute(
+        "SELECT i.id, i.status, i.webhook_status FROM items i "
+        "WHERE i.aggregator='plaid' "
+        "AND COALESCE(i.status,'') <> 'archived' "
+        "AND COALESCE(i.access_token,'') <> '' "
+        "AND i.institution_id IS NOT NULL AND i.institution_id <> %s "
+        "AND (%s::text IS NULL OR i.id = %s::text)",
+        (inst_id, only, only)).fetchall()
+    dead = [r["id"] for r in rows
+            if _cannot_sign_in(r["status"])
+            or _cannot_sign_in(r["webhook_status"])]
+    if not dead:
+        return None
+    from .adopt import pair_accounts
+    try:
+        # a list (as `_masked_accounts` keeps too): two accounts at the new
+        # login sharing a type and a mask must stay two, or the pairing
+        # below would see one and call it unique where adoption refuses
+        fresh = [{"type": a.type, "mask": a.mask} for a in _norm_accounts(
+            client.post("/accounts/get", {"access_token": access_token}))
+            if a.mask]
+    except PlaidError:
+        return None
+    if not fresh:
+        return None
+    matched = []
+    for old_id in dead:
+        held = conn.execute(
+            "SELECT id, type, mask, type_user_set, raw->>'type' AS feed_type "
+            "FROM accounts "
+            "WHERE item_id=%s AND COALESCE(mask,'')<>'' "
+            "AND user_removed_at IS NULL", (old_id,)).fetchall()
+        # the identity rule adoption carries the accounts over by: a
+        # connection released here whose accounts adoption would then
+        # leave behind strands their history on a released Item
+        paired = {c["id"] for _a, c in pair_accounts(held, fresh)}
+        if held and all(r["id"] in paired for r in held):
+            matched.append(old_id)
+    if len(matched) != 1:
+        if matched:
+            log.info("link at %s matches %d dead connections by mask — "
+                     "none carried over", inst_id, len(matched))
+        return None
+    log.info("link at %s continues the connection item=%s (login moved "
+             "banks): its accounts are carried over", inst_id, matched[0])
+    return matched[0]
 
 
 def _settle_relink(conn, old_id: str, new_id: str, same_bank: bool) -> None:
-    """The new Item is held: release the one it replaces (same bank) under
-    the relink reason, or leave it live (another bank — an ordinary add).
+    """The new Item is held: release the one it replaces (the same bank,
+    or a login that moved banks — `_moved_login`) under the relink reason,
+    or leave it live (another bank — an ordinary add).
     Either way the binding on the old row is spent. The old Item's
     accounts come across to the new one at its first pull (adopt), which
     is why the release comes first: adoption takes from a tokenless Item.
@@ -1119,6 +1260,18 @@ def link_item(conn, public_token: str, institution_name: str = "",
                 # stays and this one is an ordinary add.
                 same_bank = _same_accounts(conn, client, ex["access_token"],
                                            relink_of)
+    # A sign-in at another bank whose accounts are those of a connection
+    # here that can no longer sign in is that connection MOVED (a bank
+    # bought the book): it is settled exactly like a relink of the same
+    # bank — the old Item released and named as the donor, so the first
+    # pull carries its accounts and history onto the new ids instead of
+    # minting copies (adopt). From the relink door only the bound Item is
+    # considered; from a plain add, any.
+    if not same_bank:
+        moved = _moved_login(conn, client, ex["access_token"], inst_id,
+                             only=relink_of)
+        if moved:
+            relink_of, same_bank = moved, True
     repeat = _repeat_inputs(conn, client, ex["access_token"], item_id,
                             inst_id, relink_of if same_bank else None)
     for attempt in range(3):

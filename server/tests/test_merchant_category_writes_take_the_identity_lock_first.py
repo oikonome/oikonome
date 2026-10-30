@@ -81,7 +81,7 @@ class CategoryWriteLockOrderTests(unittest.TestCase):
     def test_a_category_undo_meeting_a_rename_waits_for_it(self):
         res = data.set_merchant_category(self.conn, self.display,
                                          "FOOD_AND_DRINK")
-        self.assertTrue(res["undo"]["affected"])
+        self.assertTrue(data.held_undo(self.conn, res["undo"])["affected"])
         self._collide(lambda c: data.undo_merchant_category(c, res["undo"]))
 
 

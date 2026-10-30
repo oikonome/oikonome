@@ -8,6 +8,7 @@ import { useRef, useState } from "react";
 import { api, errText, mmdd, money, type SavingsGoal,
          type Settings as SettingsData } from "../api/client";
 import { saveSettings } from "../api/cache";
+import { parseMoneyDraft } from "../moneymath";
 
 export default function SavingsGoalsCard({ data, onSaved, onDirtyChange }: {
   data: SettingsData; onSaved: () => void;
@@ -33,7 +34,16 @@ export default function SavingsGoalsCard({ data, onSaved, onDirtyChange }: {
   // the Budget page's remount guard reads
   const baseline = useRef<SavingsGoal[]>(data.savings_goals ?? []);
   const touch = () => onDirtyChange?.(true);
-  const num = (v: string) => Number(v.replace(/[$,\s]/g, "") || 0);
+  // blank is 0. Text that is not a number stops the save: sent on, NaN
+  // travels as JSON null and would be stored as $0 without a word.
+  const num = (v: string, what: string) => {
+    if (v.replace(/[$\s]/g, "") === "") return 0;
+    const n = parseMoneyDraft(v);
+    if (n === null)
+      throw new Error(`${what}: "${v.trim()}" is not an amount — `
+                      + "type it like 1,250.50.");
+    return n;
+  };
   // Match words with no account can never be measured: they match both
   // legs of a transfer and nothing says which side is the fund, so the
   // server refuses the shape. Mobile shares this predicate
@@ -61,13 +71,14 @@ export default function SavingsGoalsCard({ data, onSaved, onDirtyChange }: {
           if (live) { out.push(live); continue; }
           if (baseNames.has(name)) continue;   // deleted elsewhere
         }
-        out.push({ name, target: num(r.target),
+        out.push({ name, target: num(r.target, `${name} target`),
                    target_date: r.target_date || null,
-                   monthly_plan: num(r.monthly_plan),
+                   monthly_plan: num(r.monthly_plan, `${name} plan`),
                    account_id: r.account_id || null,
                    tokens: r.tokens.split(",").map((t) => t.trim())
                      .filter(Boolean),
-                   start_balance: num(r.start_balance),
+                   start_balance: num(r.start_balance,
+                                      `${name} starting balance`),
                    mode: r.mode === "sweep" ? "sweep" : "monthly" });
       }
       for (const g of curG)

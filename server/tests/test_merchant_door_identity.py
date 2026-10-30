@@ -110,7 +110,8 @@ class ApplyToWholeMerchantFollowsTheRowsOwnMerchant(unittest.TestCase):
         # brand's warehouse row
         out = data.set_category(self.conn, self.pump, "TRANSPORTATION",
                                 scope="all")
-        self.assertEqual([a["id"] for a in out["undo"]["affected"]],
+        held = data.held_undo(self.conn, out["undo"])
+        self.assertEqual([a["id"] for a in held["affected"]],
                          [self.other_pump])
 
     def test_the_preview_count_equals_what_the_teach_does(self):
@@ -166,8 +167,8 @@ class HistoryPageBulkSetFollowsTheDisplayedMerchant(unittest.TestCase):
         changed = {i for i in after if after[i] != before.get(i)}
         self.assertEqual(changed, _displayed_under(self.conn, "Fuel Stop"))
         self.assertEqual(res["count"], len(changed))
-        self.assertEqual([a["id"] for a in res["undo"]["affected"]],
-                         [self.pump])
+        held = data.held_undo(self.conn, res["undo"])
+        self.assertEqual([a["id"] for a in held["affected"]], [self.pump])
 
     def test_the_confirm_counts_what_the_write_moves(self):
         preview = data.merchant_category_preview(self.conn, "Fuel Stop",

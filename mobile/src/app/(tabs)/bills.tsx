@@ -621,7 +621,10 @@ export default function Bills() {
       {d?.totals && (
         <Card>
           <KV k="Monthly bill load" v={money(d.totals.bills_monthly, false)} />
-          <KV k="Monthly income" v={money(d.totals.income_monthly, false)}
+          <KV k={d.totals.income_basis === "actual"
+                  ? `Monthly income (${d.totals.income_months ?? 12}-month average)`
+                  : "Monthly income"}
+              v={money(d.totals.income_monthly, false)}
               tone="good" />
           {/* the difference is what the variable budget and savings
               actually have to work with (matches the web hero) */}

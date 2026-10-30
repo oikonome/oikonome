@@ -201,7 +201,10 @@ def _rows(z: zipfile.ZipFile, name: str):
     id_cells = (("id", "pending_transaction_id") + _TXN_ID_CELLS
                 if name == "transactions.csv" else _TXN_ID_CELLS)
     with fh:
-        lines = _MemberLines(io.TextIOWrapper(fh, encoding="utf-8"), name)
+        # newline="": csv does its own line handling, and a universal-
+        # newline read would turn a CR inside a quoted cell into a line feed
+        lines = _MemberLines(io.TextIOWrapper(fh, encoding="utf-8",
+                                              newline=""), name)
         reader = csv.DictReader(lines)
         reader.reader = _MemberReader(reader.reader, lines)
         _tick(name, 0)
@@ -1008,15 +1011,19 @@ def clean_excluded_accounts(cfg: dict) -> None:
 def _amount_or_none(v):
     """A settings amount as the settings door accepts it: a real number
     (a bool is not one), finite, and no larger than any real sum; None for
-    anything else. A numeric string passes, as the door parses one."""
+    anything else. A numeric string passes, read by the parser the door
+    uses, so a decimal-comma "12,50" restores as 12.5 — deleting every
+    comma would bring it back as 1250."""
     if isinstance(v, bool) or v is None:
         return None
-    if isinstance(v, str):
-        v = v.replace(",", "").replace("$", "").strip()
-        if not v:
-            return None
     try:
-        n = float(v)
+        if isinstance(v, str):
+            from .csvimport import parse_money_text
+            if not v.strip():
+                return None
+            n = parse_money_text(v)
+        else:
+            n = float(v)
     except (TypeError, ValueError, OverflowError):
         return None
     if not math.isfinite(n) or abs(n) > MAX_AMOUNT:
@@ -1300,6 +1307,20 @@ def _plan_moved_accounts(conn) -> dict[str, str]:
     step = {r["old_account_id"]: r["account_id"] for r in rows
             if r["old_account_id"] and r["account_id"]
             and r["old_account_id"] != r["account_id"]}
+    # A split re-key records the old id with its number cut
+    # (split_lineage_id), so two numbered ids sharing their last four leave
+    # one key. Which account each went to is then unknown here, and
+    # filing both onto one would merge two accounts' rows: such a key is
+    # not followed, and the archive's account lands and is re-keyed again
+    # on its own (its rows already here stay where they are).
+    targets: dict[str, set] = {}
+    for r in rows:
+        if "\u2026" in (r["old_account_id"] or ""):
+            targets.setdefault(r["old_account_id"], set()).add(
+                r["account_id"])
+    for k, v in targets.items():
+        if len(v) > 1:
+            step.pop(k, None)     # _resolve_cut_lineage may still place it
     live = {r["id"] for r in conn.execute(
         "SELECT id FROM accounts WHERE id = ANY(%s)",
         (list(step),)).fetchall()} if step else set()
@@ -1315,6 +1336,51 @@ def _plan_moved_accounts(conn) -> dict[str, str]:
     return out
 
 
+# Archived rows per numbered account read to place it under a cut lineage
+# key that names several accounts: a few are enough to find them here.
+_CUT_LINEAGE_PROBE = 2_000
+
+
+def _resolve_cut_lineage(conn, z, moved: dict) -> None:
+    """Place each archived split account whose id spells a full number
+    under a cut lineage key naming several accounts (two cards sharing
+    their last four, both moved): onto the one account here holding its
+    archived rows' ids, which hash the full id and so tell the cards
+    apart. One no account, or several, hold stays unplaced, lands, and is
+    re-keyed on its own, as _plan_moved_accounts leaves it — never filed
+    onto the other card's account."""
+    rows = conn.execute(
+        "SELECT old_account_id, account_id FROM account_adoptions"
+        " WHERE item_id = 'manual' AND strpos(old_account_id, %s) > 0",
+        ("\u2026",)).fetchall()
+    targets: dict[str, set] = {}
+    for r in rows:
+        targets.setdefault(r["old_account_id"], set()).add(r["account_id"])
+    ambiguous = {k: v for k, v in targets.items() if len(v) > 1}
+    if not ambiguous:
+        return
+    ids: dict[str, list] = {}
+    for r in _rows(z, "transactions.csv"):
+        tid, aid = r.get("id"), r.get("account_id")
+        if not tid or not aid:
+            continue
+        aid = _comma_free(str(aid))
+        if (aid in moved or not _sync_base.NUMBERED_SPLIT_ID_RE.search(aid)
+                or _sync_base.split_lineage_id(aid) not in ambiguous):
+            continue
+        got = ids.setdefault(aid, [])
+        if len(got) < _CUT_LINEAGE_PROBE:
+            got.append(str(tid))
+    for aid, tids in ids.items():
+        reach = sorted(ambiguous[_sync_base.split_lineage_id(aid)])
+        held = [r["account_id"] for r in conn.execute(
+            "SELECT DISTINCT account_id FROM transactions"
+            " WHERE id = ANY(%s) AND account_id = ANY(%s)",
+            (tids, reach)).fetchall()]
+        if len(held) == 1:
+            moved[aid] = held[0]
+
+
 def _account_id(v):
     """An archived account id as it restores: comma-free, the same rename
     the database migration gave ids already stored (see
@@ -1327,7 +1393,12 @@ def _account_id(v):
         return v
     v = _comma_free(str(v))
     moved = _MOVED_ACCOUNTS.get()
-    return moved.get(v, v) if moved else v
+    if not moved:
+        return v
+    if v not in moved and _sync_base.NUMBERED_SPLIT_ID_RE.search(v):
+        # a split id spelling a full number moved under its cut form
+        return moved.get(_sync_base.split_lineage_id(v), v)
+    return moved.get(v, v)
 
 
 # Where a transaction this household already moved now lives: archived id
@@ -1346,6 +1417,25 @@ def _account_id(v):
 # member that names the old id the live one instead: the insert then meets
 # the row it already holds, and the row's notes, splits and pins land on
 # the live row rather than on nothing.
+# The line an export's README carries when its cells were written by the
+# lossless guard (pages._csv_cell: the head rule with its doubled
+# apostrophe, then the piece rule). Read once per restore into _GUARD_V2,
+# which _unescape consults for every cell; absent, the archive is an older
+# one and gets the reverse it was written for.
+GUARD_MARK = "Spreadsheet guard: v2"
+_GUARD_V2: contextvars.ContextVar = contextvars.ContextVar(
+    "restore_guard_v2", default=False)
+
+
+def archive_guard_v2(z: zipfile.ZipFile) -> bool:
+    """Was this archive written with the lossless spreadsheet guard?"""
+    try:
+        with z.open("README.txt") as fh:
+            return GUARD_MARK.encode() in fh.read(256 * 1024)
+    except KeyError:
+        return False
+
+
 _MOVED_TXNS: contextvars.ContextVar = contextvars.ContextVar(
     "oikonome_restore_moved_txns", default=None)
 # the cells of each member that name a transaction by its id
@@ -1950,10 +2040,36 @@ def _unescape(v):
     # The exact rule lives in one place — api._csv_safe — so the two
     # sides cannot drift: undo the quote when what follows it is what
     # the export would have quoted.
-    if isinstance(v, str) and v[:1] == "'":
-        from ..web.api import _csv_safe
-        if _csv_safe(v[1:]) == v:
-            return v[1:]
+    # An archive written with GUARD_MARK also guards the pieces after a
+    # ';', tab or line break (api._csv_piece_safe, after the head rule) and
+    # adds a quote in front of a household's own leading apostrophe, so
+    # both steps there are exact inverses and lose nothing. An older
+    # archive was written by the head rule alone, without that doubling:
+    # it gets the old head-only reverse, and no piece step that would eat
+    # an apostrophe the household typed after a ';'.
+    if not isinstance(v, str) or "'" not in v:
+        return v
+    if not _GUARD_V2.get():
+        return _unescape_head_v1(v)
+    from ..web.api import _csv_piece_unsafe, _csv_safe
+    v = _csv_piece_unsafe(v)
+    if v[:1] == "'" and _csv_safe(v[1:]) == v:
+        return v[1:]
+    return v
+
+
+def _unescape_head_v1(v: str) -> str:
+    """The reverse of the head rule archives carried before GUARD_MARK: a
+    quote put in front of = + - @ (behind optional invisible characters)
+    or a leading tab/CR, with no doubling of an apostrophe already there."""
+    if v[:1] != "'":
+        return v
+    rest = v[1:]
+    lead = ("\t", "\r", "\n", "\ufeff", " ")
+    head = rest.lstrip("".join(lead))
+    if (rest[:1] in lead + ("=", "+", "-", "@")
+            and head[:1] in ("=", "+", "-", "@")) or rest[:1] in ("\t", "\r"):
+        return rest
     return v
 
 
@@ -1982,7 +2098,8 @@ MAX_DESCRIPTOR = 600
 def _descriptor(v):
     """A restored free-text descriptor: un-escaped, and never longer than a
     real one."""
-    v = _unescape(v)
+    # the cell was un-escaped once already, by _rows: a second pass would
+    # take a quote off text the household typed
     return v[:MAX_DESCRIPTOR] if isinstance(v, str) else v
 
 
@@ -2021,10 +2138,12 @@ def restore_zip(conn, data: bytes, *, progress=None,
     moved_txns = _MOVED_TXNS.set({})
     moved = _MOVED_ACCOUNTS.set(_plan_moved_accounts(conn))
     sessions = _START_SESSIONS.set(_starter_watch(conn, starter))
+    guard = _GUARD_V2.set(False)
     try:
         return _restore_zip(conn, data)
     finally:
         _START_SESSIONS.reset(sessions)
+        _GUARD_V2.reset(guard)
         _MOVED_TXNS.reset(moved_txns)
         _COMMA_RENAMES.reset(renames)
         _MOVED_ACCOUNTS.reset(moved)
@@ -2218,9 +2337,14 @@ def _restore_zip(conn, data) -> dict:
     # the whole archive back into the heap the streaming was built to avoid
     z = zipfile.ZipFile(data if hasattr(data, "seek") else io.BytesIO(data))
     _check_zip_sizes(z)          # refuse zip bombs before reading rows
+    # how this archive's cells were guarded; restore_zip scopes the value
+    _GUARD_V2.set(archive_guard_v2(z))
     planned = _COMMA_RENAMES.get()
     if planned is not None:
         planned.update(_plan_comma_renames(conn, z))
+    moved_accounts = _MOVED_ACCOUNTS.get()
+    if moved_accounts is not None:
+        _resolve_cut_lineage(conn, z, moved_accounts)
     carried = _MOVED_TXNS.get()
     if carried is not None:
         # read before any row lands: the pairing is against what the
@@ -2421,7 +2545,12 @@ def _restore_zip(conn, data) -> dict:
                 # that name brings the full account number back with it.
                 # Migration 189 makes the same cut to stored names.
                 a_name = _sync_base.mask_long_digits(a_name)
-                if _sync_base.LONG_DIGITS_RE.search(r["id"] or ""):
+                # a split import's id is re-keyed once the rows have
+                # landed (below); any other keeps it, and is named
+                restored_id = str(_account_id(r["id"]) or "")
+                if (_sync_base.LONG_DIGITS_RE.search(restored_id)
+                        and not _sync_base.NUMBERED_SPLIT_ID_RE.search(
+                            restored_id)):
                     numbered_ids.append(a_name or "an account")
             cur = conn.execute(
                 """INSERT INTO accounts (id, item_id, name, display_name,
@@ -3035,6 +3164,13 @@ def _restore_zip(conn, data) -> dict:
             except _AmountOutOfRange:
                 out_of_range += 1
                 continue
+            if amount is None:
+                # a line item is a priced line: reading a receipt drops any
+                # line without a finite amount, and every client renders
+                # the amount as a number — so the archive may not bring
+                # in a shape the app itself never stores
+                skipped += 1
+                continue
             cur = conn.execute(
                 """INSERT INTO receipt_items (receipt_id, line, description,
                        qty, amount, tag)
@@ -3520,6 +3656,19 @@ def _restore_zip(conn, data) -> dict:
             if not (isinstance(snap_bills, dict)
                     and isinstance(snap_bills.get("rows"), list)):
                 snap_bills = None
+            else:
+                # each frozen row's raw config gets the pass a live bill
+                # gets (clean_bill_raw): the lenses expand these rows the
+                # same way, and a recurrence that is a string or an
+                # interval that is text would 500 that month and its year.
+                # A row whose payee or amount is malformed is dropped.
+                snap_bills = {**snap_bills, "rows": [
+                    {**b, "raw": clean_bill_raw(b.get("raw"))}
+                    for b in snap_bills["rows"]
+                    if isinstance(b, dict)
+                    and isinstance(b.get("payee"), str)
+                    and isinstance(b.get("amount"), (int, float))
+                    and not isinstance(b.get("amount"), bool)]}
             cur = conn.execute(
                 """INSERT INTO budget_snapshots (year, month, config, bills,
                        captured_at, source)
@@ -4013,6 +4162,14 @@ def _restore_zip(conn, data) -> dict:
             row = conn.execute(
                 "SELECT current_setting('app.tenant_id', true) AS tid").fetchone()
             demoguard.invalidate(row["tid"] if row and row["tid"] else None)
+        # A split account an archive written before migration 199 holds
+        # under an id spelling a full account number is moved onto its
+        # masked id here, as the migration moved the stored ones, once its
+        # rows, lineage and settings have landed; the adoption it leaves is
+        # what a re-import, and a later restore of the same archive,
+        # follow to it.
+        rekeyed = _sync_base.rekey_numbered_split_accounts(conn)
+        landed_accounts = {rekeyed.get(a, a) for a in landed_accounts}
     # Restored AFTER the same bank was linked here: the link already holds
     # each account under its new Plaid id, and the archive just brought the
     # same account back under its old one on a tokenless shell. The link

@@ -296,7 +296,7 @@ export interface FollowUp { id: string; question: string; last_at: string }
 
 /** the note a question re-asked as a new conversation carries */
 export const RESTARTED_NOTE =
-  "the earlier conversation was removed, so this was asked as a new question";
+  "the earlier conversation can no longer be continued here, so this was asked as a new question";
 /** the note an answer carries when its conversation was removed while it
  *  was being written: the server kept it nowhere, so it stands alone */
 export const REMOVED_NOTE =

@@ -136,7 +136,7 @@ def is_unlocked(conn, email: str) -> bool:
     return row is not None
 
 
-def refund(conn, email: str) -> None:
+def refund(conn, email: str, ids=None) -> None:
     """Un-spend an exemption consumed MOMENTS ago by a sign-in step that
     could not possibly finish — password verified, but the account needs a
     second factor the same request does not carry (totp_required /
@@ -148,31 +148,39 @@ def refund(conn, email: str) -> None:
 
     One refund per unlock (refunded_at is the stamp). The two-step form
     needs exactly one — the password post spends and refunds, the code post
-    spends for good — so the exemption still buys a single attempt."""
+    spends for good — so the exemption still buys a single attempt.
+
+    `ids`: the unlocks the asking request itself spent (`consume`'s
+    return). Given, only those can be refunded — a concurrent attempt's
+    spend inside the same 90 seconds is that attempt's, not this one's."""
     if not email:
         return
+    scope = "" if ids is None else "AND u.id = ANY(%s)"
+    params = ((email.strip().lower(),) if ids is None
+              else (email.strip().lower(), list(ids)))
     conn.execute(
-        """UPDATE login_unlocks u SET consumed_at = NULL, refunded_at = now()
+        f"""UPDATE login_unlocks u SET consumed_at = NULL, refunded_at = now()
            FROM users usr
-           WHERE usr.id = u.user_id AND lower(usr.email) = %s
+           WHERE usr.id = u.user_id AND lower(usr.email) = %s {scope}
              AND u.consumed_at IS NOT NULL
              AND u.consumed_at > now() - interval '90 seconds'
              AND u.refunded_at IS NULL
              AND u.unlocked_until IS NOT NULL
-             AND u.unlocked_until > now()""",
-        (email.strip().lower(),))
+             AND u.unlocked_until > now()""", params)
 
 
-def consume(conn, email: str) -> bool:
+def consume(conn, email: str) -> list:
     """Spend the exemption — ONE sign-in attempt, not a ten-minute pass for
-    unlimited guessing. Returns True if one was actually spent."""
+    unlimited guessing. Returns the ids of the unlocks spent (empty, so
+    falsy, when there was none): a request that later has to give its
+    spend back names exactly these rows, never another attempt's."""
     if not email:
-        return False
-    row = conn.execute(
+        return []
+    rows = conn.execute(
         """UPDATE login_unlocks u SET consumed_at=now()
            FROM users usr
            WHERE usr.id = u.user_id AND lower(usr.email)=%s
              AND u.consumed_at IS NULL
              AND u.unlocked_until IS NOT NULL AND u.unlocked_until > now()
-           RETURNING u.id""", (email.strip().lower(),)).fetchone()
-    return row is not None
+           RETURNING u.id""", (email.strip().lower(),)).fetchall()
+    return [r["id"] for r in rows]

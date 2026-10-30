@@ -8,6 +8,7 @@ import { VerifyEmailCard } from "../components/VerifyEmailCard";
 import { sharedLock } from "../sharedlogin";
 import { api, errText, mmdd, MOBILE_HOMES, NextCodeNeeded, WEB_HOMES,
          type ActivityPage, type ApiToken, type Invite, type Me, type Member,
+         type MemberNotify,
          type MobileDevice, type NotifyStatus, type Session,
          type Settings as SettingsData, type TokenScope, type Webhook,
          type WebhookDelivery, type WebhookEvent } from "../api/client";
@@ -606,7 +607,9 @@ export default function Settings() {
   if (!owner && !viewer)
     for (const k of Object.keys(secShow))
       if (!MEMBER_SECS.includes(k)) secShow[k] = false;
-  const ids = (viewer ? ["email", "household", "security"]
+  // a viewer manages their own notices and their own login, nothing
+  // else — the roster is the owner's to read
+  const ids = (viewer ? ["email", "security"]
                : owner ? SECS.map((s) => s.id) : MEMBER_SECS)
     .filter((id) => (id !== "billing" || billingOn)
                     && (id !== "system" || !hosted));
@@ -773,11 +776,7 @@ export default function Settings() {
                 Household email reaches you once the address is confirmed.
               </VerifyEmailCard>
               <MyEmailCard />
-            </Sec>
-            <Sec id="household" show={secOn("household")}>
-              <Show on={h.family}>
-                <DemoLock on={false} shared={lockGrant}><FamilyCard /></DemoLock>
-              </Show>
+              <MyPushCard />
             </Sec>
             <Sec id="security" show={secOn("security")}>
               <VerifyEmailCard me={meQ.data} />
@@ -872,7 +871,7 @@ export default function Settings() {
       {/* WHO the household's mail goes to, and when, is the owner's —
           the recipient list is a door out of the instance. A member sets
           their own delivery on or off, exactly as a viewer does. */}
-      {!owner && <MyEmailCard />}
+      {!owner && <><MyEmailCard /><MyPushCard /></>}
       {owner && (<>
       <Show on={h.daily}>
       <DemoLock on={meQ.data?.demo}>
@@ -1304,6 +1303,7 @@ function EnrichCard() {
           {d.candidates.toLocaleString()} row{d.candidates === 1 ? "" : "s"} still
           undescribed · {d.used.toLocaleString()} of {d.cap.toLocaleString()} used
           this month{!d.plaid_configured && " · Plaid is not configured"}
+          {d.awaits_confirm && " · confirm your email address to start"}
         </div>
       )}
       <button className="pri" disabled={!d || !d.plaid_configured
@@ -3018,6 +3018,62 @@ function CadenceEditor({ sched, onChange, timezone, onTimezone }: {
   );
 }
 
+/** One member's notices on the roster: their email switches — on the
+ *  household's mail, muted, which kinds reach them — and their push switch
+ *  with the devices it governs. Every box here writes the same place the
+ *  member's own Settings page writes, so a change on either side shows on
+ *  the other. */
+function MemberNotifyRow({ n, busy, onChange }: {
+  n: MemberNotify; busy: boolean;
+  onChange: (body: Parameters<typeof api.memberNotify>[1]) => void;
+}) {
+  const devices = [
+    n.push_browsers ? `${n.push_browsers} browser${n.push_browsers === 1 ? "" : "s"}` : null,
+    n.push_phones ? `${n.push_phones} phone${n.push_phones === 1 ? "" : "s"}` : null,
+  ].filter(Boolean).join(", ") || "no device registered";
+  return (
+    <div style={{ display: "flex", gap: "1.2rem", flexWrap: "wrap",
+                  alignItems: "center", fontSize: 13, opacity: busy ? 0.6 : 1 }}>
+      <span style={{ display: "flex", gap: ".6rem", flexWrap: "wrap",
+                     alignItems: "center" }}>
+        <span className="mut">email</span>
+        {!n.on_mail && !n.mail_listed ? (
+          <span className="mut" title="not on the household's mail list — add them under Email & Push">
+            not on the mail list</span>
+        ) : (<>
+          {!n.on_mail && (
+            <span className="mut" title="listed under Email & Push, but no mail goes to them yet: their invite is unanswered, the household's mail is paused, or the address is not confirmed">
+              listed, not receiving yet</span>
+          )}
+          <label className="check" title="receive none of the household's email">
+            <input type="checkbox" checked={!n.email_muted} disabled={busy}
+                   onChange={(e) => onChange({ email_muted: !e.target.checked })} />
+            on
+          </label>
+          {!n.email_muted && EMAIL_KINDS.map((k) => (
+            <label key={k} className="check">
+              <input type="checkbox" checked={prefOn(n.email_prefs, k)}
+                     disabled={busy}
+                     onChange={(e) => onChange({ email_pref: { kind: k, on: e.target.checked } })} />
+              {EMAIL_KIND_LABEL[k]}
+            </label>
+          ))}
+        </>)}
+      </span>
+      <span style={{ display: "flex", gap: ".6rem", flexWrap: "wrap",
+                     alignItems: "center" }}>
+        <span className="mut">push</span>
+        <label className="check" title="the household's push notices to this person's browsers and phones">
+          <input type="checkbox" checked={!n.push_muted} disabled={busy}
+                 onChange={(e) => onChange({ push_muted: !e.target.checked })} />
+          on
+        </label>
+        <span className="mut">{devices}</span>
+      </span>
+    </div>
+  );
+}
+
 // What each role is called on screen. One spelling, so the roster, the
 // invite picker and the pending-invite row cannot describe the same grant
 // three ways.
@@ -3211,7 +3267,27 @@ function FamilyCard({ onMemberRemoved }: {
     },
     onError: (e) => { if (!String(e).includes("cancelled"))
       window.alert(errText(e)); } });
+  // one member's switches, written where the member's own doors write;
+  // the reply is the row as the roster now shows it
+  const notify = useMutation({
+    mutationFn: (v: { id: string } & Parameters<typeof api.memberNotify>[1]) =>
+      api.memberNotify(v.id, v),
+    onSuccess: (r, v) => {
+      qc.setQueryData<{ users: Member[]; assignable_roles: string[] }>(
+        memKey, (old) => old && { ...old, users: old.users.map((u) =>
+          u.id === v.id ? { ...u, notify: r.notify } : u) });
+      // the owner's own row is also MyEmailCard/MyPushCard's state and
+      // the recipient grid's
+      if (members.data?.users.find((u) => u.id === v.id)?.me) {
+        qc.invalidateQueries({ queryKey: ["me"] });
+      }
+      qc.invalidateQueries({ queryKey: ["settings"] });
+    },
+    onError: (e) => window.alert(errText(e)) });
   if (members.isPending || members.isLoadingError) return null;
+  // the roster carries each member's notices for the owner (older servers
+  // send none, and the column stays out)
+  const showNotify = owner && members.data.users.some((u) => u.notify);
   return (
     <div className="card" style={{ marginTop: "1rem" }}>
       <h2>Family</h2>
@@ -3226,8 +3302,8 @@ function FamilyCard({ onMemberRemoved }: {
       </p>
       <table>
         <tbody>
-          {members.data.users.map((u) => (
-            <tr key={u.id}>
+          {members.data.users.map((u) => (<Fragment key={u.id}>
+            <tr>
               <td>{u.email}{u.me &&
                 <span className="pill g" style={{ marginLeft: 6 }}>you</span>}</td>
               <td className="mut">{ROLE_LABEL[u.role] ?? u.role}
@@ -3255,7 +3331,16 @@ function FamilyCard({ onMemberRemoved }: {
                 </>)}
               </td>
             </tr>
-          ))}
+            {showNotify && u.notify && (
+            <tr className="notify-row">
+              <td colSpan={3} style={{ paddingTop: 0, paddingBottom: ".7rem" }}>
+                <MemberNotifyRow n={u.notify}
+                  busy={notify.isPending && notify.variables?.id === u.id}
+                  onChange={(body) => notify.mutate({ id: u.id, ...body })} />
+              </td>
+            </tr>
+            )}
+          </Fragment>))}
           {owner && (invites.data?.invites ?? []).map((i) => (
             <tr key={i.token_hash}>
               <td className="mut">{i.label || "pending invite"}</td>
@@ -5018,6 +5103,92 @@ function MyEmailCard() {
             </label>);
         })}
       </div>
+      {err && <p className="mut">{err}</p>}
+    </div>
+  );
+}
+
+/** A household member's own push switch — the web twin of the mail mute:
+ *  the household's push notices (the daily verdict, alerts, reports) stop
+ *  reaching THIS person's browsers and phones; the devices stay registered
+ *  and notices about their own account still arrive. POST /api/me/push,
+ *  a door every role holds. The browser's own subscription is offered
+ *  here too, since a non-owner has no other way to turn it on. */
+function MyPushCard() {
+  const qc = useQueryClient();
+  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
+  const notify = useQuery({ queryKey: ["notify"], queryFn: api.notifyStatus });
+  const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const set = useMutation({
+    mutationFn: (muted: boolean) => api.mePush(muted),
+    onSuccess: (r) => { setErr(null);
+      qc.setQueryData<Me>(["me"], (old) => old && { ...old, push_muted: r.muted });
+      // the owner's roster reads the same switch
+      qc.invalidateQueries({ queryKey: ["members"] }); },
+    onError: (e) => setErr(errText(e)),
+  });
+  // older servers carry no switch; the card then says nothing about it
+  if (!me.data || me.data.push_muted === undefined) return null;
+  const muted = !!me.data.push_muted;
+  const status = notify.data;
+  const grantLock = sharedLock(me.data, "grant");
+  const blocked = browserPushBlocked();
+  const enable = async () => {
+    if (!status?.vapid_public_key || grantLock) return;
+    setBusy(true); setErr(null);
+    try {
+      const r = await enableBrowserPush(status.vapid_public_key);
+      if (!r.ok) { setErr(r.reason); return; }
+      qc.setQueryData<NotifyStatus>(["notify"],
+        (old) => old && { ...old, push_subscribed: true });
+    } catch (e) { setErr(errText(e)); }
+    finally { setBusy(false); }
+  };
+  const disable = async () => {
+    setBusy(true);
+    try {
+      await disableBrowserPush();
+      qc.setQueryData<NotifyStatus>(["notify"],
+        (old) => old && { ...old, push_subscribed: false });
+    } catch (e) { setErr(errText(e)); }
+    finally { setBusy(false); }
+  };
+  return (
+    <div className="card">
+      <h2>Push</h2>
+      <p className="mut">
+        The household's push notices — the daily verdict, alerts, reports —
+        go to every signed-in phone and browser. Whether they reach{" "}
+        <b>yours</b> is yours; notices about your own login, household security warnings and your own test push always arrive.
+      </p>
+      <p>
+        <b>{muted ? "Household push is off for you." : "You receive household push."}</b>{" "}
+        <button className={muted ? "pri" : ""} disabled={set.isPending}
+                onClick={() => set.mutate(!muted)}>
+          {muted ? "Turn push back on" : "Turn off for me"}
+        </button>
+      </p>
+      {status?.push_available && (
+        <div style={{ display: "flex", gap: ".5rem", flexWrap: "wrap",
+                      alignItems: "center" }}>
+          <span className="mut">This browser:</span>
+          <button disabled={busy || blocked || !!grantLock}
+                  title={grantLock ?? (blocked
+                    ? "Browsers only allow notifications on https:// or localhost"
+                    : "")}
+                  onClick={enable}>
+            {status.push_subscribed ? "re-enable" : "enable"}</button>
+          {status.push_subscribed && (
+            <button disabled={busy} onClick={disable}>disable</button>)}
+          {!grantLock && blocked && (
+            <span className="mut" style={{ fontSize: 12 }}>
+              needs <b>https</b> — this page is on http, so the browser will
+              not allow it</span>)}
+          {grantLock && (
+            <span style={{ fontSize: 12, color: "var(--amber)" }}>{grantLock}</span>)}
+        </div>
+      )}
       {err && <p className="mut">{err}</p>}
     </div>
   );

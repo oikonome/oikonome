@@ -441,7 +441,7 @@ bills, reports. The roles differ in what they can change.
 | Ask the Assistant about it (it only reads) | ✓ | ✓ | ✓ |
 | Edit transactions, bills, budgets, rules, categories, receipts | ✓ | ✓ | |
 | Import files, run a sync, act on alerts | ✓ | ✓ | |
-| Their own password, 2FA, sessions, email delivery | ✓ | ✓ | ✓ |
+| Their own password, 2FA, sessions, email and push delivery | ✓ | ✓ | ✓ |
 | Bank connections — link, repair, disconnect, remove an account | ✓ | | |
 | Export the data, restore a backup, connections bundle | ✓ | | |
 | Invite, remove, or change what another member can do | ✓ | | |
@@ -459,6 +459,23 @@ undo or that reach outside the instance.
 
 There is no way to make somebody else the owner. A household has exactly
 one, and transferring it is not something an invite or a dropdown does.
+
+A view-only login's Settings holds two sections: **Email & Push** — whether
+the household's email reaches their inbox and which kinds, and whether
+its push notices reach their phones and browsers — and **Security** for
+their own login. It does not see the **Users** roster. A member finds the
+same **Push** card under Email & Push: **Turn off for me** stops the
+household's push notices (the daily verdict, alerts, reports) reaching
+that person's devices without unregistering them, and **This browser:
+enable** subscribes the browser in hand. The owner sees and sets every
+member's email and push switches — their own included — on each row of
+the **Users** roster (**Settings → Users** on the web, the Family card
+under **Security & household** on the phone), beside how many browsers
+and phones each person has registered; a change made on either side
+shows on the other, because both write the same setting. Notices about
+a person's own login, a warning that a reset of a household account can
+still go through, and their own **Send a test** push always reach them,
+switch or no switch.
 
 ## Activity — who changed what
 

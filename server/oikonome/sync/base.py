@@ -1025,10 +1025,19 @@ def mask_long_digits(text):
 # arrive under the key None (an unquoted comma in the last free-text
 # column) — stored as "null" — and are that column's text by position,
 # so they count as free text too. Migrations 178 and 181 apply the same
-# keys to rows already stored; keep them in step.
+# keys to rows already stored; keep them in step. The source account's
+# name (_SPLIT_SOURCE_KEYS) is cut the same way, migration 199 for the
+# rows already stored.
 _FREE_TEXT_KEYS = frozenset((
     "name", "memo", "note", "notes", "payee", "description",
     "original description", "original statement"))
+
+# The raw cells a split import keeps its source account's name under (QIF
+# and the vendor exports: "account"; Mint: "Account Name"), compared
+# trimmed and lower-cased as headers are. Free text too: a split account
+# named by its number would otherwise keep the number in every row it
+# holds, after the account's own name and id lost it.
+_SPLIT_SOURCE_KEYS = ("account", "account name")
 _FREE_TEXT_WORDS = ("memo", "note", "description", "details", "payee",
                     "narrative", "particulars")
 _OVERFLOW_KEYS = frozenset(("", "null"))
@@ -1039,6 +1048,7 @@ def _free_text_key(k) -> bool:
         return True
     key = str(k).strip().lower()
     return (key in _FREE_TEXT_KEYS or key in _OVERFLOW_KEYS
+            or key in _SPLIT_SOURCE_KEYS
             or any(w in key for w in _FREE_TEXT_WORDS))
 
 
@@ -1092,9 +1102,15 @@ class FileImportIds:
     adding a second copy beside it.
     """
 
-    def __init__(self, prefix: str, account_id: str):
+    def __init__(self, prefix: str, account_id: str, *,
+                 former: tuple[str, ...] = ()):
         self.prefix = prefix
         self.account_id = account_id
+        # ids the caller knows this account's rows may have been hashed
+        # under that no record names in full: a split source's original
+        # id, which a re-key records only with its number cut (see
+        # split_lineage_id); the file being imported spells it again
+        self._known_former = tuple(a for a in former if a and a != account_id)
         self._occ: dict[str, int] = {}
         self._legacy_occ: dict[str, int] = {}
         self._legacy_of: dict[str, str] = {}
@@ -1149,7 +1165,7 @@ class FileImportIds:
         the app minted itself (`manual:`, slugged to [a-z0-9-]) never held
         a comma, so its dashes are not taken for renamed commas: that would
         multiply every imported line by up to 63 spellings for nothing."""
-        seen = {self.account_id}
+        seen = {self.account_id, *self._known_former}
         recorded: list[str] = []
         spelled_ids: list[str] = []
         todo = [self.account_id]
@@ -1167,7 +1183,8 @@ class FileImportIds:
                     seen.add(r["old_account_id"])
                     recorded.append(r["old_account_id"])
                     todo.append(r["old_account_id"])
-        return sorted(recorded) + sorted(spelled_ids)
+        return (list(self._known_former) + sorted(recorded)
+                + sorted(spelled_ids))
 
     def _adopt_renamed(self, conn, txns: list[Transaction]
                        ) -> list[Transaction]:
@@ -1464,7 +1481,19 @@ def _write_rows(conn, txns: list[Transaction], hidden: set,
         # No merchant from the aggregator → recover the P2P counterparty
         # from the bank's statement line. Deterministic on the same input,
         # so a re-sync (pending → posted) re-derives the same merchant.
-        desc = (t.raw or {}).get("original_description")
+        # Cut to a descriptor's length BEFORE any parsing: a file import's
+        # raw is the whole source row, so this cell can be any size a
+        # header names it, and the counterparty patterns below backtrack
+        # quadratically on a long enough run of brackets or spaces.
+        raw = t.raw
+        desc = (raw or {}).get("original_description")
+        desc = (_descriptor(mask_long_digits(desc) if filed else desc)
+                if isinstance(desc, str) else None)
+        if filed and isinstance(raw, dict) and isinstance(
+                raw.get("original_description"), str) and len(
+                raw["original_description"]) > MAX_DESCRIPTOR:
+            raw = {**raw, "original_description":
+                   _descriptor(raw["original_description"])}
         merchant = named or venmo_counterparty(desc)
         # Zelle detail can live in `name` too (file imports put the whole
         # statement line there), and an aggregator-supplied merchant that
@@ -1616,8 +1645,8 @@ def _write_rows(conn, txns: list[Transaction], hidden: set,
              t.category_plaid, t.category_plaid_detailed,
              t.category_plaid_confidence,
              1 if t.pending else 0,
-             jsonb(mask_file_raw(t.raw, t.name, t.merchant_name)
-                   if filed else t.raw),
+             jsonb(mask_file_raw(raw, t.name, t.merchant_name)
+                   if filed else raw),
              cat_source, en["check_number"], en["payment_channel"],
              en["payment_processor"], en["location_city"], en["location_region"],
              en["location_address"], en["location_postal"], en["location_lat"],
@@ -2046,6 +2075,30 @@ def _split_slug(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:40] or "x"
 
 
+# The most source accounts one file may split into. A household
+# export (every card, loan and closed account Mint ever saw) stays far
+# below it; a file naming tens of thousands is not a ledger, and each
+# split is a new account every page of the app then lists.
+MAX_SPLIT_ACCOUNTS = 100
+
+
+def check_split_accounts(names) -> None:
+    """Refuse a file that would split into more accounts than one
+    household export holds — before any account is made."""
+    n = len(set(names))
+    if n > MAX_SPLIT_ACCOUNTS:
+        raise ValueError(
+            f"this file names {n} different accounts; one import can split "
+            f"into at most {MAX_SPLIT_ACCOUNTS}. Export the accounts in "
+            f"smaller groups, or one at a time.")
+
+
+def tally_split(counts: dict, name: str, n: int) -> None:
+    """Add `n` rows to a split result keyed by account name; two source
+    names that mask alike share one key rather than one hiding the other."""
+    counts[name] = counts.get(name, 0) + n
+
+
 def infer_account_type(name: str | None) -> tuple[str, str | None]:
     """Conservative account type from a source-side account NAME.
 
@@ -2065,29 +2118,353 @@ def infer_account_type(name: str | None) -> tuple[str, str | None]:
     return "depository", "checking"
 
 
+def _split_source(text: str) -> str:
+    """A source account name as its identity is compared: the full account
+    number cut to its last four (mask_long_digits), case and spacing
+    folded. Rows store the source name masked, so both sides of every
+    comparison are masked."""
+    return " ".join(mask_long_digits((text or "").strip()).casefold().split())
+
+
+def _holds_source(conn, aid: str, prefix: str, me: str) -> bool | None:
+    """None: no account `aid`. Otherwise whether it holds the source `me`.
+
+    Asked of the rows, because they record where each one came from: an
+    earlier release could give two sources one id, and the account's name
+    names only the first of them. An account with no row of this importer
+    naming a source (an OFX statement keeps no source cell; every row
+    deleted) is matched on its name, which a rename never touches — that is
+    display_name."""
+    row = conn.execute("SELECT name FROM accounts WHERE id=%s",
+                       (aid,)).fetchone()
+    if row is None:
+        return None
+    held = {_split_source(r["v"]) for r in conn.execute(
+        """SELECT DISTINCT e.value #>> '{}' AS v
+             FROM transactions t, jsonb_each(t.raw) e
+            WHERE t.account_id = %s AND left(t.id, %s) = %s
+              AND jsonb_typeof(t.raw) = 'object'
+              AND jsonb_typeof(e.value) = 'string'
+              AND lower(btrim(e.key)) = ANY(%s)
+            LIMIT 101""",
+        (aid, len(prefix) + 1, prefix + ":",
+         list(_SPLIT_SOURCE_KEYS))).fetchall()}
+    held.discard("")
+    if held:
+        return me in held
+    return _split_source(row["name"] or "") == me
+
+
+def _adopted_split_account(conn, starts, prefix: str, me: str,
+                           lines=None) -> str | None:
+    """The account an id this importer once minted was moved to, if it
+    still exists and holds this source: following the adoption records
+    the move left (migration 199 and restore re-key an id that spelled a
+    full account number), so a re-import lands on the moved account.
+    A move records the old id with its number cut (split_lineage_id), so
+    each start is looked up in that form as well as in full.
+
+    A cut form is not unique: two cards sharing their last four leave one
+    key pointing at two accounts, and the source name (masked the same
+    way) cannot tell them apart either. Such a key is followed only to the
+    one account holding rows whose ids recompute under the full id, which
+    the file spells again (`lines`, see _lineage_by_rows); with no such
+    account, or several, it is not followed at all, since filing one
+    card's history onto the other's account is a merge nobody asked for."""
+    todo: list[str] = []
+    for s in starts:
+        todo.append(s)
+        cut = split_lineage_id(s)
+        if cut == s:
+            continue
+        if len(_lineage_targets(conn, cut)) > 1:
+            found = _lineage_by_rows(conn, prefix, s, cut, lines)
+            if found is not None and _holds_source(conn, found, prefix, me):
+                return found
+            continue
+        todo.append(cut)
+    todo = list(dict.fromkeys(todo))
+    seen = set(todo)
+    while todo and len(seen) < 32:
+        cur = todo.pop(0)
+        for r in conn.execute(
+                "SELECT account_id FROM account_adoptions"
+                " WHERE old_account_id = %s AND item_id = 'manual'"
+                " ORDER BY adopted_at DESC", (cur,)).fetchall():
+            nxt = r["account_id"]
+            if nxt in seen:
+                continue
+            seen.add(nxt)
+            if _holds_source(conn, nxt, prefix, me):
+                return nxt
+            todo.append(nxt)
+    return None
+
+
+def _lineage_targets(conn, cut: str) -> set[str]:
+    """The accounts a re-key moved some id with this cut form onto."""
+    return {r["account_id"] for r in conn.execute(
+        "SELECT DISTINCT account_id FROM account_adoptions"
+        " WHERE old_account_id = %s AND item_id = 'manual'",
+        (cut,)).fetchall()}
+
+
+# Lines of a file hashed to tell apart the accounts one cut lineage key
+# points at: the first rows are enough to find an earlier import's ids,
+# and a 50,000-row file is not hashed whole for it.
+LINEAGE_PROBE_LINES = 5_000
+
+
+def _lineage_by_rows(conn, prefix: str, legacy: str, cut: str, lines
+                     ) -> str | None:
+    """Of the accounts the cut key `cut` leads to, the one holding rows
+    whose ids were hashed under the full old id `legacy`, recomputed from
+    the file's own lines (date, amount, name) the way FileImportIds made
+    them. None when no account, or more than one, holds such a row: the
+    key is then no evidence of where this source lives."""
+    if not lines:
+        return None
+    reach, todo = set(), [cut]
+    while todo and len(reach) < 32:
+        cur = todo.pop(0)
+        for nxt in sorted(_lineage_targets(conn, cur)):
+            if nxt not in reach:
+                reach.add(nxt)
+                todo.append(nxt)
+    if not reach:
+        return None
+    ids = FileImportIds(prefix, legacy)
+    probe: set[str] = set()
+    for n, (date, amount, name) in enumerate(lines):
+        if n >= LINEAGE_PROBE_LINES:
+            break
+        tid = ids.id_for(date, amount, name)
+        probe.add(tid)
+        if ids.legacy_id(tid):
+            probe.add(ids.legacy_id(tid))
+    if not probe:
+        return None
+    held = [r["account_id"] for r in conn.execute(
+        "SELECT DISTINCT account_id FROM transactions"
+        " WHERE id = ANY(%s) AND account_id = ANY(%s)",
+        (sorted(probe), sorted(reach))).fetchall()]
+    return held[0] if len(held) == 1 else None
+
+
+# A digest an id carries is spelled in letters: hex digits g-p stand for
+# 0-9. Eight hex digits are all decimal about one time in forty-four, and
+# an id ending in eight decimal digits reads as one that spells a full
+# account number (NUMBERED_SPLIT_ID_RE), so every restore would move the
+# account and the next import would mint the digest id beside it again.
+_DIGEST_LETTERS = str.maketrans("0123456789", "ghijklmnop")
+
+
+def letter_digest(hexdigest: str) -> str:
+    """The first eight digits of a hex digest, with no decimal digit in
+    them. Keep in step with migration 199's translate()."""
+    return hexdigest[:8].translate(_DIGEST_LETTERS)
+
+
+def split_legacy_id(prefix: str, src: str) -> str:
+    """The id every release before the masked ids gave a split source: the
+    plain slug of its name, a full account number and all."""
+    return f"manual:{prefix}-{_split_slug(src.strip())}"
+
+
+def split_lineage_id(old: str) -> str:
+    """What a re-key records as the id an account moved off: the old id
+    with every full number cut to its last four. The record must not keep
+    the number it moved the account away from (it rides /export and the
+    portability archive), and no digest of it either: an account number
+    whose last four the new id shows is a short search away from any
+    unkeyed hash. A re-import needs the full id only to recompute its rows'
+    ids, and the file it reads spells that id again (split_legacy_id).
+    Keep in step with migration 199."""
+    return mask_long_digits(old)
+
+
+def split_former(prefix: str, src: str, target: str) -> tuple[str, ...]:
+    """The former account id a split import hands FileImportIds for one
+    source: its legacy id, when ensure_split_account found the source
+    anywhere else. A re-key records that id only with its number cut, so
+    the file is the one place that still spells it."""
+    legacy = split_legacy_id(prefix, src)
+    return (legacy,) if legacy != target else ()
+
+
+def split_account_id(prefix: str, src: str, *, taken: bool = False,
+                     hex_digest: bool = False) -> str:
+    """The id a source account gets when nothing earlier claims it.
+
+    The slug of the source name with any full account number cut to its
+    last four (an id is permanent and rides every export row). A slug that
+    drops what tells two names apart — cut at 40 characters, or a name in
+    a script the slug cannot spell — carries a short digest of the source,
+    so two such accounts never share an id; so does one whose readable id
+    another source already holds (`taken`). `hex_digest` spells that
+    digest as a build before letter_digest did, for finding its accounts."""
+    masked = mask_long_digits(src.strip())
+    full = re.sub(r"[^a-z0-9]+", "-", masked.lower()).strip("-")
+    slug = full[:40]
+    lossy = (not slug or len(full) > 40
+             or any(ch.isalpha() and not ch.isascii() for ch in masked))
+    if not lossy and not taken:
+        return f"manual:{prefix}-{slug}"
+    digest = hashlib.sha1(_split_source(src).encode("utf-8")).hexdigest()
+    digest = digest[:8] if hex_digest else letter_digest(digest)
+    return f"manual:{prefix}-{(slug or 'x')[:31]}-{digest}"
+
+
 def ensure_split_account(conn, prefix: str, name: str, *,
                          key: str | None = None,
                          type_: str | None = None,
-                         subtype: str | None = None) -> str:
+                         subtype: str | None = None,
+                         lines=None) -> str:
     """A manual account for one source-side account of a multi-account
     file (the competitor exports, Mint, OFX). Stable id from `key`
     (default: the source's account name) → re-imports land on the same
     account; existing rows — including a user rename or reclassification —
     are never overwritten. Type defaults to the name-based inference
-    unless the caller knows better (OFX statements do)."""
+    unless the caller knows better (OFX statements do).
+
+    Where the rows already are decides, and the import never re-keys:
+      1. the id every earlier release derived (the plain slug), when it
+         holds this source. A slug that mapped two sources onto one id
+         stays that one account: moving one source off it here would mint
+         a new id its rows were never hashed under, and the re-import
+         would insert that source's whole history a second time;
+      2. the account an adoption moved that id to (a re-key of an id that
+         spelled a full number), when it holds this source; when the cut
+         record of that move names several accounts, the one holding
+         rows the file's `lines` (date, amount, name) recompute under the
+         full id, else none;
+      3. the current id (split_account_id), or its taken form, when it
+         holds this source; then the account an adoption moved either to;
+      4. the id a build that spelled the digest in hex digits gave it;
+      5. otherwise the current id, made if absent.
+    The importer passes split_legacy_id to FileImportIds whenever the
+    answer is not the legacy id, so rows hashed under it are found."""
     if type_ is None:
         type_, subtype = infer_account_type(name)
     conn.execute(
         """INSERT INTO items (id, aggregator, institution_name, access_token)
            VALUES ('manual','manual','Manual',NULL)
            ON CONFLICT (tenant_id, id) DO NOTHING""")
-    aid = f"manual:{prefix}-{_split_slug(key or name)}"
+    src = (key or name).strip()
+    # rows hold the source NAME (OFX passes a key and keeps no source
+    # cell, so it is matched on the account name, which is `name` too)
+    me = _split_source(name)
+    legacy = split_legacy_id(prefix, src)
+    if _holds_source(conn, legacy, prefix, me):
+        return legacy
+    moved = _adopted_split_account(conn, [legacy], prefix, me, lines)
+    if moved is not None:
+        return moved
+    aid = split_account_id(prefix, src)
+    alt = split_account_id(prefix, src, taken=True)
+    held = _holds_source(conn, aid, prefix, me)
+    if held:
+        return aid
+    if held is False and _holds_source(conn, alt, prefix, me):
+        return alt
+    moved = _adopted_split_account(conn, [aid, alt], prefix, me)
+    if moved is not None:
+        return moved
+    for hexed in dict.fromkeys(
+            split_account_id(prefix, src, taken=t, hex_digest=True)
+            for t in (False, True)):
+        if hexed not in (aid, alt) and _holds_source(conn, hexed, prefix,
+                                                     me):
+            return hexed
+    if held is False:
+        aid = alt
+    # The stored name keeps only the last four, the rule every hand-made
+    # account follows; ON CONFLICT leaves an existing account's name alone.
     conn.execute(
         """INSERT INTO accounts (id, item_id, name, type, subtype, updated_at)
            VALUES (%s,'manual',%s,%s,%s,now())
            ON CONFLICT (tenant_id, id) DO NOTHING""",
-        (aid, name.strip(), type_, subtype))
+        (aid, mask_long_digits(name.strip()), type_, subtype))
     return aid
+
+
+# The split importers whose ids were the slug of the source name, which
+# kept a full account number whole when the account was named by it.
+# OFX keys on the last four alone and never had one. Nothing the app mints
+# matches: a masked slug holds no run of eight digits, and every digest an
+# id carries is spelled in letters (letter_digest).
+NUMBERED_SPLIT_ID_RE = re.compile(
+    r"^manual:(?:qif|mint|monarch|copilot|simplifi)-.*\d{8,}")
+
+
+def renumbered_split_id(old: str) -> str:
+    """The id migration 199 gives a split account whose id spells a full
+    account number: each run cut to its last four, slugged and cut to 40
+    as the id always was. Keep in step with the migration."""
+    head, _, tail = old.partition("-")
+    tail = re.sub(r"\d{4,}(\d{4})", r"-\1", tail)
+    tail = re.sub(r"-+", "-", tail).strip("-")[:40] or "x"
+    return f"{head}-{tail}"
+
+
+# How many suffixes a re-key tries for one account whose masked id is
+# taken before it leaves the account where it is.
+RENUMBER_MAX_SUFFIXES = 32
+
+
+def renumbered_split_suffix(cut: str, n: int) -> str:
+    """The n-th suffix (from 1) a re-key tries for an account whose masked
+    id is taken: a letter digest of its cut old id and the ordinal. The
+    cut id alone is shared by every card with the same last four, so the
+    ordinal is what keeps three or more of them apart; the number itself
+    is never hashed. Keep in step with migration 199."""
+    return letter_digest(hashlib.md5(
+        f"{cut}#{n}".encode("utf-8")).hexdigest())
+
+
+def rekey_numbered_split_accounts(conn) -> dict[str, str]:
+    """Move every split account whose id spells a full account number onto
+    its masked id, the way migration 199 moves the ones already stored —
+    restore runs it, so an archive written before the migration does not
+    bring the number back. Each move leaves an adoption record (reconciled,
+    so no reconnect guard arms) from the old id with its number cut
+    (split_lineage_id), which a re-import follows to the moved account;
+    the file it reads spells the original id again, and its rows' ids are
+    recomputed under that. Transaction ids are left as they are: they are
+    hashes, the number is not readable from them.
+
+    An id whose masked form is taken gets the first free suffix of
+    renumbered_split_suffix. Accounts are taken in the order of the md5 of
+    their old id, as the migration takes them, so both name the same ids;
+    the md5 orders and is never stored, and ordering by the id itself
+    would let the suffix tell which of two cards has the smaller number.
+    Returns old -> new."""
+    from .adopt import (_rewrite_account_id, _rewrite_account_id_in_config)
+    moved: dict[str, str] = {}
+    olds = sorted((r["id"] for r in conn.execute(
+        "SELECT id FROM accounts WHERE id ~ %s",
+        (NUMBERED_SPLIT_ID_RE.pattern,)).fetchall()),
+        key=lambda o: hashlib.md5(o.encode("utf-8")).hexdigest())
+    for old in olds:
+        cut = split_lineage_id(old)
+        base_id = renumbered_split_id(old)
+        candidates = [base_id] + [
+            f"{base_id}-{renumbered_split_suffix(cut, n)}"
+            for n in range(1, RENUMBER_MAX_SUFFIXES + 1)]
+        new = next((c for c in candidates if not conn.execute(
+            "SELECT 1 FROM accounts WHERE id=%s", (c,)).fetchone()), None)
+        if new is None:
+            continue
+        with conn.transaction():
+            if not _rewrite_account_id(conn, old, new, "manual"):
+                continue
+            _rewrite_account_id_in_config(conn, old, new)
+            conn.execute(
+                "INSERT INTO account_adoptions (account_id, old_account_id,"
+                " item_id, reconciled_at) VALUES (%s, %s, 'manual', now())",
+                (new, cut))
+        moved[old] = new
+    return moved
 
 
 # Two equity movements on one transaction that answer the same question:

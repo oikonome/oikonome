@@ -99,10 +99,11 @@ conversation with **try again** until you dismiss it. Each conversation
 is a link (`?c=` in the address bar), so the browser's back button
 leaves it; on the phone the device's back button does.
 
-If someone removes a conversation while you are continuing it, your
+If someone removes a conversation while you are continuing it — or, for
+a view-only login, someone else has added a question to it — your
 question is asked again as a new one, and its answer carries a note:
-"the earlier conversation was removed, so this was asked as a new
-question". If the conversation is removed while your question is being
+"the earlier conversation can no longer be continued here, so this was
+asked as a new question". If the conversation is removed while your question is being
 answered, the answer is still shown, on that screen only, with the note
 "the conversation was removed while this was answered, so this answer was
 not kept". An answer the app could not keep in the history (it was
@@ -120,8 +121,12 @@ use a short bullet list, and the page draws those as bold and bullets
 Every conversation is kept on your instance, with its answers, their
 charts and the time each was asked, and listed newest-first, each one's
 questions in the order they were asked — on the web and in the mobile
-app alike, so a chart drawn on the phone is on the web too. The log is the **household's**: everyone
-who can sign in reads the same one, each entry naming who asked. When a
+app alike, so a chart drawn on the phone is on the web too. The log is the **household's**: the
+owner and every member read the same one, each entry naming who asked. A
+**view-only** login sees its own conversations only — what it asked and
+was answered — and can continue only those no one else has added a
+question to; one that someone else has continued opens as a new
+conversation instead. When a
 member is removed, their questions stay but lose their name. The shared
 demonstration login sees its own questions under its address and
 everyone else's as "a household member". A question that failed (a

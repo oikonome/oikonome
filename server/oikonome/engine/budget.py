@@ -419,7 +419,14 @@ def snapshot_month(conn, today: dt.date, *,
     one. The caller passes the moment the month ended. Any save counts,
     since the document does not say which key changed when: a skipped
     re-freeze leaves the month's earlier snapshot standing, which is the
-    safe side."""
+    safe side.
+
+    The bill schedule has no such moment to test — a bill saved, archived
+    or deleted leaves no trace on the settings row — so a late re-freeze
+    keeps the schedule the month's snapshot already holds (the nightly's
+    last in-month write) and freezes the live one only when there is none.
+    Otherwise a bill archived on the 1st, before the close sweep ran,
+    would vanish from the month it was paid in."""
     if unchanged_since is not None and unchanged_since.tzinfo is None:
         raise ValueError("unchanged_since must be timezone-aware")
     # the stored budget, not the loaded one: under a month of history the
@@ -445,10 +452,13 @@ def snapshot_month(conn, today: dt.date, *,
         """INSERT INTO budget_snapshots (year, month, config, bills)
            VALUES (%s, %s, %s, %s)
            ON CONFLICT (tenant_id, year, month) DO UPDATE
-           SET config = EXCLUDED.config, bills = EXCLUDED.bills,
+           SET config = EXCLUDED.config,
+               bills = CASE WHEN %s
+                            THEN COALESCE(budget_snapshots.bills, EXCLUDED.bills)
+                            ELSE EXCLUDED.bills END,
                captured_at = now()""",
         (today.year, today.month, jsonb(scrub_config(cfg)),
-         jsonb(_freeze_bills(conn, today))))
+         jsonb(_freeze_bills(conn, today)), unchanged_since is not None))
     return True
 
 
@@ -780,14 +790,19 @@ def _seed_skips_as_mechanics(row: dict, merchant_seed) -> bool:
     leaves out exactly the uncategorized rows flow_classify is about to
     route out of spend, judged the way flow_classify judges them.
 
-    That means the same key: flow_match on the row's merchant
-    (COALESCE(merchant_name, name)), never on the raw statement line. A
-    raw line's "WITHDRAWAL" or "TRANSFER" is how some banks spell any
-    debit — "POS WITHDRAWAL EXAMPLE GROCER" under the merchant
-    "Example Grocer" is a purchase — and flow_classify reads the raw
-    line only for a loan payment, which stays in spend anyway. Of what
-    flow_match routes, only transfers and card payments leave spend; any
-    other loan payment is spend in month_status.
+    That means the same key and the same reading. The key is the row's
+    merchant (COALESCE(merchant_name, name)), never the raw statement
+    line: a raw line's "WITHDRAWAL" or "TRANSFER" is how some banks spell
+    any debit — "POS WITHDRAWAL EXAMPLE GROCER" under the merchant
+    "Example Grocer" is a purchase — and flow_classify reads the raw line
+    only for a loan payment, which stays in spend anyway. The reading is
+    flow_match_line on a row flow_classify calls narrow (`flow_narrow`,
+    its own predicate: no merchant name, so the key IS the bank's whole
+    line) and flow_match otherwise; reading a bare "WITHDRAWAL POS
+    NORTHWIND GROCERY" or a biller's "E-PAYMENT" with flow_match would
+    leave a purchase out and seed the budget low. Of what is routed, only
+    transfers and card payments leave spend; any other loan payment is
+    spend in month_status.
 
     A row the feed or a person already categorized is spend exactly as
     month_status counts it, and a bare mechanics string ("ONLINE
@@ -796,7 +811,9 @@ def _seed_skips_as_mechanics(row: dict, merchant_seed) -> bool:
     measures, and a new household reads OVER BUDGET from its first day."""
     if (row.get("stored_category") or "?") not in ("?", ""):
         return False
-    fm = merchant_seed.flow_match(row.get("flow_merchant"))
+    key = row.get("flow_merchant")
+    fm = (merchant_seed.flow_match_line(key) if row.get("flow_narrow")
+          else merchant_seed.flow_match(key))
     if not fm:
         return False
     primary, detailed = fm
@@ -1702,7 +1719,15 @@ def suggest_budgets(conn, today: dt.date) -> dict:
     # income proposals — the finder already proved their cadence, the user
     # just hasn't clicked approve, and a blank field reads as "we found
     # nothing" when we did
-    inc = monthly_income(conn)
+    # the same figure the Bills headline shows — what the income series
+    # actually brought in, averaged (income_actual_monthly); the schedule's
+    # rate for a series without three months of deposits
+    inc = income_actual_monthly(
+        conn, today, _recurring_bills(conn, income=True))["monthly"]
+    if inc <= 0:
+        # a series the matcher cannot key (no merchant, a name with no
+        # usable token) still has a stored monthly figure
+        inc = monthly_income(conn)
     if inc <= 0:
         from .compat import as_dict
         from .bills import _monthly
@@ -2999,11 +3024,18 @@ def _spend_rows(conn, since: dt.date, until: dt.date,
         amount, food = NET_AMOUNT_JOINED, FOOD_SQL
         split_join, split_line = "", "NULL::integer"
         split_source = "NULL::text"
+    # whether the flow pass reads this row by its statement line — its
+    # own predicate, evaluated over this row's columns alone so no joined
+    # table's column of the same name can answer for it
+    from .llm_categorize import _NARROW_SQL
+    narrow = (f"(SELECT {_NARROW_SQL} FROM (SELECT t.merchant_name, "
+              "t.category_source, t.category_primary) AS fn)")
     if slim:
         cols = f"""t.id AS txn_id, t.date, {amount} AS amount,
                    {merchant_sql.RAW_KEY} AS payee, t.name,
                    -- the key the flow pass routes bank mechanics by
                    COALESCE(t.merchant_name, t.name) AS flow_merchant,
+                   {narrow} AS flow_narrow,
                    t.merchant_id::text AS merchant_id,
                    {cat_disp} AS category,
                    -- `category` is the DISPLAY form (underscores blown out);
@@ -3021,6 +3053,7 @@ def _spend_rows(conn, since: dt.date, until: dt.date,
                    {merchant_sql.RAW_KEY} AS payee, t.name,
                    -- the key the flow pass routes bank mechanics by
                    COALESCE(t.merchant_name, t.name) AS flow_merchant,
+                   {narrow} AS flow_narrow,
                    t.merchant_id::text AS merchant_id,
                    -- what the LEDGER shows for this row (the merchant row's
                    -- name, else the alias, else the raw) + its logo: the
@@ -3090,7 +3123,7 @@ def _inflow_rows(conn, since: dt.date, until: dt.date,
                    {merchant_sql.RAW_KEY} AS payee, t.name,
                    -- the merchant the ledger files the row under, so an
                    -- income series follows its payer like a bill does
-                   t.merchant_id::text AS merchant_id
+                   t.merchant_id::text AS merchant_id, t.pending
             FROM transactions t
                  JOIN accounts a ON a.id = t.account_id
             WHERE t.removed = 0 {pending_sql} AND t.amount < 0
@@ -3117,12 +3150,19 @@ def _inflow_rows(conn, since: dt.date, until: dt.date,
 
 def _card_pay_bill(b: dict) -> bool:
     """A recurring bill whose payee names a card payment. Checked against
-    BOTH detectors: merchant_seed.flow_match is deliberately high-precision
-    and misses issuer+AUTOPAY names ("DISCOVER AUTOPAY") that the importers'
-    own detector (flowmap.looks_like_card_payment) catches."""
+    BOTH detectors: the statement-line reading (merchant_seed.
+    flow_match_line) and the importers' own detector (flowmap.
+    looks_like_card_payment), which catches issuer+AUTOPAY names
+    ("NORTHWIND AUTOPAY") the line reading leaves alone.
+
+    A bill's payee is often a bank's bare line, so it is read as one: the
+    looser merchant rules (flow_match) call any "<biller> E-PAYMENT" a card
+    payment, and a utility bill spelled that way would vanish from
+    upcoming bills whenever card debt exists. The line reading still names
+    an issuer's own "<issuer> E-PAYMENT" a card payment."""
     from ..sync import flowmap
     from . import merchant_seed
-    fm = merchant_seed.flow_match(b["payee"])
+    fm = merchant_seed.flow_match_line(b["payee"])
     if fm and fm[1] == "LOAN_PAYMENTS_CREDIT_CARD_PAYMENT":
         return True
     return flowmap.looks_like_card_payment(b["payee"])
@@ -3196,6 +3236,9 @@ def upcoming_bill_occurrences(conn, cfg: dict, today: dt.date,
     month-end tile each ask for a window from the same snapshot; the
     schedule and the matched spend rows are derived once and a repeated
     (today, end) window is answered outright.
+
+    The month's income does not use this walk: it settles paychecks
+    against the deposits its landed half counts (_month_income_parts).
 
     These surfaces must not disagree. Matching occurrences against
     month-to-date spend in one place and summing raw `month_occurrences` in a
@@ -3512,11 +3555,15 @@ def cash_events(conn, month_start: dt.date, until: dt.date) -> dict:
     # curated brand alias (institution_matchers), as whole words of the
     # inflow's text — never by one ordinary word or surname of it: 'Franklin
     # Templeton' must not claim a Zelle from someone named Templeton.
+    # Hand-made and file-imported accounts share the item 'manual'
+    # ("Manual"), which is no firm: a hand-made IRA must not make every
+    # imported checking read as brokerage cash, nor "manual" in an
+    # inflow's text read as money from investments.
     inst_matchers: set = set()
     for r in conn.execute(
             """SELECT DISTINCT i.institution_name
                FROM accounts a JOIN items i ON i.id = a.item_id
-               WHERE a.type = 'investment'""").fetchall():
+               WHERE a.type = 'investment' AND i.id <> 'manual'""").fetchall():
         inst_matchers |= institution_matchers(r["institution_name"] or "")
 
     def _names(phrases: set[str], text: str) -> bool:
@@ -3564,6 +3611,336 @@ def cash_events(conn, month_start: dt.date, until: dt.date) -> dict:
             "funding_ytd_total": ytd}
 
 
+def _cycle_months(rec: dict) -> float:
+    """An income series' cycle in calendar months: a monthly series is one
+    month whatever the month's length, a yearly one twelve; a cadence in
+    days or weeks is its days over the mean month."""
+    freq = str(rec.get("frequency") or "MONTHLY").upper()
+    n = rec.get("interval") or 1
+    if freq == "MONTHLY":
+        return float(n)
+    if freq == "YEARLY":
+        return 12.0 * n
+    return _cycle_days(rec) / 30.44
+
+
+def _months_before(end: dt.date, n: int) -> list[tuple[int, int]]:
+    """The n (year, month) pairs before `end` (a month's first day)."""
+    out, y, m = [], end.year, end.month
+    for _ in range(n):
+        y, m = (y, m - 1) if m > 1 else (y - 1, 12)
+        out.append((y, m))
+    return out
+
+
+def _series_income_in_span(bill: dict, run: list[dict], start: dt.date,
+                           end: dt.date, *, run_start: bool = False
+                           ) -> tuple[float, int]:
+    """(dollars, paid occurrences) a series brought in over the months
+    [start, end), each check counted for the month its occurrence pays.
+
+    Each scheduled occurrence takes at most one of the series' deposits —
+    the nearest within its match window whose size is a check's (half to
+    twice the series' amount) — so a check paid the Friday before a
+    Sunday-the-1st is its own month's, at either edge of the span, and a
+    check for the month after the span is not the span's. A claimed
+    deposit no occurrence takes (a bonus, a reimbursement, back pay from
+    the same payer) is income in the month it is dated, but never an
+    occurrence: it adds dollars, not months.
+
+    `run_start`: the span begins where the series' run does, not at the
+    window's edge — no occurrence before it was ever paid, so none of them
+    may take the run's first check out of the span."""
+    window = max(3, min(PREPAY_MATCH_DAYS,
+                        _cycle_days(bill["recurrence"]) // 2))
+    # a check may land up to its window either side of its occurrence, so
+    # the deposits are read that far past both edges: the span's last
+    # occurrence paid two days late is still the span's (the caller passes
+    # the run through today, which is never past what has landed)
+    lo = start - dt.timedelta(days=window)
+    hi = end + dt.timedelta(days=window)
+    rows = [r for r in run if lo <= r["date"] < hi]
+    occs = []
+    for y, m in _months_before(end + dt.timedelta(days=32), 14):
+        for d in _occurrences_in_month(bill, y, m):
+            if not run_start or d >= start:
+                occs.append(d)
+    amt = float(bill.get("amount") or 0)
+    pairs = sorted(
+        (abs((r["date"] - d).days), j, i)
+        for i, r in enumerate(rows)
+        if amt <= 0 or 0.5 * amt <= float(r["amount"]) <= 2 * amt
+        for j, d in enumerate(occs)
+        if abs((r["date"] - d).days) <= window)
+    used_r, used_o = set(), set()
+    owner: dict[dt.date, int] = {}      # deposit day -> occurrence it paid
+    got, paid = 0.0, 0
+    for _, j, i in pairs:
+        if i in used_r or j in used_o:
+            continue
+        used_r.add(i)
+        used_o.add(j)
+        owner.setdefault(rows[i]["date"], j)
+        if start <= occs[j] < end:
+            got += float(rows[i]["amount"])
+            paid += 1
+    for i, r in enumerate(rows):
+        if i in used_r:
+            continue
+        j = owner.get(r["date"])
+        if j is not None:
+            # the rest of a check split into two deposits that day follows
+            # the occurrence its sibling paid
+            if start <= occs[j] < end:
+                got += float(r["amount"])
+        elif start <= r["date"] < end:
+            got += float(r["amount"])
+    return got, paid
+
+
+def income_actual_monthly(conn, today: dt.date, income: list[dict], *,
+                          memo: dict | None = None,
+                          bill_rows: list | None = None,
+                          excluded: list | None = None) -> dict:
+    """What the household's income series actually bring in per month: each
+    series' own deposits (each deposit counted for the one series that
+    claims it, _income_claims) over the last twelve complete months.
+
+    Per series, only its current run counts: walking back from its latest
+    deposit, a gap of more than two and a half cycles (45 days at least)
+    ends it, so a paycheck that stopped and restarted is new again and an
+    unrelated deposit claimed a year before is not history. A run that
+    starts after the 1st of a month covers that month only in part; for a
+    cadence of a month or less the month is dropped with its deposits (a
+    biweekly check back on the 30th is not a month's pay), while a longer
+    cadence keeps it (its first deposit is a whole cycle's pay). `covered`
+    is the months from the run's start, at most twelve.
+
+    Each check counts for the month its occurrence pays
+    (_series_income_in_span), so a monthly check moved off a Sunday-the-1st
+    is twelve a year at either edge of the window, and a yearly bonus that
+    came a few weeks early is still one bonus a year; the figure does not
+    jump as a deposit ages into or out of the window. A same-payer deposit
+    that pays no occurrence (a bonus, back pay) adds its dollars. The
+    divisor is `covered`, or the months the schedule spends on the paid
+    occurrences when that is more — a quarter-end series in its first year
+    reads one check a quarter.
+
+    A series covered for less than three months, or for less than one of
+    its own cycles, counts its scheduled rate (evened_monthly_load), so a
+    new paycheck is never read as nothing and a single bonus never as a
+    monthly one. The scheduled rate is the CURRENT check annualised, which
+    a raise or a withholding cap moves; the deposits that landed are the
+    honest average. Returns the monthly figure, how it was reached
+    (`basis`: "actual" when any series used its deposits, else
+    "schedule") and the fewest months any actual leg rests on.
+
+    `bill_rows`: a closed month's frozen schedule — its income rows alone
+    claim the deposits, so a series added today cannot take a past
+    month's checks. `excluded`: that month's excluded accounts."""
+    out = {"monthly": 0.0, "basis": "schedule", "months": None}
+    if not income:
+        return out
+    # the twelve complete months before this one
+    first = today.replace(day=1)
+    for _ in range(12):
+        first = (first - dt.timedelta(days=1)).replace(day=1)
+    end = today.replace(day=1)                      # exclusive
+    claims = _income_claims(conn, today, income, memo=memo,
+                            bill_rows=bill_rows, excluded=excluded)
+    total, fewest, actual = 0.0, None, False
+    for b in income:
+        cycle = _cycle_days(b["recurrence"])
+        # the run reaches through today: a check for the span's last
+        # occurrence may land after the span (_series_income_in_span)
+        run = sorted((r for r in claims.get(b["payee"], [])
+                      if r["date"] <= today),
+                     key=lambda r: r["date"], reverse=True)
+        gap = dt.timedelta(days=max(45, int(cycle * 2.5)))
+        for i in range(1, len(run)):
+            if run[i - 1]["date"] - run[i]["date"] > gap:
+                run = run[:i]
+                break
+        covered, got, paid = 0, 0.0, 0
+        if run:
+            first_seen = run[-1]["date"]
+            start = first_seen.replace(day=1)
+            if first_seen.day > 1 and cycle <= 31:
+                start = (start + dt.timedelta(days=32)).replace(day=1)
+            start = max(start, first)
+            covered = max(0, min(12, (end.year - start.year) * 12
+                                 + end.month - start.month))
+            got, paid = _series_income_in_span(b, run, start, end,
+                                               run_start=start > first)
+        cyc_m = _cycle_months(b["recurrence"])
+        if covered >= max(3, round(cyc_m)) and got > 0:
+            # n paid occurrences never stand for fewer months than the
+            # schedule spends on n occurrences: a quarter-end series two
+            # checks into its first year is two quarters of pay, not four
+            # months of it
+            per_occ = 12.0 / max(1, sum(
+                len(_occurrences_in_month(b, y, m))
+                for y, m in _months_before(end, 12)))
+            divisor = max(float(covered), paid * per_occ)
+            total += got / divisor
+            actual = True
+            fewest = covered if fewest is None else min(fewest, covered)
+        else:
+            total += evened_monthly_load([b], today)
+    out.update(monthly=round(total, 2),
+               basis="actual" if actual else "schedule", months=fewest)
+    return out
+
+
+def _income_claimants(conn, series: list[dict], *, memo: dict | None = None,
+                      bill_rows: list | None = None) -> list[dict]:
+    """Every income series that may claim a deposit: the household's
+    active series (disabled ones too — a series left out of the budget
+    still owns its own deposits, and without it they would fall to a
+    sibling that shares a word) with `series` itself taking precedence,
+    so a frozen or filtered record decides for its own payee. With
+    `bill_rows` (a closed month's frozen schedule) the frozen income rows
+    stand in for the live table entirely: a series added or removed today
+    must not move a past month's claims."""
+    base = (_recurring_bills(conn, income=True, rows=bill_rows)
+            if bill_rows is not None
+            else _recurring_bills(conn, income=True, memo=memo))
+    by_payee = {b["payee"]: b for b in base}
+    for b in series:
+        by_payee[b["payee"]] = b
+    return list(by_payee.values())
+
+
+def _income_claims(conn, today: dt.date, series: list[dict], *,
+                   memo: dict | None = None, bill_rows: list | None = None,
+                   excluded: list | None = None) -> dict[str, list[dict]]:
+    """The deposit set (bills._income_rows) claimed among the claimants
+    (_income_claimants) — once per request for a given claimant set, since
+    the month plan, the averages and the paycheck sizing all ask."""
+    from . import bills as _bills
+    rows = _bills._income_rows(conn, today, excluded=excluded, memo=memo)
+    claimants = _income_claimants(conn, series, memo=memo,
+                                  bill_rows=bill_rows)
+    key = _memo_key("income_claims", today, id(rows), sorted(
+        (b["payee"], b["amount"], b["anchor"], str(b.get("ids")),
+         b["key"], tuple(sorted(b["recurrence"].items())))
+        for b in claimants))
+    if memo is not None and key in memo:
+        return memo[key]
+    out = _claim_income_rows(rows, claimants)
+    if memo is not None:
+        memo[key] = out
+    return out
+
+
+def _nearest_occurrence_days(bill: dict, day: dt.date, cache: dict) -> int:
+    """Days from `day` to the series' nearest scheduled occurrence (its own
+    month and the two beside it)."""
+    best = 10 ** 6
+    for dm in (-1, 0, 1):
+        y, m = day.year, day.month + dm
+        if m == 0:
+            y, m = y - 1, 12
+        elif m == 13:
+            y, m = y + 1, 1
+        k = (id(bill), y, m)
+        if k not in cache:
+            cache[k] = _occurrences_in_month(bill, y, m)
+        for d in cache[k]:
+            best = min(best, abs((d - day).days))
+    return best
+
+
+def _claim_income_rows(rows: list[dict], series: list[dict]
+                       ) -> dict[str, list[dict]]:
+    """Deposit rows (bills._income_rows) grouped by the ONE income series
+    each belongs to, by payee. A row is a candidate for every series whose
+    own matcher accepts it (_bill_matches: the merchant identity when the
+    series has one, else its merchant's words or its lead word — the rule
+    occurrence matching uses), and goes to the closest of them: an
+    identity match first, then the series whose name shares the most words
+    with the row, then a series whose check size admits the row (half to
+    twice), then the series with an occurrence nearest the row's date,
+    then the one whose check is nearest the row's amount.
+
+    Two series can share a matcher — a pension and a payroll from the same
+    state both key on "state" — and summing every series' candidates
+    independently counts each deposit once per series that accepts it,
+    doubling the household's income. One owner per row is what keeps the
+    series' totals adding up to the deposits. The date matters for a
+    payroll kept as two monthly series, the 1st's and the 15th's: same
+    payer, same words, same amount, so only the payday tells whose check a
+    deposit is."""
+    out: dict[str, list[dict]] = {b["payee"]: [] for b in series}
+    cache: dict = {}
+    for r in rows:
+        best = None
+        for b in series:
+            if not _bill_matches(b, r["tokens"], r["text"],
+                                 r.get("merchant_id")):
+                continue
+            words = len((set(b.get("tokens") or ())
+                         | set(b.get("merchant_tokens") or ())) & r["tokens"])
+            amt = float(b.get("amount") or 0)
+            got = float(r["amount"])
+            gap = abs(got - amt) / amt if amt > 0 else float("inf")
+            in_band = amt > 0 and 0.5 * amt <= got <= 2 * amt
+            near = _nearest_occurrence_days(b, r["date"], cache)
+            score = (b.get("ids") is not None, words, in_band, -near, -gap)
+            if (best is None or score > best[0]
+                    or (score == best[0] and b["payee"] < best[1])):
+                best = (score, b["payee"])
+        if best is not None:
+            out[best[1]].append(r)
+    return out
+
+
+def latest_deposit_amount(conn, today: dt.date, bill: dict,
+                          rows: list[dict] | None = None, *,
+                          claims: dict[str, list[dict]] | None = None,
+                          memo: dict | None = None
+                          ) -> float | None:
+    """What this income series last paid: its most recent deposit (same-day
+    deposits merged, as bills._events reads them), accepted when it is
+    within half to twice the series' amount — a one-off bonus or a partial
+    deposit is not the new check. None when no deposit in the last two
+    years qualifies. This is the per-check size the month plan carries
+    forward: the latest check is the best guess at the next one, because a
+    paycheck changes through the year and the configured amount lags it.
+
+    `bill` is a processed series record (_recurring_bills). Its deposits
+    are the rows it claims among every income series (_income_claims),
+    so a sibling series' check is never read as this one's; `claims` is
+    that grouping when the caller already holds it."""
+    from . import bills as _bills
+    if claims is None:
+        if rows is None:
+            claims = _income_claims(conn, today, [bill], memo=memo)
+        else:
+            claims = _claim_income_rows(
+                [r for r in rows if r["date"] <= today],
+                _income_claimants(conn, [bill], memo=memo))
+    mine = [r for r in claims.get(bill["payee"], []) if r["date"] <= today]
+    if not mine:
+        return None
+    events = _bills._events(mine)
+    last = events[-1]["amount"]
+    planned = float(bill.get("amount") or 0)
+    if planned > 0 and not (0.5 * planned <= last <= 2 * planned):
+        return None
+    return round(float(last), 2)
+
+
+def expected_income_remaining(conn, cfg: dict, today: dt.date,
+                              memo: dict | None = None) -> float:
+    """The paychecks still due before `today`'s month ends — the month
+    plan's "still due" half, and the ledger header's "expected". The rule
+    is _month_income_parts'; 0.0 for a household with no income series in
+    the budget."""
+    parts = _month_income_parts(conn, cfg, today, closed=False, memo=memo)
+    return parts["expected"] if parts is not None else 0.0
+
+
 def recurring_load(conn, today: dt.date) -> dict:
     """What the recurring schedule costs and brings in, per month, plus the
     week ahead — the Bills page's headline.
@@ -3590,7 +3967,10 @@ def recurring_load(conn, today: dt.date) -> dict:
 
     bills_mo = (evened_monthly_load(bills, today)
                 + sum(e["monthly"] for e in envelopes))
-    income_mo = evened_monthly_load(income, today)
+    # income by what actually landed (income_actual_monthly says why),
+    # falling back to the schedule's rate for a series without history
+    inc = income_actual_monthly(conn, today, income)
+    income_mo = inc["monthly"]
     # The week ahead is what is still OWED in it, by the rule every cash
     # surface reads (upcoming_bill_occurrences): an occurrence already paid
     # — rent autopaid on the 28th for the 1st — is out of checking and not
@@ -3603,11 +3983,168 @@ def recurring_load(conn, today: dt.date) -> dict:
                                      today + dt.timedelta(days=7))
     return {"bills_monthly": round(bills_mo, 2),
             "income_monthly": round(income_mo, 2),
+            "income_basis": inc["basis"], "income_months": inc["months"],
             "week_total": round(sum(o["planned"] for o in week), 2),
             "week_count": len(week)}
 
 
 # ---- the monthly picture ----------------------------------------------
+
+
+def _month_income_parts(conn, cfg: dict, today: dt.date, *, closed: bool,
+                        memo: dict | None = None,
+                        bill_rows: list | None = None) -> dict | None:
+    """The month's income in two halves, split at `today`: what had landed
+    by the end of `today` (`received`; the whole month when `closed`) and
+    the paychecks still due from `today` to month end (`expected`; nothing
+    once closed). None when the budget tracks no income series — every
+    series disabled counts as none, since a disabled series is out of the
+    budget.
+
+    A paycheck belongs to the month it PAYS — its occurrence's due month —
+    whatever day its deposit lands. A check due Sunday the 1st and paid on
+    Friday the 30th is the new month's income, not the old month's second
+    check; one paid two days late is still its own month's. So:
+      - The month's deposits are read in one statement
+        (reporting.month_deposit_rows, under the judged config's excluded
+        accounts): from PREPAY_MATCH_DAYS before the 1st through `today`
+        (a closed month: through that far past its end, so a late check
+        comes home).
+      - Every income series' occurrences of last month, this month and
+        next month are matched against them, nearest first — last month's
+        and next month's only so that their own deposits go to them.
+      - received = the deposits matched to this month's occurrences of an
+        enabled series, wherever dated, each at its full amount even
+        where the ledger's income definition does not count it (a deposit
+        into a brokerage's cash account that is not stamped INCOME — the
+        series says it is a paycheck); a paycheck at a bank whose name
+        reads like a brokerage is a bank deposit and the ledger counts it
+        like any other. Plus
+        the ledger's income rows dated in the month through `today` that
+        no occurrence took (interest, refunds, one-off deposits). A
+        deposit matched to a disabled series counts nowhere; one matched
+        to the month before or after counts there.
+      - expected = this month's enabled occurrences no deposit matched,
+        due after `today`, or ON `today` while the series still names
+        today as its payday — a check due today (the month's last day
+        included) has not failed to come until the day is over. One whose
+        day has passed is not expected: a late paycheck is not owed, and a
+        biweekly series' back-projected occurrence would otherwise add a
+        phantom check. Each is sized at the series' latest deposit
+        (latest_deposit_amount; the planned amount without one).
+
+    `bill_rows`: the frozen schedule a closed month is judged under."""
+    from . import reporting as _reporting
+    caps, disabled = cfg.get("occurrence_caps"), cfg.get("disabled_bills")
+    every = [b for b in _recurring_bills(conn, caps=caps, income=True,
+                                         memo=memo, rows=bill_rows)
+             if (b["recurrence"] or {}).get("frequency")]
+    off = {(p or "").lower() for p in (disabled or [])}
+    series = [b for b in every if b["payee"].lower() not in off]
+    if not series:
+        return None
+    month_start = today.replace(day=1)
+    month_end = today.replace(
+        day=calendar.monthrange(today.year, today.month)[1])
+    window = dt.timedelta(days=PREPAY_MATCH_DAYS)
+    one = dt.timedelta(days=1)
+    upto = (month_end if closed else today) + one       # the month's own days
+    until = month_end + one + window if closed else today + one
+    excluded = excluded_account_ids(cfg)
+    deposits, known = _reporting.month_deposit_rows(
+        conn, today.year, today.month, month_start - window, until,
+        excluded=excluded, memo=memo)
+    rows = [r for r in deposits if r["matchable"]]
+
+    py, pm = ((today.year, today.month - 1) if today.month > 1
+              else (today.year - 1, 12))
+    ny, nm = ((today.year, today.month + 1) if today.month < 12
+              else (today.year + 1, 1))
+    occs = month_occurrences(every, py, pm)
+    n_prev = len(occs)
+    occs += month_occurrences(every, today.year, today.month)
+    n_cur = len(occs)
+    occs += month_occurrences(every, ny, nm)
+    _, occs = match_occurrences(rows, occs)
+
+    taken = {o["txn"]["txn_id"] for o in occs if o["txn"] is not None}
+    # A paycheck split into two deposits the same day (a net-pay split, a
+    # bonus run with the check) matches its occurrence with one of them;
+    # the rest follows it, so both halves are the month the check pays —
+    # not one in the month it pays and one in the month it is dated.
+    by_day = {}
+    for i, o in enumerate(occs):
+        if o["txn"] is not None:
+            by_day.setdefault((o["txn"]["date"], o["txn"]["payee"]), i)
+    rest: dict[int, list[dict]] = {}
+    for r in rows:
+        i = by_day.get((r["date"], r["payee"]))
+        if i is not None and r["txn_id"] not in taken:
+            rest.setdefault(i, []).append(r)
+            taken.add(r["txn_id"])
+
+    def _worth(r):
+        return float(r["net"] if r["counted"] else r["amount"])
+
+    paid = 0.0
+    any_paid = False
+    due: list[dict] = []
+    for k, occ in enumerate(occs[n_prev:n_cur], start=n_prev):
+        on = occ["bill"]["payee"].lower() not in off
+        txn = occ["txn"]
+        if txn is not None:
+            if on:
+                paid += _worth(txn) + sum(_worth(r) for r in rest.get(k, []))
+                any_paid = True
+            continue
+        if closed or not on or occ["floored"]:
+            continue
+        d = occ["due"]
+        if d > today or (d == today and occ["bill"]["anchor"] <= today):
+            due.append(occ)
+    other = sum(float(r["net"] or 0) for r in deposits
+                if r["counted"] and r["txn_id"] not in taken
+                and month_start <= r["date"] < upto)
+    received = (round(paid + other, 2) if known or any_paid else None)
+
+    expected = 0.0
+    if due:
+        claims = _income_claims(conn, today, [o["bill"] for o in due],
+                                memo=memo, excluded=excluded)
+        latest: dict[str, float | None] = {}
+        for o in due:
+            bill = o["bill"]
+            if bill["payee"] not in latest:
+                latest[bill["payee"]] = latest_deposit_amount(
+                    conn, today, bill, claims=claims)
+            amt = latest[bill["payee"]]
+            expected += amt if amt is not None else o["planned"]
+    return {"received": received, "expected": round(expected, 2)}
+
+
+def _month_income(conn, cfg: dict, today: dt.date, *, closed: bool,
+                  memo: dict | None = None,
+                  bill_rows: list | None = None
+                  ) -> tuple[float | None, float | None, float | None]:
+    """(income, received, expected) for `today`'s month — see month_status
+    and _month_income_parts. Without an income series in the budget the
+    budgeted monthly income stands in and the halves are None; so it does
+    when nothing has landed and nothing is due (a month before the feed).
+
+    Whether the household tracks an income series is read from the
+    schedule the month is judged under: a closed month's frozen rows
+    (`bill_rows`) when it has them, the live table otherwise, with the
+    judged config's disabled list. Reading today's table for a frozen
+    month would let archiving a series today flip a past month between
+    what landed and the budgeted figure."""
+    parts = _month_income_parts(conn, cfg, today, closed=closed, memo=memo,
+                                bill_rows=bill_rows)
+    if parts is None:
+        return active_monthly_income(cfg), None, None
+    received, expected = parts["received"], parts["expected"]
+    if received is None and not expected:
+        return active_monthly_income(cfg), None, None
+    return round((received or 0.0) + expected, 2), received, expected
 
 
 def month_status(conn, today: dt.date, *, historical: bool = False,
@@ -3879,7 +4416,18 @@ def month_status(conn, today: dt.date, *, historical: bool = False,
     # the cash-basis fixed_month above), split in the configured ratio. SHRINK-ONLY — heavy-bill months compress budgets so the plan
     # breaks even; light months stay capped (surplus = savings).
     food_budget, other_budget = cfg["food_monthly"], cfg["other_monthly"]
-    income = active_monthly_income(cfg)
+    # This month's income as it actually is: the deposits that landed so
+    # far (the ledger's income, settled against the paychecks on the same
+    # deposits — _month_income_parts) plus the paychecks
+    # still due before the month ends, at their current amount — a
+    # three-paycheck month shows its third check, a month whose checks
+    # grew shows the growth. A closed month is what landed. A household
+    # with no income series keeps its budgeted figure: with nothing to
+    # expect, a half-landed month would read as half an income and
+    # squeeze every variable budget to nothing.
+    income, income_received, income_expected = _month_income(
+        conn, cfg, today, closed=closed or historical, memo=memo,
+        bill_rows=bill_rows)
     scale = None
     if cfg.get("dynamic_variable_budget", True) and income:
         available = income - scheduled_month
@@ -4315,6 +4863,9 @@ def month_status(conn, today: dt.date, *, historical: bool = False,
                             if o.get("withdrawn_on") else None)
                            for o in overdue_unpaid],
         "avg_bills": avg_bills, "plan_surplus": plan_surplus, "income": income,
+        # the two halves of this month's income: landed, and still due
+        # (None when the figure is the budgeted one, not the month's)
+        "income_received": income_received, "income_expected": income_expected,
         # the surplus subtracts the savings plan, so every surface that
         # renders the plan flow needs it or the chain does not add up
         "savings_plan": goals_plan,

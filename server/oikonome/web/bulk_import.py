@@ -145,6 +145,7 @@ def _csv_sign_guess(data: bytes) -> tuple[str, bool]:
         # decoded the way the import itself will read the file, so a
         # UTF-16 export is sniffed as text, not as NUL-riddled noise
         from .pages import upload_text
+        from ..sync import csvimport
         text = upload_text(head)
         rows = list(itertools.islice(csvmod.reader(io.StringIO(text)),
                                      SNIFF_ROWS))
@@ -168,10 +169,13 @@ def _csv_sign_guess(data: bytes) -> tuple[str, bool]:
         for j, cell in enumerate(row):
             if (amount_cols and j not in amount_cols) or j in skip:
                 continue
-            c = cell.strip().replace("$", "").replace(",", "")
-            if re.fullmatch(r"-?\d+(\.\d{1,2})?", c) and "." in c:
+            # a money cell carries cents after either separator; a
+            # decimal-comma export ("-12,50") counts the same as "-12.50",
+            # and an id or a whole count carries none and is not a vote
+            c = cell.strip()
+            if re.fullmatch(r"[-+]?\$?-?[\d.,]*\d[.,]\d{1,2}", c):
                 try:
-                    nums.append(float(c))
+                    nums.append(csvimport.parse_money_text(c))
                 except ValueError:
                     pass
     if len(nums) < 3:

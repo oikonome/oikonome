@@ -168,20 +168,97 @@ class SweepForecastTests(unittest.TestCase):
             self.assertGreaterEqual(swp[k]["end"], fixed[k]["end"], k)
 
     def test_zero_surplus_month_contributes_nothing(self):
-        # income exactly covers the budgets (no bills in this fixture)
-        # → standing surplus is 0 — the month never produces anything
-        # to sweep, so the goal must leave the forecast untouched
-        write_config(self.conn, budgeted_income_monthly=2000,
-                     food_monthly=1000, other_monthly=1000,
+        # the budgets exactly use up what an ordinary month's income leaves
+        # after the rent → standing surplus is 0, and this month (whose
+        # own income is no larger) has none either — no month produces
+        # anything to sweep, so the goal must leave the forecast untouched.
+        # The standing income is the paycheck series' average, so the
+        # budgets are sized from it, not from a typed figure.
+        write_config(self.conn, food_monthly=1, other_monthly=1)
+        st = budget.month_status(self.conn, TODAY)
+        # a cent over, so rounding never leaves a cent of surplus to sweep
+        half = round((forecast.standing_surplus(self.conn, st, TODAY) + 2)
+                     / 2, 2) + 0.01
+        write_config(self.conn, food_monthly=half, other_monthly=half,
                      savings_goals=[_goal()])
+        # ...and spent exactly on pace so far: under-pace spending is
+        # surplus the month-end sweep may take (the projection realises
+        # it), so a month that is to produce nothing must be on plan
+        # (a first charge on the 1st so the month is paced from its start,
+        # not from the ledger's first day — specs/short-ledger-pacing.md)
+        add_txn(self.conn, TODAY.replace(day=1), 10.0, "ON PACE STORE")
+        st = budget.month_status(self.conn, TODAY)
+        add_txn(self.conn, TODAY - dt.timedelta(days=1), -st["variance"],
+                "ON PACE STORE")
+        st = budget.month_status(self.conn, TODAY)
+        self.assertAlmostEqual(forecast.standing_surplus(
+            self.conn, st, TODAY), 0, places=1)
+        self.assertLessEqual(st["plan_surplus"], 0.1)
+        self.assertAlmostEqual(st["variance"], 0, places=1)
         swp = forecast.build(self.conn, today=TODAY, days=60)
-        write_config(self.conn, budgeted_income_monthly=2000,
-                     food_monthly=1000, other_monthly=1000,
+        write_config(self.conn, food_monthly=half, other_monthly=half,
                      savings_goals=[])
         base = forecast.build(self.conn, today=TODAY, days=60)
         for k in ("plan", "pace", "pace_stmt"):
             self.assertEqual(swp[k]["series"], base[k]["series"], k)
             self.assertEqual(swp[k]["sweep_events"], [], k)
+
+    def test_a_three_paycheck_month_does_not_sweep_its_surplus_forward(self):
+        # July carries three biweekly checks (one landed, two due), so its
+        # own surplus is a whole extra check; an ordinary month's (the
+        # series' average, 26 checks over 12 months) is sized to nothing.
+        # This month may sweep; next month must not be booked a sweep the
+        # standing surplus cannot pay for, or the trough reads low.
+        add_txn(self.conn, TODAY.replace(day=3), -4000.0, "Paycheck Co",
+                primary="INCOME", account="chk")
+        add_txn(self.conn, TODAY.replace(day=1), 10.0, "ON PACE STORE")
+        write_config(self.conn, food_monthly=1, other_monthly=1)
+        st = budget.month_status(self.conn, TODAY)
+        standing = forecast.standing_surplus(self.conn, st, TODAY)
+        half = round((standing + 2) / 2, 2) + 0.01
+        write_config(self.conn, food_monthly=half, other_monthly=half,
+                     savings_goals=[_goal(monthly_plan=1500)])
+        st = budget.month_status(self.conn, TODAY)
+        self.assertGreater(st["plan_surplus"], 1500,
+                           "the fixture month must carry an extra check")
+        self.assertLessEqual(forecast.standing_surplus(
+            self.conn, st, TODAY), 0)
+        swp = forecast.build(self.conn, today=TODAY, days=60)
+        months = {when[:7] for when, _, _ in swp["pace_stmt"]["sweep_events"]}
+        self.assertNotIn("2026-08", months, swp["pace_stmt"]["sweep_events"])
+
+    def test_a_closed_months_standing_surplus_reads_its_own_schedule(self):
+        # a past month is read under the schedule it was judged under: with
+        # one the series come from those rows; with none, today's series
+        # are never averaged for it — its standing income is what the
+        # ledger realised (test_a_closed_months_standing_surplus_reads_the_
+        # ledgers_realised_income), and a ledger with no whole months to
+        # average keeps the month's own surplus
+        from unittest import mock
+        st = {"plan_surplus": 500.0, "income": 6000.0,
+              "income_received": 6000.0, "income_expected": 0.0}
+        seen = []
+        real = budget._recurring_bills
+
+        def spy(*a, **kw):
+            seen.append(kw.get("rows"))
+            return real(*a, **kw)
+
+        with mock.patch.object(budget, "income_actual_monthly") as series:
+            self.assertEqual(forecast.standing_surplus(
+                self.conn, st, TODAY, closed=True), 500.0)
+            series.assert_not_called()
+        with mock.patch.object(budget, "_recurring_bills", side_effect=spy):
+            frozen = [{"payee": "Old Job", "amount": 3000.0,
+                       "raw": {"frequency": "MONTHLY", "interval": 1},
+                       "merchant": None}]
+            with mock.patch.object(budget, "income_actual_monthly",
+                                   return_value={"monthly": 6000.0}):
+                self.assertEqual(forecast.standing_surplus(
+                    self.conn, st, TODAY, closed=True, bill_rows=frozen),
+                    500.0)
+        # the income series were expanded from the frozen rows
+        self.assertIs(seen[-1], frozen)
 
     def test_posted_transfer_marks_the_month_satisfied(self):
         # the real transfer posts mid-month (destination side, Plaid
@@ -243,7 +320,7 @@ class MultipleSweepGoalTests(unittest.TestCase):
         # the month-end pool: the standing surplus for a future month, and
         # for the current month the surplus PROJECTED to month end (the
         # standing figure corrected by today's pace variance)
-        std_room = max(0.0, st["plan_surplus"])
+        std_room = max(0.0, forecast.standing_surplus(self.conn, st, TODAY))
         cur_room = max(0.0, st["plan_surplus"] - (st.get("variance") or 0))
         self.assertLess(std_room, 2 * big)    # the pool really is short
         self._cfg([first, second])

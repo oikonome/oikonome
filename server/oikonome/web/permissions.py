@@ -68,7 +68,7 @@ DEFAULT_ROLE = "viewer"
 SELF_WRITE_OK = ("/api/logout", "/api/password/change", "/api/totp",
                  "/api/sessions/revoke", "/api/testing", "/api/passkeys",
                  "/api/devices",
-                 "/api/me/email", "/api/account/leave",
+                 "/api/me/email", "/api/me/push", "/api/account/leave",
                  # the caller's OWN login address: changing it (re-authed)
                  # and asking for a fresh verification link. A viewer whose
                  # verify link lapsed needs a route to a new one, and the

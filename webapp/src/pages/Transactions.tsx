@@ -321,6 +321,16 @@ export default function Transactions() {
     return () => cancelAnimationFrame(id);
   }, [shownTarget, shown, searching, tableRows]);
 
+  // the primary checking balance heads the ledger: the account the cash
+  // forecast starts from (the live pin, else the largest-balance pick),
+  // available balance first like the runway. Nothing when the household
+  // has no checking account; "balance not set" when the row has none yet
+  const primary = accts.data?.primary_checking_id
+    ? accts.data.accounts.find((a) => a.id === accts.data!.primary_checking_id)
+    : undefined;
+  const primaryBal = primary
+    ? (primary.balance_available ?? primary.balance_current) : null;
+
   return (
     <>
       {/* a receipt can be snapped before its charge is here — the ledger
@@ -329,6 +339,18 @@ export default function Transactions() {
       <div style={{ display: "flex", gap: ".6rem", alignItems: "center",
                     flexWrap: "wrap" }}>
         <h1 style={{ marginRight: "auto" }}>Transactions</h1>
+        {primary && (
+          <Link to="/accounts" style={{ textDecoration: "none", textAlign: "right" }}
+                title="primary checking — the account the cash forecast starts from; change it on Accounts">
+            <span className="sub" style={{ display: "block" }}>
+              {primary.name}{primary.mask ? ` ••${primary.mask}` : ""}
+            </span>
+            <span className={`kpi sm ${(primaryBal ?? 0) < 0 ? "neg" : ""}`}
+                  style={{ display: "block", lineHeight: 1.1 }}>
+              {primaryBal == null ? "balance not set" : money(primaryBal)}
+            </span>
+          </Link>
+        )}
         <WaitingBadge />
         {canEdit(me) && <SnapReceiptButton />}
       </div>
@@ -379,6 +401,14 @@ export default function Transactions() {
                     ? <span className="sub">—</span>
                     : <span className="pos">{money(query.data.in_sum)}</span>}
                   <span className="sub" style={{ fontWeight: 400 }}> in</span>
+                  {/* the current month: what has landed, and the paychecks
+                      still due before month end — the Budget plan's income
+                      is the two together */}
+                  {(query.data.in_expected ?? 0) > 0 && (
+                    <span className="sub" style={{ fontWeight: 400 }}
+                          title="paychecks still due this month, at their current amount">
+                      {" "}(+{money(query.data.in_expected!)} expected)</span>
+                  )}
                   {" · "}
                   {money(query.data.out_sum)}
                   <span className="sub" style={{ fontWeight: 400 }}> out</span>

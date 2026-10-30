@@ -497,6 +497,33 @@ def thread_context(conn, thread_id: str) -> list[dict]:
     return [{"question": r["question"], "answer": r["answer"]} for r in rows]
 
 
+def thread_is_own(conn, thread_id: str, user_id) -> bool:
+    """Is every turn in this conversation this person's? A view-only
+    login may continue only threads it alone has asked in — the
+    household's others are not shown to it, so it must not be able to
+    read them through a follow-up either. The whole thread is checked,
+    not just its opening: the owner and a member read the viewer's
+    conversations and may continue one, and a follow-up hands the model
+    every turn in the thread, so one turn of theirs in it would reach the
+    model on the viewer's next question. A thread holding a turn whose
+    asker has left the household (asked_by_id nulled by forget_asker) is
+    not provably the viewer's either. False for a thread that does not
+    exist, so the refusal reads the same as an unknown id."""
+    if user_id is None:
+        return False
+    try:
+        uid = str(_uuid.UUID(str(user_id)))
+    except ValueError:
+        return False
+    row = conn.execute(
+        """SELECT count(*) AS n,
+                  bool_and(asked_by_id IS NOT NULL
+                           AND asked_by_id = %s::uuid) AS own
+             FROM assistant_turns WHERE thread_id = %s""",
+        (uid, str(_uuid.UUID(str(thread_id))))).fetchone()
+    return bool(row and row["n"] and row["own"])
+
+
 def record_turn(conn, user, question: str, result: dict,
                 thread_id: str | None = None) -> str | None:
     """Keep an answered question. Returns the row id, or None when there
@@ -654,19 +681,29 @@ def parse_cursor(before: str | None, before_id: str | None = None
 
 
 def history(conn, limit: int = HISTORY_PAGE, before: str | None = None,
-            before_id: str | None = None) -> dict:
+            before_id: str | None = None, asked_by_id=None) -> dict:
     """The household's answered questions, newest first. The next page
     starts after (`before`, `before_id`) — the last row's asked_at and id,
     handed back as `next` — so rows sharing one timestamp are neither
     skipped nor repeated. `before` alone (no id) pages by the time only.
-    Raises ValueError for a malformed cursor."""
+    Raises ValueError for a malformed cursor.
+
+    `asked_by_id` narrows the log to one person's own questions — what a
+    view-only login is shown: the household's record is the owner's and a
+    member's to read, a viewer reads what they asked."""
     limit = max(1, min(int(limit or HISTORY_PAGE), HISTORY_PAGE))
     at, rid = parse_cursor(before, before_id)
-    where, args = "", []
+    clauses, args = [], []
     if at is not None and rid is not None:
-        where, args = "WHERE (asked_at, id) < (%s, %s::uuid)", [at, rid]
+        clauses.append("(asked_at, id) < (%s, %s::uuid)")
+        args += [at, rid]
     elif at is not None:
-        where, args = "WHERE asked_at < %s", [at]
+        clauses.append("asked_at < %s")
+        args.append(at)
+    if asked_by_id is not None:
+        clauses.append("asked_by_id = %s::uuid")
+        args.append(str(_uuid.UUID(str(asked_by_id))))
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     rows = conn.execute(
         f"""SELECT id, thread_id, asked_at, asked_by, question, answer, blocks,
                    tools_used

@@ -1,6 +1,8 @@
 // Settings-screen rules that read the settings view, pure so the logic
 // tests can hold them.
 
+import { parseMoneyDraft } from "./pure.ts";
+
 export type LlmBackendSeed = {
   id: string; name: string; url: string; model: string;
   vision_model?: string; extra_body?: string | null;
@@ -107,13 +109,15 @@ export function investBody(f: InvestForm,
   const investment_basis_override: Record<string, number> = {};
   for (const r of f.basis) {
     const mask = r.mask.trim().toUpperCase();
-    const amt = r.amount.trim().replace(/[$,]/g, "");
+    const amt = r.amount.trim().replace(/\$/g, "");
     if (!mask && !amt) continue;
     if (!MASK.test(mask))
       return { ok: false,
                error: "Each money-in override needs the account's last 2 to 8 "
                       + "letters or digits." };
-    const n = Number(amt);
+    // the server's separator rules: "1,250.50" and "1.250,50" both read
+    // as 1250.5; any other comma is refused rather than stripped
+    const n = parseMoneyDraft(amt) ?? NaN;
     if (amt === "" || !Number.isFinite(n) || n < 0)
       return { ok: false,
                error: `Money in for account ${mask} must be a dollar amount `

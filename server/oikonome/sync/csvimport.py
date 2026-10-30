@@ -149,11 +149,41 @@ def _parse_date(s: str, order: str = "mdy") -> dt.date:
     raise ValueError(f"unrecognized date: {s!r}")
 
 
-def _parse_amount(s: str) -> float:
-    s = s.strip().replace("$", "").replace(",", "")
+# The separators an amount cell is written with. A comma is a thousands
+# mark only in groups of three ahead of the point ("1,234.56", "1,234");
+# a comma followed by one or two digits at the end is the decimal mark of a
+# locale that writes "12,50" and "1.234,56". Deleting every comma read
+# those as 1250 and 1.23456 — a plausible, silently wrong number that then
+# flows into every total — so the two conventions are read explicitly and
+# anything else is refused.
+_THOUSANDS_COMMA = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?")
+_THOUSANDS_DOT_DECIMAL_COMMA = re.compile(r"\d{1,3}(?:\.\d{3})+,\d{1,2}")
+_DECIMAL_COMMA = re.compile(r"\d+,\d{1,2}")
+
+
+def parse_money_text(s: str) -> float:
+    """An amount cell as a number: a currency sign, a sign or accounting
+    parentheses, and either separator convention."""
+    s = s.strip().replace("$", "").replace(" ", "")
     if s.startswith("(") and s.endswith(")"):    # accounting negatives
         s = "-" + s[1:-1]
-    return float(s)
+    sign, body = "", s
+    if s[:1] in ("-", "+"):
+        sign, body = ("-" if s[0] == "-" else ""), s[1:]
+    if "," in body:
+        if _THOUSANDS_COMMA.fullmatch(body):
+            body = body.replace(",", "")
+        elif _THOUSANDS_DOT_DECIMAL_COMMA.fullmatch(body):
+            body = body.replace(".", "").replace(",", ".")
+        elif _DECIMAL_COMMA.fullmatch(body):
+            body = body.replace(",", ".")
+        else:
+            raise ValueError(f"unrecognized amount: {s!r}")
+    return float(sign + body)
+
+
+def _parse_amount(s: str) -> float:
+    return parse_money_text(s)
 
 
 # A bank's export runs to a few dozen columns at the very most. Every row

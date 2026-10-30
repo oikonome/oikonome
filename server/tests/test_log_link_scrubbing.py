@@ -76,6 +76,14 @@ SHAPES = [
      "FAKEBEARER0000000001", "Authorization: Bearer "),
     ("stored enc:v1:RkFLRUNJUEhFUlRFWFQwMDAx= ok",
      "RkFLRUNJUEhFUlRFWFQwMDAx", "enc:v1:"),
+    # a member address in a query string arrives with '@' percent-encoded:
+    # the Activity filter (?who=) and the invite link's email= parameter
+    ('"GET /api/activity?who=alice%40example.com HTTP/1.1" 200',
+     "lice%40example.com", "/api/activity?who=a"),
+    ("GET /signup?invite=FAKEINVITE0000000002&email=bob%40example.org HTTP/1.1",
+     "example.org", "&email=b"),
+    ("GET /signup?invite=FAKEINVITE0000000003&email=carol%40Example.ORG HTTP/1.1",
+     "Example.ORG", "&email=c"),
 ]
 
 # lines with no secret must come back byte-for-byte: an over-broad rule

@@ -144,6 +144,48 @@ class RestoreUnescapeTests(unittest.TestCase):
             dest.close()
 
 
+    def test_a_formula_after_a_separator_is_guarded_and_round_trips(self):
+        """A ';'-locale spreadsheet reads the text after a ';' (or a tab,
+        or a line break) as a cell of its own, so the full-data export
+        guards that piece as every other CSV writer does — and restore,
+        reading the same ZIP, gives the ledger text back unchanged."""
+        os.environ["OIKONOME_DEV"] = "1"
+        import oikonome.web.app as appmod
+        appmod.DEV_MODE = True
+        client = TestClient(appmod.app)
+        client.post("/api/signup", data={
+            "email": f"piece-{uuid.uuid4().hex[:8]}@example.dev",
+            "password": PW})
+        tid = client.get("/api/me").json()["tenant_id"]
+        name = 'ZELLE FROM BOB;=HYPERLINK("http://x","refund")\r\nline\rtwo'
+        conn = tenancy.tenant_connect(tid)
+        try:
+            seed_accounts(conn)
+            write_config(conn)
+            conn.execute(
+                """INSERT INTO transactions (id, account_id, date, amount,
+                       name, merchant_name, pending, removed)
+                   VALUES ('piece-1','chk','2026-07-10',25.0,%s,
+                           'A;=1+1',0,0)""", (name,))
+        finally:
+            conn.close()
+        r = export_get(client, "/export")
+        self.assertEqual(r.status_code, 200)
+        txns_csv = zipfile.ZipFile(io.BytesIO(r.content)) \
+            .read("transactions.csv").decode()
+        self.assertIn("A;'=1+1", txns_csv)
+        self.assertIn("BOB;'=HYPERLINK", txns_csv)
+        dest = make_db()
+        try:
+            restore.restore_zip(dest, r.content)
+            row = dest.execute(
+                "SELECT name, merchant_name FROM transactions "
+                "WHERE id='piece-1'").fetchone()
+            self.assertEqual(row["name"], name)
+            self.assertEqual(row["merchant_name"], "A;=1+1")
+        finally:
+            dest.close()
+
 class ReceiptItemsCascadeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

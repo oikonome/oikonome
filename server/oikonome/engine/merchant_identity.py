@@ -110,53 +110,84 @@ CONTEXT_KINDS = ("payment_app", "payment_terminal")
 _CONF_RANK = {"VERY_HIGH": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "UNKNOWN": 0}
 
 
+# an entity id is an opaque token of a few dozen characters
+_ENTITY_ID_MAX = 128
+
+
+def _str_field(d: dict, key: str, max_len: int = 2048) -> str | None:
+    """A text field of a raw record, or None when it is missing or is not
+    text. The record may come from a restored archive rather than the
+    aggregator, and a number or a list where a string belongs would
+    otherwise crash every reader of it — the nightly pass included, on
+    the same row every night."""
+    v = d.get(key)
+    if not isinstance(v, str):
+        return None
+    v = v.strip()
+    return v[:max_len] if v else None
+
+
+def _entity_id(d: dict, key: str = "entity_id") -> str | None:
+    v = _str_field(d, key, max_len=_ENTITY_ID_MAX + 1)
+    return v if v and len(v) <= _ENTITY_ID_MAX else None
+
+
 def plaid_identity(raw: dict | None) -> dict | None:
     """Pick the identity out of a Plaid transaction's raw record.
 
     Returns {entity_id, name, kind, logo_url, website, processor} or None
-    when Plaid resolved nothing (no entity id anywhere)."""
+    when Plaid resolved nothing (no entity id anywhere). Every value is a
+    string or None whatever the record holds: a field of the wrong type is
+    read as absent."""
     if not isinstance(raw, dict):
         return None
-    cps = raw.get("counterparties") or []
+    cps = raw.get("counterparties")
+    cps = cps if isinstance(cps, list) else []
     best = None
     processor = None
     fin = None
     for c in cps:
         if not isinstance(c, dict):
             continue
-        kind = c.get("type") or "other"
+        kind = _str_field(c, "type") or "other"
         if kind in CONTEXT_KINDS:
-            processor = processor or c.get("name")
+            processor = processor or _str_field(c, "name")
             continue
         if kind == "financial_institution":
             fin = fin or c
             continue
-        if not c.get("entity_id"):
+        if not _entity_id(c):
             continue
         if kind not in IDENTITY_KINDS:
             continue
-        rank = _CONF_RANK.get(c.get("confidence_level") or "UNKNOWN", 0)
+        rank = _CONF_RANK.get(_str_field(c, "confidence_level") or "UNKNOWN",
+                              0)
         if best is None or rank > best[0]:
             best = (rank, c)
     if best is not None:
         c = best[1]
-        return {"entity_id": c["entity_id"], "name": c.get("name"),
-                "kind": c.get("type") or "merchant",
-                "logo_url": c.get("logo_url") or raw.get("logo_url"),
-                "website": c.get("website") or raw.get("website"),
+        return {"entity_id": _entity_id(c), "name": _str_field(c, "name"),
+                "kind": _str_field(c, "type") or "merchant",
+                "logo_url": (_str_field(c, "logo_url")
+                             or _str_field(raw, "logo_url")),
+                "website": (_str_field(c, "website")
+                            or _str_field(raw, "website")),
                 "processor": processor}
-    if raw.get("merchant_entity_id"):
-        return {"entity_id": raw["merchant_entity_id"],
-                "name": raw.get("merchant_name") or raw.get("name"),
-                "kind": "merchant", "logo_url": raw.get("logo_url"),
-                "website": raw.get("website"), "processor": processor}
+    if _entity_id(raw, "merchant_entity_id"):
+        return {"entity_id": _entity_id(raw, "merchant_entity_id"),
+                "name": (_str_field(raw, "merchant_name")
+                         or _str_field(raw, "name")),
+                "kind": "merchant", "logo_url": _str_field(raw, "logo_url"),
+                "website": _str_field(raw, "website"), "processor": processor}
     # a lone financial institution is the identity only when Plaid gave no
     # merchant name at all (a card payment, a bank transfer) — a P2P row
     # ("Zelle — Casey Example") names its counterparty and must keep it
-    if fin is not None and fin.get("entity_id") and not raw.get("merchant_name"):
-        return {"entity_id": fin["entity_id"], "name": fin.get("name"),
+    if fin is not None and _entity_id(fin) \
+            and not _str_field(raw, "merchant_name"):
+        return {"entity_id": _entity_id(fin), "name": _str_field(fin, "name"),
                 "kind": "financial_institution",
-                "logo_url": fin.get("logo_url"), "website": fin.get("website"),
+                "logo_url": _str_field(fin, "logo_url"),
+                "website": _str_field(fin, "website"),
                 "processor": processor}
     return None
 
@@ -361,9 +392,11 @@ _MAX_LABEL = merchant_dedup._MAX_LABEL
 def _words(s: str) -> list[str]:
     """The alphanumeric words of a string, lowercased: "SQ *EXAMPLE CO #12"
     becomes ["sq", "example", "co", "12"]. An apostrophe breaks a word, so
-    this is the SPLIT reading of a possessive — "Kohl's" becomes
-    ["kohl", "s"]. `_joined_words` is the other reading."""
-    s = (s or "")[:_MAX_LABEL]
+    this is the SPLIT reading of a possessive — "Contoso's" becomes
+    ["contoso", "s"]. `_joined_words` is the other reading. Accents are
+    folded first, as canonical_merchant folds them, so "Café Contoso" and a
+    line printing "CAFE CONTOSO" share their words."""
+    s = merchant_dedup.ascii_fold((s or "")[:_MAX_LABEL])
     return "".join(c if c.isalnum() else " " for c in s.lower()).split()
 
 
@@ -374,7 +407,7 @@ _APOSTROPHES = "'’ʼ"
 
 def _joined_words(s: str) -> list[str]:
     """The words of a string with apostrophes DELETED rather than broken on:
-    "Kohl's" becomes ["kohls"], "O'Reilly Auto" becomes ["oreilly", "auto"]."""
+    "Contoso's" becomes ["contosos"], "O'Fabrikam Parts" becomes ["ofabrikam", "parts"]."""
     s = (s or "")[:_MAX_LABEL]
     return _words("".join(c for c in s if c not in _APOSTROPHES))
 
@@ -383,8 +416,8 @@ def _descriptor_words(descriptor: str) -> set[str]:
     """Every word a bank line offers, under BOTH readings of an apostrophe.
 
     A line is printed either way and we cannot tell which: one bank writes
-    "KOHLS", the next "KOHL S", a third "O REILLY AUTO"
-    for a name the aggregator spells "O'Reilly". Taking the union means a
+    "CONTOSOS", the next "CONTOSO S", a third "O FABRIKAM PARTS"
+    for a name the aggregator spells "O'Fabrikam". Taking the union means a
     name matches whichever way its line happened to be printed."""
     return set(_words(descriptor)) | set(_joined_words(descriptor))
 
@@ -393,9 +426,9 @@ def _name_readings(merchant: str) -> list[list[str]]:
     """The payee name as words, joined reading first, then split.
 
     Both are needed, and neither alone will do. Deleting the apostrophe
-    reads "Kohl's" as one word, which is what a line printing "KOHLS" says;
-    breaking on it reads "O'Reilly" as ["o", "reilly"], which is what a line
-    printing "O REILLY" — or one that elides the prefix altogether — says.
+    reads "Contoso's" as one word, which is what a line printing "CONTOSOS" says;
+    breaking on it reads "O'Fabrikam" as ["o", "fabrikam"], which is what a line
+    printing "O FABRIKAM" — or one that elides the prefix altogether — says.
     A name matches when EITHER reading of it does."""
     joined, split = _joined_words(merchant), _words(merchant)
     return [joined] if joined == split else [joined, split]
@@ -425,9 +458,9 @@ def _descriptor_names(descriptor: str, merchant: str) -> bool:
     that tail is the city, the terminal, the country.
 
     A possessive is read both ways on both sides (_name_readings,
-    _descriptor_words). Read only as a break, "Kohl's" wants an "s" from a
-    line reading "KOHLS" and nothing in a bank descriptor can ever supply
-    it; read only as a deletion, "O'Reilly" becomes "oreilly" and no longer
+    _descriptor_words). Read only as a break, "Contoso's" wants an "s" from a
+    line reading "CONTOSOS" and nothing in a bank descriptor can ever supply
+    it; read only as a deletion, "O'Fabrikam" becomes "ofabrikam" and no longer
     matches the line that prints the prefix as a word of its own, nor the
     name a household wrote without it. Either reading matching is enough:
     the two describe one payee, and which one a feed used is not evidence
@@ -1869,6 +1902,14 @@ def re_resolve_recleaned(conn, was: dict) -> list[dict]:
     the answer, like prune_empty, and a full pass pruning in between would
     delete the row before it could be pointed anywhere.
 
+    A clean that SPLITS a merchant — its strings now name several
+    merchants, or only some of them moved — has no one survivor to retire
+    it into, and choosing one would silently change which charges a bill,
+    a category rule or a 1099 mark covers: the other parts would lose
+    them. So nothing is retired; every part gets a copy instead
+    (`_follow_split`), and each moved string is journalled so the Merchants
+    page can undo it.
+
     Returns [{"from": old name, "into": survivor's name}] per merchant
     retired, for callers with name-keyed state of their own to move."""
     retired: list[dict] = []
@@ -1877,6 +1918,11 @@ def re_resolve_recleaned(conn, was: dict) -> list[dict]:
     raws = list(was)
     with conn.transaction():
         _lock_identity(conn)
+        # the offers and bills a split rewrites are locked before any row
+        # moves, in id order, as rename() takes them: an approval holds
+        # its offer and its bill while it stamps that bill's charges
+        from . import bills
+        bills.lock_merchant_split(conn, [m for m in was.values() if m])
         ids = [r["id"] for r in conn.execute(
             f"SELECT t.id FROM transactions t "
             f" WHERE {merchant_sql.RAW_KEY} = ANY(%s) "
@@ -1887,15 +1933,29 @@ def re_resolve_recleaned(conn, was: dict) -> list[dict]:
         now = {r["raw_merchant"]: r["merchant_id"] for r in conn.execute(
             "SELECT raw_merchant, merchant_id FROM merchant_canonical "
             " WHERE raw_merchant = ANY(%s)", (raws,)).fetchall()}
-        done: set = set()
+        # where each old merchant's strings went, read in full before
+        # anything is retired: old merchant -> {survivor: [raw keys]}
+        went: dict = {}
         for raw_key in sorted(raws):
             old_mid, new_mid = was[raw_key], now.get(raw_key)
-            if old_mid is None or new_mid is None or old_mid in done:
+            if old_mid is None or new_mid is None:
                 continue
             new_mid = _survivor(conn, new_mid)
             if new_mid is None or new_mid == old_mid:
                 continue
-            done.add(old_mid)
+            went.setdefault(old_mid, {}).setdefault(new_mid, []).append(raw_key)
+        for old_mid in sorted(went, key=str):
+            parts = went[old_mid]
+            left = conn.execute(
+                "SELECT EXISTS (SELECT 1 FROM transactions "
+                "                WHERE merchant_id=%s AND removed=0) "
+                "    OR EXISTS (SELECT 1 FROM merchant_canonical "
+                "                WHERE merchant_id=%s) AS left",
+                (old_mid, old_mid)).fetchone()["left"]
+            if len(parts) > 1 or left:
+                _follow_split(conn, old_mid, parts, keep_old=bool(left))
+                continue
+            new_mid = next(iter(parts))
             _retire_if_empty(conn, old_mid, new_mid)
             pair = conn.execute(
                 "SELECT o.name AS old, s.name AS new "
@@ -1924,6 +1984,52 @@ def re_resolve_recleaned(conn, was: dict) -> list[dict]:
                 sorted(r for r in raws if was[r] == old_mid))
             retired.append({"from": pair["old"], "into": pair["new"]})
     return retired
+
+
+def _follow_split(conn, old_mid, parts: dict, *, keep_old: bool) -> None:
+    """Copy what the old merchant held to every merchant its strings went
+    to — the bills that paid it, the pending offers to add it to a bill,
+    the category rules under its name, its 1099 marks — and journal each moved string as a rename from the old
+    name, so undoing it puts the string, and what it carried, back.
+
+    The old merchant is not marked merged into any part. While it keeps
+    rows (`keep_old`) it keeps its own refs, rule and mark; once empty it
+    loses them here, after every part has its copy, and the next prune
+    takes it. Called inside re_resolve_recleaned's locked transaction."""
+    from . import bills, merchant_dedup, selfemploy
+    old = conn.execute("SELECT name FROM merchants WHERE id = %s",
+                       (old_mid,)).fetchone()
+    if old is None:
+        return
+    old_name = old["name"]
+    named = []
+    for sid in sorted(parts, key=str):
+        s = conn.execute("SELECT id::text AS id, name FROM merchants "
+                         " WHERE id = %s", (sid,)).fetchone()
+        if s is not None:
+            named.append((s["id"], s["name"], sorted(parts[sid])))
+    if not named:
+        return
+    bills.follow_merchant_split(conn, old_mid, old_name, named, keep_old)
+    notes = merchant_dedup._copy_rules_on_split(
+        conn, old_name, old_mid, [n for _, n, _ in named], keep_old)
+    selfemploy.follow_merchant_split(conn, old_mid, old_name, named, keep_old)
+    for _sid, sname, mine in named:
+        canon = {r["raw_merchant"]: r["canonical"] for r in conn.execute(
+            "SELECT raw_merchant, canonical FROM merchant_canonical "
+            " WHERE raw_merchant = ANY(%s)", (mine,)).fetchall()}
+        journal = [r for r in mine if canon.get(r)]
+        if not journal:
+            continue
+        ids = [r["id"] for r in conn.execute(
+            "INSERT INTO merchant_renames (raw_merchant, from_canonical, "
+            "                              to_canonical) "
+            "SELECT r, %s, c FROM unnest(%s::text[], %s::text[]) AS j(r, c) "
+            "RETURNING id",
+            (old_name, journal, [canon[r] for r in journal])).fetchall()]
+        # every row carries a note, even an empty one: a row without one
+        # is what the repair of renames made before rules followed walks
+        merchant_dedup._journal_note(conn, notes[sname], ids)
 
 
 def reconcile_raws(conn, raws: list[str]) -> dict:

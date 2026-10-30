@@ -7,8 +7,15 @@ shop's totals across three rows that never add up on any page.
 
 The app consolidates the obvious cases automatically — including a name
 the bank prints without its apostrophe ("Juniper's Market" and "JUNIPERS
-MARKET" are one merchant), and when that cleanup improves, bills and
-category rules attached to the old spelling move with it — but it is
+MARKET" are one merchant), an initials brand stays whole ("Q&Z Market"
+keeps its ampersand, "J.T. Outfitters" reads "JT Outfitters"),
+accented letters fold to plain ones ("Café Northwind" and "CAFE
+NORTHWIND" are one merchant), and when that cleanup improves, bills and
+category rules attached to the old spelling move with it. If an improved
+cleanup splits one merchant into several, each part gets a copy of its
+bills, pending bill offers, category rules and 1099 contractor marks,
+and each moved spelling is listed under
+Recent changes so it can be undone — but the cleanup is
 deliberately cautious: a wrong merge is worse than a missed one. The **Merchants** page is
 where you settle the rest by hand — and your answer outranks every
 automatic rule, because you were there and the app was only reading

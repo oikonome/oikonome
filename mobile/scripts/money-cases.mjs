@@ -183,6 +183,27 @@ export function moneyCases(impl, assert) {
       }
     },
 
+    "a typed comma is read by the server's separator rules": () => {
+      // the server reads "12,50" as twelve-fifty; stripping every comma
+      // sent 1250 for it. A comma that fits no convention is refused.
+      for (const [text, want] of [
+        ["12,50", 12.5], ["12,5", 12.5], ["-12,50", -12.5],
+        ["1.234,56", 1234.56], ["$12.345,67", 12345.67],
+        ["1,234.56", 1234.56], ["1,234", 1234], ["1,234,567", 1234567],
+        ["1,2,3", null], ["12,345,6", null], ["1,2345", null],
+        ["12,", null], [",50", null], ["1.234,567", null],
+        ["1,234.", null]]) {
+        assert.equal(parseMoneyDraft(text), want, JSON.stringify(text));
+      }
+      assert.equal(receiptDetailsDraft("27,35", "2030-03-01").body.total,
+                   27.35);
+      const rows = [{ name: "Hobby", monthly: "12,50", category: "hobbies" },
+                    { name: "Club", monthly: "1,2,3", category: "clubs" }];
+      assert.deepEqual(mergePlannerBuckets(rows, [], []), [
+        { name: "Hobby", parent: "other", monthly: 12.5,
+          categories: ["hobbies"], merchants: [] }]);
+    },
+
     "card and loan balances come off a headline total": () => {
       const accts = [
         { kind: "depository/checking", balance_current: 1000 },

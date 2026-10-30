@@ -24,7 +24,8 @@ import { ago } from "../../lib/dates";
 import { CONFIRM_TO_CONNECT, VerifyEmailCard }
   from "../../components/verify-email-card";
 import { firstSyncPending, linkedLine, accountRemoveMoved, accountRemoveNote, bankAwaitsConfirm, hueOf, keptRowsQuestion, institutionAllowance, lastSyncPhrase,
-         listPhase, monogram, purgeKeptRows, signedBalance, classifyChange }
+         listPhase, monogram, parseMoneyDraft, purgeKeptRows, signedBalance,
+         classifyChange }
   from "../../lib/pure";
 import { useLogosOn } from "../../components/merchant-avatar";
 import { historyMonthsOf, historyRowNote, windowNarrower }
@@ -52,9 +53,12 @@ function statusDot(a: Account): string {
   return a.status === "restored" || a.status === "stale" ? C.warn : C.bad;
 }
 
-function AccountRow({ a, onPress, primary, excluded, badge }:
+function AccountRow({ a, onPress, primary, pinnedUnused, excluded, badge }:
     { a: Account; onPress?: () => void;
-      primary?: boolean; excluded?: boolean; badge?: string }) {
+      // the server's words for why the pin is passed over ("" when it
+      // sent none); undefined when this row is not a passed-over pin
+      primary?: boolean; pinnedUnused?: string; excluded?: boolean;
+      badge?: string }) {
   const bal = a.balance_current;
   const dot = statusDot(a);
   // linked-source state rides the row (the web's pills): the healthy
@@ -65,6 +69,8 @@ function AccountRow({ a, onPress, primary, excluded, badge }:
     : "";
   const flags = [
     primary ? "primary" : "",
+    pinnedUnused !== undefined
+      ? `pinned — not used${pinnedUnused ? `: ${pinnedUnused}` : ""}` : "",
     excluded ? "excl" : "",           // the web's pill names
     a.user_removed_at ? "removed" : "",
     linkFlag,
@@ -374,7 +380,12 @@ export default function Accounts() {
       history_months: historyMonthsOf(v.history_months) }),
     enabled: !!client,
   });
+  // the pin as saved (the editor's switch) and the account the cash
+  // forecast actually starts from — the web's pair: a pin on an excluded
+  // account or a linked pair's backup is kept but anchors nothing, so the
+  // pill follows the server and the dead pin says why
   const primary = settings.data?.checking_account_id ?? null;
+  const anchor = query.data?.primary_checking_id ?? null;
   const excludedSet = new Set(settings.data?.excluded_accounts ?? []);
   const [editing, setEditing] = useState<Account | null>(null);
   const openEditor = (a: Account) => setEditing(a);
@@ -392,14 +403,19 @@ export default function Accounts() {
       const revert = !trimmed || trimmed === a.bank_name;
       if ((revert ? a.bank_name || a.name : trimmed) !== a.name)
         writes.push(client!.accountRename(a.id, revert ? "" : trimmed));
+      // the exclusion lands BEFORE the pin is sent: the pin door refuses
+      // an excluded account, so including and pinning in one save must
+      // not race (the web's order)
+      const excl = f.excl !== null
+        ? client!.accountExclude(a.id, f.excl) : Promise.resolve();
+      writes.push(excl);
       const cls = classifyChange(a.kind, f.kind, f.primary);
-      if (cls) writes.push(client!.accountClassify(a.id, cls.kind, cls.primary));
-      if (f.excl !== null)
-        writes.push(client!.accountExclude(a.id, f.excl));
+      if (cls) writes.push(excl.then(() =>
+        client!.accountClassify(a.id, cls.kind, cls.primary)));
       if (f.owner.trim() !== (a.owner ?? ""))
         writes.push(client!.accountOwner(a.id, f.owner.trim()));
       if (isManual(a) && f.bal.trim() !== ""
-          && Number(f.bal.replace(/[$,]/g, "")) !== a.balance_current)
+          && (parseMoneyDraft(f.bal) ?? NaN) !== a.balance_current)
         writes.push(client!.accountBalance(a.id, f.bal));
       await Promise.all(writes);
     },
@@ -407,7 +423,7 @@ export default function Accounts() {
       const a = editing!;
       setEditing(null);
       const balChanged = isManual(a) && f.bal.trim() !== ""
-        && Number(f.bal.replace(/[$,]/g, "")) !== a.balance_current;
+        && (parseMoneyDraft(f.bal) ?? NaN) !== a.balance_current;
       patchList<{ accounts: Account[] }, Account>(qc, ["accounts"],
         "accounts", (x) => x.id === a.id, {
           name: !f.name.trim() || f.name.trim() === a.bank_name
@@ -415,7 +431,7 @@ export default function Accounts() {
           kind: f.kind,
           owner: f.owner.trim() || null,
           ...(balChanged
-              ? { balance_current: Number(f.bal.replace(/[$,]/g, "")) } : {}),
+              ? { balance_current: (parseMoneyDraft(f.bal) ?? NaN) } : {}),
         });
       const wasPrimary = a.id === primary;
       const wasExcl = excludedSet.has(a.id);
@@ -438,6 +454,13 @@ export default function Accounts() {
           || (f.excl !== null && f.excl !== wasExcl) || balChanged
           || f.kind !== a.kind)
         qc.invalidateQueries({ queryKey: ["today"], refetchType: "none" });
+    },
+    // the writes are separate doors: a refused pin can follow an exclusion
+    // that already landed, so the cache is re-read, not left stale
+    onError: () => {
+      qc.invalidateQueries({ queryKey: ["accounts"] });
+      qc.invalidateQueries({ queryKey: ["settings"] });
+      qc.invalidateQueries({ queryKey: ["today"], refetchType: "none" });
     },
   });
   const setHidden = useMutation({
@@ -1113,7 +1136,9 @@ export default function Accounts() {
               </View>
               {list.map((a) => (
                 <AccountRow key={a.id} a={a} badge={badgeLabel(a)}
-                  primary={a.id === primary}
+                  primary={a.id === anchor}
+                  pinnedUnused={a.id === primary && a.id !== anchor
+                    ? (query.data?.primary_pin_unused ?? "") : undefined}
                   excluded={excludedSet.has(a.id)}
                   onPress={viewer
                     ? () => router.push({ pathname: "/transactions",

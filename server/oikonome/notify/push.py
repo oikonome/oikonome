@@ -195,6 +195,24 @@ def db_handle(conn, connect):
         c.close()
 
 
+def live_subscriptions(c, tenant_id: str, user_id=None) -> list:
+    """The browsers a household notice goes to: every live subscription
+    of the tenant's users, minus the people who turned the household's
+    push off for themselves (users.push_muted) — or, with `user_id`, that
+    one user's browsers whatever their switch says, because a notice about
+    a person's own account is theirs to receive."""
+    if user_id is None:
+        return c.execute(
+            "SELECT id, endpoint, p256dh, auth FROM push_subscriptions "
+            f"WHERE tenant_id=%s AND {LIVE} AND NOT EXISTS ("
+            "SELECT 1 FROM users mu WHERE mu.id = push_subscriptions.user_id"
+            " AND mu.push_muted)", (tenant_id,)).fetchall()
+    return c.execute(
+        "SELECT id, endpoint, p256dh, auth FROM push_subscriptions "
+        f"WHERE tenant_id=%s AND user_id=%s AND {LIVE}",
+        (tenant_id, user_id)).fetchall()
+
+
 def send_tenant(conn, tenant_id: str, title: str, body: str,
                 url: str = "/app/", *, user_id=None, connect=None) -> int:
     """Push to every live subscription of the tenant's users — or, with
@@ -215,15 +233,7 @@ def send_tenant(conn, tenant_id: str, title: str, body: str,
     from py_vapid import Vapid
     from pywebpush import WebPushException, webpush
     with db_handle(conn, connect) as c:
-        if user_id is None:
-            subs = c.execute(
-                "SELECT id, endpoint, p256dh, auth FROM push_subscriptions "
-                f"WHERE tenant_id=%s AND {LIVE}", (tenant_id,)).fetchall()
-        else:
-            subs = c.execute(
-                "SELECT id, endpoint, p256dh, auth FROM push_subscriptions "
-                f"WHERE tenant_id=%s AND user_id=%s AND {LIVE}",
-                (tenant_id, user_id)).fetchall()
+        subs = live_subscriptions(c, tenant_id, user_id)
         if not subs:
             return 0
         sendable = []

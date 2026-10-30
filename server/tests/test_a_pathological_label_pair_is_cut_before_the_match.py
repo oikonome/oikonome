@@ -102,5 +102,47 @@ class PathologicalRowTests(unittest.TestCase):
             {"name": line, "merchant_name": "Juniper's Market"})
 
 
+class PathologicalStatementLineTests(unittest.TestCase):
+    """A file import's raw is the whole source row, so a column headed
+    original_description can carry any cell the row bound allows. The
+    Zelle and Venmo counterparty patterns backtrack quadratically on a long
+    run of brackets or spaces, so that cell is cut to a descriptor's length
+    before anything parses it, and stored at that length too."""
+
+    def setUp(self):
+        self.conn = make_db()
+        write_config(self.conn)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_a_huge_statement_line_cell_is_cut_before_it_is_parsed(self):
+        cells = {"zel": "zelle payment from " + "(" * 120_000,
+                 "ven": "VENMO *" + " " * 120_000 + "1"}
+        t0 = time.monotonic()
+        base.upsert_transactions(self.conn, [base.Transaction(
+            id=f"csv:{k}", account_id="card", date=dt.date(2026, 2, 13),
+            amount=-20.0, name="TRANSFER", merchant_name=None,
+            raw={"original_description": v}) for k, v in cells.items()])
+        self.assertLess(time.monotonic() - t0, _PROMPT)
+        for k in cells:
+            stored = self.conn.execute(
+                "SELECT raw->>'original_description' AS d FROM transactions "
+                "WHERE id=%s", (f"csv:{k}",)).fetchone()["d"]
+            self.assertLessEqual(len(stored), base.MAX_DESCRIPTOR)
+
+    def test_an_ordinary_zelle_line_still_names_the_counterparty(self):
+        base.upsert_transactions(self.conn, [base.Transaction(
+            id="csv:zelle-ok", account_id="card", date=dt.date(2026, 2, 14),
+            amount=25.0, name="ZELLE", merchant_name=None,
+            raw={"original_description":
+                 "Zelle payment from A Person (Acme Checking XXXXXX1234) "
+                 "to Bea Builder"})])
+        name = self.conn.execute(
+            "SELECT merchant_name FROM transactions WHERE id='csv:zelle-ok'"
+        ).fetchone()["merchant_name"]
+        self.assertIn("Bea Builder", name or "")
+
+
 if __name__ == "__main__":
     unittest.main()

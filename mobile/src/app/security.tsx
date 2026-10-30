@@ -17,11 +17,12 @@ import PullRefresh from "../components/pull-refresh";
 import { VerifyEmailCard } from "../components/verify-email-card";
 
 import { Card, H, Pill, SharedLock } from "../components/ui";
-import { errText, Me, NextCodeNeeded } from "../lib/api";
+import { errText, Me, NextCodeNeeded, type MemberNotify } from "../lib/api";
 import { invalidateAfterRotation, patchList, patchQuery, removeFromList,
          smsPauseNote }
   from "../lib/cache";
-import { inviteOutcome, localDayOf, membersRemovedNote, oneTimeCodeSentence,
+import { EMAIL_KIND_LABEL, EMAIL_KINDS, inviteOutcome, localDayOf,
+         membersRemovedNote, oneTimeCodeSentence, prefOn,
          svgFromDataUri, type InviteOutcome } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { C, mmddyy } from "../lib/theme";
@@ -183,9 +184,14 @@ export default function Security() {
         {/* the shared login's roster is withheld, so this renders
             nothing for it — no sign-out buttons to switch off */}
         <SessionsCard />
-        <SharedLock note={lockGrant}>
-          <FamilyCard owner={owner} />
-        </SharedLock>
+        {/* the roster is the owner's to read (and a member's); a viewer
+            manages their own notices and login, nothing else — the web
+            shows them Email & Push + Security only */}
+        {mayEdit && (
+          <SharedLock note={lockGrant}>
+            <FamilyCard owner={owner} />
+          </SharedLock>
+        )}
         <SharedLock note={lockLogin}>
           {owner ? <DeleteCard onDeleted={signOut} />
                  : <LeaveCard onDeleted={signOut} />}
@@ -817,6 +823,66 @@ const ROLE_LABEL: Record<string, string> = {
   owner: "owner", member: "member · can edit", viewer: "view-only",
 };
 
+/** One member's notices on the roster (the web's MemberNotifyRow): email —
+ *  on the household's mail, receiving, which kinds — and push, with the
+ *  devices the switch governs. */
+function MemberNotifyRow({ n, busy, onChange }: {
+  n: MemberNotify; busy: boolean;
+  onChange: (body: { push_muted?: boolean; email_muted?: boolean;
+                     email_pref?: { kind: string; on: boolean } }) => void;
+}) {
+  const devices = [
+    n.push_browsers
+      ? `${n.push_browsers} browser${n.push_browsers === 1 ? "" : "s"}` : null,
+    n.push_phones
+      ? `${n.push_phones} phone${n.push_phones === 1 ? "" : "s"}` : null,
+  ].filter(Boolean).join(", ") || "no device registered";
+  return (
+    <View style={{ paddingLeft: 8, paddingBottom: 8, gap: 6,
+                   opacity: busy ? 0.6 : 1 }}>
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+        <Text style={[s.mut, { width: 40 }]}>email</Text>
+        {!n.on_mail && !n.mail_listed ? (
+          <Text style={s.mut}>not on the mail list — add them under
+            Email &amp; Push</Text>
+        ) : (<>
+          {!n.on_mail && (
+            <Text style={s.mut}>listed, not receiving yet</Text>
+          )}
+          <Switch value={!n.email_muted} disabled={busy}
+                  accessibilityLabel="household email to this person"
+                  onValueChange={(on) => onChange({ email_muted: !on })} />
+          {!n.email_muted && (
+            <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6,
+                           flex: 1 }}>
+              {EMAIL_KINDS.map((k) => {
+                const on = prefOn(n.email_prefs, k);
+                return (
+                  <Pressable key={k} disabled={busy}
+                    accessibilityLabel={`${EMAIL_KIND_LABEL[k]} email`}
+                    accessibilityState={{ checked: on }}
+                    onPress={() => onChange({ email_pref: { kind: k, on: !on } })}>
+                    <Text style={{ color: on ? C.text : C.mut, fontSize: 12 }}>
+                      {on ? "☑" : "☐"} {EMAIL_KIND_LABEL[k]}
+                    </Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+          )}
+        </>)}
+      </View>
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+        <Text style={[s.mut, { width: 40 }]}>push</Text>
+        <Switch value={!n.push_muted} disabled={busy}
+                accessibilityLabel="household push to this person's devices"
+                onValueChange={(on) => onChange({ push_muted: !on })} />
+        <Text style={s.mut}>{devices}</Text>
+      </View>
+    </View>
+  );
+}
+
 function FamilyCard({ owner }: { owner: boolean }) {
   const { client } = useSession();
   const qc = useQueryClient();
@@ -893,6 +959,23 @@ function FamilyCard({ owner }: { owner: boolean }) {
          onPress: () => roleChange.mutate({ id, role }) },
        { text: "Cancel", style: "cancel" }]);
   };
+  // one member's switches, written where the member's own doors write;
+  // the reply is the row as the roster now shows it (web: FamilyCard.notify)
+  const notify = useMutation({
+    mutationFn: (v: { id: string } & Parameters<
+      NonNullable<typeof client>["memberNotify"]>[1]) =>
+      client!.memberNotify(v.id, v),
+    onSuccess: (r, v) => {
+      patchList(qc, ["members"], "users",
+                (u: { id: string }) => u.id === v.id,
+                (u) => ({ ...u, notify: r.notify }));
+      if (members.data?.users.find((u) => u.id === v.id)?.me)
+        qc.invalidateQueries({ queryKey: ["me"] });
+      qc.invalidateQueries({ queryKey: ["settings"] });
+    },
+    onError: (e) => Alert.alert("Couldn't save", errText(e)),
+  });
+  const showNotify = owner && !!members.data?.users.some((u) => u.notify);
   const removeMember = (id: string, email: string) => {
     Alert.alert(`Remove ${email}?`,
       "They lose access immediately.",
@@ -914,8 +997,8 @@ function FamilyCard({ owner }: { owner: boolean }) {
                     + "and only that address can use it." : ".")
           : ""}
       </Text>
-      {(members.data?.users ?? []).map((u) => (
-        <View key={u.id} style={s.row}>
+      {(members.data?.users ?? []).map((u) => (<View key={u.id}>
+        <View style={s.row}>
           <View style={{ flex: 1 }}>
             <Text style={{ color: C.text, fontSize: 13,
                            fontWeight: "600" }}>
@@ -948,7 +1031,14 @@ function FamilyCard({ owner }: { owner: boolean }) {
             </Text>
           )}
         </View>
-      ))}
+        {/* what this person receives — every switch here is the one their
+            own Settings flips, so the two views agree */}
+        {showNotify && u.notify && (
+          <MemberNotifyRow n={u.notify}
+            busy={notify.isPending && notify.variables?.id === u.id}
+            onChange={(body) => notify.mutate({ id: u.id, ...body })} />
+        )}
+      </View>))}
       {owner && (invites.data?.invites ?? []).map((iv) => (
         <View key={iv.token_hash} style={s.row}>
           <View style={{ flex: 1 }}>

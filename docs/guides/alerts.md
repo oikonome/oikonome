@@ -92,7 +92,8 @@ Separately from the strip, a broken bank connection sends an
 (and again on recovery), so a multi-day outage emails exactly once, not
 every sync. It links to the Accounts page to re-link. Break and
 recovery notices — along with source-failover and stale-collector
-alerts — also go to any push channels you've enabled. The **Alerts** box
+alerts — also go to any push channels you've enabled, except the devices
+of a person who turned household push off for themselves. The **Alerts** box
 under *Who gets which email* (Settings → Email & Push) turns these
 emails off for one person without touching their daily or report mail.
 

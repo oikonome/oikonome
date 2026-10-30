@@ -76,6 +76,9 @@ export interface TodayFull {
   // buckets.fixed.month_budget, the fixed bar's basis). Absent from older
   // servers; fall back to the fixed bucket then.
   scheduled_month?: number;
+  // this month's income in its two halves — landed, and still due; absent
+  // when `income` is the budgeted figure (no income series) or on older servers
+  income_received?: number | null; income_expected?: number | null;
   // sweep goals: plan cap, month-to-date availability, and the
   // server-composed sentence (identical wording in the daily email)
   sweep_plan?: number;
@@ -228,6 +231,8 @@ export interface TxnPage {
   // excluded, so these are not row sums. In and net are null for a month
   // before the bank feed starts: its income is unknown, not $0
   out_sum?: number; in_sum?: number | null; net_sum?: number | null;
+  // the current month's paychecks still due before month end
+  in_expected?: number | null;
   // listed/matched rows that belong to a business (not in the totals
   // unless the business scope was asked for)
   biz_count?: number;
@@ -279,7 +284,17 @@ export interface Continuity {
   note_max: number;
 }
 
+/** One member's notices: their email switches and their push switch with
+ *  the devices it governs (the web's MemberNotify). */
+export interface MemberNotify {
+  on_mail: boolean; mail_listed?: boolean; email_muted: boolean;
+  email_prefs: Partial<Record<string, boolean>>;
+  push_muted: boolean; push_browsers: number; push_phones: number;
+}
 export interface Me {
+  // this login's own switch for the household's push notices (absent on
+  // older servers)
+  push_muted?: boolean;
   email: string; tenant_id: string; role: "owner" | "viewer";
   version: string; hosted: boolean; demo: boolean;
   // the shared demonstration login (an owner whose password is handed
@@ -521,6 +536,7 @@ export interface BillsData {
   archived: { payee: string; amount: number; frequency?: string | null;
               synced_at?: string | null }[];
   totals?: { bills_monthly: number; income_monthly: number;
+             income_basis?: "actual" | "schedule"; income_months?: number | null;
              week_total: number; week_count: number; attention: number };
   // the cadence picker's options, FREQ:interval value + words
   cadences?: [string, string][];
@@ -2052,7 +2068,13 @@ export function makeClient(baseUrl: string, token: string,
       }
       return null;
     },
-    accounts: () => req<{ accounts: Account[] }>("/api/accounts"),
+    // primary_checking_id: the account the cash forecast starts from (the
+    // live pin, else the largest-balance pick) — the ledger heads itself
+    // with its balance; absent from older servers. primary_pin_unused: why
+    // the saved pin is not that account (the web's)
+    accounts: () => req<{ accounts: Account[];
+                          primary_checking_id?: string | null;
+                          primary_pin_unused?: string | null }>("/api/accounts"),
     // `month` (YYYY-MM) reads a past month's paid/received per bill
     bills: (month?: string) =>
       req<BillsData>(month ? `/api/bills?month=${month}` : "/api/bills"),
@@ -2194,6 +2216,12 @@ export function makeClient(baseUrl: string, token: string,
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ muted }) }),
     // one kind of the household's mail on or off for my own inbox
+    // this login's own switch for the household's push notices (every
+    // role); the phone stays registered, account notices still arrive
+    mePush: (muted: boolean) =>
+      req<{ ok: boolean; muted: boolean }>("/api/me/push", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ muted }) }),
     meEmailPref: (kind: string, on: boolean) =>
       req<{ ok: boolean; prefs: Record<string, boolean> }>("/api/me/email", {
         method: "POST", headers: { "Content-Type": "application/json" },
@@ -2353,8 +2381,22 @@ export function makeClient(baseUrl: string, token: string,
     // ---- household members + invites ----
     members: () =>
       req<{ users: { id: string; email: string; role: string;
-            created_at: string; me: boolean }[];
+            created_at: string; me: boolean;
+            // what this person receives — the owner gets every member's,
+            // everyone else only their own row's; absent on older servers
+            notify?: MemberNotify | null }[];
             assignable_roles: string[] }>("/api/users"),
+    // the owner sets one member's switches — the same places the member's
+    // own doors write, so the roster and their screen agree
+    memberNotify: (id: string, body: { push_muted?: boolean;
+                                       email_muted?: boolean;
+                                       email_pref?: { kind: string;
+                                                      on: boolean } }) =>
+      req<{ ok: boolean; notify: MemberNotify }>(
+        `/api/users/${encodeURIComponent(id)}/notify`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body) }),
     // move somebody between "member" (can edit the household's money) and
     // "viewer" (reads everything, changes nothing). Elevation-gated, like
     // every other durable grant.
@@ -3531,7 +3573,9 @@ export function makeClient(baseUrl: string, token: string,
     // Plaid Enrich for imported history — status + a capped run (owner)
     enrichStatus: () =>
       req<{ candidates: number; plaid_configured: boolean; cap: number;
-            used: number; month: string; remaining: number }>("/api/import/enrich"),
+            used: number; month: string; remaining: number;
+            // the web's: the run waits on a confirmed address
+            awaits_confirm?: boolean }>("/api/import/enrich"),
     enrichRun: (limit = 100) =>
       req<{ sent: number; enriched: number; cap_hit: boolean; error: string | null }>(
         "/api/import/enrich", { method: "POST",

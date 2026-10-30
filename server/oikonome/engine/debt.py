@@ -67,6 +67,20 @@ PLAN_KEY = "debt_plan"
 _MORTGAGE_SUBTYPES = ("mortgage", "home equity", "home")
 
 
+def _typed(v: str) -> float | None:
+    """A hand-typed plan figure as a number, or None when it is not one.
+    Either separator convention is read the way the CSV importer reads it
+    ("1,234.56", "1.234,56", "12,50"): stripping every comma would save a
+    decimal-comma "12,50" extra payment as 1250 a month and a "19,99" APR
+    as 1999 % — the first passes the range check, with nothing to say so.
+    A blank is the caller's to handle."""
+    from ..sync.csvimport import parse_money_text
+    try:
+        return parse_money_text(v)
+    except ValueError:
+        return None
+
+
 def _num(v) -> float | None:
     """A finite number, or None. `True` is an int to float() and a
     restored blob can carry "N/A" — neither is a rate or a payment."""
@@ -257,7 +271,7 @@ def normalize_plan(body) -> dict:
     out["method"] = method
     extra = body.get("extra_monthly", 0)
     if isinstance(extra, str):
-        extra = extra.replace(",", "").replace("$", "").strip() or "0"
+        extra = _typed(extra) if extra.strip() else 0.0
     ev = _num(extra)
     if ev is None or ev < 0 or ev > MAX_EXTRA:
         raise ValueError("extra monthly payment must be a number from 0 "
@@ -285,7 +299,12 @@ def normalize_plan(body) -> dict:
                 continue
             v = ov[key]
             if isinstance(v, str):
-                v = v.replace(",", "").replace("$", "").replace("%", "").strip()
+                v = v.replace("%", "").strip()
+                if v:
+                    v = _typed(v)
+                    if v is None:
+                        raise ValueError(f"{what} must be a number from 0 "
+                                         f"to {hi:g}")
             if v is None or v == "":
                 row[key] = None
                 continue

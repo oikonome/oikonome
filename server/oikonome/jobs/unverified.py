@@ -207,6 +207,13 @@ def _reopen_locked(admin, user_id) -> str | None:
             # access. Inside this transaction, with the row locked, which
             # is how the gate's reactivate expects to be called.
             landed = ext.gate.reactivate(admin, t["id"])
+            if landed == "active":
+                # A household frozen this way held no intake seat, so
+                # coming back takes one. The confirmation that preceded
+                # this asked while the household was still frozen, so the
+                # question is asked again here, in the transaction that
+                # makes it live, where the answer cannot go stale.
+                landed = ext.gate.wait_for_seat(admin, t["id"]) or landed
         from ..web.adminconsole import _audit
         _audit(admin, "tenant_delete_restored", target=str(t["id"]),
                detail=f"restored_to={landed} reason=email_confirmed",

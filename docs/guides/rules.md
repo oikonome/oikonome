@@ -86,8 +86,8 @@ writes no rule. **All** sets the same override and also teaches the
 merchant map — every past row of that merchant updates immediately and
 every future row lands pre-categorized — and that is the rule you see
 here. A merchant-wide set from a history page shows you the affected
-count first and is undoable; the undo leaves alone any row whose
-category has been changed again since.
+count first and is undoable, however many rows it reached; the undo
+leaves alone any row whose category has been changed again since.
 
 ## Editing, disabling, deleting
 

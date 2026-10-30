@@ -60,7 +60,8 @@ the older files from Accounts → Import.
 an export before or after linking the same banks here; either way you end
 up with one copy of each account. When a bank is already linked, every
 restored account that matches exactly one linked account at that bank (same
-last four digits and type) is merged into it: the older history comes
+last four digits and the type the bank gives it, even if you changed the
+type by hand) is merged into it: the older history comes
 across, the days both copies cover are kept once, under the linked
 connection's transactions, and your notes, categories and receipts on those
 days stay on them. If two accounts at one bank share the last four digits
@@ -77,6 +78,12 @@ absent rather than assumed. A sign printed inside such a column is
 ignored — a card export that writes a refund as `-150.00` in its Credit
 column is still money in. YNAB's Outflow/Inflow columns are read the
 same way.
+
+**Decimal commas:** amounts written the European way are read as
+decimals — `12,50` is 12.50 and `1.234,56` is 1,234.56 — in every
+import format, in restored settings and in any amount you type into a
+form. A comma followed by exactly three digits (`1,234`) is a thousands
+separator.
 
 **Re-importing after a reading changed.** When the importer reads a line
 differently from the way an earlier version did — the sign a Debit/Credit
@@ -101,7 +108,9 @@ OFX file carrying several statements) never merges into one account:
 each source-side account gets its own, typed from its name or statement
 (cards land as credit so spend math stays honest). Re-importing lands on
 the same accounts, and renames/reclassifications you make are never
-overwritten. Single-account files go to the account you picked.
+overwritten. A file that would split into more than 100 accounts is
+refused before anything is made — export fewer accounts at a time.
+Single-account files go to the account you picked.
 
 **A YNAB register with several accounts asks where each goes.** A YNAB
 register export names its account on every line (a checking account and a
@@ -157,12 +166,24 @@ for what the refusals look like.
 after its file, and banks often name an export after the full account
 number. Only the last four digits of any run of eight or more are kept
 in the account's name and in the import history, and older names and
-archives are cut the same way. The account's internal id is permanent,
-though, so an account created before this rule still carries the number
-there, and it travels in exports; a restore lists any such account by
-name. To be rid of it, undo that account's imports under *Recent
-imports*, rename the files without the number, import them again, and
-remove the old, now empty account.
+archives are cut the same way.
+
+An account's internal id is a different matter, and it depends on how
+the account was made:
+
+- **An account split out of a multi-account file** (QIF, Mint, Monarch,
+  Copilot, Simplifi) whose source name was a full account number is moved
+  onto an id that keeps only the last four digits. That happens on its
+  own, once, for accounts already in your ledger, and again whenever a
+  restore brings one back from an older export. Your history, settings
+  and earlier imports follow it, and re-importing the same file still
+  lands on the same account.
+- **An account a folder import named after its file** keeps its id: it is
+  permanent, so an account created before the name rule above still
+  carries the number there, and it travels in exports; a restore lists
+  any such account by name. To be rid of it, undo that account's imports
+  under *Recent imports*, rename the files without the number, import
+  them again, and remove the old, now empty account.
 
 **A folder import runs in the background.** Pressing *Import* hands the
 plan to the server and the page follows it file by file — *N of M files*,

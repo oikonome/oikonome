@@ -100,7 +100,8 @@ class MerchantRecategorizeScansOnce(unittest.TestCase):
         expected = self._per_canonical("Harbor Books", "SHOPPING_BOOKS")
         r = data.set_merchant_category(self.conn, "Harbor Books",
                                        "SHOPPING_BOOKS")
-        self.assertEqual({a["id"] for a in r["undo"]["affected"]}, expected)
+        held = data.held_undo(self.conn, r["undo"])
+        self.assertEqual({a["id"] for a in held["affected"]}, expected)
         self.assertEqual(r["count"], len(expected))
         moved = {x["id"] for x in self.conn.execute(
             "SELECT id FROM transactions WHERE category_primary = "

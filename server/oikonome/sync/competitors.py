@@ -25,10 +25,11 @@ from typing import Callable
 
 from ..engine.compat import as_date
 from . import flowmap
-from .base import (FileImportIds, Transaction, ensure_split_account,
-                   drop_before_history, upsert_transactions)
+from .base import (FileImportIds, Transaction, check_split_accounts,
+                   drop_before_history, ensure_split_account, split_former,
+                   mask_long_digits, tally_split, upsert_transactions)
 from .csvimport import (bounded_dict_reader, check_width, date_order,
-                        scrub_identifiers)
+                        parse_money_text, scrub_identifiers)
 from .rowcap import capped
 from .dedup import Deduper
 
@@ -75,10 +76,10 @@ def _date(s: str, order: str = "mdy") -> dt.date:
 
 
 def _money(s: str) -> float:
-    s = (s or "").strip().replace("$", "").replace(",", "")
-    if s.startswith("(") and s.endswith(")"):
-        s = "-" + s[1:-1]
-    return float(s) if s else 0.0
+    """An amount cell by the CSV rule (sign, accounting parentheses, either
+    separator convention): dropping every comma read "12,50" as 1250."""
+    s = (s or "").strip()
+    return parse_money_text(s) if s else 0.0
 
 
 def _vendor_category(low: dict, amount: float) -> tuple[str | None, str | None]:
@@ -143,16 +144,21 @@ def _generic(conn, account_id: str, text: str, *, prefix: str,
         by_vendor.setdefault((p[4].get("account") or "?").strip(), []).append(p)
     total = {"imported": 0, "rows": 0, "skipped_duplicates": 0,
              "split_accounts": {}}
+    check_split_accounts(by_vendor)
     for vendor_name in sorted(by_vendor):
         # ensure_split_account (sync.base, shared with Mint/OFX): stable
         # slug id, never clobbers existing rows, shared type inference
-        target = ensure_split_account(conn, prefix, vendor_name)
+        target = ensure_split_account(
+            conn, prefix, vendor_name,
+            lines=[(p[0], p[1], p[2]) for p in by_vendor[vendor_name]])
         out = _import_into(conn, target, by_vendor[vendor_name],
                            prefix=prefix, batch_id=batch_id,
-                           categorize=categorize)
+                           categorize=categorize,
+                           former=split_former(prefix, vendor_name, target))
         for k in ("imported", "rows", "skipped_duplicates"):
             total[k] += out[k]
-        total["split_accounts"][vendor_name] = out["imported"]
+        tally_split(total["split_accounts"], mask_long_digits(vendor_name),
+               out["imported"])
     total["note"] = (f"file contains {len(by_vendor)} accounts — split "
                      f"into one account per vendor account (the selected "
                      f"account was not used)")
@@ -160,10 +166,11 @@ def _generic(conn, account_id: str, text: str, *, prefix: str,
 
 
 def _import_into(conn, account_id: str, parsed: list[tuple], *, prefix: str,
-                 batch_id: str | None, categorize: Callable) -> dict:
+                 batch_id: str | None, categorize: Callable,
+                 former: tuple[str, ...] = ()) -> dict:
     deduper = Deduper(conn, account_id, prefix, [p[0] for p in parsed])
     txns: list[Transaction] = []
-    ids = FileImportIds(prefix, account_id)
+    ids = FileImportIds(prefix, account_id, former=former)
     skipped_dupes = 0
     for date, amount, name, merchant, low, raw in parsed:
         if deduper.claim(date, amount, name, merchant):

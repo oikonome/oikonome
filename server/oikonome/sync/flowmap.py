@@ -57,10 +57,51 @@ _CC_PAYMENT_NAME = _re.compile(
     r")", _re.I)
 
 
+# A purchase made with the household's DEBIT card prints "card" and a
+# payment word on the checking line ("POS DEBIT CARD PAYMENT NORTHWIND",
+# "CHECK CARD 0000 FABRIKAM"), and some print the network brand too ("VISA
+# DEBIT ... PAYMENT"). That is money spent at a store, never a credit-card
+# settlement, so no card-payment reading may take it out of spend.
+_DEBIT_CARD = _re.compile(r"\b(?:debit|check)\s*c(?:ar|r)?d\b", _re.I)
+
+
 def looks_like_card_payment(name: str | None) -> bool:
     """True when a bare transaction NAME clearly means a credit-card payment
-    (internal transfer), not a merchant purchase. Conservative by design."""
-    return bool(name and _CC_PAYMENT_NAME.search(name))
+    (internal transfer), not a merchant purchase. Conservative by design:
+    a debit-card purchase line is never one."""
+    return bool(name and _CC_PAYMENT_NAME.search(name)
+                and not _DEBIT_CARD.search(name))
+
+
+def is_debit_card_line(name: str | None) -> bool:
+    """True when the line names the household's debit card — a purchase,
+    whatever payment words it also carries."""
+    return bool(name and _DEBIT_CARD.search(name))
+
+
+# The credit-card issuers whose settlement a checking line spells only as
+# "<issuer> E-PAYMENT", with no card word anywhere on it.
+# The issuer name is the only card signal such a line carries, while the
+# same E-PAYMENT word on any other biller ("FABRIKAM WATER E-PAYMENT") is an
+# ordinary bill paid online. Kept in this one list so every reader of a
+# statement line agrees on which names are card issuers.
+_CARD_ISSUERS = (
+    r"amex", r"american\s+express", r"discover", r"barclay(?:card)?",
+    r"synchrony", r"syncb", r"capital\s+one", r"cap\s+one",
+    r"citi(?:card)?", r"chase", r"apple\s*card", r"gs\s+bank",
+    r"wells\s+fargo\s+card", r"bk\s+of\s+amer", r"bank\s+of\s+america",
+)
+_ISSUER_RE = _re.compile(r"\b(?:" + "|".join(_CARD_ISSUERS) + r")\b", _re.I)
+_E_PAYMENT_RE = _re.compile(r"\b(?:e-?payment|epay)\b", _re.I)
+
+
+def looks_like_issuer_e_payment(line: str | None) -> bool:
+    """True when a statement line pays a card issuer electronically:
+    E-PAYMENT (or EPAY) together with a name from _CARD_ISSUERS. A debit
+    card line is never one."""
+    return bool(line and _E_PAYMENT_RE.search(line)
+                and _ISSUER_RE.search(line)
+                and not _DEBIT_CARD.search(line))
 
 
 # Payment-shaped descriptions inside a mixed payments/credits category

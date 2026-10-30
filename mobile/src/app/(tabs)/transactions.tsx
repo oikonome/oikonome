@@ -471,6 +471,12 @@ export default function Transactions() {
           rows.length === 1 ? "" : "s"}${
           narrowed ? ` · ${money(-listedSum)} listed` : ""}`;
 
+  const primary = accts.data?.primary_checking_id
+    ? accts.data.accounts.find((a) => a.id === accts.data!.primary_checking_id)
+    : undefined;
+  const primaryBal = primary
+    ? (primary.balance_available ?? primary.balance_current) : null;
+
   return (
     <View style={s.wrap}>
       <View style={{ flexDirection: "row", gap: 8 }}>
@@ -494,6 +500,30 @@ export default function Transactions() {
         </Pressable>
         {!viewer && <SnapReceiptButton />}
       </View>
+      {/* the primary checking balance heads the ledger (mirrors the web
+          header): the account the cash forecast starts from — the live
+          pin, else the largest-balance pick — available balance first
+          like the runway. Nothing without a checking account; "balance
+          not set" when the row has none yet. Tapping opens Accounts,
+          where the pin is changed */}
+      {primary && (
+        <Pressable onPress={() => router.push("/accounts" as never)}
+                   accessibilityRole="link"
+                   accessibilityLabel={`primary checking ${primary.name}, ${
+                     primaryBal == null ? "balance not set" : money(primaryBal)}`}
+                   style={{ flexDirection: "row", alignItems: "baseline",
+                            justifyContent: "flex-end", gap: 6,
+                            paddingHorizontal: 12 }}>
+          <Text style={{ color: C.mut, fontSize: 12 }} numberOfLines={1}>
+            {primary.name}{primary.mask ? ` ••${primary.mask}` : ""}
+          </Text>
+          <Text style={{ color: (primaryBal ?? 0) < 0 ? C.bad : C.text,
+                         fontSize: 16, fontWeight: "700",
+                         fontVariant: ["tabular-nums"] }}>
+            {primaryBal == null ? "balance not set" : money(primaryBal)}
+          </Text>
+        </Pressable>
+      )}
       {(waiting.data?.count ?? 0) > 0 && (
         <View style={{ flexDirection: "row" }}>
           <WaitingBadge />
@@ -580,7 +610,13 @@ export default function Transactions() {
                 {d0.in_sum == null
                   ? <Text style={s.heroMut}>—</Text>
                   : <Text style={{ color: C.good }}>{money(d0.in_sum)}</Text>}
-                <Text style={s.heroMut}> in · </Text>
+                <Text style={s.heroMut}> in</Text>
+                {/* the current month: the paychecks still due before month
+                    end — the Budget plan's income is the two together */}
+                {(d0.in_expected ?? 0) > 0 ? (
+                  <Text style={s.heroMut}> (+{money(d0.in_expected!)} expected)</Text>
+                ) : null}
+                <Text style={s.heroMut}> · </Text>
                 {money(d0.out_sum ?? 0)}
                 <Text style={s.heroMut}> out · </Text>
                 {d0.net_sum != null && (

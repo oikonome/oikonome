@@ -190,6 +190,10 @@ class TestYearGrid(LensBase):
         # the year money map's rows — per-bucket sums over the elapsed
         # BUDGETED months (7 with TODAY = 2026-07-15 and months 1–6
         # snapshotted), PlanBucket-shaped
+        # an established household: the ledger predates the year, so every
+        # month is judged whole. A ledger whose first row is 12 February
+        # would pace February from the 12th and leave January unbudgeted.
+        add_ledger_history(self.conn, dt.date(2026, 1, 1))
         snapshot_months(self.conn, 2026, 1, 2, 3, 4, 5, 6)
         add_txn(self.conn, dt.date(2026, 2, 12), 900.0, "SAFEWAY",
                 primary="FOOD_AND_DRINK")

@@ -79,6 +79,11 @@ SENSITIVE = re.compile(
 # Matches SENSITIVE but correctly does NOT step up. Each line is a claim
 # someone made on purpose; if it stops being true the pin above catches it.
 STEPUP_EXEMPT = {
+    "POST /api/users/{user_id}/notify":
+        "the owner's household-mail and push switches for a member — the "
+        "same email_muted / email_prefs the settings save writes for any "
+        "address without a step-up, plus a per-login push mute; grants no "
+        "access, adds no destination, moves no data",
     # De-escalations. Step-up protects against an attacker GAINING access;
     # requiring it to give access up would strand a user who suspects
     # compromise behind the very factor they may have lost.

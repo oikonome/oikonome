@@ -71,6 +71,17 @@ class Gate:
                       (tenant_id,))
         return "active"
 
+    def wait_for_seat(self, admin, tenant_id) -> str | None:
+        """A household that held no intake seat a moment ago has just
+        become a live one by a road other than a confirmation link: a
+        reclaim that replaced a signup nobody confirmed in time, or a
+        household frozen for never confirming that its owner reopened.
+        Called inside that road's transaction, after the household is
+        'active'. An add-on with an intake ceiling may put it on a waiting
+        list instead and return the status it now has; a household running
+        for itself has no ceiling, so nothing waits."""
+        return None
+
     # ---- plan and entitlement --------------------------------------------
     def billing_enabled(self) -> bool:
         return False
@@ -100,6 +111,14 @@ class Gate:
         add-a-bank doors and say why, instead of offering a bank sign-in
         the server would refuse. A household's own instance never waits."""
         return False
+
+    def enrich_awaits_confirm(self, conn) -> bool:
+        """The same question asked by a door that spends money (Plaid
+        Enrich, billed per row): unlike bank_awaits_confirm, which feeds a
+        display and may swallow an error to False, an implementation must
+        let an error RAISE (or answer True) — the caller refuses when the
+        gate cannot answer."""
+        return self.bank_awaits_confirm(conn)
 
     def institution_cap_message(self, cap: int, used: int) -> str:
         """What a household is told when adding one more institution would
@@ -338,11 +357,22 @@ class _FailClosedGate(Gate):
         # add-on's to say; landing it in 'active' could not be taken back
         raise GateUnavailable("reactivating a household")
 
+    def wait_for_seat(self, admin, tenant_id) -> str | None:
+        # whether the ceiling has room is the add-on's to say. Both roads
+        # that ask have already been refused by this gate (provision,
+        # reactivate) before they get here; refusing here too keeps a road
+        # added later from taking a seat nothing counted
+        raise GateUnavailable("deciding an intake seat")
+
     def unknown_status_lockout(self) -> tuple[int, str, tuple[str, ...]]:
         return (503, "this account is unavailable right now — please try "
                      "again shortly", ())
 
     def money_attached(self, admin, tenant_id) -> bool:
+        return True
+
+    def enrich_awaits_confirm(self, conn) -> bool:
+        # a door that bills per row waits whenever the add-on cannot say
         return True
 
     def on_tenant_delete_scheduled(self, tenant_id) -> str:

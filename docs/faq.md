@@ -41,7 +41,10 @@ yearly can go out by email,
 SMS (a short form; verify your phone number first), push notification
 (enable it per browser), or any combination. If you use the mobile app
 and your server opts in to mobile push (`OIKONOME_PUSH_RELAY_URL`),
-signed-in phones are tickled on the same push preference. The daily email itself has
+signed-in phones are tickled on the same push preference. Each person
+can turn the household's push off for their own devices (the **Push**
+card under Email & Push; the owner sets it per person on the Users
+roster) — notices about their own login still arrive. The daily email itself has
 two shapes, chosen on the daily row's **email face** picker: **summary**
 sends just the verdict pane — the one number, its category chips, and
 any pinned bills — while **detail** sends the full report with the
@@ -179,7 +182,12 @@ aggregator disagrees. **Just this one** changes only the row you picked
 and writes no rule. Two things are never swept along: flow categories
 (transfers, income, loan payments) and rows that carry their own
 per-transaction override. The Rules page lists every learned rule with its provenance; correct,
-disable, or delete any of them there.
+disable, or delete any of them there. The merchant's history page
+(**Bills → a payee**, or the merchant link on a row) has the same
+picker under **Categorize this merchant**, resting on the category the
+merchant carries today; choosing **✎ custom category…** (type a new name
+in the filter on the phone) files the whole merchant under a category
+nobody has used yet, after a count of the rows it will move.
 
 **How are merchants categorized automatically?**
 In order of authority: your own corrections (always win), the bank's
@@ -465,6 +473,17 @@ link, not a repair. Self-host: the window is
 `OIKONOME_PLAID_REAP_DAYS` (0 disables the reaper; a disconnect you
 asked for whose removal at Plaid failed is still retried, since the
 connection bills until that removal goes through).
+
+**My bank was bought and my login moved to another bank — how do I keep my history?**
+Connect the new bank from the Accounts page (**Connect an account**),
+not **reconnect** on the old one, which can only reopen the old bank's
+login. When the new login shows the accounts the dead connection held
+(same last digits and the bank's own type, even for an account you
+retyped by hand), the app recognises the move: the old
+connection is released, its accounts carry over to the new one with all
+their history, and the new bank's backfill fills in only what you did not
+already have. If the accounts do not match, the new bank is added
+alongside and the old connection is left for you to disconnect.
 
 **Adding a bank says I've reached a limit.**
 An instance may cap how many institutions can be connected; the cap, and

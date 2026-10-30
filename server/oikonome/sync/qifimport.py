@@ -42,10 +42,10 @@ import re
 
 from ..engine.compat import as_date
 from . import flowmap
-from .base import (FileImportIds, Transaction, ensure_split_account,
-                   drop_before_history, upsert_transactions)
-from .csvimport import scrub_identifiers
-from .csvimport import date_order
+from .base import (FileImportIds, Transaction, check_split_accounts,
+                   drop_before_history, ensure_split_account, split_former,
+                   mask_long_digits, tally_split, upsert_transactions)
+from .csvimport import date_order, parse_money_text, scrub_identifiers
 from .rowcap import MAX_IMPORT_ROWS, check_len
 from .dedup import Deduper
 
@@ -207,7 +207,11 @@ def parse_qif(text: str) -> list[dict]:
             # month-first is decided per FILE, not per record
             rec["date"] = _clean_date(rest)
         elif tag == "T" or tag == "U":
-            rec["amount"] = float(rest.replace(",", "").replace("$", ""))
+            # a comma-locale Quicken, GnuCash or HomeBank file writes
+            # "-12,50" and "1.234,56": read by the same rule as a CSV cell,
+            # never by dropping every comma, which stores them 100x too
+            # large or 1000x too small without a word
+            rec["amount"] = parse_money_text(rest)
         elif tag == "P":
             rec["payee"] = rest.strip()
         elif tag == "M":
@@ -251,6 +255,7 @@ def import_qif(conn, account_id: str, text: str,
             by_acct.setdefault(r.get("account") or "?", []).append(r)
         total = {"imported": 0, "rows": 0, "skipped_duplicates": 0,
                  "split_accounts": {}}
+        check_split_accounts(by_acct)
         for qif_name in sorted(by_acct):
             declared = next((r["account_type"] for r in by_acct[qif_name]
                              if r.get("account_type")), None)
@@ -260,12 +265,15 @@ def import_qif(conn, account_id: str, text: str,
                 declared = "Invst"
             type_, subtype = account_type(declared)
             target = ensure_split_account(conn, "qif", qif_name,
-                                          type_=type_, subtype=subtype)
+                                          type_=type_, subtype=subtype,
+                                          lines=_lines(by_acct[qif_name]))
             out = _import_into(conn, target, by_acct[qif_name],
-                               batch_id=batch_id)
+                               batch_id=batch_id,
+                               former=split_former("qif", qif_name, target))
             for k in ("imported", "rows", "skipped_duplicates"):
                 total[k] += out[k]
-            total["split_accounts"][qif_name] = out["imported"]
+            tally_split(total["split_accounts"], mask_long_digits(qif_name),
+                   out["imported"])
         total["note"] = (f"file contains {len(by_acct)} accounts — split "
                          f"into one account per Quicken account (the "
                          f"selected account was not used)")
@@ -273,11 +281,25 @@ def import_qif(conn, account_id: str, text: str,
     return _import_into(conn, account_id, rows, batch_id=batch_id)
 
 
+def _lines(rows: list[dict]):
+    """(date, amount, name) of each cash record, as _import_into hashes
+    it: what ensure_split_account recomputes an earlier import's row ids
+    from when a moved account's record cannot say which account it is."""
+    out = []
+    for r in rows:
+        amount = _signed(r)[0]
+        if amount is not None:
+            out.append((r["date"], amount,
+                        (r.get("payee") or r.get("memo") or r.get("security")
+                         or r.get("action") or "?").strip()))
+    return out
+
+
 def _import_into(conn, account_id: str, rows: list[dict], *,
-                 batch_id: str | None) -> dict:
+                 batch_id: str | None, former: tuple[str, ...] = ()) -> dict:
     deduper = Deduper(conn, account_id, "qif", [r["date"] for r in rows])
     txns: list[Transaction] = []
-    ids = FileImportIds("qif", account_id)
+    ids = FileImportIds("qif", account_id, former=former)
     # The ids an earlier release gave investment records, which it signed
     # as written (-T) and named by payee or memo alone, for every action —
     # share-only ones included. Counted on their own, over every record, so
@@ -326,9 +348,10 @@ def _import_into(conn, account_id: str, rows: list[dict], *,
             # scrub runs here too. QIF's tag set carries no account number
             # today (N inside a transaction is the CHECK number, and the
             # `account` key is Quicken's account NAME — the split accounts
-            # are named from it, so both are kept whole); this keeps the
-            # rule with the write, where a new tag would otherwise sail
-            # past it.
+            # are named from it, and the write cuts any full number in it
+            # to the last four, as it does the account's own name); this
+            # keeps the rule with the write, where a new tag would
+            # otherwise sail past it.
             raw=scrub_identifiers(
                 {k: (v.isoformat() if isinstance(v, dt.date) else v)
                  for k, v in r.items()})))

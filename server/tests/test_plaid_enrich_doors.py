@@ -45,6 +45,59 @@ def _owner_client():
     return client
 
 
+class EnrichWaitsOnAConfirmedAddress(unittest.TestCase):
+    """Enrich bills per row on the instance's Plaid account exactly as a
+    bank link does, so a household that may connect no bank until its
+    owner confirms their address may send no rows either; the status card
+    counts nothing it could send. Once confirmed, the run goes through."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = _owner_client()
+
+    def _gate(self, waits):
+        from oikonome import ext
+        return mock.patch.object(type(ext.gate._resolve()),
+                                 "bank_awaits_confirm",
+                                 lambda self, conn: waits)
+
+    def test_an_unconfirmed_owner_sends_nothing_until_confirmed(self):
+        sent = mock.MagicMock(return_value={"sent": 1, "enriched": 1,
+                                            "cap_hit": False, "error": None})
+        with mock.patch.object(plaid, "credentials", return_value={}), \
+                mock.patch.object(plaid, "enrich_rows", sent):
+            with self._gate(True):
+                r = self.client.post("/api/import/enrich", json={})
+                self.assertEqual(r.status_code, 403, r.text)
+                self.assertIn("Confirm your email", r.json()["detail"])
+                st = self.client.get("/api/import/enrich").json()
+                self.assertTrue(st["awaits_confirm"])
+                self.assertEqual(st["remaining"], 0)
+            sent.assert_not_called()
+            with self._gate(False):
+                r = self.client.post("/api/import/enrich", json={})
+                self.assertEqual(r.status_code, 200, r.text)
+                st = self.client.get("/api/import/enrich").json()
+                self.assertFalse(st["awaits_confirm"])
+            sent.assert_called_once()
+
+    def test_a_gate_that_cannot_answer_sends_nothing(self):
+        from oikonome import ext
+
+        def broken(self, conn):
+            raise RuntimeError("billing row unreadable")
+        sent = mock.MagicMock()
+        with mock.patch.object(plaid, "credentials", return_value={}), \
+                mock.patch.object(plaid, "enrich_rows", sent), \
+                mock.patch.object(type(ext.gate._resolve()),
+                                  "enrich_awaits_confirm", broken):
+            r = self.client.post("/api/import/enrich", json={})
+            self.assertEqual(r.status_code, 403, r.text)
+            st = self.client.get("/api/import/enrich").json()
+            self.assertEqual(st["remaining"], 0)
+        sent.assert_not_called()
+
+
 class TheMonthlyEnrichCapIsSettable(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

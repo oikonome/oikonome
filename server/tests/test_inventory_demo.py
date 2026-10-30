@@ -141,6 +141,7 @@ DEMO_GUARDED = {
     "POST /api/transactions/{txn_id:path}/receipt",
     "POST /api/receipts",
     "POST /api/users/{user_id}/role",
+    "POST /api/users/{user_id}/notify",
     "POST /import",
     "POST /import/mapped",
     "POST /import/rollback",

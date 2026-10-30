@@ -249,7 +249,8 @@ class TokenFamilyTests(unittest.TestCase):
         res = data.set_merchant_category(self.conn, "ACME TOY",
                                          "ENTERTAINMENT")
         self.assertEqual(res["count"], p["count"])
-        self.assertEqual({a["id"] for a in res["undo"]["affected"]},
+        held = data.held_undo(self.conn, res["undo"])
+        self.assertEqual({a["id"] for a in held["affected"]},
                          {"t1", "t2", "x1", "x2"})
         for tid in ("t1", "t2", "x1", "x2"):
             self.assertEqual(cat(self.conn, tid), "ENTERTAINMENT")
@@ -262,10 +263,11 @@ class TokenFamilyTests(unittest.TestCase):
     def test_legacy_single_canon_undo_shape_still_works(self):
         res = data.set_merchant_category(self.conn, "ACME TOY",
                                          "ENTERTAINMENT")
-        entry = res["undo"]["canons"][0]
+        held = data.held_undo(self.conn, res["undo"])
+        entry = held["canons"][0]
         legacy = {"canon": entry["canon"],
                   "prior_rule": entry["prior_rule"],
-                  "affected": [a for a in res["undo"]["affected"]]}
+                  "affected": list(held["affected"])}
         n = data.undo_merchant_category(self.conn, legacy)
         self.assertEqual(n, 2)
 

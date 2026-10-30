@@ -683,14 +683,21 @@ def pending_merchants(conn, limit: int | None = None) -> list[dict]:
     # policy). Original PFC / category_plaid is used so a prior apply() that
     # rewrote category_primary does not hide the merchant from re-queue.
     q = f"""
-        SELECT p.merchant, p.n, p.avg_amount, p.sample_name, p.raw_name
+        SELECT p.merchant, p.n, p.avg_amount, p.sample_name, p.raw_name,
+               p.narrow
         FROM (
             SELECT {_DISPLAY} AS merchant,
                    COUNT(*) AS n, AVG(t.amount) AS avg_amount,
                    MAX(t.name) AS sample_name,
                    MAX(COALESCE(t.merchant_name, t.name)) AS raw_name,
                    SUM(t.amount) AS total,
-                   MAX(t.merchant_id::text) AS mid
+                   MAX(t.merchant_id::text) AS mid,
+                   -- every row of the merchant is one the flow pass reads
+                   -- by its statement line (flow_classify's own
+                   -- predicate, over this row's columns alone)
+                   BOOL_AND((SELECT {_NARROW_SQL} FROM (
+                       SELECT t.merchant_name, t.category_source,
+                              t.category_primary) AS fn)) AS narrow
             FROM transactions t
             -- keyed AND grouped on the DISPLAY name — the merchant ROW's
             -- name first, then the alias, then the raw string, exactly
@@ -744,11 +751,25 @@ def pending_merchants(conn, limit: int | None = None) -> list[dict]:
     # capped, so the cap isn't wasted on rows we'd drop. Both the canonical
     # and the raw descriptor are screened — canonicalization must never
     # launder a flow/mechanics string into the LLM's view.
-    rows = [dict(r) for r in conn.execute(q)
-            if not merchant_seed.flow_match(r["merchant"])
-            and not merchant_seed.skip_llm(r["merchant"])
-            and not merchant_seed.flow_match(r["raw_name"])
-            and not merchant_seed.skip_llm(r["raw_name"])]
+    #
+    # The screen is the one flow_classify used on these rows: a merchant
+    # whose every row has no merchant name is the bank's whole line, read
+    # by flow_match_line. The looser flow_match would drop a bare
+    # "WITHDRAWAL POS … GROCERY" or a biller's "E-PAYMENT" here while the
+    # flow pass left it in spend, and the purchase would never be
+    # categorized by anything. One named row keeps the wider screen.
+    def _flow(r, s):
+        return (merchant_seed.flow_match_line(s) if r["narrow"]
+                else merchant_seed.flow_match(s))
+    rows = []
+    for r in conn.execute(q):
+        if (_flow(r, r["merchant"]) or merchant_seed.skip_llm(r["merchant"])
+                or _flow(r, r["raw_name"])
+                or merchant_seed.skip_llm(r["raw_name"])):
+            continue
+        d = dict(r)
+        d.pop("narrow", None)
+        rows.append(d)
     return rows[:int(limit)] if limit else rows
 
 
@@ -1146,6 +1167,16 @@ def categorize_check_payee(conn, txn_id: str, payee: str, memo: str = "",
     return cat if cur.rowcount else None
 
 
+# Rows flow_classify reads by their statement line (merchant_seed.
+# flow_match_line) instead of the wider merchant rules. A row with no
+# merchant name carries the bank's whole line as its payee, where the loose
+# words — a bare WITHDRAWAL, a biller's E-PAYMENT — name ordinary spending.
+# A row whose category came from the importer already carries the bank's
+# own word for it, which those loose words must not overrule either.
+_NARROW_SQL = ("(merchant_name IS NULL OR (COALESCE(category_source, '') "
+               "= 'import' AND category_primary IS NOT NULL))")
+
+
 def flow_classify(conn, stats: dict | None = None) -> int:
     """Route bank-mechanics rows on category-less sources to flow
     categories BEFORE any categorizer runs — a credit-card payment filed as
@@ -1155,7 +1186,8 @@ def flow_classify(conn, stats: dict | None = None) -> int:
     filed "Chase Credit Card" under merchandise)."""
     from . import merchant_seed
     rows = conn.execute(f"""
-        SELECT DISTINCT COALESCE(merchant_name, name) AS merchant, name
+        SELECT DISTINCT COALESCE(merchant_name, name) AS merchant, name,
+               {_NARROW_SQL} AS narrow
         FROM transactions
         WHERE removed = 0 AND category_override IS NULL
           AND COALESCE(raw #>> '{{personal_finance_category,primary}}', '') = ''
@@ -1165,7 +1197,9 @@ def flow_classify(conn, stats: dict | None = None) -> int:
     with conn.transaction():
         for r in rows:
             m = r["merchant"]
-            fm = merchant_seed.flow_match(m)
+            narrow = bool(r["narrow"])
+            fm = (merchant_seed.flow_match_line(m) if narrow
+                  else merchant_seed.flow_match(m))
             # the rows are keyed by the display merchant; when only the raw
             # statement line says "loan payment" (the importer cleaned it
             # to a bare servicer name), key on that line instead
@@ -1200,9 +1234,10 @@ def flow_classify(conn, stats: dict | None = None) -> int:
                         category_detailed = NULL, category_source = 'flow'
                     WHERE removed = 0 AND category_override IS NULL
                       AND COALESCE(merchant_name, name) = %s
+                      AND {_NARROW_SQL} = %s
                       AND COALESCE(raw #>> '{{personal_finance_category,primary}}', '') = ''
                       AND COALESCE(category_primary, '') NOT IN {_FLOW_SQL}""",
-                    (m,))
+                    (m, narrow))
             else:
                 cur = conn.execute(f"""
                     UPDATE transactions
@@ -1210,9 +1245,10 @@ def flow_classify(conn, stats: dict | None = None) -> int:
                         category_source = 'flow'
                     WHERE removed = 0 AND category_override IS NULL
                       AND COALESCE(merchant_name, name) = %s
+                      AND {_NARROW_SQL} = %s
                       AND COALESCE(raw #>> '{{personal_finance_category,primary}}', '') = ''
                       AND COALESCE(category_primary, '') NOT IN {_FLOW_SQL}""",
-                    (primary, detailed, m))
+                    (primary, detailed, m, narrow))
             n += cur.rowcount
     if stats is not None:
         stats["flow_classified"] = n
@@ -1383,6 +1419,9 @@ def own_transfer_classify(conn, stats: dict | None = None) -> int:
             FROM items i JOIN accounts a ON a.item_id = i.id
             WHERE COALESCE(i.status,'') <> 'archived'
               AND a.type = 'investment'
+              -- the shared item of hand-made and imported accounts is no
+              -- institution anyone invests with
+              AND i.id <> 'manual'
               AND COALESCE(i.institution_name,'') <> '')
         UPDATE transactions t SET
             category_primary = CASE WHEN t.amount < 0

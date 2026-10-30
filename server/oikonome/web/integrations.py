@@ -105,8 +105,12 @@ def summary(conn, today: dt.date | None = None, *, st: dict | None = None) -> di
     cfg = st.get("config") or budget.load_config(conn)
     days_left = max(1, st["days_in_month"] - today.day + 1)
     # the verdict's own budget: the two variable buckets (a carve-out is
-    # a slice of one of them, not an addition)
-    month_budget = b["food"]["month_budget"] + b["other"]["month_budget"]
+    # a slice of one of them, not an addition), at the share the hero
+    # judges — a ledger that began inside the month may spend only the
+    # budget from its first day on, and a monitor reading the whole month
+    # here would see room the app says the month never had
+    month_budget = todayview.paced_budget(
+        st, b["food"]["month_budget"] + b["other"]["month_budget"])
 
     # balances: the Accounts page's rows, minus what the page hides
     accounts = []

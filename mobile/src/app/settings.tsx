@@ -479,7 +479,7 @@ export default function Settings() {
       {/* a member's own daily-email switch — the web's MyEmailCard: the
           household schedule is the owner's, whether it reaches THIS inbox
           is the member's */}
-      {me.data?.role !== "owner" && <MyEmailCard />}
+      {me.data?.role !== "owner" && <><MyEmailCard /><MyPushCard /></>}
       {/* owner chrome, like the web — a viewer reads the household but
           does not walk off with its full export */}
       {me.data?.role === "owner" && (
@@ -1368,7 +1368,8 @@ function EnrichCard() {
       // ceiling; the refetch then brings the rest of the card along
       const cap = storedEnrichCap(v, capNum);
       qc.setQueryData<typeof d>(["enrich-status"], (o) => o && {
-        ...o, cap, remaining: Math.max(0, cap - o.used) });
+        ...o, cap,
+        remaining: o.awaits_confirm ? 0 : Math.max(0, cap - o.used) });
       qc.invalidateQueries({ queryKey: ["enrich-status"] });
       setCapDraft(null); setLast("Monthly cap saved.");
     },
@@ -1389,6 +1390,7 @@ function EnrichCard() {
         <Text style={{ color: C.mut, fontSize: 12, marginTop: 6 }}>
           {d.candidates} still undescribed · {d.used} of {d.cap} used this month
           {!d.plaid_configured ? " · Plaid is not configured" : ""}
+          {d.awaits_confirm ? " · confirm your email address to start" : ""}
         </Text>
       ) : null}
       {!viewer && (
@@ -1867,6 +1869,52 @@ function MyEmailCard() {
             .join(" · ")}
         </Text>
       )}
+      {err && <Text style={[s.hint, { color: C.warn }]}>{err}</Text>}
+    </Card>
+  );
+}
+
+/** A household member's own push switch — the web's MyPushCard: the
+ *  household's push notices (daily verdict, alerts, reports) stop reaching
+ *  THIS person's phones and browsers; the phone stays registered and
+ *  notices about their own login still arrive. POST /api/me/push, a door
+ *  every role holds; the owner's roster reads the same switch. */
+function MyPushCard() {
+  const { client } = useSession();
+  const qc = useQueryClient();
+  const me = useQuery({ queryKey: ["me"], queryFn: () => client!.me(),
+                        enabled: !!client });
+  const [err, setErr] = useState<string | null>(null);
+  const set = useMutation({
+    mutationFn: (muted: boolean) => client!.mePush(muted),
+    onSuccess: (r) => {
+      setErr(null);
+      qc.setQueryData<Me>(["me"], (o) => o && { ...o, push_muted: r.muted });
+      qc.invalidateQueries({ queryKey: ["members"] });
+    },
+    onError: (e) => setErr(errText(e)),
+  });
+  // older servers carry no switch; say nothing about one then
+  if (!me.data || me.data.push_muted === undefined) return null;
+  const muted = !!me.data.push_muted;
+  return (
+    <Card>
+      <H>Push</H>
+      <Text style={s.hintL}>
+        The household's push notices — the daily verdict, alerts, reports —
+        go to every signed-in phone and browser. Whether they reach yours is
+        yours; notices about your own login, household security warnings and your own test push always arrive.
+      </Text>
+      <View style={{ flexDirection: "row", alignItems: "center",
+                     justifyContent: "space-between", marginTop: 8 }}>
+        <Text style={{ color: C.text, fontSize: 14, flex: 1 }}>
+          {muted ? "Household push is off for you"
+                 : "You receive household push"}
+        </Text>
+        <Switch value={!muted} disabled={set.isPending}
+                accessibilityLabel="household push notices to my devices"
+                onValueChange={(on) => set.mutate(!on)} />
+      </View>
       {err && <Text style={[s.hint, { color: C.warn }]}>{err}</Text>}
     </Card>
   );

@@ -272,11 +272,29 @@ def _not_demo_instance():
 # two the elevation sheet would hit 402 with no way through, in both
 # clients. Neither door moves money nor touches household data, which is
 # the same argument /api/billing already makes.
+# permissions.SELF_WRITE_OK: the caller's OWN credentials and delivery
+# switches. A lapsed subscription is no reason to keep a stolen session or
+# device token live, refuse a password change, or keep sending notices to
+# someone who has switched them off — the worker goes on sending to the
+# household through its wind-down, so the switch has to keep working too.
+# None of these doors writes the household's money.
 BILLING_WRITE_OK = ("/api/billing", "/api/logout", "/api/export",
                     "/api/auth", "/api/stepup",
                     # stopping a recovery someone else asked for must not
                     # wait on a card being updated
-                    "/api/recovery/cancel-pending")
+                    "/api/recovery/cancel-pending",
+                    *permissions.SELF_WRITE_OK)
+# The owner's switches for one member's notices — the same writes the
+# member makes through /api/me/push and /api/me/email, so they stay open
+# for the same reason. A pattern, because the door carries the member id.
+BILLING_WRITE_OK_PATTERNS = (re.compile(r"^/api/users/[^/]+/notify$"),)
+
+
+def billing_write_ok(path: str) -> bool:
+    """Does this write stay open while the household is read-only for
+    billing?"""
+    return (path_within(path, BILLING_WRITE_OK)
+            or any(p.match(path) for p in BILLING_WRITE_OK_PATTERNS))
 
 # The tenant statuses that freeze a household out of the app COMPLETELY —
 # reads included, unlike the billing read-only state. Sign-out always stays
@@ -432,46 +450,43 @@ def _verify_holding_guess(slot, hashed: str, password: str) -> bool:
         raise
 
 
-def _sign_in_verify(email: str, hashed: str, password: str,
-                    checked_at: float) -> bool:
+def _sign_in_verify(email: str, hashed: str, password: str) -> bool:
     """verify_password at a sign-in door whose human check has already
     passed. That check may have been answered by spending the account's
     emailed unlock — the only way through it a native app has. A busy
     hasher (passwords.HasherBusy, answered 503 "try again") verified
-    nothing, so the attempt the unlock paid for never happened: an unlock
+    nothing, so the attempt the unlock paid for never happened: the unlock
     this request spent is put back before the refusal travels on. Kept
     spent, every 503 of a burst would cost the person another unlock mail,
-    and those are capped per hour. `checked_at` is `time.monotonic()`
-    taken just before the human check."""
+    and those are capped per hour."""
     try:
         return passwords.verify_password(hashed, password)
     except passwords.HasherBusy:
-        import time
-        _unspend_unlock(email, time.monotonic() - checked_at)
+        _unspend_unlock(email)
         raise
 
 
-def _unspend_unlock(email: str, within_s: float) -> None:
-    """Re-arm an emailed unlock spent in the last `within_s` seconds (the
-    span of the request asking, measured on one clock and applied to the
-    database's, plus a second of slack). Unlike `turnstile.refund_unlock`
-    this leaves `refunded_at` alone: that one refund belongs to the
-    two-step TOTP sign-in, and an attempt the hasher never ran must not
-    use it up. Best-effort — failing here leaves the unlock spent, which
-    is what happened before."""
-    if not email:
+def _unspend_unlock(email: str) -> None:
+    """Re-arm the emailed unlock THIS request spent at its human check
+    (turnstile.spent_unlocks) — exactly those rows, so a concurrent
+    attempt's spend (one that reached a wrong password) stays spent, and a
+    request that passed by a token or by no challenge re-arms nothing.
+    Unlike `turnstile.refund_unlock` this leaves `refunded_at` alone: that
+    one refund belongs to the two-step TOTP sign-in, and an attempt the
+    hasher never ran must not use it up. Best-effort — failing here leaves
+    the unlock spent, which is what happened before."""
+    ids = turnstile.spent_unlocks()
+    if not email or not ids:
         return
     try:
         with _control_conn() as conn:
             conn.execute(
                 """UPDATE login_unlocks u SET consumed_at = NULL
-                     FROM users usr
-                    WHERE usr.id = u.user_id AND lower(usr.email) = %s
+                    WHERE u.id = ANY(%s)
                       AND u.consumed_at IS NOT NULL
-                      AND u.consumed_at > now() - make_interval(secs => %s)
                       AND u.unlocked_until IS NOT NULL
-                      AND u.unlocked_until > now()""",
-                (email.strip().lower(), max(0.0, within_s) + 1.0))
+                      AND u.unlocked_until > now()""", (list(ids),))
+        turnstile.forget_spent_unlocks()
     except Exception:                    # noqa: BLE001 — best-effort
         log.warning("could not re-arm an emailed unlock after a busy "
                     "hasher", exc_info=True)
@@ -880,7 +895,7 @@ def current_user(request: Request) -> dict:
     if mutating and permissions.credential_door(request.url.path):
         demoguard.deny_shared_credentials(sess)
     if (mutating
-            and not path_within(request.url.path, BILLING_WRITE_OK)
+            and not billing_write_ok(request.url.path)
             and _billing_write_blocked(sess)):
         raise HTTPException(402, "this account is read-only right now")
     # Server enforcement of the forced-2FA-enrollment gate. Enforced in
@@ -1083,8 +1098,6 @@ def login_form(request: Request, email: str = Form(...),
     # with recent failures behind it (see turnstile.verify_login). No-JS
     # door: one submit, one token. A rejected token re-renders the form
     # rather than 4xx-ing, so the widget gets a fresh challenge.
-    import time
-    checked_at = time.monotonic()
     if not turnstile.verify_login(cf_token, security.client_ip(request), email):
         # show_unlock is load-bearing HERE above all: this is the
         # response a user gets when they cannot complete the widget — script
@@ -1119,7 +1132,7 @@ def login_form(request: Request, email: str = Form(...),
             "totp_last_counter FROM users WHERE email=%s",
             (email.strip().lower(),)).fetchone()
     ok = _sign_in_verify(email, u["password_hash"] if u else _DUMMY_HASH,
-                         password, checked_at)
+                         password)
     err = None
     # Only reveal that TOTP is needed AFTER the password verifies —
     # showing the code field on a wrong password (for a known email) is an
@@ -1905,6 +1918,7 @@ def _security_fan_out(email: str, tenant_id, title: str, short: str, *,
         from ..notify import push as _push
         from ..notify import push_native as _native
         own_web = own_native = False
+        muted_ids: list = []
         # Who to tell is read here; the sends below open their own
         # connections only around their database steps. Each push waits on
         # an outside service, and holding a control connection across them
@@ -1923,6 +1937,15 @@ def _security_fan_out(email: str, tenant_id, title: str, short: str, *,
                     (tenant_id, me["id"])).fetchone() is not None
                 own_native = bool(_devices.push_targets(cc, tenant_id,
                                                         me["id"]))
+            if neutral is not None:
+                # The household send skips anyone who turned the
+                # household's push off (users.push_muted). That switch is
+                # for the daily verdict, alerts and reports; a warning that
+                # a reset can still land is not one of them, so each muted
+                # person is reached by name, which the mute never filters.
+                muted_ids = [r["id"] for r in cc.execute(
+                    "SELECT id FROM users WHERE tenant_id=%s AND push_muted",
+                    (tenant_id,)).fetchall()]
         if own_web:
             _push.send_tenant(None, tenant_id, title, short,
                               url="/app/settings",
@@ -1940,6 +1963,12 @@ def _security_fan_out(email: str, tenant_id, title: str, short: str, *,
                               url="/app/settings", connect=_control_conn)
             _native.send_tenant(None, tenant_id, "alert",
                                 connect=_control_conn)
+            for uid in muted_ids:
+                _push.send_tenant(None, tenant_id, "Security notice", neutral,
+                                  url="/app/settings", user_id=uid,
+                                  connect=_control_conn)
+                _native.send_tenant(None, tenant_id, "alert", user_id=uid,
+                                    connect=_control_conn)
     except Exception:                                    # noqa: BLE001
         log.warning("%s push notice failed", what, exc_info=True)
     if neutral is None and not sole_owner:
@@ -3322,6 +3351,17 @@ def signup_reclaim_finish(request: Request, token: str = Form(""),
                     # refusal rolls the move-out and the token spend back,
                     # so the link still works once there is room.
                     _intake_check_exact(admin)
+                elif is_owner and inv is None:
+                    # The replace road gives a seat back only when the
+                    # shell it erased still held one; a signup left
+                    # unconfirmed past its hold held none, and its
+                    # replacement arrives already confirmed. So it is the
+                    # same case as a confirmation link clicked late, and it
+                    # gets the same answer: the installed gate seats it, or
+                    # puts it on the list behind the households already
+                    # waiting. The erasure has committed, so a refusal here
+                    # would strand the person with no account at all.
+                    ext.gate.wait_for_seat(admin, tid)
         except HTTPException as e:
             if wiped or e.status_code != 503:
                 raise
@@ -4461,8 +4501,6 @@ def login(request: Request, email: str = Form(...), password: str = Form(...),
     # single-use, so pages.js resets the widget after each response.
     # Risk-gated: an IP and account with no recent failures are not asked for
     # a token at all (turnstile.verify_login).
-    import time
-    checked_at = time.monotonic()
     if not turnstile.verify_login(cf_token, security.client_ip(request), email):
         raise HTTPException(403, "human_check_failed")
     # account-scoped lockout: source-IP-
@@ -4477,7 +4515,7 @@ def login(request: Request, email: str = Form(...), password: str = Form(...),
             (email.strip().lower(),)).fetchone()
     # verify against a dummy hash on unknown users — uniform timing
     ok = _sign_in_verify(email, u["password_hash"] if u else _DUMMY_HASH,
-                         password, checked_at)
+                         password)
     if not u or not ok:
         # NB: a wrong PASSWORD does NOT feed the account lock (that would
         # let anyone with the email DoS the owner) — only second-factor
@@ -6112,7 +6150,7 @@ def me(user: dict = Depends(current_user)):
         pending_change = _pending_email_change(conn, user["user_id"])
         u = conn.execute(
             "SELECT totp_secret, verified_at, created_at, "
-            "second_factor_waived FROM users "
+            "second_factor_waived, push_muted FROM users "
             "WHERE id=%s", (user["user_id"],)).fetchone()
         # the date the nightly sweep freezes a never-confirmed household —
         # read here while the control connection is open
@@ -6320,6 +6358,9 @@ def me(user: dict = Depends(current_user)):
             # is three more mornings of silence.
             "email_delivery": _delivery_state_for(user["email"]),
             "daily_email": daily_email,
+            # this login's own switch for the household's push notices
+            # (POST /api/me/push); account notices still arrive
+            "push_muted": bool(u and u["push_muted"]),
             # hosted accounts must enroll a second factor (TOTP or
             # passkey) before using the app — the SPA renders a blocking
             # enrollment gate while this is true. Viewers INCLUDED: a
@@ -6528,11 +6569,32 @@ def users_list(user: dict = Depends(current_user)):
                 "hidden": True}
     with _control_conn() as conn:
         rows = conn.execute(
-            """SELECT id, email, role, created_at FROM users
-               WHERE tenant_id = %s ORDER BY created_at""",
+            """SELECT id, email, role, created_at, verified_at, push_muted
+               FROM users WHERE tenant_id = %s ORDER BY created_at""",
             (user["tenant_id"],)).fetchall()
-    return {"users": [{**r, "id": str(r["id"]),
-                       "me": str(r["id"]) == str(user["user_id"])}
+    # what each person receives (email + push switches, devices) — the
+    # owner manages every member's from the roster; everyone else is
+    # shown their own row's only, the rest of the household's switches
+    # being the owner's to see
+    notify: dict = {}
+    try:
+        tc = tenancy.tenant_connect(user["tenant_id"])
+        try:
+            cfg = budget.load_config(tc)
+            mailed = _mailed_addresses(tc, user["tenant_id"])
+        finally:
+            tc.close()
+        with _control_conn() as cc:
+            notify = _member_notify(cc, cfg, user["tenant_id"], rows, mailed)
+    except Exception:                            # noqa: BLE001
+        log.exception("member notify state failed")
+    mine = str(user["user_id"])
+    return {"users": [{"id": str(r["id"]), "email": r["email"],
+                       "role": r["role"], "created_at": r["created_at"],
+                       "me": str(r["id"]) == mine,
+                       "notify": notify.get(str(r["id"]))
+                       if (user.get("role") == "owner"
+                           or str(r["id"]) == mine) else None}
                       for r in rows],
             # what the owner may pick in the roster, named by the server so
             # the two clients cannot drift from the policy or each other
@@ -8107,6 +8169,185 @@ def me_email(user: dict = Depends(current_user), body: dict = Body(...)):
     finally:
         tc.close()
     return {"ok": True, "muted": body["muted"]}
+
+
+@app.post("/api/me/push",
+          dependencies=[Depends(limit("me_push", 30, 3600))])
+def me_push(user: dict = Depends(current_user), body: dict = Body(...)):
+    """This login's own switch for the household's push notices — the
+    daily verdict, alerts and reports stop reaching MY browsers and phones
+    (users.push_muted, read by both push fan-outs). Every role holds it
+    (SELF_WRITE_OK): whether a notice reaches a person's own devices is
+    theirs, like their address in the mail mute list. The devices stay
+    registered, so notices about the person's own account still arrive and
+    unmuting needs no re-enrolment."""
+    demoguard.deny(user)
+    if "muted" not in body or not isinstance(body["muted"], bool):
+        raise HTTPException(400, "muted must be true or false")
+    _set_push_muted(user["user_id"], user["tenant_id"], body["muted"])
+    return {"ok": True, "muted": body["muted"]}
+
+
+def _set_push_muted(user_id, tenant_id, muted: bool) -> bool:
+    """Write the switch under the ADMIN connection: the app role's UPDATE
+    on users is column-scoped to the login factors, on purpose. Returns
+    whether a row in this household was written."""
+    admin = tenancy.admin_connect()
+    try:
+        return admin.execute(
+            "UPDATE users SET push_muted = %s WHERE id = %s AND tenant_id = %s",
+            (muted, user_id, tenant_id)).rowcount == 1
+    finally:
+        admin.close()
+
+
+def _mailed_addresses(tc, tenant_id) -> set[str]:
+    """Who the household's scheduled mail goes to, before each person's own
+    mute: the sender's own list (worker._recipient_lists), so the roster's
+    "on the mail" cannot claim someone the sender skips — an invite never
+    accepted, an address with no account here on hosted, a paused one."""
+    from ..jobs import worker as _worker
+    return {str(e).strip().lower() for e in
+            _worker._recipient_lists(tc, str(tenant_id),
+                                     honour_mute=False)[0]}
+
+
+def _member_notify(cc, cfg: dict, tenant_id, rows: list[dict],
+                   mailed: set[str]) -> dict:
+    """What each member of the household receives, keyed by user id:
+    their email switches (the address's place in the household's
+    recipient and mute lists, and which kinds reach it) and their push
+    switch with the devices it governs. The roster reads this for the
+    owner, who manages every member's notices from one place. `mailed` is
+    _mailed_addresses: whether a person is on the mail at all is the
+    scheduled sender's answer, not a second copy of its rules."""
+    from ..notify import email_prefs as _email_prefs
+    from ..notify import push as _push
+    muted = cfg.get("email_muted") or []
+    if isinstance(muted, str):
+        muted = [x.strip() for x in muted.split(",") if x.strip()]
+    muted_set = {str(m).strip().lower() for m in muted
+                 if isinstance(m, str)} if isinstance(muted, list) else set()
+    browsers = {str(r["user_id"]): r["n"] for r in cc.execute(
+        "SELECT user_id, count(*) AS n FROM push_subscriptions "
+        f"WHERE tenant_id=%s AND {_push.LIVE} GROUP BY user_id",
+        (tenant_id,)).fetchall()}
+    phones = {str(r["user_id"]): r["n"] for r in cc.execute(
+        """SELECT d.user_id, count(*) AS n FROM device_tokens d
+           WHERE d.tenant_id = %s AND d.revoked_at IS NULL
+                 AND d.expires_at > now() AND d.push_token IS NOT NULL
+                 AND d.push_dead_at IS NULL GROUP BY d.user_id""",
+        (tenant_id,)).fetchall()}
+    from . import mailguard
+    configured = cfg.get("email_recipients") or []
+    # every shape a list was ever stored in (`Name <a@x>`, `a@x;b@y`)
+    listed_set = {e.strip().lower()
+                  for e in mailguard.split_mailboxes(configured)[0]}
+    out = {}
+    for r in rows:
+        email = str(r["email"] or "").strip().lower()
+        uid = str(r["id"])
+        # on the mail: exactly whom the scheduled sender would mail
+        on_mail = email in mailed
+        out[uid] = {
+            "on_mail": on_mail,
+            # on the household's list but not mailed yet (an invite not
+            # accepted, mail paused, an owner not verified): the roster
+            # says so and keeps the switches, rather than "add them"
+            # the owner is on the list by construction, and with no list
+            # configured every verified person is: an unverified member
+            # is waiting on confirmation, not on being added
+            "mail_listed": (on_mail or email in listed_set
+                            or r.get("role") == "owner" or not configured),
+            "email_muted": email in muted_set,
+            "email_prefs": _email_prefs.row(cfg, email),
+            "push_muted": bool(r["push_muted"]),
+            "push_browsers": int(browsers.get(uid, 0)),
+            "push_phones": int(phones.get(uid, 0)),
+        }
+    return out
+
+
+@app.post("/api/users/{user_id}/notify",
+          dependencies=[Depends(limit("user_notify", 60, 3600))])
+def user_set_notify(user_id: str, user: dict = Depends(current_user),
+                    body: dict = Body(...)):
+    """The owner sets what one household member receives: their push
+    switch (`push_muted`), their email switch (`email_muted` — the
+    address in or out of the household's mute list) and one kind of mail
+    on or off (`email_pref: {kind, on}`). The same switches the member
+    flips for themselves through /api/me/push and /api/me/email, written
+    to the same places, so the two views can never disagree. Owner-only
+    (/api/users is in OWNER_ONLY; stated here too). No step-up: these are
+    the owner's own household-mail switches, which the settings save
+    already writes for any address without one."""
+    demoguard.deny(user)
+    _owner_only(user)
+    import uuid as uuid_mod
+    try:
+        target = uuid_mod.UUID(str(user_id))
+    except ValueError:
+        raise HTTPException(404, "no such member")
+    with _control_conn() as conn:
+        row = conn.execute(
+            "SELECT id, email FROM users WHERE id = %s AND tenant_id = %s",
+            (target, user["tenant_id"])).fetchone()
+    if not row:
+        raise HTTPException(404, "no such member")
+    email = str(row["email"] or "").strip().lower()
+    # Every part of the body is checked before anything is written, and
+    # the push switch (its own autocommit write) goes last, after the mail
+    # half has committed or refused inside its config transaction — a 400
+    # must mean nothing changed, not "the push half did".
+    if "push_muted" in body and not isinstance(body["push_muted"], bool):
+        raise HTTPException(400, "push_muted must be true or false")
+    if "email_muted" in body and not isinstance(body["email_muted"], bool):
+        raise HTTPException(400, "email_muted must be true or false")
+    if "email_pref" in body and not isinstance(body["email_pref"], dict):
+        raise HTTPException(400, "email_pref must be {kind, on}")
+    if ("email_muted" in body or "email_pref" in body) and not email:
+        raise HTTPException(400, "that login has no email address")
+    if not ("push_muted" in body or "email_muted" in body
+            or "email_pref" in body):
+        raise HTTPException(
+            400, "nothing to change: push_muted, email_muted or email_pref")
+    if "email_muted" in body or "email_pref" in body:
+        tc = tenancy.tenant_connect(user["tenant_id"])
+        try:
+            with budget.config_txn(tc) as cfg:
+                if "email_muted" in body:
+                    muted = cfg.get("email_muted") or []
+                    if isinstance(muted, str):
+                        muted = [x.strip() for x in muted.split(",")
+                                 if x.strip()]
+                    muted = [m for m in muted
+                             if str(m).strip().lower() != email]
+                    if body["email_muted"]:
+                        muted.append(email)
+                    cfg["email_muted"] = muted
+                if "email_pref" in body:
+                    pref = body["email_pref"]
+                    _api._apply_email_pref(
+                        cfg, {"address": email, "kind": pref.get("kind"),
+                              "on": pref.get("on")}, user)
+        finally:
+            tc.close()
+    if "push_muted" in body:
+        _set_push_muted(target, user["tenant_id"], body["push_muted"])
+    # the row as the roster now shows it
+    with _control_conn() as cc:
+        urow = cc.execute(
+            "SELECT id, email, role, verified_at, push_muted FROM users "
+            "WHERE id = %s", (target,)).fetchone()
+    tc = tenancy.tenant_connect(user["tenant_id"])
+    try:
+        cfg = budget.load_config(tc)
+        mailed = _mailed_addresses(tc, user["tenant_id"])
+    finally:
+        tc.close()
+    with _control_conn() as cc:
+        notify = _member_notify(cc, cfg, user["tenant_id"], [urow], mailed)
+    return {"ok": True, "notify": notify[str(target)]}
 
 
 @app.post("/api/account/leave",

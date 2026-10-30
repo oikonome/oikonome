@@ -6,7 +6,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router";
 import { api, errText, mmdd, money as money$, type BillsData, type BillsHistoryData,
-         catLabel, proposalSuperseded, toast } from "../api/client";
+         catLabel, promptCategoryName, proposalSuperseded, toast } from "../api/client";
 import { invalidateRollups, patchQueries, patchQuery,
          removeFromList } from "../api/cache";
 import { RANGES, RangePicker, type Range } from "../components/RangePicker";
@@ -192,7 +192,8 @@ export default function RecurringHistory() {
                                         inUse={d.merchant_in_use} />}
       </div>
 
-      {mayEdit && <MerchantCategory payee={d.payee} onDone={refetchAfterRecat} />}
+      {mayEdit && <MerchantCategory payee={d.payee} current={dominantCategory(d.txns)}
+                                    onDone={refetchAfterRecat} />}
 
       {d.proposals.length > 0 && (
         <div className="card">
@@ -510,10 +511,28 @@ function AddAsBill({ d, onDone }: { d: BillsHistoryData; onDone: () => void }) {
   );
 }
 
+// the category the merchant's rows carry today — the most common one over
+// the matched ledger rows, which is what the picker's resting label shows
+// (one merchant, one category is the rule this card enforces; a split
+// merchant shows its majority and the picker still moves every row)
+export function dominantCategory(txns: { category: string | null }[]): string | null {
+  const n = new Map<string, number>();
+  for (const t of txns) if (t.category) n.set(t.category, (n.get(t.category) ?? 0) + 1);
+  let best: string | null = null;
+  for (const [c, k] of n) if (best === null || k > n.get(best)!) best = c;
+  return best;
+}
+
 // bulk category override for the whole (canonical) merchant.
-// Owner-only. preview → confirm-with-count → apply → undo. The count is the
-// TRUE merchant-wide scope, so the user consents before the write.
-function MerchantCategory({ payee, onDone }: { payee: string; onDone: () => void }) {
+// Owner-only. pick → confirm-with-count → apply → undo. The count is the
+// TRUE merchant-wide scope, so the user consents before the write. The
+// picker is the Transactions row's: it rests on the current category and
+// picking an entry previews at once; "✎ custom category…" names a NEW
+// category here, so a merchant that belongs under a category nobody has
+// used yet never sends the person to the ledger to find a row.
+function MerchantCategory({ payee, current, onDone }: {
+  payee: string; current: string | null; onDone: () => void;
+}) {
   const [cat, setCat] = useState("");
   const [confirm, setConfirm] = useState<
     Awaited<ReturnType<typeof api.merchantCategoryPreview>> | null>(null);
@@ -537,10 +556,16 @@ function MerchantCategory({ payee, onDone }: { payee: string; onDone: () => void
                        ...(cats.data?.plaid_flow ?? [])]);
   const custom = (cats.data?.categories ?? []).filter((c) => !std.has(c));
 
-  const preview = async () => {
-    const c = cat.trim();
+  const preview = async (picked: string) => {
+    let c = picked.trim();
+    if (c === "__customcat__") {
+      // the ledger row's prompt, so a name typed here is bounded the same way
+      const name = promptCategoryName();
+      if (!name) return;
+      c = name;
+    }
     if (!c) return;
-    setErr(null); setBusy(true);
+    setCat(c); setErr(null); setBusy(true);
     try {
       setConfirm(await api.merchantCategoryPreview(payee, c));
     }
@@ -577,9 +602,17 @@ function MerchantCategory({ payee, onDone }: { payee: string; onDone: () => void
         </div>
       )}
       <div style={{ display: "flex", gap: ".5rem", flexWrap: "wrap", alignItems: "center" }}>
-        <select value={cat} onChange={(e) => setCat(e.target.value)}
+        <span className="sub">filed under</span>
+        {/* value="" keeps the resting label on the current category, like
+            the ledger row; picking anything previews, the confirm below
+            is the consent */}
+        <select value="" disabled={busy || demo}
+                aria-label={`category: ${catLabel(current)} — change for the whole merchant`}
+                onChange={(e) => e.target.value && preview(e.target.value)}
                 style={{ minWidth: "16rem" }}>
-          <option value="">choose a category…</option>
+          <option value="">
+            {busy ? "checking…" : catLabel(current)}</option>
+          <option value="__customcat__">✎ custom category…</option>
           <optgroup label="Spending">
             {cats.data?.plaid_spend.map((c) => (
               <option key={c} value={c}>{catLabel(c)}</option>
@@ -593,10 +626,7 @@ function MerchantCategory({ payee, onDone }: { payee: string; onDone: () => void
             </optgroup>
           )}
         </select>
-        <button className="pri" disabled={busy || demo || !cat.trim()}
-                onClick={preview}>
-          Apply to whole merchant…
-        </button>
+        <span className="mut" style={{ fontSize: 13 }}>applies to the whole merchant</span>
       </div>
       {confirm && (
         // display:block — .note is a flex row, which would set the
@@ -606,9 +636,9 @@ function MerchantCategory({ payee, onDone }: { payee: string; onDone: () => void
           <div style={{ fontSize: 15 }}>
             {confirm.count > 0 ? <>
               Move <b>{confirm.count}</b> past transaction{confirm.count === 1 ? "" : "s"} to{" "}
-              <b>{catLabel(cat.trim())}</b>
+              <b>{catLabel(cat)}</b>
             </> : <>
-              Every matched charge is already <b>{catLabel(cat.trim())}</b>
+              Every matched charge is already <b>{catLabel(cat)}</b>
             </>}
             {" "}— and keep future charges there.
           </div>

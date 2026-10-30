@@ -73,6 +73,8 @@ SKIP = {
     "assistant_turns": "the assistant's question-and-answer log — a "
                        "conversation on this instance, not the books; the "
                        "figures in it are the ledger's, which travels",
+    "category_undo": "a category write's held undo — a week of scratch "
+                     "whose reference only this instance issued",
 }
 
 

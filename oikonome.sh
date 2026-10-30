@@ -824,7 +824,9 @@ cmd_logs() {
     # (reset, invite, export ticket), so those are scrubbed at the source
     # — the same shapes the feedback bundle scrubs: query tickets, invite
     # links, bearer headers, key=value secrets, envelope ciphertext, and
-    # member addresses (one leading character kept, like the bundle).
+    # member addresses (one leading character kept, like the bundle) —
+    # also in their percent-encoded form, since a query string carries '@'
+    # as %40 (the Activity filter, the invite link's email=).
     # The query-param and token-path lists in the first two rules are a
     # copy of TOKEN_QUERY_PARAMS / TOKEN_PATH_SEGMENTS in
     # server/oikonome/web/feedback.py (bash cannot import it); a shape
@@ -837,7 +839,7 @@ cmd_logs() {
           -e 's#([Aa]uthorization:[[:space:]]*[Bb]earer[[:space:]]+)[^[:space:]]+#\1<redacted>#g' \
           -e 's#\b((token|api[_-]?key|secret|password|passwd|pwd|access[_-]?token|client[_-]?secret)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?)[^[:space:]'"'"'"&,}]+#\1<redacted>#Ig' \
           -e 's#(enc:(v1|cp1):)[A-Za-z0-9=_-]+#\1<redacted>#g' \
-          -e 's#\b([A-Za-z0-9])[A-Za-z0-9._%+-]*@[A-Za-z0-9.-]+\.[A-Za-z]{2,}#\1<redacted>@<redacted>#g' \
+          -e 's#\b([A-Za-z0-9])[A-Za-z0-9._%+-]*(@|%40)[A-Za-z0-9.-]+\.[A-Za-z]{2,}#\1<redacted>@<redacted>#g' \
       || true
     return
   fi

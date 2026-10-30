@@ -20,7 +20,7 @@ import { ago, api, errText, linkCardVisible, mmdd, money, type Account,
          type Connection, type HistoryMonths, type Me, type Settings }
   from "../api/client";
 import { historyRowNote, windowNarrower } from "../components/HistoryChoice";
-import { signedBalance } from "../moneymath";
+import { parseMoneyDraft, signedBalance } from "../moneymath";
 import { patchList, removeFromList } from "../api/cache";
 import { canEdit, isOwner, isViewer } from "../role";
 import { hueOf, monogram, useLogosOn } from "../components/MerchantAvatar";
@@ -223,7 +223,15 @@ export default function Accounts({ embedded }: { embedded?: boolean } = {}) {
   if (accounts.isLoadingError)
     return <div className="card">Couldn't load accounts: {String(accounts.error)}</div>;
 
+  // the pin as saved (the editor's switch) and the account the cash
+  // forecast actually starts from: a pin on an excluded account or on a
+  // linked pair's backup is kept but anchors nothing, so the pill follows
+  // the server's answer and the dead pin says why
   const primary = settings.data?.checking_account_id ?? null;
+  const anchor = accounts.data.primary_checking_id ?? null;
+  // the server's words for why the pin is passed over (it knows the rules:
+  // exclusion, a linked backup, a balance nobody has set, …)
+  const pinUnused = accounts.data.primary_pin_unused ?? null;
   const excluded = new Set(settings.data?.excluded_accounts ?? []);
   // A linked pair is ONE real account fed by two sources: the serving row
   // carries the balance and the backup shadows it. Every server-side money
@@ -320,7 +328,9 @@ export default function Accounts({ embedded }: { embedded?: boolean } = {}) {
   const categories = buildCategories((a) => !a.entity_id);
   const bizCategories = buildCategories((a) => !!a.entity_id);
 
-  const rowProps = { mayEdit, owner, primary, excluded, editId, setEditId,
+  const rowProps = { mayEdit, owner, primary, anchor, pinUnused, excluded,
+                     editId,
+                     setEditId,
                      historyWindow: settings.data?.history_months ?? null,
                      onDone: done };
   // every hero figure derives from payloads this page already loads
@@ -567,11 +577,12 @@ function OwnerImport({ onDone }: { onDone: DoneFn }) {
   );
 }
 
-function GroupRows({ g, archived, hidden, mayEdit, owner, primary, excluded,
-                     editId, setEditId, historyWindow,
+function GroupRows({ g, archived, hidden, mayEdit, owner, primary, anchor,
+                     pinUnused, excluded, editId, setEditId, historyWindow,
                      onDone, onSync, syncing }: {
   g: Group; archived?: boolean; hidden?: boolean;
   mayEdit: boolean; owner: boolean; primary: string | null;
+  anchor: string | null; pinUnused: string | null;
   excluded: Set<string>;
   // the household's history choice, to tell a bank linked narrower
   historyWindow?: HistoryMonths | null;
@@ -829,7 +840,8 @@ function GroupRows({ g, archived, hidden, mayEdit, owner, primary, excluded,
     return (
       <AcctRow a={a} institution={g.institution} leftBox={left} badge={badge}
                mayEdit={mayEdit} owner={owner}
-               primary={primary} excluded={excluded.has(a.id)}
+               primary={primary} anchor={anchor} pinUnused={pinUnused}
+               excluded={excluded.has(a.id)}
                editId={editId} setEditId={setEditId} onDone={onDone} />
     );
   }
@@ -848,7 +860,7 @@ function GroupRows({ g, archived, hidden, mayEdit, owner, primary, excluded,
       </tr>
       {g.accounts.map((a) => (
         <AcctRow key={a.id} a={a} indent mayEdit={mayEdit} owner={owner}
-                 primary={primary}
+                 primary={primary} anchor={anchor} pinUnused={pinUnused}
                  excluded={excluded.has(a.id)}
                  editId={editId} setEditId={setEditId} onDone={onDone} />
       ))}
@@ -875,10 +887,12 @@ function InstMark({ a }: { a: Account }) {
 }
 
 function AcctRow({ a, institution, indent, leftBox, badge, mayEdit, owner,
-                   primary, excluded, editId, setEditId, onDone }: {
+                   primary, anchor, pinUnused, excluded, editId, setEditId,
+                   onDone }: {
   a: Account; institution?: string; indent?: boolean;
   leftBox?: React.ReactNode; badge?: React.ReactNode;
-  mayEdit: boolean; owner: boolean; primary: string | null; excluded: boolean;
+  mayEdit: boolean; owner: boolean; primary: string | null;
+  anchor: string | null; pinUnused: string | null; excluded: boolean;
   editId: string | null;
   setEditId: (id: string | null) => void; onDone: DoneFn;
 }) {
@@ -904,8 +918,12 @@ function AcctRow({ a, institution, indent, leftBox, badge, mayEdit, owner,
           {/* inert inline span on desktop; the phone layout turns it into
               the row's second line so pills never wrap under the buttons */}
           <span className="acct-pills">
-          {a.id === primary && <>{" "}<span className="pill b"
+          {a.id === anchor && <>{" "}<span className="pill b"
             title="cash forecast + solvency anchor">primary</span></>}
+          {a.id === primary && a.id !== anchor && <>{" "}<span
+            className="pill m"
+            title="pinned as primary checking, but the cash forecast starts from another account">
+            pinned — not used{pinUnused ? `: ${pinUnused}` : ""}</span></>}
           {excluded && <>{" "}<span className="pill m"
             title="excluded from budget math — its spending never counts">excl</span></>}
           {a.user_removed_at && <>{" "}<span className="pill m"
@@ -1167,14 +1185,16 @@ function EditRow({ a, owner, primary, excluded, onDone, onCancel }: {
       // anchor only when its switch moved: a kind-only save must not
       // re-send a pin another device may have moved since this cache
       const pinMoved = isPrimary !== (a.id === primary);
+      // the exclusion before the pin: the pin door refuses an excluded
+      // account, so including it and pinning it in one save needs this order
+      if (isExcl !== excluded) await api.accountExclude(a.id, isExcl);
       if (kind !== a.kind || pinMoved)
         await api.accountClassify(a.id, kind,
                                   pinMoved ? isPrimary : undefined);
-      if (isExcl !== excluded) await api.accountExclude(a.id, isExcl);
       if (ownerLbl.trim() !== (a.owner ?? ""))
         await api.setAccountOwner(a.id, ownerLbl.trim());
       if (manual && bal.trim() !== "" &&
-          Number(bal.replace(/[$,]/g, "")) !== a.balance_current)
+          (parseMoneyDraft(bal) ?? NaN) !== a.balance_current)
         await api.accountBalance(a.id, bal);
     },
     onSuccess: () => {
@@ -1182,7 +1202,7 @@ function EditRow({ a, owner, primary, excluded, onDone, onCancel }: {
       // write what was just saved into it — the editor closes on the new
       // values instead of the old ones. Each door is a plain field write
       // with no server-side derivation, so the prediction is the truth.
-      const newBal = Number(bal.replace(/[$,]/g, ""));
+      const newBal = (parseMoneyDraft(bal) ?? NaN);
       patchList<AccountsData, Account>(qc, ["accounts"], "accounts",
         (x) => x.id === a.id,
         { name: nextName, kind, owner: ownerLbl.trim() || null,
@@ -1207,7 +1227,10 @@ function EditRow({ a, owner, primary, excluded, onDone, onCancel }: {
              anchorMoved || exclMoved || kindMoved
                ? ["accounts", "today"] : ["accounts"]);
     },
-    onError: (e) => onDone(errText(e)),
+    // a save is several doors in a row: one that fails can leave the
+    // earlier ones written (an exclusion lands, the pin is then refused),
+    // so the cache is re-read rather than left showing the old switches
+    onError: (e) => onDone(errText(e), ["accounts", "settings", "today"]),
   });
 
   const setHidden = useMutation({

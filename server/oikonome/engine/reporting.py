@@ -1290,32 +1290,71 @@ def compute_spending(conn, today: dt.date | None = None) -> dict:
 
 # ---- cash flow & savings ------------------------------------------------
 # investment-provider tokens as they appear in bank-transaction descriptors
-# and institution names — the same list decides what is a bank, what is an
-# own-money inflow and what is investment funding
+# and institution names. Income no longer reads them to decide which
+# ACCOUNTS are banks (see _bank_account_ids); they still name the provider
+# on a deposit's own line, and the investment-funding and cash-cost figures
+# use them to tell a provider's accounts from a bank's.
 _INV_PROVIDERS = ("acorns", "betterment", "coinbase", "fidelity", "robinhood",
                   "schwab", "sofi invest", "vanguard", "wealthfront")
 _INV_PATTERNS = ["%" + p + "%" for p in _INV_PROVIDERS]
 # own-money inflows a bank stamps INCOME: transfers back from an investment
 # provider (stock sells moved to checking — the budget engine treats
 # those as shortfall funding, never income) and "Ext Trans" (transfers
-# between own accounts at different banks). Literal SQL so _INCOME_WHERE
-# keeps its one parameter; the doubled percents survive the param step.
-_NOT_OWN_MONEY_SQL = " ".join(
-    f"AND LOWER(t.name) NOT LIKE '%%{tok}%%'" for tok in (*_INV_PROVIDERS, "ext trans"))
+# between own accounts at different banks). A deposit the aggregator
+# tagged as wages is a paycheck whoever pays it — an employer can share a
+# provider's name — so the descriptor test leaves it alone. Literal SQL so
+# _INCOME_WHERE keeps its one parameter; the doubled percents survive the
+# param step.
+_NOT_OWN_MONEY_SQL = (
+    "AND (COALESCE(t.category_detailed, '') = 'INCOME_WAGES' OR ("
+    + " AND ".join(f"LOWER(t.name) NOT LIKE '%%{tok}%%'"
+                   for tok in (*_INV_PROVIDERS, "ext trans"))
+    + "))")
+
+# A deposit into a brokerage's cash account — a depository account held in
+# the same login as an investment account — counts as income only when it
+# is stamped INCOME. That account takes the household's paycheck and earns
+# interest like any bank account, but it also receives the cash leg of every
+# sale and sweep out of the portfolio beside it, which is the household's
+# own money moving, not money earned. The test is the login's account
+# TYPES, never the institution's name: a bank whose name reads like a
+# brokerage is a bank. Hand-made and file-imported accounts all share the
+# item 'manual', which is no login at all — a hand-made IRA beside an
+# imported checking account must not turn that checking into brokerage
+# cash and drop its paychecks.
+_BROKERAGE_CASH_ONLY_INCOME_SQL = """AND (COALESCE(t.category_override,
+                                          t.category_primary, '') = 'INCOME'
+              OR NOT EXISTS (SELECT 1 FROM accounts ba
+                             JOIN accounts ia ON ia.item_id = ba.item_id
+                                             AND ia.type = 'investment'
+                             WHERE ba.id = t.account_id
+                               AND ba.item_id <> 'manual'))"""
 
 
-def _bank_account_ids(conn) -> list[str]:
-    """Depository accounts at a real bank — not an investment provider's cash
-    sweep (a robo-advisor's "Cash" account), which is depository-typed but
-    isn't bank money. Reaching these rows by joining accounts and items inside a full
-    scan of transactions costs the whole ledger; resolving the handful of
-    account ids first lets the same predicate run as an index probe over the
-    bank rows alone. A NULL institution name fails the LIKE test here exactly
-    as it failed it inside the join."""
+def _bank_account_ids(conn, *, brokerage_cash: bool = True) -> list[str]:
+    """The household's bank accounts for income: every depository account,
+    by its TYPE. The institution's name decides nothing — a paycheck banked
+    at a bank whose name reads like a brokerage is income on every surface,
+    exactly as the budget's month plan already counted it. A brokerage's
+    cash account (depository, in a login that also holds an investment
+    account) is included, and _INCOME_WHERE counts only its INCOME-stamped
+    deposits; `brokerage_cash=False` leaves those accounts out, for the
+    coverage question (from when is income measured), where a cash account
+    that only ever received sweeps would call years known that no paycheck
+    was ever seen in.
+
+    Reaching these rows by joining accounts inside a full scan of
+    transactions costs the whole ledger; resolving the handful of account
+    ids first lets the same predicate run as an index probe over the bank
+    rows alone."""
+    cash = "" if brokerage_cash else """
+             AND NOT EXISTS (SELECT 1 FROM accounts ia
+                             WHERE ia.item_id = a.item_id
+                               AND ia.item_id <> 'manual'
+                               AND ia.type = 'investment')"""
     return [r["id"] for r in conn.execute(
-        """SELECT a.id FROM accounts a JOIN items i ON i.id=a.item_id
-           WHERE a.type='depository'
-             AND LOWER(i.institution_name) NOT LIKE ALL(%s)""", (_INV_PATTERNS,))]
+        f"""SELECT a.id FROM accounts a
+           WHERE a.type='depository'{cash}""")]
 
 
 # A deposit stamped TRANSFER_IN whose partial links do not use it up. A
@@ -1347,10 +1386,13 @@ PARTLY_CLAIMED_DEPOSIT = """(t.category_override = 'TRANSFER_IN'
         < -t.amount - 0.005)"""
 
 # The income definition, as SQL over bank rows. Own-money inflows a bank
-# stamps INCOME are excluded (_NOT_OWN_MONEY_SQL). Callers supply the bank
-# account ids as the one parameter.
+# stamps INCOME are excluded (_NOT_OWN_MONEY_SQL), and so is a brokerage
+# cash account's deposit that is not stamped INCOME
+# (_BROKERAGE_CASH_ONLY_INCOME_SQL). Callers supply the bank account ids
+# as the one parameter.
 _INCOME_WHERE = f"""t.removed=0 AND t.amount < 0 AND t.account_id = ANY(%s)
               {_NOT_OWN_MONEY_SQL}
+              {_BROKERAGE_CASH_ONLY_INCOME_SQL}
               AND (COALESCE(t.category_override, t.category_primary, '')
                    NOT IN ('TRANSFER_IN','TRANSFER_OUT')
                    OR {PARTLY_CLAIMED_DEPOSIT})
@@ -1413,14 +1455,134 @@ def month_flows(conn, year: int, month: int) -> dict:
             FROM transactions t {REIMB_PARTIAL_JOIN}
             WHERE {SPEND_WHERE} AND t.date >= %s AND t.date < %s {excl}""",
         (start, end, *ex_p)).fetchone()["amt"]
-    inc = conn.execute(
-        f"""SELECT {_R2.format(f"COALESCE(SUM({INCOME_NET}), 0)")} amt
-            FROM transactions t
-            WHERE {_INCOME_WHERE} AND t.date >= %s AND t.date < %s {excl}""",
-        (_bank_account_ids(conn), start, end, *ex_p)).fetchone()["amt"]
-    if not _income_known(_income_coverage(conn), f"{year:04d}-{month:02d}"):
+    # the exclusion just read, handed on so the income half does not read
+    # the config a second time
+    inc = month_income(conn, year, month, memo={
+        budget._memo_key("reporting.excluded_accounts_sql"): (excl, ex_p)})
+    if inc is None:
         return {"out": out, "in": None, "net": None}
     return {"out": out, "in": inc, "net": round(inc - out, 2)}
+
+
+def _month_income_scope(conn, year: int, month: int, *,
+                        memo: dict | None, until: dt.date | None,
+                        excluded: list | None) -> tuple[str, tuple] | None:
+    """(WHERE, params) over `transactions t` for the month's income rows,
+    or None for a month before the bank feed starts — the shared half of
+    month_income and month_income_rows.
+
+    `until` (exclusive) cuts the month short: a day viewed inside the month
+    counts what had landed by then, not deposits that came after it.
+    `excluded` is the excluded-account list of the config the month is
+    judged under (a closed month's snapshot); without it the live config's
+    list applies. An explicit list never reads or fills the memo's live
+    exclusion, so the two can never be served for each other."""
+    start = dt.date(year, month, 1)
+    end = (start + dt.timedelta(days=32)).replace(day=1)
+    if until is not None:
+        end = min(end, until)
+
+    def _once(name, fn):
+        if memo is None:
+            return fn()
+        key = budget._memo_key(name)
+        if key not in memo:
+            memo[key] = fn()
+        return memo[key]
+
+    cov = _once("reporting.income_coverage", lambda: _income_coverage(conn))
+    if not _income_known(cov, f"{year:04d}-{month:02d}"):
+        return None
+    if excluded is None:
+        excl, ex_p = _once("reporting.excluded_accounts_sql",
+                           lambda: excluded_accounts_sql(conn, memo=memo))
+    else:
+        excl, ex_p = (("AND NOT (t.account_id = ANY(%s))", (list(excluded),))
+                      if excluded else ("", ()))
+    bank = _once("reporting.bank_account_ids",
+                 lambda: _bank_account_ids(conn))
+    return (f"{_INCOME_WHERE} AND t.date >= %s AND t.date < %s {excl}",
+            (bank, start, end, *ex_p))
+
+
+def month_income(conn, year: int, month: int, *,
+                 memo: dict | None = None, until: dt.date | None = None,
+                 excluded: list | None = None) -> float | None:
+    """month_flows' `in` alone — the month's income by the Cash Flow
+    definition (_INCOME_WHERE), None for a month before the bank feed
+    starts. The budget's month plan reads only this half, once per month
+    of a window (the fixed-spend totals of an all-history Cash Flow run it
+    for every month of the ledger), so it skips the spend sum, and with
+    the request's `memo` the per-household inputs — the bank accounts,
+    the exclusion, the months the feed covers — are read once per
+    request instead of once per month. `until` and `excluded`: see
+    _month_income_scope."""
+    scope = _month_income_scope(conn, year, month, memo=memo, until=until,
+                                excluded=excluded)
+    if scope is None:
+        return None
+    where, params = scope
+    return conn.execute(
+        f"""SELECT {_R2.format(f"COALESCE(SUM({INCOME_NET}), 0)")} amt
+            FROM transactions t WHERE {where}""", params).fetchone()["amt"]
+
+
+def month_deposit_rows(conn, year: int, month: int, since: dt.date,
+                       until: dt.date, *, excluded: list,
+                       memo: dict | None = None) -> tuple[list[dict], bool]:
+    """Every deposit dated [since, until) the budget's month plan reads,
+    from ONE statement: the rows a paycheck occurrence may be matched
+    against (`matchable`: depository, not a transfer — the _inflow_rows
+    rule, pending included) and the rows the ledger counts as the month's
+    income (`counted`: _INCOME_WHERE, with `net` its contribution). Both
+    flags come from the same snapshot, so a pending paycheck that posts
+    between two reads cannot be counted once as each.
+
+    `excluded` (with the linked-account shadows) drops accounts entirely.
+    Returns (rows, known): `known` is False for a month before the bank
+    feed starts, whose ledger income is unknown — `counted` is then False
+    on every row."""
+    from . import links, merchant_sql
+    key = budget._memo_key("reporting.month_deposit_rows", year, month,
+                           since, until, sorted(excluded))
+    if memo is not None and key in memo:
+        return memo[key]
+
+    def _once(name, fn):
+        if memo is None:
+            return fn()
+        k = budget._memo_key(name)
+        if k not in memo:
+            memo[k] = fn()
+        return memo[k]
+
+    cov = _once("reporting.income_coverage", lambda: _income_coverage(conn))
+    known = _income_known(cov, f"{year:04d}-{month:02d}")
+    bank = _once("reporting.bank_account_ids",
+                 lambda: _bank_account_ids(conn)) if known else []
+    drop = list(excluded) + links.shadow_ids(conn)
+    rows = conn.execute(
+        f"""SELECT t.id AS txn_id, t.date, -t.amount AS amount,
+                   {merchant_sql.RAW_KEY} AS payee, t.name,
+                   t.merchant_id::text AS merchant_id, t.pending,
+                   ({_INCOME_WHERE}) AS counted,
+                   ({INCOME_NET})::float8 AS net,
+                   (a.type = 'depository'
+                    AND COALESCE(t.category_override, t.category_primary, '')
+                        NOT IN ('TRANSFER_OUT','TRANSFER_IN')) AS matchable
+            FROM transactions t JOIN accounts a ON a.id = t.account_id
+            WHERE t.removed = 0 AND t.amount < 0
+              AND t.date >= %s AND t.date < %s
+              AND NOT (t.account_id = ANY(%s))
+              {budget.PERSONAL_ONLY_SQL}
+            ORDER BY t.amount ASC, t.id""",
+        (bank, since, until, drop)).fetchall()
+    out = [dict(r, date=as_date(r["date"]),
+                counted=bool(known and r["counted"])) for r in rows]
+    out = [r for r in out if r["matchable"] or r["counted"]]
+    if memo is not None:
+        memo[key] = (out, known)
+    return out, known
 
 
 _MON = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep",
@@ -1828,7 +1990,17 @@ def income_window(conn, today: dt.date, range_key: str) -> dict:
     monthly series, and the previous equal window's figures for the delta.
     Pure SQL plus a per-row classify pass — cheap at any range."""
     bank = _bank_account_ids(conn)
-    start, end, prev, label, live = _range_window(conn, today, range_key, bank)
+    # The window opens, and its pace divides, from the first month income
+    # is measured — the coverage rule the Year and Month lenses use, which
+    # leaves out a brokerage's cash account. That account's rows are summed
+    # when stamped INCOME, but one that only ever received sweeps would
+    # otherwise open "All" years before the first paycheck and spread the
+    # income over months nobody measured. A household whose only bank is
+    # such an account still anchors on it — there is nothing else to open
+    # the window at.
+    anchor = _bank_account_ids(conn, brokerage_cash=False) or bank
+    start, end, prev, label, live = _range_window(conn, today, range_key,
+                                                  anchor)
     # the window's own last day, as on the Spending tab — "1m" ends where
     # last month did, so its pace divides by that one month
     last_day = end - dt.timedelta(days=1)
@@ -1882,7 +2054,7 @@ def income_window(conn, today: dt.date, range_key: str) -> dict:
                    if k not in current_keys and f["amt"] > 0][:10]
     return {
         "from": start.isoformat(), "to": last_day.isoformat(), "label": label,
-        "months": _pace_months(conn, bank, start, last_day),
+        "months": _pace_months(conn, anchor, start, last_day),
         "live_month": live,
         "total": round(sum(kinds.values()), 2),
         "prev_total": (round(sum(prev_kinds.values()), 2)
@@ -2164,7 +2336,8 @@ def _income_coverage(conn) -> tuple[set[str], str | None]:
     (_counted_rows_where, the predicate _first_ledger_month uses for the
     bank accounts), so the months a window or a lens calls known are the
     months whose deposits are actually summed."""
-    where, params = _counted_rows_where(conn, _bank_account_ids(conn))
+    where, params = _counted_rows_where(
+        conn, _bank_account_ids(conn, brokerage_cash=False))
     rows = conn.execute(
         f"""SELECT to_char(t.date,'YYYY') yr, MIN(t.date) AS d
             FROM transactions t WHERE {where}
@@ -2778,21 +2951,28 @@ _INTEREST_WORDS = ("interest charge", "purchase interest", "finance charge",
                    "interest charged")
 
 
-def _cash_account_ids(conn) -> list[str]:
+def _cash_account_ids(conn, *,
+                      types: tuple[str, ...] = ("depository", "credit"),
+                      ) -> list[str]:
     """Depository and credit accounts at a real bank — the accounts whose
     fees and interest are the cost of holding cash and carrying a balance.
     An investment provider's accounts are out: their fee drag is
     compute_fees' subject, and counting a custodian fee here would report
-    it twice on one page."""
+    it twice on one page. The provider is told by its name, not by the
+    login holding an investment account: a bank that also offers a
+    brokerage account in the same login is still the bank whose overdraft
+    and card interest the household paid. `types` narrows the set — the
+    interest-earned figure beside the costs reads the depository half of
+    this same set, so "net vs earned" compares the same accounts."""
     from . import links
     shadows = links.shadow_ids(conn)
     return [r["id"] for r in conn.execute(
         f"""SELECT a.id FROM accounts a JOIN items i ON i.id=a.item_id
-            WHERE a.type IN ('depository','credit')
+            WHERE a.type = ANY(%s)
               AND LOWER(COALESCE(i.institution_name,'')) NOT LIKE ALL(%s)
               AND NOT (a.id = ANY(%s))
               AND ({budget.COMBINE_OR} a.entity_id IS NULL)""",
-        (_INV_PATTERNS, shadows))]
+        (list(types), _INV_PATTERNS, shadows))]
 
 
 def cash_cost_kind(name: str, detailed: str) -> str:
@@ -2867,9 +3047,11 @@ def compute_cash_costs(conn, today: dt.date | None = None) -> dict:
                 for k, v in b.items()}
                for b in sorted(years.values(), key=lambda b: b["year"],
                                reverse=True)]
-    # interest earned this year, on the same accounts, so "net vs earned"
-    # compares like with like (dividends are a brokerage's, not a bank's)
-    bank = _bank_account_ids(conn)
+    # interest earned this year, on the same accounts the costs are read
+    # from, so "net vs earned" compares like with like (dividends are a
+    # brokerage's, not a bank's). Depository only: a card's interest refund
+    # is already netted on the cost side as a negative charge.
+    bank = _cash_account_ids(conn, types=("depository",))
     excl, ex_p = excluded_accounts_sql(conn)
     earned = conn.execute(
         f"""SELECT COALESCE(SUM({INCOME_NET}),0) AS amt FROM transactions t

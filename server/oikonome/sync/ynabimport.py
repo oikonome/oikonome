@@ -19,7 +19,8 @@ from ..engine.compat import as_date
 from . import flowmap, reimport
 from .base import (FileImportIds, Transaction, drop_before_history, mask_file_raw,
                    upsert_transactions)
-from .csvimport import bounded_dict_reader, date_order, scrub_identifiers
+from .csvimport import (bounded_dict_reader, date_order, parse_money_text,
+                        scrub_identifiers)
 from .rowcap import capped
 from .dedup import Deduper
 
@@ -48,8 +49,10 @@ def looks_like_ynab(header: list[str]) -> bool:
 
 
 def _money(s: str) -> float:
-    s = (s or "").strip().replace("$", "").replace(",", "")
-    return float(s) if s else 0.0
+    # the CSV importer's reading of a money cell: a decimal comma is a
+    # decimal, never a thousands mark to delete
+    s = (s or "").strip()
+    return parse_money_text(s) if s else 0.0
 
 
 def _date(s: str, order: str = "mdy") -> dt.date:

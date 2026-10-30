@@ -67,7 +67,15 @@ def _checking_balance(conn, cfg: dict) -> float | None:
 
 
 def _checking_start(conn, cfg: dict) -> tuple[float | None, bool, bool]:
-    """The runway's starting checking balance; whether the bank reported
+    """The runway's starting checking balance, its available/current
+    flag and its unset flag — checking_pick without the account id."""
+    return checking_pick(conn, cfg)[1:]
+
+
+def checking_pick(conn, cfg: dict) -> tuple[str | None, float | None, bool, bool]:
+    """The household's primary checking account as every surface honours
+    it — the id the runway starts from, then the runway's starting
+    checking balance; whether the bank reported
     it as an AVAILABLE balance (True) or the walk fell back to the current
     balance (False) — a pending deposit is inside the first and not the
     second, which the payday re-date has to know; and whether the balance
@@ -91,16 +99,12 @@ def _checking_start(conn, cfg: dict) -> tuple[float | None, bool, bool]:
     runway would then start from money every other figure on the page
     ignores, and an old high-balance account kept linked would hide the
     household actually running out of cash."""
-    excluded = budget.excluded_account_ids(cfg)
     acct_id = cfg.get("checking_account_id")
     # a pinned account that has since become a linked group's shadow (its
     # source went stale or errored and the healthy twin took over) would
     # feed a frozen balance into every runway number — honour the live
-    # failover the rest of the money math already follows
-    from . import links
-    if acct_id and (acct_id in set(links.shadow_ids(conn))
-                    or acct_id in set(excluded)):
-        acct_id = None
+    # failover the rest of the money math already follows; an excluded one
+    # is money every other figure ignores. pinned_account_live drops both.
     # the one rule for a pin the forecast honours (pin_is_live): the
     # checklist, the wizard and the auto-pin read the same answer
     if acct_id and not pinned_account_live(conn, cfg, acct_id):
@@ -118,7 +122,7 @@ def _checking_start(conn, cfg: dict) -> tuple[float | None, bool, bool]:
                       balance_available IS NOT NULL AS has_avail
                FROM accounts WHERE id = %s""", (acct_id,)).fetchone()
         if row and row["bal"] is not None:
-            return row["bal"], bool(row["has_avail"]), False
+            return acct_id, row["bal"], bool(row["has_avail"]), False
     # Only a row that carries a balance may win the pick: every file
     # import (Mint, QIF, OFX, a competitor export) creates a checking row
     # nobody has set a balance on, and sorting it as $0 would let it beat a
@@ -127,21 +131,21 @@ def _checking_start(conn, cfg: dict) -> tuple[float | None, bool, bool]:
     # excluded, business, shadow, hidden or disconnected-bank account)
     eligible = eligible_checking_ids(conn, cfg)
     rows = conn.execute(
-        """SELECT COALESCE(balance_available, balance_current) AS bal,
+        """SELECT id, COALESCE(balance_available, balance_current) AS bal,
                   balance_available IS NOT NULL AS has_avail
            FROM accounts WHERE id = ANY(%s)
            ORDER BY COALESCE(balance_available, balance_current) IS NULL,
                     COALESCE(balance_current, 0) DESC LIMIT 1""",
         (eligible,)).fetchall() if eligible else []
     if not rows:
-        return None, False, False
+        return None, None, False, False
     row = rows[0]
     if row["bal"] is not None:
-        return row["bal"], bool(row["has_avail"]), False
+        return row["id"], row["bal"], bool(row["has_avail"]), False
     # checking accounts exist but none carries a balance yet: that is a
     # balance the household has not set, not a missing account — $0 here
     # lets the surfaces ask for today's balance instead of for an account
-    return 0.0, False, True
+    return row["id"], 0.0, False, True
 
 
 def eligible_checking_ids(conn, cfg: dict) -> list[str]:
@@ -179,7 +183,16 @@ def pinned_account_live(conn, cfg: dict, acct_id: str) -> bool:
     hidden, its bank is not a disconnected or restored shell, and it is
     personal money unless the household combines entities. A pin that
     fails here is kept in the settings but anchors nothing: the checklist
-    reads it as unset and the auto-pin may replace it."""
+    reads it as unset and the auto-pin may replace it.
+
+    An account the household excluded from its budget, or one that is a
+    linked group's shadow (its healthy twin carries the balance), anchors
+    nothing either — checking_pick drops both — so the checklist and the
+    Accounts page must not call it the primary checking."""
+    from . import links
+    if (acct_id in set(budget.excluded_account_ids(cfg))
+            or acct_id in set(links.shadow_ids(conn))):
+        return False
     row = conn.execute(
         """SELECT 1 FROM accounts a LEFT JOIN items i ON i.id = a.item_id
            WHERE a.id = %s AND a.user_removed_at IS NULL
@@ -188,6 +201,77 @@ def pinned_account_live(conn, cfg: dict, acct_id: str) -> bool:
              AND (%s OR a.entity_id IS NULL)""",
         (acct_id, bool(cfg.get("combine_entities")))).fetchone()
     return row is not None
+
+
+def _pin_facts(conn, cfg: dict, acct_id: str) -> dict | None:
+    """What decides whether a pin on `acct_id` anchors anything: None when
+    no row carries the id, else its standing on each rule."""
+    from . import links
+    row = conn.execute(
+        """SELECT a.user_removed_at IS NOT NULL AS hidden, a.entity_id,
+                  COALESCE(a.balance_available, a.balance_current) IS NULL
+                    AS no_balance,
+                  (i.aggregator IN ('plaid','mx','simplefin','simplefin-org')
+                   AND COALESCE(i.status, '') IN ('archived', 'restored'))
+                    AS bank_gone
+           FROM accounts a LEFT JOIN items i ON i.id = a.item_id
+           WHERE a.id = %s""", (acct_id,)).fetchone()
+    if row is None:
+        return None
+    return {"hidden": bool(row["hidden"]),
+            "business": bool(row["entity_id"])
+                        and not cfg.get("combine_entities"),
+            "bank_gone": bool(row["bank_gone"]),
+            "no_balance": bool(row["no_balance"]),
+            "excluded": acct_id in set(budget.excluded_account_ids(cfg)),
+            "shadow": acct_id in set(links.shadow_ids(conn))}
+
+
+def pin_refusal(conn, cfg: dict, acct_id: str) -> str | None:
+    """Why the household may not pin `acct_id` as its primary checking —
+    the sentence every pin door answers with — or None when it may. The
+    same rules pinned_account_live applies, so a pin that is saved is one
+    the forecast honours (a balance aside: a row nobody has set one on is
+    pinnable, and its balance is the next thing asked)."""
+    f = _pin_facts(conn, cfg, acct_id)
+    if f is None:
+        return "account not found"
+    if f["bank_gone"]:
+        return ("that account's bank is disconnected — reconnect it, or "
+                "pick a live checking account")
+    if f["business"]:
+        return ("a business account cannot be the household's primary "
+                "checking — move it back to personal first, or turn on "
+                "the combined view")
+    if f["excluded"]:
+        return ("an account excluded from the budget cannot be the "
+                "household's primary checking — include it first")
+    if f["hidden"] or f["shadow"]:
+        return ("the cash forecast skips this account (it is hidden, or "
+                "the backup source of a linked pair) — pin the account it "
+                "is linked to, or show it again first")
+    return None
+
+
+def pin_unused_reason(conn, cfg: dict, anchor: str | None) -> str | None:
+    """Why the saved pin is not the account the forecast starts from
+    (`anchor`, checking_pick's id), in the words the Accounts page shows
+    beside it; None when there is no pin or it is the anchor. Read from
+    the rules checking_pick applies, so the page never guesses."""
+    pin = cfg.get("checking_account_id")
+    if not pin or pin == anchor:
+        return None
+    f = _pin_facts(conn, cfg, pin)
+    if f is None:
+        return "account removed"
+    for key, words in (("excluded", "excluded"), ("hidden", "hidden"),
+                       ("shadow", "backup source"),
+                       ("bank_gone", "bank disconnected"),
+                       ("business", "business account"),
+                       ("no_balance", "no balance set")):
+        if f[key]:
+            return words
+    return "not a live account"
 
 
 def pin_is_live(conn, cfg: dict) -> bool:
@@ -261,6 +345,97 @@ def auto_pin_primary_checking(conn) -> str | None:
         return ids[0]
 
 
+def standing_surplus(conn, st: dict, today: dt.date, *,
+                     memo: dict | None = None, cfg: dict | None = None,
+                     bill_rows: list | None = None,
+                     closed: bool = False) -> float | None:
+    """The plan surplus of an ordinary month, from a month_status `st`.
+
+    month_status's plan_surplus is built from that month's own income —
+    what landed plus the checks still due — so a three-paycheck month, a
+    tax refund or a check that has not arrived yet moves it. That is right
+    for the month itself and wrong for the months after it. The standing
+    figure swaps the month's income for what the household's income series
+    bring in on average (budget.income_actual_monthly, the Bills page's
+    headline), keeping the same bills, budgets and savings plan. When the
+    month's income was the budgeted figure already (no income series), it
+    is standing as it is. None when `st` has no plan surplus.
+
+    A closed month is read under the schedule and config it was judged
+    under (`bill_rows`, `cfg`: its snapshot), so archiving a series today
+    cannot rewrite a past year's figure. A closed month with no frozen
+    schedule has no series of its own to average, and today's series do
+    not speak for it (a job that started later would count at its
+    scheduled rate, one that ended would vanish); its standing income is
+    instead what the ledger realised (_realised_income_average)."""
+    ps = st.get("plan_surplus")
+    if ps is None:
+        return None
+    if (st.get("income_received") is None
+            and st.get("income_expected") is None):
+        return ps
+    if cfg is None:
+        cfg = budget.load_config(conn, memo=memo)
+    if closed and bill_rows is None:
+        avg = _realised_income_average(conn, cfg, today, memo=memo)
+        if avg is None:
+            return ps
+        return round(ps - float(st.get("income") or 0.0) + avg, 2)
+    series = [b for b in budget._recurring_bills(
+                  conn, caps=cfg.get("occurrence_caps"),
+                  disabled=cfg.get("disabled_bills"), income=True, memo=memo,
+                  rows=bill_rows)
+              if (b["recurrence"] or {}).get("frequency")]
+    avg = budget.income_actual_monthly(
+        conn, today, series, memo=memo, bill_rows=bill_rows,
+        excluded=budget.excluded_account_ids(cfg))["monthly"]
+    if avg <= 0:
+        return ps
+    return round(ps - float(st.get("income") or 0.0) + avg, 2)
+
+
+# A realised average needs a few whole months behind it before it says more
+# than the month itself does — the same floor income_actual_monthly sets
+# before a series' deposits outrank its schedule.
+REALISED_INCOME_MIN_MONTHS = 3
+
+
+def _realised_income_average(conn, cfg: dict, today: dt.date, *,
+                             memo: dict | None = None) -> float | None:
+    """The income a closed month's household realised per month: the
+    average, over the twelve months through `today`'s month, of each
+    whole month's income exactly as month_status read it for a month
+    with no frozen schedule (budget._month_income, closed) — the deposits
+    that landed, each check counted for the month it pays. Nothing is
+    projected, so a series that started later adds no month it did not
+    pay, and one that ended keeps the months it did.
+
+    Months before the ledger's first whole month are no data, not months
+    of no income, and are left out; so is a month the reader has nothing
+    for. None when fewer than REALISED_INCOME_MIN_MONTHS whole months are
+    left — the month's own surplus is then the best figure there is."""
+    first = budget.ledger_start(conn, budget.excluded_account_ids(cfg))
+    if first is None:
+        return None
+    if first.day > 1:
+        first = (first.replace(day=1) + dt.timedelta(days=32)).replace(day=1)
+    y, m = today.year, today.month
+    got = []
+    for _ in range(12):
+        start = dt.date(y, m, 1)
+        if start < first:
+            break
+        end = start.replace(day=calendar.monthrange(y, m)[1])
+        _, received, _ = budget._month_income(conn, cfg, end, closed=True,
+                                              memo=memo)
+        if received is not None:
+            got.append(received)
+        y, m = (y, m - 1) if m > 1 else (y - 1, 12)
+    if len(got) < REALISED_INCOME_MIN_MONTHS:
+        return None
+    return sum(got) / len(got)
+
+
 def next_paycheck(conn, today: dt.date | None = None, *,
                   memo: dict | None = None) -> dt.date | None:
     """Earliest projected paycheck (income-series occurrence) strictly after
@@ -280,19 +455,28 @@ def next_paycheck(conn, today: dt.date | None = None, *,
     return up[0]["due"] if up else None
 
 
-def _paycheck_amount(conn, payee: str, row_amount: float, today: dt.date,
-                     cap: float | None = None) -> float:
+def _paycheck_amount(conn, bill: dict, today: dt.date,
+                     cap: float | None = None, *,
+                     claims: dict[str, list[dict]] | None = None) -> float:
     """Median of the last 3 real deposits for this income series (falls back
     to the configured amount). Wide 0.5–2× band.
+
+    `bill` is the processed series record (budget._recurring_bills). Its
+    deposits are the ones it claims among every income series
+    (budget._claim_income_rows) — a sibling whose name shares a first word
+    keeps its own checks, so a pension is never sized from a payroll that
+    happens to fall inside its band. `claims` is that grouping when the
+    caller already holds it.
 
     `cap` = the active income-scenario biweekly take-home: when the
     retirement-saving toggle flips, real deposits lag the new reality by 2-3
     paychecks, so the estimate is capped at min(median, scenario)."""
-    key = budget._key_token(payee or "")
-    if not key:
-        return row_amount if cap is None else min(row_amount, cap)
-    events = bills._events(
-        [r for r in bills._income_rows(conn, today) if key in r["tokens"]])
+    row_amount = bill["amount"]
+    if claims is None:
+        claims = budget._claim_income_rows(
+            bills._income_rows(conn, today),
+            budget._income_claimants(conn, [bill]))
+    events = bills._events(claims.get(bill["payee"], []))
     core = [e["amount"] for e in events
             if 0.5 * row_amount <= e["amount"] <= 2 * row_amount]
     est = statistics.median(core[-3:]) if len(core) >= 2 else row_amount
@@ -544,13 +728,19 @@ def build(conn, today: dt.date | None = None, days: int = HORIZON_DAYS,
     # it in again on payday would count the same money twice for the days
     # between the deposit and the due date.
     amounts: dict[str, float] = {}
-    for p in budget.upcoming_bill_occurrences(conn, cfg, today, end,
-                                              income=True, memo=memo):
+    paychecks = budget.upcoming_bill_occurrences(conn, cfg, today, end,
+                                                 income=True, memo=memo)
+    # every deposit to the one series it belongs to, once for the walk
+    claims = (budget._claim_income_rows(
+        bills._income_rows(conn, today),
+        budget._income_claimants(conn, [p["occ"]["bill"] for p in paychecks]))
+        if paychecks else {})
+    for p in paychecks:
         payee = p["payee"]
         if payee not in amounts:
             amounts[payee] = _paycheck_amount(
-                conn, payee, p["occ"]["bill"]["amount"], today,
-                cap=pay_caps.get(payee))
+                conn, p["occ"]["bill"], today, cap=pay_caps.get(payee),
+                claims=claims)
         events.append((p["due"], amounts[payee], payee))
 
     # --- daily burn rates ---------------------------------------------------
@@ -581,7 +771,12 @@ def build(conn, today: dt.date | None = None, days: int = HORIZON_DAYS,
         # exactly it), not the smaller month-to-date accrual the Today
         # line quotes as "available so far"
         cur_surplus = max(0.0, st["plan_surplus"] - (st.get("variance") or 0))
-        std_surplus = max(0.0, st["plan_surplus"])
+        # a future month is not this one: this month's surplus is built
+        # from its own deposits (a third paycheck, a tax refund, a check
+        # that has not landed yet), so the months after it take the
+        # standing figure from the averaged income instead
+        std_surplus = max(0.0, standing_surplus(conn, st, today, memo=memo)
+                          or 0.0)
         for y, m in budget.months_spanned(today, end):
             eom = dt.date(y, m, calendar.monthrange(y, m)[1])
             # today IS a month end: the sweep hasn't happened yet, and the

@@ -24,9 +24,11 @@ import datetime as dt
 
 from ..engine.compat import as_date
 from . import flowmap
-from .base import (FileImportIds, Transaction, ensure_split_account,
-                   drop_before_history, upsert_transactions)
-from .csvimport import bounded_dict_reader, date_order, scrub_identifiers
+from .base import (FileImportIds, Transaction, check_split_accounts,
+                   drop_before_history, ensure_split_account, split_former,
+                   mask_long_digits, tally_split, upsert_transactions)
+from .csvimport import (bounded_dict_reader, date_order, parse_money_text,
+                        scrub_identifiers)
 from .rowcap import capped
 from .dedup import Deduper
 
@@ -156,7 +158,8 @@ def import_mint(conn, account_id: str, text: str,
         if not low.get("date") or not low.get("amount"):
             continue
         date = _date(low["date"], order)
-        amt = abs(float(low["amount"].replace(",", "").replace("$", "")))
+        # the CSV rule, so a decimal-comma cell is not read 100x too large
+        amt = abs(parse_money_text(low["amount"]))
         # debit = money out = engine positive; credit = in = negative
         amount = amt if low.get("transaction type", "").lower() == "debit" else -amt
         name = (low.get("original description") or low.get("description") or "?").strip()
@@ -168,7 +171,8 @@ def import_mint(conn, account_id: str, text: str,
         # bank's "Account Number" column imports as Mint and would store it
         # verbatim in a column that leaves through /export. Mint's own
         # "Account Name" is a nickname, not an identifier — it is kept (the
-        # per-account split reads it).
+        # per-account split reads it), with any full number in it cut to
+        # the last four on write, as the account's own name is.
         parsed.append((date, amount, name, merchant, cat_raw, acct,
                        scrub_identifiers(row)))
 
@@ -186,13 +190,20 @@ def import_mint(conn, account_id: str, text: str,
         by_acct.setdefault(p[5] or "?", []).append(p)
     total = {"imported": 0, "rows": 0, "skipped_duplicates": 0,
              "split_accounts": {}}
+    check_split_accounts(by_acct)
     for mint_name in sorted(by_acct):
-        target = ensure_split_account(conn, "mint", mint_name)
+        target = ensure_split_account(
+            conn, "mint", mint_name,
+            lines=[(p[0], p[1], p[2]) for p in by_acct[mint_name]])
         out = _import_into(conn, target, by_acct[mint_name],
-                           batch_id=batch_id)
+                           batch_id=batch_id,
+                           former=split_former("mint", mint_name, target))
         for k in ("imported", "rows", "skipped_duplicates"):
             total[k] += out[k]
-        total["split_accounts"][mint_name] = out["imported"]
+        # keyed by the name as the account holds it: the full number of
+        # an account named by its number never reaches the response
+        tally_split(total["split_accounts"], mask_long_digits(mint_name),
+               out["imported"])
     total["note"] = (f"file contains {len(by_acct)} accounts — split "
                      f"into one account per Mint account (the selected "
                      f"account was not used)")
@@ -200,10 +211,10 @@ def import_mint(conn, account_id: str, text: str,
 
 
 def _import_into(conn, account_id: str, parsed: list[tuple], *,
-                 batch_id: str | None) -> dict:
+                 batch_id: str | None, former: tuple[str, ...] = ()) -> dict:
     deduper = Deduper(conn, account_id, "mint", [p[0] for p in parsed])
     txns: list[Transaction] = []
-    ids = FileImportIds("mint", account_id)
+    ids = FileImportIds("mint", account_id, former=former)
     skipped_dupes = 0
     for date, amount, name, merchant, cat_raw, _acct, raw in parsed:
         if deduper.claim(date, amount, name, merchant):

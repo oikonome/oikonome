@@ -166,7 +166,8 @@ def stored_account_id(conn, aid: str, cache: dict | None = None) -> str:
 
 
 def _candidates(conn, institution_id, institution_name, new_item_id):
-    """Accounts on a TOKENLESS item of the same institution.
+    """Accounts on a TOKENLESS item of the same institution — or of the
+    Item, at any institution, that named this link as its replacement.
 
     Keyed on having no access token rather than on `status = 'restored'`,
     which would adopt almost nothing in practice: a restored item only
@@ -196,7 +197,8 @@ def _candidates(conn, institution_id, institution_name, new_item_id):
     mx_live = bool(cfg.get("mx_user_guid") and cfg.get("mx_client_id")
                    and cfg.get("mx_api_key"))
     return conn.execute(
-        """SELECT a.id, a.mask, a.type, a.subtype, a.name, a.item_id
+        """SELECT a.id, a.mask, a.type, a.subtype, a.name, a.item_id,
+                  a.type_user_set, a.raw->>'type' AS feed_type
              FROM accounts a JOIN items i ON i.id = a.item_id
             -- tokenless, or the one Item THIS link replaced (a relink for
             -- more history) that kept its token for a release Plaid has
@@ -220,20 +222,108 @@ def _candidates(conn, institution_id, institution_name, new_item_id):
                                        AND COALESCE(b.status, '')
                                            NOT IN ('archived', 'restored')))
                             OR (i.aggregator = 'mx' AND NOT %s))))
-              -- institution_id FIRST and on its own when we have one:
-              -- names drift between what a restore carries and what Plaid
-              -- returns for the same bank ('Acme' vs 'Acme Bank'), so a
-              -- name comparison quietly half-works. The name is only a
-              -- fallback for a restored item old enough to have no id
-              -- recorded.
-              AND (CASE WHEN %s::text IS NOT NULL
-                             AND i.institution_id IS NOT NULL
-                        THEN i.institution_id = %s::text
-                        ELSE lower(i.institution_name)
-                             = lower(%s::text) END)
+              -- the Item that named THIS link as its replacement is a
+              -- donor whatever its bank: a login that moved to another
+              -- institution (a bank bought the card book) was settled as
+              -- a relink on the strength of its masked accounts, and the
+              -- institution test below would never let it through.
+              -- Otherwise institution_id FIRST and on its own when we
+              -- have one: names drift between what a restore carries and
+              -- what Plaid returns for the same bank ('Acme' vs 'Acme
+              -- Bank'), so a name comparison quietly half-works. The name
+              -- is only a fallback for a restored item old enough to have
+              -- no id recorded.
+              AND (i.raw->>'relinked_by' = %s
+                   OR (CASE WHEN %s::text IS NOT NULL
+                                 AND i.institution_id IS NOT NULL
+                            THEN i.institution_id = %s::text
+                            ELSE lower(i.institution_name)
+                                 = lower(%s::text) END))
               AND a.user_removed_at IS NULL""",
-        (new_item_id, new_item_id, mx_live, institution_id, institution_id,
-         institution_name)).fetchall()
+        (new_item_id, new_item_id, mx_live, new_item_id, institution_id,
+         institution_id, institution_name)).fetchall()
+
+
+def feed_identity(row: dict) -> tuple[str | None, str]:
+    """(type, mask) of a held account as the BANK names it.
+
+    A type the person set by hand is theirs, not the feed's: the feed
+    keeps sending its own, and comparing the two would never match. The
+    sync rewrites `raw` from the feed even while it leaves a hand-set
+    `type` alone, so `raw->>'type'` (selected as `feed_type`) is still the
+    bank's word. Where the person has not set the type, the column is the
+    feed's. None when the bank's type is not known (a row from before
+    `raw` was kept, or a source whose raw carries no type)."""
+    mask = (row.get("mask") or "").strip()
+    typ = row.get("feed_type") if row.get("type_user_set") else row.get("type")
+    typ = (typ or "").strip().lower() or None
+    return typ, mask
+
+
+def pair_accounts(pool: list, incoming: list) -> list[tuple[dict, dict]]:
+    """Pair incoming feed accounts with the held accounts they continue.
+
+    Every incoming account is weighed before any is paired, so which one
+    happens to come first can never decide where a history goes.
+
+    1. Exact: the bank's type and the mask agree, and that pair is unique
+       on BOTH sides. Two held accounts (or two incoming ones) sharing a
+       mask and a type are a coincidence, and picking either could weld
+       the wrong history onto a live feed, so neither is paired.
+    2. Fallback, only for a held account whose bank type is unknown: its
+       mask appears exactly once among all incoming accounts and exactly
+       once in the whole pool, whatever the types. A mask that occurs
+       twice on either side cannot say which account it means.
+
+    A held account whose bank type IS known never pairs on its mask alone:
+    a hand-retyped card must not take a checking account that happens to
+    share its last digits. Returns (incoming, held) pairs."""
+    inc = []
+    for a in incoming:
+        mask = (a.get("mask") or "").strip()
+        if mask:
+            inc.append((a, (a.get("type") or "").strip().lower() or None,
+                        mask))
+    held = [(c,) + feed_identity(c) for c in pool]
+    held = [h for h in held if h[2]]
+
+    def count(seq, key):
+        n: dict = {}
+        for k in map(key, seq):
+            n[k] = n.get(k, 0) + 1
+        return n
+
+    inc_exact = count(inc, lambda x: (x[1], x[2]))
+    held_exact = count(held, lambda h: (h[1], h[2]))
+    inc_mask = count(inc, lambda x: x[2])
+    held_mask = count(held, lambda h: h[2])
+    pairs: list[tuple[dict, dict]] = []
+    paired_held: set[int] = set()
+    paired_inc: set[int] = set()
+    for i, (a, typ, mask) in enumerate(inc):
+        if typ is None or inc_exact[(typ, mask)] != 1:
+            continue
+        if held_exact.get((typ, mask)) != 1:
+            if held_exact.get((typ, mask), 0) > 1:
+                log.info("reconnect: %s candidates share mask %s — not "
+                         "adopting", held_exact[(typ, mask)], mask)
+            continue
+        j = next(j for j, h in enumerate(held) if (h[1], h[2]) == (typ, mask))
+        pairs.append((a, held[j][0]))
+        paired_held.add(j)
+        paired_inc.add(i)
+    for j, (c, typ, mask) in enumerate(held):
+        if typ is not None or j in paired_held:
+            continue
+        if held_mask[mask] != 1 or inc_mask.get(mask) != 1:
+            continue
+        i = next(i for i, x in enumerate(inc) if x[2] == mask)
+        if i in paired_inc:
+            continue
+        pairs.append((inc[i][0], c))
+        paired_held.add(j)
+        paired_inc.add(i)
+    return pairs
 
 
 def _rewrite_account_id_in_config(conn, old_id: str, new_id: str) -> list[str]:
@@ -679,32 +769,16 @@ def adopt_accounts(conn, *, item_id: str, institution_id: str | None,
         # link is what replaced it.
         retire_replaced_shells(conn, live_item_id=item_id, incoming=incoming)
         return []
-    taken: set[str] = set()
     donors: set[str] = set()
     done: list[dict] = []
-    for acct in incoming:
+    for acct, old in pair_accounts(pool, incoming):
         new_id = str(acct.get("account_id") or "")
         mask = (acct.get("mask") or "").strip()
-        typ = (acct.get("type") or "").strip().lower()
-        if not new_id or not mask:
-            continue                      # no mask, no safe identity
+        if not new_id:
+            continue                      # no id, nothing to rename onto
         if conn.execute("SELECT 1 FROM accounts WHERE id = %s",
                         (new_id,)).fetchone():
             continue                      # already ours; nothing to adopt
-        hits = [c for c in pool
-                if c["id"] not in taken
-                and (c["mask"] or "").strip() == mask
-                and (c["type"] or "").strip().lower() == typ]
-        if len(hits) != 1:
-            # zero: nothing to adopt. more than one: two accounts at this
-            # institution share a mask and a type, and picking either could
-            # weld the wrong history onto a live feed — refuse and let the
-            # ordinary path create a fresh account.
-            if len(hits) > 1:
-                log.info("reconnect: %s candidates share mask %s — not "
-                         "adopting", len(hits), mask)
-            continue
-        old = hits[0]
         # The rename and the row that RECORDS it are one move, not two.
         # The connection is autocommit, so with the bookkeeping outside the
         # rename's transaction a crash in the gap (deploy restart, OOM,
@@ -728,7 +802,6 @@ def adopt_accounts(conn, *, item_id: str, institution_id: str | None,
             # record no adoption: an adoption row for an account that does
             # not exist would keep the one-shot backfill guard open on it.
             continue
-        taken.add(old["id"])
         donors.add(old["item_id"])
         done.append({"account_id": new_id, "old_account_id": old["id"],
                      "name": old["name"], "mask": mask,
@@ -1552,12 +1625,16 @@ def retire_replaced_shells(conn, *, live_item_id: str,
         (live["institution_id"], live_item_id)).fetchall()
     n = 0
     for shell in shells:
+        # compared by the bank's type: a hand-set type never comes back
+        # from the feed. A held account whose bank type is unknown is never
+        # shown to be served, so its shell stays — the safe way to be wrong.
         left = conn.execute(
-            "SELECT mask, type FROM accounts "
+            "SELECT mask, type, type_user_set, raw->>'type' AS feed_type "
+            "FROM accounts "
             "WHERE item_id = %s AND user_removed_at IS NULL",
             (shell["id"],)).fetchall()
-        if any(((r["mask"] or "").strip(),
-                (r["type"] or "").strip().lower()) not in served
+        if any(feed_identity(dict(r))[0] is None
+               or feed_identity(dict(r))[::-1] not in served
                for r in left):
             continue                # a separate login, still waiting
         conn.execute(
@@ -1637,6 +1714,7 @@ def _restored_twins(conn, restored_ids) -> tuple[list[tuple[dict, dict]],
         return [], []
     restored = [dict(r) for r in conn.execute(
         """SELECT a.id, a.name, a.mask, a.type, a.item_id,
+                   a.type_user_set, a.raw->>'type' AS feed_type,
                    i.institution_id, i.institution_name
               FROM accounts a JOIN items i ON i.id = a.item_id
              WHERE a.id = ANY(%s)
@@ -1645,51 +1723,68 @@ def _restored_twins(conn, restored_ids) -> tuple[list[tuple[dict, dict]],
                AND COALESCE(i.status, '') = 'restored'
                AND a.user_removed_at IS NULL""",
         (list(restored_ids),)).fetchall()]
-    unmasked = [r for r in restored if not (r["mask"] or "").strip()]
-    restored = [r for r in restored if (r["mask"] or "").strip()]
+    # Both sides are compared by the BANK's type (`feed_identity`): a type
+    # the person set by hand on either copy is theirs, so the stored column
+    # would never match the twin the feed still names the bank's way, and
+    # the history would sit twice without even being reported. A side
+    # whose bank type is unknown cannot be told apart from any type, so it
+    # is never paired on — only named as a possible twin.
+    for r in restored:
+        r["_typ"], r["mask"] = feed_identity(r)
+    unmasked = [r for r in restored if not r["mask"]]
+    restored = [r for r in restored if r["mask"]]
+
+    def could_be(typ, other) -> bool:
+        return typ is None or other is None or typ == other
+
     pairs, ambiguous = [], []
     for r in unmasked:
-        live = conn.execute(
-            f"""SELECT COALESCE(btrim(a.mask), '') = '' AS no_mask
+        live = [dict(lv) for lv in conn.execute(
+            f"""SELECT a.mask, a.type, a.type_user_set,
+                       a.raw->>'type' AS feed_type
                   FROM accounts a JOIN items i ON i.id = a.item_id
                   JOIN items ri ON ri.id = %s
                  WHERE i.aggregator = 'plaid'
                    AND COALESCE(i.access_token, '') <> ''
                    AND COALESCE(i.status, '') NOT IN ('archived', 'restored')
                    AND {_same_bank_sql('i', 'ri')}
-                   AND lower(btrim(COALESCE(a.type, '')))
-                       = lower(btrim(%s))
                    AND a.user_removed_at IS NULL""",
-            (r["item_id"], r["type"] or "")).fetchall()
-        if len(live) == 1 or any(lv["no_mask"] for lv in live):
+            (r["item_id"],)).fetchall()]
+        live = [feed_identity(lv) for lv in live]
+        live = [(t, m) for t, m in live if could_be(r["_typ"], t)]
+        if len(live) == 1 or any(not m for _t, m in live):
             ambiguous.append(r)
     for r in restored:
-        live = conn.execute(
-            f"""SELECT a.id, a.item_id, i.tx_update_status
+        live = [dict(lv) for lv in conn.execute(
+            f"""SELECT a.id, a.item_id, i.tx_update_status,
+                       a.type, a.type_user_set, a.raw->>'type' AS feed_type
                   FROM accounts a JOIN items i ON i.id = a.item_id
                   JOIN items ri ON ri.id = %s
                  WHERE i.aggregator = 'plaid'
                    AND COALESCE(i.access_token, '') <> ''
                    AND COALESCE(i.status, '') NOT IN ('archived', 'restored')
                    AND {_same_bank_sql('i', 'ri')}
-                   AND btrim(a.mask) = btrim(%s)
-                   AND lower(btrim(a.type)) = lower(btrim(%s))
+                   AND btrim(a.mask) = %s
                    AND a.user_removed_at IS NULL""",
-            (r["item_id"], r["mask"], r["type"] or "")).fetchall()
+            (r["item_id"], r["mask"])).fetchall()]
+        live = [lv for lv in live
+                if could_be(r["_typ"], feed_identity(lv)[0])]
         if not live:
             continue                  # nothing here it could duplicate
         siblings = [s for s in restored
-                    if s["mask"].strip() == r["mask"].strip()
-                    and (s["type"] or "").strip().lower()
-                    == (r["type"] or "").strip().lower()
+                    if s["mask"] == r["mask"]
+                    and could_be(s["_typ"], r["_typ"])
                     and ((s["institution_id"] or None,
                           (s["institution_name"] or "").lower())
                          == (r["institution_id"] or None,
                              (r["institution_name"] or "").lower()))]
-        if len(live) != 1 or len(siblings) != 1:
+        if (r["_typ"] is None or len(live) != 1 or len(siblings) != 1
+                or feed_identity(live[0])[0] is None):
             ambiguous.append(r)
             continue
-        pairs.append((r, dict(live[0])))
+        lv = live[0]
+        pairs.append((r, {"id": lv["id"], "item_id": lv["item_id"],
+                          "tx_update_status": lv["tx_update_status"]}))
     # one live account never absorbs two restored ones
     seen: dict[str, int] = {}
     for _, lv in pairs:

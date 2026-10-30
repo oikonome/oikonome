@@ -158,6 +158,14 @@ export default function Budget() {
               <span>day {d.day_of_month} of {d.days_in_month} · variable spending{" "}
                 <b style={{ color: "var(--ink)" }}>{money(d.variable_actual)}</b>{" "}
                 of {money(d.variable_budget)}</span>)}
+            {/* this month's income is what landed plus what is still due,
+                so a three-paycheck month and a changed check both show —
+                the two halves say which is which */}
+            {d.income_expected != null && (
+              <span title="this month's income: deposits that landed, plus the paychecks still due before month end at their current amount">
+                income <b style={{ color: "var(--ink)" }}>{money(d.income_received ?? 0)}</b> landed
+                {d.income_expected > 0 && <> · <b style={{ color: "var(--ink)" }}>{money(d.income_expected)}</b> still due</>}
+              </span>)}
             <Link to="/bills" style={{ marginLeft: "auto" }}>manage bills ›</Link>
           </div>
         </div>
@@ -223,7 +231,7 @@ export default function Budget() {
               hides, never unmounts, so an open draft survives a stray
               toggle. */}
           <Collapsible title="Income scenarios"
-                       sub="take-home per paycheck; the active one powers the plan">
+                       sub="take-home per paycheck; the active one drives the cash forecast">
             <IncomeScenarioCard data={s.data} onSaved={() => {
               toast("Income scenario saved.");
               void refresh(false);

@@ -3,6 +3,7 @@ import { useRef, useState } from "react";
 import { api, errText, money, type BudgetSuggestions, type CustomBucket,
          type Settings as SettingsData, catLabel } from "../api/client";
 import { saveSettings } from "../api/cache";
+import { parseMoneyDraft } from "../moneymath";
 
 // editable row form of a config custom_bucket: numbers and the
 // merchant list are strings while being typed. `touched` marks rows the
@@ -56,7 +57,17 @@ export default function BudgetFineTune({ data, onSaved, onDirtyChange }: {
     // PREVIOUS render's value — the box flipped on screen and the server
     // stored the opposite.
     mutationFn: async (dyn?: boolean) => {
-      const num = (s: string) => Number(s.replace(/[$,\s]/g, "") || 0);
+      // blank is 0. Text that is not a number stops the save here: sent
+      // on, NaN travels as JSON null and would be stored as $0 without a
+      // word, replacing the figure the person meant to type.
+      const num = (s: string, name: string) => {
+        if (s.replace(/[$\s]/g, "") === "") return 0;
+        const n = parseMoneyDraft(s);
+        if (n === null)
+          throw new Error(`${name}: "${s.trim()}" is not an amount — `
+                          + "type it like 1,250.50.");
+        return n;
+      };
       // partial body on purpose: food/other/income and the savings plan are
       // the planner's to write — sending them here would fight it.
       // the bucket LIST is still replaced wholesale, and these
@@ -78,7 +89,7 @@ export default function BudgetFineTune({ data, onSaved, onDirtyChange }: {
           if (live) { out.push(live); continue; }
           if (baseNames.has(name)) continue;   // deleted elsewhere
         }
-        out.push({ name, parent: b.parent, monthly: num(b.monthly),
+        out.push({ name, parent: b.parent, monthly: num(b.monthly, name),
                    categories: b.categories,
                    merchants: b.merchants.split(",").map((m) => m.trim())
                      .filter(Boolean) });

@@ -8,9 +8,21 @@ The headline sums the schedule as evened-out monthly figures — what
 bills cost per month (a weekly or every-2-weeks bill at its exact rate
 over an average year, so a year with a 27th payday or a 53rd week does
 not inflate it), what income brings in, and the difference: what's
-left for variable spending and savings. The two loads use the same math
-as the Budget page's flow line, so the pages can't disagree about the
-same schedule.
+left for variable spending and savings. Income is read from what
+actually landed: each income series' deposits (a deposit two series
+could both claim counts once, for the closer match) over the last twelve
+complete months, divided by the months the series has been paying, at
+most twelve (down to three while it is young — hover the figure to see
+which). Each check counts for the month it pays, so one moved a day or
+two early off a weekend is not counted twice in a month, and a paycheck
+that stopped for a while and started again counts from its restart. A
+deposit from the same payer that pays no scheduled check (a bonus, back
+pay) adds its dollars. A paycheck changes
+through the year as withholding caps out or a raise lands, so the
+current check annualised would over- or understate a year of it; a
+series with less than three months of deposits counts its scheduled
+rate until it has them. The bill load uses the same math as the Budget
+page's flow line, so the pages can't disagree about the same schedule.
 
 ## Detection and proposals
 
@@ -246,6 +258,17 @@ lookup reads the whole ledger, so it is budgeted like the reports are —
 60 payees a minute, far above reading and well under a loop. If a panel
 ever says it's been asked too often, pause a moment and click again.
 
+**Categorize this merchant** on the same page files every past and
+future charge of the merchant under one category. The picker rests on
+the category the merchant's rows carry today (the most common one, if
+they are split); choosing another shows how many past transactions will
+move and waits for your confirm, with an undo after. **✎ custom
+category…** names a category nobody has used yet — on the phone, type
+the new name in the picker's filter and tap **✎ Create** — so a merchant
+that belongs somewhere new never needs a trip to the ledger to find one
+of its rows first. The owner and members see the card; a view-only
+login does not.
+
 You can also create a bill or envelope straight from the Transactions
 page: any row already matched to a bill shows an indicator, and
 unmatched merchants offer "add as bill / envelope" with a suggested
@@ -276,6 +299,17 @@ every event with its amount, and on the phone tapping a day opens that
 day's events under the grid (tap again to close). The grid is the whole
 agenda — nothing repeats below it, so the **Archived** table follows it
 directly.
+
+Archiving a bill yourself is a decision, not a deletion: the bill keeps
+its history, and the nightly detection pass treats that bill's own
+series as declined — it will not offer it back the next morning, though
+a different merchant that merely shares a word with it can still be
+offered. A pending offer for it is withdrawn when you archive, and can
+come back if you **Restore** or delete the bill. A bill the detection
+pass retired itself (a one-time bill past its date, a subscription that
+stopped) declines nothing. If the charges should be tracked again,
+**Restore** it from the Archived table (or from its history page) rather
+than approving a new offer.
 
 ## Gotchas
 

@@ -15,7 +15,7 @@ import StaleBanner from "../components/stale-banner";
 import { Card, H, HelpLink, KV, Pill } from "../components/ui";
 import { whatIfRefusal } from "../lib/api";
 import { saveSettings } from "../lib/cache";
-import { numv, whatIfQuery } from "../lib/pure";
+import { numv, parseMoneyDraft, whatIfQuery } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { useViewer } from "../lib/viewer";
 import { C, money } from "../lib/theme";
@@ -444,8 +444,10 @@ function RetireWizard({ defaults, onDone, onSkip }: {
         setErr("Enter an age between 18 and 100."); return;
       }
     }
-    // "60,000" is a spend, not a typo: judge it as the query will send it
-    const spendN = Number(spend.replace(/[$,\s]/g, ""));
+    // "60,000" is a spend, not a typo, and "12,50" is twelve-fifty: judge
+    // it by the server's separator rules, as the query will send it
+    const spendN = spend.replace(/[$\s]/g, "") === "" ? 0
+      : parseMoneyDraft(spend) ?? NaN;
     if (i === 1 && (!Number.isFinite(spendN) || spendN < 0)) {
       setErr("Enter a non-negative annual spend."); return;
     }

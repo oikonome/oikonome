@@ -33,7 +33,8 @@ from ofxtools.Parser import OFXTree
 from ..engine.compat import as_date
 from . import flowmap
 from .base import (FileImportIds, Transaction, _descriptor,
-                   ensure_split_account, mask_long_digits,
+                   check_split_accounts, ensure_split_account,
+                   mask_long_digits,
                    drop_before_history, upsert_transactions)
 from . import rowcap
 from .rowcap import check_len
@@ -472,6 +473,7 @@ def import_ofx(conn, account_id: str, data: bytes,
         by_acct.setdefault(r["acct"], []).append(r)
     if len([k for k in by_acct if k]) <= 1:
         return _import_into(conn, account_id, rows, batch_id=batch_id)
+    check_split_accounts(k for k in by_acct if k)
     total = {"imported": 0, "rows": 0, "skipped_duplicates": 0,
              "split_accounts": {}}
     for acct in sorted(by_acct, key=str):

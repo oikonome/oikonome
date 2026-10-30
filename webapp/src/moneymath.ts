@@ -3,9 +3,37 @@
 // it under plain node next to its mobile twin.
 import type { CustomBucket } from "./api/client";
 
-/** the pages' loose amount-field parser: "$1,234.56 " → 1234.56 */
+// A typed amount's separators, read by the server's own rules for an
+// amount cell (csvimport.parse_money_text), so a client never sends a
+// different number than the one the server would read from the same text:
+// "1,234.56" (thousands comma), "1.234,56" (thousands dot, decimal comma),
+// "12,50" (a bare decimal comma, one or two digits). Any other comma is
+// ambiguous and refused — stripping it turned "12,50" into 1250.
+const THOUSANDS_COMMA = /^\d{1,3}(?:,\d{3})+(?:\.\d+)?$/;
+const THOUSANDS_DOT_DECIMAL_COMMA = /^\d{1,3}(?:\.\d{3})+,\d{1,2}$/;
+const DECIMAL_COMMA = /^\d+,\d{1,2}$/;
+
+/** `v` without "$" or spaces, a typographic minus as "-", and its
+ *  separators normalised to a plain decimal point; null when a comma in
+ *  it fits none of the server's conventions. */
+function normaliseMoneyText(v: string): string | null {
+  const t = (v ?? "").replace(/[$\s]/g, "").replace(/\u2212/g, "-");
+  const sign = t.startsWith("-") ? "-" : "";
+  let body = t.slice(sign.length);
+  if (body.includes(",")) {
+    if (THOUSANDS_COMMA.test(body)) body = body.replace(/,/g, "");
+    else if (THOUSANDS_DOT_DECIMAL_COMMA.test(body))
+      body = body.replace(/\./g, "").replace(",", ".");
+    else if (DECIMAL_COMMA.test(body)) body = body.replace(",", ".");
+    else return null;
+  }
+  return sign + body;
+}
+
+/** the pages' loose amount-field parser: "$1,234.56 " → 1234.56,
+ *  "12,50" → 12.5; anything that is not a number reads as 0 */
 const numv = (v: string) =>
-  Number((v || "0").replace(/[$,\s]/g, "")) || 0;
+  Number(normaliseMoneyText(v || "0") ?? "0") || 0;
 
 // ---- money drafts, signed balances, the planner's bucket merge ----
 // Mobile keeps a twin of each in mobile/src/lib/pure.ts; the server
@@ -17,11 +45,12 @@ const numv = (v: string) =>
  *  save. Parsing on every keystroke made the field unusable: "-" and
  *  "0-" are NaN (the field then showed "NaN" and stayed stuck there),
  *  and "1234." re-rendered as "1234", so a decimal point could never
- *  be typed at the end. "$", "," and spaces are dropped; a typographic
- *  minus counts as "-". Blank is the caller's call (0, or "cleared"). */
+ *  be typed at the end. "$" and spaces are dropped, commas are read by
+ *  the server's rules (normaliseMoneyText); a typographic minus counts
+ *  as "-". Blank is the caller's call (0, or "cleared"). */
 export function parseMoneyDraft(v: string): number | null {
-  const t = (v ?? "").replace(/[$,\s]/g, "").replace(/\u2212/g, "-");
-  if (!/^-?(\d+\.?\d*|\.\d+)$/.test(t)) return null;
+  const t = normaliseMoneyText(v);
+  if (t === null || !/^-?(\d+\.?\d*|\.\d+)$/.test(t)) return null;
   const n = Number(t);
   return Number.isFinite(n) ? n : null;
 }

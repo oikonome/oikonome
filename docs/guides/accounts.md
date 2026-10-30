@@ -87,7 +87,17 @@ then, so a sign-in you abandon changes nothing; the swap does not count
 against an institution limit, and it is offered only while the bank's
 window is narrower than your choice. Signing in to a different bank from
 that door simply adds that bank. The same window applies to
-file imports. To bring in older history from files instead, widen the
+file imports.
+
+**A bank that moved** (one bank bought another's cards and the login now
+lives at the buyer): the old connection stops signing in, and
+**reconnect** can only reopen the old bank. Use **Connect an account**
+and sign in at the new bank instead. When the accounts it shows are the
+ones the dead connection held (same last digits and the type the bank
+gives it — an account you retyped by hand still matches), the app
+treats it as the same connection moved: the old one is released, and its
+accounts carry over with all their history — nothing is imported twice.
+A new bank whose accounts do not match is simply added. To bring in older history from files instead, widen the
 window and import the older statements from Accounts → Import.
 
 ## Connection states
@@ -261,8 +271,12 @@ balance, and mark your **primary checking** account so the cash
 forecast anchors on it. With exactly one checking account the pin is
 set for you (after the first bank's pull, a file import, or the setup
 wizard's Connect step); with two or more you pick, on the Today card or
-here. An account whose bank was disconnected cannot be pinned, and a pin
-left on one is ignored — the forecast falls back to the live checking
+here. An account whose bank was disconnected, one excluded from the
+budget, a hidden one, a business account (outside the combined view) or
+the backup source of a linked pair cannot be pinned — the editor says
+which, and including an account in the same save as pinning it works.
+A pin left on such an account is ignored, and the Accounts page says why
+beside it — the forecast falls back to the live checking
 account with the largest balance, and the nightly pass moves the pin
 there so you are not asked again; change it here any time. Closed
 accounts kept only for their history (an import with no balance) are

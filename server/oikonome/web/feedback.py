@@ -108,8 +108,9 @@ _REDACTIONS = [
     # click could carry another member's address off the box. The secret-shaped
     # rules above do not match a plain address. Local part is kept to one
     # character so a support thread can still tell two failures apart
-    # without the address itself leaving the box.
-    (_re.compile(r"\b([A-Za-z0-9])[A-Za-z0-9._%+\-]*@[A-Za-z0-9.\-]+"
+    # without the address itself leaving the box. A URL query string
+    # carries the '@' percent-encoded (%40), so that form counts too.
+    (_re.compile(r"\b([A-Za-z0-9])[A-Za-z0-9._%+\-]*(?:@|%40)[A-Za-z0-9.\-]+"
                  r"\.[A-Za-z]{2,}"), r"\1<redacted>@<redacted>"),
 ]
 

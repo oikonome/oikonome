@@ -545,7 +545,11 @@ export default function Bills({ autoDetect = false }:
               {money(totals.bills_monthly)}
               <span className="sub" style={{ fontWeight: 400 }}>/mo bills</span>
               {" · "}
-              <span className="pos">{money(totals.income_monthly)}</span>
+              <span className="pos"
+                    title={totals.income_basis === "actual"
+                      ? `what your income actually brought in, averaged over the last ${totals.income_months ?? 12} months of deposits`
+                      : "the schedule's rate — the current check annualised; the average of what landed takes over once three months have"}>
+                {money(totals.income_monthly)}</span>
               <span className="sub" style={{ fontWeight: 400 }}>/mo income</span>
               {" · "}
               {/* the difference is what the variable budget and savings

@@ -47,7 +47,7 @@ class ApostropheReadingTests(unittest.TestCase):
                 self.assertTrue(self.names(LINE, f"Juniper{mark}s Market"))
 
     def test_an_elided_prefix_still_matches_its_line(self):
-        """The string clean splits "O'Reilly" into two words, so the
+        """The string clean splits "O'Fabrikam" into two words, so the
         ledger's own cleaned name has to match the line it came from."""
         self.assertTrue(self.names("O'DALEY HARDWARE 17", "Daley Hardware"))
         self.assertTrue(self.names("L'AMANDIERE RIVERTON", "Amandiere"))

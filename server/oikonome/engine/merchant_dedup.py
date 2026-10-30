@@ -40,6 +40,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import re
+import unicodedata
 
 from . import budget, merchant_sql
 from .compat import jsonb
@@ -109,6 +110,39 @@ _ADDR = re.compile(r"(?<=\S)\s+\d{2,6}[A-Za-z]?\s+(?:[NSEW]\.?|"
 # typographic right single quote, and the modifier letter a few sources use.
 _APOSTROPHE = re.compile(r"(?<=[A-Za-z0-9])['’ʼ]")
 
+# Letters that carry an accent are folded to their plain letter before the
+# scrub, which keeps only ASCII. One payee arrives both ways — a feed spells
+# it "Café Contoso", the card line prints "CAFE CONTOSO" — and deleting the accented
+# letter instead ("Caf Contoso") would make it two merchants with the money split
+# between them. NFKD splits most accented letters into letter + mark; the
+# few that do not decompose are mapped by hand.
+_FOLD = str.maketrans({"ß": "ss", "æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE",
+                       "ø": "o", "Ø": "O", "ł": "l", "Ł": "L", "đ": "d",
+                       "Đ": "D", "þ": "th", "Þ": "TH", "ð": "d", "Ð": "D",
+                       "ı": "i"})
+
+
+def ascii_fold(s: str) -> str:
+    """The string with accents removed from its letters: "Café" -> "Cafe",
+    "Häagen" -> "Haagen". Characters with no plain-letter form are left as
+    they are. engine/merchant_identity reads descriptors through the same
+    fold, so a name this module cleaned still matches its own lines."""
+    if not s or s.isascii():
+        return s or ""
+    s = unicodedata.normalize("NFKD", s.translate(_FOLD))
+    return "".join(c for c in s if not unicodedata.combining(c))
+
+
+# An ampersand between one- or two-letter pieces is part of the name —
+# "Q&X Bank", "Q&Z", "X&Y Market", "Q&W Photo". Scrubbed to a
+# space, the pieces are too short to survive, and different businesses fall
+# to one shared word ("Bank", "Market"). Between longer words it is
+# still punctuation ("Cedar Pine & Home").
+_AMP_RUN = re.compile(r"\b[A-Za-z]{1,2}(?:\s?&\s?[A-Za-z]{1,2})+\b")
+# Dotted initials are one word — "Q.R. Hardware" is "QR Hardware", the
+# spelling a bank line prints.
+_DOT_INITIALS = re.compile(r"\b(?:[A-Za-z]\.){2,}")
+
 
 def cities_for(conn) -> tuple[str, ...]:
     """The tenant's configured city names (`merchant_strip_cities`).
@@ -151,7 +185,7 @@ def _city_variants(city: str) -> set[str]:
     actually produce are near-full ('Springfiel', 'Springfie'), while a
     short fragment would start eating real words — 'Spring' would turn
     'Mineral Spring' into 'Mineral'."""
-    city = (city or "").strip()
+    city = ascii_fold((city or "").strip())
     if len(city) < 4:
         return set()
     out = {city}
@@ -235,6 +269,12 @@ _GENERIC_ALONE = {
     "atm", "credit", "union", "the", "and", "food", "foods", "liquor",
     "wine", "spirits", "gas", "fuel", "auto", "care", "health", "supply",
 }
+# The generic words a short leading number can be the brand beside ("76
+# Gas"). Not the bank-mechanics words: before those the number is a
+# reference, and keeping it would mint a merchant per reference.
+_NUMBERED_BRAND_WORDS = _GENERIC_ALONE - {
+    "withdrawal", "deposit", "payment", "transfer", "atm", "credit", "union",
+    "the", "and", "inc", "llc", "company", "parking"}
 
 
 def _keepable(name: str) -> bool:
@@ -363,7 +403,7 @@ def canonical_merchant(name: str, cities=()) -> str:
     # regexes whose cost grows faster than linearly on long runs of one
     # character, so the label is cut first — nothing a real merchant name
     # carries lives past this point.
-    s = (name or "")[:_MAX_LABEL]
+    s = ascii_fold((name or "")[:_MAX_LABEL])
     s = _NOISE.sub("", s)
     s = _PROC.sub("", s)
     s = _TAIL.sub("", s)
@@ -390,9 +430,19 @@ def canonical_merchant(name: str, cities=()) -> str:
     # an apostrophe joins the letters it sits between instead of breaking
     # them apart — see _APOSTROPHE
     s = _APOSTROPHE.sub("", s)
-    s = re.sub(r"[^A-Za-z0-9 \x00]+", " ", s)
+    s = _DOT_INITIALS.sub(lambda m: m.group(0).replace(".", ""), s)
+    s = _AMP_RUN.sub(
+        lambda m: "\x01".join(re.split(r"\s?&\s?", m.group(0))), s)
+    s = re.sub(r"[^A-Za-z0-9 \x00\x01]+", " ", s)
+    words = s.split()
     toks = []
-    for t in s.split():
+    for t in words:
+        if "\x01" in t:
+            # an ampersand-joined name ("Q&X"), kept whole and in capitals
+            t = t.replace("\x01", "&").replace("\x00", "-").upper()
+            if len(t) >= 3:
+                toks.append((t, False))
+            continue
         if "\x00" in t and re.search(r"[A-Za-z]", t):
             # a hyphenated word with a letter in it is a name, however
             # short its halves ("A-1", "7-11") — the hyphen counts
@@ -416,10 +466,18 @@ def canonical_merchant(name: str, cities=()) -> str:
                 toks.append((piece, False))
             elif len(piece) == 2 and whole_word:
                 toks.append((piece, True))
-    out = " ".join(_short_tokens_kept(toks)).strip().title()
+    out = " ".join(t if "&" in t else t.title()
+                   for t in _short_tokens_kept(toks)).strip()
     if out and len(first := out.split(" ", 1)[0]) == 2 and first.isalpha() \
             and first.lower() not in _LEADING_WORD:
         out = first.upper() + out[2:]
+    if (out.lower() in _NUMBERED_BRAND_WORDS and len(words) >= 2
+            and words[0].isdigit() and len(words[0]) <= 3
+            and not words[0].startswith("0")
+            and words[1].lower() == out.lower()):
+        # "88 GAS 0123": the number IS the brand, and without it every
+        # such line falls to the one shared word "Gas"
+        out = f"{words[0]} {out}"
     if len(out) <= 2 and " " not in out:
         # two letters standing ALONE are not a name (the same judgement
         # _keepable makes about a city strip): a descriptor that shrank to
@@ -554,9 +612,13 @@ def apply(conn) -> int:
     # resolve below only visits rows that have none. This is how a fix to
     # canonical_merchant reaches data that is already in the ledger.
     #
-    # The merchant those rows LEAVE is retired into the one they went to
-    # rather than dropped, and what was stored under its name follows: see
-    # merchant_identity.re_resolve_recleaned and _rekey_rules.
+    # When every row of a merchant goes to ONE new merchant, the one they
+    # left is retired into it rather than dropped, and what was stored under
+    # its name follows (merchant_identity.re_resolve_recleaned, _rekey_rules
+    # below). A clean that splits a merchant across several retires nothing
+    # — there is no one survivor — and each part is given a copy of what it
+    # held instead (merchant_identity._follow_split); only retirements come
+    # back as pairs here.
     if recomputed:
         for pair in merchant_identity.re_resolve_recleaned(
                 conn, {m: held.get(m) for m in recomputed}):
@@ -614,6 +676,61 @@ def _rekey_rules(conn, old: str, new: str) -> int:
                 conn.execute("DELETE FROM merchant_categories "
                              "WHERE merchant = %s", (r["merchant"],))
     return moved
+
+
+def _copy_rules_on_split(conn, old: str, old_id, intos: list[str],
+                         keep_old: bool) -> dict:
+    """The rules of a merchant a string clean split, copied to EVERY part.
+
+    _rekey_rules hands a retired merchant's rules to the one merchant it
+    was retired into; a split has no one heir, and choosing one would
+    leave the other parts' charges filed under whatever a machine guesses.
+    So the old name's best rule is copied to each part's name, with the
+    same precedence (a person's live rule outranks a machine's, and
+    otherwise a rule already there stays). The old name's rules go only
+    when the old merchant has nothing left (`keep_old` false). A rule keyed
+    on a raw spelling travels with its alias row and is not touched, nor is
+    one whose name another live merchant still carries.
+
+    Returns {part name: journal note} in the shape follow_rules writes, so
+    undoing one string of the split puts that part's rules back."""
+    mine = [_rule_dict(r) for r in conn.execute(
+        f"""SELECT {_RULE_COLS} FROM merchant_categories m
+             WHERE lower(m.merchant) = lower(%s)
+               AND NOT EXISTS (SELECT 1 FROM merchant_canonical a
+                                WHERE a.raw_merchant = m.merchant)
+               AND NOT EXISTS (SELECT 1 FROM merchants l
+                                WHERE l.merged_into IS NULL
+                                  AND lower(l.name) = lower(m.merchant)
+                                  AND l.id <> %s)
+             {_RULE_ORDER} FOR UPDATE OF m""", (old, old_id)).fetchall()]
+    notes: dict = {}
+    for into in intos:
+        note = {"from": old, "into": into, "rules": [], "displaced": []}
+        notes[into] = note
+        if not mine or into.lower() == old.lower():
+            continue
+        best = mine[0]
+        held = conn.execute(
+            f"SELECT {_RULE_COLS} FROM merchant_categories m "
+            f" WHERE m.merchant = %s FOR UPDATE", (into,)).fetchone()
+        held = _rule_dict(held) if held is not None else None
+        if _outranks(best, held):
+            if held is not None:
+                conn.execute("DELETE FROM merchant_categories "
+                             "WHERE merchant = %s", (into,))
+                note["displaced"].append(held)
+            _put_rule(conn, best, into)
+            note["rules"].append({**best, "fate": "moved"})
+        elif not keep_old:
+            note["rules"].append({**best, "fate": "dropped"})
+    if not keep_old and mine:
+        for d in mine[1:]:
+            for n in notes.values():
+                n["rules"].append({**d, "fate": "dropped"})
+        conn.execute("DELETE FROM merchant_categories WHERE merchant = ANY(%s)",
+                     ([d["merchant"] for d in mine],))
+    return notes
 
 
 # ---- user-made naming, the layer that outranks every automatic one -------

@@ -5,6 +5,16 @@ one month at a time, with search across all accounts and the full
 history — and the place to correct a category when the source got it
 wrong.
 
+## Primary checking balance
+
+The top of the page shows your **primary checking** balance — the account
+the cash forecast starts from, with its available balance when the bank
+reports one. It is the account you pinned on the Accounts page (open it
+by clicking the balance); with no pin, the checking account with the
+largest balance. A checking account that has no balance yet reads
+"balance not set"; a household with no checking account shows nothing
+here.
+
 ## Month view and search
 
 By default you browse one calendar month with the **‹ › arrows** (the
@@ -14,7 +24,9 @@ by the same definitions the Cash Flow page uses: income in, household
 spending out. Transfers between your own accounts and credit-card
 payments are money *moved*, not made or spent (the card's swipes
 already counted), so they appear in the list but move none of the three
-figures. Beside them, **/day** is the month's spending per day: out
+figures. In the current month, **in** is what has landed so far, with
+the paychecks still due before month end shown beside it as "expected"
+— the Budget page's plan counts the two together. Beside them, **/day** is the month's spending per day: out
 divided by the days so far in the current month, or by every day of a
 closed month. A category opened for a month, a budget label (Food,
 Everything else) or a from/to date range shows the same per-day figure

@@ -112,6 +112,10 @@ class EveryAnswerFailsClosedTests(unittest.TestCase):
                       and not n.startswith("_")}
         self.assertEqual(methods - overridden - self.INHERITED, set())
 
+    def test_enrich_waits_while_the_add_on_cannot_answer(self):
+        self.assertTrue(self.g.enrich_awaits_confirm(None))
+        self.assertFalse(ext.Gate().enrich_awaits_confirm(None))
+
     def test_a_frozen_household_stays_frozen(self):
         code, _msg, open_paths = self.g.unknown_status_lockout()
         self.assertGreaterEqual(code, 400)

@@ -2,11 +2,13 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useRef, useState } from "react";
 import { api, errText, money, type Settings as SettingsData } from "../api/client";
 import { saveSettings } from "../api/cache";
-import { mergeIncomeScenarios, type ScenarioDraft } from "../incomescenarios";
+import { mergeIncomeScenarios, takeHomeOf, type ScenarioDraft }
+  from "../incomescenarios";
 
-// Named take-home scenarios; the active one, converted to a monthly
-// figure, drives the plan, the dynamic variable budget and the daily
-// email.
+// Named take-home scenarios. The active one caps the paycheck the cash
+// forecast walks in; converted to a monthly figure it is the plan's income
+// (and so the dynamic variable budget's) only while no income series is
+// tracked — after that the plan counts the month's own checks.
 export default function IncomeScenarioCard({ data, onSaved }: {
   data: SettingsData; onSaved: () => void;
 }) {
@@ -56,7 +58,7 @@ export default function IncomeScenarioCard({ data, onSaved }: {
       (r, j) => (j === i ? { ...r, ...patch, touched: true } : r)));
   const activeRow = rows.find((r) => r.name === active) ?? rows[0];
   const monthly = activeRow
-    ? Number(activeRow.take_home.replace(/[$,\s]/g, "")) *
+    ? takeHomeOf(activeRow.take_home) *
       ({ weekly: 4, biweekly: 2, semimonthly: 2, monthly: 1 }[
         activeRow.cadence] ?? 2)
     : null;
@@ -64,7 +66,7 @@ export default function IncomeScenarioCard({ data, onSaved }: {
     <div className="card">
       <h2>Income scenarios{" "}
         <span className="mut" style={{ fontSize: 13, fontWeight: 400 }}>
-          — take-home per paycheck; the active one powers the plan</span></h2>
+          — take-home per paycheck; the active one drives the cash forecast</span></h2>
       {err && <div className="note bad" onClick={() => setErr(null)}>{err}</div>}
       {rows.length > 0 && (
         <table style={{ marginBottom: ".5rem" }}>
@@ -109,7 +111,10 @@ export default function IncomeScenarioCard({ data, onSaved }: {
         {monthly && Number.isFinite(monthly)
           ? <>Active now: <b>{money(monthly)}/mo</b> ({activeRow!.name}). </>
           : null}
-        Applies to the plan, cash forecast, and daily email. No scenarios →
+        Applies to the cash forecast and daily email: the paycheck it
+        describes is walked in at no more than its take-home. It sets the
+        plan's income only until a paycheck is tracked on Bills — from
+        then the plan counts this month's own checks. No scenarios →
         the plan's own income figure is used.</p>
       <button className="pri" disabled={save.isPending}
               onClick={() => save.mutate()}>

@@ -98,23 +98,21 @@ class UndoSnapshotShapeTests(unittest.TestCase):
 
     def test_prev_is_shape_checked_not_membership_checked(self):
         # malformed prev values — over-long, control characters — are 400
+        held = data.held_undo(self.conn, self.res["undo"])
         for prev in ("X" * (data._NAME_MAX + 1), "bad\x07category", ""):
-            bad = {"canons": self.res["undo"]["canons"],
-                   "rules": self.res["undo"]["rules"],
+            bad = {"canons": held["canons"], "rules": held["rules"],
                    "affected": [{"id": "a", "prev": prev}]}
             self._refused(bad, f"malformed prev {prev!r}")
         # …but a custom label the ledger holds NOWHERE else is a restore,
         # not authored text: once the write moved every row, the displaced
         # label lives only in the snapshot, so a membership test against
         # "known" categories would 400 exactly those undos forever
-        ok = {"canons": self.res["undo"]["canons"],
-              "rules": self.res["undo"]["rules"],
+        ok = {"canons": held["canons"], "rules": held["rules"],
               "affected": [{"id": "a", "prev": "Long-Gone Custom Label"}]}
         data.undo_merchant_category(self.conn, ok)
         self.assertEqual(cat(self.conn, "a"), "Long-Gone Custom Label")
         # None (the row had no category before) is a legitimate restore
-        ok = {"canons": self.res["undo"]["canons"],
-              "rules": self.res["undo"]["rules"],
+        ok = {"canons": held["canons"], "rules": held["rules"],
               "affected": [{"id": "a", "prev": None}]}
         data.undo_merchant_category(self.conn, ok)
         self.assertIsNone(cat(self.conn, "a"))

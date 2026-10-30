@@ -929,6 +929,74 @@ def follow_merchant(conn, display: str, old_ids, survivor: tuple,
     return changed
 
 
+def follow_merchant_split(conn, old_id, old_name: str, parts: list,
+                          keep_old: bool) -> int:
+    """A string clean split one merchant into several (or moved part of it
+    away): its vendor marks are COPIED to every part, never handed to one,
+    so no payment the year-end list counted drops off it. `parts` is
+    [(survivor id, survivor name, raw strings it took)]. A part with no
+    mark of its own gets a copy, noted as carried on the split because the
+    TIN may not be that vendor's; one that has a mark keeps it, made
+    reportable when the old one was, and the flags it had are journalled
+    so undo can give them back. The old mark goes once the old merchant
+    has nothing left (`keep_old` false). Returns how many marks changed."""
+    from .compat import jsonb
+    old_id = str(old_id)
+    olds = conn.execute(
+        "SELECT id, entity_id, merchant, reportable, tin_last4, note "
+        "  FROM vendor_1099 "
+        " WHERE merchant_id::text = %s "
+        "    OR (merchant_id IS NULL AND lower(merchant) = lower(%s)) "
+        " ORDER BY created_at, id FOR UPDATE", (old_id, old_name)).fetchall()
+    changed = 0
+    for o in olds:
+        carried = f"carried from {old_name} on split"
+        note = f"{carried}: {o['note']}" if o["note"] else carried
+        for sid, sname, raws in parts:
+            sid = str(sid)
+            there = conn.execute(
+                "SELECT id, reportable, tin_last4, merged_from FROM vendor_1099 "
+                " WHERE entity_id = %s AND (merchant_id::text = %s "
+                "       OR (merchant_id IS NULL AND merchant = %s)) "
+                " ORDER BY (merchant_id IS NULL), created_at, id "
+                " LIMIT 1 FOR UPDATE", (o["entity_id"], sid, sname)).fetchone()
+            if there is None:
+                taken = conn.execute(
+                    "SELECT 1 FROM vendor_1099 WHERE entity_id = %s "
+                    "AND merchant = %s", (o["entity_id"], sname)).fetchone()
+                conn.execute(
+                    """INSERT INTO vendor_1099 (entity_id, merchant,
+                           merchant_id, reportable, tin_last4, note,
+                           merged_from)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                    (o["entity_id"],
+                     f"{sname} ({old_name})" if taken else sname, sid,
+                     o["reportable"], o["tin_last4"], note,
+                     jsonb([{"from": old_name, "id": old_id,
+                             "raws": sorted(raws), "had_into": False,
+                             "copied": True}])))
+            else:
+                notes = list(there["merged_from"] or []) + [{
+                    "from": old_name, "id": old_id, "raws": sorted(raws),
+                    "had_into": True, "copied": True,
+                    "mark": {"reportable": o["reportable"],
+                             "tin_last4": o["tin_last4"]},
+                    "into_prior": {"reportable": there["reportable"],
+                                   "tin_last4": there["tin_last4"]}}]
+                conn.execute(
+                    "UPDATE vendor_1099 SET merchant_id = %s, "
+                    "reportable = %s, tin_last4 = %s, merged_from = %s "
+                    "WHERE id = %s",
+                    (sid, there["reportable"] or o["reportable"],
+                     there["tin_last4"] or o["tin_last4"], jsonb(notes),
+                     there["id"]))
+            changed += 1
+        if not keep_old:
+            conn.execute("DELETE FROM vendor_1099 WHERE id = %s", (o["id"],))
+            changed += 1
+    return changed
+
+
 def unfollow_merchant_rename(conn, raw_key: str, into: str) -> int:
     """The undo of follow_merchant_rename for one raw string whose rename
     to `into` was just reversed. A mark that only moved goes back to the
@@ -967,6 +1035,7 @@ def unfollow_merchant_rename(conn, raw_key: str, into: str) -> int:
         keep = [n for n in notes if n not in mine]
         rep, tin = m["reportable"], m["tin_last4"]
         mid, name = m["mid"], m["merchant"]
+        drop = False
         for n in mine:
             left = [r for r in n.get("raws") or [] if r != raw_key
                     and (_merchant_of_raw(conn, r) or ("",))[0] == m["mid"]]
@@ -984,8 +1053,20 @@ def unfollow_merchant_rename(conn, raw_key: str, into: str) -> int:
                        VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
                     (m["entity_id"], bname, bid,
                      bool(was.get("reportable", True)), was.get("tin_last4")))
+            elif n.get("copied") and conn.execute(
+                    "SELECT 1 FROM vendor_1099 WHERE entity_id = %s "
+                    "AND merchant_id::text = %s AND id <> %s",
+                    (m["entity_id"], bid, m["id"])).fetchone():
+                # a copy a split made, going back to a merchant that holds
+                # its own mark again (the old one kept it, or another part
+                # went back first): the copy has nothing left to carry
+                drop = True
             else:
                 mid, name = bid, bname
+        if drop and not keep:
+            conn.execute("DELETE FROM vendor_1099 WHERE id = %s", (m["id"],))
+            changed += 1
+            continue
         if name != m["merchant"] and conn.execute(
                 "SELECT 1 FROM vendor_1099 WHERE entity_id = %s "
                 "AND merchant = %s AND id <> %s",

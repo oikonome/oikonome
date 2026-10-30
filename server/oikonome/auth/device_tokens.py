@@ -187,7 +187,13 @@ def push_targets(conn, tenant_id, user_id=None) -> list[dict]:
     A device whose holder has since moved to another household is not a
     target either — the same household test `lookup` applies before the
     token may act. The phone belongs to someone who is no longer in this
-    household, so its notices must not follow them."""
+    household, so its notices must not follow them.
+
+    A person who turned the household's push off (users.push_muted) is
+    skipped by the household fan-out; named by `user_id`, their phones are
+    still targets — a notice about their own account is theirs. Callers
+    that must reach a muted person anyway (a household security warning,
+    the person's own test push) name them by `user_id`."""
     return conn.execute(
         """SELECT d.push_token, d.push_platform
            FROM device_tokens d JOIN users u ON u.id = d.user_id
@@ -196,8 +202,9 @@ def push_targets(conn, tenant_id, user_id=None) -> list[dict]:
                  AND d.expires_at > now() AND d.push_token IS NOT NULL
                  AND d.push_dead_at IS NULL
                  AND NOT u.second_factor_waived
+                 AND (%s::uuid IS NOT NULL OR NOT u.push_muted)
                  AND (%s::uuid IS NULL OR d.user_id = %s::uuid)""",
-        (tenant_id, user_id, user_id)).fetchall()
+        (tenant_id, user_id, user_id, user_id)).fetchall()
 
 
 def mark_push_dead(conn, tokens: list[str]) -> int:

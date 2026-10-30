@@ -6,7 +6,8 @@
 // what-ifs, the retirement page's pattern.
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import { interestSaved, rebaseFields, rebaseKeyed } from "../moneymath";
+import { interestSaved, parseMoneyDraft, rebaseFields, rebaseKeyed }
+  from "../moneymath";
 import { isViewer } from "../role";
 import { api, errText, money, type DebtMethod, type DebtPlan, type DebtRow,
          type DebtSchedule } from "../api/client";
@@ -128,9 +129,11 @@ export default function Debt() {
     if (draft === null) setOpened(d);
     setDraft({ ...d, [id]: { ...d[id], ...patch } });
   };
-  // a typed "1,000" compares equal to the stored 1000; text that is not a
-  // number goes out as typed so the server's refusal names it
-  const extraN = Number(extraStr.replace(/[$,\s]/g, "") || "0");
+  // a typed "1,000" compares equal to the stored 1000 and "12,50" reads
+  // as twelve-fifty, as the server reads it; text that is not a number
+  // goes out as typed so the server's refusal names it
+  const extraN = extraStr.replace(/[$\s]/g, "") === "" ? 0
+    : parseMoneyDraft(extraStr) ?? NaN;
   const persist = () => save.mutate({
     plan: { method,
             extra_monthly: Number.isFinite(extraN) ? extraN : extraStr },

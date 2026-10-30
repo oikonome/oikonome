@@ -102,6 +102,9 @@ export default function Assistant() {
   // a 404 is a server older than the shared log: this screen's own
   // turns are all there is, and that is not an error
   const noLog = history.isError && historyNotKept(history.error);
+  // a view-only login is shown its own conversations only (the web's
+  // ownOnly); the owner and a member read the household's whole log
+  const ownOnly = viewer;
   // once the log carries a turn this screen kept, the log's row is the
   // one; the local turn hands over only its note, so it cannot come back
   // as a live conversation when its row later leaves the log
@@ -367,6 +370,7 @@ export default function Assistant() {
                            alignItems: "center", marginTop: 4 }}>
               <Text style={{ color: C.mut, fontSize: 12 }}>
                 {noLog ? "This session's conversations — this server keeps no shared history"
+                  : ownOnly ? "Your conversations"
                   : "Conversations — shared with the household"}</Text>
               {canEdit && !noLog && (
                 <Pressable hitSlop={8} disabled={clear.isPending}
@@ -400,6 +404,7 @@ export default function Assistant() {
           {!history.isPending && (!history.isError || noLog) && threads.length === 0 && (
             <Text style={s.center}>
               {noLog ? "Nothing asked yet."
+                : ownOnly ? "Nothing asked yet. Your conversations are kept here."
                 : "Nothing asked yet. Every conversation is kept here for the household."}
             </Text>
           )}
@@ -433,7 +438,8 @@ export default function Assistant() {
               <Text style={{ color: C.text, fontSize: 18, fontWeight: "600" }}>Ask about your money</Text>
               <Text style={[s.center, { padding: 0 }]}>
                 Plain questions, answered from your own ledger.
-                {!noLog && " Every conversation is kept for the household."}
+                {!noLog && (ownOnly ? " Your conversations are kept for you."
+                                    : " Every conversation is kept for the household.")}
               </Text>
               <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6,
                              justifyContent: "center", marginTop: 6 }}>

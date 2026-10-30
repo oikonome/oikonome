@@ -266,6 +266,8 @@ ARCHIVE_TABLE_SKIP = {
                       "and the tokens that commit them",
     "assistant_turns": "the assistant's question-and-answer log — a "
                        "conversation on this instance, not the books",
+    "category_undo": "a category write's held undo — scratch whose "
+                     "reference only this instance issued",
     "bulk_import_jobs": "import scratch and job bookkeeping — a folder "
                         "import's frozen plan and its progress",
     "bulk_import_files": "import scratch and job bookkeeping — the files "

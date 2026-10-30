@@ -191,6 +191,7 @@ MEMBER_OK = {
     "POST /api/email/change/cancel",
     "POST /api/email/change/resend",
     "POST /api/me/email",
+    "POST /api/me/push",
     "POST /api/account/leave",
     "POST /api/sessions/revoke",
     "POST /api/totp/enroll",

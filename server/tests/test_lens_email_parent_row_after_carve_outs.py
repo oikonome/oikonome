@@ -10,7 +10,7 @@ import unittest
 
 from oikonome.web import lens_email
 
-from .util import TODAY, add_txn, make_db, write_config
+from .util import TODAY, add_ledger_history, add_txn, make_db, write_config
 
 
 def _row(html: str, label: str) -> tuple[str, str]:
@@ -33,6 +33,10 @@ class ParentRowAfterCarveOuts(unittest.TestCase):
 
     def test_monthly_parent_row_budget_leaves_the_carve_out_out(self):
         last = TODAY.replace(day=1) - dt.timedelta(days=1)
+        # an established household: the ledger predates the month, so the
+        # month is judged whole. A ledger whose first row is the 5th would
+        # be paced from the 5th and the budgets would read that share.
+        add_ledger_history(self.conn, last.replace(day=1))
         add_txn(self.conn, last.replace(day=5), 500.0, "GROCER",
                 primary="FOOD_AND_DRINK")
         add_txn(self.conn, last.replace(day=6), 300.0, "BISTRO",

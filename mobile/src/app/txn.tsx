@@ -895,7 +895,7 @@ export default function TxnDetail() {
                               qc, ["receipts", initial?.id], "receipts",
                               (x) => x.id === r.id),
                             onError: (e) => setErr(errText(e)) })}>
-                    unmatch — wrong transaction
+                    not this transaction? unmatch
                   </Text>
                 ) : null}
               </View>

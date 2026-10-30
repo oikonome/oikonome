@@ -6,8 +6,8 @@ import { api, errText, mmdd, money, toast, type PendingReimb, type ReimbPair,
          type ReimbPairsPage } from "../api/client";
 import { patchList, patchQueries, removeFromList } from "../api/cache";
 import { canEdit } from "../role";
-import { pairGapHint, reimbCandidateWhy, reimbLeft, reimbNeed, reimbOwed }
-  from "../moneymath";
+import { pairGapHint, parseMoneyDraft, reimbCandidateWhy, reimbLeft, reimbNeed,
+         reimbOwed } from "../moneymath";
 
 // How long this charge has been out of pocket. Stating it, rather than
 // leaving it to be worked out from the date column, turns a list into a
@@ -296,7 +296,7 @@ function PendingRow({ t, mayEdit, open, onToggle, onDone }: {
                   onKeyDown={(e) => e.key === "Enter" &&
                     (e.target as HTMLInputElement).blur()}
                   onBlur={(e) => {
-                    const v = Number(e.target.value.replace(/[$,\s]/g, ""));
+                    const v = parseMoneyDraft(e.target.value) ?? 0;
                     setPartial.mutate({ partial: true, expected: v > 0 ? v : null });
                   }} />)}
               <span>· {waitedLabel(t.date)}</span>

@@ -32,6 +32,8 @@ CREATE TABLE IF NOT EXISTS users (
 );
 -- pre-012 databases lack role (schema.sql runs before migrations)
 ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'owner';
+-- a person's own switch for the household's push notices (migration 198)
+ALTER TABLE users ADD COLUMN IF NOT EXISTS push_muted BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- passkeys (WebAuthn) — control-plane like users/sessions
 CREATE TABLE IF NOT EXISTS passkeys (
@@ -1293,6 +1295,21 @@ CREATE INDEX IF NOT EXISTS assistant_turns_recent
 -- pending migrations on every start, and an index on a column a
 -- migration adds would fail on a database that predates it
 
+-- a merchant-wide category write's undo, held here and handed to the
+-- client as an opaque reference (migration 200): spent once, pruned by
+-- the writes, instance-local, never exported. Its index is migration
+-- 200's alone.
+CREATE TABLE IF NOT EXISTS category_undo (
+    tenant_id   UUID NOT NULL DEFAULT NULLIF(current_setting('app.tenant_id', true), '')::uuid,
+    id          UUID NOT NULL DEFAULT gen_random_uuid(),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    payload     JSONB NOT NULL
+        CONSTRAINT category_undo_payload_is_an_object
+            CHECK (jsonb_typeof(payload) = 'object'),
+    used_at     TIMESTAMPTZ,
+    PRIMARY KEY (tenant_id, id)
+);
+
 DO $$
 DECLARE t TEXT;
 BEGIN
@@ -1307,7 +1324,8 @@ BEGIN
         'transaction_splits','activity_log','webhooks','webhook_deliveries',
         'import_staging','business_entity','entity_membership','equity_movement',
         'business_txn_class','compliance_obligation','mileage_log','vendor_1099',
-        'bulk_import_jobs','bulk_import_files','assistant_turns']
+        'bulk_import_jobs','bulk_import_files','assistant_turns',
+        'category_undo']
     LOOP
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
         EXECUTE format('DROP POLICY IF EXISTS tenant_isolation ON %I', t);

@@ -73,6 +73,14 @@ servicer, so it is not read as a utility or a service. It still counts
 as money out. A servicer's other charges are left alone, and your own
 overrides outrank this too.
 
+A statement line with no merchant name of its own is read as a transfer
+or a card payment only when it says so outright — "TRANSFER", "XFER",
+"ATM WITHDRAWAL", "CASH WITHDRAWAL", or a card-payment wording such as
+"CREDIT CARD" or "PAYMENT THANK YOU". Some banks print every debit as a
+bare "WITHDRAWAL", and a biller's online payment reads "FABRIKAM WATER
+E-PAYMENT", so those stay spending; a card issuer's own E-PAYMENT is
+still a card payment.
+
 ## The verdict is variable-only
 
 Fixed bills never make you "over": they're obligations with their own

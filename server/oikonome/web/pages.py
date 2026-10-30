@@ -158,9 +158,7 @@ def classify(user: dict = Depends(_user()), account_id: str = Form(...),
     conn = tenancy.tenant_connect(user["tenant_id"])
     try:
         # the legacy form door, same rules as /api/accounts/classify: one
-        # transaction, the account row locked, and a business account is
-        # never pinned as the personal runway's checking unless the
-        # household combines entities
+        # transaction, the account row locked, and forecast.pin_refusal
         with budget.config_txn(conn) as cfg:
             row = conn.execute(
                 "SELECT entity_id FROM accounts WHERE id=%s FOR UPDATE",
@@ -168,23 +166,13 @@ def classify(user: dict = Depends(_user()), account_id: str = Form(...),
             if row is None:
                 return RedirectResponse("/accounts?msg=account+not+found",
                                         status_code=303)
-            if primary_checking and row["entity_id"] \
-                    and not cfg.get("combine_entities"):
-                return RedirectResponse(
-                    "/accounts?msg=" + quote(
-                        "a business account cannot be the household's "
-                        "primary checking"), status_code=303)
-            # a disconnected bank's account is a frozen balance the
-            # forecast ignores — refused here as at the API's door
-            if primary_checking and conn.execute(
-                    "SELECT 1 FROM accounts a JOIN items i ON i.id = a.item_id "
-                    "WHERE a.id=%s AND i.aggregator IN ('plaid','mx','simplefin','simplefin-org') "
-                    "AND COALESCE(i.status,'') IN ('archived','restored')",
-                    (account_id,)).fetchone():
-                return RedirectResponse(
-                    "/accounts?msg=" + quote(
-                        "that account's bank is disconnected — reconnect it, "
-                        "or pick a live checking account"), status_code=303)
+            # the one rule every pin door answers with
+            if primary_checking:
+                from ..engine import forecast as _forecast
+                why = _forecast.pin_refusal(conn, cfg, account_id)
+                if why:
+                    return RedirectResponse("/accounts?msg=" + quote(why),
+                                            status_code=303)
             # the same door the API's classify uses: pins the type AND
             # re-signs a SimpleFIN balance when the kind crosses into or out
             # of debt — a bare UPDATE would leave the bank's sign until the next pull
@@ -251,9 +239,9 @@ def add_account(user: dict = Depends(_user()), name: str = Form(...),
     typ, _, sub = kind.partition("/")
     slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "account"
     import math
-    from .api import _MONEY_MAX
+    from .api import _MONEY_MAX, _typed_money
     try:
-        bal = float(balance.replace(",", "").replace("$", "").strip() or 0)
+        bal = _typed_money(balance)
         # past _MONEY_MAX a balance is finite alone but overflows totals
         if not math.isfinite(bal) or abs(bal) > _MONEY_MAX:
             bal = 0.0
@@ -289,16 +277,21 @@ def _csv_cell(v):
     the restore side rejects. Serialize real JSON so it round-trips."""
     if isinstance(v, (dict, list)):
         import json as _j
-        return _j.dumps(v)
+        from .api import _csv_piece_safe
+        # a JSON cell is text a spreadsheet splits like any other
+        return _csv_piece_safe(_j.dumps(v))
     # Spreadsheet formula injection: a cell beginning = + - @ — with or
     # without an invisible character in front of it (tab, CR, LF, BOM,
     # space) — is prefixed with a quote so Excel/Calc treat it as text.
     # payee / merchant_name / Amazon order titles are counterparty-
     # controlled and ride this full-data export. Delegated to api._csv_safe:
     # one rule.
+    # …and a piece after a ';', a tab or a line break is guarded the same
+    # way (api._csv_piece_safe), as every other CSV writer here does: a
+    # ';'-locale spreadsheet reads that piece as a cell of its own.
     if isinstance(v, str):
-        from .api import _csv_safe
-        return _csv_safe(v)
+        from .api import _csv_piece_safe, _csv_safe
+        return _csv_piece_safe(_csv_safe(v))
     # Receipt images are BYTEA — base64 in the CSV (restore
     # decodes); str() on bytes would write the Python repr and destroy them
     if isinstance(v, (bytes, memoryview)):
@@ -583,6 +576,9 @@ EXPORT_SKIP = {
     # the assistant's question-and-answer log: a conversation held on this
     # instance, not the books — the figures in it are the ledger's own
     "assistant_turns",
+    # a merchant-wide category write's held undo: a week of scratch that
+    # only means anything to the instance that issued its reference
+    "category_undo",
     # learned categorizer overlay — a binary model artifact, not user-
     # legible data; derived from merchant_categories (which exports fully)
     # and retrained nightly, so the export carries the source, not the cache
@@ -936,12 +932,12 @@ def set_balance(user: dict = Depends(_user()), account_id: str = Form(...),
             (account_id,)).fetchone()
         if owned:
             val = None
-            s = balance.replace(",", "").replace("$", "").strip()
+            s = balance.strip()
             if s:
                 import math
-                from .api import _MONEY_MAX
+                from .api import _MONEY_MAX, _typed_money
                 try:
-                    v = float(s)
+                    v = _typed_money(s)
                     # reject NaN/Infinity: they store fine in a DOUBLE column
                     # but then permanently 500 every JSON response containing
                     # the row (allow_nan=False) — same class as _money_float,
@@ -1657,6 +1653,19 @@ def _tenant_sync_allowed(user: dict) -> bool:
                           *SYNC_PER_TENANT)
 
 
+def _simplefin_bridge_id(child_id: str) -> str:
+    """The bridge item a per-bank SimpleFIN child hangs off: children are
+    minted `<bridge id>:<bank slug>`, and the slug never holds a colon."""
+    return child_id.rpartition(":")[0]
+
+
+def _simplefin_bridge_live(conn, child_id: str) -> bool:
+    row = conn.execute(
+        "SELECT status FROM items WHERE id=%s AND aggregator='simplefin'",
+        (_simplefin_bridge_id(child_id),)).fetchone()
+    return bool(row) and row["status"] != "archived"
+
+
 def _account_sync(user: dict, item_id: str) -> tuple[str, str]:
     """Manual per-item 'sync now' — same pulls the hourly worker does for
     this one item (plaid: transactions + liabilities/holdings products).
@@ -1699,6 +1708,14 @@ def _account_sync(user: dict, item_id: str) -> tuple[str, str]:
             outcome = "disconnected"
             msg = (f"{row['institution_name'] or row['id']} is disconnected "
                    "— reconnect it to sync.")
+        elif (row["aggregator"] == "simplefin-org"
+              and not _simplefin_bridge_live(conn, item_id)):
+            # the per-bank child is pulled through its bridge, so a bridge
+            # the owner disconnected must not be pulled (and re-marked
+            # live) from one of its banks either
+            outcome = "disconnected"
+            msg = (f"{row['institution_name'] or row['id']} is disconnected "
+                   "— reconnect it to sync.")
         else:
             name = row["institution_name"] or row["id"]
             # A pull from this button lands rows exactly as the hourly sweep
@@ -1724,7 +1741,15 @@ def _account_sync(user: dict, item_id: str) -> tuple[str, str]:
                 return "ok", (f"{name}: its history is still arriving. Its "
                               "first sync has been asked for; if it cannot "
                               "start now, the hourly sync starts it.")
-            pulls = row["aggregator"] in ("plaid", "simplefin")
+            # SimpleFIN accounts hang off per-bank 'simplefin-org' children
+            # that carry no token: the pull goes through the bridge item
+            # that does. MX accounts hang off 'mx' items, and an MX pull is
+            # tenant-wide. Both are live feeds — only an import, script or
+            # manual connection has nothing to pull.
+            agg = row["aggregator"]
+            pull_id = (_simplefin_bridge_id(item_id)
+                       if agg == "simplefin-org" else item_id)
+            pulls = agg in ("plaid", "simplefin", "simplefin-org", "mx")
             before_ids = _worker._recent_txn_ids(conn) if pulls else None
             try:
                 if row["aggregator"] == "plaid":
@@ -1758,16 +1783,28 @@ def _account_sync(user: dict, item_id: str) -> tuple[str, str]:
                                f"data {_when_phrase(when)}."
                                if when else
                                f"{name}: nothing new to bring in.")
-                elif row["aggregator"] == "simplefin":
-                    token = sync_base.get_access_token(conn, item_id)
+                elif agg in ("simplefin", "simplefin-org"):
+                    token = sync_base.get_access_token(conn, pull_id)
                     if not token:
                         raise ValueError("connection has no token — reconnect")
                     r = simplefin.sync(
-                        conn, item_id, token,
+                        conn, pull_id, token,
                         since=_dt.date.today() - _dt.timedelta(days=30))
                     _categorize_after_pull_async(user["tenant_id"])
                     _worker._webhooks_after_sync(
-                        conn, {item_id: f"ok:{r['transactions']}"},
+                        conn, {pull_id: f"ok:{r['transactions']}"},
+                        before_ids, user["tenant_id"])
+                    msg = (f"{name} synced — {r['transactions']} "
+                           "transactions pulled.")
+                elif agg == "mx":
+                    from ..sync import mx as _mx
+                    # the same pull the hourly sweep and the MX sync door
+                    # run, keyed the way the sweep reports it
+                    pull_id = "mx"
+                    r = _mx.sync(conn)
+                    _categorize_after_pull_async(user["tenant_id"])
+                    _worker._webhooks_after_sync(
+                        conn, {pull_id: f"ok:{r['transactions']}"},
                         before_ids, user["tenant_id"])
                     msg = (f"{name} synced — {r['transactions']} "
                            "transactions pulled.")
@@ -1781,7 +1818,7 @@ def _account_sync(user: dict, item_id: str) -> tuple[str, str]:
                 clean = sync_base.redact_url_credentials(str(e)) or ""
                 if pulls:
                     _worker._webhooks_after_sync(
-                        conn, {item_id: f"error:{type(e).__name__}"},
+                        conn, {pull_id: f"error:{type(e).__name__}"},
                         before_ids, user["tenant_id"])
                 outcome = "failed"
                 msg = f"{name} sync failed: {clean[:160]}"
@@ -2020,6 +2057,10 @@ def bills_proposal(user: dict = Depends(_user()), pid: str = Form(...),
         conn.close()
     verb = {"approve": "approved", "reject": "rejected"}.get(action, action)
     msg = r.get("error") or f"{verb}: {r.get('approved') or r.get('rejected')}"
+    if not r.get("error") and r.get("note"):
+        # an approve can undo something the person set (a pinned amount);
+        # the form door says so as the JSON door does, never silently
+        msg += f" — {r['note']}"
     return RedirectResponse(f"/bills?msg={quote(msg)}", status_code=303)
 
 

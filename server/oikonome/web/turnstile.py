@@ -35,12 +35,23 @@ bot getting through is a whole fake tenant — so it is challenged every time.
 """
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 
 import httpx
 
 log = logging.getLogger("oikonome.turnstile")
+
+# The emailed unlocks THIS request spent passing the human check. A sign-in
+# that has to give its spend back (a busy hasher verified nothing; a
+# password step that still needs its second factor) re-arms exactly these
+# rows. Re-arming by time instead — "whatever this account spent in the
+# last few seconds" — would also hand back a concurrent attempt's spend,
+# one that got as far as a wrong password and must stay spent. Each request
+# runs in its own context, and verify_login starts the record afresh.
+_SPENT_UNLOCKS: contextvars.ContextVar[tuple] = contextvars.ContextVar(
+    "oikonome_spent_unlocks", default=())
 
 VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 
@@ -136,11 +147,23 @@ def verify_login(token: str, ip: str = "", email: str = "") -> bool:
     proxied) answer the check at all. It is tried LAST so that a user who
     can produce a token never spends one.
     """
+    _SPENT_UNLOCKS.set(())
     if not required_for_login(ip, email):
         return True
     if verify(token, ip):
         return True
     return _spend_unlock(email)
+
+
+def spent_unlocks() -> tuple:
+    """The ids of the emailed unlocks this request spent (empty when it
+    passed by a token, by no challenge, or not at all)."""
+    return _SPENT_UNLOCKS.get()
+
+
+def forget_spent_unlocks() -> None:
+    """The request's spend has been given back; nothing is left to re-arm."""
+    _SPENT_UNLOCKS.set(())
 
 
 def refund_unlock(email: str) -> None:
@@ -149,14 +172,17 @@ def refund_unlock(email: str) -> None:
     supplied) — a just-spent emailed exemption is re-armed so the SECOND
     post of the two-step flow can pass the same check. No-op when the pass
     came from a token or from no-challenge (there is no recently-consumed
-    row to refund)."""
-    if not email:
+    row to refund). Only the unlock this request spent is refunded — see
+    _SPENT_UNLOCKS."""
+    ids = spent_unlocks()
+    if not email or not ids:
         return
     try:
         from ..auth import login_unlock
         from ..db import tenancy
         with tenancy.control_connect() as conn:
-            login_unlock.refund(conn, email)
+            login_unlock.refund(conn, email, ids=ids)
+        forget_spent_unlocks()
     except Exception:                    # noqa: BLE001 — best-effort
         pass
 
@@ -178,6 +204,9 @@ def _spend_unlock(email: str) -> bool:
         from ..auth import login_unlock
         from ..db import tenancy
         with tenancy.control_connect() as conn:
-            return login_unlock.consume(conn, email)
+            ids = login_unlock.consume(conn, email)
     except Exception:
         return False
+    if ids:
+        _SPENT_UNLOCKS.set(_SPENT_UNLOCKS.get() + tuple(ids))
+    return bool(ids)

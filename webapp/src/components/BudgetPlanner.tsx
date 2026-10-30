@@ -4,7 +4,8 @@ import { Link } from "react-router";
 import { api, errText } from "../api/client";
 import { saveSettings } from "../api/cache";
 import { historyBasisNote, isPlanSavingsGoal, mergePlannerBuckets,
-         plannerUnallocAuto, type PlannerRow } from "../moneymath";
+         parseMoneyDraft, plannerUnallocAuto, type PlannerRow }
+  from "../moneymath";
 
 // The balance-your-budget planner — the wizard's budgets step AND the
 // standing /balance page share it.
@@ -43,7 +44,8 @@ export default function BudgetPlanner({ onSaved, standalone = false,
   // the numbers came from the suggestion, not a saved plan: only then
   // does the history line describe what the person is looking at
   const [fromHistory, setFromHistory] = useState(false);
-  const numv = (v: string) => Number((v || "0").replace(/[$,\s]/g, "")) || 0;
+  // a typed amount read by the server's separator rules; not a number is 0
+  const numv = (v: string) => parseMoneyDraft(v) ?? 0;
   // unsaved edits signal — the Budget page skips remounting
   // this card after a sibling's save while it holds a draft
   const touch = () => onDirtyChange?.(true);
@@ -312,7 +314,7 @@ export default function BudgetPlanner({ onSaved, standalone = false,
           <h3 style={{ marginTop: 0, color: "var(--green, #4a4)" }}>
             ⬇ Money in</h3>
           <p><label>Expected income / month{" "}
-            <span className="sub">(take-home; powers the cash forecast)</span>
+            <span className="sub">(take-home; used only when no paycheck is tracked and no scenario is active)</span>
             <br />
             <input inputMode="decimal" value={income}
               onChange={(e) => { touch(); setIncome(e.target.value); }}
@@ -322,7 +324,13 @@ export default function BudgetPlanner({ onSaved, standalone = false,
                        borderRadius: "var(--rs)", color: "var(--ink)" }} />
           </label></p>
           <p className="mut" style={{ fontSize: 13, marginBottom: 0 }}>
-            Inferred from the paychecks detected in your ledger.</p>
+            Suggested from the paychecks in your ledger: the average of
+            what landed over the last twelve months. The plan&apos;s monthly
+            &ldquo;in&rdquo; does not read this field once a paycheck is
+            tracked on Bills — it counts this month&apos;s checks, landed
+            plus still due, each at your latest deposit. It sets the
+            plan&apos;s income only while no paycheck is tracked and no
+            income scenario is active; the cash forecast never reads it.</p>
         </div>
         <div style={{ ...panel, flex: "2 1 24rem" }}>
           <h3 style={{ marginTop: 0, color: "var(--amber, #e6b159)" }}>

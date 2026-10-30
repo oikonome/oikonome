@@ -168,7 +168,8 @@ def _recipients_raw(conn, tenant_id: str,
     return _recipient_lists(conn, tenant_id, kind)[1]
 
 
-def _recipient_lists(conn, tenant_id: str, kind: str | None = None
+def _recipient_lists(conn, tenant_id: str, kind: str | None = None, *,
+                     honour_mute: bool = True
                      ) -> tuple[list[str], list[str]]:
     """Tenant alert/email recipients: the account OWNER always, plus anyone
     configured in `email_recipients`. With nothing configured, every
@@ -206,7 +207,11 @@ def _recipient_lists(conn, tenant_id: str, kind: str | None = None
     Returns `(before the per-kind choices, after them)`: everyone this
     household would mail, and who still wants `kind`. A first list with an
     empty second one is a household whose people all turned this kind off —
-    a decision, distinct from having nobody to mail at all."""
+    a decision, distinct from having nobody to mail at all.
+
+    `honour_mute=False` leaves the mute list out: who is on the household's
+    mail at all, the question the owner's roster asks beside each person's
+    own mute switch. Every other rule above still applies."""
     from ..engine import budget
     cfg = budget.load_config(conn)
     recips = cfg.get("email_recipients")
@@ -214,7 +219,7 @@ def _recipient_lists(conn, tenant_id: str, kind: str | None = None
     # scheduled send for the tenant, silently
     _muted_raw = cfg.get("email_muted")
     muted = ({str(m).lower() for m in _muted_raw}
-             if isinstance(_muted_raw, list) else set())
+             if isinstance(_muted_raw, list) and honour_mute else set())
 
     from ..notify import email_prefs
 
@@ -1523,9 +1528,18 @@ def nightly_tenant(tenant_id: str) -> dict:
         # the receipt, retrain and savings steps after it
         try:
             with _llm.amazon_chain_lock(conn, wait=True):
-                _am.run_match(conn)
-                _cm.run_match(conn)
-                _md.apply(conn)
+                # each step isolated like the ones after it: one row the
+                # merchant pass cannot read (a malformed restored record,
+                # say) fails the same way every night, and must not cost
+                # the household every step behind it, every night
+                for step, fn in (("amazon match", _am.run_match),
+                                 ("costco match", _cm.run_match),
+                                 ("merchant clean", _md.apply)):
+                    try:
+                        fn(conn)
+                    except Exception as e:               # noqa: BLE001
+                        log.warning("%s failed tenant=%s: %s", step,
+                                    tenant_id, e)
                 # and converge any payee an earlier, unevenly-enriched sync
                 # split across two merchants. Bounded per run and journalled
                 # like a rename, so it cannot run long and cannot be

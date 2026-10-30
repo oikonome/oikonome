@@ -15,7 +15,7 @@ import { ApiError, busyText, countsInTotals, downloadRefusal, errText,
          inOperatingProfit, signInErrText, whatIfRefusal }
   from "../src/lib/api.ts";
 import { accountTheme, billToggleNote, categoryForServer, CLEAR_CATEGORY, composeBugReport,
-         filterCategories, dayLabel, daySpend, rowSpend,
+         filterCategories, dominantCategory, dayLabel, daySpend, rowSpend,
          elevationProof, recoveryNeedsPassword, hostOf,
          hueOf, isPlanSavingsGoal, isPrivateHost, isValidYmd, logoProxyUrl,
          mergeIncomeScenarios, monogram,
@@ -1753,6 +1753,17 @@ test("an empty category filter shows every option, not none", () => {
   assert.deepEqual(filterCategories(all, "   "), all);
 });
 
+test("a merchant's current category is the one most of its rows carry", () => {
+  const rows = (...cs) => cs.map((c) => ({ category: c }));
+  assert.equal(dominantCategory(rows("A", "B", "B")), "B");
+  // a tie keeps the first seen — stable, never flickering between renders
+  assert.equal(dominantCategory(rows("A", "B")), "A");
+  // uncategorized rows never win the label
+  assert.equal(dominantCategory(rows(null, null, "C")), "C");
+  assert.equal(dominantCategory(rows(null)), null);
+  assert.equal(dominantCategory([]), null);
+});
+
 test("the category filter matches the display label, underscores as spaces", () => {
   const all = ["FOOD_AND_DRINK", "GENERAL_SERVICES", "TRANSFER_OUT"];
   assert.deepEqual(filterCategories(all, "food and"), ["FOOD_AND_DRINK"]);
@@ -2086,9 +2097,12 @@ test("a demo instance has no unlock door, and says so", () => {
 test("what-if money: formatted amounts become plain numbers", () => {
   assert.equal(moneyParam("1,000"), "1000");
   assert.equal(moneyParam("$ 250.50"), "250.5");
-  // the save door strips "," too, so a comma decimal reads the same way
-  // in the what-if as in what Save would store
-  assert.equal(moneyParam("50,5"), "505");
+  // the save door reads a decimal comma as a decimal, so the what-if
+  // reads it the same way — and an ambiguous comma is no number at all
+  assert.equal(moneyParam("50,5"), "50.5");
+  assert.equal(moneyParam("1.234,56"), "1234.56");
+  assert.equal(numv("12,50"), 12.5);
+  assert.equal(numv("1,2,3"), 0);
   assert.equal(moneyParam(""), "0");
   assert.equal(moneyParam("abc"), "0");
   // whole dollars round the way every other money figure does — half to
@@ -4218,6 +4232,34 @@ test("mergeIncomeScenarios: names compare case-insensitively, no duplicate carri
     [{ name: "Full", take_home: 9, cadence: "weekly" }], cur), cur);
 });
 
+// A typed take-home reaches the save as the number the server would read
+// from the same text: "2.100,50" and "2,100.50" are both 2100.5, and a
+// comma that fits no convention is refused — the save throws, naming the
+// row — never stripped to a figure ten or a hundred times too big, and
+// never sent as NaN, which JSON carries as null.
+import * as webScenarios from "../../webapp/src/incomescenarios.ts";
+for (const [side, merge] of [["mobile", mergeIncomeScenarios],
+                             ["web", webScenarios.mergeIncomeScenarios]]) {
+  test(`${side}: an income scenario's take-home reads a decimal comma`, () => {
+    const rows = [
+      { name: "Full", take_home: "2.100,50", cadence: "biweekly", touched: true },
+      { name: "Half", take_home: "1050,25", cadence: "biweekly", touched: true },
+      { name: "Side", take_home: "2,100.50", cadence: "weekly", touched: true },
+      { name: "Blank", take_home: "", cadence: "monthly", touched: true }];
+    assert.deepEqual(merge(rows, [], []).map((r) => r.take_home),
+                     [2100.5, 1050.25, 2100.5, 0]);
+    for (const typed of ["1,2,3", "1,234.", "1,23,456", "12,3456", "abc"])
+      assert.throws(() => merge([{ name: "Odd", take_home: typed,
+                                   cadence: "weekly", touched: true }],
+                                [], []),
+                    /Odd: .* is not an amount/, typed);
+    // an untouched row is the live value, never re-read from its text
+    const live = [{ name: "Odd", take_home: 900, cadence: "weekly" }];
+    assert.deepEqual(merge([{ name: "Odd", take_home: "1,234.",
+                              cadence: "weekly" }], live, live), live);
+  });
+}
+
 // ---- Investment fees & basis: the web form and the mobile form post the
 // same body for the same rows, and refuse the same mistakes
 import * as mobileInvest from "../src/lib/settings-pure.ts";
@@ -4316,6 +4358,18 @@ for (const [side, m] of [["mobile", mobileInvest], ["web", webInvest]]) {
     assert.deepEqual(m.investChanges(base, { ...base, exempt: "1111" }).body, {
       advisory_fee_exempt_masks: ["1111"] });
     assert.equal(m.INVEST_STALE_STATUS, 409);
+  });
+
+  test(`${side}: a money-in override reads a decimal comma as the server does`, () => {
+    const r = m.investBody({ fees: [], exempt: "",
+      basis: [{ mask: "3333", amount: "$1.250,50" },
+              { mask: "4444", amount: "12,5" }] });
+    assert.equal(r.ok, true);
+    assert.deepEqual(r.body.investment_basis_override,
+                     { "3333": 1250.5, "4444": 12.5 });
+    // a comma that fits no convention is refused, not stripped to 123
+    assert.equal(m.investBody({ fees: [], exempt: "",
+      basis: [{ mask: "3333", amount: "1,2,3" }] }).ok, false);
   });
 
   test(`${side}: masks accept letters the bank uses`, () => {

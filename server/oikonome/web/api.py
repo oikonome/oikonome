@@ -121,14 +121,19 @@ def _csv_safe(v):
     sources: LLM-parsed receipt lines, bank-feed merchant names, the user's
     own free-text category on a file an accountant opens.
 
-    `pages.py:_csv_cell` carries the same rule for the full-data export."""
+    `pages.py:_csv_cell` carries the same rule for the full-data export.
+
+    A cell that already opens with quotes in front of such a lead gets one
+    more: the household's own apostrophe then survives (a spreadsheet hides
+    exactly one), and a restore can take exactly one off — the mark is
+    reversible because text that looks guarded is always guarded again."""
     if not isinstance(v, str) or not v:
         return v
-    head = v.lstrip("".join(_CSV_INVISIBLE_LEAD))
-    if v[:1] in _CSV_INVISIBLE_LEAD + _CSV_FORMULA_LEAD \
+    head = v.lstrip("".join(_CSV_INVISIBLE_LEAD) + "'")
+    if v[:1] in _CSV_INVISIBLE_LEAD + _CSV_FORMULA_LEAD + ("'",) \
             and head[:1] in _CSV_FORMULA_LEAD:
         return "'" + v
-    if v[:1] in ("\t", "\r"):
+    if v.lstrip("'")[:1] in ("\t", "\r"):
         # a leading tab/CR is neutralized whatever follows it: it splits or
         # shifts a cell in some readers on its own
         return "'" + v
@@ -156,7 +161,9 @@ def _csv_piece_safe(v: str) -> str:
     a formula character". A tab, CR or line feed is both a break and
     invisible, so a run of them does not clear that flag; the quote put in
     after the break nearest the formula character does, because it is
-    then the first visible character of every piece that reaches it. A
+    then the first visible character of every piece that reaches it. An
+    apostrophe already there keeps the flag too, so a piece the household
+    typed as "'=x" gets one more and a restore takes exactly one off. A
     lookahead regex does the same job in time quadratic in the length of a
     tab run, and the regex engine holds the interpreter lock the whole
     while — one restored note of tabs would stall every household."""
@@ -175,7 +182,7 @@ def _csv_piece_safe(v: str) -> str:
         out.append(ch)
         if ch in _CSV_FORMULA:
             lead = True
-        elif ch not in _CSV_INVISIBLE and ch != '"':
+        elif ch not in _CSV_INVISIBLE and ch not in ('"', "'"):
             # a double quote keeps the flag: csv doubles it, and a reader
             # that splits on the break opens a quoted field there, closes it
             # at the doubled quote and reads what follows as the cell
@@ -184,6 +191,36 @@ def _csv_piece_safe(v: str) -> str:
         return v
     out.reverse()
     return "".join(out)
+
+
+def _csv_piece_unsafe(v):
+    """Reverse _csv_piece_safe for a cell read back from an export (the
+    full-data ZIP is also the restore input, so a round trip must give
+    the household's text back byte for byte). Exactly one quote comes out
+    where the export put one: right after a piece break, with a formula
+    character next once quotes, invisible characters (a break excepted)
+    and double quotes are passed. The export adds one there whenever the
+    piece already looks like that, so the step loses nothing; the result
+    is kept only when guarding it again gives exactly the cell read."""
+    if not isinstance(v, str) or "'" not in v:
+        return v
+    out = []
+    changed = False
+    n = len(v)
+    for i, ch in enumerate(v):
+        if ch == "'" and i and v[i - 1] in _CSV_PIECE_BREAK:
+            j = i + 1
+            while j < n and (v[j] in _CSV_INVISIBLE or v[j] in ('"', "'")) \
+                    and v[j] not in _CSV_PIECE_BREAK:
+                j += 1
+            if j < n and v[j] in _CSV_FORMULA:
+                changed = True
+                continue
+        out.append(ch)
+    if not changed:
+        return v
+    cand = "".join(out)
+    return cand if _csv_piece_safe(cand) == v else v
 
 
 class _SafeCsvWriter:
@@ -254,6 +291,17 @@ def _filename_safe(v: str, fallback: str = "export") -> str:
 _MONEY_MAX = 1e12
 
 
+def _typed_money(raw) -> float:
+    """A hand-typed amount as a number; blank reads as 0. Either separator
+    convention is read the way the CSV importer reads it ("1,234.56",
+    "1.234,56", "12,50"): stripping every comma would store a decimal-comma
+    "12,50" as 1250 and "1.234,56" as 1.23456, with nothing to say so.
+    Raises ValueError for anything that is not an amount."""
+    from ..sync.csvimport import parse_money_text
+    s = str(raw).strip()
+    return parse_money_text(s) if s else 0.0
+
+
 def _money_float(raw, field: str) -> float:
     """Parse a user money string; reject NaN/Infinity — they parse fine
     but poison DOUBLE PRECISION columns and then permanently 500 every
@@ -261,7 +309,7 @@ def _money_float(raw, field: str) -> float:
     past _MONEY_MAX, which is finite alone but overflows the totals."""
     import math
     try:
-        v = float(str(raw).replace(",", "").replace("$", "").strip() or 0)
+        v = _typed_money(raw)
     except (TypeError, ValueError):
         raise HTTPException(400, f"{field} must be a number")
     if not math.isfinite(v):
@@ -551,6 +599,10 @@ def today_full(user: dict = Depends(_user()), date: str = ""):
         # from budget.month_status
         "income": (round(st["income"], 2)
                    if st.get("income") is not None else None),
+        # this month's income in its two halves: landed, and still due
+        # (absent halves = the budgeted figure, not the month's)
+        "income_received": st.get("income_received"),
+        "income_expected": st.get("income_expected"),
         "plan_surplus": (round(st["plan_surplus"], 2)
                          if st.get("plan_surplus") is not None else None),
         "avg_bills": round(st.get("avg_bills") or 0, 2),
@@ -1656,10 +1708,27 @@ def _transactions_payload(conn, *, y: int = 0, m: int = 0, q: str = "",
     # inside the month)
     per_day, per_day_days = _per_seen_day(
         flows["out"], _month_windows(_ledger_first(conn), yy, [mm], today))
+    # the current month's income still to come — the paychecks due before
+    # month end that have not landed — so the header's "in" can say what
+    # the month will be, the same figure the Budget plan counts. Like
+    # in_sum it is the household's month, whatever owner or scope narrows
+    # the list. The download (`chunk`) has no header, so it skips the walk.
+    # "in" and "net" stay the ledger's figure (month_flows), the one the
+    # Month lens hero, the Year cells, Cash Flow and the monthly email all
+    # count by date: a paycheck dated the 1st that the plan counts in the
+    # month before (a weekend payday) would otherwise sit in two different
+    # months on two pages. "expected" is the plan's still-due half.
+    in_expected = None
+    in_sum, net_sum = flows["in"], flows["net"]
+    if (yy, mm) == (today.year, today.month) and not chunk:
+        from ..engine import budget as _budget
+        in_expected = _budget.expected_income_remaining(
+            conn, _budget.load_config(conn), today)
     return {"mode": "month", "year": y or today.year,
             "month": m or today.month, "rows": out,
-            "out_sum": flows["out"], "in_sum": flows["in"],
-            "net_sum": flows["net"],
+            "out_sum": flows["out"], "in_sum": in_sum,
+            "in_expected": in_expected,
+            "net_sum": net_sum,
             # the month's spending per day so far (every day, once closed)
             "per_day": per_day, "per_day_days": per_day_days,
             # zero under the combined toggle: the rows ARE household
@@ -1717,7 +1786,7 @@ def set_category(txn_id: str, user: dict = Depends(_user()),
         # `rule_written` reports what happened: an "all" on a flow category or
         # a merchant-less row writes nothing, so `scope == "all"` alone would
         # claim a write that never happened. When a rule IS
-        # written, `undo` carries the same snapshot the history page's
+        # written, `undo` is the same opaque reference the history page's
         # bulk write returns — POST it back to
         # /bills/merchant-category/undo to reverse the teach (the per-row
         # override itself stays; it was the user's direct answer).
@@ -2281,7 +2350,17 @@ def accounts(user: dict = Depends(_user())):
         for r in rows:
             r["link"] = link_info.get(r["id"])
             r["script"] = script_info.get(r["item_id"])
-        return {"accounts": rows}
+        # the account the cash forecast starts from — the pin when it is
+        # live, else the same fall-through pick — named once here so the
+        # ledger can head itself with that balance without a forecast walk
+        from ..engine import budget, forecast
+        _cfg = budget.load_config(conn)
+        primary = forecast.checking_pick(conn, _cfg)[0]
+        # why a saved pin is not that account, in the page's words — the
+        # clients render this rather than re-derive the forecast's rules
+        return {"accounts": rows, "primary_checking_id": primary,
+                "primary_pin_unused": forecast.pin_unused_reason(
+                    conn, _cfg, primary)}
     finally:
         conn.close()
 
@@ -4672,14 +4751,18 @@ def merchant_category_undo_api(user: dict = Depends(_user()),
         raise HTTPException(400, "undo snapshot required")
     conn = _conn(user)
     try:
-        # the snapshot is client-held state posted back verbatim; its shape
-        # and every value it would write are checked there, not trusted
+        # `undo` is what the write answered: a reference to the snapshot
+        # the server holds (spent once; another household's, or a pruned
+        # one, is not found), or an older client's inline snapshot, whose
+        # shape and every value it would write are checked, not trusted
         n = data.undo_merchant_category(conn, undo)
         _activity.record(conn, user, "rule", "undone",
                          target=str(undo.get("merchant") or ""),
                          label=str(undo.get("merchant") or "a merchant"),
                          detail={"count": n})
         return {"ok": True, "restored": n}
+    except data.UndoNotFound as e:
+        raise HTTPException(404, str(e))
     except ValueError as e:
         raise HTTPException(400, str(e))
     finally:
@@ -4858,6 +4941,13 @@ def assistant_ask_api(user: dict = Depends(_user()), body: dict = Body(...)):
     try:
         context: list[dict] = []
         if thread_id:
+            # a view-only login continues only its own conversations: the
+            # household's others are not shown to it, and the answer the
+            # same question would get for an unknown thread says nothing
+            # about whether one exists
+            if _own_log_only(user) and not assistant.thread_is_own(
+                    conn, thread_id, user.get("user_id")):
+                raise HTTPException(404, "no such conversation")
             context = assistant.thread_context(conn, thread_id)
             if not context:
                 raise HTTPException(404, "no such conversation")
@@ -4974,20 +5064,30 @@ def assistant_report_api(user: dict = Depends(_user()),
                              "cache-control": "no-store"})
 
 
+def _own_log_only(user: dict) -> bool:
+    """Is this login shown only its own conversations? A view-only login:
+    it reads the household's money, not what the household asked about
+    it. The owner and a member read the whole log."""
+    return user.get("role") == "viewer"
+
+
 @router.get("/assistant/history")
 def assistant_history_api(user: dict = Depends(_user()),
                           limit: int = Query(assistant.HISTORY_PAGE),
                           before: str | None = Query(None),
                           before_id: str | None = Query(None)):
-    """The household's answered questions, newest first — every member
-    reads the same log, so a chart drawn on the phone is on the web too.
+    """The household's answered questions, newest first — the owner and
+    every member read the same log, so a chart drawn on the phone is on
+    the web too; a view-only login is shown its own questions only.
     The shared demonstration login is shown its own address only: every
     visitor holds it, so who asked what would hand each of them the
     household's people."""
     conn = _conn(user)
     try:
-        out = assistant.history(conn, limit=limit, before=before,
-                                before_id=before_id)
+        out = assistant.history(
+            conn, limit=limit, before=before, before_id=before_id,
+            asked_by_id=(user.get("user_id") if _own_log_only(user)
+                         else None))
     except ValueError:
         raise HTTPException(400, "bad cursor")
     finally:
@@ -5202,24 +5302,15 @@ def accounts_classify_api(user: dict = Depends(_user()),
             # stays invisible
             if row is None:
                 raise HTTPException(404, "account not found")
-            # the runway ignores a business account unless the household
-            # combines entities (forecast); a pin the forecast will not
-            # honour must be refused, not saved
-            # …and a disconnected or restored-shell bank's account is a
-            # frozen balance the forecast ignores (forecast._checking_start)
-            if pin and conn.execute(
-                    "SELECT 1 FROM accounts a JOIN items i ON i.id = a.item_id "
-                    "WHERE a.id=%s AND i.aggregator IN ('plaid','mx','simplefin','simplefin-org') "
-                    "AND COALESCE(i.status,'') IN ('archived','restored')",
-                    (account_id,)).fetchone():
-                raise HTTPException(
-                    400, "that account's bank is disconnected — reconnect "
-                         "it, or pick a live checking account")
-            if pin and row["entity_id"] and not cfg.get("combine_entities"):
-                raise HTTPException(
-                    400, "a business account cannot be the household's "
-                         "primary checking — move it back to personal "
-                         "first, or turn on the combined view")
+            # a pin the forecast will not honour (a disconnected bank, a
+            # business account outside the combined view, an excluded or
+            # backup account) is refused, not saved — the one rule every
+            # pin door answers with (forecast.pin_refusal)
+            if pin:
+                from ..engine import forecast as _forecast
+                why = _forecast.pin_refusal(conn, cfg, account_id)
+                if why:
+                    raise HTTPException(400, why)
             sync_base.mark_type_user_set(conn, account_id, typ, sub or None)
             if pin:
                 cfg["checking_account_id"] = account_id
@@ -5243,10 +5334,17 @@ def accounts_exclude_api(user: dict = Depends(_user()),
         raise HTTPException(400, "account_id required")
     conn = _conn(user)
     try:
-        if not conn.execute("SELECT 1 FROM accounts WHERE id=%s",
-                            (aid,)).fetchone():
-            raise HTTPException(404, "no such account")
         with budget.config_txn(conn) as cfg:
+            # the existence check sits inside the settings transaction and
+            # locks the row (settings first, then accounts — the order
+            # every door takes): a reconnect adoption renaming this id
+            # holds the row, and once it commits the id is gone. Checked
+            # outside, the door read the rewritten list, appended the dead
+            # id and answered excluded while the renamed account counted on.
+            if not conn.execute(
+                    "SELECT 1 FROM accounts WHERE id=%s FOR UPDATE",
+                    (aid,)).fetchone():
+                raise HTTPException(404, "no such account")
             cur = list(cfg.get("excluded_accounts") or [])
             want = (bool(body["excluded"]) if "excluded" in body
                     else aid not in cur)
@@ -5999,6 +6097,21 @@ def _hide_people(view: dict, user: dict) -> dict:
                            or paused["recipients"]
                            or paused.get("aggregator")
                            or paused.get("removed_members")) else None)
+    if user.get("role") != "owner":
+        # each member's mail switches (muted, which kinds they take, whether
+        # their address bounces, their invite) are the owner's to see, as
+        # on the roster; everyone else reads their own row and no other
+        mine = str(user.get("email") or "").strip().lower()
+        if "email_muted" in view:
+            muted = view.get("email_muted") or []
+            if isinstance(muted, str):
+                muted = [x for x in muted.split(",")]
+            view["email_muted"] = [m for m in muted
+                                   if str(m or "").strip().lower() == mine]
+        if "email_recipient_status" in view:
+            view["email_recipient_status"] = [
+                r for r in (view.get("email_recipient_status") or [])
+                if str(r.get("email") or "").strip().lower() == mine]
     paused = view.get("outbound_paused")
     if (isinstance(paused, dict) and paused.get("removed_members")
             and user.get("role") != "owner"):
@@ -6283,11 +6396,18 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
             _cfg_was = _copy.deepcopy(cfg)
             _smtp_from_missing = _smtp_user_given = False
             def _num(v, field):
-                if v is None or v == "":
+                # A blank box is an answer of 0. A JSON null is not: it is
+                # what a client's NaN becomes on the wire, so a field the
+                # person typed and the client could not read would be
+                # stored as 0 without a word. No client sends null to mean
+                # "clear" — clearing is a blank or a 0 — so refuse it.
+                if v is None:
+                    raise HTTPException(400, f"{field} must be a number")
+                if v == "":
                     return 0.0
                 import math
                 try:
-                    n = float(str(v).replace(",", "").replace("$", "").strip())
+                    n = _typed_money(v)
                 except (TypeError, ValueError):
                     raise HTTPException(400, f"{field} must be a number")
                 # a literal NaN/Infinity would ride into the jsonb config and make
@@ -6743,7 +6863,7 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                         seen.add(name.lower())
                         cleaned.append({
                             "name": name, "parent": parent,
-                            "monthly": max(0.0, _num(e.get("monthly"),
+                            "monthly": max(0.0, _num(e.get("monthly", 0),
                                                      f"bucket '{name}' monthly")),
                             "categories": cats, "merchants": merch})
                     cfg["custom_buckets"] = cleaned
@@ -6900,7 +7020,7 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                     if name.lower() in names:
                         raise HTTPException(400, f"duplicate scenario '{name}'")
                     names.add(name.lower())
-                    take = _num(s.get("take_home"), "take_home")
+                    take = _num(s.get("take_home", 0), "take_home")
                     if take <= 0:
                         raise HTTPException(
                             400, f"scenario '{name}' needs a take-home > 0")
@@ -6959,8 +7079,8 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                     if name.lower() in names:
                         raise HTTPException(400, f"duplicate goal '{name}'")
                     names.add(name.lower())
-                    target = _num(g.get("target") or 0, "target")
-                    plan = round(max(0.0, _num(g.get("monthly_plan") or 0,
+                    target = _num(g.get("target", 0), "target")
+                    plan = round(max(0.0, _num(g.get("monthly_plan", 0),
                                                "monthly_plan")), 2)
                     # open-ended saving (a monthly plan with no
                     # target yet) is valid — the wizard's default Savings
@@ -6998,7 +7118,7 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                                        for t in tokens_in[:8]
                                        if str(t).strip()],
                             "start_balance": round(
-                                _num(g.get("start_balance") or 0,
+                                _num(g.get("start_balance", 0),
                                      "start_balance"), 2)}
                     # Match words with no account cannot be measured: they
                     # match both legs of a transfer and nothing says which
@@ -7061,7 +7181,7 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                                 400, "asset as_of must be YYYY-MM-DD")
                     entry = {"name": name,
                              "kind": str(a.get("kind") or "other").strip()[:30],
-                             "value": round(_num(a.get("value") or 0, "value"), 2),
+                             "value": round(_num(a.get("value", 0), "value"), 2),
                              "as_of": as_of.isoformat()}
                     for k in ("auto", "rate", "monthly_delta"):
                         if a.get(k) is not None:
@@ -11170,6 +11290,21 @@ def _pin_kind(body: dict):
         kind if kind in ("api", "scrape") else None)
 
 
+def _enrich_awaits_confirm(conn) -> bool:
+    """Whether Enrich waits on the owner confirming their address. It bills
+    per row on the instance's Plaid account exactly as a bank link does, so
+    it waits on the same condition the add-a-bank door does. Asked through
+    ext.gate.enrich_awaits_confirm, the fail-closed form of
+    bank_awaits_confirm: the display's form swallows an error to False, and
+    a spending door must not inherit that. A household's own instance
+    never waits."""
+    try:
+        return bool(ext.gate.enrich_awaits_confirm(conn))
+    except Exception:                                    # noqa: BLE001
+        # a gate that cannot answer refuses: this door spends money
+        return True
+
+
 @router.get("/import/enrich")
 def enrich_status_api(user: dict = Depends(_user())):
     """How much imported history Plaid Enrich could still describe, and
@@ -11187,9 +11322,15 @@ def enrich_status_api(user: dict = Depends(_user())):
             configured = False
         # the connector owns the definition of a candidate — a count computed
         # separately here would drift from what a click would actually send
-        return {"candidates": _plaid.enrich_candidate_count(conn),
-                "plaid_configured": configured,
-                **_plaid.enrich_usage(conn)}
+        out = {"candidates": _plaid.enrich_candidate_count(conn),
+               "plaid_configured": configured,
+               **_plaid.enrich_usage(conn),
+               "awaits_confirm": _enrich_awaits_confirm(conn)}
+        if out["awaits_confirm"]:
+            # the run refuses until the address is confirmed, so the card
+            # must not count rows it could send
+            out["remaining"] = 0
+        return out
     finally:
         conn.close()
 
@@ -11219,6 +11360,11 @@ def enrich_run_api(user: dict = Depends(_user()), body: dict = Body(default={}))
         if not ext.gate.tier_allows(conn, "enrich"):
             raise HTTPException(
                 402, "Enriching imported history isn't enabled for this account.")
+        if _enrich_awaits_confirm(conn):
+            raise HTTPException(
+                403, "Confirm your email address first — describing "
+                     "imported history waits on it, as connecting a bank "
+                     "does.")
         try:
             _plaid.credentials(conn)
         except _plaid.PlaidError:
@@ -11603,25 +11749,32 @@ def account_set_hidden(account_id: str, user: dict = Depends(_user()),
     hidden = bool(body.get("hidden"))
     conn = _conn(user)
     try:
-        row = conn.execute("SELECT id, name FROM accounts WHERE id=%s",
-                           (account_id,)).fetchone()
-        if row is None:
-            raise HTTPException(404, "no such account")
-        refills = _account_balance_refills(conn, account_id)
-        if hidden:
-            _hide_account(conn, account_id)
-        else:
-            # a fed account's balances stay NULL until the next sync
-            # refreshes them — the aggregator is the only source of truth
-            # for a live balance. A manual/imported one was never nulled,
-            # so it comes back with the number it had.
-            conn.execute(
-                "UPDATE accounts SET user_removed_at=NULL WHERE id=%s",
-                (account_id,))
-            # unhiding changes the group's election exactly as hiding
-            # does — the ambient shadow set follows on this path too
-            from ..engine import links as _links
-            _links.set_shadow_scope(conn)
+        # check and write in ONE transaction under the row lock: a
+        # reconnect adoption renaming this id holds the row, and once it
+        # commits the old id is gone. A bare check first let the UPDATE
+        # match nothing after the rename and still answer "hidden" while
+        # the renamed account went on counting.
+        with conn.transaction():
+            row = conn.execute(
+                "SELECT id, name FROM accounts WHERE id=%s FOR UPDATE",
+                (account_id,)).fetchone()
+            if row is None:
+                raise HTTPException(404, "no such account")
+            refills = _account_balance_refills(conn, account_id)
+            if hidden:
+                _hide_account(conn, account_id)
+            else:
+                # a fed account's balances stay NULL until the next sync
+                # refreshes them — the aggregator is the only source of
+                # truth for a live balance. A manual/imported one was
+                # never nulled, so it comes back with the number it had.
+                conn.execute(
+                    "UPDATE accounts SET user_removed_at=NULL WHERE id=%s",
+                    (account_id,))
+                # unhiding changes the group's election exactly as hiding
+                # does — the ambient shadow set follows on this path too
+                from ..engine import links as _links
+                _links.set_shadow_scope(conn)
         if hidden:
             note = (f"{row['name']} is hidden — it won't appear in or "
                     f"count toward anything, and stops pulling new data.")
@@ -12036,6 +12189,13 @@ def jobs_email_api(user: dict = Depends(_user())):
 # channel availability (so the UI can say WHY a toggle is disabled).
 
 
+def _caller_push_muted(cc, user) -> bool:
+    """Has the caller turned the household's push off for themselves?"""
+    row = cc.execute("SELECT push_muted FROM users WHERE id=%s",
+                     (user["user_id"],)).fetchone()
+    return bool(row and row["push_muted"])
+
+
 @router.get("/notify")
 def notify_status_api(user: dict = Depends(_user())):
     from .. import notify  # noqa: F401
@@ -12068,6 +12228,13 @@ def notify_status_api(user: dict = Depends(_user())):
         # the shared demonstration login registered — never makes the
         # clients offer push that nothing would carry
         native = len(_device_tokens.push_targets(cc, user["tenant_id"]))
+        # the household fan-out skips a person who turned its push off
+        # (users.push_muted); their phones are still registered and still
+        # carry the test push and their own account's notices, so they
+        # count here as well
+        if _caller_push_muted(cc, user):
+            native += len(_device_tokens.push_targets(
+                cc, user["tenant_id"], user["user_id"]))
         vapid_pub = None
         if _push.available():
             try:
@@ -12434,6 +12601,27 @@ def notify_test_api(user: dict = Depends(_user()), body: dict = Body(...)):
         n += _native.send_tenant(None, user["tenant_id"], "test",
                                  detail=native_detail,
                                  connect=_control_conn)
+        # The household send skips anyone who turned its push off for
+        # themselves. That switch is about the household's notices; the
+        # test is the caller checking their own devices, so a muted caller
+        # is reached by name too (the household send left them out, so
+        # nothing arrives twice).
+        with _control_conn() as cc:
+            muted = _caller_push_muted(cc, user)
+        if muted:
+            own_detail: dict = {}
+            n += _push.send_tenant(None, user["tenant_id"], "Oikonome test",
+                                   short, user_id=user["user_id"],
+                                   connect=_control_conn)
+            n += _native.send_tenant(None, user["tenant_id"], "test",
+                                     detail=own_detail, user_id=user["user_id"],
+                                     connect=_control_conn)
+            # the failure story below reads one detail: the targets of
+            # both sends, and the first reason either gave
+            native_detail["targets"] = (native_detail.get("targets", 0)
+                                        + own_detail.get("targets", 0))
+            for k, v in own_detail.items():
+                native_detail.setdefault(k, v)
         if not n:
             # a registered phone whose platform leg isn't live is a
             # CONFIG story, not an account one — say the true reason

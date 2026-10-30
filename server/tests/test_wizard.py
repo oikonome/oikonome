@@ -228,6 +228,143 @@ class WizardApiTests(unittest.TestCase):
                                    "primary_checking": True})
         self.assertEqual(r.status_code, 400, r.text)
 
+    def test_a_pin_on_an_excluded_account_is_named_nowhere_as_the_primary(self):
+        """An account excluded from the budget is one the cash forecast
+        passes over, pinned or not. The pin door refuses it with a reason;
+        a pin that was saved before the exclusion is kept but reads as
+        unset on the checklist, and the accounts list names the account
+        the forecast really starts from — so no surface calls one account
+        the primary while the money math uses another."""
+        from oikonome.engine import budget
+        conn = self._conn()
+        try:
+            budget.save_config(conn, {k: v for k, v in budget.load_config(conn).items()
+                                      if k not in ("checking_account_id",
+                                                   "excluded_accounts")})
+            conn.execute("DELETE FROM accounts")
+            self._add_checking(conn, "manual:chk-big", "Old checking", 900)
+            self._add_checking(conn, "manual:chk-run", "Checking", 300)
+        finally:
+            conn.close()
+        r = self.client.post("/api/accounts/exclude",
+                             json={"account_id": "manual:chk-big",
+                                   "excluded": True})
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.client.post("/api/accounts/classify",
+                             json={"account_id": "manual:chk-big",
+                                   "kind": "depository/checking",
+                                   "primary_checking": True})
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertIn("excluded", r.json()["detail"])
+        # pinned first, excluded after: the pin stays saved, anchors nothing
+        self.client.post("/api/accounts/exclude",
+                         json={"account_id": "manual:chk-big",
+                               "excluded": False})
+        r = self.client.post("/api/accounts/classify",
+                             json={"account_id": "manual:chk-big",
+                                   "kind": "depository/checking",
+                                   "primary_checking": True})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self.client.get("/api/accounts").json()
+                         ["primary_checking_id"], "manual:chk-big")
+        self.client.post("/api/accounts/exclude",
+                         json={"account_id": "manual:chk-big",
+                               "excluded": True})
+        accts = self.client.get("/api/accounts").json()
+        self.assertEqual(accts["primary_checking_id"], "manual:chk-run")
+        ob = self.client.get("/api/onboarding").json()
+        self.assertFalse(ob["primary_checking_set"])
+        self.assertIsNone(ob["primary_checking_id"])
+        conn = self._conn()
+        try:
+            self.assertEqual(budget.load_config(conn)["checking_account_id"],
+                             "manual:chk-big")
+        finally:
+            conn.close()
+
+    def test_the_accounts_list_says_why_a_saved_pin_is_passed_over(self):
+        """The Accounts page shows the server's reason beside a pin the
+        forecast passes over rather than guessing it: an excluded pin
+        reads "excluded", and a pin on a row nobody has set a balance on
+        (the forecast falls through to one that has) reads "no balance
+        set". The legacy form door refuses the excluded pin like the API's."""
+        from oikonome.engine import budget
+        conn = self._conn()
+        try:
+            budget.save_config(conn, {k: v for k, v in budget.load_config(conn).items()
+                                      if k not in ("checking_account_id",
+                                                   "excluded_accounts")})
+            conn.execute("DELETE FROM accounts")
+            self._add_checking(conn, "manual:chk-live", "Checking", 300)
+            self._add_checking(conn, "manual:chk-blank", "Imported", 0)
+            conn.execute("UPDATE accounts SET balance_current = NULL "
+                         "WHERE id = 'manual:chk-blank'")
+        finally:
+            conn.close()
+        r = self.client.post("/api/accounts/classify",
+                             json={"account_id": "manual:chk-blank",
+                                   "kind": "depository/checking",
+                                   "primary_checking": True})
+        self.assertEqual(r.status_code, 200, r.text)
+        accts = self.client.get("/api/accounts").json()
+        self.assertEqual(accts["primary_checking_id"], "manual:chk-live")
+        self.assertEqual(accts["primary_pin_unused"], "no balance set")
+        self.client.post("/api/accounts/exclude",
+                         json={"account_id": "manual:chk-blank",
+                               "excluded": True})
+        self.assertEqual(self.client.get("/api/accounts").json()
+                         ["primary_pin_unused"], "excluded")
+        # a pin the forecast uses carries no reason
+        self.client.post("/api/accounts/classify",
+                         json={"account_id": "manual:chk-live",
+                               "kind": "depository/checking",
+                               "primary_checking": True})
+        self.assertIsNone(self.client.get("/api/accounts").json()
+                          ["primary_pin_unused"])
+        # the form door answers with the same rule
+        r = self.client.post("/accounts/classify", data={
+            "account_id": "manual:chk-blank", "kind": "depository/checking",
+            "primary_checking": "1"}, follow_redirects=False)
+        self.assertEqual(r.status_code, 303)
+        self.assertIn("excluded", r.headers["location"])
+        conn = self._conn()
+        try:
+            self.assertEqual(budget.load_config(conn)["checking_account_id"],
+                             "manual:chk-live")
+        finally:
+            conn.close()
+
+    def test_a_pin_on_a_linked_pairs_backup_is_refused(self):
+        """A linked pair's backup source is a shadow the money math
+        ignores; the pin door says so instead of saving a pin the
+        forecast would pass over."""
+        from oikonome.engine import budget, forecast
+        conn = self._conn()
+        try:
+            budget.save_config(conn, {k: v for k, v in budget.load_config(conn).items()
+                                      if k not in ("checking_account_id",
+                                                   "excluded_accounts")})
+            conn.execute("DELETE FROM accounts")
+            self._add_checking(conn, "manual:chk-a", "Checking", 300)
+            self._add_checking(conn, "manual:chk-b", "Checking twin", 300)
+            from unittest import mock
+            from oikonome.engine import links
+            with mock.patch.object(links, "shadow_ids",
+                                   return_value=["manual:chk-b"]):
+                cfg = budget.load_config(conn)
+                self.assertFalse(forecast.pinned_account_live(
+                    conn, cfg, "manual:chk-b"))
+                self.assertTrue(forecast.pinned_account_live(
+                    conn, cfg, "manual:chk-a"))
+                r = self.client.post("/api/accounts/classify",
+                                     json={"account_id": "manual:chk-b",
+                                           "kind": "depository/checking",
+                                           "primary_checking": True})
+            self.assertEqual(r.status_code, 400, r.text)
+            self.assertIn("linked", r.json()["detail"])
+        finally:
+            conn.close()
+
     def test_a_restored_manual_checking_account_is_still_live(self):
         """An export restore leaves manual and file-import items wearing
         'restored' too; only an aggregator's restored shell is a dead

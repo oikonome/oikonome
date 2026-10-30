@@ -12,6 +12,7 @@ import { Link } from "react-router";
 import { api, errText, money, type Account, type Connection,
          type Settings } from "../api/client";
 import { patchList, removeFromList } from "../api/cache";
+import { parseMoneyDraft } from "../moneymath";
 import { openPlaidHostedLink, plaidLinkOutcome } from "./ConnectHub";
 import { KINDS, RemoveAccountPanel, type DoneFn,
          type Moved } from "./RemoveAccountPanel";
@@ -73,7 +74,12 @@ export default function ManageAccounts() {
   // the shared demonstration login is refused: those buttons are shown
   // switched off, with the refusal's sentence said once above the list
   const credLock = sharedLock(me.data, "credential");
+  // the saved pin (the editor's switch) and the account the forecast
+  // actually starts from, with the server's words for why a pin is passed
+  // over — the Accounts page's pair, so the two surfaces name one anchor
   const primary = settings.data?.checking_account_id ?? null;
+  const anchor = accounts.data.primary_checking_id ?? null;
+  const pinUnused = accounts.data.primary_pin_unused ?? null;
   const excluded = new Set(settings.data?.excluded_accounts ?? []);
   const connById = new Map(conns.data.connections.map((c) => [c.id, c]));
   const groups = new Map<string, Grp>();
@@ -102,6 +108,7 @@ export default function ManageAccounts() {
       )}
       {ordered.map((g) => (
         <GroupPanel key={g.itemId || g.institution} g={g} primary={primary}
+                    anchor={anchor} pinUnused={pinUnused}
                     credLock={credLock}
                     excluded={excluded} openId={openId} setOpenId={setOpenId}
                     syncing={syncing === g.itemId}
@@ -115,9 +122,10 @@ export default function ManageAccounts() {
   );
 }
 
-function GroupPanel({ g, primary, credLock, excluded, openId, setOpenId,
-                      syncing, onSync, onDone }: {
-  g: Grp; primary: string | null; credLock: string | null;
+function GroupPanel({ g, primary, anchor, pinUnused, credLock, excluded,
+                      openId, setOpenId, syncing, onSync, onDone }: {
+  g: Grp; primary: string | null; anchor: string | null;
+  pinUnused: string | null; credLock: string | null;
   excluded: Set<string>;
   openId: string | null; setOpenId: (id: string | null) => void;
   syncing: boolean; onSync: () => void; onDone: DoneFn;
@@ -219,6 +227,9 @@ function GroupPanel({ g, primary, credLock, excluded, openId, setOpenId,
       </div>
       {g.accounts.map((a) => (
         <AccountRow key={a.id} a={a} isPrimary={a.id === primary}
+                    isAnchor={a.id === anchor}
+                    pinUnused={a.id === primary && a.id !== anchor
+                      ? (pinUnused ?? "") : undefined}
                     isExcluded={excluded.has(a.id)} live={live}
                     open={openId === a.id}
                     onToggle={() => setOpenId(openId === a.id ? null : a.id)}
@@ -228,9 +239,13 @@ function GroupPanel({ g, primary, credLock, excluded, openId, setOpenId,
   );
 }
 
-function AccountRow({ a, isPrimary, isExcluded, live, open, onToggle,
-                      onDone }: {
-  a: Account; isPrimary: boolean; isExcluded: boolean; live: boolean;
+function AccountRow({ a, isPrimary, isAnchor, pinUnused, isExcluded, live,
+                      open, onToggle, onDone }: {
+  // isPrimary: the saved pin (seeds the editor's switch); isAnchor: the
+  // account the forecast starts from (the pill); pinUnused: the server's
+  // reason when this row is a pin the forecast passes over
+  a: Account; isPrimary: boolean; isAnchor: boolean; pinUnused?: string;
+  isExcluded: boolean; live: boolean;
   open: boolean; onToggle: () => void; onDone: DoneFn;
 }) {
   const hidden = !!a.user_removed_at;
@@ -245,7 +260,10 @@ function AccountRow({ a, isPrimary, isExcluded, live, open, onToggle,
         <span className="macct-nm">{a.name}</span>
         {a.mask && <span className="mut macct-sub">·{a.mask}</span>}
         <span className="mut macct-sub macct-kind">{kindLabel}</span>
-        {isPrimary && <span className="pill b">primary</span>}
+        {isAnchor && <span className="pill b">primary</span>}
+        {pinUnused !== undefined && <span className="pill m"
+          title="pinned as primary checking, but the cash forecast starts from another account">
+          pinned — not used{pinUnused ? `: ${pinUnused}` : ""}</span>}
         {isExcluded && <span className="pill m">excluded</span>}
         {hidden && <span className="pill m">hidden</span>}
         <span className="macct-bal">
@@ -284,7 +302,7 @@ function Editor({ a, isPrimary, isExcluded, live, hidden, onDone }: {
   const dirty = name !== a.name || kind !== a.kind
     || ownerLbl !== (a.owner ?? "") || primMoved || exclMoved
     || (manual && bal.trim() !== "" &&
-        Number(bal.replace(/[$,]/g, "")) !== a.balance_current);
+        (parseMoneyDraft(bal) ?? NaN) !== a.balance_current);
 
   const save = useMutation({
     mutationFn: async () => {
@@ -295,6 +313,11 @@ function Editor({ a, isPrimary, isExcluded, live, hidden, onDone }: {
       const steps: [string, () => Promise<unknown>][] = [];
       if (name.trim() && name !== a.name)
         steps.push(["name", () => api.accountRename(a.id, name)]);
+      // the exclusion goes before the pin: the pin door refuses an
+      // excluded account, so including it and pinning it in one save
+      // only works in this order
+      if (exclMoved)
+        steps.push(["exclusion", () => api.accountExclude(a.id, excl)]);
       if (kind !== a.kind || primMoved)
         steps.push([
           kind !== a.kind && primMoved ? "type/primary"
@@ -302,13 +325,11 @@ function Editor({ a, isPrimary, isExcluded, live, hidden, onDone }: {
           // the anchor rides along only when its switch moved
           () => api.accountClassify(a.id, kind,
                                     primMoved ? prim : undefined)]);
-      if (exclMoved)
-        steps.push(["exclusion", () => api.accountExclude(a.id, excl)]);
       if (ownerLbl.trim() !== (a.owner ?? ""))
         steps.push(["owner", () => api.setAccountOwner(a.id,
                                                        ownerLbl.trim())]);
       if (manual && bal.trim() !== "" &&
-          Number(bal.replace(/[$,]/g, "")) !== a.balance_current)
+          (parseMoneyDraft(bal) ?? NaN) !== a.balance_current)
         steps.push(["balance", () => api.accountBalance(a.id, bal)]);
       const saved: string[] = [];
       for (const [label, run] of steps) {
@@ -329,7 +350,7 @@ function Editor({ a, isPrimary, isExcluded, live, hidden, onDone }: {
       // what was just written: Save greys out and the header shows the new
       // name in the same frame, instead of after two refetches. Every door
       // above is a plain field write, so the prediction is exact.
-      const newBal = Number(bal.replace(/[$,]/g, ""));
+      const newBal = (parseMoneyDraft(bal) ?? NaN);
       patchList<{ accounts: Account[] }, Account>(qc, ["accounts"], "accounts",
         (x) => x.id === a.id,
         { name: name.trim() || a.name, kind, owner: ownerLbl.trim() || null,
@@ -356,7 +377,10 @@ function Editor({ a, isPrimary, isExcluded, live, hidden, onDone }: {
       onDone(`Saved ${name || a.name}.`,
              moved ? ["accounts", "today"] : ["accounts"]);
     },
-    onError: (e) => onDone(errText(e)),
+    // a save is several doors in a row: one that fails can leave the
+    // earlier ones written (an exclusion lands, the pin is then refused),
+    // so the cache is re-read rather than left showing the old switches
+    onError: (e) => onDone(errText(e), ["accounts", "settings", "today"]),
   });
   const setHidden = useMutation({
     mutationFn: (h: boolean) => api.accountSetHidden(a.id, h),

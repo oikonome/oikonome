@@ -282,6 +282,8 @@ export interface Me {
                   // and which cadences the household sends at all
                   prefs?: Partial<Record<EmailKind, boolean>>;
                   cadences?: Partial<Record<EmailKind, boolean>> };
+  // this login's own switch for the household's push notices
+  push_muted?: boolean;
   email: string; tenant_id: string; totp_enabled: boolean;
   role: "owner" | "viewer"; version: string; hosted: boolean;
   /** the IANA zone every scheduled hour is kept in — the household's own
@@ -384,8 +386,18 @@ export interface Invite {
   token_hash: string; role: string; label: string;
   created_at: string; expires_at: string;
 }
+/** What one household member receives — their email switches (on the
+ *  household's mail, muted, which kinds) and their push switch with the
+ *  devices it governs. The owner gets every member's; everyone else only
+ *  their own row's (null on the rest). Absent from older servers. */
+export interface MemberNotify {
+  on_mail: boolean; mail_listed?: boolean; email_muted: boolean;
+  email_prefs: Partial<Record<EmailKind, boolean>>;
+  push_muted: boolean; push_browsers: number; push_phones: number;
+}
 export interface Member {
   id: string; email: string; role: string; created_at: string; me: boolean;
+  notify?: MemberNotify | null;
 }
 // the household activity log: one hand-authored act per row, the sentence
 // composed by the server so every client reads the same words
@@ -440,6 +452,10 @@ export interface TodayFull {
   // buckets.fixed.month_budget, the fixed bar's basis). Absent from older
   // servers; fall back to the fixed bucket then.
   scheduled_month?: number;
+  /** this month's income in its two halves — landed so far and the checks
+   *  still due before month end; absent/null when `income` is the budgeted
+   *  figure (no income series) or on older servers */
+  income_received?: number | null; income_expected?: number | null;
   // sweep goals: plan cap, month-to-date availability, and the
   // server-composed sentence (identical wording in the daily email)
   sweep_plan?: number;
@@ -729,6 +745,9 @@ export interface BillsData {
   // evened-out figure, so the two pages agree), the week ahead, and how many
   // bills are actually unhealthy
   totals?: { bills_monthly: number; income_monthly: number;
+             // how income_monthly was reached: the deposits that landed
+             // ("actual", over income_months months) or the schedule's rate
+             income_basis?: "actual" | "schedule"; income_months?: number | null;
              week_total: number; week_count: number; attention: number };
 }
 
@@ -1997,6 +2016,8 @@ export const api = {
           // net are null for a month before the bank feed starts: its
           // income is unknown, not $0
           out_sum?: number; in_sum?: number | null; net_sum?: number | null;
+          // the current month's paychecks still due before month end
+          in_expected?: number | null;
           // how many of the listed/matched rows belong to a business (not
           // in the totals unless scope=business)
           biz_count?: number;
@@ -2068,7 +2089,13 @@ export const api = {
     json<{ old: string; new: string; overrides: number; primaries: number;
            manual: number; rules: number; buckets: number }>(
       "/api/categories/rename", { old: oldName, new: newName }),
-  accounts: () => req<{ accounts: Account[] }>("/api/accounts"),
+  // primary_checking_id: the account the cash forecast starts from (the
+  // live pin, else the largest-balance pick) — the ledger heads itself
+  // with its balance; absent from older servers. primary_pin_unused: why
+  // the saved pin is not that account, in the page's words (null when it is)
+  accounts: () => req<{ accounts: Account[];
+                        primary_checking_id?: string | null;
+                        primary_pin_unused?: string | null }>("/api/accounts"),
   // primary_checking left out = the household's anchor stays put
   accountClassify: (account_id: string, kind: string,
                     primary_checking?: boolean) =>
@@ -2119,9 +2146,12 @@ export const api = {
       "/api/accounts/simplefin", { token }),
   settings: () => req<Settings>("/api/settings"),
   // Plaid Enrich for imported history — status + a capped run (owner)
+  // awaits_confirm: the run waits on the owner confirming their address
+  // (remaining is then 0), as connecting a bank does
   enrichStatus: () => req<{ candidates: number; plaid_configured: boolean;
                             cap: number; used: number; month: string;
-                            remaining: number }>("/api/import/enrich"),
+                            remaining: number;
+                            awaits_confirm?: boolean }>("/api/import/enrich"),
   enrichRun: (limit = 100) =>
     json<{ sent: number; enriched: number; cap_hit: boolean;
            error: string | null }>("/api/import/enrich", { limit }),
@@ -2231,6 +2261,18 @@ export const api = {
   meEmailPref: (kind: EmailKind, on: boolean) =>
     json<{ ok: boolean; prefs: Record<EmailKind, boolean> }>(
       "/api/me/email", { kind, on }),
+  // this login's own switch for the household's push notices (every role);
+  // the devices stay registered, account notices still arrive
+  mePush: (muted: boolean) =>
+    json<{ ok: boolean; muted: boolean }>("/api/me/push", { muted }),
+  // the owner sets one member's switches — the same places the member's
+  // own doors write, so the roster and their screen agree
+  memberNotify: (id: string, body: { push_muted?: boolean;
+                                     email_muted?: boolean;
+                                     email_pref?: { kind: EmailKind;
+                                                    on: boolean } }) =>
+    json<{ ok: boolean; notify: MemberNotify }>(
+      `/api/users/${encodeURIComponent(id)}/notify`, body),
   // full erasure — FRESH elevation (the sheet asks again even inside an
   // open window; Form endpoint)
   accountDelete: () =>

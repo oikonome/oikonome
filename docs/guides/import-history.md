@@ -48,7 +48,9 @@ newest undescribed rows (100 at a time) and brings back the merchant,
 logo, location and category the way live Plaid rows have them. Plaid
 bills this per row, so it never runs on its own — a monthly cap
 (default 2,000 rows; set it under the button, 0 turns Enrich off) bounds
-it, and the card shows what is left. Only one run at a time; a second
+it, and the card shows what is left. On an instance that asks you to
+confirm your email address, the run waits until it is confirmed, as
+connecting a bank does. Only one run at a time; a second
 click while one is in progress says so. Nothing about
 the rows' amounts, dates or accounts changes.
 

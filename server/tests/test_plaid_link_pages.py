@@ -86,7 +86,12 @@ def _transport(state: dict):
             return httpx.Response(200, text=json.dumps(
                 {"institution": {"name": "Chase"}}))
         if path == "/accounts/get":
-            return httpx.Response(200, text=json.dumps(BALANCES))
+            # a custom account list answers for the NEW login only; every
+            # other token (an Item an earlier test left) keeps the default
+            return httpx.Response(200, text=json.dumps(
+                state.get("balances", BALANCES)
+                if body.get("access_token") == "access-prod-new"
+                else BALANCES))
         if path == "/transactions/sync":
             return httpx.Response(200, text=json.dumps(TXN_PAGE))
         if path == "/liabilities/get":
@@ -586,6 +591,428 @@ class PlaidLinkPagesTests(unittest.TestCase):
             self.assertEqual(removed, [])
             self.assertIsNone(self._ledger_reason(item))
             self.assertEqual(sync_base.released_count(conn), 0)
+        finally:
+            conn.close()
+
+    def _dead_bank(self, item: str, inst: str, *, mask: str,
+                   account: str = "old-acct", txns: int = 3,
+                   status: str = "error:ITEM_LOGIN_REQUIRED") -> None:
+        """A Plaid connection at `inst` that can no longer sign in, holding
+        one card ×`mask` with a little history."""
+        from oikonome.sync import base as sync_base
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            # a clean slate at the fake bank (ins_1): every Item an earlier
+            # test linked there shares the fake's one access token, so the
+            # repeat check would read the new login's accounts as theirs
+            conn.execute("UPDATE items SET status='archived' WHERE "
+                         "aggregator='plaid' AND institution_id='ins_1'")
+            sync_base.upsert_item(conn, item, "plaid", "Old Bank",
+                                  f"access-prod-{item}")
+            conn.execute("UPDATE items SET institution_id=%s, status=%s "
+                         "WHERE id=%s", (inst, status, item))
+            conn.execute("INSERT INTO accounts (id, item_id, name, type, "
+                         "subtype, mask) VALUES (%s,%s,'Old Card','credit',"
+                         "'credit card',%s)", (account, item, mask))
+            for i in range(txns):
+                conn.execute(
+                    "INSERT INTO transactions (id, account_id, date, amount, "
+                    "name, pending, removed) VALUES (%s,%s,%s,%s,'COFFEE',0,0)",
+                    (f"{account}-t{i}", account, f"2026-09-{10 + i:02d}",
+                     4.5 + i))
+        finally:
+            conn.close()
+
+    def _moved_card(self, account_id: str, mask: str) -> dict:
+        return {"accounts": [
+            {"account_id": account_id, "name": "Moved Card", "type": "credit",
+             "subtype": "credit card", "mask": mask,
+             "balances": {"current": 120.0, "iso_currency_code": "USD"}}]}
+
+    def test_a_login_that_moved_to_another_bank_carries_its_accounts_over(self):
+        """A bank sells its card book and the login moves to the buyer: the
+        old connection can no longer sign in, and the fresh link lands at
+        a different Plaid institution. Adding the new
+        bank continues the old connection — its account is carried onto
+        the new Plaid id with its history, the old Item is released under
+        the relink reason, and no second copy of the card appears."""
+        from oikonome.sync import base as sync_base
+        from oikonome.sync import plaid as plaid_mod
+        old = "pl-moved-old"
+        self._dead_bank(old, "ins_old", mask="1234", account="old-1234")
+        state = {"link_token": "lt-moved", "item_id": "pl-moved-new",
+                 "balances": self._moved_card("moved-1234", "1234")}
+        removed = []
+        with _patch_client(state), mock.patch.object(
+                plaid_mod.Client, "remove_item",
+                side_effect=lambda tok: removed.append(tok) or {"removed": True}):
+            r = self.client.post("/accounts/plaid/link", data={},
+                                 headers={"accept": "application/json"})
+            self.assertEqual(r.status_code, 200, r.text)
+            state["link_done"] = True       # the fake bank is ins_1
+            s = self.client.get("/accounts/plaid/link/lt-moved/status").json()
+            self.assertTrue(s["done"], s)
+            self.assertEqual(s["kind"], "add", s)
+            # the first pull runs on the worker; here, by hand
+            conn = tenancy.tenant_connect(self.tid)
+            try:
+                plaid_mod.sync(conn, "pl-moved-new")
+            finally:
+                conn.close()
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            it = conn.execute("SELECT status, raw->>'relinked_by' AS by "
+                              "FROM items WHERE id=%s", (old,)).fetchone()
+            self.assertEqual(it["status"], "archived")
+            self.assertEqual(it["by"], "pl-moved-new")
+            self.assertEqual(removed, [f"access-prod-{old}"])
+            self.assertIn(self._ledger_reason(old),
+                          (None, sync_base.RELINK_LEDGER_REASON))
+            rows = conn.execute(
+                "SELECT id, item_id FROM accounts WHERE mask='1234' "
+                "ORDER BY id").fetchall()
+            self.assertEqual([(r["id"], r["item_id"]) for r in rows],
+                             [("moved-1234", "pl-moved-new")])
+            n = conn.execute("SELECT count(*) AS n FROM transactions "
+                             "WHERE account_id='moved-1234'").fetchone()["n"]
+            self.assertEqual(n, 3)          # the history came with it
+            self.assertIsNotNone(conn.execute(
+                "SELECT 1 FROM account_adoptions WHERE account_id='moved-1234'"
+            ).fetchone())                   # the backfill guard is armed
+        finally:
+            conn.close()
+
+    def test_a_new_bank_with_different_accounts_leaves_a_dead_connection_alone(self):
+        """Only matching masks make a sign-in elsewhere a continuation: a
+        new bank whose accounts are not the dead connection's is an
+        ordinary add, and the old Item stays as it was for Reconnect."""
+        from oikonome.sync import plaid as plaid_mod
+        old = "pl-moved-other"
+        self._dead_bank(old, "ins_44", mask="1111", account="old-1111")
+        state = {"link_token": "lt-moved2", "item_id": "pl-moved-new2",
+                 "balances": self._moved_card("new-2222", "2222")}
+        removed = []
+        with _patch_client(state), mock.patch.object(
+                plaid_mod.Client, "remove_item",
+                side_effect=lambda tok: removed.append(tok) or {"removed": True}):
+            r = self.client.post("/accounts/plaid/link", data={},
+                                 headers={"accept": "application/json"})
+            self.assertEqual(r.status_code, 200, r.text)
+            state["link_done"] = True
+            s = self.client.get("/accounts/plaid/link/lt-moved2/status").json()
+        self.assertTrue(s["done"], s)
+        self.assertEqual(s["kind"], "add", s)
+        with _patch_client(state):
+            conn = tenancy.tenant_connect(self.tid)
+            try:
+                plaid_mod.sync(conn, "pl-moved-new2")
+            finally:
+                conn.close()
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            it = conn.execute("SELECT status FROM items WHERE id=%s",
+                              (old,)).fetchone()
+            self.assertEqual(it["status"], "error:ITEM_LOGIN_REQUIRED")
+            self.assertEqual(removed, [])
+            self.assertEqual(sorted(r["id"] for r in conn.execute(
+                "SELECT id FROM accounts WHERE mask IN ('1111','2222')")),
+                ["new-2222", "old-1111"])
+        finally:
+            conn.close()
+
+    def test_a_working_connection_elsewhere_is_never_adopted_away(self):
+        """The same masks at a connection that still signs in are a
+        coincidence or a second login sharing an account — never a move."""
+        from oikonome.sync import plaid as plaid_mod
+        old = "pl-moved-live"
+        self._dead_bank(old, "ins_55", mask="7777", account="live-7777",
+                        status="ok")
+        state = {"link_token": "lt-moved3", "item_id": "pl-moved-new3",
+                 "balances": self._moved_card("new-7777", "7777")}
+        removed = []
+        with _patch_client(state), mock.patch.object(
+                plaid_mod.Client, "remove_item",
+                side_effect=lambda tok: removed.append(tok) or {"removed": True}):
+            self.client.post("/accounts/plaid/link", data={},
+                             headers={"accept": "application/json"})
+            state["link_done"] = True
+            s = self.client.get("/accounts/plaid/link/lt-moved3/status").json()
+        self.assertTrue(s["done"], s)
+        self.assertEqual(s["kind"], "add", s)
+        with _patch_client(state):
+            conn = tenancy.tenant_connect(self.tid)
+            try:
+                plaid_mod.sync(conn, "pl-moved-new3")
+            finally:
+                conn.close()
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            self.assertEqual(conn.execute(
+                "SELECT status FROM items WHERE id=%s", (old,)).fetchone()
+                ["status"], "ok")
+            self.assertEqual(removed, [])
+            self.assertEqual(conn.execute(
+                "SELECT count(*) AS n FROM accounts WHERE mask='7777'"
+            ).fetchone()["n"], 2)
+        finally:
+            conn.close()
+
+    def test_a_syncing_connection_wearing_a_reauth_flag_is_not_dead(self):
+        """new_accounts, pending_expiration and pending_disconnect ride on
+        Items that still sign in and sync. None of them makes a connection
+        a donor: a new bank showing the same masked card is an ordinary
+        add, and the flagged Item keeps its token."""
+        from oikonome.sync import plaid as plaid_mod
+        for i, flag in enumerate(("new_accounts", "pending_expiration",
+                                  "pending_disconnect")):
+            old = f"pl-flagged-{i}"
+            self._dead_bank(old, f"ins_flag{i}", mask=f"55{i}5",
+                            account=f"flagged-{i}", status="ok")
+            conn = tenancy.tenant_connect(self.tid)
+            try:
+                conn.execute("UPDATE items SET webhook_status=%s WHERE id=%s",
+                             (flag, old))
+            finally:
+                conn.close()
+            state = {"link_token": f"lt-flag{i}", "item_id": f"pl-flag-new{i}",
+                     "balances": self._moved_card(f"new-55{i}5", f"55{i}5")}
+            removed = []
+            with _patch_client(state), mock.patch.object(
+                    plaid_mod.Client, "remove_item",
+                    side_effect=lambda tok: removed.append(tok)
+                    or {"removed": True}):
+                self.client.post("/accounts/plaid/link", data={},
+                                 headers={"accept": "application/json"})
+                state["link_done"] = True
+                s = self.client.get(
+                    f"/accounts/plaid/link/lt-flag{i}/status").json()
+            self.assertEqual(s.get("kind"), "add", s)
+            conn = tenancy.tenant_connect(self.tid)
+            try:
+                it = conn.execute(
+                    "SELECT status, webhook_status, "
+                    "COALESCE(access_token,'')<>'' AS tok, "
+                    "raw->>'relinked_by' AS by FROM items WHERE id=%s",
+                    (old,)).fetchone()
+                self.assertEqual((it["status"], it["webhook_status"],
+                                  it["tok"], it["by"]),
+                                 ("ok", flag, True, None), flag)
+                self.assertEqual(removed, [], flag)
+            finally:
+                conn.close()
+
+    def test_a_new_login_showing_fewer_accounts_than_the_dead_one_held_is_no_move(self):
+        """Every account of the dead connection must reappear: a new login
+        showing one of its two cards is not that connection moved (the
+        other card still lives at the old bank), so nothing is released
+        and the new bank is added beside it."""
+        from oikonome.sync import plaid as plaid_mod
+        old = "pl-moved-partial"
+        self._dead_bank(old, "ins_part", mask="7001", account="part-7001")
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            conn.execute("INSERT INTO accounts (id, item_id, name, type, "
+                         "subtype, mask) VALUES ('part-7002', %s, 'Old Card "
+                         "Two', 'credit', 'credit card', '7002')", (old,))
+        finally:
+            conn.close()
+        state = {"link_token": "lt-partial", "item_id": "pl-partial-new",
+                 "balances": self._moved_card("new-7001", "7001")}
+        removed = []
+        with _patch_client(state), mock.patch.object(
+                plaid_mod.Client, "remove_item",
+                side_effect=lambda tok: removed.append(tok) or {"removed": True}):
+            self.client.post("/accounts/plaid/link", data={},
+                             headers={"accept": "application/json"})
+            state["link_done"] = True
+            s = self.client.get("/accounts/plaid/link/lt-partial/status").json()
+            self.assertEqual(s.get("kind"), "add", s)
+            conn = tenancy.tenant_connect(self.tid)
+            try:
+                plaid_mod.sync(conn, "pl-partial-new")
+            finally:
+                conn.close()
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            it = conn.execute("SELECT status, raw->>'relinked_by' AS by "
+                              "FROM items WHERE id=%s", (old,)).fetchone()
+            self.assertEqual((it["status"], it["by"]),
+                             ("error:ITEM_LOGIN_REQUIRED", None))
+            self.assertEqual(removed, [])
+            self.assertEqual(sorted(r["id"] for r in conn.execute(
+                "SELECT id FROM accounts WHERE mask IN ('7001','7002')")),
+                ["new-7001", "part-7001", "part-7002"])
+        finally:
+            conn.close()
+
+    def test_a_card_removed_by_hand_or_retyped_does_not_hide_a_move(self):
+        """The accounts that make up a connection are the ones the person
+        keeps: a card they removed by hand (closed years ago) is not asked
+        to reappear at the new bank, and a card whose type they set by
+        hand matches on its last digits alone. Otherwise a long-lived
+        connection would never be recognised as moved, and the new bank
+        would mint the duplicate this path exists to prevent."""
+        from oikonome.sync import plaid as plaid_mod
+        old = "pl-moved-stale"
+        self._dead_bank(old, "ins_stale", mask="3101", account="stale-3101")
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            conn.execute("INSERT INTO accounts (id, item_id, name, type, "
+                         "subtype, mask, user_removed_at) VALUES ('stale-3102', "
+                         "%s, 'Closed Card', 'credit', 'credit card', '3102', "
+                         "now())", (old,))
+            conn.execute("INSERT INTO accounts (id, item_id, name, type, "
+                         "subtype, mask, type_user_set) VALUES ('stale-3103', "
+                         "%s, 'Retyped Card', 'loan', 'credit card', '3103', "
+                         "TRUE)", (old,))
+        finally:
+            conn.close()
+        state = {"link_token": "lt-stale", "item_id": "pl-stale-new",
+                 "balances": {"accounts": [
+                     self._moved_card("new-3101", "3101")["accounts"][0],
+                     self._moved_card("new-3103", "3103")["accounts"][0]]}}
+        removed = []
+        with _patch_client(state), mock.patch.object(
+                plaid_mod.Client, "remove_item",
+                side_effect=lambda tok: removed.append(tok) or {"removed": True}):
+            self.client.post("/accounts/plaid/link", data={},
+                             headers={"accept": "application/json"})
+            state["link_done"] = True
+            s = self.client.get("/accounts/plaid/link/lt-stale/status").json()
+            self.assertEqual(s.get("kind"), "add", s)
+            conn = tenancy.tenant_connect(self.tid)
+            try:
+                plaid_mod.sync(conn, "pl-stale-new")
+            finally:
+                conn.close()
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            it = conn.execute("SELECT status, raw->>'relinked_by' AS by "
+                              "FROM items WHERE id=%s", (old,)).fetchone()
+            self.assertEqual((it["status"], it["by"]),
+                             ("archived", "pl-stale-new"))
+            self.assertEqual(removed, [f"access-prod-{old}"])
+            rows = conn.execute(
+                "SELECT id, item_id FROM accounts WHERE mask='3101'").fetchall()
+            self.assertEqual([(r["id"], r["item_id"]) for r in rows],
+                             [("new-3101", "pl-stale-new")])
+            self.assertEqual(conn.execute(
+                "SELECT count(*) AS n FROM transactions "
+                "WHERE account_id='new-3101'").fetchone()["n"], 3)
+        finally:
+            conn.close()
+
+    def _retyped_dead_bank(self, old: str, inst: str) -> None:
+        """A dead connection holding card 3101 and card 3103, the second
+        retyped by hand as a loan, with the bank's own type still in its
+        raw record (the sync keeps it there) and a little history."""
+        self._dead_bank(old, inst, mask="3101", account=f"{old}-3101")
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            conn.execute("INSERT INTO accounts (id, item_id, name, type, "
+                         "subtype, mask, type_user_set, raw) VALUES (%s, "
+                         "%s, 'Retyped Card', 'loan', 'credit card', '3103', "
+                         "TRUE, '{\"type\": \"credit\"}'::jsonb)",
+                         (f"{old}-3103", old))
+            for i in range(3):
+                conn.execute(
+                    "INSERT INTO transactions (id, account_id, date, amount, "
+                    "name, pending, removed) VALUES (%s,%s,%s,%s,"
+                    "'LOAN PAYMENT',0,0)",
+                    (f"{old}-3103-t{i}", f"{old}-3103",
+                     f"2026-09-{12 + i:02d}", 50.0 + i))
+        finally:
+            conn.close()
+
+    def _link_moved(self, token: str, new_item: str, accounts: list) -> list:
+        from oikonome.sync import plaid as plaid_mod
+        state = {"link_token": token, "item_id": new_item,
+                 "balances": {"accounts": accounts}}
+        removed = []
+        with _patch_client(state), mock.patch.object(
+                plaid_mod.Client, "remove_item",
+                side_effect=lambda tok: removed.append(tok) or {"removed": True}):
+            self.client.post("/accounts/plaid/link", data={},
+                             headers={"accept": "application/json"})
+            state["link_done"] = True
+            s = self.client.get(f"/accounts/plaid/link/{token}/status").json()
+            self.assertEqual(s.get("kind"), "add", s)
+            conn = tenancy.tenant_connect(self.tid)
+            try:
+                plaid_mod.sync(conn, new_item)
+            finally:
+                conn.close()
+        return removed
+
+    def test_a_moved_login_carries_a_retyped_card_over_by_the_banks_type(self):
+        """The release and the adoption judge a hand-retyped card by the
+        same identity, the bank's type: the old connection is released
+        AND the card comes across as one account, with its history and
+        the type the person gave it — never released and then stranded
+        beside a fresh copy."""
+        old = "pl-retyped-move"
+        self._retyped_dead_bank(old, "ins_retyped")
+        removed = self._link_moved("lt-retyped", "pl-retyped-new", [
+            self._moved_card("rt-new-3101", "3101")["accounts"][0],
+            self._moved_card("rt-new-3103", "3103")["accounts"][0]])
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            it = conn.execute("SELECT status, raw->>'relinked_by' AS by "
+                              "FROM items WHERE id=%s", (old,)).fetchone()
+            self.assertEqual((it["status"], it["by"]),
+                             ("archived", "pl-retyped-new"))
+            self.assertEqual(removed, [f"access-prod-{old}"])
+            rows = conn.execute(
+                "SELECT id, item_id, type, type_user_set FROM accounts "
+                "WHERE id IN (%s, 'rt-new-3103')", (f"{old}-3103",)
+            ).fetchall()
+            self.assertEqual(
+                [(r["id"], r["item_id"], r["type"], r["type_user_set"])
+                 for r in rows],
+                [("rt-new-3103", "pl-retyped-new", "loan", True)])
+            self.assertEqual(conn.execute(
+                "SELECT count(*) AS n FROM transactions "
+                "WHERE account_id='rt-new-3103'").fetchone()["n"], 3)
+        finally:
+            conn.close()
+
+    def test_a_retyped_card_is_never_welded_onto_a_checking_account_sharing_its_mask(self):
+        """A new login showing a CHECKING account with the retyped card's
+        last digits does not continue the card: the bank calls the card a
+        card. So the old connection is not taken for moved, nothing is
+        released, and the card keeps its history where it is while the
+        checking account arrives as an account of its own."""
+        old = "pl-retyped-weld"
+        self._retyped_dead_bank(old, "ins_weld")
+        checking = {"account_id": "wd-new-3103", "name": "Checking",
+                    "type": "depository", "subtype": "checking",
+                    "mask": "3103",
+                    "balances": {"current": 900.0,
+                                 "iso_currency_code": "USD"}}
+        removed = self._link_moved("lt-weld", "pl-weld-new", [
+            self._moved_card("wd-new-3101", "3101")["accounts"][0],
+            checking])
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            it = conn.execute("SELECT status, raw->>'relinked_by' AS by "
+                              "FROM items WHERE id=%s", (old,)).fetchone()
+            self.assertEqual((it["status"], it["by"]),
+                             ("error:ITEM_LOGIN_REQUIRED", None))
+            self.assertEqual(removed, [])
+            rows = conn.execute(
+                "SELECT id, item_id, type FROM accounts WHERE id IN "
+                "(%s, 'wd-new-3103') ORDER BY id", (f"{old}-3103",)
+            ).fetchall()
+            self.assertEqual(
+                [(r["id"], r["item_id"], r["type"]) for r in rows],
+                [(f"{old}-3103", old, "loan"),
+                 ("wd-new-3103", "pl-weld-new", "depository")])
+            self.assertEqual(conn.execute(
+                "SELECT count(*) AS n FROM transactions WHERE account_id=%s",
+                (f"{old}-3103",)).fetchone()["n"], 3)
+            self.assertEqual(conn.execute(
+                "SELECT count(*) AS n FROM transactions "
+                "WHERE account_id='wd-new-3103'").fetchone()["n"], 0)
         finally:
             conn.close()
 
