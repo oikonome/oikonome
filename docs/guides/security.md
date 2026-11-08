@@ -21,6 +21,9 @@ Changing the password is treated as a full credential rotation:
   again) — the device you made the change from is spared, like the
   browser session you're using.
 - **All script tokens you minted are revoked** (re-mint after).
+- **Your recovery codes are replaced** when the app shows the new sheet
+  (an older app keeps the codes you have), and voided when the change
+  leaves the account with no second factor.
 - **Unspent reset links and pending invitations are cancelled**, and
   (owners only) **members your invitations brought in during the last 7
   days are removed** — see *Household members* below.
@@ -83,7 +86,8 @@ its own address, so a change made from a stolen session is never silent:
 
 - **Password changed**, **authenticator app set up, replaced or turned
   off**, **passkey added or removed**, **recovery codes regenerated** — a
-  short notice saying what changed. It carries no link. If it was you,
+  short notice saying what changed, including when a removal also
+  replaced your recovery codes. It carries no link. If it was you,
   there is nothing to do; if it was not, reset your password from the
   sign-in page straight away and write to the instance's support address
   (the mail names it when one is set; otherwise tell whoever runs the
@@ -213,9 +217,8 @@ Plaid or MX keys until **These are mine — resume** is pressed.
 
 ## Recovery codes
 
-Enrolling your **first** strong factor (confirming TOTP, or adding your
-first passkey) issues a batch of **8 one-time recovery codes**, shown
-**once** — save them; only hashes are stored. Each code works once:
+A batch of **8 one-time recovery codes** is shown **once** — save them;
+only hashes are stored. Each code works once:
 
 - at sign-in, typed into the code field, when the authenticator is lost
   or the passkey is unavailable;
@@ -230,7 +233,79 @@ voids the old set. That line is there whichever strong factor you hold
 — a passkey-only account sees the same count and the same control, since
 the codes are its escape hatch when the key is lost; either way the
 regenerate confirms through the step-up sheet.
-Re-enrolling TOTP does not reissue codes — regenerate if you've lost them.
+
+A new batch is issued, and every code from the old one stops working,
+exactly when:
+
+- you enrol your **first** strong factor (confirming TOTP, or adding your
+  first passkey);
+- you **replace the authenticator**;
+- you **turn 2FA off while a passkey stays** on the account;
+- you **remove a passkey while another factor stays** (the authenticator,
+  or another passkey);
+- you **change the password or the sign-in email** while a second factor
+  stays (the new codes appear on the card you changed it from);
+- you press **regenerate**.
+
+Each of those shows the new codes in the same box, once, so you are never
+left with codes you have not seen. The point of every one between the
+first and the last: whoever
+you are shutting out may be holding the old sheet — one they generated
+while signed in as you, or a photo of yours — and it would otherwise sign
+in past the factor you kept. If removing a passkey signs you out (it was
+the one you signed in with), the new codes are shown first and sign-in
+follows once you dismiss them.
+
+Every one of them signs out every other browser and device, stops
+browser notifications everywhere but the browser you made the change from,
+and cancels unspent reset links and any recovery still waiting to land — everything
+a code from the old sheet could have opened on its own. Whoever held it
+cannot stay signed in and take the new batch. A sign-in that spent an old
+code moments before the reissue is refused as well. The account's notice
+says the old codes no longer work.
+
+All but **regenerate** also run the rest of the credential rotation
+above, because they are what you reach for when you think someone else
+is in the account: script tokens are revoked, pending invitations are
+cancelled and members who joined through your recent invites are
+removed, support access ends, webhooks and the household's outbound
+settings are paused, and the text-message number waits to be confirmed
+again. **Regenerate** is the routine top-up for a sheet running low, so
+it stops at sign-in: your script tokens, webhooks, invitations, members
+and text number stay as they were, and anything pushing with a token
+keeps working. If you are regenerating because you think the old sheet
+was taken, also sign out other sessions and review your script tokens
+and webhooks — or replace your authenticator, which takes the whole
+set.
+
+An older copy of the phone app (or a browser tab opened before an update)
+cannot show a new batch, so on those turning 2FA off, removing a passkey,
+and changing the password or sign-in email leave your codes as they were;
+update the app, or regenerate afterwards, to replace them.
+
+Nothing else issues codes. Adding TOTP beside a passkey, or a second
+passkey, keeps the batch you have — regenerate if you've lost it. Removing
+your **last** factor (only possible where two-factor is not required)
+issues none: there is no factor left for them to stand in for.
+
+**Which change takes what away.** Every security change falls into one of
+a few steps, and each step always takes the same things. A routine
+**regenerate** signs out your other browsers and devices and cancels
+pending recoveries — nothing else. **Turning the authenticator on or off,
+a first passkey, or removing a passkey with a new sheet** add the rest of
+the hijack clean-up: script tokens, webhooks, the household's outbound
+settings and text number, invitations and recently invited members, and
+support access. **A password or sign-in email change** does all of that and
+also removes your passkeys (except the one you confirmed with when it is
+your only second factor); the recovery codes are replaced when the app
+shows you a new sheet, kept when it can't, and voided outright when the
+change leaves no second factor for them to stand in for. **An emailed reset
+or the operator clearing your factors** takes everything, including this
+browser, the authenticator and every code. **Undoing an email change** from
+the link signs everything out and pauses tokens, webhooks and support
+access, but leaves your second factor and codes alone — the reset it mails
+still asks for one. Removing a passkey **without** a new sheet ends only
+what that key signed in.
 
 ## Lost the password, the authenticator AND the recovery codes
 
@@ -443,7 +518,7 @@ bills, reports. The roles differ in what they can change.
 | Import files, run a sync, act on alerts | ✓ | ✓ | |
 | Their own password, 2FA, sessions, email and push delivery | ✓ | ✓ | ✓ |
 | Bank connections — link, repair, disconnect, remove an account | ✓ | | |
-| Export the data, restore a backup, connections bundle | ✓ | | |
+| Export the data (the full export, the ledger CSV / XLSX, the business CSVs, the itemized expense CSV and the year-end package), restore a backup, connections bundle | ✓ | | |
 | Invite, remove, or change what another member can do | ✓ | | |
 | SMTP, the daily-email recipient list, AI backend | ✓ | | |
 | The account section of Settings, and deleting the account | ✓ | | |

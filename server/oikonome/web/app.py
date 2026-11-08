@@ -32,7 +32,8 @@ def _html_escape(s) -> str:
     return _htmlmod.escape(str(s or ""))
 
 from ..auth import api_tokens, device_tokens, email_verify, login_unlock, \
-    passwords, reset as reset_mod, sessions, signup_invites, widget_tokens
+    passwords, posture, reset as reset_mod, sessions, signup_invites, \
+    widget_tokens
 from ..db import crypto, tenancy
 from ..engine import budget
 # `FLAG=0` has to mean off: compose materializes every declared key, and a
@@ -64,6 +65,10 @@ _LOGIN_PER_IP = (40, 300)
 # verify — same work as a known email. Hashing "dummy" per request would be
 # two argon2 ops (hash + verify) and a timing/cost oracle for user enumeration.
 _DUMMY_HASH = passwords.hash_password("dummy")
+
+# no mailbox address is longer (RFC 5321 path limit); a longer field is
+# junk, refused before it reaches a limiter, a query or a log line
+EMAIL_MAX = 254
 
 log = logging.getLogger("oikonome.auth")
 
@@ -230,6 +235,10 @@ NEEDS_2FA_OK = ("/api/logout", "/api/totp", "/api/passkeys", "/api/recovery",
                 # than be forced to enroll on an account it was invited
                 # to by mistake
                 "/api/account/leave",
+                # and an owner erasing the account it no longer wants owes
+                # no enrollment first: the door demands its own fresh
+                # elevation, and the erasure is the person's due
+                "/api/account/delete",
                 # the step-up assertion IS presenting the strong factor —
                 # gating it behind "have a strong factor" is circular, and
                 # the self-guarded doors above accept its ticket
@@ -260,41 +269,22 @@ def _not_demo_instance():
         raise HTTPException(404, "not found")
 
 
-# paths a tenant under a read-only standing may still write — resolving
-# the standing and leaving. Reads stay open: read-only is the whole
-# penalty, and it never destroys records.
-# /api/export: reads and the archive stay open under a read-only
-# standing, and the door that mints the export ticket is a POST — so
-# without this it would answer 402 to exactly the person whose records
-# those are.
-# /api/auth + /api/stepup: opening the archive and deleting the account both
-# require a fresh elevation, and elevating is a POST too — without these
-# two the elevation sheet would hit 402 with no way through, in both
-# clients. Neither door moves money nor touches household data, which is
-# the same argument /api/billing already makes.
-# permissions.SELF_WRITE_OK: the caller's OWN credentials and delivery
-# switches. A lapsed subscription is no reason to keep a stolen session or
-# device token live, refuse a password change, or keep sending notices to
-# someone who has switched them off — the worker goes on sending to the
-# household through its wind-down, so the switch has to keep working too.
-# None of these doors writes the household's money.
-BILLING_WRITE_OK = ("/api/billing", "/api/logout", "/api/export",
-                    "/api/auth", "/api/stepup",
-                    # stopping a recovery someone else asked for must not
-                    # wait on a card being updated
-                    "/api/recovery/cancel-pending",
-                    *permissions.SELF_WRITE_OK)
-# The owner's switches for one member's notices — the same writes the
-# member makes through /api/me/push and /api/me/email, so they stay open
-# for the same reason. A pattern, because the door carries the member id.
-BILLING_WRITE_OK_PATTERNS = (re.compile(r"^/api/users/[^/]+/notify$"),)
+# The writes a tenant under a read-only standing may still make are one
+# declared table of exact (method, path) pairs, permissions.READ_ONLY_EXITS:
+# the caller's own account, proving it is them, and the ways out of the
+# household. Reads stay open: read-only is the whole penalty, and it never
+# destroys records. The one family left here is an installed add-on's
+# billing namespace — resolving the standing is the add-on's own door, and
+# the product cannot name what the add-on mounts under it. Neither moves
+# the household's money.
+BILLING_WRITE_OK = ("/api/billing",)
 
 
-def billing_write_ok(path: str) -> bool:
+def billing_write_ok(method: str, path: str) -> bool:
     """Does this write stay open while the household is read-only for
     billing?"""
     return (path_within(path, BILLING_WRITE_OK)
-            or any(p.match(path) for p in BILLING_WRITE_OK_PATTERNS))
+            or permissions.read_only_exit(method, path))
 
 # The tenant statuses that freeze a household out of the app COMPLETELY —
 # reads included, unlike the billing read-only state. Sign-out always stays
@@ -697,6 +687,20 @@ def write_refusal(sess: dict) -> tuple[int, str] | None:
     return None
 
 
+def exit_refusal(sess: dict) -> tuple[int, str] | None:
+    """`write_refusal` for a door that is a way out
+    (permissions.READ_ONLY_EXITS): the billing read-only state does not
+    hold it, exactly as current_user lets it through; a lockout and the
+    forced-2FA gate still do."""
+    frozen = lockout_for(sess.get("tenant_status"))
+    if frozen is not None:
+        return frozen[0], frozen[1]
+    if _lacks_second_factor(sess):
+        return 403, ("enroll a second factor (authenticator or passkey) "
+                     "before making changes")
+    return None
+
+
 # The exact doors a script token may open — push-only, as
 # docs/community-scripts.md promises ("push through the import endpoints
 # and update a manual account balance — nothing else"). A
@@ -894,8 +898,10 @@ def current_user(request: Request) -> dict:
             403, permissions.denial(sess["role"], request.url.path))
     if mutating and permissions.credential_door(request.url.path):
         demoguard.deny_shared_credentials(sess)
+    if mutating and permissions.people_door(request.url.path):
+        demoguard.deny_shared_grant(sess)
     if (mutating
-            and not billing_write_ok(request.url.path)
+            and not billing_write_ok(request.method, request.url.path)
             and _billing_write_blocked(sess)):
         raise HTTPException(402, "this account is read-only right now")
     # Server enforcement of the forced-2FA-enrollment gate. Enforced in
@@ -973,7 +979,7 @@ def setup_page(request: Request):
 
 
 @app.post("/setup", dependencies=[Depends(limit("setup", 5, 3600))])
-def setup_submit(request: Request, email: str = Form(...),
+def setup_submit(request: Request, email: str = Form(..., max_length=EMAIL_MAX),
                  password: str = Form(...),
                  simplefin_token: str = Form(""),
                  plaid_client_id: str = Form(""),
@@ -1088,7 +1094,7 @@ def login_page(request: Request):
 
 
 @app.post("/login", dependencies=[Depends(limit("login", *_LOGIN_PER_IP))])
-def login_form(request: Request, email: str = Form(...),
+def login_form(request: Request, email: str = Form(..., max_length=EMAIL_MAX),
                password: str = Form(...), totp_code: str = Form(""),
                cf_token: str = Form("", alias=_TS_FIELD)):
     from fastapi.responses import HTMLResponse
@@ -1139,6 +1145,7 @@ def login_form(request: Request, email: str = Form(...),
     # enrollment oracle.
     need_totp = False
     _totp_counter = None
+    redeemed = None         # the id of the recovery code spent, if any
     if not u or not ok:
         err = "Wrong email or password."
     elif _passkey_only_login_blocked(u):
@@ -1154,7 +1161,8 @@ def login_form(request: Request, email: str = Form(...),
             if _slot is None:
                 return _locked_page()
         with _control_conn() as _c:
-            redeemed = totp_code and recovery.redeem(_c, u["id"], totp_code)
+            redeemed = totp_code and recovery.redeem_id(_c, u["id"],
+                                                        totp_code)
         if redeemed:
             security.release_login_guess(_slot)
         if not redeemed:
@@ -1200,7 +1208,7 @@ def login_form(request: Request, email: str = Form(...),
             # escape), only after the TOTP check fails
             from ..auth import recovery
             with _control_conn() as _c:
-                redeemed = totp_code and recovery.redeem(
+                redeemed = totp_code and recovery.redeem_id(
                     _c, u["id"], totp_code)
             if not redeemed:
                 err = ("Enter the 6-digit code from your authenticator (or "
@@ -1259,7 +1267,8 @@ def login_form(request: Request, email: str = Form(...),
     security.clear_challenge_risk(security.client_ip(request), email)
     resp = _login_response(u["id"], u["tenant_id"],
                            request.headers.get("user-agent", ""),
-                           request=request, proof=_password_proof(u))
+                           request=request,
+                           proof=_password_proof(u, redeemed or None))
     resp.status_code = 303
     resp.headers["location"] = "/app/"
     return resp
@@ -1481,7 +1490,7 @@ def _reset_send_allowed(conn, user_id) -> bool:
 
 @app.post("/forgot", dependencies=[Depends(limit("forgot", 5, 3600)),
                               Depends(_not_demo_instance)])
-def forgot_submit(request: Request, email: str = Form(...),
+def forgot_submit(request: Request, email: str = Form(..., max_length=EMAIL_MAX),
                   cf_token: str = Form("", alias=_TS_FIELD)):
     from fastapi.responses import HTMLResponse
     from . import security, todayview
@@ -1600,7 +1609,7 @@ def unlock_confirm(token: str = Form("")):
 
 @app.post("/unlock", dependencies=[Depends(limit("unlock", 5, 3600)),
                                    Depends(_not_demo_instance)])
-def unlock_submit(request: Request, email: str = Form(...)):
+def unlock_submit(request: Request, email: str = Form(..., max_length=EMAIL_MAX)):
     from fastapi.responses import HTMLResponse
     from . import todayview
     email = email.strip().lower()
@@ -1895,6 +1904,12 @@ def recover_cancel_pending(user: dict = Depends(current_user)):
     return {"ok": True, "cancelled": n}
 
 
+# Where a security notice's web push opens: the Security section, which
+# holds the pending-recovery cancel. Bare /app/settings opens the first
+# section on a wide screen, which says nothing about it.
+_SECURITY_SETTINGS_URL = "/app/settings/security"
+
+
 def _security_fan_out(email: str, tenant_id, title: str, short: str, *,
                       neutral: str | None = None,
                       what: str = "security") -> None:
@@ -1948,7 +1963,7 @@ def _security_fan_out(email: str, tenant_id, title: str, short: str, *,
                     (tenant_id,)).fetchall()]
         if own_web:
             _push.send_tenant(None, tenant_id, title, short,
-                              url="/app/settings",
+                              url=_SECURITY_SETTINGS_URL,
                               user_id=me["id"], connect=_control_conn)
         if own_native:
             _native.send_tenant(None, tenant_id, "alert",
@@ -1960,12 +1975,13 @@ def _security_fan_out(email: str, tenant_id, title: str, short: str, *,
         # household's devices get the neutral line as well.
         if neutral is not None and not own_native:
             _push.send_tenant(None, tenant_id, "Security notice", neutral,
-                              url="/app/settings", connect=_control_conn)
+                              url=_SECURITY_SETTINGS_URL,
+                              connect=_control_conn)
             _native.send_tenant(None, tenant_id, "alert",
                                 connect=_control_conn)
             for uid in muted_ids:
                 _push.send_tenant(None, tenant_id, "Security notice", neutral,
-                                  url="/app/settings", user_id=uid,
+                                  url=_SECURITY_SETTINGS_URL, user_id=uid,
                                   connect=_control_conn)
                 _native.send_tenant(None, tenant_id, "alert", user_id=uid,
                                     connect=_control_conn)
@@ -2011,10 +2027,40 @@ _SECURITY_CHANGES = {
     "totp_disabled": "Sign-in codes from an authenticator app were turned "
                      "off on your Oikonome account.",
     "passkey_added": "A passkey was added to your Oikonome account.",
+    "passkey_enrolled": "A passkey was added to your Oikonome account.",
     "passkey_removed": "A passkey was removed from your Oikonome account.",
     "recovery_codes": "A new set of recovery codes was made for your "
                       "Oikonome account, and the old ones no longer work.",
+    # a factor removed while another stays voids the printed sheet too:
+    # the owner must learn here that the codes they kept are dead
+    "totp_disabled_reissued": "Sign-in codes from an authenticator app "
+                              "were turned off on your Oikonome account, "
+                              "and a new set of recovery codes was made: "
+                              "the old ones no longer work.",
+    "passkey_removed_reissued": "A passkey was removed from your Oikonome "
+                                "account, and a new set of recovery codes "
+                                "was made: the old ones no longer work.",
+    "password_reissued": "The password on your Oikonome account was "
+                         "changed, and a new set of recovery codes was "
+                         "made: the old ones no longer work.",
+    # credential-grade acts that are not sign-in factors: each hands out,
+    # or takes in, something that reaches the household's data
+    "api_token_created": "A script access token was made for your Oikonome "
+                         "account.",
+    "connections_exported": "The connection credentials on your Oikonome "
+                            "account were exported to a sealed file.",
+    "connections_imported": "A connections file was imported into your "
+                            "Oikonome account; it can change where AI and "
+                            "mail settings send data.",
 }
+
+# The changes whose door leaves the account's other sign-ins as they were
+# (a passkey added beside a factor, or removed without a reissue), so
+# their notice does not claim a sign-out that never happened.
+_KEEPS_OTHER_SIGN_INS = frozenset({"passkey_added", "passkey_removed",
+                                   "api_token_created",
+                                   "connections_exported",
+                                   "connections_imported"})
 
 
 def _deliver_security_notice(email: str, tenant_id, change: str) -> None:
@@ -2027,9 +2073,11 @@ def _deliver_security_notice(email: str, tenant_id, change: str) -> None:
     first = _SECURITY_CHANGES.get(change)
     if not first or not email:
         return
-    body = (f"{first} Other signed-in browsers and devices were signed "
-            f"out. If this was you, there is nothing to do. If it was NOT "
-            f"you, reset your password from the sign-in page now, then ")
+    signed_out = ("" if change in _KEEPS_OTHER_SIGN_INS else
+                  " Other signed-in browsers and devices were signed out.")
+    body = (f"{first}{signed_out} If this was you, there is nothing to do. "
+            f"If it was NOT you, reset your password from the sign-in page "
+            f"now, then ")
     body += _not_you_line()
     smtp = _smtp_for(email, tenant_id)
     sent = False
@@ -2046,6 +2094,14 @@ def _deliver_security_notice(email: str, tenant_id, change: str) -> None:
     _security_fan_out(email, tenant_id, "Security change",
                       "Oikonome: " + first + " Not you? Reset your password.",
                       what="security-change")
+
+
+def _reaper_day_counts() -> dict:
+    from ..jobs import reaper as _reaper
+    try:
+        return _reaper.client_day_counts()
+    except Exception:                            # noqa: BLE001
+        return {}
 
 
 def _notify_security_change(user: dict, change: str) -> None:
@@ -2867,7 +2923,7 @@ def signup_page(invite: str = "", email: str = "", ref: str = ""):
 
 @app.post("/signup", dependencies=[Depends(limit("signup", *_SIGNUP_PER_IP)),
                               Depends(_not_demo_instance)])
-def signup_submit(request: Request, email: str = Form(...),
+def signup_submit(request: Request, email: str = Form(..., max_length=EMAIL_MAX),
                   password: str = Form(...), invite: str = Form(""),
                   ref: str = Form(""),
                   cf_token: str = Form("", alias=_TS_FIELD)):
@@ -3284,6 +3340,11 @@ def signup_reclaim_finish(request: Request, token: str = Form(""),
                     # holds it (record_turn), so this waits for that row
                     # to land and then blanks it too, and an answer that
                     # comes later waits for the move and finds them gone.
+                    # the factor lock before the row lock (auth/posture lock
+                    # order): a reissue still under it commits first and
+                    # its batch is deleted below; one that starts now waits
+                    # for this move and finds its caller signed out
+                    _lock_user_factors(admin, uid)
                     admin.execute("SELECT 1 FROM users WHERE id=%s "
                                   "FOR UPDATE", (uid,))
                     from ..engine import assistant as _assistant
@@ -3296,36 +3357,18 @@ def signup_reclaim_finish(request: Request, token: str = Form(""),
                     # take their tenant from that setting's default
                     admin.execute("SELECT set_config('app.tenant_id', %s, "
                                   "true)", (prev or "",))
-                    for sql in (
-                            "DELETE FROM sessions WHERE user_id=%s",
-                            "DELETE FROM passkeys WHERE user_id=%s",
-                            "UPDATE device_tokens SET revoked_at=now() "
-                            "WHERE user_id=%s AND revoked_at IS NULL",
-                            "DELETE FROM webauthn_challenges "
-                            "WHERE user_id=%s",
-                            "DELETE FROM recovery_codes WHERE user_id=%s",
-                            "DELETE FROM push_subscriptions WHERE user_id=%s",
-                            "UPDATE api_tokens SET revoked_at=now() "
-                            "WHERE created_by=%s AND revoked_at IS NULL",
-                            "DELETE FROM invites WHERE created_by=%s "
-                            "AND used_at IS NULL",
-                            "UPDATE password_resets SET used_at=now() "
-                            "WHERE user_id=%s AND used_at IS NULL",
-                            "UPDATE login_unlocks SET consumed_at=now() "
-                            "WHERE user_id=%s AND consumed_at IS NULL",
-                            "UPDATE email_verifications SET used_at=now() "
-                            "WHERE user_id=%s AND used_at IS NULL"):
-                        admin.execute(sql, (uid,))
-                    # a link back to an address this row left: the row now
-                    # carries the clicker's credentials into a household
-                    # of their own, and the old inbox has no say over that
-                    from ..auth import email_revert
-                    email_revert.burn_all(admin, uid)
-                    # and a cooling-off factor-clearing recovery: it would
-                    # otherwise follow the person into the new household
-                    # and land there, on credentials set by this reclaim
-                    from ..auth import factor_reset
-                    factor_reset.cancel_for_user(admin, uid, reason="moved")
+                    # The MOVE_OUT rotation (auth/posture): every session,
+                    # passkey, device token and challenge, the recovery
+                    # sheet (under this row lock, without the code lock —
+                    # posture lock rule 3), push, script tokens, the hooks
+                    # and support grants they made in the household being
+                    # left, unused invites, and every link still on its way to this
+                    # row: reset links, sign-in unlocks, verifications, the
+                    # way back to an address it left, and a cooling-off
+                    # recovery, which would otherwise follow the person into
+                    # the new household and land on credentials set here.
+                    posture.rotate(admin, None, {"user_id": uid},
+                                   posture.MOVE_OUT, reason="moved")
 
                 if not is_owner and not signup_reclaim.spend(admin, r["id"]):
                     # Nothing irreversible happens on the member road — the
@@ -3926,6 +3969,27 @@ async def _bad_text(request: Request, exc: DataError):
                        "which can't be stored. Remove it and try again.")
 
 
+_SURROGATE_MSG = "text contains an invalid character"
+
+
+@app.exception_handler(UnicodeEncodeError)
+async def _bad_surrogate(request: Request, exc: UnicodeEncodeError):
+    """JSON can spell half a surrogate pair (a client that cuts text through
+    an emoji sends one), and the string it parses to cannot be encoded for
+    the database, the password hasher or the response. It is the caller's
+    bad input wherever it surfaces, so it is answered once, here, like a
+    NUL. Any other encoding failure says nothing about what the caller sent
+    and is re-raised to the 500 handler and the log."""
+    if exc.reason != "surrogates not allowed":
+        raise exc
+    if _machine_path(request.url.path):
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"detail": _SURROGATE_MSG}, status_code=400)
+    return _error_page(400, "Can't use that text",
+                       "Something you entered contains a character that "
+                       "can't be stored. Remove it and try again.")
+
+
 @app.exception_handler(Exception)
 async def _unhandled_error(request: Request, exc: Exception):
     """Browser routes render a branded 500 instead of Starlette's bare
@@ -4252,7 +4316,7 @@ _SIGNUP_REPEAT_WINDOW = dt.timedelta(minutes=15)
 
 @app.post("/api/signup", dependencies=[Depends(limit("signup", *_SIGNUP_PER_IP)),
                                   Depends(_not_demo_instance)])
-def signup(request: Request, email: str = Form(...),
+def signup(request: Request, email: str = Form(..., max_length=EMAIL_MAX),
            password: str = Form(...), invite: str = Form(""),
            ref: str = Form(""),
            cf_token: str = Form("", alias=_TS_FIELD)):
@@ -4490,7 +4554,7 @@ def signup(request: Request, email: str = Form(...),
 
 
 @app.post("/api/login", dependencies=[Depends(limit("login", *_LOGIN_PER_IP))])
-def login(request: Request, email: str = Form(...), password: str = Form(...),
+def login(request: Request, email: str = Form(..., max_length=EMAIL_MAX), password: str = Form(...),
           totp_code: str = Form(""),
           cf_token: str = Form("", alias=_TS_FIELD)):
     from ..auth import totp as totp_mod
@@ -4524,6 +4588,7 @@ def login(request: Request, email: str = Form(...), password: str = Form(...),
         # the next attempt, which is recoverable in a way a lock is not).
         security.record_auth_failure(security.client_ip(request), email)
         raise ReauthRefused("bad credentials")
+    code_id = None          # the recovery code spent, when one was
     if _passkey_only_login_blocked(u):
         # Passkey-only account — the SPA routes this to the
         # WebAuthn sign-in, where the factor is actually presented.
@@ -4533,15 +4598,16 @@ def login(request: Request, email: str = Form(...), password: str = Form(...),
             from ..auth import recovery
             slot = _reserve_login_guess(email)
             with _control_conn() as conn2:
-                if recovery.redeem(conn2, u["id"], totp_code):
-                    security.release_login_guess(slot)
-                    security.clear_login_failures(email)
-                    security.clear_challenge_risk(
-                        security.client_ip(request), email)
-                    return _login_response(
-                        u["id"], u["tenant_id"],
-                        request.headers.get("user-agent", ""), request=request,
-                        proof=_password_proof(u))
+                code_id = recovery.redeem_id(conn2, u["id"], totp_code)
+            if code_id is not None:
+                security.release_login_guess(slot)
+                security.clear_login_failures(email)
+                security.clear_challenge_risk(
+                    security.client_ip(request), email)
+                return _login_response(
+                    u["id"], u["tenant_id"],
+                    request.headers.get("user-agent", ""), request=request,
+                    proof=_password_proof(u, code_id))
             # the kept slot is the account-lock count for this miss
             security.record_auth_failure(security.client_ip(request), email)
             # a code was typed and did not redeem: say so, as the TOTP step
@@ -4576,7 +4642,8 @@ def login(request: Request, email: str = Form(...), password: str = Form(...),
             # when the TOTP check failed, so normal 2FA is unaffected.
             from ..auth import recovery
             with _control_conn() as conn2:
-                if not recovery.redeem(conn2, u["id"], totp_code):
+                code_id = recovery.redeem_id(conn2, u["id"], totp_code)
+                if code_id is None:
                     # the kept slot is the account-lock count for this miss
                     security.record_auth_failure(
                         security.client_ip(request), email)
@@ -4595,7 +4662,8 @@ def login(request: Request, email: str = Form(...), password: str = Form(...),
     security.clear_challenge_risk(security.client_ip(request), email)
     return _login_response(u["id"], u["tenant_id"],
                            request.headers.get("user-agent", ""),
-                           request=request, proof=_password_proof(u))
+                           request=request,
+                           proof=_password_proof(u, code_id))
 
 
 def _demo_login_payload(nusers: int, cfg: dict | None) -> dict:
@@ -4633,11 +4701,15 @@ def demo_login():
     return _demo_login_payload(len(rows), cfg)
 
 
-def _password_proof(u: dict) -> dict:
+def _password_proof(u: dict, recovery_code_id=None) -> dict:
     """What a password sign-in verified against (see _proof_still_stands):
-    the hash it checked and the TOTP secret it did or did not ask for."""
-    return {"password_hash": u["password_hash"],
-            "totp_secret": u["totp_secret"]}
+    the hash it checked, the TOTP secret it did or did not ask for, and
+    the recovery code it spent in place of a factor, when it spent one."""
+    proof = {"password_hash": u["password_hash"],
+             "totp_secret": u["totp_secret"]}
+    if recovery_code_id is not None:
+        proof["recovery_code_id"] = recovery_code_id
+    return proof
 
 
 def _proof_still_stands(conn, user_id, proof: dict) -> bool:
@@ -4645,8 +4717,9 @@ def _proof_still_stands(conn, user_id, proof: dict) -> bool:
     asked under the factor lock just before the session is written.
 
     `proof` holds what the sign-in checked against: the `password_hash`
-    and `totp_secret` it read, and/or the `passkey_id` that signed the
-    assertion. A password change or reset rewrites the hash, a factor
+    and `totp_secret` it read, the `recovery_code_id` it spent in place of
+    a factor, and/or the `passkey_id` that signed the assertion. A
+    reissue deletes the sheet a spent code came from, and a password change or reset rewrites the hash, a factor
     clear or TOTP change rewrites the secret, and every rotation evicts
     the passkeys it does not keep — so a sign-in that verified against
     what a rotation has since replaced finds a mismatch here."""
@@ -4661,6 +4734,13 @@ def _proof_still_stands(conn, user_id, proof: dict) -> bool:
             "SELECT 1 FROM passkeys WHERE id=%s AND user_id=%s",
             (proof["passkey_id"], user_id)).fetchone() is None:
         return False
+    # a code from a sheet that a reissue voided meanwhile: the reissue has
+    # swept every session it could see, and this one it could not
+    if proof.get("recovery_code_id") is not None:
+        from ..auth import recovery
+        if not recovery.still_issued(conn, user_id,
+                                     proof["recovery_code_id"]):
+            return False
     return True
 
 
@@ -4940,9 +5020,9 @@ def _proved_passkey_or_refuse(user_id, keep_passkey_id):
 # The TOTP doors take the lock first because their whole question ("would
 # this leave the account with no factor?") has to be asked under it. A
 # password- or email-change door that updated `users` first and reached
-# the lock later, inside `_evict_passkeys`, would invert that order — and
-# since each rotation runs as ONE transaction, the row lock is held until
-# COMMIT and the cycle is real. Every door here takes the factor lock as
+# the lock later, inside its rotation (auth/posture), would invert that
+# order — and since each rotation runs as ONE transaction, the row lock is
+# held until COMMIT and the cycle is real. Every door here takes the factor lock as
 # the first statement of its transaction, so the order is the same
 # everywhere and no cycle exists.
 #
@@ -4955,36 +5035,21 @@ def _lock_user_factors(conn, user_id) -> None:
     reset_mod.lock_user_factors(conn, user_id)
 
 
+def _wants_reissue(value) -> bool:
+    """The opt-in a client sends to say it shows a reissued recovery sheet
+    (form field or JSON value). Read leniently — a spelling a client got
+    wrong must not silently leave the old sheet standing."""
+    return value is True or value == 1 or (
+        isinstance(value, str) and value.strip().lower() in ("1", "true"))
+
+
 def _caller_still_signed_in(conn, user) -> None:
     """Under the per-user factor lock, in the transaction that plants a
     factor or a bearer credential: refuse with 401 when the session or
-    device token this caller authenticated with is gone.
-
-    current_user checked that row once, at the start of the request, and
-    these doors then do slow work (an argon2 step-up, a WebAuthn verify)
-    before they write. A password reset or the operator's clear-second-
-    factor that lands in between deletes the session and every factor; a
-    write committed after it would plant a fresh TOTP secret, passkey,
-    device token or recovery batch for whoever sent the request, on an
-    account its owner just recovered.
-
-    The eviction takes the same factor lock first (reset.revoke_everything),
-    so the two are ordered: a door holding the lock commits before the
-    eviction starts, and the eviction removes what it wrote; an eviction
-    that got the lock first has removed this caller's row, and the door
-    stops here having written nothing. Script and widget tokens never
+    device token this caller authenticated with is gone (see
+    auth/posture.caller_still_signed_in). Script and widget tokens never
     reach these doors."""
-    if user.get("device_id"):
-        row = conn.execute(
-            "SELECT 1 FROM device_tokens WHERE id=%s AND revoked_at IS NULL",
-            (user["device_id"],)).fetchone()
-    elif user.get("session_id"):
-        row = conn.execute("SELECT 1 FROM sessions WHERE id=%s",
-                           (user["session_id"],)).fetchone()
-    else:
-        return
-    if row is None:
-        raise HTTPException(401, "not signed in")
+    posture.caller_still_signed_in(conn, user)
 
 
 @contextlib.contextmanager
@@ -5013,85 +5078,6 @@ def _still_signed_in_under_factor_lock(user):
         _caller_still_signed_in(conn, user)
         with netguard.no_lookups():
             yield
-
-
-def _evict_passkeys(conn, user_id, keep_passkey_id=None) -> tuple[int, int]:
-    """Burn the passkeys a credential rotation must not leave behind.
-    Returns (removed, kept).
-
-    A password or email change evicts passkeys because a hijacked session
-    could have enrolled one, and WebAuthn login would otherwise outlive
-    every session, token and invite the rotation revokes. But on a hosted
-    account whose ONLY strong factor is a passkey, evicting all of them
-    drops the account to zero factors: _passkey_only_login_blocked goes
-    False and email+password alone opens the whole household — the exact
-    downgrade passkey_delete and totp_disable each refuse — so the
-    rotation doors have to honour the same invariant.
-
-    So exactly ONE key may survive: the one that produced this caller's
-    elevation proof, named by `keep_passkey_id`. Every other one goes.
-
-    Recency is not that test. /api/stepup/passkey is
-    reachable by any authenticated session with no elevation of its own, so
-    an attacker who plants a key can re-assert it every few minutes and
-    keep it exactly as freshly used as the owner's — the rotation would
-    then spare the planted key alongside the real one, or, on the
-    recovery-code road where the owner's key is the stale one, spare the
-    stranger's key and delete the owner's while telling them it is "your
-    only second factor".
-
-    When no passkey proved this caller — a password, a live TOTP code, a
-    recovery code — `keep_passkey_id` is None and they ALL go. That is the
-    lost-authenticator road, and it lands exactly where the password-reset
-    road lands on the same proof: no factor left, and the account's next
-    write goes through the forced-enrollment gate.
-
-    An account with TOTP keeps a factor either way, and a self-hosted or
-    operator-waived account was never under forced 2FA (nor is a self-host
-    password login blocked), so both evict unconditionally.
-    """
-    with conn.transaction():
-        # the lock passkey_delete takes, for the same reason: the count and
-        # the delete must not straddle another door's delete. A rotation
-        # door has already taken it (canonical order) — re-taking it in
-        # the same transaction is free.
-        _lock_user_factors(conn, user_id)
-        row = conn.execute(
-            "SELECT totp_secret, second_factor_waived FROM users WHERE id=%s",
-            (user_id,)).fetchone()
-        if (env_flag("OIKONOME_HOSTED") and row and not row["totp_secret"]
-                and not row["second_factor_waived"] and keep_passkey_id):
-            # Truthy is not existence. The callers refuse a dangling name
-            # up front (_proved_passkey_or_refuse), so this only fires when
-            # the key was deleted between that check and this lock — but
-            # the keep branch is precisely where a name that no longer
-            # exists deletes the account's last factor and calls it
-            # success, so it is re-asked here, where passkey_delete's own
-            # lock makes the answer final.
-            if not conn.execute(
-                    "SELECT 1 FROM passkeys WHERE id=%s AND user_id=%s",
-                    (keep_passkey_id, user_id)).fetchone():
-                raise HTTPException(403,
-                                    detail={"error": "elevation_required",
-                                            "fresh": False})
-            removed = conn.execute(
-                "DELETE FROM passkeys WHERE user_id=%s AND id <> %s",
-                (user_id, keep_passkey_id)).rowcount
-            kept = conn.execute(
-                "SELECT count(*) AS n FROM passkeys WHERE user_id=%s",
-                (user_id,)).fetchone()["n"]
-            if not kept:
-                # Unreachable given the check above, and it stays checked:
-                # this branch exists to keep ONE factor, so reporting
-                # success with none left is the one outcome it must never
-                # have. Raising inside the transaction rolls the delete
-                # back, so nothing is destroyed by the refusal.
-                raise HTTPException(500, "passkey rotation would have left "
-                                         "this account with no second "
-                                         "factor — nothing was removed")
-            return removed, kept
-        return conn.execute("DELETE FROM passkeys WHERE user_id=%s",
-                            (user_id,)).rowcount, 0
 
 
 @app.post("/api/password/change",
@@ -5165,130 +5151,61 @@ def password_change(request: Request, user: dict = Depends(current_user),
     # A proof that names a passkey which is no longer there is no proof —
     # refuse before a single row is written (see _proved_passkey_or_refuse).
     keep_passkey = _proved_passkey_or_refuse(user["user_id"], keep_passkey)
-    token = request.cookies.get(sessions.COOKIE_NAME, "")
     if new_hash is None:
         # the elevation road spends nothing single-use, so its hash waits
         # until the window has been checked — a refused elevation pays none
         new_hash = passwords.hash_password(new)
-    with _control_conn() as conn:
-        # ONE transaction for the whole rotation. Every statement here is
-        # part of a single act — the new password and the eviction of
-        # everything the old one could still reach — and a rotation that
-        # half happens is worse than one that does not. The eviction below
-        # can still REFUSE (a passkey deleted between the pre-flight check
-        # and its lock), and on an autocommit connection that refusal would
-        # arrive after the password had already changed: the caller told
-        # 403 while their password was in fact new, their other sessions
-        # gone, and their tokens, devices, push subscriptions and pending
-        # invites still live — a rotation reported as a failure that left
-        # the hijacker's persistence in place. Inside the transaction the
-        # refusal rolls the whole act back, so the answer is true either
-        # way.
+    # A client that shows a reissued recovery sheet says so; an older build
+    # keeps the sheet it has, which it could otherwise lose unseen. The
+    # batch rides an unpooled admin connection, opened here, before the
+    # lock, when there is a sheet to void or one to mint.
+    reissue = _wants_reissue(body.get("reissue_codes"))
+    from ..auth import recovery
+    with recovery.issue_staged(
+            tenancy.admin_connect,
+            reissue or _has_recovery_sheet(user["user_id"])) as batch:
+      with _control_conn() as conn:
+        # ONE transaction for the whole rotation. The new password and the
+        # eviction of everything the old one could still reach are a
+        # single act, and a rotation that half happens is worse than one
+        # that does not: the eviction can still REFUSE (a passkey deleted
+        # between the pre-flight check and its lock), and inside the
+        # transaction that refusal rolls the whole act back, so the answer
+        # is true either way.
         with conn.transaction():
-            # FIRST statement of the transaction — the canonical lock
-            # order. `_evict_passkeys` below takes this same lock, and
-            # updating `users` ahead of it would put this door's two locks
-            # in the opposite order from the TOTP doors' — which deadlocks
-            # two concurrent requests on one account and rolls the whole
-            # rotation back after a full step-up.
-            _lock_user_factors(conn, user["user_id"])
-            _caller_still_signed_in(conn, user)
-            # the household's SMS number, which a hijacker past the
-            # step-up could have verified to their own phone: it stops
-            # receiving until a fresh code sent to it is typed back.
-            # Paused BEFORE the users row is written — the canonical lock
-            # order's second step, see above.
-            sms_needs_verify = reset_mod._unverify_sms_number(
-                conn, user["user_id"])
-            # and the household's own relay, extra recipients and AI
-            # endpoint — paused until the owner confirms them in Settings.
-            # It takes the same settings row, so it too goes before the
-            # users row is written.
-            from ..notify import outbound_pause as _outbound
-            _outbound.pause_for_rotation(conn, user["user_id"])
-            # pending family invites and the members this owner's recent
-            # invites created — a hijacker's claimed invite is a second
-            # account no credential of the owner's reaches. Taken while
-            # the settings row is still the only row written: the record
-            # naming them is that row, and a removal writes a users row.
-            invites_removed, members_removed = \
-                reset_mod.evict_invite_footholds(conn, user["user_id"])
+            # The CREDENTIAL rotation (auth/posture): the factor lock
+            # first, the caller re-checked, the household's settings row,
+            # then sessions, devices, tickets, passkeys (the one that
+            # proved this caller kept), script tokens, support grants,
+            # webhooks, push (this browser's kept), pending recoveries, and
+            # the sheet voided or reissued. The password after it: the
+            # users row comes last in the lock order.
+            rotated = posture.rotate(
+                conn, batch, user, posture.CREDENTIAL, mint=reissue,
+                keep_passkey=keep_passkey,
+                keep_push_endpoint=str(body.get("keep_push_endpoint") or ""))
             conn.execute("UPDATE users SET password_hash=%s WHERE id=%s",
                          (new_hash, user["user_id"]))
-            sessions.revoke_all_others(conn, user["user_id"], token)
-            # Mirror the session eviction for passkeys — a
-            # hijacked session could have enrolled one; a password change must
-            # not leave that backdoor. The user re-adds passkeys after. The key
-            # that PROVED this caller — the one behind this session's step-up
-            # ticket, never merely a recently-used one — is kept when it is the
-            # account's last factor: see _evict_passkeys.
-            passkeys_removed, passkeys_kept = _evict_passkeys(
-                conn, user["user_id"], keep_passkey)
-            # Same for script tokens —
-            # a hijack-minted oik_ token must not survive the password change.
-            tokens_revoked = conn.execute(
-                "UPDATE api_tokens SET revoked_at=now() "
-                "WHERE created_by=%s AND revoked_at IS NULL",
-                (user["user_id"],)).rowcount
-            # and webhooks, the same persistence pointed at a URL
-            from ..notify import webhooks as _webhooks
-            webhooks_paused = _webhooks.pause_for_rotation(
-                conn, user["user_id"])
-            # mobile device tokens are the same class of persistence — every
-            # device re-authenticates after a credential rotation
-            devices_revoked = device_tokens.revoke_all_for_user(
-                conn, user["user_id"], keep_device_id=user.get("device_id"))
-            # and the unspent mint ticket from this login — a bearer that
-            # would plant a fresh device token right after this revocation
-            device_tokens.revoke_mint_tickets(conn, user["user_id"])
-            # and every browser's web-push subscription — household content
-            # must not keep arriving where the session just died
-            _drop_web_push(conn, user["user_id"],
-                           str(body.get("keep_push_endpoint") or ""))
-            # and any unspent reset link or pending cooling-off recovery:
-            # one started from the OLD mailbox by whoever held it would
-            # otherwise outlive this rotation and strip every factor later
-            _end_pending_recoveries(conn, user["user_id"])
-            # (pending family invites went with the members, above: a
-            # hijacker who minted one before the rotation would otherwise
-            # keep a claimable member slot. The owner re-mints; a real
-            # pending invitee asks.)
-            # and a support-access grant: it opens the household's data to
-            # the operator for up to a week, so a window a hijacker opened
-            # must not outlive the rotation any more than a recovery's
-            support_revoked = _revoke_support_grants(conn, user["user_id"])
-    _notify_security_change(user, "password")
+    _notify_security_change(
+        user, posture.notice("password", posture.CREDENTIAL, rotated))
     # The counts let the client say what the rotation actually cost —
     # a passkey that stops working with no explanation reads as a bug.
-    return {"ok": True, "passkeys_removed": passkeys_removed,
-            # the count that survived, so the client can say "your passkey
-            # still works" instead of leaving someone to discover it
-            "passkeys_kept": passkeys_kept,
-            "tokens_revoked": tokens_revoked,
-            "webhooks_paused": webhooks_paused,
-            "devices_revoked": devices_revoked,
-            "invites_removed": invites_removed,
-            # who left the household with this rotation, so the client
-            # can name them and the owner can invite back their own
-            "members_removed": _members_public(members_removed),
-            "support_access_revoked": support_revoked,
-            "sms_number_needs_verify": sms_needs_verify}
+    return {"ok": True, **rotated}
+
+
+def _has_recovery_sheet(user_id) -> bool:
+    """Whether the account holds a recovery sheet a rotation may void —
+    the cheap read that decides whether a door opens its admin connection
+    before the lock (the rotation asks again under it)."""
+    with _control_conn() as conn:
+        return conn.execute(
+            "SELECT 1 FROM recovery_codes WHERE user_id=%s LIMIT 1",
+            (user_id,)).fetchone() is not None
 
 
 def _members_public(members: list[dict]) -> list[dict]:
-    """The removed members as a rotation door answers them: who, in which
-    role, joined when — the same three things the paused-settings banner
-    shows."""
-    return [{"email": m["email"], "role": m["role"], "joined": m["joined"]}
-            for m in members or []]
-
-
-def _revoke_support_grants(conn, user_id) -> int:
-    """End every live support-access grant this user made. Revoked, never
-    deleted: the row is the audit of who granted what."""
-    return conn.execute(
-        "UPDATE support_consents SET revoked_at=now() "
-        "WHERE granted_by=%s AND revoked_at IS NULL", (user_id,)).rowcount
+    """The removed members as a rotation door answers them."""
+    return posture.members_public(members)
 
 
 def _check_password(user_id: str, password: str,
@@ -5725,87 +5642,13 @@ def _redeem_recovery_or_fail(user: dict, recovery_code: str) -> None:
             "each one works once")
 
 
-def _end_pending_recoveries(conn, user_id) -> None:
-    """Void every recovery still waiting to land on this account: unspent
-    mailed reset links AND a cooling-off factor-clearing reset.
-
-    Every door that rotates a credential or re-enrols a factor calls this
-    inside its rotation transaction. Both kinds of recovery strip the
-    account's factors when they land; one started before the rotation —
-    by whoever read the old mailbox, or by the owner who has since found
-    their authenticator — would otherwise land afterwards and take away
-    the credentials the owner has just put on. The two are voided together
-    so a door cannot remember one and forget the other."""
-    conn.execute("UPDATE password_resets SET used_at=now() "
-                 "WHERE user_id=%s AND used_at IS NULL", (user_id,))
-    from ..auth import factor_reset
-    if factor_reset.cancel_for_user(conn, user_id, reason="rotation"):
-        log.info("pending factor reset cancelled by a credential rotation")
-
-
-def _revoke_bearer_persistence(conn, user: dict) -> dict:
-    """The non-session persistence a hijacked session could have planted:
-    device tokens (every one but the device making this request), script
-    tokens, unspent device-mint tickets, browser push subscriptions, the
-    webhooks this user created, any support-access grant they made,
-    unspent password-reset links, pending family invites and — for an
-    owner — the members this owner's recent invites created. Called by
-    the posture changes that already evict other sessions — enrolling the
-    first strong factor is precisely the moment an owner believes a hijack
-    is closed — so it takes away the same set password_change and
-    email_change take. Returns {"invites_removed", "members_removed"} for
-    the door's answer.
-
-    The household's verified SMS number belongs to the same set, but its
-    pause (reset._unverify_sms_number) writes `tenant_settings` and so is
-    the caller's to make, as the first write after the factor lock and
-    before the `users` row — the canonical lock order above. The outbound
-    pause at the end takes that same row: a caller that writes `users`
-    before calling this makes the outbound pause itself first, so the
-    row is already its own here and nothing waits."""
-    device_tokens.revoke_all_for_user(conn, user["user_id"],
-                                      keep_device_id=user.get("device_id"))
-    conn.execute("UPDATE api_tokens SET revoked_at=now() "
-                 "WHERE created_by=%s AND revoked_at IS NULL",
-                 (user["user_id"],))
-    device_tokens.revoke_mint_tickets(conn, user["user_id"])
-    _revoke_support_grants(conn, user["user_id"])
-    # the browser making the request keeps its own subscription: it lives
-    # exactly as long as this caller's session, which these doors keep
-    _drop_web_push(conn, user["user_id"],
-                   keep_session_id=user.get("session_id"))
-    # an unspent reset link minted to the mailbox a hijacker read — or a
-    # cooling-off recovery started before this door — would otherwise
-    # strip every factor this door just put on
-    _end_pending_recoveries(conn, user["user_id"])
-    from ..notify import outbound_pause as _outbound
-    from ..notify import webhooks as _webhooks
-    _webhooks.pause_for_rotation(conn, user["user_id"])
-    _outbound.pause_for_rotation(conn, user["user_id"])
-    # after the outbound pause, which has taken the settings row the
-    # removed members are named on (see reset.evict_invite_footholds)
-    invites_removed, members_removed = reset_mod.evict_invite_footholds(
-        conn, user["user_id"])
-    return {"invites_removed": invites_removed,
-            "members_removed": _members_public(members_removed)}
-
-
 def _drop_web_push(conn, user_id, keep_endpoint: str = "",
                    keep_session_id=None) -> int:
-    """A browser's web-push subscription outlives its session: the
-    verdict text and alert titles keep arriving in a browser whose cookie
-    was just revoked, because nothing tied the two. Every posture change
-    that evicts sessions drops the subscriptions too; the browser that
-    made the request may keep its own — named by its endpoint
-    (`keep_endpoint`), or by the session it was made under
-    (`keep_session_id`), which the server knows without being told. Native
-    tickles are content-free and already follow the device token's
-    revocation."""
-    return conn.execute(
-        "DELETE FROM push_subscriptions WHERE user_id=%s AND endpoint <> %s"
-        " AND (%s::uuid IS NULL OR session_id IS DISTINCT FROM %s::uuid)",
-        (user_id, keep_endpoint or "", keep_session_id,
-         keep_session_id)).rowcount
+    """Drop the user's browser push subscriptions but the requesting
+    browser's own: what "sign out everywhere else" ends with the sessions
+    (auth/posture closes them for every rotation)."""
+    return posture._drop_web_push(conn, user_id, keep_endpoint,
+                                  keep_session_id)
 
 
 @app.post("/api/totp/enroll",
@@ -5896,19 +5739,18 @@ def totp_confirm(request: Request, user: dict = Depends(current_user),
     new_counter = totp_mod.verify_used(secret, code, None)
     if new_counter is None:
         raise HTTPException(400, "code doesn't match — check your app's clock")
-    token = request.cookies.get(sessions.COOKIE_NAME, "")
-    import hashlib
-    codes = None
     # The recovery batch is minted on an ADMIN connection (the app role
     # cannot insert codes), which is unpooled — a fresh connect per call.
     # Open it BEFORE the lock below, and only when the cheap read says a
     # batch will probably be needed, so the critical section holds a
     # pooled control connection and the per-user lock across a handful of
     # statements, never across a TLS handshake.
-    maybe_first = not (row0 and row0["totp_secret"]) and not _has_passkey(
+    maybe_batch = bool(row0 and row0["totp_secret"]) or not _has_passkey(
         user["user_id"])
-    admin = tenancy.admin_connect() if maybe_first else None
-    try:
+    from ..auth import recovery
+    # committed after the control transaction below, never before it: see
+    # recovery.issue_staged
+    with recovery.issue_staged(tenancy.admin_connect, maybe_batch) as batch:
       with _control_conn() as conn, conn.transaction():
         # "Is this the FIRST strong factor?" is decided, written and acted
         # on under the same per-user advisory lock passkey_register and
@@ -5924,54 +5766,30 @@ def totp_confirm(request: Request, user: dict = Depends(current_user),
             "WHERE user_id = %s) AS n_pk FROM users WHERE id = %s",
             (user["user_id"], user["user_id"])).fetchone()
         first_factor = not (cur and (cur["totp_secret"] or cur["n_pk"]))
-        # the SMS number a hijacker could have verified stops receiving —
-        # paused before the users row below is written (canonical order);
-        # the relay, extra recipients and AI endpoint pause with it
-        sms_needs_verify = reset_mod._unverify_sms_number(
-            conn, user["user_id"])
-        from ..notify import outbound_pause as _outbound
-        _outbound.pause_for_rotation(conn, user["user_id"])
+        replacing = bool(cur and cur["totp_secret"])
+        # The FACTOR rotation (auth/posture): every other session and
+        # device, script tokens, webhooks, the household's outbound
+        # settings and SMS number, invites and recent members, support
+        # grants, push and pending recoveries — a device token is a full
+        # session that never prompts TOTP, and the owner closes a hijack
+        # here in good faith. The first strong factor mints a recovery
+        # sheet so a lost authenticator is not a lockout; replacing one
+        # mints too, since the old codes bypass the new authenticator; a
+        # TOTP added beside a passkey keeps the sheet that passkey minted.
+        rotated = posture.rotate(conn, batch, user, posture.FACTOR,
+                                 mint=first_factor or replacing)
         # the seed is encrypted at rest — a DB dump must not be a
-        # 2FA-seed dump. Control-plane path (master key direct, no tenant).
-        # totp_last_counter is per-SECRET: a counter stamped against the OLD
-        # secret must not reject the new secret's codes in the same wall-clock
-        # window. Stamp the counter the confirming code just
-        # matched rather than clearing it outright — same effect for the old
-        # secret, and it also burns the confirming code itself.
+        # 2FA-seed dump. totp_last_counter is per-SECRET: stamp the step
+        # the confirming code matched, which also burns that code. The
+        # users row last, after the rotation's settings row.
         conn.execute("UPDATE users SET totp_secret=%s, "
                      "totp_last_counter=%s WHERE id=%s",
                      (crypto.encrypt_cp(secret), new_counter,
                       user["user_id"]))
-        conn.execute("DELETE FROM sessions WHERE user_id=%s AND token_hash != %s",
-                     (user["user_id"],
-                      hashlib.sha256(token.encode()).hexdigest()))
-        # Sessions are not the only thing a hijacker can be holding. A
-        # device token is a full session equivalent that never prompts
-        # TOTP, and a stolen cookie can mint one inside its fresh-auth
-        # window with no password; a script token is durable too. Both
-        # must die with the enrollment or the owner closes the hijack in
-        # good faith while a 90-day bearer rides on. The device driving
-        # this enrollment (if it is one) stays, like the calling session.
-        revoked = _revoke_bearer_persistence(conn, user)
-        # issuing TOTP as the user's FIRST strong factor mints a batch
-        # of one-time recovery codes (shown once) so a lost authenticator
-        # isn't a lockout under the forced-2FA policy. Re-binding an
-        # existing TOTP doesn't reissue (they still hold their codes;
-        # Settings can regenerate). Minted while the lock is held, so the
-        # batch the response carries is the batch that stands.
-        if first_factor:
-            from ..auth import recovery
-            if admin is None:          # the cheap read was stale; rare
-                admin = tenancy.admin_connect()
-            codes = recovery.issue(admin, user["user_id"])
-    finally:
-        if admin is not None:
-            admin.close()
     _notify_security_change(
-        user, "totp_replaced" if row0 and row0["totp_secret"]
-        else "totp_enrolled")
-    return {"ok": True, "recovery_codes": codes,
-            "sms_number_needs_verify": sms_needs_verify, **revoked}
+        user, posture.notice("totp_replaced" if row0 and row0["totp_secret"]
+                             else "totp_enrolled", posture.FACTOR))
+    return {"ok": True, **rotated}
 
 
 @app.post("/api/totp/recovery-regenerate",
@@ -5987,22 +5805,22 @@ def recovery_regenerate(user: dict = Depends(current_user),
     _require_elevation(user, password=password, totp_code=totp_code,
                        recovery_code=recovery_code)
     from ..auth import recovery
-    admin = tenancy.admin_connect()
-    try:
-        # minted under the factor lock with the caller re-checked, so a
-        # reset landing meanwhile either finds this batch and drops it
-        # with the rest of the account's codes, or stops this door first
-        # (see _caller_still_signed_in)
+    # the batch commits after the sweep does (recovery.issue_staged)
+    with recovery.issue_staged(tenancy.admin_connect) as batch:
+        # The SHEET rotation (auth/posture), minted under the factor lock
+        # with the caller re-checked, so a reset landing meanwhile either
+        # finds this batch and drops it or stops this door first.
+        # Regenerating is how an owner shuts out whoever holds the old
+        # sheet, so it signs out what that sheet could have signed in, and
+        # ends pending recoveries, which would void the fresh batch when
+        # they landed. It is the owner's routine "running low" door, so it
+        # stops at sign-in: tokens, webhooks, invites and members are the
+        # hijack doors' to take.
         with _control_conn() as conn, conn.transaction():
-            _lock_user_factors(conn, user["user_id"])
-            _caller_still_signed_in(conn, user)
-            codes = recovery.issue(admin, user["user_id"])
-            # a recovery landing later would void this fresh batch
-            _end_pending_recoveries(conn, user["user_id"])
-    finally:
-        admin.close()
-    _notify_security_change(user, "recovery_codes")
-    return {"ok": True, "recovery_codes": codes}
+            rotated = posture.rotate(conn, batch, user, posture.SHEET)
+    _notify_security_change(user, posture.notice("recovery_codes",
+                                                 posture.SHEET))
+    return {"ok": True, **rotated}
 
 
 # Same throttle reasoning as password_change/account_delete — this door
@@ -6011,7 +5829,8 @@ def recovery_regenerate(user: dict = Depends(current_user),
 @app.post("/api/totp/disable",
           dependencies=[Depends(limit("totp_disable", 5, 3600))])
 def totp_disable(request: Request, user: dict = Depends(current_user),
-                 code: str = Form(...), password: str = Form("")):
+                 code: str = Form(...), password: str = Form(""),
+                 reissue_codes: str = Form("")):
     """Turning 2FA OFF demands the password AND a live code. A code
     alone would mean one shoulder-surfed 6-digit number plus a stolen
     session could strip the second factor and keep that session — weaker than
@@ -6023,8 +5842,6 @@ def totp_disable(request: Request, user: dict = Depends(current_user),
     # removing a factor can't lock another holder of a shared login
     # out — it is how one enrolled by mistake is undone — so plain deny
     demoguard.deny(user)
-    import hashlib
-    token = request.cookies.get(sessions.COOKIE_NAME, "")
     with _control_conn() as conn:
         u = conn.execute(
             "SELECT totp_secret, second_factor_waived FROM users WHERE id=%s",
@@ -6065,7 +5882,21 @@ def totp_disable(request: Request, user: dict = Depends(current_user),
         raise ReauthRefused(_TOTP_CODE_USED_MSG)
     if outcome != "ok":
         raise ReauthRefused("bad one-time code")
-    with _control_conn() as conn:
+    # A passkey staying means a factor stays, and the recovery sheet would
+    # stand in for it: re-minted below — but only for a client that says
+    # it shows the new sheet. An older app build ignores the field, so
+    # voiding its sheet would leave the owner with codes that no longer
+    # work and none they have seen; it keeps the sheet it has. The batch
+    # is minted on an unpooled ADMIN connection (the app role cannot
+    # insert codes), opened here, before the lock, so the critical section
+    # never waits on a connect.
+    reissue = _wants_reissue(reissue_codes)
+    from ..auth import recovery
+    # committed after the control transaction below (issue_staged)
+    with recovery.issue_staged(
+            tenancy.admin_connect,
+            reissue and _has_passkey(user["user_id"])) as batch:
+      with _control_conn() as conn:
         # The check above ran before the argon2/TOTP work, on a stale
         # read: a concurrent passkey_delete can have removed the fallback
         # passkey in the meantime, and each request's own guard would have
@@ -6086,16 +5917,22 @@ def totp_disable(request: Request, user: dict = Depends(current_user),
                          "— add another passkey or an authenticator app "
                          "before removing it")
             _caller_still_signed_in(conn, user)
-            # the SMS number pauses with the rest of the persistence below,
-            # written before the users row (canonical lock order); the
-            # relay, extra recipients and AI endpoint pause with it
-            sms_needs_verify = reset_mod._unverify_sms_number(
-                conn, user["user_id"])
-            from ..notify import outbound_pause as _outbound
-            _outbound.pause_for_rotation(conn, user["user_id"])
+            # Dropping 2FA is a security-posture change: the FACTOR
+            # rotation (auth/posture) — every OTHER session and device and
+            # everything a hijacked session could have planted, so it
+            # cannot quietly persist after the owner turns it off. A
+            # passkey remains, so the account keeps a factor and the old
+            # sheet would sign in past it: re-minted, for a client that
+            # shows the new sheet. With no factor left (a waived or
+            # self-hosted account) nothing is minted.
+            rotated = posture.rotate(
+                conn, batch, user, posture.FACTOR,
+                mint=bool(reissue and row and row["n_pk"]))
             # clears the secret the code was checked against and no other:
             # a re-enrolment that committed in between bound a new one,
-            # which this request's code says nothing about
+            # which this request's code says nothing about. The users row
+            # after the rotation's settings row (lock order); a refusal
+            # here rolls the rotation and the staged batch back.
             if not conn.execute(
                     "UPDATE users SET totp_secret=NULL, "
                     "totp_last_counter=NULL WHERE id=%s AND totp_secret=%s",
@@ -6103,20 +5940,9 @@ def totp_disable(request: Request, user: dict = Depends(current_user),
                 raise HTTPException(
                     409, "your authenticator changed while this was in "
                          "flight — reload and try again")
-            # Dropping 2FA is a security-posture change — revoke every OTHER
-            # session (like enroll/confirm and password-change already do)
-            # so a hijacked session can't quietly persist after the owner
-            # turns it off. Inside the same transaction, under the factor
-            # lock: a mint ticket redeemed in parallel either commits first
-            # (and its device token is revoked here) or waits and finds its
-            # ticket burnt — never a device token planted after the sweep.
-            conn.execute(
-                "DELETE FROM sessions WHERE user_id=%s AND token_hash != %s",
-                (user["user_id"], hashlib.sha256(token.encode()).hexdigest()))
-            revoked = _revoke_bearer_persistence(conn, user)
-    _notify_security_change(user, "totp_disabled")
-    return {"ok": True, "sms_number_needs_verify": sms_needs_verify,
-            **revoked}
+    _notify_security_change(
+        user, posture.notice("totp_disabled", posture.FACTOR, rotated))
+    return {"ok": True, **rotated}
 
 
 def _delivery_state_for(email: str) -> dict | None:
@@ -6233,6 +6059,14 @@ def me(user: dict = Depends(current_user)):
             # and still connect, and an uncapped one always may.
             features["bank_awaits_confirm"] = (
                 _cap == 0 and bool(ext.gate.bank_awaits_confirm(tc)))
+            # an operator's opt-out of the per-request Plaid products turns
+            # them off on every instance and plan, so their controls hide
+            # (self-host included, where no plan gate answers)
+            from ..sync import plaid as _plaid
+            for f, prod in (("enrich", "enrich"),
+                            ("plaid_recurring", "recurring")):
+                if not _plaid.plaid_product_allowed(tc, prod):
+                    features[f] = False
         finally:
             tc.close()
     except Exception:                            # noqa: BLE001
@@ -6316,6 +6150,9 @@ def me(user: dict = Depends(current_user)):
     return {"email": user["email"], "tenant_id": str(user["tenant_id"]),
             # entitlement tier, or null when no gate is installed
             "plan": plan, "features": features,
+            # the day counts the clients print (reap after failures, slot
+            # kept after a disconnect): one source, not a constant per screen
+            "day_counts": _reaper_day_counts(),
             # true once a business exists → the SPA shows the
             # Business tab. False hides the TAB only, never the route.
             "has_business": has_business,
@@ -6625,6 +6462,11 @@ def user_set_role(user_id: str, user: dict = Depends(current_user),
         raise HTTPException(
             400, "role must be one of "
                  + ", ".join(permissions.ASSIGNABLE_ROLES))
+    # The door is a read-only exit so the owner can make somebody
+    # view-only in a household held read-only; handing out edit rights is
+    # a grant, and stays refused there. Decided before the step-up.
+    if role != "viewer" and _billing_write_blocked(user):
+        raise HTTPException(402, "this account is read-only right now")
     # Every refusal is decided BEFORE the step-up, so a request that could
     # never change anything cannot spend a single-use recovery code or burn
     # the TOTP counter (as on the member-removal door) — an owner target
@@ -6935,6 +6777,8 @@ def invite_claim(request: Request, body: dict = Body(...)):
                 raise HTTPException(403, "this household is not accepting "
                                          "new members right now — ask the "
                                          "owner")
+        if len(str(body.get("email") or "")) > EMAIL_MAX:
+            raise HTTPException(400, "that is not an email address")
         try:
             r = invites.claim(conn, str(body.get("token") or ""),
                               str(body.get("email") or ""),
@@ -7066,8 +6910,13 @@ def passkey_register(request: Request, user: dict = Depends(current_user),
     # of its own, and a request holding one control connection while it
     # waits for a second is how four of them empty the pool for everyone
     maybe_first = no_totp and not _has_passkey(user["user_id"])
-    admin = tenancy.admin_connect() if maybe_first else None
-    try:
+    from ..auth import recovery
+    # The first key mints a recovery sheet, staged on an unpooled admin
+    # connection opened here, before the lock, and committed after the
+    # key's own transaction (recovery.issue_staged): committed first, a
+    # failure in the enrolment would leave a batch standing that no reply
+    # ever showed.
+    with recovery.issue_staged(tenancy.admin_connect, maybe_first) as batch:
       with _control_conn() as conn:
         conn.execute("SELECT pg_advisory_lock(hashtext(%s))",
                      ("oikonome:passkeys:" + str(user["user_id"]),))
@@ -7098,28 +6947,26 @@ def passkey_register(request: Request, user: dict = Depends(current_user),
                 result = bind()
                 # an added key is a re-enrolment like the first one: a
                 # recovery still waiting to land would strip it with the
-                # rest (the first-factor path does this in the eviction)
-                _end_pending_recoveries(conn, user["user_id"])
+                # rest (the first-factor path does this in its rotation)
+                posture.end_pending_recoveries(conn, user["user_id"])
             else:
                 # The first strong factor is the same posture change as
-                # totp_confirm and gets the same eviction: every other
-                # session, device token, script token and mint ticket a
-                # hijacker could be holding dies here, or the passkey the
+                # totp_confirm and gets the same FACTOR rotation
+                # (auth/posture), minting the first recovery sheet: every
+                # other session, device token, script token and mint ticket
+                # a hijacker could be holding dies here, or the passkey the
                 # owner just added to close a hijack closes nothing.
                 #
-                # The key and that eviction are ONE transaction. Committed
-                # apart, a failure half way through the eviction (a lock
-                # conflict in the member removal) would answer 500 with
-                # the key already bound — and a retry would then see a
-                # passkey, treat the new one as a second key, and never
-                # evict or mint recovery codes again. One transaction also
-                # keeps the canonical lock order: the outbound pause takes
-                # the settings row and HOLDS it while the eviction takes
-                # the household-member lock after it, as every rotation
-                # door does. The passkey row's foreign key share-locks the
-                # users row, which a step-up's counter burn (a non-key
-                # UPDATE) does not wait on, so no users row is held here
-                # that the settings row's other holders could need.
+                # The sheet's code lock and household re-check come before
+                # the key is written (posture lock rule 3): the key's
+                # foreign key share-locks the users row, which a reclaim
+                # moving this account out may be queued for.
+                posture.hold_sheet(conn, batch, user)
+                # The key and the rotation are ONE transaction. Committed
+                # apart, a failure half way through the eviction would
+                # answer 500 with the key already bound — and a retry would
+                # see a passkey, treat the new one as a second key, and
+                # never evict or mint recovery codes again.
                 #
                 # A key the verifier refuses still has to burn its
                 # challenge (see above), so a refusal is answered after
@@ -7137,34 +6984,15 @@ def passkey_register(request: Request, user: dict = Depends(current_user),
                             raise
                         refused = e
                     if refused is None:
-                        token = request.cookies.get(sessions.COOKIE_NAME, "")
-                        sms_needs_verify = reset_mod._unverify_sms_number(
-                            conn, user["user_id"])
-                        sessions.revoke_all_others(conn, user["user_id"],
-                                                   token)
-                        revoked = _revoke_bearer_persistence(conn, user)
+                        rotated = posture.rotate(conn, batch, user,
+                                                 posture.FACTOR, mint=True)
                 if refused is not None:
                     raise refused
-                result = {**result,
-                          "sms_number_needs_verify": sms_needs_verify,
-                          **revoked}
-                from ..auth import recovery
-                if admin is None:          # the cheap read was stale; rare
-                    admin = tenancy.admin_connect()
-                # ALWAYS a fresh batch, never "keep whatever is left":
-                # codes left over from before a reset (or a prior
-                # enrolment) are live bypass primitives for passkey login
-                # and passkey step-up, and the owner may believe they were
-                # voided. Minted while the lock is held, so the batch the
-                # response carries is the batch that stands.
-                result = {**result, "recovery_codes":
-                          recovery.issue(admin, user["user_id"])}
+                result = {**result, **rotated}
         finally:
             conn.execute("SELECT pg_advisory_unlock_all()")
-    finally:
-        if admin is not None:
-            admin.close()
-    _notify_security_change(user, "passkey_added")
+    _notify_security_change(
+        user, "passkey_enrolled" if first_factor else "passkey_added")
     return result
 
 
@@ -7230,7 +7058,22 @@ def passkey_delete(pk_id: str, user: dict = Depends(current_user),
         user, password=str((body or {}).get("password") or ""),
         totp_code=str((body or {}).get("totp_code") or ""),
         recovery_code=str((body or {}).get("recovery_code") or ""))
-    with _control_conn() as conn:
+    # Removing a key while another factor stays re-mints the recovery
+    # sheet (below), for a client that says it shows the new sheet; an
+    # older build omits the field and keeps the sheet it has, which it
+    # could otherwise lose unseen. The batch goes in on an unpooled ADMIN
+    # connection, opened here, before the lock, when the pre-check says a
+    # factor will remain — so the critical section never waits on a
+    # connect.
+    reissue = _wants_reissue((body or {}).get("reissue_codes"))
+    rotated = posture.blank_report()
+    from ..auth import recovery
+    # committed after the control transaction below (issue_staged)
+    with recovery.issue_staged(
+            tenancy.admin_connect,
+            bool(reissue and row
+                 and (row["totp_secret"] or row["n_pk"] > 1))) as batch:
+      with _control_conn() as conn:
         # The pre-check above ran on another connection, before an argon2
         # verify, so two deletes of two different keys can each have seen
         # "two passkeys" and both proceed — leaving zero and re-enabling
@@ -7239,6 +7082,9 @@ def passkey_delete(pk_id: str, user: dict = Depends(current_user),
         # second sees the first's delete.
         with conn.transaction():
             _lock_user_factors(conn, user["user_id"])
+            # this door can mint a recovery batch: a session an eviction
+            # removed while it waited must not receive one
+            _caller_still_signed_in(conn, user)
             row = conn.execute(
                 "SELECT totp_secret, second_factor_waived, "
                 "(SELECT count(*) FROM passkeys WHERE user_id = %s) AS n_pk "
@@ -7250,48 +7096,45 @@ def passkey_delete(pk_id: str, user: dict = Depends(current_user),
                     400, "last_factor: this is your only two-factor method "
                          "— add another passkey or an authenticator app "
                          "before removing it")
-            # what this key signed in goes with it — see the helper
-            signed_out = False
-            if conn.execute(
-                    "SELECT 1 FROM passkeys WHERE id = %s AND user_id = %s",
-                    (pk_uuid, user["user_id"])).fetchone():
-                # Asked before the helper deletes the row: if the caller's
-                # own session or device token was opened by this key, the
-                # removal ends it too, and the client must say so rather
-                # than meet a bare 401 on its next request.
-                signed_out = _caller_signed_in_by(conn, user, pk_uuid)
-                _end_what_a_passkey_opened(conn, user["user_id"], pk_uuid)
-            n = conn.execute(
-                "DELETE FROM passkeys WHERE id = %s AND user_id = %s",
-                (pk_uuid, user["user_id"])).rowcount
-            # A live session or device may be carrying an elevation stamp
-            # that NAMES this key. The column has no foreign key
-            # (migration 120), so nothing else clears it, and a credential
-            # rotation inside the remaining window reads that name as
-            # "keep this one" — deleting every OTHER key to spare one that
-            # no longer exists, which on a passkey-only account is the
-            # account's last factor.
-            #
-            # The whole stamp goes, `elevated_at` included, not just the
-            # id: a sudo window is only as good as the credential that
-            # opened it, and this one has just been destroyed by its own
-            # owner. Clearing the id alone would leave the window open
-            # with no key named, which is the lost-authenticator road —
-            # and that road evicts EVERY key, so the same last factor
-            # would still go. Closing it costs one re-confirmation with a
-            # key they still have; leaving it open costs the factor.
-            # Rows whose stamp names a key that still exists, or that was
-            # opened by a password or a recovery code, are untouched.
-            for tbl in ("sessions", "device_tokens"):
-                conn.execute(
-                    f"UPDATE {tbl} SET elevated_at = NULL, "             # noqa: S608 — table name is a literal from the tuple above
-                    "elevated_passkey_id = NULL "
-                    "WHERE user_id = %s AND elevated_passkey_id = %s",
-                    (user["user_id"], pk_uuid))
+            exists = conn.execute(
+                "SELECT 1 FROM passkeys WHERE id = %s AND user_id = %s",
+                (pk_uuid, user["user_id"])).fetchone() is not None
+            # Asked before the key goes: if the caller's own session or
+            # device token was opened by this key, the removal ends it too,
+            # and the client must say so rather than meet a bare 401 on its
+            # next request.
+            signed_out = exists and _caller_signed_in_by(conn, user,
+                                                         pk_uuid)
+            # Another factor stays (the authenticator, or another key), and
+            # the old recovery sheet keeps working past it: a batch a
+            # hijacker minted with the key being removed, or a photographed
+            # sheet, would sign in past what is left. So, for a client that
+            # shows the new sheet, the sheet is reissued with the FACTOR
+            # rotation (auth/posture): every OTHER session and device is
+            # signed out with the old sheet, and everything it could have
+            # planted goes with them, as turning 2FA off does — one a
+            # hijacker opened with a code from it could otherwise elevate
+            # and regenerate the new batch away. First, before anything is
+            # written, so the sheet's household re-check holds no row a
+            # move is queued behind (posture lock rule 3). Without the
+            # field, nobody else is signed out: the old sheet stays valid,
+            # so a sweep would close nothing (a deliberate asymmetry). A key
+            # that was not there changes nothing and mints nothing.
+            if (reissue and exists and row
+                    and (row["totp_secret"] or row["n_pk"] > 1)):
+                rotated = posture.rotate(conn, batch, user, posture.FACTOR,
+                                         mint=True)
+            # what this key signed in goes with it, and every elevation
+            # stamp that names it — key-scoped, see the helper
+            n = posture.revoke_passkey(conn, user["user_id"],
+                                       pk_uuid) if exists else 0
     if not n:
         raise HTTPException(404, "no such passkey")
-    _notify_security_change(user, "passkey_removed")
-    return {"ok": True, "signed_out": signed_out}
+    _notify_security_change(
+        user, posture.notice("passkey_removed",
+                             posture.FACTOR if rotated["recovery_codes"]
+                             else None, rotated))
+    return {**rotated, "ok": True, "signed_out": signed_out}
 
 
 # Inline step-up assertion for destructive actions on a passkey
@@ -7538,7 +7381,7 @@ def _mint_ticket_passkey(conn, ticket: str):
 
 def _caller_signed_in_by(conn, user, passkey_id) -> bool:
     """Whether the session or device token this caller authenticated with
-    was opened by `passkey_id` — the credential _end_what_a_passkey_opened
+    was opened by `passkey_id` — the credential posture.revoke_passkey
     is about to end."""
     if user.get("device_id"):
         row = conn.execute(
@@ -7552,34 +7395,6 @@ def _caller_signed_in_by(conn, user, passkey_id) -> bool:
         return False
     return bool(row and row["signin_passkey_id"]
                 and str(row["signin_passkey_id"]) == str(passkey_id))
-
-
-def _end_what_a_passkey_opened(conn, user_id, passkey_id) -> None:
-    """End every credential a passkey's sign-ins left live: the sessions
-    it signed in, the device tokens minted from them and their unspent
-    mint tickets. Run inside the removal's transaction, under the factor
-    lock, and in this order: a ticket is found through the session it was
-    issued with, so the tickets go before the sessions do.
-
-    The current session is not spared, which is the console's rule for
-    its own keys: removing a key means it can no longer act, and a
-    session it signed in is that key acting. Someone removing the key
-    they are signed in with is signed out and signs in with what they
-    have left; someone removing a stolen one ends the thief's session."""
-    conn.execute(
-        "DELETE FROM webauthn_challenges "
-        "WHERE purpose='device-mint-ticket' AND user_id=%s "
-        "AND session_hash IN ("
-        "    SELECT token_hash FROM sessions "
-        "    WHERE user_id=%s AND signin_passkey_id=%s)",
-        (user_id, user_id, passkey_id))
-    conn.execute(
-        "UPDATE device_tokens SET revoked_at=now() "
-        "WHERE user_id=%s AND signin_passkey_id=%s AND revoked_at IS NULL",
-        (user_id, passkey_id))
-    conn.execute(
-        "DELETE FROM sessions WHERE user_id=%s AND signin_passkey_id=%s",
-        (user_id, passkey_id))
 
 
 # Per address only as a wide backstop — every app sign-in mints one, and a
@@ -8449,9 +8264,10 @@ _PENDING_VERIFY_SENT = False
 @app.post("/api/email/change",
           dependencies=[Depends(limit("email_change", 5, 3600))])
 def email_change(request: Request, user: dict = Depends(current_user),
-                 new_email: str = Form(...), password: str = Form(""),
+                 new_email: str = Form(..., max_length=EMAIL_MAX), password: str = Form(""),
                  totp_code: str = Form(""), recovery_code: str = Form(""),
-                 keep_push_endpoint: str = Form("")):
+                 keep_push_endpoint: str = Form(""),
+                 reissue_codes: str = Form("")):
     """Change the account email (= the login username). Re-auth like the
     other account-security doors (password + TOTP when enrolled). The write
     goes through the ADMIN connection on purpose: the app role is
@@ -8515,6 +8331,7 @@ def email_change(request: Request, user: dict = Depends(current_user),
     # its entry: change away and it is dropped, mute and it is silenced.
     # So only an owner may move onto an address already on either list.
     _refuse_listed_address_unless_owner(user, new_email)
+    from ..auth import recovery
     hosted = env_flag("OIKONOME_HOSTED")
     if hosted:
         from ..auth import email_change as _email_change
@@ -8527,9 +8344,9 @@ def email_change(request: Request, user: dict = Depends(current_user),
             if (live is not None and live["mail_sent_at"] is not None
                     and live["new_email"].lower() == new_email
                     and _email_change_asked_by(live, user)):
-                return _resend_email_change(request, user,
-                                            keep_push_endpoint,
-                                            new_email=new_email)
+                return _resend_email_change(
+                    request, user, keep_push_endpoint, new_email=new_email,
+                    reissue=_wants_reissue(reissue_codes))
             # Before any single-use factor is spent. The authoritative
             # count re-runs under the address lock below.
             kind, wait = _email_change_mail_wait(admin, user["user_id"],
@@ -8565,7 +8382,6 @@ def email_change(request: Request, user: dict = Depends(current_user),
         raise HTTPException(
             403, "change the sign-in email from a signed-in browser or "
                  "the app")
-    token = request.cookies.get(sessions.COOKIE_NAME, "")
     # ONE transaction for the whole rotation, on ONE connection — the same
     # rule password_change records, for the same reason. The email IS the
     # login identifier, so changing it and evicting everything the old one
@@ -8600,7 +8416,7 @@ def email_change(request: Request, user: dict = Depends(current_user),
             admin.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
                           ("oikonome:signup:" + new_email,))
             # and the per-user factor lock BEFORE the users write, the
-            # canonical order — `_evict_passkeys` below takes it, and
+            # canonical order — the rotation below takes it, and
             # reaching it only after this transaction held the users row
             # would invert the order the TOTP doors use.
             _lock_user_factors(admin, user["user_id"])
@@ -8630,8 +8446,22 @@ def email_change(request: Request, user: dict = Depends(current_user),
                     else user.get("session_id"),
                     device_id=user.get("device_id"), mail_sent=False)
             else:
-                sms_needs_verify, invites_removed, members_removed = \
-                    _rotation_before_move(admin, user["user_id"])
+                # The CREDENTIAL rotation (auth/posture), before the users
+                # row changes: the email IS the login identifier and the
+                # recovery channel, so it is rotated like a credential —
+                # sessions, devices, tickets, passkeys (the proving one
+                # kept), tokens, webhooks (recorded under the address their
+                # maker had), outbound settings, the SMS number, invites and
+                # members, support grants, push (this browser's kept),
+                # pending recoveries, and the sheet voided or — for a client
+                # that shows the new one — reissued. The batch rides this
+                # same admin connection (recovery.issue_here), so it commits
+                # with the change and the address write never waits on it.
+                rotated = posture.rotate(
+                    admin, recovery.issue_here(admin), user,
+                    posture.CREDENTIAL, mint=_wants_reissue(reissue_codes),
+                    keep_passkey=keep_passkey,
+                    keep_push_endpoint=keep_push_endpoint)
                 if hosted:
                     # the address waits for its mailbox (docstring); the
                     # request answers only while the credential making it
@@ -8646,9 +8476,6 @@ def email_change(request: Request, user: dict = Depends(current_user),
                     change_token = None
                     revert_token = _move_login_email(
                         admin, user["user_id"], u["email"], new_email)
-                passkeys_removed, passkeys_kept, support_revoked = \
-                    _rotation_after_move(admin, user, token, keep_passkey,
-                                         keep_push_endpoint)
     except UniqueViolation as e:
         # a writer that does not take the address lock (an operator's own
         # edit, a future door) got there first: still the caller's 409,
@@ -8660,11 +8487,7 @@ def email_change(request: Request, user: dict = Depends(current_user),
         admin.close()
     if withheld:
         raise _email_change_cap_refusal(*withheld)
-    rotated = _rotated_answer(
-        new_email, passkeys_removed=passkeys_removed,
-        passkeys_kept=passkeys_kept, sms_needs_verify=sms_needs_verify,
-        support_revoked=support_revoked, invites_removed=invites_removed,
-        members_removed=members_removed)
+    rotated = _rotated_answer(new_email, rotated)
     if change_token is not None:
         _send_email_change_confirm(new_email, change_token,
                                    user["tenant_id"])
@@ -8706,7 +8529,7 @@ def _move_login_email(admin, user_id, old_email: str, new_email: str):
     # the move: a reset link or a cooling-off factor reset minted to that
     # mailbox while a hosted change waited for its confirm would otherwise
     # land on the account at its new address and strip its credentials.
-    _end_pending_recoveries(admin, user_id)
+    posture.end_pending_recoveries(admin, user_id)
     # the address is the account's now; nothing else may still be on its
     # way to it
     from ..auth import email_change as _email_change
@@ -8799,7 +8622,8 @@ def email_change_cancel(user: dict = Depends(current_user)):
           dependencies=[Depends(limit("email_change_resend", 5, 3600))])
 def email_change_resend(request: Request,
                         user: dict = Depends(current_user),
-                        keep_push_endpoint: str = Form("")):
+                        keep_push_endpoint: str = Form(""),
+                        reissue_codes: str = Form("")):
     """Mail the pending login-email change's confirmation link again — for
     a first mail that went to spam or never arrived, so the fix is not
     pressing Change again. Only from the browser or app that asked (the
@@ -8817,7 +8641,8 @@ def email_change_resend(request: Request,
     if not env_flag("OIKONOME_HOSTED"):
         raise HTTPException(409, "there is no email change waiting to be "
                                  "confirmed")
-    return _resend_email_change(request, user, keep_push_endpoint)
+    return _resend_email_change(request, user, keep_push_endpoint,
+                                reissue=_wants_reissue(reissue_codes))
 
 
 def _email_change_asked_by(live: dict, user: dict) -> bool:
@@ -8831,15 +8656,17 @@ def _email_change_asked_by(live: dict, user: dict) -> bool:
 
 def _resend_email_change(request: Request, user: dict,
                          keep_push_endpoint: str = "", *,
-                         new_email: str | None = None) -> dict:
+                         new_email: str | None = None,
+                         reissue: bool = False) -> dict:
     """The resend door's body, shared with the change door's "same address
     again" case. `new_email`: the address the caller asked for, which the
-    live request must still name."""
+    live request must still name. `reissue`: the client shows a reissued
+    recovery sheet (only a rotation this mail runs reissues one)."""
     from ..auth import email_change as _email_change
+    from ..auth import recovery
     uid = user["user_id"]
     gone = HTTPException(409, "there is no email change waiting to be "
                               "confirmed")
-    token = request.cookies.get(sessions.COOKIE_NAME, "")
     rotated = None
     admin = tenancy.admin_connect()
     try:
@@ -8874,15 +8701,13 @@ def _resend_email_change(request: Request, user: dict,
                 _require_elevation(user)
                 keep_passkey = _proved_passkey_or_refuse(
                     uid, _elevation_passkey(user))
-                sms, invites, members = _rotation_before_move(admin, uid)
+                # the change door's CREDENTIAL rotation (see there)
+                rotated = _rotated_answer(live["new_email"], posture.rotate(
+                    admin, recovery.issue_here(admin), user,
+                    posture.CREDENTIAL, mint=reissue,
+                    keep_passkey=keep_passkey,
+                    keep_push_endpoint=keep_push_endpoint))
                 change_token = _email_change.resend(admin, live)
-                removed, kept, support = _rotation_after_move(
-                    admin, user, token, keep_passkey, keep_push_endpoint)
-                rotated = _rotated_answer(
-                    live["new_email"], passkeys_removed=removed,
-                    passkeys_kept=kept, sms_needs_verify=sms,
-                    support_revoked=support, invites_removed=invites,
-                    members_removed=members)
             else:
                 change_token = _email_change.resend(admin, live)
     finally:
@@ -8896,86 +8721,11 @@ def _resend_email_change(request: Request, user: dict,
             **(rotated or _rotated_answer(live["new_email"]))}
 
 
-def _rotation_before_move(admin, user_id) -> tuple[bool, int, list]:
-    """The half of a login-email rotation that must land before the users
-    row changes. Returns (sms_needs_verify, invites_removed,
-    members_removed)."""
-    # webhooks go the way of the script tokens — paused BEFORE the address
-    # changes, because they are recorded under the address their creator
-    # had
-    # a recovery started before the address moves — a mailed reset link,
-    # a cooling-off factor clear — must not outlive the move: void it
-    # before the users row changes, in the same transaction
-    _end_pending_recoveries(admin, user_id)
-    from ..notify import webhooks as _webhooks
-    _webhooks.pause_for_rotation(admin, user_id)
-    # and the household's SMS number, as on a password change, with the
-    # relay, extra recipients and AI endpoint
-    sms_needs_verify = reset_mod._unverify_sms_number(admin, user_id)
-    from ..notify import outbound_pause as _outbound
-    _outbound.pause_for_rotation(admin, user_id)
-    # pending family invites — a share URL that needs no mailbox — and the
-    # members this owner's recent invites created, as on a password change;
-    # before the users row, as there
-    invites_removed, members_removed = \
-        reset_mod.evict_invite_footholds(admin, user_id)
-    return sms_needs_verify, invites_removed, members_removed
-
-
-def _rotation_after_move(admin, user: dict, token: str, keep_passkey,
-                         keep_push_endpoint: str) -> tuple[int, int, int]:
-    """The rest of the rotation: the email IS the login identifier, so it
-    is rotated like a credential. Returns (passkeys_removed,
-    passkeys_kept, support_access_revoked)."""
-    uid = user["user_id"]
-    # Other sessions (a hijacker's, most importantly) and script tokens
-    # don't get to ride through the change; this session stays, same shape
-    # as password_change.
-    sessions.revoke_all_others(admin, uid, token)
-    admin.execute("UPDATE api_tokens SET revoked_at=now() "
-                  "WHERE created_by=%s AND revoked_at IS NULL", (uid,))
-    # keep the CALLING device, like password_change and every other
-    # posture-change door — a phone that just proved full step-up must not
-    # sign itself out by changing its own email
-    device_tokens.revoke_all_for_user(admin, uid,
-                                      keep_device_id=user.get("device_id"))
-    device_tokens.revoke_mint_tickets(admin, uid)
-    # and any unspent reset link or pending cooling-off recovery: one
-    # started from the OLD mailbox by whoever held it would otherwise
-    # outlive this rotation and strip every factor later
-    _end_pending_recoveries(admin, uid)
-    # Passkeys die with the rotation too, mirroring password_change and the
-    # reset path: a hijacked session could have enrolled its own passkey,
-    # and WebAuthn login would keep working for the attacker no matter how
-    # many sessions and tokens are revoked above. The owner re-adds
-    # passkeys after; the count comes back in the response so the client
-    # can say what happened. Same last-factor rule as password_change — the
-    # key that PROVED this caller survives when it is the only factor left,
-    # or the rotation would re-enable password-only login. Only that key: a
-    # stranger's freshly-used one is not a proof of anything.
-    passkeys_removed, passkeys_kept = _evict_passkeys(admin, uid,
-                                                      keep_passkey)
-    # and a support-access grant, as on a password change: an operator
-    # access window a hijacker opened must not outlive the rotation the
-    # owner made to shut them out
-    support_revoked = _revoke_support_grants(admin, uid)
-    # and the other browsers' web push, as on a password change
-    _drop_web_push(admin, uid, keep_push_endpoint)
-    return passkeys_removed, passkeys_kept, support_revoked
-
-
-def _rotated_answer(new_email: str, *, passkeys_removed=0, passkeys_kept=0,
-                    sms_needs_verify=False, support_revoked=0,
-                    invites_removed=0, members_removed=()) -> dict:
-    """What a login-email change answers about the rotation it ran (all
-    zeros when it ran none)."""
+def _rotated_answer(new_email: str, rotated: dict | None = None) -> dict:
+    """What a login-email change answers about the rotation it ran (the
+    posture report; all zeros when it ran none)."""
     from ..notify import emailhint as _emailhint
-    return {"passkeys_removed": passkeys_removed,
-            "passkeys_kept": passkeys_kept,
-            "sms_number_needs_verify": sms_needs_verify,
-            "support_access_revoked": support_revoked,
-            "invites_removed": invites_removed,
-            "members_removed": _members_public(list(members_removed)),
+    return {**(rotated if rotated is not None else posture.blank_report()),
             # a "did you mean…?" for an address that looks like a typo of a
             # major provider. Advisory ONLY — a form that refuses your own
             # email is worse than a rare undelivered message, and some real
@@ -9310,12 +9060,14 @@ def email_revert_finish(token: str = Form("")):
                 return _email_revert_page(
                     state="taken", old_email=old, status=409)
             uid = r["user_id"]
-            from ..notify import webhooks as _webhooks
-            _webhooks.pause_for_rotation(admin, uid)
-            # any reset link or cooling-off recovery started meanwhile —
-            # by whoever held the account — goes before the fresh reset
-            # below is minted, so that one is the only one that works
-            _end_pending_recoveries(admin, uid)
+            # The REVERT rotation (auth/posture), before the users row:
+            # every session and device (no caller to spare — this is a
+            # link), mint tickets, script tokens, webhooks, support grants,
+            # push, and any reset link or cooling-off recovery started
+            # meanwhile by whoever held the account — before the fresh
+            # reset below is minted, so that one is the only one that
+            # works. No factor and not the sheet: the reset asks for one.
+            posture.rotate(admin, None, {"user_id": uid}, posture.REVERT)
             # the address the revert leaves is reported like any other
             # move, but the undo of a hijack never waits on the add-on: a
             # gate that cannot record it — absent, or failing in the
@@ -9342,15 +9094,6 @@ def email_revert_finish(token: str = Form("")):
                     ext.gate.on_email_verified(admin, r["tenant_id"], uid)
             except Exception as e:                       # noqa: BLE001
                 log.warning("email revert: verification not recorded: %s", e)
-            admin.execute("DELETE FROM sessions WHERE user_id=%s", (uid,))
-            device_tokens.revoke_all_for_user(admin, uid)
-            device_tokens.revoke_mint_tickets(admin, uid)
-            admin.execute("UPDATE api_tokens SET revoked_at=now() "
-                          "WHERE created_by=%s AND revoked_at IS NULL",
-                          (uid,))
-            _revoke_support_grants(admin, uid)
-            admin.execute("DELETE FROM push_subscriptions WHERE user_id=%s",
-                          (uid,))
             reset_token = reset_mod.create_reset(admin, uid)
     except UniqueViolation as e:
         # a writer that does not take the address lock got there first

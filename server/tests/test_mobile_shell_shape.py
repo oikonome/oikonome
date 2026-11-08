@@ -37,6 +37,16 @@ class MobileShellShapeTests(unittest.TestCase):
         # a passcode-only device reports false there and would walk in
         self.assertNotIn("LocalAuthentication.isEnrolledAsync", src)
 
+    def test_passkey_failure_points_only_at_a_control_the_phone_has(self):
+        # the sign-in error names where to add a passkey; Security &
+        # household on the phone has no passkey control unless it registers
+        # one, so the message must send the person to the web app instead
+        login = self._read("app/login.tsx")
+        security = self._read("app/security.tsx")
+        if "passkeyRegister" not in security:
+            self.assertNotIn("re-add this device's passkey", login)
+            self.assertIn("Settings → Security", login)
+
     def test_bundle_import_invalidates_only_what_it_touches(self):
         src = self._read("app/settings.tsx")
         self.assertNotIn("invalidateQueries()", src,

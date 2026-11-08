@@ -184,6 +184,14 @@ class SetupTests(unittest.TestCase):
         for k in ("llm_url", "llm_model", "llm_api_key"):
             self.assertNotIn(k, cfg)
 
+    def test_first_owner_opens_today_on_the_detail_face(self):
+        """A self-host first owner opens Today on the same face a hosted
+        signup gets; the face must not depend on how the account was made."""
+        r = setup.bootstrap(f"face-{uuid.uuid4().hex[:8]}@example.dev",
+                            "correct-horse-battery")
+        self.assertEqual(self._tenant_config(r["tenant_id"]).get("today_view"),
+                         "detail")
+
     def test_bootstrap_llm_validation_before_user_created(self):
         cases = [dict(llm_url="http://x.test"),               # URL sans model
                  dict(llm_model="gemma3"),                    # model sans URL

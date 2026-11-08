@@ -128,5 +128,53 @@ class CadencesAreIndependentTests(unittest.TestCase):
         self.assertEqual(tried, ["daily", "monthly", "yearly"])
 
 
+class ReportPushOpensItsPeriodTests(unittest.TestCase):
+    """A web push announcing the monthly or yearly report must open that
+    month or year, not Today — the same period the native app's tap opens."""
+
+    def setUp(self):
+        self.conn = make_db()
+        self.tid = str(self.conn.execute(
+            "SELECT current_setting('app.tenant_id') AS t").fetchone()["t"])
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _push_url(self, cadence, today):
+        import datetime as dt
+        from oikonome import localtime
+        cfg = budget.load_config(self.conn)
+        cfg["email_schedule"] = {cadence: {"on": True, "hour": 7,
+                                           "push": True}}
+        budget.save_config(self.conn, cfg)
+        when = dt.datetime.combine(today, dt.time(9))
+        with mock.patch.object(localtime, "now_local", return_value=when), \
+             mock.patch("oikonome.notify.push.send_tenant") as web_push, \
+             mock.patch("oikonome.notify.push_native.send_tenant"):
+            worker.email_tenant(self.tid, send_it=True, cadence=cadence)
+        web_push.assert_called_once()
+        args, kw = web_push.call_args
+        return kw.get("url", args[4] if len(args) > 4 else "/app/")
+
+    def test_monthly_push_opens_the_month_it_reports(self):
+        import datetime as dt
+        self.assertEqual(self._push_url("monthly", dt.date(2026, 1, 1)),
+                         "/app/?lens=month&y=2025&m=12")
+
+    def test_yearly_push_opens_the_year_it_reports(self):
+        import datetime as dt
+        self.assertEqual(self._push_url("yearly", dt.date(2026, 1, 1)),
+                         "/app/?lens=year&y=2025")
+
+    def test_report_url_names_each_cadence(self):
+        import datetime as dt
+        day = dt.date(2026, 11, 1)
+        self.assertEqual(worker.report_url("daily", day), "/app/")
+        self.assertEqual(worker.report_url("monthly", day),
+                         "/app/?lens=month&y=2026&m=10")
+        self.assertEqual(worker.report_url("yearly", day),
+                         "/app/?lens=year&y=2025")
+
+
 if __name__ == "__main__":
     unittest.main()

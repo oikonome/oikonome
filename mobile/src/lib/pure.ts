@@ -5,8 +5,9 @@
 // silently — a $1 rounding drift off the web/email, and a savings
 // goal lost to a concurrent edit. The server suite runs that script
 // too, so `make test` goes red on a regression.
-import type { AccountRemoveMode, CustomBucket, ElevationProof,
-              ElevationStatus, IncomeScenario, SavingsGoal } from "./api";
+import type { AccountChoice, AccountRemoveMode, CustomBucket,
+              ElevationProof, ElevationStatus, IncomeScenario,
+              SavingsGoal } from "./api";
 
 // A typed amount's separators, read by the server's own rules for an
 // amount cell (csvimport.parse_money_text), so a client never sends a
@@ -118,6 +119,29 @@ export const isValidYmd = (v: string): boolean => {
   return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1
     && dt.getUTCDate() === d;
 };
+
+/** A typed birthdate as the ISO date the settings door takes, or the
+ *  sentence to show. The web wizard's date picker always hands over
+ *  YYYY-MM-DD; a phone keyboard gets free text, so the US M/D/YYYY shape
+ *  is read too, and an impossible or future date is refused here instead
+ *  of by a save nobody sees fail. Blank is "no birthdate" (iso ""). */
+export function birthdateIso(text: string, today = new Date()):
+    { iso: string } | { error: string } {
+  const t = text.trim();
+  if (!t) return { iso: "" };
+  const m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(t);
+  const u = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(t);
+  const [y, mo, d] = m ? [+m[1], +m[2], +m[3]]
+    : u ? [+u[3], +u[1], +u[2]] : [NaN, NaN, NaN];
+  const dt = new Date(y, mo - 1, d);
+  if ((!m && !u) || dt.getFullYear() !== y || dt.getMonth() !== mo - 1
+      || dt.getDate() !== d)
+    return { error: "Enter the birthdate like 1980-01-31 or 1/31/1980." };
+  if (dt >= today || y < 1900)
+    return { error: "The birthdate must be a real date in the past." };
+  const p2 = (n: number) => String(n).padStart(2, "0");
+  return { iso: `${y}-${p2(mo)}-${p2(d)}` };
+}
 
 /** one Savings-goals card row as drafted on screen (strings, unsaved) */
 export type GoalDraft = { name: string; target: string; target_date: string;
@@ -818,7 +842,8 @@ export function cashflowCutoffMonth(
  *  — the same rule over that client's key names (its ledger is ["txns"],
  *  and its Accounts page never mounts it). */
 export function accountRemoveMoved(mode: AccountRemoveMode): string[] {
-  const keys = ["accounts", "today", "transactions"];
+  // top holdings leaves hidden and removed accounts out
+  const keys = ["accounts", "today", "transactions", "holdings"];
   if (mode !== "hide") keys.push("connections", "me");
   // a purge can take the checking anchor or an excluded account with it,
   // and the bill calendar's balances
@@ -1255,6 +1280,28 @@ export function parseMoneyDraft(v: string): number | null {
   if (t === null || !/^-?(\d+\.?\d*|\.\d+)$/.test(t)) return null;
   const n = Number(t);
   return Number.isFinite(n) ? n : null;
+}
+
+/** The split editor's arithmetic: each part's cents as typed (null when
+ *  the text is not an amount yet), what is left to place against the
+ *  charge, and whether the split can be saved — at least two parts, each
+ *  with a category and more than zero, no category twice, adding up to
+ *  the charge to the cent. */
+export function splitDraftCheck(charge: number,
+                                parts: readonly { category: string; amount: string }[]):
+    { cents: (number | null)[]; left: number; ready: boolean } {
+  // parseMoneyDraft, not Number(): a decimal-comma keypad types "12,50",
+  // which Number() reads as NaN, so no part with cents could be saved
+  const cents = parts.map((p) => {
+    const v = parseMoneyDraft(p.amount);
+    return v === null ? null : pyround(v * 100);
+  });
+  const left = pyround(Math.abs(charge) * 100)
+    - cents.reduce<number>((a, c) => a + (c ?? 0), 0);
+  const ready = parts.length >= 2 && left === 0
+    && parts.every((p, i) => !!p.category && (cents[i] ?? 0) > 0)
+    && new Set(parts.map((p) => p.category)).size === parts.length;
+  return { cents, left, ready };
 }
 
 /** A receipt's total, date and store as typed on a waiting receipt, ready
@@ -1797,6 +1844,36 @@ export function localYmd(d: Date): string {
     + String(d.getDate()).padStart(2, "0");
 }
 
+/** The calendar day it is where the household lives, as YYYY-MM-DD. The
+ *  server answers "today" and "this month" on the household's clock
+ *  (/api/me `timezone`), so a device in another zone must read the same
+ *  clock: between London's midnight and Los Angeles's, a browser in LA
+ *  would otherwise call the household's yesterday "today" and its new
+ *  month the future. Before /api/me answers, or with a zone this runtime
+ *  cannot read, the device clock stands in. */
+export function householdYmd(at: Date, zone?: string): string {
+  if (zone) {
+    try {
+      const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone: zone, year: "numeric", month: "numeric", day: "numeric",
+      }).formatToParts(at);
+      const n = (t: string) => Number(parts.find((p) => p.type === t)?.value);
+      const y = n("year"), m = n("month"), d = n("day");
+      if (Number.isInteger(y) && Number.isInteger(m) && Number.isInteger(d))
+        return `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+    } catch { /* an unknown zone name: read the device clock instead */ }
+  }
+  return `${at.getFullYear()}-${String(at.getMonth() + 1).padStart(2, "0")}-`
+    + String(at.getDate()).padStart(2, "0");
+}
+
+/** The household's day as a device-local midnight Date, for the helpers
+ *  that take a Date (getFullYear, getMonth, date arithmetic). */
+export function householdDay(at: Date, zone?: string): Date {
+  const [y, m, d] = householdYmd(at, zone).split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+
 /** The local day a timestamp fell on, as YYYY-MM-DD; the text itself when
  *  it is not a time JS can read, so a date-only value still prints. */
 export function localDayOf(ts: string): string {
@@ -1895,6 +1972,28 @@ export const mintGrantRefused = (status: number) => status === 401;
  *  tells someone with accounts that they have none. Data on hand (even
  *  stale, even empty) is the answer; the stale banner covers its age. */
 export type ListPhase = "loading" | "failed" | "empty" | "rows";
+// The Alerts screen shows what needs attention first and keeps the rest —
+// resolved rows, dismissed ones — behind a history toggle: three live
+// alerts at the top of a sixty-row log were the three things the page is
+// for, and they read as three more rows. `active` is what needs a person
+// now; `history` is every row, for the toggle's count and its list.
+export type AlertLike = { active: number | boolean; dismissed: number | boolean };
+export function alertSections<T extends AlertLike>(rows: T[]): {
+  active: T[]; dismissed: T[]; resolved: T[]; history: T[];
+} {
+  const active = rows.filter((r) => !!r.active && !r.dismissed);
+  const dismissed = rows.filter((r) => !!r.active && !!r.dismissed);
+  const resolved = rows.filter((r) => !r.active);
+  return { active, dismissed, resolved, history: rows };
+}
+
+// The history toggle's label: how many rows it hides, so the count on the
+// header ("60 resolved") and the toggle never disagree.
+export function historyToggleLabel(shown: boolean, count: number): string {
+  if (shown) return "Hide history";
+  return count === 1 ? "Show history (1 alert)" : `Show history (${count} alerts)`;
+}
+
 export function listPhase(q: { isError: boolean; hasData: boolean },
                           count: number): ListPhase {
   if (count > 0) return "rows";
@@ -2150,8 +2249,9 @@ export function customCadence(unit: string, n: string): string {
 export const SHARED_LOGIN_NOTE = "This is a shared demonstration login — "
   + "its password, email, sign-in factors and sessions can't be changed.";
 export const SHARED_GRANT_NOTE = "This is a shared demonstration login — "
-  + "it can't add people, script tokens, support access or new outbound "
-  + "destinations to this household.";
+  + "it can't change who is in this household or how they are reached, "
+  + "send to its members, or add script tokens, support access or "
+  + "outbound destinations.";
 export const SHARED_CREDENTIAL_NOTE = "This is a shared demonstration login — "
   + "it can't connect, disconnect or reconnect a bank or exchange, save "
   + "aggregator keys or take the credential bundle, since those outlive "
@@ -2449,6 +2549,32 @@ export function pushRoute(event: string,
     return `/year?y=${y}`;
   }
   return "/";
+}
+
+/** Where a push tap goes once the account's state is known. The relay
+ *  sends one textless "alert" event for budget alerts and security notices
+ *  alike, so the event cannot say which one it was. A recovery that would
+ *  strip this account's two-factor is the notice that can still be undone,
+ *  and only the Security screen can cancel it — so while one is pending,
+ *  an alert tap opens Security instead of Alerts. */
+export function pushTapRoute(route: string,
+                             me: { factor_reset_pending?: string | null }
+                               | null | undefined): string {
+  return route === "/alerts" && me?.factor_reset_pending ? "/security"
+    : route;
+}
+
+/** The line Today and Alerts show while a two-factor recovery is pending
+ *  on this account, or null when none is. `lands` is an instant; `fmt`
+ *  renders the LOCAL day it falls on the way the screen dates everything
+ *  else — its UTC day is tomorrow for a household west of Greenwich. */
+export function pendingRecoveryLine(lands: string | null | undefined,
+                                    fmt: (iso: string) => string)
+    : string | null {
+  if (!lands) return null;
+  return "Someone asked for a recovery that removes this account's "
+    + `two-factor methods. It lands ${fmt(localDayOf(lands))}. Not you? `
+    + "Cancel it in Security.";
 }
 
 // ---- who receives which kind of email ----
@@ -2901,4 +3027,191 @@ export function historyBasisNote(s: {
   return n < (s.min_rate_days ?? 7)
     ? `${head} — under a week, so expect it to move; revisit after your first full month.`
     : `${head}.`;
+}
+
+const choiceDate = (iso: string | null) => {
+  if (!iso || iso.length < 10) return "";
+  const [y, m, d] = iso.slice(0, 10).split("-");
+  return `${m}/${d}/${y.slice(2)}`;
+};
+
+/** The line under each account a refusal or a plan row asks the person
+ *  to choose: what tells two cards sharing their last four apart when
+ *  their names read the same — the web Import page's choiceDetail. */
+export const choiceDetail = (c: AccountChoice) =>
+  [`${c.rows} row${c.rows === 1 ? "" : "s"}`,
+   c.first_date ? `${choiceDate(c.first_date)}–${choiceDate(c.last_date)}`
+     : "",
+   c.balance_cents === null ? ""
+     : `balance ${money(c.balance_cents / 100, true)}`]
+    .filter(Boolean).join(" · ");
+
+/** The destination sheet's [id, label] options for a plan row the server
+ *  offered `choices` on: "name …mask — " and the line that tells two
+ *  cards sharing their last four apart, plus the id only when even that
+ *  reads the same — the web Import page's planChoiceOptions. */
+export function describedChoiceOptions(choices: AccountChoice[]
+                                       ): [string, string][] {
+  const label = (c: AccountChoice) =>
+    `${c.name}${c.mask ? ` …${c.mask}` : ""} — ${choiceDetail(c)}`;
+  const seen = new Map<string, number>();
+  for (const c of choices) seen.set(label(c), (seen.get(label(c)) ?? 0) + 1);
+  return choices.map((c) => [c.id, (seen.get(label(c)) ?? 0) > 1
+    ? `${label(c)} (${c.id})` : label(c)]);
+}
+
+/** Plan rows that would import with no destination: an imported file
+ *  (not a whole-instance export) naming neither an existing account nor a
+ *  new one — a row whose `choices` nobody has picked from yet. The server
+ *  refuses the whole plan while one is left, so Import waits for it. */
+export function planUnplaced<T extends {
+  action: string; kind: string; account_id: string | null;
+  new_account_name: string }>(files: T[]): T[] {
+  return files.filter((f) => f.action === "import"
+    && f.kind !== "Oikonome export ZIP"
+    && !f.account_id && !(f.new_account_name ?? "").trim());
+}
+
+// ---- copying a one-time secret (recovery codes, tokens, signing secrets) ----
+// The clipboard is outside the screen's FLAG_SECURE protection, and
+// expo-clipboard cannot mark a clip sensitive (no Android
+// EXTRA_IS_SENSITIVE, no iOS localOnly/expiry), so the most the app can do
+// is take the secret back off once it has had time to be pasted. That is
+// best effort: Android pauses JS timers in the background and refuses
+// clipboard reads from an app without focus, so the clear runs on the first
+// of the timer firing in the foreground, the app coming back to the
+// foreground, or the screen being left — once the minute has passed. If the
+// app never comes back (or the OS kills it) the clip stays.
+export const SECRET_CLIPBOARD_TTL_MS = 60_000;
+
+export type SecretClipboard = {
+  set: (text: string) => Promise<unknown>;
+  // absent where reading the clipboard would prompt the user: the clear
+  // must know the clip is still ours, so without a reader it never runs
+  get?: () => Promise<string>;
+};
+
+/** The one pending clear of a copied secret. It is cleared only if the
+ *  clipboard still holds exactly that value, so something copied since is
+ *  kept. A read that fails or comes back empty (Android without focus)
+ *  keeps it pending for the next chance; a later copy replaces it. */
+export class SecretClipboardClear {
+  private pending: { id: number; text: string; due: number;
+                     ops: SecretClipboard & { get: () => Promise<string> } }
+                   | null = null;
+  private seq = 0;
+  // bumped by every copy as it is dispatched, before it lands: a clear
+  // whose read straddles a copy must not write after it
+  private copies = 0;
+  private readonly now: () => number;
+
+  constructor(now: () => number = Date.now) {
+    this.now = now;
+  }
+
+  /** A copy is about to be dispatched: any clear in flight stands down. */
+  copying(): void {
+    this.copies += 1;
+  }
+
+  /** Record a landed copy; returns the id its own timer expires. */
+  arm(ops: SecretClipboard & { get: () => Promise<string> }, text: string,
+      ttlMs: number): number {
+    this.seq += 1;
+    this.pending = { id: this.seq, text, due: this.now() + ttlMs, ops };
+    return this.seq;
+  }
+
+  /** The copy's own timer fired: its minute is up by definition. */
+  expire(id: number): Promise<void> {
+    return this.pending?.id === id ? this.run() : Promise.resolve();
+  }
+
+  /** Any other chance to clear: runs only once the minute has passed. */
+  sweep(): Promise<void> {
+    const p = this.pending;
+    return p && this.now() >= p.due ? this.run() : Promise.resolve();
+  }
+
+  /** Wire to AppState "change": the return to the foreground. */
+  appStateChanged(state: string): Promise<void> {
+    return state === "active" ? this.sweep() : Promise.resolve();
+  }
+
+  /** Wire to the secret screen's unmount. */
+  released(): Promise<void> {
+    return this.sweep();
+  }
+
+  private async run(): Promise<void> {
+    const p = this.pending;
+    if (!p) return;
+    const copies = this.copies;
+    let current: string;
+    try {
+      current = await p.ops.get();
+    } catch {
+      return;  // refused read: try again at the next chance
+    }
+    if (current === "") return;  // focusless Android reads as empty
+    // a newer copy took over, or was dispatched, while the read was out
+    if (this.pending !== p || this.copies !== copies) return;
+    this.pending = null;
+    if (current !== p.text) return;  // the user copied something since
+    try {
+      await p.ops.set("");
+    } catch {
+      // best effort: a refused write leaves the clip
+    }
+  }
+}
+
+/** Copy `text`; true when the copy landed. Never throws — a refused copy
+ *  is the caller's cue to leave the secret on screen. When it can read the
+ *  clipboard back, it arms `clear` and schedules its timer (see
+ *  SecretClipboardClear for the other moments the clear runs). */
+export async function copySecretWith(
+  ops: SecretClipboard, text: string,
+  schedule: (fn: () => Promise<void>, ms: number) => void =
+    (fn, ms) => { setTimeout(() => { void fn(); }, ms); },
+  ttlMs: number = SECRET_CLIPBOARD_TTL_MS,
+  clear: SecretClipboardClear = new SecretClipboardClear(),
+): Promise<boolean> {
+  clear.copying();
+  try {
+    if ((await ops.set(text)) === false) return false;
+  } catch {
+    return false;
+  }
+  const get = ops.get;
+  if (get) {
+    const id = clear.arm({ set: ops.set, get }, text, ttlMs);
+    schedule(() => clear.expire(id), ttlMs);
+  }
+  return true;
+}
+
+/** The notice after a change the server pairs with signing every other
+ *  session out (turning 2FA on or off, replacing the authenticator). */
+export function signedOutOthers(lead: string): string {
+  return `${lead} — every other session was signed out.`;
+}
+
+/** The digits of a 6-digit one-time code (authenticator or SMS) as typed or
+ *  pasted. Authenticators and password managers copy the code grouped
+ *  ("123 456"), so a raw six-character field cap would cut the paste to
+ *  "123 45" before it ever reached the server. Every one-time-code field
+ *  runs its input through this instead of capping the raw text. */
+export function oneTimeCodeDigits(raw: string): string {
+  return raw.replace(/\D/g, "").slice(0, 6);
+}
+
+
+/** A bill scan refused because another pass is running (409): the list
+ *  is waiting on that pass, not empty. */
+export const SCAN_RUNNING_RETRY_MS = 20_000;
+export function scanAlreadyRunning(e: unknown): boolean {
+  const st = (e as { status?: number } | null)?.status;
+  const m = e instanceof Error ? e.message : String(e ?? "");
+  return st === 409 || /already running/i.test(m);
 }

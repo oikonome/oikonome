@@ -3,15 +3,86 @@
 // table (expected-hours + email-when-stale, self-host only).
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import { Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View } from "react-native";
+import { Alert, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View } from "react-native";
 import PullRefresh from "../components/pull-refresh";
 
 import StaleBanner from "../components/stale-banner";
 import { Card, H, HelpLink } from "../components/ui";
 import { useSession } from "../lib/session";
-import { C } from "../lib/theme";
+import { errText } from "../lib/api";
+import { removeFromList } from "../lib/cache";
+import { C, mmddyy, money } from "../lib/theme";
 import { DownloadButton } from "./settings";
 import { useOwner } from "../lib/viewer";
+
+// the business equity list's names for the two kinds
+const KIND_LABEL: Record<string, string> = {
+  contribution: "Capital contribution", reimbursement: "Reimbursement" };
+
+// A capital contribution or reimbursement booked for a charge that was
+// later deleted, from before deletes took the movement along — the web's
+// Unlinked capital card.
+function UnlinkedCapital({ viewer }: { viewer: boolean }) {
+  const { client } = useSession();
+  const qc = useQueryClient();
+  const q = useQuery({ queryKey: ["doctor-unlinked"],
+    queryFn: () => client!.doctorUnlinked(), enabled: !!client });
+  type Unlinked = NonNullable<typeof q.data>;
+  const remove = useMutation({
+    mutationFn: (m: Unlinked["movements"][number]) =>
+      client!.doctorUnlinkedRemove(m.id),
+    onSuccess: (_r, m) => {
+      removeFromList<Unlinked, Unlinked["movements"][number]>(
+        qc, ["doctor-unlinked"], "movements", (r) => r.id === m.id);
+      // the check row and the business's own capital figures moved
+      qc.invalidateQueries({ queryKey: ["doctor"] });
+      qc.invalidateQueries({ queryKey: ["equity", m.entity_id] });
+      qc.invalidateQueries({ queryKey: ["balancesheet", m.entity_id] });
+    },
+    onError: (e) => Alert.alert("Couldn't remove", errText(e)),
+  });
+  const rows = q.data?.movements ?? [];
+  if (!rows.length) return null;
+  return (
+    <Card>
+      <H>Unlinked capital</H>
+      <Text style={s.mut}>
+        Recorded for a charge that was later deleted. Each still counts on
+        its business&apos;s capital account.
+      </Text>
+      {rows.map((m) => (
+        <View key={m.id} style={[s.row, { alignItems: "center" }]}>
+          <View style={{ flex: 1 }}>
+            <Text style={{ color: C.text, fontSize: 14, fontWeight: "600" }}>
+              {m.entity_name ?? "a business"}
+            </Text>
+            <Text style={{ color: C.mut, fontSize: 12 }}>
+              {mmddyy(m.date)} · {KIND_LABEL[m.kind] ?? m.kind}
+            </Text>
+          </View>
+          <Text style={{ color: C.text, fontSize: 14 }}>
+            {money(m.amount, true)}
+          </Text>
+          <Pressable style={[s.btn, (viewer || remove.isPending)
+                               && { opacity: 0.5 }]}
+                     disabled={viewer || remove.isPending}
+                     accessibilityRole="button"
+                     onPress={() => Alert.alert("Remove movement",
+                       "Remove this movement? It changes the "
+                       + "capital-account balance.",
+                       [{ text: "Remove", style: "destructive",
+                          onPress: () => remove.mutate(m) },
+                        { text: "Cancel", style: "cancel" }])}>
+            <Text style={s.btnText}>
+              {remove.isPending && remove.variables?.id === m.id
+                ? "removing…" : "Remove"}
+            </Text>
+          </Pressable>
+        </View>
+      ))}
+    </Card>
+  );
+}
 
 export default function Doctor() {
   const { client } = useSession();
@@ -70,12 +141,26 @@ export default function Doctor() {
     onSettled: () =>
       qc.invalidateQueries({ queryKey: ["doctor-scripts"] }),
   });
+  // the same cache entry the list reads, so a hosted screen knows whether
+  // the list is all it has — the Business screen links here when it has rows
+  const unlinked = useQuery({ queryKey: ["doctor-unlinked"],
+    queryFn: () => client!.doctorUnlinked(),
+    enabled: !!client && me.data?.hosted === true });
+  if (me.data?.hosted && (unlinked.data?.movements.length ?? 0) > 0) {
+    return (
+      <ScrollView style={s.wrap}>
+        <UnlinkedCapital viewer={viewer} />
+      </ScrollView>
+    );
+  }
   if (me.data?.hosted) {
     return (
       <ScrollView style={s.wrap}>
         <Text style={s.center}>
           System health is managed by the host on this instance.
         </Text>
+        {/* the household's own records, so they show on hosted too */}
+        <UnlinkedCapital viewer={viewer} />
       </ScrollView>
     );
   }
@@ -147,6 +232,7 @@ export default function Doctor() {
           ))}
         </Card>
       ))}
+      <UnlinkedCapital viewer={viewer} />
       {(scripts.data?.scripts ?? []).length > 0 && (
         <Card>
           <H>Collectors</H>

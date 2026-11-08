@@ -256,7 +256,7 @@ def clear_second_factor(conn, user_id, expect_members=None) -> dict:
         raise LookupError("no such user")
     with conn.transaction():
         members = reset_mod.revoke_everything(
-            conn, user_id, expect_members=expect_members)
+            conn, user_id, expect_members=expect_members, reason="operator")
         # and every link that would put the account back on an address it
         # left. A revert ends in a password reset to that address, and on
         # an account the operator has just left with no factor that reset

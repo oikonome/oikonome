@@ -95,11 +95,18 @@ class EnvNumHasOneHomeTests(unittest.TestCase):
         self.assertEqual(len(out.strip().splitlines()), 1, out)
 
     def test_both_callers_use_it(self):
+        """Both read their knobs through the typed readers, which are the
+        empty-is-unset helper with a bound and a fallback on top."""
+        import inspect
+
+        from oikonome import envnum
         from oikonome.engine import receipts
         from oikonome.web import plaid_webhook
-        from oikonome.envnum import env_num
-        self.assertIs(receipts.env_num, env_num)
-        self.assertIs(plaid_webhook.env_num, env_num)
+        for mod in (receipts, plaid_webhook):
+            self.assertIs(mod.env_int, envnum.env_int)
+            self.assertIs(mod.env_float, envnum.env_float)
+        for fn in (envnum.env_int, envnum.env_float):
+            self.assertIn("env_num(", inspect.getsource(fn))
 
     def test_empty_and_whitespace_are_unset(self):
         import os

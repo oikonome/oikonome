@@ -10,6 +10,7 @@ import { Pressable, Text, TextInput, View } from "react-native";
 import { errText } from "../lib/api";
 import type { BillsData, Proposal } from "../lib/api";
 import { removeFromList } from "../lib/cache";
+import { onSeveralDays, severalDaysWords, TWICE_A_MONTH, withSeveralDays } from "../lib/monthdays";
 import { cadenceChoices, cadenceWords, localYmd, money, parseMoneyDraft,
          proposalSuperseded } from "../lib/pure";
 import { useSession } from "../lib/session";
@@ -297,8 +298,9 @@ function AdjustFields({ p, cadences, busy, refused, onCancel, onSave }: {
   const [err, setErr] = useState<string | null>(null);
   // the server's list plus the proposal's own cadence when it is not on
   // it — touching the picker must never lose the cadence that was found
-  const options = cadenceChoices(cadences, [own])
-    .map(([value, label]) => ({ value, label }));
+  const options = withSeveralDays(
+    cadenceChoices(cadences, [own === TWICE_A_MONTH ? null : own]),
+    p.by_month_day).map(([value, label]) => ({ value, label }));
   const set = (patch: Partial<AdjustForm>) => {
     setErr(null); setF((o) => ({ ...o, ...patch }));
   };
@@ -312,7 +314,9 @@ function AdjustFields({ p, cadences, busy, refused, onCancel, onSave }: {
                  keyboardType="decimal-pad"
                  onChangeText={(t) => set({ amount: t })} />
       <Select title="Cadence"
-              placeholder={own ? cadenceWords(own) : "cadence"}
+              placeholder={onSeveralDays(p.by_month_day)
+                ? severalDaysWords(p.by_month_day)
+                : own ? cadenceWords(own) : "cadence"}
               value={f.cadence} options={options}
               onChange={(v) => set({ cadence: v || (own ?? "") })} />
       {/* a day of the month anchors only a monthly or yearly bill;
@@ -434,7 +438,8 @@ export function ManualBills() {
             <Text style={{ color: C.text, fontSize: 14, fontWeight: "600" }}
                   numberOfLines={1}>{b.payee}</Text>
             <Text style={ws.small}>
-              {billLine(b.amount, b.cadence_value ?? b.cadence, b.due_on)}</Text>
+              {billLine(b.amount, onSeveralDays(b.by_month_day) ? b.cadence
+                : b.cadence_value ?? b.cadence, b.due_on)}</Text>
           </View>
           <Text style={[ws.chip, { color: C.good, borderColor: C.good }]}>
             {b.income ? "income" : "added"}</Text>

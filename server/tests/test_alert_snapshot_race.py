@@ -150,6 +150,23 @@ class AlertSnapshotRaceTests(unittest.TestCase):
         self.assertEqual(self._row()["active"], 1)
         self.assertEqual(emit.call_count, 1)
 
+    def test_a_writer_a_day_behind_does_not_advance_the_stamp(self):
+        """A writer whose day is older asserts nothing — including the
+        instant stamp. If it raised `seen_at` anyway, a newer-day clear
+        that took the lock after it, with an instant a hair earlier (the
+        two read the clock microseconds apart), found the row "newer" than
+        its view and left the alert standing."""
+        t = dt.datetime.now(dt.timezone.utc)
+        alerts.log(self.conn, [ALERT], NEW, as_of=t)
+        alerts.dismiss(self.conn, ALERT["kind"], ALERT["message"])
+        alerts.log(self.conn, [ALERT], OLD,
+                   as_of=t + dt.timedelta(seconds=2))       # a day behind
+        alerts.log(self.conn, [], NEW, as_of=t + dt.timedelta(seconds=1))
+        row = self._row()
+        self.assertEqual(row["active"], 0,
+                         "a day-old writer's stamp blocked the newer clear")
+        self.assertEqual(row["dismissed"], 1)
+
     # ---- the lock: two connections, and the newer clear wins ----------
 
     def test_the_newer_clear_wins_over_a_concurrent_stale_resurrect(self):

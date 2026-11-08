@@ -256,9 +256,11 @@ text and no category:
    predicts a category with a real confidence and only answers above a
    floor — below it the merchant is left alone rather than guessed at.
    Both run entirely on the instance (your data never leaves it).
-   Enable the shipped model by pointing `OIKONOME_CATEGORIZER_MODEL` in
-   `.env` at a joblib artifact (the compose file mounts `./models` into
-   the containers at `/models`, read-only); `OIKONOME_CATEGORIZER_MIN_CONF`
+   No such model ships with Oikonome and nothing in it builds one: you
+   supply the file. Put your joblib artifact in `./models` (the compose
+   file mounts it into the containers at `/models`, read-only) and point
+   `OIKONOME_CATEGORIZER_MODEL` in `.env` at it; a path to a file that is
+   not there leaves this layer off. `OIKONOME_CATEGORIZER_MIN_CONF`
    tunes its abstention floor (default 0.55), and
    `OIKONOME_CATEGORIZER_OVERLAY_MIN_CONF` the overlay's stricter one
    (default 0.70). Any scikit-learn pipeline that maps a merchant
@@ -319,6 +321,28 @@ recurring-bill tagging). Three ways to run the LLM, easiest first:
   for receipts, and an Anthropic API key. A URL pasted with a trailing
   `/v1` is fine.
 
+**How many model calls run at once.** Each process (the web app and the
+background worker separately) lets at most `OIKONOME_LLM_CONCURRENCY`
+calls to the model run at the same time; the default is a quarter of that
+process's database pool (`OIKONOME_POOL_MAX`, or `OIKONOME_WORKER_POOL_MAX`
+for the worker), but never fewer than the receipt reads allowed at once
+(`OIKONOME_RECEIPT_READ_SLOTS`, 3 by default — so 3 with the default pool
+of 10). Those slots are shared by every model call: imports, bank pulls,
+tax-document and receipt reads, and the assistant. The assistant also has
+one slot of its own on top, so receipt reads filling every shared slot do
+not make a question fail as busy, and one question in flight does not take
+a slot a receipt read was counting on. An import, a bank pull, or a tax-document or receipt read keeps a
+database connection while it waits for the model, so the limit stops a
+slow model from tying up every connection and stalling the app. A call
+that finds every slot busy waits only briefly (`OIKONOME_LLM_SLOT_WAIT_S`,
+5 seconds by default, at most 60), then fails the same way a model that
+took too long does, letting its connection go (the log says the slots were
+busy; a receipt read that fails this way is retried by the nightly sweep).
+Raise it if your model server answers many requests in parallel
+and your database has connections to spare; the limit is per process, so
+the instance as a whole can run up to the web and worker limits added
+together.
+
 Skip it and everything still works; categorization is just manual. Two
 config layers: the wizard/Settings values are stored per tenant and **win**;
 the `OIKONOME_LLM_URL` / `OIKONOME_LLM_MODEL` / `OIKONOME_LLM_API_KEY` env
@@ -364,7 +388,9 @@ SMTP carries the daily email, password-reset links, and the
 reports email themselves to the inbox you name in `OIKONOME_FEEDBACK_TO`.
 Without SMTP, or with no inbox named, nothing is lost — the tab hands
 you the same report as a downloadable .zip to email manually, and it
-says so up front.
+says so up front. Accounts named in `OIKONOME_FEEDBACK_SKIP`
+(comma-separated address globs) — a test or automation account, say — have
+their reports kept but not mailed.
 
 The daily email starts once a budget exists — before that there is no
 verdict to send, so the sweep skips it rather than mailing "on budget, $0
@@ -536,17 +562,53 @@ account, routing or loan number left in the raw copy of an account, loan
 or transaction to its last four digits, as new rows already are —
 including any run of eight or more digits in a file-imported row's memo,
 payee, description or other free-text cell, or in cells past its header
-row. A weekly or daily bill saved before bills used the average-year rate
+row. A card number printed in groups (four groups of four, or 4-6-5,
+separated by spaces, dashes, dots or slashes, singly, doubled or mixed)
+in a file-imported row's name, merchant or cells is cut the same way, and
+so is one the app had carried into a merchant name it derived; a merchant
+name you typed yourself is kept. The same cut reaches what was named
+from those rows before it: detected bills (a bill whose name spelled a
+number moves onto the cut name, and its categories, offers and settings
+follow it; a bill you made yourself, or one whose cut name another bill
+already holds, is left as it is), recurring-bill and fee offers, and the
+activity log's labels and sentences. A later upgrade cuts the rest of
+what a detected bill holds — the text it is matched by and the merchant
+names it is attached under — and the bill, payee and merchant names the
+activity log's entries point at and quote; a bill still matches the same
+charges whether the bank spells the number whole or cut, and a bill you
+made yourself, or a merchant name you typed and kept whole, is left as it
+is. Two
+merchants that cut to one name are usually folded together overnight, and
+re-importing the same file still finds the rows it made. A weekly or daily bill saved before bills used the average-year rate
 has its stored monthly figure restated at that rate,
 so the Budget page and the Bills headline agree; restoring an older
 archive does the same. An
 account id that contains a comma is renamed, each comma becoming a dash
 (with a short suffix if that name is taken), and everything that names the
 account follows it; a script that pushes to such an account by id needs
-the new id (`/api/integrations/accounts` lists every id). A connection
+the new id (`/api/integrations/accounts` lists every id). A hand-made
+account whose id spells a full card or account number (one named with
+the number before names were cut) moves the same way, onto an id keeping
+the last four digits; its history follows it, re-importing the same file
+lands on it, and a script still pushing to `/api/import` or
+`/api/accounts/balance` by the old id reaches it while the move led to
+one live account (otherwise the import answers *"that account no longer
+exists"* or *"that account moved to several"* and imports nothing, and
+a balance push answers *no such account*); either
+way it should switch to the new id from `/api/integrations/accounts`. A connection
 you disconnected earlier has its stored credential (an exchange key, a
 SimpleFIN bridge URL) dropped, as a new disconnect now does; it was never
 read again, and history is untouched.
+
+A transaction an older restore stored with no amount is set to 0 and
+marked as missing its amount, keeping its notes, splits and receipts, and
+from then on the database refuses a transaction without one; edit the
+amount of any such row by hand. Every account you made by hand or by
+uploading a file gets a record of the name it was made from (a digest of
+that name once any card number in it has been cut), so later imports keep
+finding it; accounts a multi-account export created, such as an OFX or QIF
+file, keep finding their sources by their ids instead. Nothing about the
+account itself changes, and existing ids stay as they are.
 
 The weekly report email no longer exists: a household that had it
 switched on simply stops receiving it, and the daily, monthly and yearly

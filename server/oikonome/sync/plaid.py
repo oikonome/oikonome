@@ -119,6 +119,31 @@ def extra_products(conn=None) -> list[str]:
     return [p.strip() for p in raw.split(",") if p.strip()]
 
 
+# Billed per request rather than attached to the Item, so no link asks
+# consent for them and extra_products never lists them: Plaid's recurring
+# streams (the nightly bills cross-check) and Enrich (imported history,
+# person-initiated, inside its own monthly cap).
+BILLED_PER_REQUEST = ("recurring", "enrich")
+
+
+def plaid_product_allowed(conn, product: str) -> bool:
+    """May this instance call the billed Plaid product `product` now?
+
+    The ONE question every billed call asks before it goes out. The
+    per-Item products follow ``extra_products`` exactly (link consent and
+    sync must agree). The per-request ones are on unless the operator wrote
+    the opt-out word, which promises nothing billed beyond transactions;
+    a household setting or a plan may still narrow them further, never
+    widen them past this. An unknown name raises: a new billed call must
+    be named here, not slip through as "allowed"."""
+    if product in BILLED_PRODUCTS:
+        return product in extra_products(conn)
+    if product in BILLED_PER_REQUEST:
+        raw = (os.environ.get("OIKONOME_PLAID_PRODUCTS_EXTRA") or "").strip()
+        return raw.lower() != PRODUCTS_OPT_OUT
+    raise ValueError(f"unknown billed Plaid product {product!r}")
+
+
 class PlaidError(Exception):
     def __init__(self, payload: dict, status: int):
         self.code = payload.get("error_code", "UNKNOWN")
@@ -627,6 +652,28 @@ def release_live_items(tenant_id, reason: str) -> int:
 
 # ---- normalization ---------------------------------------------------------
 
+# The fields of a Plaid object that identify an account or a person, kept
+# out of every raw the app stores: raw leaves the instance verbatim through
+# /export and the portability archive, and nothing the app computes reads
+# them. A loan's own number (account_number) and, on a student loan, the
+# payment reference number, which is normally that same number; a
+# mortgage's property address (the household's home); a transaction's
+# account owner and an account's owners (names, addresses, phones). A check
+# number stays: it is a ledger fact the app shows and searches. The ONE
+# list: the write paths below, export.py on the way out, the restore and
+# migration 214 for rows stored earlier all cut exactly these keys.
+PLAID_RAW_IDENTIFIERS: tuple[str, ...] = (
+    "account_number", "payment_reference_number", "property_address",
+    "account_owner", "owners")
+
+
+def scrub_raw(obj):
+    """A stored raw without the PLAID_RAW_IDENTIFIERS keys at its top
+    level; anything that is not an object passes through unchanged."""
+    if not isinstance(obj, dict):
+        return obj
+    return {k: v for k, v in obj.items() if k not in PLAID_RAW_IDENTIFIERS}
+
 
 def _norm_accounts(payload: dict) -> list[Account]:
     out = []
@@ -637,7 +684,7 @@ def _norm_accounts(payload: dict) -> list[Account]:
             type=a.get("type") or "depository", subtype=a.get("subtype"),
             mask=a.get("mask"), balance_current=b.get("current"),
             balance_available=b.get("available"),
-            currency=b.get("iso_currency_code"), raw=a))
+            currency=b.get("iso_currency_code"), raw=scrub_raw(a)))
     return out
 
 
@@ -659,7 +706,7 @@ def _norm_txn(t: dict) -> Transaction:
         category_plaid=primary,
         category_plaid_detailed=detailed,
         category_plaid_confidence=conf,
-        raw=t)
+        raw=scrub_raw(t))
 
 
 # ---- item lifecycle --------------------------------------------------------
@@ -1522,6 +1569,8 @@ def recurring_streams(conn, item_id: str, transport=None) -> list[dict]:
     spellings and its cadence model has more history than one instance's
     lookback. Best-effort: an item whose plan/products cannot serve it (or
     any Plaid error) yields [] and a log line, never a failed nightly."""
+    if not plaid_product_allowed(conn, "recurring"):
+        return []
     token = get_access_token(conn, item_id)
     if not token:
         return []
@@ -1714,6 +1763,9 @@ def enrich_rows(conn, *, limit: int = ENRICH_BATCH, transport=None) -> dict:
     would otherwise select the same candidates — nothing marks a row until
     the answer comes back — and pay for both."""
     stats = {"sent": 0, "enriched": 0, "cap_hit": False, "error": None}
+    if not plaid_product_allowed(conn, "enrich"):
+        stats["error"] = "turned off on this instance"
+        return stats
     tid = conn.execute(
         "SELECT current_setting('app.tenant_id', true) AS t").fetchone()["t"]
     lock = f"oikonome:enrich:{tid}"
@@ -2405,12 +2457,10 @@ def sync_liabilities(conn, item_id: str, client: Client | None = None,
                    VALUES (%s, now(), %s)
                    ON CONFLICT (tenant_id, account_id)
                    DO UPDATE SET as_of=now(), raw=EXCLUDED.raw""",
-                # the loan's own number is a credential-shaped value Plaid
-                # documents on the liability entry; it has no use here and
-                # would otherwise sit in plaintext and ride the export
-                (entry["account_id"],
-                 jsonb({k: v for k, v in entry.items()
-                        if k not in ("account_number",)})))
+                # the loan's number, its payment reference and the home
+                # address have no use here and would otherwise sit in
+                # plaintext and ride the export
+                (entry["account_id"], jsonb(scrub_raw(entry))))
             n += 1
     return n
 
@@ -2472,12 +2522,12 @@ def sync_holdings(conn, item_id: str, client: Client | None = None,
             merged[(h["account_id"], sym)] = {
                 "name": nm, "quantity": h.get("quantity"),
                 "price": h.get("institution_price"),
-                "value": h.get("institution_value"), "raw": [h]}
+                "value": h.get("institution_value"), "raw": [scrub_raw(h)]}
             continue
         for k, src in (("quantity", "quantity"), ("value", "institution_value")):
             if h.get(src) is not None:
                 m[k] = (m[k] or 0) + h[src]
-        m["raw"].append(h)
+        m["raw"].append(scrub_raw(h))
         # one price for the merged position, the one its value implies, so
         # quantity × price (what the net-worth history multiplies) still
         # equals the value the feed reported
@@ -2537,9 +2587,8 @@ def sync_products(conn, item_id: str, transport=None) -> dict:
     get the same answer. With no add-on to narrow it, that answer is both
     products unless the owner opts out (their keys, their Plaid bill), so
     the sync never pulls products no link asked consent for."""
-    extra = extra_products(conn)
-    want_liab = "liabilities" in extra
-    want_inv = "investments" in extra
+    want_liab = plaid_product_allowed(conn, "liabilities")
+    want_inv = plaid_product_allowed(conn, "investments")
     if not (want_liab or want_inv):
         return {"liabilities": 0, "holdings": 0}
     client = Client.for_tenant(conn, transport=transport)

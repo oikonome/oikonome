@@ -12,7 +12,7 @@ import Sparkline from "../components/sparkline";
 import StaleBanner from "../components/stale-banner";
 import { Card, H, HelpLink, KV } from "../components/ui";
 import { errText, ManualAsset, PLRow } from "../lib/api";
-import { saveSettings } from "../lib/cache";
+import { SETTINGS_SAVES, saveSettings } from "../lib/cache";
 import { monthChange } from "../lib/networth-pure";
 import { RANGE_LABEL, rangeCaption, TREND_RANGES, trendWindow,
          type TrendRange } from "../lib/pure";
@@ -349,6 +349,7 @@ function ManualAssets() {
   const lastSent = useRef<ManualAsset[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const save = useMutation({
+    scope: SETTINGS_SAVES,
     // The server replaces the whole list, and this one is a copy from
     // when Edit was pressed: the nightly valuation or another device may
     // have saved since. Read the stored list now and lay only this
@@ -447,12 +448,6 @@ function ManualAssets() {
                      value={r.draft ?? String(r.value)}
                      onChangeText={(v) => upd(i, { draft: v,
                                                    as_of: null })} />
-          {r.auto ? (
-            <Text style={s.mut}>
-              auto-valued ({r.auto}) — a manual value edit wins until
-              the next auto update
-            </Text>
-          ) : null}
           <Text style={{ color: C.bad, fontSize: 12 }}
                 onPress={() => setRows(rows.filter((_, j) => j !== i))}>
             Remove

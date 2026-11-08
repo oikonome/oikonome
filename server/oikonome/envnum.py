@@ -12,7 +12,11 @@ caller reads empty-as-unset the same way.
 
 from __future__ import annotations
 
+import logging
+import math
 import os
+
+_log = logging.getLogger(__name__)
 
 
 def env_num(name: str, default: str) -> str:
@@ -32,3 +36,56 @@ def env_flag(name: str) -> bool:
     """
     return (os.environ.get(name) or "").strip().lower() in (
         "1", "true", "yes", "on")
+
+
+def _bounded(name: str, v, lo, hi):
+    if lo is not None and v < lo:
+        _log.warning("%s=%r is below %r — using %r", name, v, lo, lo)
+        return lo
+    if hi is not None and v > hi:
+        _log.warning("%s=%r is above %r — using %r", name, v, hi, hi)
+        return hi
+    return v
+
+
+def env_float(name: str, default: float, *, lo: float | None = None,
+              hi: float | None = None) -> float:
+    """A numeric knob as a float that can never stop a process starting.
+
+    Empty is unset (env_num). A value that is not a finite number — a typo,
+    a unit suffix like `60s`, `nan` — is logged by name and the documented
+    `default` is used; a number outside [lo, hi] is held to the bound."""
+    raw = env_num(name, "")
+    if not raw:
+        return default
+    try:
+        v = float(raw)
+    except ValueError:
+        v = math.nan
+    if not math.isfinite(v):
+        _log.warning("%s=%r is not a number — using the default %r",
+                     name, raw, default)
+        return default
+    return _bounded(name, v, lo, hi)
+
+
+def env_int(name: str, default: int, *, lo: int | None = None,
+            hi: int | None = None) -> int:
+    """A whole-number knob, on env_float's terms. `12e6` is a whole number
+    and reads as 12000000; `2.5` is not, and falls back to `default`."""
+    raw = env_num(name, "")
+    if not raw:
+        return default
+    try:
+        v = int(raw)
+    except ValueError:
+        try:
+            f = float(raw)
+        except ValueError:
+            f = math.nan
+        if not (math.isfinite(f) and f.is_integer()):
+            _log.warning("%s=%r is not a whole number — using the default %r",
+                         name, raw, default)
+            return default
+        v = int(f)
+    return _bounded(name, v, lo, hi)

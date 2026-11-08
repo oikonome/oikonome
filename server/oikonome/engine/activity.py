@@ -30,6 +30,7 @@ import copy
 import datetime as dt
 import logging
 
+from ..sync import card_number
 from .compat import jsonb
 
 log = logging.getLogger("oikonome.activity")
@@ -263,7 +264,7 @@ def sentence(kind: str, action: str, label: str, detail: dict | None) -> str:
     return f"{action} {kind} {label}".strip()
 
 
-def _cadence_words(freq, interval) -> str:
+def _cadence_words(freq, interval, by_month_day=None) -> str:
     f = (freq or "").upper()
     # the bills table spells a cadence the aggregator's way (EVERY_MONTH);
     # the save door spells it MONTHLY — one word for both
@@ -279,6 +280,13 @@ def _cadence_words(freq, interval) -> str:
         return "annual envelope" if n >= 12 else "envelope"
     if not f or f == "ONE_TIME":
         return "one-time"
+    if by_month_day:
+        from .budget import month_days_words, monthly_rule_days
+        days = monthly_rule_days({"frequency": f, "interval": n,
+                                  "byMonthDay": by_month_day})
+        if days:
+            times = "twice" if len(days) == 2 else f"{len(days)} times"
+            return f"{times} a month ({month_days_words(days)})"
     base = {"DAILY": "day", "WEEKLY": "week", "MONTHLY": "month",
             "YEARLY": "year"}.get(f, f.lower())
     if n == 1:
@@ -295,7 +303,8 @@ def _bill_facts(d: dict) -> str:
     if a.get("amount") is not None:
         bits.append(money(a["amount"]))
     if a.get("frequency") is not None or a.get("interval") is not None:
-        bits.append(_cadence_words(a.get("frequency"), a.get("interval")))
+        bits.append(_cadence_words(a.get("frequency"), a.get("interval"),
+                                   a.get("by_month_day")))
     if a.get("due_on"):
         bits.append(f"due {_mmddyy(a['due_on'])}")
     return f" ({', '.join(bits)})" if bits else ""
@@ -308,10 +317,13 @@ def _bill_changes(d: dict) -> str:
     bits = []
     if b.get("amount") != a.get("amount") and a.get("amount") is not None:
         bits.append(f"amount {money(b.get('amount'))} → {money(a['amount'])}")
-    if ((b.get("frequency"), b.get("interval"))
-            != (a.get("frequency"), a.get("interval"))):
-        bits.append(f"cadence {_cadence_words(b.get('frequency'), b.get('interval'))}"
-                    f" → {_cadence_words(a.get('frequency'), a.get('interval'))}")
+    if ((b.get("frequency"), b.get("interval"), b.get("by_month_day"))
+            != (a.get("frequency"), a.get("interval"), a.get("by_month_day"))):
+        was = _cadence_words(b.get("frequency"), b.get("interval"),
+                             b.get("by_month_day"))
+        now = _cadence_words(a.get("frequency"), a.get("interval"),
+                             a.get("by_month_day"))
+        bits.append(f"cadence {was} → {now}")
     if b.get("due_on") != a.get("due_on") and a.get("due_on"):
         bits.append(f"due {_mmddyy(b.get('due_on')) or '—'} → {_mmddyy(a['due_on'])}")
     if b.get("category") != a.get("category"):
@@ -345,6 +357,7 @@ def bill_snapshot(row) -> dict | None:
     notice changing. None for no row."""
     if row is None:
         return None
+    from .budget import monthly_rule_days
     from .compat import as_dict
     raw = as_dict(row.get("raw"))
     # the cadence lives in raw.recurrence, as the bills engine writes it;
@@ -360,9 +373,119 @@ def bill_snapshot(row) -> dict | None:
     due = row.get("due_on")
     return {"payee": row.get("payee"), "amount": abs(float(row.get("amount") or 0)),
             "frequency": freq, "interval": interval,
+            **({"by_month_day": monthly_rule_days(rec)}
+               if monthly_rule_days(rec) else {}),
             "due_on": due.isoformat() if isinstance(due, dt.date) else due,
             "category": row.get("category"),
             "income": (row.get("type") or "").upper() == "INCOME"}
+
+
+def _cut_text(v):
+    """`v` with every string in it cut (sync.card_number.cut): what the
+    sentence is composed from. The stored detail is cut only where it
+    quotes a name (cut_names) — its ids are what the keying pass finds a
+    re-id'd row by."""
+    if isinstance(v, str):
+        return card_number.cut(v)
+    if isinstance(v, dict):
+        return {k: _cut_text(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_cut_text(x) for x in v]
+    return v
+
+
+# The kinds whose target is a NAME — a bill's payee, a merchant's, the
+# merchant a rule is keyed on — and the one act among them that names its
+# subject by id instead (a merge offer kept apart). Every other target is
+# an id: a transaction's, an account's, which the keying pass finds a
+# re-id'd row by (sync/base._MENTIONS_SQL), so it is never cut.
+NAMED_TARGET_KINDS = ("bill", "merchant", "rule")
+_ID_TARGET_ACTS = (("merchant", "kept_apart"),)
+
+# where a row's detail quotes a name, per kind: the bill snapshot's payee
+# before and after (bill_snapshot), a merchant's or an account's name
+# before and after, the merchant a category act taught
+_DETAIL_NAMES = {
+    "bill": (("before", "payee"), ("after", "payee")),
+    "merchant": (("before",), ("after",)),
+    "account": (("before",), ("after",)),
+    "category": (("merchant",),),
+}
+
+
+def cut_names(kind, action, target, detail):
+    """(target, detail) of a row with every card or account number in the
+    names they hold cut (sync.card_number.cut): the target where it is a
+    name (NAMED_TARGET_KINDS), the names its detail quotes (_DETAIL_NAMES).
+    Ids are left as they are, the detail's `ids` and every other key
+    included. Neither argument is changed; the detail returned is a copy
+    when anything in it was cut. What `record` stores, and what migration
+    208 made of the rows stored before it."""
+    if (isinstance(target, str) and kind in NAMED_TARGET_KINDS
+            and (kind, action) not in _ID_TARGET_ACTS):
+        target = card_number.cut(target)
+    paths = _DETAIL_NAMES.get(kind)
+    if not paths or not isinstance(detail, dict):
+        return target, detail
+    out = None
+    for path in paths:
+        holder = out if out is not None else detail
+        *head, leaf = path
+        for k in head:
+            holder = holder.get(k) if isinstance(holder, dict) else None
+        if not isinstance(holder, dict) or not isinstance(holder.get(leaf), str):
+            continue
+        done = card_number.cut(holder[leaf])
+        if done == holder[leaf]:
+            continue
+        if out is None:
+            out = copy.deepcopy(detail)
+            holder = out
+            for k in head:
+                holder = holder[k]
+        holder[leaf] = done
+    return target, (out if out is not None else detail)
+
+
+# the stored rows cut_names may change: four digits in a named target or
+# in a name the detail quotes — a probe; the cut decides, in Python
+_NAMED_ROWS_SQL = """
+    SELECT tenant_id, id, kind, action, target, detail FROM activity_log
+     WHERE (kind IN ('bill', 'merchant', 'rule')
+            AND NOT (kind = 'merchant' AND action = 'kept_apart')
+            AND target ~ '[0-9]{4}')
+        OR (jsonb_typeof(detail) = 'object' AND (
+               kind = 'bill' AND (detail->'before'->>'payee' ~ '[0-9]{4}'
+                                  OR detail->'after'->>'payee' ~ '[0-9]{4}')
+            OR kind IN ('merchant', 'account')
+               AND (detail->>'before' ~ '[0-9]{4}'
+                    OR detail->>'after' ~ '[0-9]{4}')
+            OR kind = 'category' AND detail->>'merchant' ~ '[0-9]{4}'))"""
+
+
+def cut_stored_names(conn) -> int:
+    """`cut_names` over every stored row `conn` sees: the names in a
+    row's target and detail, as `record` cuts them now. Migration 206 cut
+    the label and the sentence and left these. Ids stay. A row is written
+    only if it still reads as it was read. Idempotent. Returns the rows
+    written."""
+    n = 0
+    for r in conn.execute(_NAMED_ROWS_SQL).fetchall():
+        detail = r["detail"]
+        target, new = cut_names(r["kind"], r["action"], r["target"], detail)
+        if new is not detail:
+            n += conn.execute(
+                "UPDATE activity_log SET target = %s, detail = %s"
+                " WHERE tenant_id = %s AND id = %s"
+                "   AND target IS NOT DISTINCT FROM %s AND detail = %s",
+                (target, jsonb(new), r["tenant_id"], r["id"], r["target"],
+                 jsonb(detail))).rowcount
+        elif target != r["target"]:
+            n += conn.execute(
+                "UPDATE activity_log SET target = %s"
+                " WHERE tenant_id = %s AND id = %s AND target = %s",
+                (target, r["tenant_id"], r["id"], r["target"])).rowcount
+    return n
 
 
 def record(conn, user, kind: str, action: str, *, target: str | None = None,
@@ -381,8 +504,16 @@ def record(conn, user, kind: str, action: str, *, target: str | None = None,
     uid, actor = actor_of(user)
     if not actor:
         actor = "someone"
-    label = _clip(label, LABEL_MAX)
-    words = sentence(kind, action, label, detail)[:SUMMARY_MAX]
+    # the label and the sentence are kept for years and ride the export:
+    # a card or account number a payee or a file row spelled in full keeps
+    # only its last four there, as on the row itself (sync.card_number)
+    label = _clip(card_number.cut(label), LABEL_MAX)
+    # the facts are cut before the sentence quotes them too: a quote is
+    # clipped, and a number clipped mid-group no longer reads as one
+    words = card_number.cut(
+        sentence(kind, action, label, _cut_text(detail)))[:SUMMARY_MAX]
+    # the names the row's target and detail hold are cut too; its ids stay
+    target, detail = cut_names(kind, action, target, detail)
     d = copy.deepcopy(detail) if detail else None
     try:
         with conn.transaction():

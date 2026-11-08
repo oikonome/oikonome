@@ -205,7 +205,7 @@ so fixing one merchant teaches it about the next lookalike. That learned
 model lives in your database (it rides backups, and rebuilds itself from
 your corrections after a restore either way), never leaves the instance,
 and works even if you never mounted a classifier model file. It holds
-its own, stricter confidence bar than the shipped classifier (0.70 vs
+its own, stricter confidence bar than an operator-provided classifier (0.70 vs
 0.55 by default) since it trains on far fewer examples; tune it with
 `OIKONOME_CATEGORIZER_OVERLAY_MIN_CONF` independently of
 `OIKONOME_CATEGORIZER_MIN_CONF`.
@@ -358,6 +358,9 @@ email goes out at 7am — kept in your household's time
 zone (shown beside the hour; the first time the owner opens the web app
 or the phone somewhere other than the instance's zone, that device's
 zone is adopted silently, once — and you can change it there).
+The same zone decides what "today" and "this month" are on Transactions,
+Bills, the Month and Year lenses and Business, whatever the clock of the
+server or device says.
 
 **I added someone and they aren't getting the email.**
 Adding an address invites it — it doesn't sign anyone up. When you save,

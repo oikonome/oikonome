@@ -24,7 +24,7 @@ import { patchList, patchQuery, removeFromList,
          saveSettings } from "../../lib/cache";
 import { shiftYmd, ymd } from "../../lib/dates";
 import { autopayMarks, isPlanSavingsGoal, noCheckingLinked,
-         resolveFace } from "../../lib/pure";
+         pendingRecoveryLine, resolveFace, daySpend } from "../../lib/pure";
 import { useRefetchWhenShown } from "../../lib/focus";
 
 const TODAY_KEY = ["today"];
@@ -39,6 +39,15 @@ import { C, mmddyy, money } from "../../lib/theme";
 // the account (mirrors the web's oiko-today-face)
 const FACE_KEY = "oikonome.todayFace";
 
+
+// The cash tile's line when it has no paycheck figure, keyed by the
+// payload's `income_due_note` (the server decides why; never re-derived
+// here). Same strings as the email render and the web Today page.
+const NO_PAYCHECK_NOTE: Record<string, string> = {
+  none: "no paycheck set up — add your income under Bills & Income and this counts it",
+  budgeted: "your income is budgeted, not scheduled — this counts no paycheck",
+  off: "your income is switched off under Bills & Income — this counts no paycheck",
+};
 
 export default function Today() {
   const { client, serverUrl } = useSession();
@@ -258,6 +267,12 @@ export default function Today() {
                         enabled: !!client, staleTime: 5 * 60_000,
                         select: (m) => m.tenant_id });
   const tenantId = me.data;
+  // a two-factor recovery pending on this account: the push that announced
+  // it carries no text, so Home says it too and links to the cancel card
+  const recoveryQ = useQuery({ queryKey: ["me"], queryFn: () => client!.me(),
+                               enabled: !!client, staleTime: 5 * 60_000,
+                               select: (m) => m.factor_reset_pending });
+  const recovery = pendingRecoveryLine(recoveryQ.data, mmddyy);
   const [leftWiz, setLeftWiz] = useState<boolean | null>(null);
   useEffect(() => {
     if (!tenantId) return;
@@ -324,7 +339,9 @@ export default function Today() {
     ? futureRows.filter((r) => r.date <= p0.min_date) : futureRows;
   const shownFuture = allEvents || preLow.length === 0
     ? futureRows : preLow;
-  const recentSum = (d?.recent ?? []).reduce((s0, r) => s0 + r.amount, 0);
+  // the verdict's own per-row figure (net of a partial reimbursement),
+  // as the email twin sums — the gross amount overstated a repaid dinner
+  const recentSum = daySpend(d?.recent ?? []);
   // dates carry the year, like the web's mmdd() — a truncated 08/10
   // reads wrong the moment a forecast or ETA crosses New Year
   const mmdd = mmddyy;
@@ -353,6 +370,12 @@ export default function Today() {
                                       progressBackgroundColor={C.card}
                                       onRefresh={() => q.refetch()} />}>
       <StaleBanner query={q} />
+      {recovery && (
+        <Pressable style={s.card} accessibilityRole="link"
+                   onPress={() => router.push("/security" as never)}>
+          <Text style={{ color: C.warn, fontSize: 13 }}>{recovery} ›</Text>
+        </Pressable>
+      )}
       {!d && !q.isError && <Text style={s.mut}>Loading…</Text>}
       {q.isError && !d && (
         <Text style={s.err}>Couldn't reach the server.</Text>
@@ -732,7 +755,8 @@ export default function Today() {
                 {d.headroom !== null && d.headroom < 0
                   ? `● Short ${money(-d.headroom, false)} today — checking `
                     + "doesn't cover cards & bills before the next "
-                    + "paycheck. Cover it from savings"
+                    + `paycheck${d.next_paycheck
+                        ? ` (${mmdd(d.next_paycheck)})` : ""}. Cover it from savings`
                   : `● Short ${money(-(firstNeg ?? p0!.min), false)} by ${
                       p0!.negative_date ? mmdd(p0!.negative_date) : "now"
                     } — cover it from savings`}
@@ -746,7 +770,8 @@ export default function Today() {
                   ? `● Cash gets tight around ${mmdd(p0.min_date)} (low ${
                       money(p0.min, false)}).`
                   : `● Cash is tight — ${money(d.headroom ?? 0, false)
-                      } left after cards & bills before the next paycheck.`}
+                      } left after cards & bills before the next paycheck${
+                      d.next_paycheck ? ` (${mmdd(d.next_paycheck)})` : ""}.`}
               </Text>
             ) : null}
 
@@ -989,17 +1014,46 @@ export default function Today() {
                                gap: 14 }}>
                   <Kpi label="checking now" value={fc.checking} />
                   <Kpi label="card debt" value={fc.card_debt} plain />
+                  {/* the month-end figure counts the paychecks still due
+                      as well as the bills still due — bills alone reads as
+                      if the product forgot the household's pay. Without an
+                      income series the tile says why (`income_due_note`);
+                      the figure stays cash. */}
                   {d.runway && d.runway.checking !== null
                     && typeof d.bills_remaining_month === "number" && (
-                    <View>
-                      <Kpi label="after cards & bills"
-                           value={d.runway.checking - d.runway.card_debt
-                                  - d.bills_remaining_month} signed />
-                      {/* the web meter's tooltip, said in place */}
-                      <Text style={{ color: C.mut, fontSize: 10 }}>
-                        checking − card debt − bills still due
-                      </Text>
-                    </View>
+                    typeof d.income_due_total === "number" ? (<>
+                      <View>
+                        <Text style={s.kpiLbl}>paychecks still due</Text>
+                        <Text style={[s.kpi, { color: C.good }]}>
+                          +{money(d.income_due_total, false)}</Text>
+                        {(d.income_due_dates ?? []).length > 0 && (
+                          <Text style={{ color: C.mut, fontSize: 10 }}>
+                            {(d.income_due_dates ?? []).slice(0, 3).map(mmdd).join(", ")}
+                          </Text>)}
+                      </View>
+                      <View>
+                        <Kpi label="after cards, bills & paychecks"
+                             value={d.runway.checking - d.runway.card_debt
+                                    - d.bills_remaining_month + d.income_due_total} signed />
+                        {/* the web meter's tooltip, said in place */}
+                        <Text style={{ color: C.mut, fontSize: 10 }}>
+                          checking − card debt − bills still due + paychecks still due
+                        </Text>
+                      </View>
+                    </>) : (
+                      <View>
+                        <Kpi label="after cards & bills"
+                             value={d.runway.checking - d.runway.card_debt
+                                    - d.bills_remaining_month} signed />
+                        <Text style={{ color: C.mut, fontSize: 10 }}>
+                          checking − card debt − bills still due
+                        </Text>
+                        <Text style={{ color: C.mut, fontSize: 10 }}>
+                          {NO_PAYCHECK_NOTE[d.income_due_note ?? "none"]
+                            ?? NO_PAYCHECK_NOTE.none}
+                        </Text>
+                      </View>
+                    )
                   )}
                   {/* the web's converged rule + labels: one line only
                       when the scenarios share min AND min_date */}

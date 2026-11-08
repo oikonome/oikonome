@@ -23,15 +23,21 @@ The model is the ordinary planner arithmetic, made explicit:
     can show what the preference costs.
   * A minimum that does not cover the month's interest lets the balance
     grow; the walk stops at MAX_MONTHS and reports no debt-free date
-    rather than searching forever.
+    rather than searching forever. Such a schedule carries
+    `finishes: False`, and its interest total — fifty years of compounding
+    on a balance nobody will carry that long — is not a figure to quote.
 
 Where the inputs come from, in order: the aggregator's liabilities pull
 (a card's purchase APR and minimum payment, a mortgage's rate and the
 principal-and-interest its term implies — see load_debts on escrow — a
 student loan's rate), then the household's own overrides saved
-with the plan, then an ESTIMATE the page labels as such — 2% of the
-balance (at least $25) for a card, a 5-year amortization for another loan,
-30 years for a mortgage. The estimate exists so the page is never blank
+with the plan, then an ESTIMATE the page labels as such — for a card the
+month's interest plus 1% of the balance (at least $25), the way issuers
+compute a minimum, a 5-year amortization for another loan, 30 years for a
+mortgage. Every estimate covers the month's interest, so an estimated plan
+always finishes; a flat percentage would not, since 2% of the balance
+falls short of the month's interest once the APR passes 24%. The estimate
+exists so the page is never blank
 for a self-hoster whose bank sends no liabilities data; it is shown as an
 estimate so it gets corrected, not trusted.
 
@@ -171,12 +177,14 @@ def _iso_date(v) -> dt.date | None:
 
 def remaining_term_months(raw: dict | None, today: dt.date) -> int | None:
     """Payments left on an amortizing loan, from what the servicer sent:
-    the maturity date, else the origination date plus the loan term
-    ("30 year", "360 months"). None when neither is there or the loan is
-    already past its end — the caller then estimates."""
+    the maturity date (a student loan's expected payoff date), else the
+    origination date plus the loan term ("30 year", "360 months"). None
+    when none is there or the loan is already past its end — the caller
+    then estimates."""
     if not isinstance(raw, dict):
         return None
-    end = _iso_date(raw.get("maturity_date"))
+    end = (_iso_date(raw.get("maturity_date"))
+           or _iso_date(raw.get("expected_payoff_date")))
     if end is not None:
         left = (end.year - today.year) * 12 + (end.month - today.month)
     else:
@@ -195,6 +203,31 @@ def remaining_term_months(raw: dict | None, today: dt.date) -> int | None:
     return left if 0 < left <= MAX_MONTHS else None
 
 
+def _up_to_cent(x: float) -> float:
+    """Up to the cent, as a servicer rounds a payment: rounded down, the
+    schedule leaves a few dollars for one payment past the term."""
+    return math.ceil(x * 100 - 1e-6) / 100
+
+
+def term_payment(raw: dict | None, balance: float, apr: float,
+                 today: dt.date) -> float | None:
+    """A non-mortgage loan's monthly payment over the payments its servicer
+    says are left, or None when it sent no term — or too short a term to
+    plan by. A loan reporting no payment a month or two from its payoff
+    date (a student loan in deferment reports $0) is not going to be paid
+    off in one or two instalments of half the balance; the caller's
+    estimate is the safer minimum there."""
+    left = remaining_term_months(raw, today)
+    if left is None or left <= TERM_PAYMENT_MIN_MONTHS:
+        return None
+    return _up_to_cent(amortized_payment(balance, apr, left))
+
+
+# fewer payments left than this, and a payment worked out from the term is
+# most of the balance: no minimum to plan by
+TERM_PAYMENT_MIN_MONTHS = 6
+
+
 def mortgage_principal_and_interest(raw: dict | None, balance: float,
                                     apr: float, today: dt.date) -> float | None:
     """A mortgage's monthly principal and interest from what the servicer
@@ -208,10 +241,7 @@ def mortgage_principal_and_interest(raw: dict | None, balance: float,
     never does is amortize TODAY's balance over a fresh 30 years: on a loan
     ten years in that understates the payment by a third and adds ten
     years and tens of thousands in interest to the plan."""
-    def up(x: float) -> float:
-        # up to the cent, as a servicer rounds it: rounded down, the
-        # schedule leaves a few dollars for one payment past the term
-        return math.ceil(x * 100 - 1e-6) / 100
+    up = _up_to_cent
     left = remaining_term_months(raw, today)
     if left is not None:
         return up(amortized_payment(balance, apr, left))
@@ -235,16 +265,26 @@ def amortized_payment(balance: float, apr: float, months: int) -> float:
     r = apr / 1200.0
     if months <= 0:
         return balance
-    if r <= 0:
+    # 1 - (1 + r)^-n through log1p/expm1: for a rate so small that 1 + r
+    # rounds to 1 the plain form divides by zero and fails the plan
+    denom = -math.expm1(-months * math.log1p(r)) if r > 0 else 0.0
+    if denom <= 0:
         return balance / months
-    return balance * r / (1.0 - (1.0 + r) ** -months)
+    return balance * r / denom
 
 
 def estimated_minimum(kind: str, balance: float, apr: float) -> float:
     """What a debt with no reported minimum is assumed to be paid each
     month. Labelled an estimate wherever it is shown."""
     if kind == "card":
-        return min(balance, max(25.0, 0.02 * balance))
+        # interest plus 1% of the balance, as issuers set it: a flat share
+        # of the balance falls below the interest at a high enough rate,
+        # and the plan built on it never ends. Never under 2% either: an
+        # unknown rate reads as 0, and the 1% alone would then tell a
+        # household (and the continuity packet) to pay a third of what a
+        # typical card asks
+        return min(balance, max(25.0, balance * apr / 1200.0 + 0.01 * balance,
+                                0.02 * balance))
     if kind == "mortgage":
         return min(balance, amortized_payment(balance, apr, 360))
     return min(balance, amortized_payment(balance, apr, 60))
@@ -386,15 +426,27 @@ def load_debts(conn, cfg: dict, plan: dict | None = None, *,
         else:
             apr, apr_src = 0.0, "none"
         reported = None
+        # what the servicer's own term says the loan pays: a mortgage's
+        # principal and interest, another loan's balance amortized over the
+        # payments left. Derived whether or not a payment was reported — a
+        # loan that sent its maturity but no payment is planned to end on
+        # that maturity, not on a fresh 30 or 5 years
+        if kind == "mortgage":
+            termed = mortgage_principal_and_interest(raw, bal, apr, today)
+        elif kind == "loan":
+            termed = term_payment(raw, bal, apr, today)
+        else:
+            termed = None
         if kind == "mortgage" and min_issuer is not None:
             reported = min_issuer
-            pi = mortgage_principal_and_interest(raw, bal, apr, today)
-            if pi is not None:
-                min_issuer = min(pi, reported)
+            if termed is not None:
+                min_issuer = min(termed, reported)
         if ov.get("min_payment") is not None:
             mp, min_src = float(ov["min_payment"]), "you"
         elif min_issuer is not None:
             mp, min_src = min_issuer, "issuer"
+        elif termed is not None:
+            mp, min_src = termed, "estimate"
         else:
             mp, min_src = estimated_minimum(kind, bal, apr), "estimate"
         out.append({
@@ -520,6 +572,9 @@ def simulate(debts: list[dict], *, method: str = "avalanche",
         "monthly": round(monthly, 2),
         "starting": round(total0, 2),
         "growing": peak > total0 + 0.005 and debt_free is None,
+        # False when the walk hit max_months: total_interest / total_paid
+        # are then a cut-off figure, never "what the plan costs"
+        "finishes": debt_free is not None,
         "series": series,
         "debts": per,
     }
@@ -551,6 +606,11 @@ def build(conn, today: dt.date, *, method: str | None = None,
         "saved": {"method": plan["method"],
                   "extra_monthly": plan["extra_monthly"]},
         "debts": debts,
+        # every stored override, listed debt or not: the planner lists only
+        # debts carrying a balance, and the save replaces the whole plan, so
+        # a client rebuilding the map from the list alone would erase the
+        # rate or skip mark of a card paid to zero this cycle
+        "overrides": plan["debts"],
         "plan": chosen,
         "alt": alt,
         "minimums": base,

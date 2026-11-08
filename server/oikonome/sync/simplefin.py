@@ -38,6 +38,7 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 import httpx
 
 from ..engine.compat import MAX_AMOUNT, as_date
+from . import feed_dates
 from .adopt import stored_account_id
 from .base import DEBT_TYPES, Account, Transaction, _finite_or_none, \
     bound_first_pull, \
@@ -561,8 +562,7 @@ def sync(conn, item_id: str, access_url: str, *, since: dt.date | None = None,
             # row: skip it rather than abort the pull or store a date every
             # later reader raises on
             try:
-                posted_on = as_date(dt.datetime.fromtimestamp(
-                    int(posted), dt.timezone.utc).date())
+                posted_on = as_date(feed_dates.epoch_day(posted))
             except (ValueError, OverflowError, OSError):
                 log.warning("SimpleFIN row skipped (date out of range): "
                             "%s/%s", a["id"], t.get("id"))

@@ -84,7 +84,8 @@ class ExportJsonbTests(unittest.TestCase):
         names = set(self._export_zip().namelist())
         expected = ({f"{t}.csv" for t in discovered - EXPORT_SKIP}
                     | {f"{t}.csv" for t in CONTROL_TABLES})
-        self.assertEqual(names - {"README.txt"}, expected)
+        # beside the tables: the map, and the schema the rows are in
+        self.assertEqual(names - {"README.txt", "manifest.json"}, expected)
         for forbidden in ("users.csv", "invites.csv", "api_tokens.csv",
                           "sessions.csv", "tenant_keys.csv",
                           "sync_log.csv", "job_progress.csv"):

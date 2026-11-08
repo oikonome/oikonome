@@ -35,3 +35,17 @@ class RestoreConsentKeyTests(unittest.TestCase):
             "smtp_starttls": False, "theme": "dark",
         })
         self.assertEqual(cfg, {"theme": "dark"})
+
+
+class RestoreOperatorKnobTests(unittest.TestCase):
+
+    def test_the_merchant_city_list_never_rides_in_or_out(self):
+        """The city list is set where the operator works, and the
+        settings door no longer bounds it; an archive, hand-edited or from
+        another household, must not be the way round that."""
+        cfg = restore.scrub_config({
+            "merchant_strip_cities": ["x" * 500] * 5000,
+            "merchant_cities_seen": ["Stone Creek"],
+            "theme": "dark",
+        })
+        self.assertEqual(cfg, {"theme": "dark"})

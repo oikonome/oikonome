@@ -99,6 +99,25 @@ class TypeInferenceTests(unittest.TestCase):
             self.assertEqual(base.infer_account_type(name), want, name)
 
 
+OFX_SPLIT = {"Checking ...4321": 2, "Savings ...7777": 1, "Card ...4444": 1}
+
+
+def _by_name(conn, prefix):
+    """Rows per split account, by the account's name (its id is opaque)."""
+    return {r["name"]: r["n"] for r in conn.execute(
+        "SELECT a.name, COUNT(*) AS n FROM transactions t"
+        "  JOIN accounts a ON a.id = t.account_id"
+        f" WHERE t.id LIKE '{prefix}:%%' AND a.id LIKE 'manual:{prefix}-%%'"
+        " GROUP BY a.name").fetchall()}
+
+
+def _split_id(conn, prefix, name):
+    (row,) = conn.execute(
+        "SELECT id FROM accounts WHERE name = %s AND id LIKE %s",
+        (name, f"manual:{prefix}-%")).fetchall()
+    return row["id"]
+
+
 class MintSplitTests(unittest.TestCase):
     def setUp(self):
         self.conn = make_db()
@@ -117,6 +136,14 @@ class MintSplitTests(unittest.TestCase):
             "SELECT name, type, subtype FROM accounts WHERE id=%s",
             (aid,)).fetchone()
 
+    def _id(self, name):
+        """The split account made for the Mint account `name` (its id is
+        opaque, minted once)."""
+        return _split_id(self.conn, "mint", name)
+
+    def _by_name(self):
+        return _by_name(self.conn, "mint")
+
     def test_multi_account_mint_splits_per_account(self):
         out = mintimport.import_mint(self.conn, "chk", MINT_MULTI)
         self.assertEqual(out["imported"], 4)
@@ -124,20 +151,19 @@ class MintSplitTests(unittest.TestCase):
             "Household Checking": 2, "Rewards Credit Card": 1,
             "Emergency Savings": 1})
         self.assertIn("3 accounts", out["note"])
-        self.assertEqual(self._by_account(), {
-            "manual:mint-household-checking": 2,
-            "manual:mint-rewards-credit-card": 1,
-            "manual:mint-emergency-savings": 1})
+        self.assertEqual(self._by_name(), {
+            "Household Checking": 2, "Rewards Credit Card": 1,
+            "Emergency Savings": 1})
 
     def test_split_accounts_get_inferred_types(self):
         mintimport.import_mint(self.conn, "chk", MINT_MULTI)
-        card = self._acct("manual:mint-rewards-credit-card")
+        card = self._acct(self._id("Rewards Credit Card"))
         self.assertEqual((card["type"], card["subtype"]),
                          ("credit", "credit card"))
-        sav = self._acct("manual:mint-emergency-savings")
+        sav = self._acct(self._id("Emergency Savings"))
         self.assertEqual((sav["type"], sav["subtype"]),
                          ("depository", "savings"))
-        chk = self._acct("manual:mint-household-checking")
+        chk = self._acct(self._id("Household Checking"))
         self.assertEqual((chk["type"], chk["subtype"]),
                          ("depository", "checking"))
         self.assertEqual(card["name"], "Rewards Credit Card")
@@ -150,22 +176,22 @@ class MintSplitTests(unittest.TestCase):
     def test_mint_split_reimport_is_idempotent(self):
         mintimport.import_mint(self.conn, "chk", MINT_MULTI)
         mintimport.import_mint(self.conn, "chk", MINT_MULTI)
-        self.assertEqual(self._by_account(), {
-            "manual:mint-household-checking": 2,
-            "manual:mint-rewards-credit-card": 1,
-            "manual:mint-emergency-savings": 1})
+        self.assertEqual(self._by_name(), {
+            "Household Checking": 2, "Rewards Credit Card": 1,
+            "Emergency Savings": 1})
         n = self.conn.execute("SELECT COUNT(*) AS n FROM accounts "
                               "WHERE id LIKE 'manual:mint%'").fetchone()
         self.assertEqual(n["n"], 3)
 
     def test_reimport_never_clobbers_user_rename_or_type(self):
         mintimport.import_mint(self.conn, "chk", MINT_MULTI)
+        card = self._id("Rewards Credit Card")
         self.conn.execute(
             "UPDATE accounts SET name='My Card', type='depository', "
-            "subtype=NULL, type_user_set=TRUE "
-            "WHERE id='manual:mint-rewards-credit-card'")
+            "subtype=NULL, type_user_set=TRUE WHERE id=%s", (card,))
         mintimport.import_mint(self.conn, "chk", MINT_MULTI)
-        r = self._acct("manual:mint-rewards-credit-card")
+        self.assertEqual(self._by_name()["My Card"], 1)
+        r = self._acct(card)
         self.assertEqual((r["name"], r["type"]), ("My Card", "depository"))
 
 
@@ -186,15 +212,12 @@ class CompetitorSplitTypeTests(unittest.TestCase):
 
     def test_monarch_split_accounts_get_inferred_types(self):
         competitors.import_monarch(self.conn, "chk", self.MULTI)
-        types = {r["id"]: (r["type"], r["subtype"]) for r in self.conn.execute(
-            "SELECT id, type, subtype FROM accounts "
-            "WHERE id LIKE 'manual:monarch%'").fetchall()}
-        self.assertEqual(types["manual:monarch-chase-card"],
-                         ("credit", "credit card"))
-        self.assertEqual(types["manual:monarch-savings"],
-                         ("depository", "savings"))
-        self.assertEqual(types["manual:monarch-checking"],
-                         ("depository", "checking"))
+        types = {r["name"]: (r["type"], r["subtype"]) for r in self.conn.execute(
+            "SELECT name, type, subtype FROM accounts "
+            "WHERE id LIKE 'manual:monarch-%'").fetchall()}
+        self.assertEqual(types["Chase Card"], ("credit", "credit card"))
+        self.assertEqual(types["Savings"], ("depository", "savings"))
+        self.assertEqual(types["Checking"], ("depository", "checking"))
 
 
 class OfxMultiStatementTests(unittest.TestCase):
@@ -214,30 +237,21 @@ class OfxMultiStatementTests(unittest.TestCase):
         out = ofximport.import_ofx(self.conn, "chk", OFX_MULTI)
         self.assertEqual(out["imported"], 4)
         self.assertIn("3 statements", out["note"])
-        self.assertEqual(self._by_account(), {
-            "manual:ofx-checking-4321": 2,
-            "manual:ofx-savings-7777": 1,
-            "manual:ofx-card-4444": 1})
-        types = {r["id"]: (r["type"], r["subtype"], r["name"])
-                 for r in self.conn.execute(
-                     "SELECT id, type, subtype, name FROM accounts "
-                     "WHERE id LIKE 'manual:ofx%'").fetchall()}
-        self.assertEqual(types["manual:ofx-card-4444"][:2],
-                         ("credit", "credit card"))
-        self.assertEqual(types["manual:ofx-savings-7777"][:2],
-                         ("depository", "savings"))
-        self.assertEqual(types["manual:ofx-checking-4321"][:2],
-                         ("depository", "checking"))
+        self.assertEqual(_by_name(self.conn, "ofx"), OFX_SPLIT)
         # names carry the type + ACCTID suffix so the user can tell them apart
-        self.assertIn("4444", types["manual:ofx-card-4444"][2])
+        types = {r["name"]: (r["type"], r["subtype"])
+                 for r in self.conn.execute(
+                     "SELECT name, type, subtype FROM accounts "
+                     "WHERE id LIKE 'manual:ofx-%'").fetchall()}
+        self.assertEqual(types["Card ...4444"], ("credit", "credit card"))
+        self.assertEqual(types["Savings ...7777"], ("depository", "savings"))
+        self.assertEqual(types["Checking ...4321"],
+                         ("depository", "checking"))
 
     def test_ofx_split_reimport_is_idempotent(self):
         ofximport.import_ofx(self.conn, "chk", OFX_MULTI)
         ofximport.import_ofx(self.conn, "chk", OFX_MULTI)
-        self.assertEqual(self._by_account(), {
-            "manual:ofx-checking-4321": 2,
-            "manual:ofx-savings-7777": 1,
-            "manual:ofx-card-4444": 1})
+        self.assertEqual(_by_name(self.conn, "ofx"), OFX_SPLIT)
         n = self.conn.execute("SELECT COUNT(*) AS n FROM accounts "
                               "WHERE id LIKE 'manual:ofx%'").fetchone()
         self.assertEqual(n["n"], 3)
@@ -246,8 +260,15 @@ class OfxMultiStatementTests(unittest.TestCase):
         ofximport.import_ofx(self.conn, "chk", OFX_MULTI)
         ids = {r["id"] for r in self.conn.execute(
             "SELECT id FROM transactions WHERE id LIKE 'ofx:%'").fetchall()}
-        self.assertIn("ofx:manual:ofx-checking-4321:F001", ids)
-        self.assertIn("ofx:manual:ofx-card-4444:C001", ids)
+        chk = _split_id(self.conn, "ofx", "Checking ...4321")
+        card = _split_id(self.conn, "ofx", "Card ...4444")
+        self.assertIn(f"ofx:{chk}:F001", ids)
+        self.assertIn(f"ofx:{card}:C001", ids)
+        # and a re-import keeps them where they are
+        ofximport.import_ofx(self.conn, "chk", OFX_MULTI)
+        self.assertEqual({r["id"] for r in self.conn.execute(
+            "SELECT id FROM transactions WHERE id LIKE 'ofx:%'").fetchall()},
+            ids)
 
     def test_single_statement_ofx_uses_selected_account(self):
         from .test_ofximport import OFX as OFX_SINGLE

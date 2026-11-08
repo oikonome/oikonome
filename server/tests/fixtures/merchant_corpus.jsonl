@@ -40,3 +40,5 @@
 {"raw": "JUNIPERS MARKET", "merchant": "Junipers Market"}
 {"raw": "L'Amandiere", "merchant": "Lamandiere", "note": "an elided prefix joins too, agreeing with the line that prints it closed up"}
 {"raw": "Q'Z BURGER BARN", "merchant": "QZ Burger Barn", "note": "two letters an apostrophe joins are a whole word, not two dropped pieces"}
+{"raw": "Q DEPOT #5813", "merchant": "Q Depot", "note": "a leading letter beside a lone word is the brand"}
+{"raw": "SQ *V ZORBIT 0042", "merchant": "V Zorbit", "note": "the leading letter survives a processor prefix and a store number"}

@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { api, errText, type Batch, type TaxdocPlan, type TaxdocRow, mmdd, type ImportOutcome, bulkJobLive, type BulkJob, type BulkJobStatus, type ColumnMappingNeeded, type MappingNeeded, type YnabAccountsNeeded, type YnabDestination } from "../api/client";
+import { api, assistant as assistantApi, errText, type Batch, type TaxdocPlan, type TaxdocRow, mmdd, type ImportOutcome, type AccountChoice, money, bulkJobLive, type BulkJob, type BulkJobStatus, type ColumnMappingNeeded, type MappingNeeded, type YnabAccountsNeeded, type YnabDestination } from "../api/client";
 import { parseMoneyDraft } from "../moneymath";
 import { removeFromList } from "../api/cache";
 import DemoLock from "../components/DemoLock";
@@ -15,16 +15,22 @@ import HistoryChoice, { HISTORY_CHOICES, HISTORY_SAVING, useHistorySaving }
 // Rows older than the household's history window never reach the ledger,
 // so an import that dropped some says how many and where the window is
 // widened — otherwise a short count reads as a misread file.
+// The window is the owner's to change (the server refuses anyone else),
+// so a member or viewer is pointed at the owner, as the phone does.
 function OlderRowsNote({ n }: { n?: number }) {
   const s = useQuery({ queryKey: ["settings"], queryFn: api.settings });
+  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
+  const owner = isOwner(me);
   if (!n || n <= 0) return null;
   const win = HISTORY_CHOICES.find(([v]) =>
     v === (s.data?.history_months ?? null))?.[1];
   return (
     <div style={{ marginTop: ".3rem" }}>
       {n} older row{n === 1 ? "" : "s"} left out
-      {win ? ` — the history window is ${win}` : ""}; widen it on the
-      Accounts page or in the wizard to bring {n === 1 ? "it" : "them"} in.
+      {win ? ` — the history window is ${win}` : ""}; {owner
+        ? "widen it on the Accounts page or in the wizard"
+        : "the household owner can widen it"} to bring{" "}
+      {n === 1 ? "it" : "them"} in.
     </div>
   );
 }
@@ -205,6 +211,46 @@ const isRestoreRow = (f: { kind: string; oversized?: boolean;
 
 type BulkPlanFile = Awaited<ReturnType<typeof api.bulkAnalyze>>["files"][number];
 
+// One line under each account a refusal asks the person to choose: what
+// tells two cards sharing their last four apart when their names read the
+// same — the mobile screen's choiceDetail.
+const choiceDetail = (c: AccountChoice) =>
+  [`${c.rows} row${c.rows === 1 ? "" : "s"}`,
+   c.first_date ? `${mmdd(c.first_date)}–${mmdd(c.last_date)}` : "",
+   c.balance_cents === null ? ""
+     : `balance ${money(c.balance_cents / 100, true)}`]
+    .filter(Boolean).join(" · ");
+
+// The destination picker's [id, label] options for a row the server
+// offered `choices` on: "name …mask — " and the line that tells two cards
+// sharing their last four apart (an <option> holds no second line), plus
+// the id only when even that reads the same — the mobile screen's
+// describedChoiceOptions.
+function planChoiceOptions(choices: AccountChoice[]): [string, string][] {
+  const label = (c: AccountChoice) =>
+    `${c.name}${c.mask ? ` …${c.mask}` : ""} — ${choiceDetail(c)}`;
+  const seen = new Map<string, number>();
+  for (const c of choices) seen.set(label(c), (seen.get(label(c)) ?? 0) + 1);
+  return choices.map((c) => [c.id, (seen.get(label(c)) ?? 0) > 1
+    ? `${label(c)} (${c.id})` : label(c)]);
+}
+
+function AccountChoices({ choices, busy, onPick }: {
+  choices: AccountChoice[]; busy?: boolean; onPick: (id: string) => void;
+}) {
+  return (
+    <div style={{ marginTop: ".4rem" }}>
+      {choices.map((c) => (
+        <div key={c.id} style={{ marginTop: ".3rem" }}>
+          <button disabled={busy} onClick={() => onPick(c.id)}>
+            {c.name}{c.mask ? ` …${c.mask}` : ""}</button>
+          <div className="mut">{choiceDetail(c)}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function PlanReview({ files, onSubmitted, onTaxDocs, onRestore }: {
   files: File[];
   // the plan as it was submitted, with the job the server made of it
@@ -274,6 +320,10 @@ function PlanReview({ files, onSubmitted, onTaxDocs, onRestore }: {
       files: plan.files.map((f) => (f.index === i ? { ...f, ...p } : f)) });
 
   const importable = plan?.files.filter((f) => f.action === "import") ?? [];
+  // a row naming no account (one the server could not place, offered as
+  // a choice) waits for a pick: the server refuses the plan without one
+  const unplaced = importable.some((f) => f.kind !== "Oikonome export ZIP"
+    && !f.account_id && !(f.new_account_name ?? "").trim());
   // once submitted, the job card shows the outcome; this one has only an
   // analyze in flight, a plan to review, or an error to say
   if (!plan && !analyze.isPending && !err) return null;
@@ -313,7 +363,20 @@ function PlanReview({ files, onSubmitted, onTaxDocs, onRestore }: {
                         title={f.name}>{f.name}</td>
                     <td>{f.kind}</td>
                     <td>
-                      {f.kind === "Oikonome export ZIP" ? <span className="mut">whole instance</span> : (
+                      {f.kind === "Oikonome export ZIP" ? <span className="mut">whole instance</span>
+                        : f.choices?.length ? (
+                        // only the accounts the file could mean: a new
+                        // account under the same number would lead back
+                        // to the same question
+                        <select value={f.account_id ?? ""}
+                          onChange={(e) => patch(f.index,
+                            { account_id: e.target.value || null })}>
+                          <option value="">choose one…</option>
+                          {planChoiceOptions(f.choices).map(([id, l]) => (
+                            <option key={id} value={id}>{l}</option>
+                          ))}
+                        </select>
+                      ) : (
                         <>
                           <select value={f.account_id ?? "__new__"}
                             onChange={(e) => patch(f.index,
@@ -362,7 +425,8 @@ function PlanReview({ files, onSubmitted, onTaxDocs, onRestore }: {
             </table>
           </div>
           <button className="pri" style={{ marginTop: ".6rem" }}
-            disabled={run.isPending || !importable.length || saving}
+            disabled={run.isPending || !importable.length || saving
+                      || unplaced}
             title={saving ? HISTORY_SAVING : undefined}
             onClick={() => run.mutate()}>
             {run.isPending ? "starting…"
@@ -623,7 +687,17 @@ export default function Import({ heading = "Import transactions",
         </div>
       )}
 
-      {res?.error && <div className="note bad">{res.error}</div>}
+      {res?.error && (
+        <div className="note bad">{res.error}
+          {/* the file goes to the card picked; the YNAB card asks on
+              its own row */}
+          {!!res.choices?.length && !mapping && escalate.variables && (
+            <AccountChoices choices={res.choices} busy={escalate.isPending}
+              onPick={(id) => escalate.mutate(
+                { ...escalate.variables!, accountId: id })} />
+          )}
+        </div>
+      )}
       {res && !res.error && (
         <div className="note good">
           {res.source && <b>{res.source} — </b>}
@@ -727,11 +801,57 @@ export default function Import({ heading = "Import transactions",
   );
 }
 
+// The W-2 rows as corrected in the preview, checked the way the commit door
+// checks them, so a misread year or box 1 is fixed before it is stored
+// instead of being stored wrong: a year is a whole 1900–2100, box 1 a
+// finite amount inside the money bound (blank clears it), the employer
+// trimmed (blank is none). Drafts are the typed TEXT, keyed "row:field".
+function settleW2Rows(rows: TaxdocRow[], drafts: Record<string, string>,
+                      parse: (v: string) => number | null):
+    { ok: true; rows: TaxdocRow[] } | { ok: false; error: string } {
+  const out = rows.map((r) => ({ ...r, boxes: { ...(r.boxes ?? {}) } }));
+  for (const [k, v] of Object.entries(drafts)) {
+    const cut = k.indexOf(":");
+    const r = out[Number(k.slice(0, cut))];
+    const f = k.slice(cut + 1);
+    const t = v.trim();
+    if (!r) continue;
+    if (f === "year") {
+      if (!/^\d{4}$/.test(t) || Number(t) < 1900 || Number(t) > 2100)
+        return { ok: false, error: `"${t}" is not a tax year (1900–2100)` };
+      r.year = Number(t);
+    } else if (f === "employer") {
+      r.employer = t ? t.slice(0, 120) : null;
+    } else if (f === "box1") {
+      if (t === "") { delete r.boxes["1"]; r.box1 = null; continue; }
+      const n = parse(t);
+      if (n === null || Math.abs(n) > 1e12)
+        return { ok: false, error: `box 1: "${t}" is not an amount` };
+      r.boxes["1"] = n; r.box1 = n;
+    }
+  }
+  return { ok: true, rows: out };
+}
+
 // tax & income documents → the lifetime income spine
 // (income_annual / income_documents) that Cash Flow coverage and
 // retirement analysis read. Analyze → editable preview → commit.
 function TaxDocsCard({ file }: { file: File | null }) {
   const qc = useQueryClient();
+  // where a document goes is the server's answer for the vision task —
+  // the reader of every tax document — never assumed while it loads, and
+  // asked afresh on every visit: a cached "stays here" from before a
+  // Settings → AI change is exactly the claim this line must not make
+  const status = useQuery({ queryKey: ["assistant-status"],
+                            queryFn: assistantApi.status, retry: false,
+                            staleTime: 0 });
+  const vision = status.isFetchedAfterMount ? status.data?.roles?.vision : undefined;
+  const whereLine = !status.isFetchedAfterMount ? " Checking where documents are read…"
+    : !vision ? ""
+    : vision.where === "remote"
+      ? ` Reading a W-2 or 1040 sends the whole document — Social Security numbers included — to ${
+          vision.host || "the remote AI service this instance is configured with"}.`
+      : " Everything stays on this instance.";
   const [plan, setPlan] = useState<TaxdocPlan | null>(null);
   const [rows, setRows] = useState<TaxdocRow[]>([]);
   // the TEXT of each edited cell ("row:field"), parsed only at save — a
@@ -805,8 +925,8 @@ function TaxDocsCard({ file }: { file: File | null }) {
         the Cash Flow report's early years and retirement analysis, not the
         ledger. Where to get each:{" "}
         <a href="https://github.com/oikonome/oikonome/blob/main/docs/tax-documents.md"
-          target="_blank" rel="noreferrer">the how-to</a>. Everything stays
-        on this instance.</p>
+          target="_blank" rel="noreferrer">the how-to</a>.
+        {vision?.where === "remote" ? <b>{whereLine}</b> : whereLine}</p>
       {msg && <div className={"note " + (msg.bad ? "bad" : "good")}
                    onClick={() => setMsg(null)}>{msg.text}</div>}
       {analyze.isPending && <p className="mut">reading {file?.name}…</p>}
@@ -855,13 +975,41 @@ function TaxDocsCard({ file }: { file: File | null }) {
       )}
       {plan && plan.kind === "w2" && (
         <div style={{ marginTop: ".6rem" }}>
-          {rows.map((r, i) => (
-            <p key={i} style={{ margin: ".3rem 0" }}>
-              W-2 · <b>{r.employer ?? "unknown employer"}</b> · {r.year} ·
-              box 1 ${r.box1 ?? "?"}{r.ein ? <> · EIN {r.ein}</> : null}</p>
-          ))}
+          {/* what the reader saw, correctable before it is stored: a
+              misread year or box 1 is otherwise stored wrong or discarded */}
+          {rows.map((r, i) => {
+            const cell = (f: string, shown: unknown) =>
+              drafts[`${i}:${f}`] ?? (shown == null ? "" : String(shown));
+            return (
+              <p key={i} style={{ margin: ".3rem 0", display: "flex",
+                                  gap: ".5rem", flexWrap: "wrap",
+                                  alignItems: "center" }}>
+                W-2 ·
+                <label>employer{" "}
+                  <input size={22} placeholder="unknown employer"
+                    value={cell("employer", r.employer)}
+                    onChange={(e) => upd(i, "employer", e.target.value)} />
+                </label>
+                <label>year{" "}
+                  <input size={5} inputMode="numeric"
+                    value={cell("year", r.year)}
+                    onChange={(e) => upd(i, "year", e.target.value)} />
+                </label>
+                <label>box 1 wages{" "}
+                  <input size={10} inputMode="decimal" placeholder="unread"
+                    style={{ textAlign: "right" }}
+                    value={cell("box1", r.boxes?.["1"] ?? r.box1)}
+                    onChange={(e) => upd(i, "box1", e.target.value)} />
+                </label>
+                {r.ein ? <span>EIN {r.ein}</span> : null}</p>
+            );
+          })}
           <button className="pri" disabled={commit.isPending}
-                  onClick={() => commit.mutate(rows)}>
+                  onClick={() => {
+                    const s = settleW2Rows(rows, drafts, parseMoneyDraft);
+                    if (!s.ok) { setMsg({ text: s.error, bad: true }); return; }
+                    commit.mutate(s.rows);
+                  }}>
             {commit.isPending ? "saving…" : "Store W-2"}</button>{" "}
           <button onClick={() => { setPlan(null); setRows([]); }}>cancel</button>
         </div>
@@ -1014,6 +1162,14 @@ function YnabAccountsCard({ need, onDone }: {
   const [remove, setRemove] = useState<Record<string, boolean>>(() =>
     Object.fromEntries(need.accounts.map((a) => [a.name,
                                                  a.stored_on_pick > 0])));
+  // a new-account name that leads to several cards: the ones it could
+  // mean, asked under the YNAB account it was typed for
+  const [asked, setAsked] = useState<{ for: string;
+                                       choices: AccountChoice[] } | null>(null);
+  // the account picked from those choices, with the name typed that led
+  // there: sent together, so the pick is remembered under that name
+  const [picked, setPicked] = useState<Record<string, { id: string;
+                                                        typed: string }>>({});
   const names = need.accounts.map((a) => a.name);
   const pickName = accounts.data?.accounts.find((a) => a.id === need.pick)
     ?.name ?? "the picked account";
@@ -1023,13 +1179,16 @@ function YnabAccountsCard({ need, onDone }: {
       const removing: Record<string, boolean> = {};
       for (const n of names) {
         answers[n] = dest[n] === "__new__"
-          ? { new: (newName[n] ?? "").trim() } : dest[n];
+          ? { new: (newName[n] ?? "").trim() }
+          : picked[n]?.id === dest[n] ? picked[n] : dest[n];
         removing[n] = !!remove[n] && dest[n] !== need.pick;
       }
       return api.importYnabAccounts(token, answers, removing);
     },
     onSuccess: (r) => {
       if (r.result.token) setToken(r.result.token);
+      setAsked(r.result.choices?.length && r.result.choice_for !== undefined
+        ? { for: r.result.choice_for, choices: r.result.choices } : null);
       onDone(r.result);
     },
     onError: (e) => onDone({ error: errText(e) }),
@@ -1069,6 +1228,14 @@ function YnabAccountsCard({ need, onDone }: {
                       onChange={(e) => setNewName({ ...newName,
                                                     [a.name]: e.target.value })}
                       style={{ marginLeft: 4, width: "10rem" }} />
+                  )}
+                  {asked?.for === a.name && dest[a.name] === "__new__" && (
+                    <AccountChoices choices={asked.choices}
+                      onPick={(id) => {
+                        setDest({ ...dest, [a.name]: id });
+                        setPicked({ ...picked, [a.name]:
+                          { id, typed: (newName[a.name] ?? "").trim() } });
+                        setAsked(null); }} />
                   )}
                   {a.stored_on_pick > 0 && !!dest[a.name]
                     && dest[a.name] !== need.pick && (

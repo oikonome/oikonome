@@ -17,7 +17,7 @@ Training set discipline:
 - seed/builtin rules are excluded too: they are already deterministic
   SQL, and the world-knowledge they encode is the shipped artifact's job.
 
-The overlay abstains the same way the shipped model does, under its own
+The overlay abstains the same way the operator-provided model does, under its own
 stricter bar (model_categorize.overlay_min_conf), so a small training
 set yields a narrow model, not a wrong one — it answers near its own
 merchants and stays silent elsewhere.

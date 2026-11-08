@@ -106,6 +106,38 @@ class FeedbackTests(unittest.TestCase):
             self.assertTrue(any(n.endswith("feedback.md")
                                 for n in z.namelist()))
 
+    def test_skipped_sender_is_stored_not_mailed(self):
+        env = {"OIKONOME_SMTP_HOST": "smtp.test",
+               "OIKONOME_FEEDBACK_TO": "feedback@example.org",
+               "OIKONOME_FEEDBACK_SKIP": " Crawler+*@Example.test , x@y.test"}
+        with mock.patch.dict("os.environ", env), \
+             mock.patch("oikonome.web.report.send") as send:
+            r = feedback.submit(self.conn, self.tid, "crawler@example.test",
+                                sender="crawler+play@example.test")
+        send.assert_not_called()
+        self.assertEqual(r["delivery"], "emailed")
+        self.assertIsNone(r["package"])
+        row = self.conn.execute(
+            "SELECT delivery, message FROM feedback_reports WHERE number=%s",
+            (r["number"],)).fetchone()
+        self.assertEqual(row["delivery"], "skipped")
+        self.assertEqual(row["message"], "crawler@example.test")
+
+    def test_unlisted_or_unknown_sender_still_mailed(self):
+        env = {"OIKONOME_SMTP_HOST": "smtp.test",
+               "OIKONOME_FEEDBACK_TO": "feedback@example.org",
+               "OIKONOME_FEEDBACK_SKIP": "crawler@example.test"}
+        for who in ("person@example.test", None, ""):
+            with mock.patch.dict("os.environ", env), \
+                 mock.patch("oikonome.web.report.send") as send:
+                r = feedback.submit(self.conn, self.tid, "real", sender=who)
+            send.assert_called_once()
+            self.assertEqual(r["delivery"], "emailed")
+
+    def test_empty_skip_list_mutes_nothing(self):
+        with mock.patch.dict("os.environ", {"OIKONOME_FEEDBACK_SKIP": " , "}):
+            self.assertFalse(feedback.sender_muted("a@example.test"))
+
     def test_smtp_failure_falls_back_to_download(self):
         with mock.patch.dict("os.environ",
                              {"OIKONOME_SMTP_HOST": "smtp.test"}), \

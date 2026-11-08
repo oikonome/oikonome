@@ -49,7 +49,7 @@ class SplitAccountReimportTests(unittest.TestCase):
         before = self._split_rows()
         mintimport.import_mint(self.conn, "chk", text)
         self.assertEqual(self._split_rows(), before)
-        self.assertIn("manual:mint-everyday-checking", before)
+        self.assertEqual(len(before), 2, before)
 
     def test_two_names_the_slug_cannot_spell_split_and_reimport_cleanly(self):
         """Both names slug to nothing a plain id can hold. Each gets its own

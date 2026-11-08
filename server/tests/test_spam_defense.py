@@ -72,7 +72,36 @@ class SpamModuleTests(unittest.TestCase):
         self.assertIsNone(spamdefense.domain_of("no-at-sign"))
         self.assertIsNone(spamdefense.domain_of("x@localhost"))
 
+    def test_a_domain_longer_than_dns_allows_is_not_a_domain(self):
+        """The domain is stored (block list, verdict cache, drop log) and
+        sent to the live checker, so its size must not be the client's to
+        choose; nothing longer than DNS's 253 characters can receive mail."""
+        huge = ".".join(["a" * 60] * 2000) + ".com"
+        self.assertIsNone(spamdefense.domain_of("x@" + huge))
+        ok = ".".join(["a" * 60] * 4) + ".com"           # 248 chars
+        self.assertEqual(spamdefense.domain_of("x@" + ok), ok)
+
     # --- enforcement toggle ---
+    def test_live_lookup_switch_reads_only_truthy_spellings_as_on(self):
+        """A written OIKONOME_SPAM_API value turns the third-party lookup on
+        only when it is 1/true/yes/on; `disabled` or `none` must stop it,
+        and empty still means the default."""
+        dev = os.environ.get("OIKONOME_DEV")
+        try:
+            os.environ["OIKONOME_DEV"] = "0"
+            for off in ("disabled", "none", "n", "off", "0"):
+                os.environ["OIKONOME_SPAM_API"] = off
+                self.assertFalse(spamdefense._live_enabled(), off)
+            for on in ("1", "TRUE", "yes", " on "):
+                os.environ["OIKONOME_SPAM_API"] = on
+                self.assertTrue(spamdefense._live_enabled(), on)
+            os.environ["OIKONOME_SPAM_API"] = ""
+            self.assertTrue(spamdefense._live_enabled())
+            os.environ["OIKONOME_DEV"] = "1"
+            self.assertFalse(spamdefense._live_enabled())
+        finally:
+            os.environ["OIKONOME_DEV"] = dev if dev is not None else "1"
+
     def test_enforcement_off_is_noop(self):
         os.environ.pop("OIKONOME_SPAM_DEFENSE", None)   # and no HOSTED
         admin = _admin()

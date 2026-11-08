@@ -109,7 +109,7 @@ PUSH_LOCK = "oikonome:push:{}"
 WRITER_LOCKS = ("oikonome:sync:{}", "oikonome:sync-categorize:{}",
                 "oikonome:nightly:{}", "oikonome:email:{}",
                 "oikonome:snapshot:{}", "oikonome:script-alert:{}",
-                PUSH_LOCK)
+                "oikonome:bills-detect:{}", PUSH_LOCK)
 
 
 def writer_lock_keys(tenant_id) -> list[str]:

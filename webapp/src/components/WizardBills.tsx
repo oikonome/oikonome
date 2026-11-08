@@ -5,7 +5,8 @@ import { api, errText, money as money$, proposalSuperseded, toast,
          type BillsData, type Proposal, type ProposalAdjust, type SetupMode }
   from "../api/client";
 import { cadenceChoices, cadenceWords } from "../cadence";
-import { parseMoneyDraft } from "../moneymath";
+import { TWICE_A_MONTH, cadencePick, onSeveralDays, withSeveralDays } from "../monthdays";
+import { parseMoneyDraft, scanAlreadyRunning, SCAN_RUNNING_RETRY_MS } from "../moneymath";
 
 // The setup wizard's bills step: the question (find them, or type them),
 // then one of two panes. The Bills page stays the full editor; these panes
@@ -39,7 +40,8 @@ export function nextDueISO(day: number, today = new Date()): string {
  *  it has none to edit (an envelope pools by month, it has no cycle). */
 const cadenceOf = (p: Proposal) =>
   p.frequency && p.bill_type !== "envelope"
-    ? `${p.frequency.toUpperCase()}:${p.interval ?? 1}` : null;
+    ? cadencePick(`${p.frequency.toUpperCase()}:${p.interval ?? 1}`, p.by_month_day)
+    : null;
 
 /** Every write here can change the schedule, the Today verdict, the
  *  budgets prefill (it reads pending and approved income) and the wizard's
@@ -122,6 +124,9 @@ function AdjustForm({ p, cadences, busy, refused, onCancel, onSave }: {
     if (v === null || v <= 0) { setErr("The amount must be above $0."); return; }
     if (Math.abs(v - Math.abs(p.amount)) >= 0.005) a.amount = v;
     if (cad && cad !== cad0) a.cadence = cad;
+    // leaving the offer's two days for one is the explicit ask to drop one
+    if (cad0 === TWICE_A_MONTH && cad === "MONTHLY:1")
+      a.by_month_day = [day ?? day0 ?? 1];
     if (withDay && day !== null && day !== day0) a.due_day = day;
     setErr(null);
     onSave(a);
@@ -136,7 +141,9 @@ function AdjustForm({ p, cadences, busy, refused, onCancel, onSave }: {
         {cad0 ? (
           <select aria-label="Cadence" value={cad}
                   onChange={(e) => setCad(e.target.value)}>
-            {cadenceChoices(cadences, [cad0]).map(([v, l]) => (
+            {withSeveralDays(
+              cadenceChoices(cadences, [cad0 === TWICE_A_MONTH ? null : cad0]),
+              p.by_month_day).map(([v, l]) => (
               <option key={v} value={v}>{l}</option>))}
           </select>
         ) : <span className="mut" style={{ alignSelf: "center" }}>
@@ -167,11 +174,12 @@ function proposalLine(p: Proposal): string {
   const cad = cadenceOf(p);
   const parts = [
     p.bill_type === "envelope" ? "~/mo pooled"
-      : cad ? cadenceWords(cad) : p.cadence,
+      : cad && !onSeveralDays(p.by_month_day) ? cadenceWords(cad) : p.cadence,
     (p.income ? "+" : "") + money(Math.abs(p.amount)),
   ];
   const d = dayOf(p.next_due);
-  if (d && p.bill_type !== "envelope") parts.push(ordinal(d));
+  if (d && p.bill_type !== "envelope" && !onSeveralDays(p.by_month_day))
+    parts.push(ordinal(d));
   return parts.filter(Boolean).join(" · ");
 }
 
@@ -234,7 +242,15 @@ export function AutoBillsPane() {
   const detect = useMutation({
     mutationFn: api.billsDetect,
     onSuccess: () => refetchBills(qc),
-    onError: (e) => toast(errText(e)),
+    onError: (e) => {
+      if (scanAlreadyRunning(e)) {
+        // another pass is finding the bills now: show its result after
+        toast("A scan is already running — its results show here shortly.");
+        window.setTimeout(() => refetchBills(qc), SCAN_RUNNING_RETRY_MS);
+        return;
+      }
+      toast(errText(e));
+    },
   });
   // The scan waits for the list's FIRST load: fired on mount it would race
   // that load, and the invalidate after it would fold into the in-flight

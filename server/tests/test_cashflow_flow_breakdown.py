@@ -242,6 +242,10 @@ class FlowBreakdownTests(unittest.TestCase):
         from oikonome.engine import budget
         self.assertLessEqual(set(budget._LEDGER_TABLES),
                              set(reporting._FIXED_LEDGER_TABLES))
+        # the tables stamped per month instead of tenant-wide are tables
+        # the walk really reads, so none of them drops out of both stamps
+        self.assertLessEqual(set(reporting._FIXED_DATED_TABLES),
+                             set(reporting._FIXED_LEDGER_TABLES))
 
 if __name__ == "__main__":
     unittest.main()

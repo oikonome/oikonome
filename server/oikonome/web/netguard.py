@@ -32,6 +32,8 @@ from ..envnum import env_flag
 import socket
 import threading
 import time
+import contextvars
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FTimeout
 from urllib.parse import urlsplit
 
@@ -50,8 +52,13 @@ METADATA_IPS = {"169.254.169.254", "fd00:ec2::254"}
 _DNS_TIMEOUT = 2.0
 _DNS_TTL_OK = 300.0
 _DNS_TTL_FAIL = 60.0
-_DNS_CACHE: dict[str, tuple[float, list[str]]] = {}
-_DNS_LOCKS: dict[str, threading.Lock] = {}
+# Both maps are keyed by a name a caller chose, so both are bounded: the
+# cache keeps the most recently used answers up to a ceiling, and a host's
+# lock lives only while a lookup for it is in flight (a count of the
+# threads holding or waiting on it says when the last one is done).
+_DNS_CACHE_MAX = 4096
+_DNS_CACHE: "OrderedDict[str, tuple[float, list[str]]]" = OrderedDict()
+_DNS_LOCKS: dict[str, list] = {}          # host -> [lock, users]
 _DNS_LOCKS_GUARD = threading.Lock()
 _DNS_POOL = ThreadPoolExecutor(max_workers=4,
                                thread_name_prefix="netguard-dns")
@@ -86,6 +93,64 @@ class BlockedURL(ValueError):
     """Raised when a URL is disallowed by policy."""
 
 
+class _Budget:
+    __slots__ = ("left", "deadline")
+
+    def __init__(self, lookups: int, seconds: float):
+        self.left = lookups
+        self.deadline = time.monotonic() + seconds
+
+
+_BUDGET: contextvars.ContextVar = contextvars.ContextVar(
+    "netguard_lookup_budget", default=None)
+
+
+@contextlib.contextmanager
+def lookup_budget(lookups: int, *, seconds: float = 6.0):
+    """Bound the nameserver work one request may cause.
+
+    A door that validates caller-supplied addresses — a settings save with
+    its list of AI endpoints, a bundle import — runs its checks inside this
+    block. Each name not already answered costs one lookup; past `lookups`
+    the next new name is refused (BlockedURL, which every caller already
+    turns into a 400). Names answered from the cache cost nothing. Past
+    `seconds` of wall time no further nameserver call starts and the name
+    is judged unresolvable, exactly as a lookup that timed out is, so a
+    resolver that answers slowly cannot multiply its deadline by the
+    number of names in the body. Nested blocks keep the tighter of the
+    two. Outside any block, lookups are unbounded per request as before
+    (each still has its own deadline)."""
+    outer = _BUDGET.get()
+    b = _Budget(lookups, seconds)
+    if outer is not None:
+        b.left = min(b.left, outer.left)
+        b.deadline = min(b.deadline, outer.deadline)
+    start = b.left
+    tok = _BUDGET.set(b)
+    try:
+        yield b
+    finally:
+        _BUDGET.reset(tok)
+        if outer is not None:
+            outer.left -= start - b.left      # what the inner block spent
+
+
+def _cache_get(host: str):
+    with _DNS_LOCKS_GUARD:
+        hit = _DNS_CACHE.get(host)
+        if hit is not None:
+            _DNS_CACHE.move_to_end(host)
+        return hit
+
+
+def _cache_put(host: str, value) -> None:
+    with _DNS_LOCKS_GUARD:
+        _DNS_CACHE[host] = value
+        _DNS_CACHE.move_to_end(host)
+        while len(_DNS_CACHE) > _DNS_CACHE_MAX:
+            _DNS_CACHE.popitem(last=False)
+
+
 def _getaddrinfo(host: str) -> list[str]:
     return sorted({ai[4][0] for ai in socket.getaddrinfo(host, None)})
 
@@ -97,34 +162,61 @@ def _resolved_ips(host: str) -> list[str]:
     consent gate still fires). A timeout is the same as unresolvable: a
     non-answering nameserver must not be able to hold a request thread."""
     if getattr(_NO_LOOKUPS, "on", False):
-        hit = _DNS_CACHE.get(host)
+        hit = _cache_get(host)
         return hit[1] if hit is not None else []
-    now = time.monotonic()
-    hit = _DNS_CACHE.get(host)
-    if hit is not None and hit[0] > now:
+    hit = _cache_get(host)
+    if hit is not None and hit[0] > time.monotonic():
         return hit[1]
+    budget = _BUDGET.get()
+    if budget is not None:
+        # spent before the wait, so a stampede of new names inside one
+        # request cannot queue more lookups than it was allowed
+        if budget.left <= 0:
+            raise BlockedURL("too many host names to check in one request")
+        budget.left -= 1
     with _DNS_LOCKS_GUARD:
-        lock = _DNS_LOCKS.setdefault(host, threading.Lock())
-    with lock:
-        # A stampeded peer may have filled the cache while we waited.
-        hit = _DNS_CACHE.get(host)
-        if hit is not None and hit[0] > time.monotonic():
-            return hit[1]
-        try:
-            ips = _DNS_POOL.submit(_getaddrinfo, host).result(
-                timeout=_DNS_TIMEOUT)
-            ttl = _DNS_TTL_OK
-        except (socket.gaierror, _FTimeout, OSError):
-            # unresolvable or too slow: on hosted, refuse (can't prove it's
-            # public); on self-host, let the real request surface the error
-            ips, ttl = [], _DNS_TTL_FAIL
-        _DNS_CACHE[host] = (time.monotonic() + ttl, ips)
-        return ips
+        slot = _DNS_LOCKS.setdefault(host, [threading.Lock(), 0])
+        slot[1] += 1
+    try:
+        with slot[0]:
+            # A stampeded peer may have filled the cache while we waited.
+            hit = _cache_get(host)
+            if hit is not None and hit[0] > time.monotonic():
+                return hit[1]
+            timeout = _DNS_TIMEOUT
+            if budget is not None:
+                timeout = min(timeout, budget.deadline - time.monotonic())
+                if timeout <= 0:
+                    # the request's time is spent: judged as a lookup that
+                    # timed out, and nothing is cached, since nothing was
+                    # learned about the name
+                    return []
+            try:
+                ips = _DNS_POOL.submit(_getaddrinfo, host).result(
+                    timeout=timeout)
+                ttl = _DNS_TTL_OK
+            except (socket.gaierror, _FTimeout, OSError, UnicodeError):
+                # unresolvable or too slow: on hosted, refuse (can't prove
+                # it's public); on self-host, let the real request surface
+                # the error. A name the resolver cannot encode (an empty or
+                # over-long label) raises UnicodeError from the same call
+                # and resolves to nothing.
+                ips, ttl = [], _DNS_TTL_FAIL
+            _cache_put(host, (time.monotonic() + ttl, ips))
+            return ips
+    finally:
+        with _DNS_LOCKS_GUARD:
+            slot[1] -= 1
+            if slot[1] <= 0 and _DNS_LOCKS.get(host) is slot:
+                del _DNS_LOCKS[host]
 
 
 def check_url(url: str, *, what: str = "URL") -> None:
     """Raise BlockedURL when `url` violates the SSRF policy. No-op on pass."""
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)
+    except ValueError:          # an unbalanced "[" in the host
+        raise BlockedURL(f"{what} must be an http(s) URL") from None
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise BlockedURL(f"{what} must be an http(s) URL")
     check_host(parts.hostname, what=what)
@@ -143,6 +235,12 @@ def check_host(host: str, *, what: str = "host") -> None:
     try:
         ips = [str(ipaddress.ip_address(host))]
     except ValueError:
+        try:
+            host.encode("idna")
+        except UnicodeError:
+            # refused on self-host too: unlike a name that merely does not
+            # resolve here, this one can never reach anything
+            raise BlockedURL(f"{what} is not a valid host name") from None
         ips = _resolved_ips(host)
         if hosted and not ips:
             raise BlockedURL(f"{what} host does not resolve")

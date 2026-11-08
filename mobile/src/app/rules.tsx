@@ -12,7 +12,7 @@ import { Card, HelpLink } from "../components/ui";
 import { errText, RuleRow, RulesPage } from "../lib/api";
 import { patchList, removeFromList } from "../lib/cache";
 import { useSession } from "../lib/session";
-import { useViewer } from "../lib/viewer";
+import { useDemo, useViewer } from "../lib/viewer";
 import { C } from "../lib/theme";
 import { catLabel, filterCategories, lastPage, rulesEmptyLine,
          spendPickerGroups } from "../lib/pure";
@@ -23,6 +23,10 @@ export default function Rules() {
   const { client } = useSession();
   const qc = useQueryClient();
   const viewer = useViewer();
+  // the demo instance refuses every rule write and the rename —
+  // disabled-in-place, as the web Rules page does, beats a refusal after
+  // acting
+  const demo = useDemo();
   const [source, setSource] = useState<(typeof SOURCES)[number]>("user");
   const [qText, setQText] = useState("");
   const [q, setQFinal] = useState("");
@@ -166,6 +170,12 @@ export default function Rules() {
               + "correcting one makes it yours"
             : "shipped starting points"}
       </Text>
+      {!viewer && demo && (
+        <Text style={{ color: C.warn, fontSize: 12, marginHorizontal: 12,
+                       textAlign: "center", paddingTop: 4 }}>
+          Not available on the demo instance — synthetic data only.
+        </Text>
+      )}
       <TextInput style={s.search}
                  placeholder="search merchants or categories"
                  placeholderTextColor={C.mut} autoCapitalize="none"
@@ -205,18 +215,21 @@ export default function Rules() {
                 </Text>
               </View>
               {!viewer && (<>
-                <Text style={{ color: C.accent, fontSize: 12, padding: 6 }}
-                      onPress={() => { setCatFilter("");
+                <Text style={[{ color: C.accent, fontSize: 12, padding: 6 },
+                              demo && { opacity: 0.4 }]}
+                      onPress={() => { if (demo) return; setCatFilter("");
                                        setChanging(r.merchant); }}>
                   Change
                 </Text>
-                <Text style={{ color: C.accent, fontSize: 12, padding: 6 }}
-                      onPress={() => !busy && disable.mutate({
+                <Text style={[{ color: C.accent, fontSize: 12, padding: 6 },
+                              demo && { opacity: 0.4 }]}
+                      onPress={() => !busy && !demo && disable.mutate({
                         merchant: r.merchant, disabled: !r.disabled })}>
                   {r.disabled ? "Enable" : "Disable"}
                 </Text>
-                <Text style={{ color: C.bad, fontSize: 12, padding: 6 }}
-                      onPress={() => !busy && del(r.merchant)}>
+                <Text style={[{ color: C.bad, fontSize: 12, padding: 6 },
+                              demo && { opacity: 0.4 }]}
+                      onPress={() => !busy && !demo && del(r.merchant)}>
                   ✕
                 </Text>
               </>)}
@@ -268,7 +281,7 @@ export default function Rules() {
           one makes it yours.
         </Text>
       )}
-      {!viewer && <RenameCategoryCard />}
+      {!viewer && <RenameCategoryCard demo={demo} />}
 
       <Modal visible={!!changing} animationType="slide" transparent
              onRequestClose={() => setChanging(null)}>
@@ -344,7 +357,7 @@ export default function Rules() {
 
 // rename a free-form custom category everywhere it appears — the
 // web Rules page's second card
-function RenameCategoryCard() {
+function RenameCategoryCard({ demo }: { demo: boolean }) {
   const { client } = useSession();
   const qc = useQueryClient();
   const [oldName, setOldName] = useState("");
@@ -377,8 +390,17 @@ function RenameCategoryCard() {
     },
     onError: (e) => setMsg(errText(e)),
   });
+  // the web wraps this card in DemoLock: the amber line over it, every
+  // control inside switched off and dimmed
   return (
     <Card>
+      {demo && (
+        <Text style={{ color: C.warn, fontSize: 12, marginBottom: 4 }}>
+          Not available on the demo instance — synthetic data only.
+        </Text>
+      )}
+      <View pointerEvents={demo ? "none" : "auto"}
+            style={demo ? { opacity: 0.55 } : undefined}>
       <Text style={{ color: C.text, fontSize: 15, fontWeight: "700" }}>
         Rename a category
       </Text>
@@ -412,13 +434,14 @@ function RenameCategoryCard() {
                                        marginTop: 0 }]}
                    placeholder="new name" placeholderTextColor={C.mut}
                    autoCapitalize="none"
+                   editable={!demo}
                    value={newName} onChangeText={setNewName} />
         <Pressable style={{ backgroundColor: C.accent, borderRadius: 8,
                             paddingHorizontal: 12,
                             justifyContent: "center",
                             opacity: !oldName.trim() || !newName.trim()
                               || run.isPending ? 0.5 : 1 }}
-                   disabled={!oldName.trim() || !newName.trim()
+                   disabled={demo || !oldName.trim() || !newName.trim()
                              || run.isPending}
                    onPress={() => run.mutate()}>
           <Text style={{ color: C.text, fontSize: 13,
@@ -430,6 +453,7 @@ function RenameCategoryCard() {
                          ? C.good : C.bad, fontSize: 12, marginTop: 4 }}
               onPress={() => setMsg(null)}>{msg}</Text>
       ) : null}
+      </View>
     </Card>
   );
 }

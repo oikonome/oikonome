@@ -20,7 +20,7 @@ import { errText, setHandedOffTxn, Txn, TxnPage, TxnQuery }
   from "../../lib/api";
 import { patchQueries } from "../../lib/cache";
 import { DayHead, RANGE_LABEL, TREND_RANGES, withDayHeads, catLabel,
-         filterCategories, ledgerRange, routeYm,
+         filterCategories, householdDay, ledgerRange, routeYm,
          BULK_CHUNK, BULK_MAX, flattenPile, goneTxnIds, mergePilePages,
          runChunked }
   from "../../lib/pure";
@@ -28,7 +28,7 @@ import { useRefetchWhenShown } from "../../lib/focus";
 
 const TXNS_KEY = ["transactions"];
 import { useSession } from "../../lib/session";
-import { useViewer } from "../../lib/viewer";
+import { useDemo, useMe, useOwner, useViewer } from "../../lib/viewer";
 import { WAITING_KEY, useWaitingReceipts } from "../../lib/waiting";
 import { C, mmddyy, money } from "../../lib/theme";
 
@@ -42,6 +42,12 @@ export default function Transactions() {
   const topRef = useRef<FlashListRef<Txn | DayHead>>(null);
   useScrollToTop(topRef);
   const viewer = useViewer();
+  // the ledger as a file is the owner's to take (web: isOwner)
+  const mayExport = useOwner();
+  // the demo instance refuses bulk writes; row-by-row edits still go
+  // through, so the bar stays (and can clear) but cannot act — the web
+  // TxnTable's bulk bar, mirrored
+  const demo = useDemo();
   // receipts snapped before their charge: the camera sits beside the
   // ledger (where people look for the charge), and what is still waiting
   // links to the Receipts screen — refetched when this tab is shown, since
@@ -49,7 +55,10 @@ export default function Transactions() {
   const waiting = useWaitingReceipts();
   useRefetchWhenShown(waiting, WAITING_KEY);
   const router = useRouter();
-  const now = new Date();
+  // "this month" is the household's (/api/me timezone), the month the
+  // server's ledger and verdicts count in — not the device's
+  const me = useMe();
+  const now = householdDay(new Date(), me.data?.timezone);
   // honor the deep-link an Accounts row sends (?acct=…), like the web
   // ...and the one a category label sends (?cat=&y=&m= or a date range),
   // like the web's /transactions deep links
@@ -129,10 +138,15 @@ export default function Transactions() {
     if (want.length > 0 && want.length < 2) return;
     const id = setTimeout(() => {
       setSearch(want);
-      // typing is an all-history search — it leaves any bucket / month
-      // scope, and the bucket path ignores the term anyway (setters
-      // inline rather than the helper: a stable effect body)
-      if (want) { setBucket(""); setMonthScope(false); }
+      // typing is an all-history search — it leaves every scope the
+      // Enter path's leaveScope leaves: a counted category listing
+      // ignores the term and, with the month dropped, jumped to the
+      // current month (setters inline rather than the helper: a stable
+      // effect body)
+      if (want) {
+        setBucket(""); setAsOf(""); setCounted(false);
+        setMonthScope(false); setYearScope(false);
+      }
       setPage(1);
     }, 250);
     return () => clearTimeout(id);
@@ -316,6 +330,7 @@ export default function Transactions() {
       Alert.alert("Bulk update failed", errText(e));
     },
   });
+  const bulkLocked = bulk.isPending || tooMany || demo;
   const toggleSel = useCallback((id: string) => setSel((prev) => {
     const next = new Set(prev);
     if (next.has(id)) next.delete(id); else next.add(id);
@@ -358,8 +373,6 @@ export default function Transactions() {
   const reimbQ = useQuery({ queryKey: ["reimburse"],
     queryFn: () => client!.reimbPending(), enabled: !!client,
     staleTime: 5 * 60_000 });
-  const me = useQuery({ queryKey: ["me"], queryFn: () => client!.me(),
-    enabled: !!client, staleTime: 5 * 60_000 });
   const awaitingN = reimbQ.data?.pending.length ?? 0;
   const d0 = query.data;
   const acctName = (id: string) =>
@@ -530,8 +543,9 @@ export default function Transactions() {
         </View>
       )}
       {/* the page as a file, filters included: the share sheet takes it,
-          since a browser tab cannot carry the bearer token */}
-      {d0 && (
+          since a browser tab cannot carry the bearer token. Owner-only:
+          the door refuses a member or a viewer, so they get no chip */}
+      {d0 && mayExport && (
         <View style={{ flexDirection: "row", justifyContent: "flex-end",
                        paddingHorizontal: 12 }}>
           <Pressable style={s.chip} onPress={exportRows} disabled={exporting}
@@ -813,33 +827,38 @@ export default function Transactions() {
                 select fewer than {BULK_MAX.toLocaleString("en-US")}
               </Text>
             )}
+            {demo && (
+              <Text style={{ color: C.warn, fontSize: 12 }}>
+                Not available on the demo instance — synthetic data only.
+              </Text>
+            )}
             <Text style={s.bulkAct}
                   onPress={() =>
                     setSel(new Set(rows.map((r) => r.id)))}>
               All
             </Text>
-            <Text style={[s.bulkAct, (bulk.isPending || tooMany) && { opacity: 0.4 }]}
-                  onPress={() => !bulk.isPending && !tooMany && setBulkPicking(true)}>
+            <Text style={[s.bulkAct, bulkLocked && { opacity: 0.4 }]}
+                  onPress={() => !bulkLocked && setBulkPicking(true)}>
               Category
             </Text>
             {/* the web TxnTable's action names, verbatim */}
-            <Text style={[s.bulkAct, (bulk.isPending || tooMany) && { opacity: 0.4 }]}
-                  onPress={() => !bulk.isPending && !tooMany
+            <Text style={[s.bulkAct, bulkLocked && { opacity: 0.4 }]}
+                  onPress={() => !bulkLocked
                     && bulk.mutate({ action: "reimb_flag" })}>
               ⚑ expect reimbursement
             </Text>
-            <Text style={[s.bulkAct, (bulk.isPending || tooMany) && { opacity: 0.4 }]}
-                  onPress={() => !bulk.isPending && !tooMany
+            <Text style={[s.bulkAct, bulkLocked && { opacity: 0.4 }]}
+                  onPress={() => !bulkLocked
                     && bulk.mutate({ action: "reimb_unflag" })}>
               unflag
             </Text>
-            <Text style={[s.bulkAct, (bulk.isPending || tooMany) && { opacity: 0.4 }]}
-                  onPress={() => !bulk.isPending && !tooMany
+            <Text style={[s.bulkAct, bulkLocked && { opacity: 0.4 }]}
+                  onPress={() => !bulkLocked
                     && bulk.mutate({ action: "biz_on" })}>
               mark business
             </Text>
-            <Text style={[s.bulkAct, (bulk.isPending || tooMany) && { opacity: 0.4 }]}
-                  onPress={() => !bulk.isPending && !tooMany
+            <Text style={[s.bulkAct, bulkLocked && { opacity: 0.4 }]}
+                  onPress={() => !bulkLocked
                     && bulk.mutate({ action: "biz_off" })}>
               unmark business
             </Text>

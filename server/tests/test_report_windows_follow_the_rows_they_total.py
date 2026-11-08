@@ -113,8 +113,10 @@ class IncomeCoverageAgrees(_Base):
         super().setUp()
         for d in _months(dt.date(2025, 1, 1), dt.date(2026, 9, 1)):
             self.card(d, 1000.0)
+        # paid on the 1st: the feed covers June 2025 whole (opening later
+        # in June would leave June itself unknown)
         for d in _months(dt.date(2025, 6, 1), dt.date(2026, 9, 1)):
-            self.pay(d, 3000.0)
+            self.pay(d.replace(day=1), 3000.0)
 
     def test_the_year_the_feed_starts_is_unknown_in_the_by_year_table(self):
         rows = {r[0]: r for r in

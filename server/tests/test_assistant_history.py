@@ -307,6 +307,45 @@ class HistoryRouteTests(unittest.TestCase):
         # refused exactly as a thread that does not exist
         self.assertEqual(r.status_code, 404, r.text)
 
+    def test_a_turn_landing_mid_follow_up_never_reaches_a_viewer(self):
+        """The ownership check and the context a viewer's follow-up hands
+        the model are one read: an owner turn committed between them must
+        not reach the model. The turn is written right after the first
+        statement of the follow-up that reads the thread."""
+        from oikonome.web import api as api_mod
+        self.addCleanup(self.owner.delete, "/api/assistant/history")
+        viewer = self._claim("viewer")
+        r = self._ask(viewer, "viewer-race-q", "viewer-race-a")
+        self.assertEqual(r.status_code, 200, r.text)
+        thread = viewer.get("/api/assistant/history").json()["turns"][0][
+            "thread_id"]
+        real_conn = api_mod._conn
+
+        class _Racing:
+            def __init__(self, conn):
+                self._c, self._fired = conn, False
+
+            def __getattr__(self, name):
+                return getattr(self._c, name)
+
+            def execute(self, sql, *a, **k):
+                cur = self._c.execute(sql, *a, **k)
+                if not self._fired and "assistant_turns" in str(sql):
+                    self._fired = True
+                    self._c.execute(
+                        "INSERT INTO assistant_turns (id, thread_id, "
+                        "asked_by_id, asked_by, question, answer, blocks, "
+                        "tools_used) VALUES (%s, %s, NULL, 'owner', "
+                        "'owner-race-q', 'owner-race-a', '[]'::jsonb, '{}')",
+                        (str(uuid.uuid4()), thread))
+                return cur
+
+        with mock.patch.object(api_mod, "_conn",
+                               lambda user: _Racing(real_conn(user))):
+            r, sent = self._follow_up(viewer, thread, "and then?")
+        self.assertNotIn("owner-race-q", sent)
+        self.assertNotIn("owner-race-a", sent)
+
     def test_a_viewer_cannot_tell_a_household_thread_from_a_missing_one(self):
         """A view-only login's follow-up on a conversation someone else
         opened gets the same status and body as one on an id that names

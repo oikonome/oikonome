@@ -53,6 +53,8 @@ import logging
 import math
 import os
 import re
+import threading
+import time
 from contextlib import contextmanager
 
 import httpx
@@ -60,6 +62,119 @@ import httpx
 log = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 600
+
+
+class LLMError(Exception):
+    pass
+
+
+class LLMBusy(LLMError):
+    """No LLM slot freed up within the short slot wait. An LLMError, so
+    every caller answers it the way it answers a reply that took too long;
+    a caller with a retry path for a busy server (the receipt reader) can
+    tell it apart by its type."""
+
+
+def _slots_from_env() -> int:
+    """How many LLM calls this process may have in flight at once.
+
+    Import, a bank pull, a tax-document read and a receipt read each hold a
+    pooled database connection while the model answers, so calls in flight
+    are connections out of the pool. The default leaves three quarters of
+    this process's pool (OIKONOME_POOL_MAX, which the worker's compose entry
+    maps from its own knob) for everything else, but never runs fewer slots
+    than the receipt reader runs reads at once (OIKONOME_RECEIPT_READ_SLOTS):
+    the reader already holds those reads to a bounded number of connections,
+    and a read it granted a turn must not then queue here.
+    OIKONOME_LLM_CONCURRENCY sets it outright. A value that is not a whole
+    number falls back to the default rather than failing the import."""
+    from ..envnum import env_int, env_num
+    from . import receipts
+    # the reader tenancy sizes the pool with
+    pool = env_int("OIKONOME_POOL_MAX", 10, lo=1)
+    default = max(1, pool // 4, int(receipts.PARSE_SLOTS))
+    try:
+        n = int(env_num("OIKONOME_LLM_CONCURRENCY", str(default)))
+    except ValueError:
+        n = default
+    return max(1, min(n, 256))
+
+
+def _slot_wait_from_env() -> float:
+    """How long a call waits for a slot before failing as busy, in seconds.
+
+    Short on purpose: a caller waiting for a slot is still holding its own
+    pooled connection, so a wait as long as the reply deadline would empty
+    the pool the slots exist to protect. Held to 0..60 s; a value that is not
+    a number falls back to the default."""
+    from ..envnum import env_num
+    try:
+        v = float(env_num("OIKONOME_LLM_SLOT_WAIT_S", "5"))
+    except ValueError:
+        return 5.0
+    if v != v:
+        return 5.0
+    return min(60.0, max(0.0, v))
+
+
+# One bound for every chat call in THIS process (a threading primitive: the
+# web process and the worker each have their own, and each replica of either
+# is its own process).
+LLM_SLOTS = _slots_from_env()
+_LLM_SLOTS = threading.BoundedSemaphore(LLM_SLOTS)
+SLOT_WAIT_S = _slot_wait_from_env()
+
+
+@contextmanager
+def _llm_slot(timeout: float):
+    """Hold one of the process's LLM slots; yield the seconds left of
+    `timeout` for the exchange itself. The wait for a slot is SLOT_WAIT_S at
+    most, and never longer than `timeout`; a call that gets no slot in that
+    time raises LLMBusy at once, so its caller lets go of its connection
+    instead of holding it through a queue. The wait comes out of the one
+    deadline, so a queued call is never held longer than an unqueued one
+    could be. The slot is released on every exit path."""
+    end = time.monotonic() + timeout
+    sem = _LLM_SLOTS
+    if not sem.acquire(blocking=False):
+        wait = max(0.0, min(SLOT_WAIT_S, timeout))
+        log.warning("all %d LLM slots are busy; a call is waiting up to "
+                    "%.1f s for one (OIKONOME_LLM_CONCURRENCY)",
+                    LLM_SLOTS, wait)
+        if not sem.acquire(timeout=wait):
+            log.warning("an LLM call got no slot within %.1f s and failed "
+                        "as busy (OIKONOME_LLM_SLOT_WAIT_S)", wait)
+            raise LLMBusy("the AI backend is busy with other requests — "
+                          "try again in a minute")
+    try:
+        yield max(0.001, end - time.monotonic())
+    finally:
+        sem.release()
+
+
+# The assistant's own slot, on top of the shared ones. The shared default is
+# sized so receipt reads alone may fill it, so without this a sweep of reads
+# would turn every question into a busy error, and a question would take
+# the slot a read had been promised. One ask at a time runs here; further
+# asks (up to OIKONOME_ASSISTANT_CONCURRENCY) queue for the shared slots
+# like any other call. The process holds at most one connection more for it.
+_ASSISTANT_SLOT = threading.BoundedSemaphore(1)
+
+
+@contextmanager
+def _assistant_slot(timeout: float):
+    """_llm_slot for the assistant: its own slot when free, else a shared
+    one on the same terms."""
+    if _ASSISTANT_SLOT.acquire(blocking=False):
+        try:
+            yield timeout
+        finally:
+            _ASSISTANT_SLOT.release()
+        return
+    with _llm_slot(timeout) as left:
+        yield left
+
+
 # Largest completion body we will read. A tenant may point a backend at any
 # public host, so the reply is untrusted input: without a ceiling one
 # multi-GB "completion" is buffered whole into the web process. Real
@@ -142,10 +257,6 @@ CATEGORIES = {
     "PERSONAL_CARE": "salons, barbers, gyms, spas",
     "GOVERNMENT_AND_NON_PROFIT": "taxes, government fees, courts, donations",
 }
-
-
-class LLMError(Exception):
-    pass
 
 
 def _reply_shape(content: str) -> str:
@@ -265,6 +376,74 @@ def _json_object(content: str, stage: str) -> dict:
 ROLES = ("categorize", "assistant", "vision")
 
 
+def bundled_available() -> bool:
+    """Whether a task routed to "bundled" has a backend to land on: the
+    operator's env endpoint exists and this is not a hosted instance (where
+    that endpoint is the operator's infrastructure, never a tenant's pick).
+    The one predicate the resolver, the settings view and the settings
+    save all read, so a stale route means the same thing at each."""
+    from ..envnum import env_flag
+    return (bool(os.environ.get("OIKONOME_LLM_URL", "").strip())
+            and not env_flag("OIKONOME_HOSTED"))
+
+
+def live_roles(cfg: dict) -> dict:
+    """The stored task routes, less a "bundled" one with no bundled
+    backend behind it — what resolve_role actually honours."""
+    ok = bundled_available()
+    return {k: v for k, v in (cfg.get("llm_roles") or {}).items()
+            if v != "bundled" or ok}
+
+
+def backend_endpoint(cfg: dict, role: str = "categorize") -> dict:
+    """{"url", "source"} of the endpoint `role` would call, read from an
+    already-loaded config. The URL is stored in the clear, so judging where
+    a task's data goes never decrypts a credential — a key that cannot be
+    decrypted (a restore onto another master key) must not take the
+    destination read down with it. Same precedence as _backend."""
+    layer, b = resolve_role(cfg, role)
+    if layer == "backend":
+        return {"url": b["url"], "source": "tenant"}
+    if layer == "legacy":
+        return {"url": cfg["llm_url"], "source": "tenant"}
+    return {"url": os.environ.get("OIKONOME_LLM_URL", ""), "source": "env"}
+
+
+def _destination(be: dict) -> dict:
+    from urllib.parse import urlsplit
+
+    from .taxdocs import _endpoint_is_local
+    url = be.get("url") or ""
+    if not url:
+        return {"where": "off", "host": ""}
+    # a hostname's addresses are cached by netguard, so a status read
+    # does not go to the nameserver on every call
+    if _endpoint_is_local(url):
+        return {"where": "local", "host": ""}
+    host = (urlsplit(url).hostname or "") if be.get("source") == "tenant" else ""
+    return {"where": "remote", "host": host}
+
+
+def role_destination(conn, role: str) -> dict:
+    """Where this task's data goes: {"where": "local"|"remote"|"off",
+    "host"}. Judged from the endpoint the task would actually call, by the
+    same address judge the off-box consent gates use, so a "stays on this
+    instance" line can never disagree with what is sent. A remote endpoint
+    the household configured is named; the operator's never is."""
+    from . import budget
+    return _destination(backend_endpoint(budget.load_config(conn), role))
+
+
+def destinations_of(cfg: dict) -> dict:
+    """role_destination for every task, from one loaded config."""
+    return {r: _destination(backend_endpoint(cfg, r)) for r in ROLES}
+
+
+def role_destinations(conn) -> dict:
+    from . import budget
+    return destinations_of(budget.load_config(conn))
+
+
 def resolve_role(cfg: dict, role: str = "categorize"):
     """Which config layer answers `role`. Returns (layer, entry):
 
@@ -284,6 +463,11 @@ def resolve_role(cfg: dict, role: str = "categorize"):
         # until the owner confirms the endpoint in Settings
         return "env", None
     bid = str((cfg.get("llm_roles") or {}).get(role) or "")
+    if bid == "bundled" and not bundled_available():
+        # a route that outlived its backend (`llm off`, a restore or a
+        # mirror carrying it in, hosted) reads as unset — never as the
+        # operator's env backend standing in for the household's own
+        bid = ""
     if bid and bid != "bundled":
         b = next((x for x in (cfg.get("llm_backends") or [])
                   if isinstance(x, dict) and x.get("id") == bid), None)
@@ -559,8 +743,15 @@ def read_json(client: httpx.Client, method: str, url: str, **kw):
     broken backend can't grow the process by the size of its answer, and a
     small compressed body that inflates enormously is cut off at the same
     line. Redirects are never followed: the address that was vetted is the
-    only one we talk to."""
+    only one we talk to. The client's read timeout also limits the whole
+    exchange: per read, a backend sending one byte just inside it (headers
+    included) would hold the caller for ever."""
+    from ..notify.webhooks import _with_deadline
     kw.setdefault("follow_redirects", False)
+    end = time.monotonic() + (client.timeout.read or REQUEST_TIMEOUT)
+    # a transport with no connection pool (a test's) opens no socket
+    if hasattr(client._transport, "_pool"):
+        _with_deadline(client, end)
     with client.stream(method, url, **kw) as r:
         r.raise_for_status()
         try:
@@ -574,6 +765,8 @@ def read_json(client: httpx.Client, method: str, url: str, **kw):
             buf += chunk
             if len(buf) > MAX_RESPONSE_BYTES:
                 raise LLMError("LLM reply too large")
+            if time.monotonic() > end:
+                raise LLMError("the LLM endpoint took too long to answer")
     try:
         return json.loads(bytes(buf))
     except ValueError:
@@ -618,7 +811,8 @@ def _chat(messages: list[dict], max_tokens: int, transport=None,
     _merge_extra_body(body, be["extra_body"])
     from ..web.netguard import BlockedURL
     try:
-        with httpx.Client(transport=transport, timeout=REQUEST_TIMEOUT) as c:
+        with _llm_slot(REQUEST_TIMEOUT) as left, \
+                httpx.Client(transport=transport, timeout=left) as c:
             msg = _completion_message(_read_completion(
                 c, f"{base}/v1/chat/completions", body, headers))
     except BlockedURL as e:
@@ -652,7 +846,8 @@ def chat_tools(messages: list[dict], tools: list[dict], max_tokens: int,
     _merge_extra_body(body, be["extra_body"])
     from ..web.netguard import BlockedURL
     try:
-        with httpx.Client(transport=transport, timeout=timeout) as c:
+        with _assistant_slot(timeout) as left, \
+                httpx.Client(transport=transport, timeout=left) as c:
             return _completion_message(_read_completion(
                 c, f"{base}/v1/chat/completions", body, headers))
     except BlockedURL as e:
@@ -2044,6 +2239,8 @@ def _proposal_prompt(rows) -> list[dict]:
                 cpm = f"{min(counts)}-{max(counts)}"
             cad = (f"~${r['amount']:,.0f}/month across "
                    f"{cpm or 'several'} charges")
+        elif isinstance(ev.get("by_month_day"), list):
+            cad = f"${r['amount']:,.0f} twice a month"
         else:
             iv = r["interval"] or 1
             cad = f"${r['amount']:,.0f} every {iv if iv > 1 else ''} {(r['frequency'] or '').lower()}"

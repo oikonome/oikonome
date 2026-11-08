@@ -307,7 +307,7 @@ class LockKeyContractTests(unittest.TestCase):
                          ["oikonome:sync:T", "oikonome:sync-categorize:T",
                           "oikonome:nightly:T", "oikonome:email:T",
                           "oikonome:snapshot:T", "oikonome:script-alert:T",
-                          "oikonome:push:T"])
+                          "oikonome:bills-detect:T", "oikonome:push:T"])
         # and each writer really holds the key the erasure waits on
         from oikonome.sync import base as sync_base
         from oikonome.web import api

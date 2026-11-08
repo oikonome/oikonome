@@ -27,7 +27,7 @@ import { Card, SharedLock } from "../components/ui";
 import { CONFIRM_TO_CONNECT, VerifyEmailCard }
   from "../components/verify-email-card";
 import type { Account, Entity } from "../lib/api";
-import { patchList, patchQuery, saveSettings, bizKeys, personalKeys, invalidateAll } from "../lib/cache";
+import { patchList, patchQuery, SETTINGS_SAVES, saveSettings, bizKeys, personalKeys, invalidateAll } from "../lib/cache";
 import { plaidHostedLink } from "../lib/plaid";
 import { bankAwaitsConfirm, bizSetupEntity, bizWizardEntryStep }
   from "../lib/pure";
@@ -88,7 +88,10 @@ export default function BusinessWizardRoute() {
   if (viewer || summary.isPending) return <View style={s.wrap} />;
   // A FAILED fetch is not "no business yet": falling through would offer
   // to create a second business, the one thing this route must not do.
-  if (summary.isError)
+  // Only the FIRST load counts: a background refetch failing over loaded
+  // data (focus, or the invalidations the steps fire) must not unmount the
+  // wizard and throw away the answers typed so far.
+  if (summary.isLoadingError)
     return (
       <ScrollView style={s.wrap}>
         <Card>
@@ -147,6 +150,7 @@ function BusinessWizard({ resume, owner, flagged }: {
   // the save returns the full settings view, so the marks land in the
   // cache from the reply — no second GET per step
   const mark = useMutation({
+    scope: SETTINGS_SAVES,
     mutationFn: (m: Record<string, string | null>) =>
       saveSettings(qc, client!, { biz_wizard_steps: m }),
   });

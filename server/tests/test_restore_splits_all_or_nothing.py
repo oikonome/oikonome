@@ -107,7 +107,9 @@ class RestoreSplitGroupTests(unittest.TestCase):
         ]))
         self.assertEqual(splits.for_txn(self.conn, refund), [])
         self.assertNotIn("transaction_splits", counts)
-        self.assertEqual(counts.get("already_present"), 2)
+        # refused, not "already present": the destination never held them
+        self.assertEqual(counts.get("malformed"), 2)
+        self.assertNotIn("already_present", counts)
 
     def test_a_hand_split_in_the_archive_outranks_a_store_split_here(self):
         """A person's split outranks a store's reading of the charge. A row

@@ -284,6 +284,10 @@ class RouteTests(_Routes):
         tok = self._tok(self.owner, "cat", self.txn, "FOOD_AND_DRINK")
         r = self.client.get("/act", params={"token": tok})
         self.assertIn("FOOD AND DRINK", r.text)
+        self.assertIsNone(self.conn.execute(
+            "SELECT category_override FROM transactions WHERE id=%s",
+            (self.txn,)).fetchone()["category_override"],
+            "a GET (a mail scanner's prefetch) filed the charge")
         r = self.client.post("/act", data={"token": tok})
         self.assertEqual(r.status_code, 200, r.text)
         row = self.conn.execute(
@@ -366,6 +370,9 @@ class RouteTests(_Routes):
         r = self.client.get("/act", params={"token": tok})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertIn("Mute", r.text)
+        self.assertIn(a["message"], [x["message"] for x in report.gather(
+            self.conn, TODAY)["alerts"]],
+            "a GET (a mail scanner's prefetch) muted the alert")
         r = self.client.post("/act", data={"token": tok})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertIn("Muted", r.text)
@@ -450,11 +457,26 @@ class StandingTests(_Routes):
                 self._refused(code)
         self._set_status("active")
 
-    def test_read_only_household_buttons_write_nothing(self):
+    def test_read_only_household_buttons_write_nothing_but_a_mute(self):
+        """Read-only refuses the bill and category buttons; muting an alert
+        is a way out the app keeps open in that state (the worker goes on
+        mailing through the wind-down), so the mail's mute keeps working."""
         from oikonome import ext
         with mock.patch.object(ext.gate, "write_blocked",
                                lambda tid: str(tid) == self.tid):
-            self._refused(402)
+            for tok in self._tokens()[:-1]:
+                r = self.client.get("/act", params={"token": tok})
+                self.assertEqual(r.status_code, 402, r.text)
+                r = self.client.post("/act", data={"token": tok})
+                self.assertEqual(r.status_code, 402, r.text)
+            self.assertEqual(self._status(), "pending")
+            a = self._alert()
+            r = self.client.post("/act", data={"token": self._tokens()[-1]})
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertTrue(self.conn.execute(
+                "SELECT dismissed FROM alerts_log WHERE kind=%s "
+                "AND message=%s", (a["kind"], a["message"])
+            ).fetchone()["dismissed"])
 
     def test_hosted_account_without_a_second_factor_cannot_act_from_mail(self):
         with mock.patch.dict(os.environ, {"OIKONOME_HOSTED": "1"}):

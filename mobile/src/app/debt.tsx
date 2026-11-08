@@ -21,6 +21,14 @@ import { useViewer } from "../lib/viewer";
 import { C, money } from "../lib/theme";
 
 const m$ = (n: number) => money(n, false);
+// whether a schedule ends inside the fifty-year walk; one that does not
+// carries fifty years of compounding as its interest, which nobody pays
+// (web: pages/Debt.tsx finishes / noEnd)
+const finishes = (x: { finishes?: boolean; debt_free: string | null }) =>
+  x.finishes ?? x.debt_free !== null;
+const noEnd = (x: { growing: boolean }) =>
+  x.growing ? "grows — the minimums don't cover the interest"
+    : "not paid off within fifty years";
 const NAMES: Record<DebtMethod, string> =
   { avalanche: "Avalanche", snowball: "Snowball" };
 const OTHER: Record<DebtMethod, DebtMethod> =
@@ -37,6 +45,16 @@ const draftOf = (rows: DebtRow[]): Draft =>
     min_payment: d.min_source === "you" ? String(d.min_payment) : "",
     skip: d.skip,
   }]));
+
+// The planner reply also carries every stored override (the shared
+// type predates it, so it is optional here).
+type WithOverrides = DebtPlan & { overrides?: DebtPlanSave["debts"] };
+
+// Stored overrides whose debt is not in the map being saved.
+const keptOverrides = (stored: DebtPlanSave["debts"] | undefined,
+                       saving: Record<string, unknown>): DebtPlanSave["debts"] =>
+  Object.fromEntries(Object.entries(stored ?? {})
+    .filter(([id]) => !Object.prototype.hasOwnProperty.call(saving, id)));
 
 export default function Debt() {
   const { client } = useSession();
@@ -61,16 +79,19 @@ export default function Debt() {
     // the stored plan now and lay only this screen's changes over it.
     mutationFn: async (v: { plan: PlanFields; planBase: PlanFields;
                             mine: Draft; base: Draft }) => {
-      const fresh = await client!.debtPlan({});
+      const fresh: WithOverrides = await client!.debtPlan({});
       const plan = rebaseFields(v.plan, v.planBase, fresh.saved);
       const debts = rebaseKeyed(v.mine, v.base, draftOf(fresh.debts));
       const body: DebtPlanSave = {
         method: plan.method, extra_monthly: plan.extra_monthly,
-        debts: Object.fromEntries(Object.entries(debts).map(([id, x]) => [id, {
+        // the list holds only debts carrying a balance; a stored override
+        // of one off it (paid to zero, excluded) rides along untouched, or
+        // this save would erase it
+        debts: { ...keptOverrides(fresh.overrides, debts), ...Object.fromEntries(Object.entries(debts).map(([id, x]) => [id, {
           apr: x.apr === "" ? null : x.apr,
           min_payment: x.min_payment === "" ? null : x.min_payment,
           skip: x.skip,
-        }])),
+        }])) },
       };
       return client!.debtPlanSave(body);
     },
@@ -172,13 +193,14 @@ export default function Debt() {
                   not within 50 years
                   <Text style={{ fontSize: 13, fontWeight: "400" }}>
                     {"  "}{plan.growing
-                      ? "the minimums don't cover the interest"
+                      ? "the minimums don't cover the interest — the balance grows"
                       : "at these payments"}
                   </Text>
                 </Text>
               )}
               <KV k="Paying monthly" v={m$(plan.monthly)} />
               <Text style={s.mut}>every minimum + {m$(plan.extra)} extra</Text>
+              {finishes(plan) ? (<>
               <KV k="Interest to pay" v={m$(plan.total_interest)} />
               <Text style={[s.mut, saved(plan) > 0 && { color: C.good }]}>
                 {saved(plan) > 0
@@ -187,8 +209,19 @@ export default function Debt() {
                     ? `minimums only: ${m$(base.total_interest)}`
                     : "minimums only never finish"}
               </Text>
+              </>) : (<>
+              <KV k="Interest to pay" v="no end" />
+              <Text style={[s.mut, { color: C.bad }]}>{noEnd(plan)}</Text>
+              </>)}
               <KV k={`${NAMES[OTHER[method]]} instead`}
                   v={alt.debt_free ? monthYear(alt.debt_free) : "never"} />
+              {!finishes(alt) ? (
+                <Text style={[s.mut, { color: C.bad }]}>{noEnd(alt)}</Text>
+              ) : !finishes(plan) ? (
+                <Text style={[s.mut, { color: C.good }]}>
+                  {m$(alt.total_interest)} interest
+                </Text>
+              ) : (
               <Text style={[s.mut,
                             alt.total_interest <= plan.total_interest
                               && { color: C.good }]}>
@@ -198,7 +231,7 @@ export default function Debt() {
                     ? ` — ${m$(alt.total_interest - plan.total_interest)} more`
                     : ` — ${m$(plan.total_interest - alt.total_interest)} less`)
                   : ""}
-              </Text>
+              </Text>)}
 
               <View style={{ backgroundColor: C.hover, borderRadius: 8,
                              padding: 10, marginTop: 8, gap: 8 }}>
@@ -293,7 +326,8 @@ export default function Debt() {
                         : p?.paid_off ? <Pill text={monthYear(p.paid_off)} tone="good" />
                         : <Pill text="never" tone="bad" />}
                       <Text style={s.mut}>
-                        {p ? `${m$(p.interest)} interest` : ""}
+                        {/* a debt the walk never clears has no interest total */}
+                        {p?.paid_off ? `${m$(p.interest)} interest` : ""}
                       </Text>
                     </View>
                     <View style={{ flexDirection: "row", alignItems: "flex-end",
@@ -348,8 +382,9 @@ export default function Debt() {
               })}
               <Text style={[s.mut, { marginTop: 8 }]}>
                 Rates and minimums come from the bank where it reports them,
-                else from what you type here; an estimate is 2% of a
-                card&apos;s balance (at least $25), a five-year payment for a
+                else from what you type here; an estimate is a month&apos;s
+                interest plus 1% of a card&apos;s balance, at least 2% and $25, a
+                five-year payment for a
                 loan, thirty years for a mortgage — correct it and save.
                 Minimums are held flat for the whole walk, and interest
                 accrues monthly at APR ÷ 12.

@@ -31,7 +31,9 @@ you kept.
 
 A month no bank feed covers has unknown income, not $0, so it is left
 out of the picture on both sides, and the window's label under the
-picture says so. When no bank feed covers the window at all, the picture is
+picture says so. The same goes for the month a bank feed starts partway
+through, when your card history reaches back further: its paychecks
+before the feed began were never imported. When no bank feed covers the window at all, the picture is
 not drawn and the sentence says *income unknown for this range* and
 gives only what went out. A household whose ledger starts this month
 sees the month so far, labelled as such, instead of an empty page.
@@ -176,9 +178,13 @@ the past works.
   fixed-vs-variable split there.
 - The current month's projection is pace (spend so far ÷ days elapsed
   × days in month) — early-month numbers swing.
-- The Spending tab's comparison needs a previous window of data — a
-  1y view early in your history compares against a mostly-empty year
-  and reads as a huge change. The All view simply has no comparison.
+- The Spending and Income tabs compare only against a previous window
+  your history covers from its first day; one that starts before your
+  accounts were imported shows no comparison rather than a huge change
+  against months with nothing on file. A feed whose first row lands by
+  the month's second weekday counts as covering it from the 1st, since
+  nothing posts on a weekend or a bank holiday. The All view simply has
+  no comparison.
 - The Category × year matrix only lists the top-15 **all-time**
   categories. A category with real spend in one year can be absent if its
   lifetime total didn't make the cut.

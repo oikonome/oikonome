@@ -23,8 +23,12 @@ in an answer comes from the same engine functions that power the pages:
   year" is one lookup. Same personal-spend
   predicate as the Cash Flow page's Spending tab (no transfers, no
   card payments), so the number is the page's number.
-- **recurring bills** — your bills with their amounts and health, from
-  the same analysis behind the Bills page (see the Bills guide).
+- **recurring bills** — your bills (money out; income is left out),
+  each with its amount per charge, its monthly cost, its cadence, next
+  due date and health, from the same analysis behind the Bills page (see
+  the Bills guide). A one-time bill's monthly cost is its amount evened
+  over its own year, as the Bills headline evens it. The largest 25 by
+  monthly cost are listed, and the answer says when the list was cut.
 
 Those four summaries are the **only** data the model can reach. It
 picks which to fetch, over up to three rounds of tool calls per

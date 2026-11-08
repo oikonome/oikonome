@@ -117,6 +117,32 @@ class ArithmeticTests(unittest.TestCase):
         self.assertEqual(len(r["series"]), debt.MAX_MONTHS + 1)
         self.assertGreater(r["series"][-1][1], 10_000)
 
+    def test_a_run_that_never_finishes_says_so_rather_than_quoting_a_total(self):
+        # the fifty-year compounded interest of a growing balance is not a
+        # figure anyone will pay; the schedule says it does not finish
+        r = debt.simulate([_d("a", 10_000, 30.0, 100)], start=TODAY)
+        self.assertFalse(r["finishes"])
+        done = debt.simulate([_d("a", 1_000, 12.0, 100)], start=TODAY)
+        self.assertTrue(done["finishes"])
+        self.assertTrue(debt.simulate([], start=TODAY)["finishes"])
+
+    def test_the_estimated_card_minimum_always_finishes(self):
+        # a high-rate card with no reported minimum: the estimate must cover
+        # the month's interest at every rate the planner accepts
+        for apr in (0.0, 18.0, 24.0, 27.0, 36.0, 99.0, debt.MAX_APR):
+            for bal in (40.0, 800.0, 5_000.0, 23_456.0):
+                mn = debt.estimated_minimum("card", bal, apr)
+                r = debt.simulate([_d("a", bal, apr, mn)], start=TODAY)
+                self.assertTrue(r["finishes"], (apr, bal, mn))
+                self.assertFalse(r["growing"], (apr, bal, mn))
+
+    def test_a_vanishingly_small_rate_amortizes_like_zero(self):
+        # 1 + r rounds to 1 for a rate this small; the payment must not
+        # divide by zero and fail the whole plan
+        self.assertAlmostEqual(debt.amortized_payment(6000, 1e-300, 60), 100.0)
+        self.assertAlmostEqual(debt.estimated_minimum("loan", 6000, 1e-15),
+                               100.0)
+
     def test_nothing_owed_is_debt_free_today(self):
         r = debt.simulate([], start=TODAY)
         self.assertEqual(r["debt_free"], TODAY.isoformat())
@@ -187,7 +213,14 @@ class IssuerFieldTests(unittest.TestCase):
         self.assertIsNone(debt.issuer_minimum(None))
 
     def test_the_estimate_for_a_debt_the_bank_said_nothing_about(self):
-        self.assertEqual(debt.estimated_minimum("card", 5000, 20), 100.0)
+        # a card: the month's interest plus 1% of the balance, as issuers
+        # compute it, at least $25 and never more than the balance
+        self.assertAlmostEqual(debt.estimated_minimum("card", 5000, 20), 133.33,
+                               places=2)
+        self.assertAlmostEqual(debt.estimated_minimum("card", 5000, 27), 162.50,
+                               places=2)
+        # an unknown rate (0) still estimates at least 2%, near a typical card
+        self.assertEqual(debt.estimated_minimum("card", 5000, 0), 100.0)
         self.assertEqual(debt.estimated_minimum("card", 600, 20), 25.0)
         self.assertEqual(debt.estimated_minimum("card", 10, 20), 10.0)
         # a five-year loan at 0% is the balance over 60 months
@@ -319,6 +352,17 @@ class LoadDebtsTests(unittest.TestCase):
         # the issuer's number is still carried, so the page can offer it back
         self.assertEqual(rows["card"]["apr_issuer"], 24.99)
 
+    def test_build_returns_overrides_of_debts_it_does_not_list(self):
+        # the save replaces the whole plan, so a client can only keep the
+        # override of a debt off the list (excluded, or paid to zero this
+        # cycle) if the payload hands it back
+        write_config(self.conn, excluded_accounts=["mort"], debt_plan={
+            "debts": {"mort": {"apr": 6.25}, "card": {"skip": True}}})
+        r = debt.build(self.conn, TODAY)
+        self.assertNotIn("mort", {d["id"] for d in r["debts"]})
+        self.assertEqual(r["overrides"], {"mort": {"apr": 6.25},
+                                          "card": {"skip": True}})
+
     def test_an_excluded_account_is_not_a_debt_here(self):
         write_config(self.conn, excluded_accounts=["mort"])
         cfg = budget.load_config(self.conn)
@@ -434,6 +478,69 @@ class LoadDebtsTests(unittest.TestCase):
         self.assertEqual((mort["min_payment"], mort["min_source"],
                           mort["payment_reported"]),
                          (1498.88, "issuer", 2100.0))
+
+    def test_a_mortgage_with_no_reported_payment_still_ends_on_its_maturity(self):
+        """The servicer sent the maturity and the rate but no monthly
+        payment. The plan must amortize the balance over the payments left
+        to that maturity, never over a fresh 30 years: on 240 payments left
+        that would plan the payoff ten years late and quote tens of
+        thousands of interest that will never be charged."""
+        mort = self._raw_mortgage(200_000, {
+            "interest_rate": {"percentage": 6.0},
+            "maturity_date": TODAY.replace(year=TODAY.year + 20).isoformat()})
+        self.assertEqual((mort["min_payment"], mort["min_source"],
+                          mort["payment_reported"]),
+                         (1432.87, "estimate", None))
+        r = debt.simulate([mort], extra=0, start=TODAY, rollover=False)
+        self.assertEqual(r["months"], 240)
+
+    def _raw_loan(self, balance, raw, subtype="student"):
+        self.conn.execute("UPDATE accounts SET balance_current = %s, "
+                          "subtype = %s WHERE id = 'auto'", (balance, subtype))
+        self.conn.execute("DELETE FROM liabilities WHERE account_id = 'auto'")
+        self.conn.execute("INSERT INTO liabilities (account_id, raw) "
+                          "VALUES ('auto', %s)", (jsonb(raw),))
+        cfg = budget.load_config(self.conn)
+        return {d["id"]: d for d in
+                debt.load_debts(self.conn, cfg, today=TODAY)}["auto"]
+
+    def test_a_loan_with_no_minimum_follows_the_servicers_payoff_date(self):
+        """A student loan with no minimum but an expected payoff date eight
+        years out is paid over those 96 months, not a flat five years that
+        would double the payment the household is told to plan for."""
+        loan = self._raw_loan(30_000, {
+            "interest_rate_percentage": 5.0,
+            "expected_payoff_date":
+                TODAY.replace(year=TODAY.year + 8).isoformat()})
+        self.assertEqual(loan["min_source"], "estimate")
+        r = debt.simulate([loan], extra=0, start=TODAY, rollover=False)
+        self.assertEqual(r["months"], 96)
+
+    def test_a_loan_with_no_minimum_follows_its_maturity_or_its_term(self):
+        loan = self._raw_loan(12_000, {
+            "maturity_date": TODAY.replace(year=TODAY.year + 3).isoformat()},
+            subtype="auto")
+        self.assertEqual(loan["min_payment"], 333.34)
+        orig = TODAY.replace(year=TODAY.year - 2)
+        loan = self._raw_loan(12_000, {"origination_date": orig.isoformat(),
+                                       "loan_term": "84 months"},
+                              subtype="auto")
+        r = debt.simulate([loan], extra=0, start=TODAY, rollover=False)
+        self.assertEqual(r["months"], 60)
+
+    def test_a_loan_months_from_payoff_with_no_payment_keeps_the_estimate(self):
+        """A payoff date two months out with no reported payment would make
+        the minimum half the balance: the estimate stands instead."""
+        today = dt.date(2026, 11, 7)
+        raw = {"expected_payoff_date": "2027-01-28"}
+        self.assertIsNone(debt.term_payment(raw, 24000.0, 5.5, today))
+        far = {"expected_payoff_date": "2034-11-28"}
+        self.assertIsNotNone(debt.term_payment(far, 24000.0, 5.5, today))
+
+    def test_a_loan_with_no_term_keeps_the_five_year_estimate(self):
+        loan = self._raw_loan(6_000, {}, subtype="auto")
+        self.assertEqual((loan["min_payment"], loan["min_source"]),
+                         (100.0, "estimate"))
 
     def test_a_typed_payment_still_wins_for_a_mortgage(self):
         write_config(self.conn, debt_plan={

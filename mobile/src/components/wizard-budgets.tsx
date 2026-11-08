@@ -14,7 +14,7 @@ import { useEffect, useState } from "react";
 import { Pressable, Text, TextInput, View } from "react-native";
 
 import { errText } from "../lib/api";
-import { saveSettings } from "../lib/cache";
+import { SETTINGS_SAVES, saveSettings } from "../lib/cache";
 import { isPlanSavingsGoal, parseMoneyDraft } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { C } from "../lib/theme";
@@ -91,6 +91,7 @@ export function ManualBudgets({ viewer, onSaved }: {
   const savings = Math.round(eff(income, keepIncome) - bills
     - eff(food, keepFood) - eff(other, keepOther));
   const save = useMutation({
+    scope: SETTINGS_SAVES,
     mutationFn: async (): Promise<boolean> => {
       // the goals list is replaced wholesale on save: carry every other
       // goal through from the server's current copy, and keep the stored

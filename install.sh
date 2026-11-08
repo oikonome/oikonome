@@ -201,7 +201,9 @@ else
   # `-f PG_VERSION` from this user is false and fresh passwords would be
   # minted against a cluster that already has its own.
   ORPHAN_DIR=$(data_dir_resolve "$PWD" ../data/postgres)
-  PG_IMAGE=$(grep -oE 'image: docker.io/library/postgres:[0-9]+-alpine' compose.yaml 2>/dev/null | head -1 | sed 's/^image: //' || true)
+  # With no .env there is no project name, so the install's own built image
+  # cannot be named: read the folder with the base that image is built from.
+  PG_IMAGE=$(grep -oE 'base_image: docker.io/library/postgres:[0-9]+-alpine' compose.yaml 2>/dev/null | head -1 | sed 's/^base_image: //' || true)
   ORPHAN_RC=0
   ORPHAN_VER=$(pg_data_version "$ORPHAN_DIR" "$ENGINE" "${PG_IMAGE:-docker.io/library/postgres:18-alpine}") || ORPHAN_RC=$?
   if [ "$ORPHAN_RC" -ne 0 ]; then

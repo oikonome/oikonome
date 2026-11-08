@@ -153,7 +153,7 @@ def _num(x, limit: float = MAX_AMOUNT):
     # the door takes a portal export that may have passed through a
     # spreadsheet in a decimal-comma locale, where stripping every comma
     # would read "1.234,56" as 1.23456 and "12,5" shares as 125.
-    from .csvimport import parse_money_text
+    from .csvimport import AmountOutOfRange, parse_money_text
     if x is None:
         return None
     s = str(x).strip()
@@ -161,6 +161,10 @@ def _num(x, limit: float = MAX_AMOUNT):
         return None
     try:
         v = parse_money_text(s)
+    except AmountOutOfRange:
+        # a number the shared parser refused as out of range is this
+        # door's refusal too, never a blank cell
+        raise ValueError(f"value out of range: {str(x).strip()[:32]!r}")
     except (ValueError, TypeError):
         return None
     if not math.isfinite(v) or abs(v) > limit:
@@ -398,28 +402,50 @@ def rollback(conn, plan: str | None = None, *,
     provider = provider_slug(provider)
     plans = [plan.upper()] if plan else list(PLAN_CODES)
     n = 0
+    kept_any = False
     with conn.transaction():
         for p in plans:
             aid = account_id(provider, p)
             # a pair on a row about to go is unlinked first, so its
             # counterpart lets go of the transfer category the link gave it
             from ..web.data import detach_pairs
-            from .base import release_matched_receipts
+            from .base import (release_fronted_movements,
+                               release_matched_receipts)
             from .reanchor import hold_pairing_lock
             hold_pairing_lock(conn)
-            doomed = [r["id"] for r in conn.execute(
-                "SELECT id FROM transactions WHERE account_id=%s", (aid,))]
+            # the rows first, then any business (see lock_account_rows)
+            from .base import lock_account_rows
+            doomed = lock_account_rows(conn, aid)
+            # an archived business's rows are retention records only its
+            # delete-forever may remove (batches._archived_business_rows)
+            from .batches import _archived_business_rows
+            archived = _archived_business_rows(conn, doomed)
+            doomed = [d for d in doomed if d not in archived]
             detach_pairs(conn, doomed)
             # a receipt paired with one of these rows goes back to waiting
             # rather than down with it
             release_matched_receipts(conn, doomed)
+            release_fronted_movements(conn, doomed, "an unlinked plan")
             n += conn.execute(
-                "DELETE FROM transactions WHERE account_id=%s", (aid,)).rowcount
+                "DELETE FROM transactions WHERE account_id=%s"
+                " AND NOT id = ANY(%s)", (aid, list(archived))).rowcount
             conn.execute("DELETE FROM holdings WHERE account_id=%s", (aid,))
-            conn.execute("DELETE FROM accounts WHERE id=%s", (aid,))
+            if archived:
+                # the account stays to hold the kept rows; its balance does
+                # not — nothing will refresh it, so it is filed as closed
+                # and leaves net worth (as base's purge does)
+                conn.execute("UPDATE accounts SET balance_current = NULL,"
+                             " balance_available = NULL WHERE id = %s",
+                             (aid,))
+                kept_any = True
+                from .base import _purge_kept_note, log_sync
+                log_sync(conn, "plan-unlink", 0, error=f"account {aid}: "
+                         + _purge_kept_note(0, len(archived)))
+            else:
+                conn.execute("DELETE FROM accounts WHERE id=%s", (aid,))
             # the connection's entity scope was stamped at checkout
             from ..db import tenancy
             tenancy.set_entity_scope(conn)
-        if not plan:
+        if not plan and not kept_any:
             conn.execute("DELETE FROM items WHERE id=%s", (provider,))
     return n

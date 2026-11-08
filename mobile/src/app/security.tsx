@@ -8,12 +8,12 @@
 // which the session stays elevated for ten minutes. Deleting the account
 // asks again every time.
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import * as Clipboard from "expo-clipboard";
 import { useState } from "react";
 import { Alert, Pressable, ScrollView, StyleSheet, Switch, Text,
          TextInput, View } from "react-native";
 import { SvgXml } from "react-native-svg";
 import PullRefresh from "../components/pull-refresh";
+import { SecretCopyButtons } from "../components/secret-copy";
 import { VerifyEmailCard } from "../components/verify-email-card";
 
 import { Card, H, Pill, SharedLock } from "../components/ui";
@@ -22,8 +22,9 @@ import { invalidateAfterRotation, patchList, patchQuery, removeFromList,
          smsPauseNote }
   from "../lib/cache";
 import { EMAIL_KIND_LABEL, EMAIL_KINDS, inviteOutcome, localDayOf,
-         membersRemovedNote, oneTimeCodeSentence, prefOn,
-         svgFromDataUri, type InviteOutcome } from "../lib/pure";
+         membersRemovedNote, oneTimeCodeDigits, oneTimeCodeSentence, prefOn,
+         signedOutOthers, svgFromDataUri, type InviteOutcome }
+  from "../lib/pure";
 import { useSession } from "../lib/session";
 import { C, mmddyy } from "../lib/theme";
 import { useOwner, useSharedLock, useViewer } from "../lib/viewer";
@@ -209,6 +210,8 @@ function PasswordCard() {
   const [next, setNext] = useState("");
   const [confirm, setConfirm] = useState("");
   const [msg, setMsg] = useState<{ text: string; bad: boolean } | null>(null);
+  // the change voided the recovery sheet; the new one is shown once
+  const [codes, setCodes] = useState<string[] | null>(null);
   const run = useMutation({
     mutationFn: () => {
       if (next !== confirm)
@@ -234,6 +237,12 @@ function PasswordCard() {
                      + membersRemovedNote(r),
                bad: false });
       setCur(""); setNext(""); setConfirm("");
+      // The rotation voided the old recovery sheet (the account has a
+      // second factor) and this is the one that stands.
+      const fresh = r.recovery_codes?.length ? r.recovery_codes : null;
+      setCodes(fresh);
+      if (fresh)
+        patchQuery<Me>(qc, ["me"], { recovery_codes_left: fresh.length });
       // the rotation empties all four lists, not just sessions, and an
       // owner's rotation also removes members who joined through the
       // owner's recent invites
@@ -262,6 +271,8 @@ function PasswordCard() {
       <TextInput style={s.input} placeholder="confirm new password"
                  placeholderTextColor={C.mut} secureTextEntry
                  value={confirm} onChangeText={setConfirm} />
+      {codes && <ReissuedSheet codes={codes}
+                               onDone={() => setCodes(null)} />}
       {msg && (
         <Text style={{ color: msg.bad ? C.bad : C.good, fontSize: 12 }}
               onPress={() => setMsg(null)}>{msg.text}</Text>
@@ -290,6 +301,8 @@ function EmailCard({ email, pending, pendingUntil }: {
   const qc = useQueryClient();
   const [next, setNext] = useState("");
   const [msg, setMsg] = useState<{ text: string; bad: boolean } | null>(null);
+  // the change voided the recovery sheet; the new one is shown once
+  const [codes, setCodes] = useState<string[] | null>(null);
   const run = useMutation({
     mutationFn: () => client!.emailChange(next.trim()),
     onSuccess: (r) => {
@@ -317,10 +330,17 @@ function EmailCard({ email, pending, pendingUntil }: {
               : "")
           + smsPauseNote(qc, r) + membersRemovedNote(r) });
       setNext("");
+      // The rotation voided the old recovery sheet (the account has a
+      // second factor) and this is the one that stands. Its code count
+      // rides the same patch.
+      const fresh = r.recovery_codes?.length ? r.recovery_codes : null;
+      setCodes(fresh);
       // a pending change moved nothing — the sign-in address and its
       // verified state stand — so only the pending line is patched
-      patchQuery<Me>(qc, ["me"], r.pending_email
-        ? { pending_email: r.pending_email } : { email: r.email });
+      patchQuery<Me>(qc, ["me"], {
+        ...(r.pending_email
+          ? { pending_email: r.pending_email } : { email: r.email }),
+        ...(fresh ? { recovery_codes_left: fresh.length } : {}) });
       qc.invalidateQueries({ queryKey: ["me"] });
       // the same credential rotation a password change is
       for (const k of ["sessions", "devices", "tokens", "invites", "members"])
@@ -374,6 +394,8 @@ function EmailCard({ email, pending, pendingUntil }: {
       <TextInput style={s.input} placeholder="new email"
                  placeholderTextColor={C.mut} keyboardType="email-address"
                  autoCapitalize="none" value={next} onChangeText={setNext} />
+      {codes && <ReissuedSheet codes={codes}
+                               onDone={() => setCodes(null)} />}
       {msg && (
         <Text style={{ color: msg.bad ? C.bad : C.good, fontSize: 12 }}
               onPress={() => setMsg(null)}>{msg.text}</Text>
@@ -387,6 +409,35 @@ function EmailCard({ email, pending, pendingUntil }: {
         </Text>
       </Pressable>
     </Card>
+  );
+}
+
+// ---- the sheet a password or email change reissued ----
+// (web: the recovery-codes note on the password and email cards) The
+// same anatomy as the two-factor card's sheet, plus the line saying the
+// old codes are dead — the change voided them.
+function ReissuedSheet({ codes, onDone }: {
+  codes: string[]; onDone: () => void;
+}) {
+  return (
+    <View style={{ backgroundColor: C.bg, borderColor: C.warn,
+                   borderWidth: 1, borderRadius: 8, padding: 10,
+                   marginTop: 8, gap: 4 }}>
+      <Text style={{ color: C.text, fontSize: 13, fontWeight: "700" }}>
+        Recovery codes — save these somewhere safe.
+      </Text>
+      <Text style={s.mut}>
+        Each works once to sign in if you lose your passkey or
+        authenticator; they won&apos;t be shown again. The codes you had
+        before no longer work.
+      </Text>
+      <Text style={{ color: C.text, fontFamily: "monospace",
+                     fontSize: 14, lineHeight: 24 }} selectable>
+        {codes.join("\n")}
+      </Text>
+      <SecretCopyButtons text={codes.join("\n")} what="codes" plural
+                         onDone={onDone} />
+    </View>
   );
 }
 
@@ -409,7 +460,7 @@ function PendingRecoveryCard({ lands }: { lands: string }) {
       <H>Recovery requested</H>
       <Text style={[s.mut, { color: C.warn }]}>
         Someone asked for a recovery that removes this account's
-        two-factor methods. It lands {mmddyy(lands)}. Not you? Cancel it.
+        two-factor methods. It lands {mmddyy(localDayOf(lands))}. Not you? Cancel it.
       </Text>
       <Pressable style={[s.btn, { alignSelf: "flex-start", marginTop: 6 },
                    cancel.isPending && { opacity: 0.5 }]}
@@ -489,13 +540,23 @@ function TwoFactorCard({ enabled, left }: {
     mutationFn: () => client!.totpDisable(code),
     onSuccess: (r) => {
       setCode("");
-      setMsg({ text: "Two-factor is off." + smsPauseNote(qc, r)
+      // a passkey stays, so the old recovery sheet was voided and this is
+      // the one that stands — shown like the replace flow's
+      if (r.recovery_codes?.length) setCodes(r.recovery_codes);
+      // the server signs every other session and device out with it
+      setMsg({ text: signedOutOthers("Two-factor is off") + smsPauseNote(qc, r)
                      + membersRemovedNote(r), bad: false });
-      patchQuery<Me>(qc, ["me"], { totp_enabled: false });
+      patchQuery<Me>(qc, ["me"], { totp_enabled: false,
+        ...(r.recovery_codes?.length
+          ? { recovery_codes_left: r.recovery_codes.length } : {}) });
       // turning the factor off removes the members who joined through the
-      // owner's recent invites, and the settings banner records them
-      for (const k of ["members", "invites", "settings"])
+      // owner's recent invites, and the settings banner records them; it
+      // pauses this person's webhooks too
+      for (const k of ["sessions", "devices", "tokens", "members",
+                       "invites", "settings", "webhooks"])
         qc.invalidateQueries({ queryKey: [k] });
+      // and ends the support-access grants this person made
+      invalidateAfterRotation(qc);
     },
     onError: (e) => {
       if (e instanceof NextCodeNeeded) {
@@ -516,6 +577,14 @@ function TwoFactorCard({ enabled, left }: {
       setCode("");
       patchQuery<Me>(qc, ["me"],
                      { recovery_codes_left: r.recovery_codes.length });
+      // the old sheet's holders are signed out with it; tokens, webhooks,
+      // invites and the text number are left alone, so only the session
+      // and device lists moved — said as the web's security card says it
+      setMsg(r.other_sessions_signed_out
+        ? { text: "Your other browsers and devices were signed out.",
+            bad: false } : null);
+      for (const k of ["sessions", "devices"])
+        qc.invalidateQueries({ queryKey: [k] });
     },
     onError: fail,
   });
@@ -544,8 +613,9 @@ function TwoFactorCard({ enabled, left }: {
           <TextInput style={s.input}
                      placeholder="6-digit code from your authenticator"
                      placeholderTextColor={C.mut}
-                     keyboardType="number-pad" maxLength={6}
-                     value={code} onChangeText={setCode} />
+                     keyboardType="number-pad"
+                     value={code}
+                     onChangeText={(t) => setCode(oneTimeCodeDigits(t))} />
           <View style={{ flexDirection: "row", gap: 8, marginTop: 6 }}>
             <Pressable style={[s.btn, (!code || confirm.isPending)
                          && { opacity: 0.5 }]}
@@ -575,8 +645,9 @@ function TwoFactorCard({ enabled, left }: {
           <TextInput style={s.input}
                      placeholder="current 6-digit code (required to turn off)"
                      placeholderTextColor={C.mut}
-                     keyboardType="number-pad" maxLength={6}
-                     value={code} onChangeText={setCode} />
+                     keyboardType="number-pad"
+                     value={code}
+                     onChangeText={(t) => setCode(oneTimeCodeDigits(t))} />
           <Pressable style={[s.btn, s.btnQuiet,
                        { alignSelf: "flex-start", marginTop: 6 },
                        (!code || disable.isPending) && { opacity: 0.5 }]}
@@ -651,13 +722,8 @@ function TwoFactorCard({ enabled, left }: {
                          fontSize: 14, lineHeight: 24 }} selectable>
             {codes.join("\n")}
           </Text>
-          <Pressable style={[s.btn, { alignSelf: "flex-start" }]}
-                     onPress={async () => {
-                       await Clipboard.setStringAsync(codes.join("\n"));
-                       setCodes(null);
-                     }}>
-            <Text style={s.btnText}>Copy &amp; dismiss</Text>
-          </Pressable>
+          <SecretCopyButtons text={codes.join("\n")} what="codes" plural
+                             onDone={() => setCodes(null)} />
         </View>
       )}
       {msg && (
@@ -1072,13 +1138,8 @@ function FamilyCard({ owner }: { owner: boolean }) {
             <Text style={{ color: C.text, fontSize: 12 }} selectable>
               {minted.url}
             </Text>
-            <Pressable style={[s.btn, { alignSelf: "flex-start" }]}
-                       onPress={async () => {
-                         await Clipboard.setStringAsync(minted.url);
-                         setMinted(null);
-                       }}>
-              <Text style={s.btnText}>Copy &amp; dismiss</Text>
-            </Pressable>
+            <SecretCopyButtons text={minted.url} what="link"
+                               onDone={() => setMinted(null)} />
           </>) : (<>
             <Text style={s.mut}>
               Invitation emailed to{" "}

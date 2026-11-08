@@ -61,14 +61,12 @@ def enforced() -> bool:
 
 
 def _live_enabled() -> bool:
-    """The live signals (DNS null-route + StopForumSpam lookup). On for hosted;
-    OFF under DEV_MODE unless OIKONOME_SPAM_API is explicitly set, so the test
-    suite stays hermetic (no network) while the list path still works. Set
-    OIKONOME_SPAM_API=off to disable even in prod."""
-    v = os.environ.get("OIKONOME_SPAM_API")
-    if v is not None and v.strip():          # empty == unset (see _flag)
-        return v.strip().lower() not in ("off", "0", "false", "no")
-    return os.environ.get("OIKONOME_DEV") != "1"
+    """The live signals (DNS null-route + StopForumSpam lookup). Unset (or
+    empty) it is on except under DEV_MODE, so the test suite stays hermetic
+    (no network) while the list path still works. A written
+    OIKONOME_SPAM_API is read like every other on/off knob: only
+    1/true/yes/on keep the third-party lookup on, anything else is off."""
+    return _flag("OIKONOME_SPAM_API", os.environ.get("OIKONOME_DEV") != "1")
 
 
 def _budget_ms() -> int:
@@ -108,7 +106,10 @@ def domain_of(email: str) -> str | None:
         dom = dom.encode("idna").decode("ascii")
     except (UnicodeError, ValueError):
         return None
-    return dom
+    # DNS caps a name at 253 characters; anything longer can receive no
+    # mail, and the domain is stored and sent to the live checker, so its
+    # size must not be the client's to choose
+    return dom if len(dom) <= 253 else None
 
 
 def _admin_or(admin):

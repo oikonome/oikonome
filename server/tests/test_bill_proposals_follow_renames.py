@@ -81,15 +81,37 @@ class ARenameCarriesItsPendingProposalsAlong(unittest.TestCase):
         host = bills.get_bill(self.conn, "New Power")
         self.assertTrue(bills.companions_of(as_dict(host["raw"])))
 
-    def test_a_decided_proposal_keeps_the_name_it_was_decided_under(self):
-        # history is not rewritten: only rows still awaiting a decision move
+    def test_a_decided_proposal_follows_the_bill_it_was_decided_on(self):
+        # a decision is read back against its bill's CURRENT name (the
+        # rejection memory, an approved removal), so it moves with the bill
         add_bill(self.conn, "Old Water", 30.0, next_due=NEXT)
         bills._insert_proposal(self.conn, pid="prop:done", kind="remove",
                                payee="Old Water", amount=30.0,
                                status="auto")
         bills.rename_bill(self.conn, "Old Water", "New Water")
         self.assertEqual(_pending(self.conn, "prop:done")["payee"],
-                         "Old Water")
+                         "New Water")
+
+    def test_a_price_change_turned_down_is_not_offered_again_after_a_rename(self):
+        add_bill(self.conn, "Old Stream", 15.49, next_due=NEXT)
+        bills._insert_proposal(
+            self.conn, pid="prop:price", kind="amount_change",
+            payee="Old Stream", amount=17.99,
+            evidence={"old": 15.49, "new": 17.99}, status="rejected")
+        bills.rename_bill(self.conn, "Old Stream", "New Stream")
+        self.assertTrue(bills._price_was_rejected(
+            self.conn, "New Stream", 15.49, 17.99))
+
+    def test_a_decided_attach_follows_the_host_bill_it_names(self):
+        add_bill(self.conn, "Old Gas", 70.0, next_due=NEXT)
+        bills._insert_proposal(
+            self.conn, pid="prop:feedone", kind="attach", payee="Late Fee",
+            amount=9.0, evidence={"bill_payee": "Old Gas"},
+            status="rejected")
+        bills.rename_bill(self.conn, "Old Gas", "New Gas")
+        row = _pending(self.conn, "prop:feedone")
+        self.assertEqual(row["payee"], "Late Fee")
+        self.assertEqual(as_dict(row["evidence"])["bill_payee"], "New Gas")
 
     def test_a_proposal_naming_an_unrelated_bill_is_untouched(self):
         add_bill(self.conn, "Old Phone", 60.0, next_due=NEXT)

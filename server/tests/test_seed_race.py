@@ -10,6 +10,7 @@ So the persist takes the row lock, RE-READS, and merges the seed into the
 FRESH document — seed fills gaps, the concurrent write wins.
 """
 
+import datetime as dt
 import unittest
 import uuid
 from unittest import mock
@@ -17,7 +18,7 @@ from unittest import mock
 from oikonome.db import tenancy
 from oikonome.engine import budget
 
-from .util import TODAY, _admin_dsn, _ensure_db, TEST_DB, add_txn
+from .util import _admin_dsn, _ensure_db, TEST_DB, add_txn
 
 
 class SeedPersistRaceTests(unittest.TestCase):
@@ -39,7 +40,12 @@ class SeedPersistRaceTests(unittest.TestCase):
                 "INSERT INTO accounts (id,item_id,name,type,subtype,"
                 "balance_current) VALUES "
                 "('chk','it1','Chk','depository','checking',5000)")
-            add_txn(conn, TODAY, 400.0, "SAFEWAY", primary="FOOD_AND_DRINK",
+            # the seed reads the last three full months by the real
+            # clock; a full closed month of spend makes it a persisted
+            # budget, not a provisional guess, whatever day it is
+            two_back = (dt.date.today().replace(day=1)
+                        - dt.timedelta(days=1)).replace(day=1)
+            add_txn(conn, two_back, 400.0, "SAFEWAY", primary="FOOD_AND_DRINK",
                     account="chk")
             # a config WITHOUT budgets — the exact onboarding window
             conn.execute(

@@ -3,6 +3,7 @@
 // lines. Kept free of React Native so plain node can test them
 // (scripts/pure-logic-tests.mjs) — the words here are the web wizard's,
 // and a test pins each one.
+import { cadencePick, TWICE_A_MONTH } from "../lib/monthdays.ts";
 import { cadenceWords, money, numv, parseMoneyDraft } from "../lib/pure.ts";
 
 export type WizardStep =
@@ -16,6 +17,27 @@ export type WizardStep =
 // resumes here at the same step.
 export const WIZARD_STEPS: WizardStep[] =
   ["appearance", "connect", "bills", "budgets", "email", "finish"];
+
+/** What Settings → Restart sends: every step mark the server keeps,
+ *  cleared, so the restarted wizard opens on its first step rather than
+ *  skipping one whose mark survived. */
+export function wizardRestartMarks(): Record<string, null> {
+  // built from the step list, so a step added later is cleared too; sync
+  // and import are older steps the server still keeps marks for
+  const marks: Record<string, null> = { sync: null, import: null };
+  for (const k of WIZARD_STEPS) marks[k] = null;
+  return marks;
+}
+
+/** The history gate fails open only when the import status could never be
+ *  read. A background poll that fails keeps its last answer, which still
+ *  says history is arriving, so opening on it would seed bills and the
+ *  budget from the first month alone. */
+export function backfillFailsOpen(
+  q: { isError: boolean; data?: unknown },
+): boolean {
+  return q.isError && q.data === undefined;
+}
 
 export type ThemeChoice = "auto" | "light" | "dark";
 export const THEME_LABEL: Record<ThemeChoice, string> =
@@ -117,10 +139,11 @@ export function nextDueForDay(day: number, todayIso: string): string {
  *  when it has none to edit (an envelope pools by month, no cycle). */
 export function proposalCadenceValue(p: {
   frequency?: string | null; interval?: number | null;
-  bill_type?: string | null }): string | null {
+  bill_type?: string | null;
+  by_month_day?: number[] | null }): string | null {
   if (!p.frequency || p.bill_type === "envelope") return null;
   const n = p.interval && p.interval > 0 ? p.interval : 1;
-  return `${p.frequency.toUpperCase()}:${n}`;
+  return cadencePick(`${p.frequency.toUpperCase()}:${n}`, p.by_month_day);
 }
 
 /** Whether a bill on this cadence has a day of the month to set. Only
@@ -188,7 +211,8 @@ export function latestWins<T>(
 export type AdjustForm = { name: string; amount: string; cadence: string;
                            dueDay: string };
 export type ProposalAdjust = { name?: string; amount?: number;
-                               cadence?: string; due_day?: number };
+                               cadence?: string; due_day?: number;
+                               by_month_day?: number[] };
 
 /** What the Adjust form changed, as the approve's `adjust` — only the
  *  fields the person actually moved, so an untouched field keeps the
@@ -196,7 +220,7 @@ export type ProposalAdjust = { name?: string; amount?: number;
 export function adjustOf(
   p: { payee: string; amount: number; next_due?: string | null;
        frequency?: string | null; interval?: number | null;
-       bill_type?: string | null },
+       bill_type?: string | null; by_month_day?: number[] | null },
   f: AdjustForm,
 ): { adjust: ProposalAdjust } | { error: string } {
   const out: ProposalAdjust = {};
@@ -217,6 +241,9 @@ export function adjustOf(
     if (day === null) return { error: "Due day is a day of the month, 1–31." };
     if (day !== dueDayOf(p.next_due)) out.due_day = day;
   }
+  // leaving the offer's two days for one is the explicit ask to drop one
+  if (proposalCadenceValue(p) === TWICE_A_MONTH && f.cadence === "MONTHLY:1")
+    out.by_month_day = [out.due_day ?? dueDayOf(p.next_due) ?? 1];
   return { adjust: out };
 }
 
@@ -439,7 +466,9 @@ export function deliverySummary(delivery: Delivery, hour: number,
                                 recipients: number): string {
   return DELIVERY_WORDS[delivery]
     + (delivery === "off" ? "" : ` at ${clockHour(hour)}`)
-    + ` · ${plural(Math.max(1, recipients), "recipient", "recipients")}`;
+    + (recipients > 0
+      ? ` · ${plural(recipients, "recipient", "recipients")}`
+      : " · nobody");
 }
 
 /** "Who gets the email": the word beside each address. */

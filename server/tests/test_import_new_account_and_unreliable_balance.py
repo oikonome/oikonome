@@ -58,6 +58,114 @@ class ImportCreateAccountTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(seen, [pq.TransactionStatus.IDLE])
 
+    def test_a_typed_number_two_moved_cards_share_asks_which_one(self):
+        """Two cards an earlier release named by their full numbers, both
+        moved onto ids keeping only the last four they share: a file
+        whose new-account name spells one of the numbers is answered
+        with a choice to make, not landed on either and not a 500."""
+        from oikonome.sync import base
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            conn.execute(
+                "INSERT INTO items (id, aggregator, institution_name)"
+                " VALUES ('manual','manual','Manual')"
+                " ON CONFLICT (tenant_id, id) DO NOTHING")
+            for n in ("4111111111111111", "5500000000001111"):
+                conn.execute(
+                    "INSERT INTO accounts (id, item_id, name, type, subtype)"
+                    " VALUES (%s,'manual',%s,'credit','credit card')",
+                    (f"manual:shared-{n}", f"Shared {n}"))
+            moved = list(base.rekey_numbered_accounts(conn).values())
+            self.assertEqual(len(moved), 2)
+            before = conn.execute(
+                "SELECT (SELECT count(*) FROM accounts) AS a,"
+                " (SELECT count(*) FROM transactions) AS t").fetchone()
+            r = self.client.post(
+                "/api/import",
+                data={"account_id": "", "amount_sign": "card",
+                      "new_account_name": "Shared 4111111111111111"},
+                files={"file": ("shared.csv", CSV, "text/csv")})
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertIn("choose one", r.json()["result"]["error"])
+            self.assertEqual(conn.execute(
+                "SELECT (SELECT count(*) FROM accounts) AS a,"
+                " (SELECT count(*) FROM transactions) AS t").fetchone(),
+                before)
+        finally:
+            # the class shares one household
+            conn.execute("DELETE FROM account_adoptions"
+                         " WHERE account_id LIKE 'manual:shared-%%'")
+            conn.execute("DELETE FROM accounts"
+                         " WHERE id LIKE 'manual:shared-%%'")
+            conn.close()
+
+    def test_a_script_naming_a_moved_numbered_id_reaches_the_moved_account(
+            self):
+        """A script that pushes by the id an earlier release gave an
+        account named by its full number keeps working after the account
+        moves to an id keeping the last four: the move's record leads the
+        import and the balance door to it."""
+        from oikonome.sync import base
+        old = "manual:legacy-12345678901234"        # an invented number
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            conn.execute(
+                "INSERT INTO items (id, aggregator, institution_name)"
+                " VALUES ('manual','manual','Manual')"
+                " ON CONFLICT (tenant_id, id) DO NOTHING")
+            conn.execute(
+                "INSERT INTO accounts (id, item_id, name, type, subtype)"
+                " VALUES (%s,'manual','Legacy …1234','depository',"
+                "'checking')", (old,))
+            moved = base.rekey_numbered_accounts(conn)[old]
+            r = self.client.post(
+                "/api/import",
+                data={"account_id": old, "amount_sign": "bank"},
+                files={"file": ("legacy.csv", CSV, "text/csv")})
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertNotIn("error", r.json()["result"], r.text)
+            r = self.client.post("/api/accounts/balance",
+                                 json={"account_id": old, "balance": "12.5"})
+            self.assertEqual(r.status_code, 200, r.text)
+            row = conn.execute(
+                "SELECT balance_current, (SELECT count(*) FROM transactions"
+                " WHERE account_id = %s) AS n FROM accounts WHERE id = %s",
+                (moved, moved)).fetchone()
+            self.assertEqual((float(row["balance_current"]), row["n"]),
+                             (12.5, 1))
+        finally:
+            conn.execute("DELETE FROM transactions WHERE account_id LIKE"
+                         " 'manual:legacy-%%'")
+            conn.execute("DELETE FROM account_adoptions"
+                         " WHERE account_id LIKE 'manual:legacy-%%'")
+            conn.execute("DELETE FROM accounts"
+                         " WHERE id LIKE 'manual:legacy-%%'")
+            conn.close()
+
+    def test_a_huge_new_account_name_is_cut_like_the_bulk_importer(self):
+        # the name becomes the account's primary-key id; uncut, a few
+        # thousand characters overflow the index and the import was a 500
+        name = "Spare Checking " + "x" * 5000
+        r = self.client.post(
+            "/api/import",
+            data={"account_id": "", "amount_sign": "bank",
+                  "new_account_name": name},
+            files={"file": ("spare.csv", CSV, "text/csv")})
+        self.assertEqual(r.status_code, 200, r.text)
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            acct = conn.execute(
+                "SELECT id, name FROM accounts"
+                " WHERE name LIKE 'Spare Checking%%'").fetchone()
+            # the class shares one household: leave the other tests the
+            # single manual account they expect
+            conn.execute("DELETE FROM transactions WHERE account_id=%s",
+                         (acct["id"],))
+            conn.execute("DELETE FROM accounts WHERE id=%s", (acct["id"],))
+        finally:
+            conn.close()
+        self.assertEqual(acct["name"], name[:120])
+
     def test_import_into_a_new_account(self):
         r = self.client.post(
             "/api/import",

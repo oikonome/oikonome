@@ -70,9 +70,27 @@ class CashGraphTests(unittest.TestCase):
         fwd = [v for k, v in g["points"][g["forecast_from"]:]]
         spend_actual = 0.0                                # no spend this month
         income_actual = 5000.0
-        expect = (series[-1][1] - fc["checking"]
+        # the walk's balance where the last month the graph draws closes
+        last_mk = g["points"][-1][0]
+        closing = [b for d, b in series if d[:7] == last_mk][-1]
+        expect = (closing - fc["checking"]
                   + (income_actual - spend_actual))
         self.assertAlmostEqual(sum(fwd), expect, places=1)
+
+    def test_the_horizons_partial_last_month_is_not_drawn_as_a_month(self):
+        """The walk ends HORIZON_DAYS out, almost never on a month end. A
+        month it reaches only a few days into is not that month's net
+        flow (rent and the savings plan on the 1st, one paycheck), so it
+        is left out like every other partial month in the reports; every
+        forward month the graph draws is whole."""
+        g = self._graph()
+        series = forecast.build(
+            self.conn, days=forecast.HORIZON_DAYS)["pace_stmt"]["series"]
+        walk_end = dt.date.fromisoformat(series[-1][0])
+        for mk, _ in g["points"][g["forecast_from"] + 1:]:
+            first = dt.date.fromisoformat(mk + "-01")
+            self.assertLessEqual(_month_add(first, 1) - dt.timedelta(days=1),
+                                 walk_end, mk)
 
     def test_forecast_from_points_at_the_current_month(self):
         g = self._graph()
@@ -83,8 +101,14 @@ class CashGraphTests(unittest.TestCase):
         # counts only fails on a 1st, when the horizon from the 1st lands
         # inside the second month — a real off-by-a-month lying in wait for
         # one day in thirty.
-        end = TODAY + dt.timedelta(days=forecast.HORIZON_DAYS)
+        series = forecast.build(
+            self.conn, days=forecast.HORIZON_DAYS)["pace_stmt"]["series"]
+        end = dt.date.fromisoformat(series[-1][0])
         span = (end.year - TODAY.year) * 12 + (end.month - TODAY.month) + 1
+        # a last month the walk does not reach the end of is not drawn
+        if (end + dt.timedelta(days=1)).day != 1 and \
+                end.strftime("%Y-%m") != TODAY.strftime("%Y-%m"):
+            span -= 1
         self.assertEqual(len(g["points"]) - g["forecast_from"], span)
 
 

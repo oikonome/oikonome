@@ -20,7 +20,9 @@ who was removed after the mail went out finds their buttons dead. At the
 second check the account must also be in good standing, exactly as an
 in-app write requires (web.app.write_refusal): a household frozen or held
 read-only after the mail went out, or a hosted account with no second
-factor, gets a page that says so and nothing is written.
+factor, gets a page that says so and nothing is written. The mute button
+is the exception the app makes too: a household held read-only may still
+silence an alert (web.app.exit_refusal).
 
 The token is the same shape as the unsubscribe link (notify/unsubscribe):
 a signed statement, no table. It names the tenant, the address the mail
@@ -193,6 +195,13 @@ def actors(tenant_id: str) -> set[str]:
     return {_norm(r["email"]) for r in rows}
 
 
+# The in-app door each emailed action stands in for. A mute is the app's
+# alert dismiss, which a household held read-only keeps (the worker goes on
+# mailing it through the wind-down), so the button keeps working too; the
+# table that decides is the app's own (permissions.READ_ONLY_EXITS).
+_APP_DOOR = {"mute": ("POST", "/api/alerts/dismiss")}
+
+
 def _standing(tok: dict) -> dict | None:
     """None when the token's address may act right now, else the page's
     answer: `forbidden` when it no longer holds an owner/member account
@@ -203,7 +212,8 @@ def _standing(tok: dict) -> dict | None:
     household in that state may do."""
     from ..db import tenancy
     from ..envnum import env_flag
-    from ..web.app import write_refusal
+    from ..web import permissions
+    from ..web.app import exit_refusal, write_refusal
     proof = (" AND u.verified_at IS NOT NULL"
              if env_flag("OIKONOME_HOSTED") else "")
     admin = tenancy.admin_connect()
@@ -220,7 +230,10 @@ def _standing(tok: dict) -> dict | None:
         admin.close()
     if who is None:
         return {"state": "forbidden"}
-    refused = write_refusal({**who, "tenant_id": str(who["tenant_id"])})
+    door = _APP_DOOR.get(tok.get("action"))
+    gate = (exit_refusal if door and permissions.read_only_exit(*door)
+            else write_refusal)
+    refused = gate({**who, "tenant_id": str(who["tenant_id"])})
     if refused is not None:
         code, message = refused
         return {"state": "blocked", "code": code, "sentence": message}
@@ -290,7 +303,8 @@ def gather(conn, d: dict) -> dict:
                 "pid": p["id"], "kind": p["kind"], "payee": p["payee"],
                 "amount": p["amount"], "income": income,
                 "bill_payee": ev.get("bill_payee"),
-                "cadence": _cadence_label(p["frequency"], p["interval"]),
+                "cadence": _cadence_label(p["frequency"], p["interval"],
+                                          bills.offer_days(p)),
                 "summary": (bills.merchant_offer_summary(conn, p)
                             if p["kind"] == "merchant"
                             else _proposal_summary(p)),
@@ -512,11 +526,12 @@ def describe(tok: dict) -> dict:
                         "sentence": f"{p['payee']} was already decided "
                                     f"({p['status']})."}
             from ..engine.compat import as_dict
+            from ..engine.bills import offer_days
             from ..web.pages import _cadence_label
             income = bool((as_dict(p["evidence"]) or {}).get("income"))
             what = ("income" if income else "bill") if p["kind"] == "add" \
                 else "recurring change"
-            cad = _cadence_label(p["frequency"], p["interval"])
+            cad = _cadence_label(p["frequency"], p["interval"], offer_days(p))
             if v == "approve":
                 return {"state": "confirm", "button": "Confirm",
                         "sentence": f"Track {p['payee']} {_money(p['amount'])} "
@@ -599,6 +614,22 @@ def apply(tok: dict) -> dict:
                 if "already-decided" in r["error"]:
                     return {"state": "already",
                             "sentence": "That proposal was already decided."}
+                if bills.proposal_superseded(conn, t):
+                    # withdrawn: nothing to retry. An add offer was beaten
+                    # to its bill, so the tap's wish has happened; a change
+                    # offer was overtaken by a later edit of the bill, and
+                    # the engine's own sentence names that bill and why
+                    p = conn.execute(
+                        "SELECT kind, payee FROM bill_proposals WHERE id=%s",
+                        (t,)).fetchone() or {}
+                    if p.get("kind") != "add":
+                        return {"state": "already", "sentence": r["error"]}
+                    by = bills.covering_bill(conn, p.get("payee") or "")
+                    return {"state": "already", "sentence":
+                            f"{by} is already tracked, so this offer was "
+                            "withdrawn." if by else
+                            "That offer was withdrawn: the bill it offered "
+                            "is already tracked."}
                 return {"state": "failed", "sentence": r["error"]}
             who = r.get("approved") or r.get("rejected") or t
             # the log names the address the button was mailed to: that is
@@ -616,20 +647,18 @@ def apply(tok: dict) -> dict:
             from ..engine import activity as _activity
             # Two copies of the mail tapped at once must not both see the
             # charge uncategorized, so the check and the write are
-            # serialized per charge. With a lock of their own, not a row
-            # lock on the transaction: set_category writes the manual row
-            # BEFORE the transaction row, as every other category writer
-            # does, and holding the transaction row across it takes the two
-            # in the opposite order — an in-app edit of the same charge at
-            # that moment deadlocks with the tap.
+            # serialized per charge, by a lock of their own.
             #
-            # And against the in-app writer, which takes no lock of ours:
-            # its first write is the charge's manual_categories row, so the
-            # tap claims that same row first. Inserted here, an in-app edit
-            # landing meanwhile waits on it and writes after the tap — the
-            # later decision stands. Already there, the row is locked and
-            # the charge is read again below, after any in-app edit that
-            # beat the tap has committed, and the staleness check sees it.
+            # And against the in-app writers, which take no lock of ours:
+            # every one of them (set_category, clear_category, a bulk
+            # recategorize) locks the charge's transactions row BEFORE its
+            # manual_categories pin, so the tap does the same — row first,
+            # then the pin. Taken the other way round, an in-app edit
+            # holding the row and next writing the pin deadlocks with the
+            # tap. Holding the row, an in-app edit landing meanwhile waits
+            # and writes after the tap — the later decision stands; one that
+            # beat the tap has committed by the time the row is ours, and
+            # the charge read below lets the staleness check see it.
             try:
                 with conn.transaction():
                     # the pairing lock first (shared), then follow a mailed
@@ -645,7 +674,7 @@ def apply(tok: dict) -> dict:
                         "hashtext('mailact-cat:' || %s))", (t,))
                     if not conn.execute(
                             "SELECT 1 FROM transactions WHERE id=%s "
-                            "AND removed=0", (t,)).fetchone():
+                            "AND removed=0 FOR UPDATE", (t,)).fetchone():
                         return {"state": "unknown"}
                     if not conn.execute(
                             """INSERT INTO manual_categories

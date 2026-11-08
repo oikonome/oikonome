@@ -8,9 +8,11 @@ import csv as _c
 import io as _io
 import json as _json
 import logging
+import os
 import zipfile
 
 from .. import ext
+from .archive_upgrades import MANIFEST, manifest, migration_names
 
 log = logging.getLogger(__name__)
 
@@ -28,7 +30,9 @@ DATA_MAP = {
     "manual_categories": "per-transaction category overrides",
     "merchants": "merchants as rows — name, Plaid entity id, logo, "
                  "website, kind; transactions.merchant_id points here",
-    "alerts_log": "alert history",
+    "alerts_log": "alert history (a restore brings back only the alerts "
+                  "you dismissed, so they stay dismissed; the rest the "
+                  "destination rebuilds)",
     "import_batches": "file-import history (what was imported, when)",
     "liabilities": "credit-card / loan terms (due dates, APRs)",
     "holdings": "investment holdings (positions and prices)",
@@ -67,6 +71,10 @@ DATA_MAP = {
     "account_adoptions": "the ids an account stood under before a bank "
                          "reconnect moved it (so a re-imported statement "
                          "finds its earlier rows)",
+    "account_sources": "which account each imported or typed account "
+                       "name fills — a keyed fingerprint, never the name "
+                       "(a restore into another household matches by the "
+                       "accounts' names instead)",
     "receipts": "receipt images (base64 in the CSV)",
     "receipt_items": "receipt line items",
     "tenant_settings": "your settings (credentials scrubbed)",
@@ -163,6 +171,23 @@ def _control_csv(conn, table: str) -> str:
     return sio.getvalue()
 
 
+def schema_version(conn) -> str | None:
+    """The last migration this database applied: the shape its rows are
+    in. The code's own newest migration when the record cannot be read
+    (the two agree on any install `db.migrate` has run on)."""
+    try:
+        # a savepoint, so a refusal cannot abort a caller's transaction
+        with conn.transaction():
+            names = [r["name"] for r in conn.execute(
+                "SELECT name FROM schema_migrations").fetchall()]
+    except Exception:                                    # noqa: BLE001
+        log.warning("export: schema_migrations unreadable", exc_info=True)
+        names = []
+    names = names or migration_names()
+    # the order db.migrate applies the files in
+    return max(names) if names else None
+
+
 def binary_tables(conn) -> set[str]:
     """Tables with a binary column. Their rows are as large as a file the
     person uploaded, so a reader streaming them must fetch one at a time.
@@ -185,6 +210,13 @@ _EXPORT_SELECT = {
 }
 
 
+# The tables whose raw holds a feed's own object. An account or person
+# identifier in it (sync/plaid.py PLAID_RAW_IDENTIFIERS) never leaves in an
+# export, whether the row was written before the rule or not.
+_RAW_ID_TABLES = frozenset({"accounts", "transactions", "liabilities",
+                            "holdings"})
+
+
 def _scrub_snapshot(cfg):
     """A closed month's frozen config gets the same deep scrub as the live
     settings row. A snapshot frozen before a scrub rule existed still
@@ -197,8 +229,8 @@ def _scrub_snapshot(cfg):
             return None
     if not isinstance(cfg, dict):
         return cfg
-    from .restore import scrub_config
-    return scrub_config(cfg)
+    from ..web.settings_exposure import export_view
+    return export_view(cfg)
 
 
 def build_zip(conn, out=None, *,
@@ -213,6 +245,7 @@ def build_zip(conn, out=None, *,
     is logged, appended to `warnings` for the caller to show, and written
     into the archive beside the README."""
     from ..web.pages import EXPORT_SKIP, _EXPORT_ORDER, _csv_cell
+    from .plaid import scrub_raw as _plaid_scrub
     # The same RLS-only discovery the portable metadata archive
     # (tenant_export) uses:
     # tenant_id alone is NOT enough (users/invites/api_tokens carry it
@@ -244,13 +277,15 @@ def build_zip(conn, out=None, *,
         "exactly that apostrophe.\n\n"
         "What each file is. Files marked (records only) are written for\n"
         "your own reading and are NOT loaded by a restore — they hold\n"
-        "this instance's operating state (alerts, sync logs, staged\n"
-        "uploads), which the destination rebuilds for itself.\n\n"
+        "this instance's operating state (sync logs, staged uploads),\n"
+        "which the destination rebuilds for itself.\n\n"
         + "\n".join(
             f"  {t}.csv — {DATA_MAP.get(t, '')}"
             + ("" if t in _RESTORED else "  (records only)")
             for t in TABLES)
-        + "\n")
+        + f"\n  {MANIFEST} — which version of the app wrote this archive;"
+          "\n    a restore reads it to bring an older archive's rows up to"
+          "\n    date\n")
     from ..tenant_export import _EXCLUDE_COLS
     # The metadata archive's secret-column set, plus tenant_id (ambient
     # here, meaningless to the recipient) — membership is discovered, so
@@ -262,6 +297,8 @@ def build_zip(conn, out=None, *,
     _blobs = {"raw_bytes", "image", "image_optimized", "content"}
     drop = (_EXCLUDE_COLS - _blobs) | {"tenant_id"}
     binary = binary_tables(conn)
+    # read before the snapshot opens: a failure here must not abort it
+    schema = schema_version(conn)
     buf = out if out is not None else _io.BytesIO()
     # ONE snapshot for the whole archive. Syncs, collectors and other
     # members keep committing while it streams; read table by table at
@@ -277,6 +314,10 @@ def build_zip(conn, out=None, *,
         conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, "
                      "READ ONLY")
         z.writestr("README.txt", readme)
+        # the shape every row below is in, so a restore on a newer install
+        # knows which of its migrations these rows have not had yet
+        z.writestr(MANIFEST, manifest(
+            schema, os.environ.get("OIKONOME_VERSION") or "dev", TABLES))
         for tbl in TABLES:
             if tbl in CONTROL_TABLES:
                 z.writestr(f"{tbl}.csv", _control_csv(conn, tbl))
@@ -286,7 +327,7 @@ def build_zip(conn, out=None, *,
                 # only table still materialized before writing
                 import json as _j
 
-                from ..sync.restore import scrub_config as _scrub
+                from ..web.settings_exposure import export_view as _scrub
                 rows = []
                 for r in conn.execute("SELECT * FROM tenant_settings"
                                       ).fetchall():
@@ -330,6 +371,8 @@ def build_zip(conn, out=None, *,
                             r = dict(r)
                             if tbl == "budget_snapshots":
                                 r["config"] = _scrub_snapshot(r.get("config"))
+                            elif tbl in _RAW_ID_TABLES:
+                                r["raw"] = _plaid_scrub(r.get("raw"))
                             if w is None:
                                 cols = [c for c in r.keys()
                                         if c not in drop]

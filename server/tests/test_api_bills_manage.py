@@ -337,6 +337,50 @@ class RecurringManageApiTests(unittest.TestCase):
 
     # -- history + ledger fit + hint dismissal --------------------------------
 
+    def test_history_of_a_bill_with_no_amount_still_renders(self):
+        """A restore can land a bill row whose amount is empty; its history
+        page reads it as $0, like every other reader of the bill, and never
+        500s."""
+        today = dt.date.today()
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            add_txn(conn, today - dt.timedelta(days=4), 31.0,
+                    "QUILLWORKS STUDIO", account="chk")
+            self.client.post("/api/bills/save", json={
+                "payee": "Quillworks Studio", "amount": 31,
+                "cadence": "MONTHLY:1",
+                "next_due": (today + dt.timedelta(days=26)).isoformat()})
+            conn.execute("UPDATE bills SET amount=NULL "
+                         "WHERE payee='Quillworks Studio'")
+            conn.commit()
+        finally:
+            conn.close()
+        r = self.client.get("/api/bills/history",
+                            params={"payee": "Quillworks Studio"})
+        self.assertEqual(r.status_code, 200)
+
+    def test_a_proposal_with_a_signed_amount_still_marks_its_charges(self):
+        """The highlight compares charge sizes: a proposal amount stored
+        signed (a restored archive) is read as its size, so its charges
+        still count as hits."""
+        today = dt.date.today()
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            add_txn(conn, today - dt.timedelta(days=6), 27.0,
+                    "LANTERNHOUSE BOOKS", account="chk")
+            conn.execute(
+                "INSERT INTO bill_proposals (id, kind, payee, amount, "
+                "frequency, interval, status, evidence, created_at) VALUES "
+                "('p-lantern', 'add', 'Lanternhouse Books', -27, 'MONTHLY', "
+                "1, 'pending', '{}'::jsonb, now())")
+            conn.commit()
+        finally:
+            conn.close()
+        h = self.client.get("/api/bills/history",
+                            params={"payee": "Lanternhouse Books"}).json()
+        self.assertTrue(h["txns"])
+        self.assertTrue(all(t["hit"] for t in h["txns"]))
+
     def test_history_hits_fit_and_hint(self):
         today = dt.date.today()
         conn = tenancy.tenant_connect(self.tid)

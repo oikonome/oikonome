@@ -9,8 +9,8 @@ import { useState } from "react";
 import { interestSaved, parseMoneyDraft, rebaseFields, rebaseKeyed }
   from "../moneymath";
 import { isViewer } from "../role";
-import { api, errText, money, type DebtMethod, type DebtPlan, type DebtRow,
-         type DebtSchedule } from "../api/client";
+import { api, errText, money, type DebtMethod, type DebtPlan, type DebtPlanSave,
+         type DebtRow, type DebtSchedule } from "../api/client";
 import AreaChart from "../components/AreaChart";
 
 const NAMES: Record<DebtMethod, string> = { avalanche: "Avalanche", snowball: "Snowball" };
@@ -26,6 +26,15 @@ export const monthYear = (iso: string | null | undefined) => {
   const m = Number(iso.slice(5, 7)) - 1;
   return `${MONTHS[m] ?? ""} ${iso.slice(0, 4)}`;
 };
+// whether a schedule ends inside the fifty-year walk; one that does not
+// carries fifty years of compounding as its interest, which nobody pays
+export const finishes = (x: { finishes?: boolean; debt_free: string | null }) =>
+  x.finishes ?? x.debt_free !== null;
+// what to say in place of an interest figure for a schedule that never ends
+export const noEnd = (x: { growing: boolean }) =>
+  x.growing ? "grows — the minimums don't cover the interest"
+    : "not paid off within fifty years";
+
 export const span = (months: number | null) => {
   if (months === null) return "not within fifty years";
   if (months === 0) return "today";
@@ -61,6 +70,16 @@ const draftOf = (rows: DebtRow[]): Draft => Object.fromEntries(rows.map((d) => [
   skip: d.skip,
 }]));
 
+// The planner reply also carries every stored override (the shared
+// type predates it, so it is optional here).
+type WithOverrides = DebtPlan & { overrides?: DebtPlanSave["debts"] };
+
+// Stored overrides whose debt is not in the map being saved.
+const keptOverrides = (stored: DebtPlanSave["debts"] | undefined,
+                       saving: Record<string, unknown>): DebtPlanSave["debts"] =>
+  Object.fromEntries(Object.entries(stored ?? {})
+    .filter(([id]) => !Object.prototype.hasOwnProperty.call(saving, id)));
+
 export default function Debt() {
   const [params, setParams] = useState<Record<string, string>>({});
   const q = useQuery({
@@ -82,16 +101,19 @@ export default function Debt() {
     // the stored plan now and lay only this page's changes over it.
     mutationFn: async (v: { plan: PlanFields; planBase: PlanFields;
                             mine: Draft; base: Draft }) => {
-      const fresh = await api.debtPlan();
+      const fresh: WithOverrides = await api.debtPlan();
       const plan = rebaseFields(v.plan, v.planBase, fresh.saved);
       const debts = rebaseKeyed(v.mine, v.base, draftOf(fresh.debts));
       return api.debtPlanSave({
         method: plan.method, extra_monthly: plan.extra_monthly,
-        debts: Object.fromEntries(Object.entries(debts).map(([id, x]) => [id, {
+        // the list holds only debts carrying a balance; a stored override
+        // of one off it (paid to zero, excluded) rides along untouched, or
+        // this save would erase it
+        debts: { ...keptOverrides(fresh.overrides, debts), ...Object.fromEntries(Object.entries(debts).map(([id, x]) => [id, {
           apr: x.apr === "" ? null : x.apr,
           min_payment: x.min_payment === "" ? null : x.min_payment,
           skip: x.skip,
-        }])),
+        }])) },
       });
     },
     onSuccess: (d) => {
@@ -189,6 +211,7 @@ export default function Debt() {
           </div>
           <div className="tile">
             <div className="sub">Interest to pay</div>
+            {finishes(plan) ? (<>
             <div className="kpi sm">{money(plan.total_interest)}</div>
             <div className={`sub ${saved(plan) > 0 ? "pos" : ""}`}>
               {saved(plan) > 0
@@ -197,17 +220,26 @@ export default function Debt() {
                   ? `minimums only: ${money(base.total_interest)}`
                   : "minimums only never finish"}
             </div>
+            </>) : (<>
+            <div className="kpi sm neg">no end</div>
+            <div className="sub neg">{noEnd(plan)}</div>
+            </>)}
           </div>
           <div className="tile">
             <div className="sub">{NAMES[OTHER[method]]} instead</div>
             <div className="kpi sm">{alt.debt_free ? monthYear(alt.debt_free) : "never"}</div>
+            {!finishes(alt) ? (
+              <div className="sub neg">{noEnd(alt)}</div>
+            ) : !finishes(plan) ? (
+              <div className="sub pos">{money(alt.total_interest)} interest</div>
+            ) : (
             <div className={`sub ${alt.total_interest > plan.total_interest ? "" : "pos"}`}>
               {money(alt.total_interest)} interest
               {alt.total_interest !== plan.total_interest && (
                 alt.total_interest > plan.total_interest
                   ? ` — ${money(alt.total_interest - plan.total_interest)} more`
                   : ` — ${money(plan.total_interest - alt.total_interest)} less`)}
-            </div>
+            </div>)}
           </div>
         </div>
 
@@ -290,7 +322,8 @@ export default function Debt() {
                   <td>{x.skip ? <span className="pill m">left out</span>
                     : p?.paid_off ? <span className="pill g">{monthYear(p.paid_off)}</span>
                     : <span className="pill r">never</span>}</td>
-                  <td className="num">{p ? money(p.interest) : "·"}</td>
+                  {/* a debt the walk never clears has no interest total */}
+                  <td className="num">{p?.paid_off ? money(p.interest) : "·"}</td>
                   <td>{viewer ? (x.skip ? "yes" : "") : (
                     <input type="checkbox" checked={row.skip}
                            onChange={(e) => setRow(x.id, { skip: e.target.checked })} />)}</td>
@@ -301,8 +334,8 @@ export default function Debt() {
         </table>
         <p className="sub">
           Rates and minimums come from the bank where it reports them, else
-          from what you type here; an <b>estimate</b> is 2% of a card's
-          balance (at least $25), a five-year payment for a loan, thirty
+          from what you type here; an <b>estimate</b> is a month's
+          interest plus 1% of a card's balance, at least 2% and $25, a five-year payment for a loan, thirty
           years for a mortgage — correct it and save. Minimums are held
           flat for the whole walk, and interest accrues monthly at APR ÷ 12.
           {!viewer && draft !== null && " Changes here apply when you save the plan."}

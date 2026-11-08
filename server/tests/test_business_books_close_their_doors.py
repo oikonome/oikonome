@@ -690,6 +690,25 @@ class FrontedChargeTests(_Biz):
             "SELECT label FROM activity_log WHERE target = 'p1'").fetchone()
         self.assertIn("contribution", said["label"])
 
+    def test_an_archived_business_keeps_a_withdrawn_charges_movement(self):
+        """An archived business's records are kept as they are: the
+        movement stops counting with its charge but is not deleted."""
+        add_txn(self.conn, dt.date(YEAR, 5, 1), 300.0, "LAPTOP STAND",
+                account="card", txn_id="p1")
+        equity.contribute_expense(self.conn, self.eid, "p1")
+        stamp = (dt.datetime.now(dt.timezone.utc)
+                 - dt.timedelta(days=10)).isoformat()
+        self.conn.execute(
+            "UPDATE transactions SET removed = 1, raw = %s WHERE id = 'p1'",
+            (jsonb({"feed_removed_at": stamp}),))
+        self.conn.execute("UPDATE business_entity SET status = 'archived'"
+                          " WHERE id = %s", (self.eid,))
+        self.assertEqual(equity.release_withdrawn_fronted(
+            self.conn, ["p1"], older_than_days=7), 0)
+        self.assertEqual(len(equity.list_movements(self.conn, self.eid)), 1)
+        self.assertEqual(equity.capital_summary(
+            self.conn, self.eid)["contributions"], 0.0)
+
     def test_a_retired_hold_is_not_released(self):
         add_txn(self.conn, dt.date(YEAR, 5, 1), 300.0, "LAPTOP STAND",
                 account="card", txn_id="p1")

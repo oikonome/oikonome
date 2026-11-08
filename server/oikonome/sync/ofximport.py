@@ -31,10 +31,10 @@ import threading
 from ofxtools.Parser import OFXTree
 
 from ..engine.compat import as_date
-from . import flowmap
+from . import feed_dates, flowmap
 from .base import (FileImportIds, Transaction, _descriptor,
                    check_split_accounts, ensure_split_account,
-                   mask_long_digits,
+                   mask_account_name,
                    drop_before_history, upsert_transactions)
 from . import rowcap
 from .rowcap import check_len
@@ -167,6 +167,8 @@ def parse_ofx(data: bytes, tenant: str | None = None) -> list[dict]:
 def _parse_tree(data: bytes) -> list[dict]:
     tree = OFXTree()
     tree.parse(io.BytesIO(data))
+    # the day each stamp prints in the file's own zone, not its UTC day
+    feed_dates.pin_ofx_days(tree.getroot())
     ofx = tree.convert()
     out = []
     for stmt in ofx.statements:
@@ -425,9 +427,9 @@ def _statement_window(stmt) -> tuple[dt.date, dt.date] | None:
 
 
 def _stmt_target(conn, rows: list[dict]) -> str:
-    """The split account for one statement's rows, keyed by ACCTID suffix
+    """The split account for one statement's rows, found by its ACCTID
     (stable across re-imports; the full account number never lands in an
-    id). Type comes from the statement itself — CCSTMTRS → credit,
+    id or a stored name). Type comes from the statement itself — CCSTMTRS → credit,
     ACCTTYPE SAVINGS → savings, else checking."""
     r0 = rows[0]
     if r0["cc"]:
@@ -438,9 +440,20 @@ def _stmt_target(conn, rows: list[dict]) -> str:
         label = str(r0["accttype"] or "Account").title()
         type_, subtype = "depository", "checking"
     last4 = str(r0["acct"])[-4:]
+    # the account's own number is its source (account_sources keys it, the
+    # number is stored nowhere): two cards sharing their last four in one
+    # file, which the last-four key alone made one account, stay two
+    # and the statement's own lines say whether an account already holds
+    # this card's rows (an earlier build gave two such cards one account)
     return ensure_split_account(conn, "ofx", f"{label} ...{last4}",
                                 key=f"{label}-{last4}",
-                                type_=type_, subtype=subtype)
+                                type_=type_, subtype=subtype,
+                                source=str(r0["acct"]),
+                                lines=[(r["date"], -r["amount"],
+                                        str(r["name"]).strip())
+                                       for r in rows],
+                                fitids=sorted({str(r["fitid"]) for r in rows
+                                               if r.get("fitid")}))
 
 
 def import_ofx(conn, account_id: str, data: bytes,
@@ -583,7 +596,11 @@ class _FitidIds:
         dates = [r["date"] for r in rows if r.get("date")]
         if dates:
             spans.add((min(dates), max(dates)))
-        return sorted(spans)
+        # A zoned stamp was once stored on its UTC day, at most a day
+        # either side of the day it prints: a re-import still covers the
+        # row an earlier import of the same file stored that way.
+        slack = dt.timedelta(days=feed_dates.UTC_DAY_DRIFT)
+        return sorted((lo - slack, hi + slack) for lo, hi in spans)
 
     def _covered(self, day) -> bool:
         return any(lo <= day <= hi for lo, hi in self._windows)
@@ -611,7 +628,7 @@ class _FitidIds:
     @staticmethod
     def _name_key(name) -> str:
         # the form the upsert stores a file row's name in
-        return (_descriptor(mask_long_digits(str(name or "").strip()))
+        return (_descriptor(mask_account_name(str(name or "").strip()))
                 or "").lower()
 
     def _base(self, fitid) -> str:
@@ -789,7 +806,7 @@ def _import_into(conn, account_id: str, rows: list[dict], *,
         # TRANSFER TO CHK 1234567890123"); the stored name is masked, and
         # raw must not keep the copy the name lost
         for k in ("name", "memo"):
-            raw[k] = mask_long_digits(raw.get(k))
+            raw[k] = mask_account_name(raw.get(k))
         txns.append(Transaction(
             id=tid, account_id=account_id, date=r["date"], amount=amount,
             name=name, category_primary=primary, raw=raw))

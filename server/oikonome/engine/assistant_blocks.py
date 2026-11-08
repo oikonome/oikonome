@@ -63,6 +63,9 @@ def guide() -> str:
 
 # ---- validation -----------------------------------------------------------
 
+_VALUE_MAX = 1e15   # the CSV importer's amount ceiling
+
+
 def _num(v):
     """A finite number, or None. Booleans are not numbers here."""
     if isinstance(v, bool) or not isinstance(v, (int, float)):
@@ -74,7 +77,9 @@ def _num(v):
         # figure anyone meant; refusing it drops this one value, where
         # letting float() raise would fail the whole answer
         return None
-    if not math.isfinite(f):
+    # finite is not enough: values each finite can still sum past the float
+    # ceiling (a pie's centre total), so a figure no ledger holds is refused
+    if not math.isfinite(f) or abs(f) > _VALUE_MAX:
         return None
     return round(f, 2)
 

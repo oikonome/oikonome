@@ -45,11 +45,19 @@ COPY server/pyproject.toml server/
 COPY server/oikonome server/oikonome
 # [model] = the optional local-categorizer stack; the image carries it so
 # mounting a model file is all an operator has to do to enable the feature
-RUN pip install './server[model]'
+# The base image's bundled pip/setuptools lag their security fixes by months;
+# upgrade them before anything is built on them (an image scanner reads the
+# bundled copies as the image's packages otherwise)
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
+ && pip install './server[model]'
 # An operator's add-on, if one sits in extras/ (empty in the public tree):
 # installed after the product so its entry points register in this image.
 COPY extras extras
 RUN if [ -f extras/pyproject.toml ]; then pip install ./extras; fi
+# pip is a build tool: nothing in the running image installs anything, and
+# pip carries its own vendored copies of urllib3, msgpack and setuptools that
+# lag their fixes and that a scanner reads as the image's. Out it goes.
+RUN python -m pip uninstall -y pip wheel >/dev/null
 COPY --from=webapp /build/dist webapp/dist
 # In-app Help serves these (single source with the GitHub copies)
 COPY docs docs

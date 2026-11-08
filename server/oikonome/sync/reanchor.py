@@ -201,9 +201,13 @@ def find_twin(conn, row: dict) -> tuple[str | None, str]:
     linked = conn.execute(
         """SELECT id FROM transactions
             WHERE removed = 0 AND id <> %s AND account_id = %s
-              AND raw->>'pending_transaction_id' = %s
+              -- the column where the settlement wrote it (restore and adopt
+              -- re-key only the column), else the feed's raw field
+              AND (pending_transaction_id = %s
+                   OR (pending_transaction_id IS NULL
+                       AND raw->>'pending_transaction_id' = %s))
             ORDER BY id""",
-        (row["id"], row["account_id"], row["id"])).fetchall()
+        (row["id"], row["account_id"], row["id"], row["id"])).fetchall()
     if len(linked) == 1:
         return linked[0]["id"], "matched"
     cands = conn.execute(

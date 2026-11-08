@@ -3,6 +3,7 @@ import { type QueryClient, useQueryClient } from "@tanstack/react-query";
 import { api, errText } from "../api/client";
 import { smsPauseNote } from "../api/cache";
 import { signOut } from "../push";
+import { RecoverySheetButtons } from "./RecoverySheetButtons";
 
 /** a blocking enrollment gate. Hosted accounts must set up a
  *  second factor (authenticator app OR passkey) before the app is usable
@@ -132,12 +133,12 @@ export default function TwoFactorGate({ onDone }: { onDone: () => void }) {
                  userSelect: "all", background: "var(--hover)" }}>
               {codes.map((c) => <div key={c}>{c}</div>)}
             </div>
-            <button className="pri" style={{ marginTop: ".8rem" }}
-                    onClick={() => {
-                      navigator.clipboard?.writeText(codes.join("\n"));
-                      finish();
-                    }}>
-              I've saved them — continue</button>
+            {/* the only showing: a refused copy keeps the codes up */}
+            <div style={{ marginTop: ".8rem" }}>
+              <RecoverySheetButtons codes={codes} onErr={setErr}
+                onDone={finish} copyLabel="Copy & continue"
+                doneLabel="Continue" />
+            </div>
           </>
         ) : mode === "totp" ? (
           <>

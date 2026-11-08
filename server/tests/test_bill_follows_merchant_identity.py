@@ -439,37 +439,37 @@ class Discovery(_Ledger):
         self.assertEqual(names, frozenset({"Northwind"}))
 
     def test_a_processor_prefix_does_not_offer_the_merchants_other_rows(self):
-        """"GOOGLE *SMASHBURGER" is Smashburger paid through Google: the
+        """"WALLETCO *HARBORLIGHT" is Harborlight paid through Walletco: the
         word hits the descriptor, not the merchant's name."""
         sb = self.conn.execute(
             "INSERT INTO merchants (name, name_source, plaid_entity_id) VALUES "
-            "('Smashburger','plaid','ent-sb') RETURNING id").fetchone()["id"]
+            "('Harborlight','plaid','ent-hl') RETURNING id").fetchone()["id"]
         ids = [add_txn(self.conn, TODAY - dt.timedelta(days=d), 14.0, name,
-                       merchant="Smashburger", primary="FOOD_AND_DRINK")
-               for d, name in ((2, "GOOGLE *SMASHBURGER"), (9, "SMASHBURGER 1234"),
-                               (16, "SMASHBURGER 1234"))]
+                       merchant="Harborlight", primary="FOOD_AND_DRINK")
+               for d, name in ((2, "WALLETCO *HARBORLIGHT"), (9, "HARBORLIGHT 1234"),
+                               (16, "HARBORLIGHT 1234"))]
         self.conn.execute("UPDATE transactions SET merchant_id=%s WHERE id = ANY(%s)",
                           (sb, ids))
         names = budget.bill_displays(
-            self.conn, [{"payee": "Google", "merchant": "google"}], TODAY)
-        self.assertNotIn("Smashburger", names["Google"])
+            self.conn, [{"payee": "Walletco", "merchant": "walletco"}], TODAY)
+        self.assertNotIn("Harborlight", names["Walletco"])
 
     def test_a_string_clean_grouping_needs_the_majority(self):
         sb = self.conn.execute(
             "INSERT INTO merchants (name, name_source) VALUES "
-            "('Smashburger','layer1') RETURNING id").fetchone()["id"]
+            "('Harborlight','layer1') RETURNING id").fetchone()["id"]
         ids = [add_txn(self.conn, TODAY - dt.timedelta(days=d), 14.0, name,
                        merchant=m, primary="FOOD_AND_DRINK")
-               for d, name, m in ((2, "GOOGLE SMASHBURGER", "Google Smashburger"),
-                                  (9, "SMASHBURGER 1234", "Smashburger"),
-                                  (16, "SMASHBURGER 1234", "Smashburger"))]
+               for d, name, m in ((2, "WALLETCO HARBORLIGHT", "Walletco Harborlight"),
+                                  (9, "HARBORLIGHT 1234", "Harborlight"),
+                                  (16, "HARBORLIGHT 1234", "Harborlight"))]
         self.conn.execute("UPDATE transactions SET merchant_id=%s WHERE id = ANY(%s)",
                           (sb, ids))
-        q = [{"payee": "Google", "merchant": "google"}]
-        self.assertNotIn("Smashburger", budget.bill_displays(self.conn, q, TODAY)["Google"])
+        q = [{"payee": "Walletco", "merchant": "walletco"}]
+        self.assertNotIn("Harborlight", budget.bill_displays(self.conn, q, TODAY)["Walletco"])
         # the same grouping by a person's hand IS authority
         self.conn.execute("UPDATE merchants SET name_source='manual' WHERE id=%s", (sb,))
-        self.assertIn("Smashburger", budget.bill_displays(self.conn, q, TODAY)["Google"])
+        self.assertIn("Harborlight", budget.bill_displays(self.conn, q, TODAY)["Walletco"])
 
     def test_the_payees_own_name_is_its_bucket(self):
         # no words in common with the rows' text, but the ledger displays a
@@ -536,10 +536,10 @@ class AttachBoundary(unittest.TestCase):
         self.assertEqual(bills.attachable(self.conn, "Google", "google", {"Google Store"},
                                           offer=True), ["Google Store"])
         # the same shape under a manual name and under an envelope
-        for n in ("Smashburger", "Smashburger Riverton"):
+        for n in ("Harborlight", "Harborlight Eastside"):
             self._merchant(n)
-        self.assertEqual(bills.attachable(self.conn, "Smashburger", "smashburger",
-                                          {"Smashburger Riverton"}), [])
+        self.assertEqual(bills.attachable(self.conn, "Harborlight", "harborlight",
+                                          {"Harborlight Eastside"}), [])
         for n in ("Riverton", "Riverton Power"):
             self._merchant(n)
         self.assertEqual(bills.attachable(self.conn, "Riverton", "riverton",

@@ -192,6 +192,18 @@ def _tokens(name: str | None) -> list[str]:
             if len(w) >= 3 and not w.isdigit()]
 
 
+def _lead_letter(name: str | None) -> str | None:
+    """The single letter a brand leads with ('H Mart', 'K Mart'), as the
+    merchant canonicaliser keeps it, or None. Two names whose letters
+    differ are different stores whatever their other words share."""
+    if not name:
+        return None
+    from .merchant_dedup import canonical_merchant
+    words = _WORD.findall((canonical_merchant(name) or name).casefold())
+    return words[0] if len(words) >= 2 and len(words[0]) == 1 \
+        and words[0].isalpha() else None
+
+
 def merchant_match(receipt_name: str | None, names) -> str:
     """'same', 'different' or 'unknown': does a charge name the receipt's
     store?
@@ -204,12 +216,17 @@ def merchant_match(receipt_name: str | None, names) -> str:
     if not ra:
         return "unknown"
     squash_a = "".join(ra)
+    lead_a = _lead_letter(receipt_name)
     seen = False
     for n in names:
         tb = _tokens(n)
         if not tb:
             continue
         seen = True
+        lead_b = _lead_letter(n)
+        if lead_a and lead_b and lead_a != lead_b:
+            continue                         # 'Q Depot' is not 'V Depot'
+
         squash_b = "".join(tb)
         if (len(squash_a) >= 4 and len(squash_b) >= 4
                 and (squash_a in squash_b or squash_b in squash_a)):
@@ -577,6 +594,56 @@ def release_stranded(conn) -> int:
               AND r.match_method IS NOT NULL""").rowcount
 
 
+def _auto_eligible(c: dict) -> bool:
+    """Could `decide` ever pick this candidate on its own?"""
+    return (-AUTO_DAYS_BEFORE <= c["day_gap"] <= AUTO_DAYS_AFTER
+            and not c.get("refused_twin")
+            and (c["exact"] or c["merchant_match"] == "same"))
+
+
+def _closer_claims(every: list[list[dict]]) -> list[set]:
+    """For each receipt of a matcher pass, the charges ANOTHER waiting
+    receipt has a strictly closer claim on.
+
+    Pairing receipts one at a time, each taking the one charge it can
+    see, would let the order of the walk decide which of two receipts a
+    charge goes to: the same coffee bought two mornings running, with only
+    the first morning's charge posted, must not be taken by the second
+    morning's receipt just because it was walked first. The receipts and
+    charges are paired as a whole (`pairing.pair`: the charge of a receipt's own day
+    first, then the nearest, each by `decide`'s own preference), and a
+    charge paired with a receipt whose claim on it is strictly better than
+    this receipt's is not this receipt's to take. Equal claims stay as
+    they were: two receipts nothing tells apart are for a person."""
+    from ..sync.pairing import edge_key, pair
+    claim: dict[tuple[int, str], tuple] = {}
+    day: dict[str, dt.date] = {}
+    edges = []
+    for i, cands in enumerate(every):
+        for c in cands:
+            if not _auto_eligible(c):
+                continue
+            # the store and the match kind before the day gap, as decide()
+            # ranks them: a charge posts days after the purchase, so another
+            # store's receipt dated on the posting day must not outrank the
+            # charge's own store at a smaller gap (pair() orders by its
+            # `days` first, so the gap rides last inside the rank)
+            rank = (_precedence(c), _MERCHANT_RANK[c["merchant_match"]],
+                    abs(c["day_gap"]))
+            claim[(i, c["txn_id"])] = edge_key(0, rank)
+            day[c["txn_id"]] = c["date"]
+            edges.append((i, c["txn_id"], 0, rank))
+    got = pair(edges, in_key=lambda i: (i,),
+               cand_key=lambda t: (day[t], t))
+    owner_of = {txn: (i, claim[(i, txn)]) for i, txn in got.items()}
+    out: list[set] = [set() for _ in every]
+    for (i, txn), theirs in claim.items():
+        owner = owner_of.get(txn)
+        if owner is not None and owner[0] != i and owner[1] < theirs:
+            out[i].add(txn)
+    return out
+
+
 def match_waiting(conn, today: dt.date | None = None) -> dict:
     """Try the waiting parsed receipts, newest first. Cheap when nothing
     waits — one indexed probe — which is the answer on nearly every sync.
@@ -609,12 +676,14 @@ def match_waiting(conn, today: dt.date | None = None) -> dict:
         # a charge this pass has just given to one receipt is no longer
         # free for the next — the same answer a fresh query would give
         taken: set[str] = set()
-        for row, cands in zip(rows, every):
+        closer = _closer_claims(every)
+        for row, cands, theirs in zip(rows, every, closer):
             try:
                 with conn.transaction():
                     got = _try_one(
                         conn, row,
-                        [c for c in cands if c["txn_id"] not in taken],
+                        [c for c in cands if c["txn_id"] not in taken
+                         and c["txn_id"] not in theirs],
                         today)
             except Exception:                          # noqa: BLE001
                 log.warning("waiting receipt %s passed over by the matcher",

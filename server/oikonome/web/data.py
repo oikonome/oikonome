@@ -369,24 +369,9 @@ def live_edit_ids(conn, ids: list[str]) -> dict[str, str]:
     carried, or waits and is sent to the posted row."""
     conn.execute(_REIMB_LOCK.replace(
         "pg_advisory_xact_lock(", "pg_advisory_xact_lock_shared(", 1))
-    ids = [i for i in dict.fromkeys(ids) if i]
-    if not ids:
-        return {}
-    out = {r["id"]: r["id"] for r in conn.execute(
-        "SELECT id FROM transactions WHERE id = ANY(%s) AND removed = 0",
-        (ids,)).fetchall()}
-    gone = [i for i in ids if i not in out]
-    if gone:
-        for r in conn.execute(
-                """SELECT DISTINCT ON (p.id) p.id AS hold, t.id
-                     FROM transactions p
-                     JOIN transactions t
-                       ON t.removed = 0 AND t.account_id = p.account_id
-                      AND t.raw->>'pending_transaction_id' = p.id
-                    WHERE p.id = ANY(%s) AND p.removed = 1
-                    ORDER BY p.id, t.id""", (gone,)).fetchall():
-            out[r["hold"]] = r["id"]
-    return out
+    # which posted row a hold became is engine.live_txn's one rule
+    from ..engine import live_txn
+    return live_txn.resolve(conn, ids)
 
 
 def list_owners(conn) -> list[str]:
@@ -781,9 +766,17 @@ def set_account_display_name(conn, account_id: str, name: str) -> int:
     landed on nothing: a reconnect adoption renames account ids, so an
     edit racing one can address an id that no longer exists, and
     answering ok for it reports success for a change nobody will ever
-    see."""
+    see.
+
+    A full card number typed into the name keeps only its last four, as
+    a new account's name does: the rename is on every page and in every
+    export; cut as every account door stores a name
+    (account_sources.stored_account_name), so a number spaced by
+    underscores or en dashes is cut too."""
+    from ..sync.account_sources import stored_account_name
     return conn.execute("UPDATE accounts SET display_name=%s WHERE id=%s",
-                        (name.strip() or None, account_id)).rowcount
+                        (stored_account_name(name.strip()) or None,
+                         account_id)).rowcount
 
 
 NOTE_MAX = 2000
@@ -893,12 +886,19 @@ def _relabel_buckets(cfg: dict, old: str, new: str) -> int:
         return 0
     changed = 0
     out = []
+    # the bucket takes the new name only where the settings door would
+    # accept it (1-40 chars, not reserved, not another bucket's): a name it
+    # refuses would make every later save of the plan fail
+    taken = {str(b.get("name") or "").lower() for b in lst
+             if isinstance(b, dict) and (b.get("name") or "") != old}
+    name_ok = (len(new) <= 40 and new.lower() not in taken
+               and new.lower() not in budget.RESERVED_BUCKET_NAMES)
     for b in lst:
         if not isinstance(b, dict):
             out.append(b)
             continue
         bb = dict(b)
-        if (bb.get("name") or "") == old:
+        if (bb.get("name") or "") == old and name_ok:
             bb["name"] = new
             changed += 1
         cats = bb.get("categories")
@@ -1161,10 +1161,17 @@ def _drop_store_parts(conn, txn_id: str) -> None:
     the same charge — with the edit as the likely victim. Called inside
     the caller's transaction, so the lock is held through its own
     `transactions` UPDATE."""
-    conn.execute("SELECT 1 FROM transactions WHERE id=%s FOR UPDATE",
-                 (txn_id,))
-    conn.execute("DELETE FROM transaction_splits WHERE txn_id=%s "
-                 "AND source <> 'user'", (txn_id,))
+    _drop_store_parts_of(conn, [txn_id])
+
+
+def _drop_store_parts_of(conn, txn_ids: list[str]) -> None:
+    """_drop_store_parts over a selection: the rows are locked in id
+    order, so two writers over overlapping sets take their shared rows in
+    the same order and one waits for the other instead of deadlocking."""
+    conn.execute("SELECT 1 FROM transactions WHERE id = ANY(%s) "
+                 "ORDER BY id FOR UPDATE", (list(txn_ids),))
+    conn.execute("DELETE FROM transaction_splits WHERE txn_id = ANY(%s) "
+                 "AND source <> 'user'", (list(txn_ids),))
 
 
 def set_category(conn, txn_id: str, category: str,
@@ -1615,28 +1622,15 @@ def bulk_apply(conn, ids: list[str], action: str,
     live = {r["id"]: r for r in conn.execute(
         "SELECT id, COALESCE(category_primary,'') AS prim FROM transactions "
         "WHERE id = ANY(%s) AND removed = 0", (ids,)).fetchall()}
-    applied = flow = 0
+    applied = 0
     with conn.transaction():
+        if action == "category":
+            return _bulk_set_category(conn, ids, live, category)
         for tid in ids:
             row = live.get(tid)
             if row is None:
                 continue
-            if action == "category":
-                if row["prim"] in _BULK_FLOW:
-                    flow += 1          # allowed, but worth telling them
-                conn.execute(
-                    """INSERT INTO manual_categories
-                           (transaction_id, category, set_at, bill_id)
-                       VALUES (%s,%s,now(),NULL)
-                       ON CONFLICT (tenant_id, transaction_id)
-                       DO UPDATE SET category=EXCLUDED.category, set_at=now(),
-                                     bill_id=NULL, link_made=FALSE,
-                                     link_prior=NULL""",
-                    (tid, category))
-                conn.execute(
-                    "UPDATE transactions SET category_override=%s, "
-                    "override_source='user' WHERE id=%s", (category, tid))
-            elif action == "biz_on":
+            if action == "biz_on":
                 flag_business(conn, tid)
             elif action == "biz_off":
                 unflag_business(conn, tid)
@@ -1648,7 +1642,40 @@ def bulk_apply(conn, ids: list[str], action: str,
             else:
                 unflag_reimbursement(conn, tid)
             applied += 1
-    return {"applied": applied, "missing": len(ids) - len(live), "flow": flow}
+    return {"applied": applied, "missing": len(ids) - len(live), "flow": 0}
+
+
+def _bulk_set_category(conn, ids: list[str], live: dict,
+                       category: str) -> dict:
+    """bulk_apply's category action, inside its transaction.
+
+    The same answer as the row's own picker, taken in the same order: each
+    row before its pin (as set_category and clear_category do, through
+    _drop_store_parts), and the rows by id rather than in the order the
+    client listed them, so a selection crossing another category writer
+    waits for it instead of being killed as a deadlock with the whole
+    selection rolled back. The store's split parts go with the rows' old
+    answer: they outrank the row's category in every rollup."""
+    if live:
+        mine = sorted(live)
+        _drop_store_parts_of(conn, mine)
+        conn.execute(
+            # bill_id NULL: a person's answer, as on the single row
+            """INSERT INTO manual_categories
+                   (transaction_id, category, set_at, bill_id)
+               SELECT u, %s, now(), NULL
+                 FROM unnest(%s::text[]) AS u ORDER BY u
+               ON CONFLICT (tenant_id, transaction_id)
+               DO UPDATE SET category=EXCLUDED.category, set_at=now(),
+                             bill_id=NULL, link_made=FALSE,
+                             link_prior=NULL""",
+            (category, mine))
+        conn.execute(
+            "UPDATE transactions SET category_override=%s, "
+            "override_source='user' WHERE id = ANY(%s)", (category, mine))
+    return {"applied": len(live), "missing": len(ids) - len(live),
+            # allowed, but worth telling them
+            "flow": sum(1 for r in live.values() if r["prim"] in _BULK_FLOW)}
 
 
 def _lock_identity_first(conn) -> None:
@@ -2038,6 +2065,16 @@ def _validate_undo(conn, undo, caps: bool = True
 
     rules: list[dict] | None = None
     if rules_in is not None:
+        # One alias lookup for the whole set (a held snapshot is as large as
+        # the merchant's rule family); the loop below still checks entries
+        # in order, so the first bad entry is the one reported.
+        names = []
+        for r in rules_in:
+            try:
+                names.append(_undo_name(r.get("merchant"), "", name_max))
+            except (AttributeError, ValueError):
+                pass
+        rule_canon = _canonicals_of(conn, names)
         rules = []
         for i, r in enumerate(rules_in):
             if not isinstance(r, dict):
@@ -2046,7 +2083,7 @@ def _validate_undo(conn, undo, caps: bool = True
                                   name_max)
             # a snapshot only ever holds rules that resolve to a touched
             # canonical; anything else is not this undo's to restore
-            if _canonical_of(conn, merchant) not in canon_set:
+            if rule_canon[merchant] not in canon_set:
                 raise ValueError(
                     f"undo: rules[{i}] does not belong to a touched merchant")
             rules.append({"merchant": merchant,
@@ -2102,6 +2139,51 @@ def undo_merchant_category(conn, undo: dict) -> int:
     return _apply_undo(conn, undo, caps=True)
 
 
+# Rows restored per statement: large enough that a merchant of thousands of
+# rows is a handful of round trips, small enough that one array parameter
+# stays modest.
+_UNDO_SLICE = 5_000
+
+
+def _restore_rows(conn, affected: list[dict], wrote: str | None) -> int:
+    """Put each affected row's prior category back, set-based.
+
+    A held snapshot is as large as the merchant, and this runs inside the
+    transaction holding the identity and rule locks, so one statement per
+    row would hold those locks for as long as the round trips take. The
+    guards are the per-row ones: a row someone overrode by hand is never
+    touched, and (when the snapshot knows what the write set) a row that no
+    longer holds that category belongs to a later change and stays put.
+
+    The prior category's provenance was not snapshotted, so it reads as a
+    rule (which is what a merchant-wide write always displaces).
+
+    A row id repeated in the snapshot is applied in snapshot order, one
+    pass per repetition, so the outcome and the count match restoring the
+    entries one at a time."""
+    passes: list[tuple[list[str], list[str | None]]] = []
+    seen: dict[str, int] = {}
+    for a in affected:
+        k = seen.get(a["id"], 0)
+        seen[a["id"]] = k + 1
+        if k == len(passes):
+            passes.append(([], []))
+        passes[k][0].append(a["id"])
+        passes[k][1].append(a["prev"])
+    sql = ("UPDATE transactions AS t SET category_primary=u.prev, "
+           "category_source=COALESCE(t.category_source, 'rule') "
+           "FROM unnest(%s::text[], %s::text[]) AS u(id, prev) "
+           "WHERE t.id=u.id AND t.category_override IS NULL"
+           + (" AND t.category_primary=%s" if wrote is not None else ""))
+    restored = 0
+    for ids, prevs in passes:
+        for at in range(0, len(ids), _UNDO_SLICE):
+            restored += conn.execute(
+                sql, (ids[at:at + _UNDO_SLICE], prevs[at:at + _UNDO_SLICE])
+                + ((wrote,) if wrote is not None else ())).rowcount
+    return restored
+
+
 def _apply_undo(conn, undo, caps: bool) -> int:
     from ..engine import llm_categorize as _llm
     canons, affected, rules = _validate_undo(conn, undo, caps=caps)
@@ -2128,17 +2210,7 @@ def _apply_undo(conn, undo, caps: bool) -> int:
                     (entry["canon"],)).fetchone()
                 if not cur or cur["category_primary"] != wrote:
                     superseded.add(entry["canon"])
-        for a in affected:
-            restored += conn.execute(
-                # the prior category comes back; its provenance was not
-                # snapshotted, so it reads as a rule (which is what a
-                # merchant-wide write always displaces)
-                "UPDATE transactions SET category_primary=%s, "
-                "category_source=COALESCE(category_source, 'rule') "
-                "WHERE id=%s AND category_override IS NULL"
-                + (" AND category_primary=%s" if wrote is not None else ""),
-                (a["prev"], a["id"])
-                + ((wrote,) if wrote is not None else ())).rowcount
+        restored += _restore_rows(conn, affected, wrote)
         canons = [c for c in canons if c["canon"] not in superseded]
         # The write snapshots EVERY user rule resolving to a touched canonical
         # (`rules`), so undo restores the exact prior rule set: wipe every
@@ -2153,9 +2225,10 @@ def _apply_undo(conn, undo, caps: bool) -> int:
                     f"""DELETE FROM merchant_categories AS m
                         WHERE source='user' AND {_llm._RULE_CANON} = %s""",
                     (entry["canon"],))
+            rule_canon = (_canonicals_of(conn, [r["merchant"] for r in rules])
+                          if superseded else {})
             for r in rules:
-                if superseded and _canonical_of(conn, r["merchant"]) \
-                        in superseded:
+                if superseded and rule_canon[r["merchant"]] in superseded:
                     continue
                 p = r["prior"]
                 conn.execute(
@@ -2431,7 +2504,15 @@ def _release_link_category(conn, txn_id: str, category: str) -> None:
     touched. It goes back to the person's own pin the link replaced when
     there was one, else it is removed and the row falls back to the
     automatic layers. A category anyone chose since the link — or a
-    transfer set by hand before it — stays."""
+    transfer set by hand before it — stays.
+
+    The row is locked before the pin is read or written, the order every
+    category writer keeps: a person's edit takes the row and then its pin,
+    and an unlink rewriting the pin first deadlocked against it. The read
+    is its own statement after the lock, so it sees what such an edit
+    committed while this waited."""
+    conn.execute("SELECT 1 FROM transactions WHERE id=%s FOR UPDATE",
+                 (txn_id,))
     row = conn.execute(
         """SELECT t.category_override AS cur, m.link_made, m.link_prior,
                   m.bill_id
@@ -2763,8 +2844,13 @@ def link_reimbursements(conn, txn_id: str, other_ids: list[str],
     linked, errors, notes, n_partial = 0, [], [], 0
     with conn.transaction():
         conn.execute(_REIMB_LOCK)
+        # a hold that settled since the list was read is linked as the
+        # posted row it became, on either side; resolved under the lock
+        # the settlement holds, so none retires in between
+        live = live_edit_ids(conn, [txn_id, *other_ids])
+        txn_id = live.get(txn_id, txn_id)
         # the same id twice is one link, not a second request for it
-        other_ids = list(dict.fromkeys(other_ids))
+        other_ids = list(dict.fromkeys(live.get(i, i) for i in other_ids))
         rows = _pair_rows(conn, [txn_id, *other_ids])
         rooms: dict = {}
         for oid in other_ids:

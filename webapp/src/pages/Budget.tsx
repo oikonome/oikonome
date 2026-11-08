@@ -103,6 +103,9 @@ export default function Budget() {
     await qc.invalidateQueries({ queryKey: ["settings"] });
     qc.invalidateQueries({ queryKey: ["today"] });
     qc.invalidateQueries({ queryKey: ["calendar"] });
+    // the lenses carry the plan savings goal (their Savings row)
+    qc.invalidateQueries({ queryKey: ["lens-month"] });
+    qc.invalidateQueries({ queryKey: ["lens-year"] });
     if (plan) {
       qc.invalidateQueries({ queryKey: ["onboarding"] });
       qc.invalidateQueries({ queryKey: ["budgets-suggest"] });

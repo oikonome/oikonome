@@ -6,7 +6,10 @@
   "overrides": {
     "plist": {
       "@xmldom/xmldom": "^0.9.11"
-    }
+    },
+    "@xmldom/xmldom": "^0.8.15",
+    "decode-uri-component": "^0.5.1",
+    "image-size": "^2.0.3"
   },
   "dependencies": {
     "@bacons/apple-targets": "^5.0.0",
@@ -17,8 +20,8 @@
     "@tanstack/query-async-storage-persister": "^5.101.4",
     "@tanstack/react-query": "^5.101.4",
     "@tanstack/react-query-persist-client": "^5.101.4",
-    "expo": "~57.0.31",
-    "expo-build-properties": "~57.0.22",
+    "expo": "~57.0.32",
+    "expo-build-properties": "~57.0.23",
     "expo-clipboard": "~57.0.2",
     "expo-constants": "~57.0.9",
     "expo-crypto": "~57.0.4",
@@ -26,18 +29,18 @@
     "expo-document-picker": "~57.0.3",
     "expo-file-system": "~57.0.2",
     "expo-font": "~57.0.1",
-    "expo-glass-effect": "~57.0.4",
+    "expo-glass-effect": "~57.0.5",
     "expo-image": "~57.0.5",
-    "expo-image-picker": "~57.0.20",
+    "expo-image-picker": "~57.0.21",
     "expo-in-app-updates": "^0.12.0",
     "expo-linking": "~57.0.13",
     "expo-local-authentication": "~57.0.3",
-    "expo-notifications": "~57.0.24",
-    "expo-router": "~57.0.29",
+    "expo-notifications": "~57.0.25",
+    "expo-router": "~57.0.30",
     "expo-screen-capture": "~57.0.4",
     "expo-secure-store": "~57.0.4",
-    "expo-sharing": "~57.0.24",
-    "expo-splash-screen": "~57.0.10",
+    "expo-sharing": "~57.0.25",
+    "expo-splash-screen": "~57.0.11",
     "expo-status-bar": "~57.0.1",
     "expo-symbols": "~57.0.3",
     "expo-system-ui": "~57.0.4",

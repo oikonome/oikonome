@@ -211,7 +211,7 @@ class AssistantLocalityTests(unittest.TestCase):
 
     def _with_backend(self, be):
         from unittest import mock
-        return mock.patch.object(assistant._llm, "_backend",
+        return mock.patch.object(assistant._llm, "backend_endpoint",
                                  return_value=be)
 
     def test_no_backend_is_unavailable(self):
@@ -318,7 +318,7 @@ class AssistantLocalityByAddressTests(unittest.TestCase):
 
     def _status(self, url, source):
         from unittest import mock
-        with mock.patch.object(assistant._llm, "_backend",
+        with mock.patch.object(assistant._llm, "backend_endpoint",
                                return_value={**_BE, "url": url,
                                              "source": source}):
             return assistant.status(self.conn)

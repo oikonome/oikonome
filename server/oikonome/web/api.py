@@ -48,7 +48,9 @@ from starlette.concurrency import run_in_threadpool
 from ..db import tenancy
 from ..engine import activity as _activity
 from ..engine import assistant
-from . import data, demoguard, mailguard, permissions
+from ..jobs.sync_row import SYNC_LOCK_HELD_SQL, SYNC_STALE_AFTER, sync_row_live
+from . import data, demoguard, mailguard, permissions, settings_exposure
+from ..engine import storage_quota
 from .security import limit
 
 
@@ -485,7 +487,8 @@ def _category_why(r: dict) -> str | None:
     return words or ("no category yet" if not r.get("category_key") else None)
 
 
-@router.get("/today/full")
+@router.get("/today/full",
+            dependencies=[Depends(limit("engine", 60, 60))])
 def today_full(user: dict = Depends(_user()), date: str = ""):
     """Everything the SPA Today page renders — the same gather()+context
     the Jinja page and email use, serialized. Single source preserved.
@@ -673,6 +676,13 @@ def today_full(user: dict = Depends(_user()), date: str = ""):
         # unpaid bill occurrences through month end — the
         # "after paying cards and remaining bills" tile; null on past days
         "bills_remaining_month": bills_remaining,
+        # the paychecks still due this month (dates; the sum is
+        # income_expected) — the cash tile counts them next to the bills
+        "income_due_dates": st.get("income_due_dates"),
+        "income_due_total": st.get("income_due_total"),
+        # why there is no paycheck figure ("none" | "budgeted" | "off";
+        # null when there is one) — the tile's wording, decided server-side
+        "income_due_note": st.get("income_due_note"),
         "next_paycheck": st.get("next_paycheck"),
         "recent": recent,
         # two user-facing card scenarios — pay all cards now and
@@ -810,7 +820,8 @@ def _category_text(body: dict, *keys: str, user: dict) -> str:
     return v
 
 
-@router.get("/today/glance")
+@router.get("/today/glance",
+            dependencies=[Depends(limit("glance", 120, 60))])
 def today_glance(request: Request, user: dict = Depends(_user())):
     """The home-screen widget's payload: the Today hero's simple face, and
     nothing past it. One number (what is still spendable today across
@@ -870,7 +881,8 @@ def today_glance(request: Request, user: dict = Depends(_user())):
                     headers=headers)
 
 
-@router.get("/lens/month")
+@router.get("/lens/month",
+            dependencies=[Depends(limit("engine", 60, 60))])
 def lens_month(user: dict = Depends(_user()), y: int = 0, m: int = 0):
     """Month report card — final for past months, projected for the
     current one (default: this month)."""
@@ -888,7 +900,8 @@ def lens_month(user: dict = Depends(_user()), y: int = 0, m: int = 0):
         conn.close()
 
 
-@router.get("/lens/year")
+@router.get("/lens/year",
+            dependencies=[Depends(limit("engine", 60, 60))])
 def lens_year(user: dict = Depends(_user()), y: int = 0):
     """12-cell verdict grid + annual totals + category YoY (default: this
     year)."""
@@ -1337,8 +1350,14 @@ def transactions_export(request: Request, user: dict = Depends(_user()),
     BEFORE the first byte is sent: the connection is pooled and shared by
     every household, and how fast a download is read is up to the client.
     The built file is counted until the send ends (_export_hold), so
-    readers that stall cannot pile files up in the process."""
+    readers that stall cannot pile files up in the process.
+
+    Owner-only, like every door that writes the household's ledger to a
+    file: a member or a view-only login reads the same rows on the page,
+    but a copy that has left the instance cannot be recalled, so carrying
+    one away is the owner's act (permissions.py, "taking the data out")."""
     _same_site_download(request)
+    _owner_only(user)
     if format not in ("csv", "xlsx"):
         raise HTTPException(400, "format must be csv or xlsx")
     release = _export_slot(user["tenant_id"])
@@ -1875,7 +1894,7 @@ def owners_api(user: dict = Depends(_user())):
 def set_account_owner_api(account_id: str, user: dict = Depends(_user()),
                           body: dict = Body(...)):
     _may_edit(user)
-    owner = _body_text(body, "owner")
+    owner = _label_or_400(body, "owner")
     conn = _conn(user)
     try:
         n = data.set_account_owner(conn, account_id, owner or None)
@@ -1948,6 +1967,15 @@ def transactions_bulk(user: dict = Depends(_user()), body: dict = Body(...)):
                     conn.execute(data._REIMB_LOCK)
                 live = data.live_edit_ids(conn, ids)
                 ids = list(dict.fromkeys(live.get(i, i) for i in ids))
+                # Sliced in the database's id order, not the client's: each
+                # slice locks its rows by id, and the other writers over many
+                # rows do too, so only a selection walked in that one order
+                # across its slices waits for them instead of crossing them.
+                # Sorted by Postgres, not Python: ids are mixed case and the
+                # two collations disagree.
+                ids = [r["u"] for r in conn.execute(
+                    "SELECT u FROM unnest(%s::text[]) AS u ORDER BY u",
+                    (ids,)).fetchall()]
                 for at in range(0, len(ids), _BULK_SLICE):
                     part = data.bulk_apply(conn, ids[at:at + _BULK_SLICE],
                                            action, category)
@@ -1958,6 +1986,12 @@ def transactions_bulk(user: dict = Depends(_user()), body: dict = Body(...)):
                     data.bulk_apply(conn, [], action, category)
         except ValueError as e:
             raise HTTPException(400, str(e))
+        except psycopg.errors.DeadlockDetected:
+            # another edit crossed this selection and Postgres picked this
+            # side to roll back; nothing was applied and a retry succeeds
+            raise HTTPException(409, "another edit was changing some of "
+                                     "these rows — nothing was changed, "
+                                     "try again")
         if out.get("applied"):
             _log_bulk(conn, user, action, category, ids, out)
         return {"ok": True, **out}
@@ -2092,6 +2126,22 @@ def _merchant_name_or_400(field: str, val: str,
         raise HTTPException(400, f"{field} contains control characters")
 
 
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _label_or_400(body: dict, key: str) -> str:
+    """An account name or owner label from a JSON body, held to the
+    merchant-name rule. These are not stored once and read once: the
+    account label and the owner are selected onto every ledger and spend
+    row of the account, so an unbounded one multiplies into every page,
+    export and email that reads those rows. A new manual account's name
+    also becomes its primary-key id, which overflows the index long before
+    the body limit."""
+    v = _body_text(body, key)
+    _merchant_name_or_400(key, v)
+    return v
+
+
 @router.get("/merchants/detail")
 def merchants_detail(display: str, user: dict = Depends(_user())):
     """Everything about one merchant as the ledger shows it — the
@@ -2192,10 +2242,6 @@ def merchant_undo(user: dict = Depends(_user()), body: dict = Body(...)):
 # by side, and wait only for a writer holding it exclusively — a feed
 # settling a pending hold into its posted row, which carries the hold's
 # note and category across and retires it in one commit.
-_PAIRING_LOCK_SHARED = data._REIMB_LOCK.replace(
-    "pg_advisory_xact_lock(", "pg_advisory_xact_lock_shared(", 1)
-
-
 def _live_txn_for_edit(conn, txn_id: str) -> str | None:
     """Inside the caller's transaction: take the shared pairing lock, then
     name the live row an edit of `txn_id` belongs on — the row itself, or,
@@ -2206,17 +2252,7 @@ def _live_txn_for_edit(conn, txn_id: str) -> str | None:
     commit between the check and the write, and the note or category would
     land on the retired hold after its carry had already run — hidden, with
     the posted row showing nothing the person wrote."""
-    conn.execute(_PAIRING_LOCK_SHARED)
-    if conn.execute("SELECT 1 FROM transactions WHERE id=%s AND removed=0",
-                    (txn_id,)).fetchone():
-        return txn_id
-    twin = conn.execute(
-        """SELECT t.id FROM transactions t
-             JOIN transactions p ON p.id = %s AND p.removed = 1
-            WHERE t.removed = 0 AND t.account_id = p.account_id
-              AND t.raw->>'pending_transaction_id' = p.id
-            ORDER BY t.id LIMIT 1""", (txn_id,)).fetchone()
-    return twin["id"] if twin else None
+    return data.live_edit_ids(conn, [txn_id]).get(txn_id)
 
 
 @router.post("/transactions/{txn_id:path}/note")
@@ -2251,7 +2287,7 @@ def set_txn_note(txn_id: str, user: dict = Depends(_user()),
 def set_txn_owner_api(txn_id: str, user: dict = Depends(_user()),
                       body: dict = Body(...)):
     _may_edit(user)
-    owner = _body_text(body, "owner")
+    owner = _label_or_400(body, "owner")
     conn = _conn(user)
     try:
         # under the pairing lock, onto the live row: a settlement retiring
@@ -2817,6 +2853,8 @@ def connections_export(user: dict = Depends(_user()), body: dict = Body(...)):
     finally:
         conn.close()
     stamp = f"{dt.datetime.now():%Y%m%d}"
+    from .app import _notify_security_change
+    _notify_security_change(user, "connections_exported")
     return Response(
         blob, media_type="application/octet-stream",
         headers={"Content-Disposition":
@@ -2855,16 +2893,25 @@ def connections_import(user: dict = Depends(_user()),
     from ..sync.base import tenant_sync_lock
     from .app import _still_signed_in_under_factor_lock
     # The slow work happens before any lock: the passphrase KDF takes its
-    # cost from the file, and the endpoint hostnames are resolved here so
-    # the write below, which checks them again, answers from that lookup.
+    # cost from the file, and every address the file names is resolved
+    # here, inside one lookup budget, so the write below — which checks
+    # them again under the factor lock (netguard.no_lookups) — answers
+    # from these lookups.
+    from . import netguard as _ng
     try:
         payload = _json.loads(cb._open(data, passphrase))
         if isinstance(payload, dict):
             config, _secrets, _items = cb._checked_shapes(
                 copy.deepcopy(payload))
-            cb._check_urls(config)
-            cb._clean_backends(copy.deepcopy(payload.get("llm_backends")))
-    except ValueError as e:
+            with _ng.lookup_budget(cb._MAX_BACKENDS + 2 + 8, seconds=8.0):
+                cb._check_urls(config)
+                cb._clean_backends(copy.deepcopy(payload.get("llm_backends")))
+                if not env_flag("OIKONOME_HOSTED"):
+                    # hosted drops a bundle's connections unread
+                    for _it in _items:
+                        if isinstance(_it, dict):
+                            cb._check_item(_it)
+    except (ValueError, _ng.BlockedURL) as e:
         raise HTTPException(400, str(e))
     conn = _conn(user)
     try:
@@ -2886,10 +2933,13 @@ def connections_import(user: dict = Depends(_user()),
                     raise HTTPException(400, str(e))
     finally:
         conn.close()
+    from .app import _notify_security_change
+    _notify_security_change(user, "connections_imported")
     return {"ok": True, **summary}
 
 
-@router.post("/accounts/plaid/validate")
+@router.post("/accounts/plaid/validate",
+             dependencies=[Depends(limit("plaid_validate", 10, 600))])
 def plaid_validate(user: dict = Depends(_user()), body: dict = Body(...)):
     """Live Plaid key check for the guided setup flow: one
     cheap authenticated call; nothing is saved here."""
@@ -3059,6 +3109,10 @@ def reimburse_candidates(txn_id: str, user: dict = Depends(_user()),
                          q: str = ""):
     conn = _conn(user)
     try:
+        # a hold that settled since the list was read is answered as the
+        # posted row it became (anchor.id says which, for the client)
+        with conn.transaction():
+            txn_id = data.live_edit_ids(conn, [txn_id]).get(txn_id, txn_id)
         anchor, cands = data.reimbursement_candidates(conn, txn_id, q=q)
         if anchor is None:
             raise HTTPException(404, "transaction not found")
@@ -3093,6 +3147,11 @@ def reimburse_link(user: dict = Depends(_user()), body: dict = Body(...)):
         # the log says what happened, not what was asked: a request whose
         # every pair was refused linked nothing, and a full link the server
         # made partial is recorded as partial
+        # the anchor the links went on: a hold that settled since the list
+        # was read is linked as its posted row, and named so in the answer
+        with conn.transaction():
+            txn_id = data.live_edit_ids(conn, [txn_id]).get(txn_id, txn_id)
+        out["txn_id"] = txn_id
         if out["linked"] > 0:
             _activity.record(conn, user, "reimbursement", "linked",
                              target=txn_id,
@@ -3216,7 +3275,8 @@ _EMPTY_BILL_STATS = {"occurrences": 0, "paid": 0, "paid_amount": 0.0,
 from .report import bills_remaining_month as _bills_remaining_month  # noqa: E402,F401
 
 
-def _month_bill_stats(conn, cfg: dict, today: dt.date) -> dict[str, dict]:
+def _month_bill_stats(conn, cfg: dict, today: dt.date, *,
+                     closed: bool = False) -> dict[str, dict]:
     """Per-bill occurrence/envelope detail for the current month — the Bills
     page's columns (Paid x/y; envelope Used/Chgs/Paid), computed once per
     request from the same engine passes month_status runs. Caps apply;
@@ -3227,10 +3287,22 @@ def _month_bill_stats(conn, cfg: dict, today: dt.date) -> dict[str, dict]:
     the ledger the way month_status reads it — same candidate occurrences,
     same row ownership, same cash basis. Where the two would differ the
     household is told two things about one payment, and neither page can be
-    trusted."""
+    trusted.
+
+    A CLOSED month is read under the settings and the bill schedule it was
+    judged under — its snapshot (budget.snapshot_config /
+    snapshot_bill_rows), exactly as lenses.month_state hands them to
+    month_status, the live ones only where the month has none. `cfg` is
+    the live config; a bill archived, repriced or disabled since, or an
+    account excluded since, must not turn a rent the Month lens calls paid
+    into "0 of 1" here."""
     from ..engine import budget
     from ..engine.compat import as_date
     month_start = today.replace(day=1)
+    frozen = None
+    if closed:
+        cfg = budget.snapshot_config(conn, today.year, today.month) or cfg
+        frozen = budget.snapshot_bill_rows(conn, today.year, today.month)
     # the accounts the "excl" toggle drops, read the way month_status reads
     # them — a malformed setting means "nothing excluded", never a 500
     excluded = budget.excluded_account_ids(cfg)
@@ -3242,68 +3314,78 @@ def _month_bill_stats(conn, cfg: dict, today: dt.date) -> dict[str, dict]:
     # each other: a bill the household took out of the budget would hide
     # its charges from the envelope that category-matches them here, while
     # Today hands the envelope exactly those rows.
-    bills = budget._recurring_bills(conn, caps=cfg.get("occurrence_caps"))
+    bills = budget._recurring_bills(conn, caps=cfg.get("occurrence_caps"),
+                                    rows=frozen)
     budget_bills = budget.drop_card_pay_bills(conn, budget._recurring_bills(
         conn, caps=cfg.get("occurrence_caps"),
-        disabled=cfg.get("disabled_bills")))
+        disabled=cfg.get("disabled_bills"), rows=frozen), cfg=cfg)
     # by payee, the bills table's own identity — the two loads return
     # different dicts for the same bill
     in_budget = {b["payee"] for b in budget_bills}
-    # Envelopes the same way, and here the ORDER carries the rule: the
-    # claimer is first-match-wins, so the budget's envelopes get first
-    # refusal on every row and land on exactly month_status's numbers,
+    # Envelopes the same way: the disabled ones come back marked `off`, and
+    # the claimer itself gives every budget envelope first refusal on every
+    # row, at either tier, so they land on exactly month_status's numbers
     # while a disabled envelope draws on what is left — enough for the
-    # informational row it renders, and never at an enabled pool's expense.
-    all_env = budget._envelope_bills(conn)
-    in_budget_env = {e["payee"] for e in
-                     budget._envelope_bills(
-                         conn, disabled=cfg.get("disabled_bills"))}
-    envelopes = ([e for e in all_env if e["payee"] in in_budget_env]
-                 + [e for e in all_env if e["payee"] not in in_budget_env])
-    # Matching reaches back PREPAY_MATCH_DAYS before the month and forward
-    # into next month's occurrences, exactly as month_status does: rent due
-    # the 1st is autopaid on the 28th before, and a page that only looks
-    # inside the month calls that rent overdue while Today calls it settled
-    # — one ledger, one schedule, two answers. The wider row set is for
+    # informational row it renders, never at an enabled pool's expense.
+    envelopes, _ = budget.display_envelopes(
+        conn, disabled=cfg.get("disabled_bills"), rows=frozen)
+    # The occurrence pass is month_status's own, rule for rule: rows from
+    # PREPAY_MATCH_DAYS before the 1st (rent autopaid on the 28th before)
+    # through today live, or — for a CLOSED month — through the end of the
+    # month after plus PREPAY_MATCH_DAYS, so the month that was due a rent
+    # posted on the 2nd sees that it was paid; candidates from every month
+    # that window reaches (an annual premium prepaid five weeks early is
+    # offered from its due month); then only the occurrences whose ONE home
+    # month (budget.occurrence_home) is this one. Any other slice and the
+    # page calls a late rent missed in the month it was due and paid in the
+    # next, while the Month lens plans it once. The wider row set is for
     # MATCHING ONLY; `rows` (the in-month slice) is what the envelope pass
-    # and the paid dollars account against, so last month's cash can never
-    # land in this month's totals.
-    match_rows = budget._spend_rows(
-        conn, month_start - dt.timedelta(days=budget.PREPAY_MATCH_DAYS),
-        today + dt.timedelta(days=1),
-        excluded=excluded)
+    # and the paid dollars account against.
+    here = (today.year, today.month)
+    lookback = month_start - dt.timedelta(days=budget.PREPAY_MATCH_DAYS)
+    if closed:
+        ny, nm = ((today.year, today.month + 1) if today.month < 12
+                  else (today.year + 1, 1))
+        horizon = (budget._month_after(ny, nm)
+                   + dt.timedelta(days=budget.PREPAY_MATCH_DAYS))
+    else:
+        horizon = today + dt.timedelta(days=1)
+    match_rows = budget._spend_rows(conn, lookback, horizon,
+                                    excluded=excluded)
     in_month = [i for i, r in enumerate(match_rows)
-                if as_date(r["date"]) >= month_start]
+                if month_start <= as_date(r["date"]) <= today]
     _pos = {src: dst for dst, src in enumerate(in_month)}
     rows = [match_rows[i] for i in in_month]
-    ny, nm = ((today.year, today.month + 1) if today.month < 12
-              else (today.year + 1, 1))
+    reach = budget._months_between(
+        lookback, horizon + dt.timedelta(days=budget.PREPAY_MATCH_DAYS))
     py, pm = ((today.year, today.month - 1) if today.month > 1
               else (today.year - 1, 12))
 
+    def _dated_here(r) -> bool:
+        return month_start <= as_date(r["date"]) <= today
+
+    # fees that rode with an occurrence homed in ANOTHER month but are
+    # dated in this one: month_status counts them as this month's fixed
+    # actual (settled_fees), so the bill they belong to carries them here
+    settled_fees: dict[str, float] = {}
+
     def _match(bill_list, candidate_rows):
-        # LAST month's occurrences go in front as decoys, as month_status
-        # does: a bill due the 30th paid three days late on the 3rd belongs
-        # to last month's occurrence, and without the decoy it matches
-        # nothing here (or an envelope takes it) while Today counts it as
-        # fixed spend. A decoy paid inside this month is this month's cash
-        # and stays; an unpaid one, or one settled last month, is last
-        # month's business and is dropped.
-        occs = budget.month_occurrences(bill_list, py, pm)
-        n_prev = len(occs)
-        occs += budget.month_occurrences(bill_list, today.year, today.month)
-        n_this = len(occs)
-        occs += budget.month_occurrences(bill_list, ny, nm)
+        occs = []
+        for (yy, mm) in reach:
+            occs += budget.month_occurrences(bill_list, yy, mm)
         matched, occs = budget.match_occurrences(candidate_rows, occs)
-        # A next-month occurrence nobody has paid yet was a matching
-        # candidate and nothing more — keeping it would put two rents in
-        # one month's Paid x/y. One that WAS paid here stays, on the same
-        # cash basis the verdict uses: the money left in this month, so
-        # this is the month that counts it.
-        return matched, ([o for o in occs[:n_prev] if o["txn"] is not None
-                          and as_date(o["txn"]["date"]) >= month_start]
-                         + occs[n_prev:n_this]
-                         + [o for o in occs[n_this:] if o["txn"] is not None])
+        for o in occs:
+            if o["txn"] is not None and budget.occurrence_home(o) != here:
+                fee = sum(c["amount"] for c in o.get("companions") or []
+                          if _dated_here(c))
+                if fee:
+                    payee = o["bill"]["payee"]
+                    settled_fees[payee] = settled_fees.get(payee, 0.0) + fee
+        # the withdrawn reading keeps every occurrence DUE here as well (the
+        # paid ones as decoys), exactly as month_status hands it
+        return matched, [o for o in occs
+                         if budget.occurrence_home(o) == here
+                         or (o["due"].year, o["due"].month) == here]
 
     # The budget's bills match FIRST, over every candidate row — the
     # matcher is first-come by date gap and amount across all occurrences,
@@ -3320,10 +3402,8 @@ def _month_bill_stats(conn, cfg: dict, today: dt.date) -> dict[str, dict]:
         occs += extra_occs
     # the same withdrawn-charge reading Today gives its overdue line, so a
     # bill the feed took back says so on both pages
-    budget.mark_withdrawn(
-        conn, occs, today,
-        since=month_start - dt.timedelta(days=budget.PREPAY_MATCH_DAYS),
-        cfg=cfg)
+    budget.mark_withdrawn(conn, occs, today, since=lookback, cfg=cfg)
+    occs = budget.occurrences_homed_in(occs, *here)
     # Rows the BUDGET occurrences claimed (payment plus the fees that rode
     # with it), translated to `rows` indices for the envelope pass. They come
     # from the index set the matcher returns, never from the occurrence's
@@ -3338,24 +3418,31 @@ def _month_bill_stats(conn, cfg: dict, today: dt.date) -> dict[str, dict]:
     # the Bills page's received column needs its own. Same engine, deposit
     # side: match this month's income occurrences against posted
     # non-transfer inflows.
-    income_bills = budget._recurring_bills(conn, income=True)
+    income_bills = budget._recurring_bills(conn, income=True, rows=frozen)
     if income_bills:
-        # a paycheck for an occurrence due on/after the 1st can
-        # post in the closing days of the PREVIOUS month — a month-start-only
-        # inflow window would leave that occurrence "·" forever. Look back
-        # PREPAY_MATCH_DAYS before the month start (the same lookback
-        # prepaid bills get) and add LAST month's income occurrences as
-        # decoys — never emitted — so a boundary deposit attaches to its own
-        # occurrence instead of eating this month's first one.
+        # The window budget._month_income_parts reads for the Month lens's
+        # received figure. A paycheck for an occurrence due on/after the 1st
+        # can post in the closing days of the PREVIOUS month, so the read
+        # starts PREPAY_MATCH_DAYS before the month start; a closed month's
+        # check due on its last day can post days after it ended, so a
+        # closed month reads that far past its end too (live, nothing has
+        # posted after today). Last month's and next month's occurrences
+        # join as decoys — never emitted — so a boundary deposit attaches
+        # to its own occurrence instead of eating one of this month's.
+        window = dt.timedelta(days=budget.PREPAY_MATCH_DAYS)
         inflows = budget._inflow_rows(
-            conn,
-            month_start - dt.timedelta(days=budget.PREPAY_MATCH_DAYS),
-            today + dt.timedelta(days=1),
+            conn, month_start - window,
+            (budget._month_after(today.year, today.month) + window
+             if closed else today + dt.timedelta(days=1)),
             excluded=excluded)
+        ny, nm = ((today.year, today.month + 1) if today.month < 12
+                  else (today.year + 1, 1))
         decoys = budget.month_occurrences(income_bills, py, pm)
         income_occs = budget.month_occurrences(income_bills,
                                                today.year, today.month)
-        budget.match_occurrences(inflows, decoys + income_occs)
+        budget.match_occurrences(
+            inflows, decoys + income_occs
+            + budget.month_occurrences(income_bills, ny, nm))
         occs += income_occs
     _, env_states = budget.match_envelopes(
         rows, envelopes, matched_idx,
@@ -3383,9 +3470,12 @@ def _month_bill_stats(conn, cfg: dict, today: dt.date) -> dict[str, dict]:
             # and the two pages disagree about what the month cost.
             if as_date(occ["txn"]["date"]) >= month_start:
                 e["paid_amount"] += occ["txn"]["amount"]
-                # the fees that rode with it are part of what was paid
+                # the fees that rode with it are part of what was paid —
+                # those dated in this month: a fee posted the day before
+                # the 1st is last month's cash, as it is in the verdict
                 e["paid_amount"] += sum(r["amount"]
-                                        for r in occ.get("companions") or [])
+                                        for r in occ.get("companions") or []
+                                        if _dated_here(r))
         elif (not occ["floored"]
               and (e["next_unpaid"] is None or occ["due"] < e["next_unpaid"])):
             e["next_unpaid"] = occ["due"]
@@ -3394,6 +3484,9 @@ def _month_bill_stats(conn, cfg: dict, today: dt.date) -> dict[str, dict]:
             on = occ.get("withdrawn_on")
             e["withdrawn_on"] = (on.isoformat()
                                  if on and occ["due"] <= today else None)
+    for payee, fee in settled_fees.items():
+        e = per.setdefault(payee, dict(_EMPTY_BILL_STATS))
+        e["paid_amount"] += fee
     for e in per.values():
         e["paid_amount"] = round(e["paid_amount"], 2)
         if e["next_unpaid"] is not None:
@@ -3470,10 +3563,12 @@ def bills_list(user: dict = Depends(_user()),
                   # an "attach" (fee) or "merchant" proposal names the
                   # bill it would join
                   "bill_payee": (as_dict(p["evidence"]) or {}).get("bill_payee"),
-                  "cadence": _cadence_label(p["frequency"], p["interval"]),
+                  "cadence": _cadence_label(p["frequency"], p["interval"],
+                                            bills.offer_days(p)),
                   # proposal extras: raw cadence pieces for the
                   # "freq ×N · next date" cell, and the "Looks like" LLM tag
                   "frequency": p["frequency"], "interval": p["interval"],
+                  "by_month_day": bills.offer_days(p),
                   "next_due": (p["next_due"].isoformat()
                                if p["next_due"] else None),
                   "llm_tag": p["llm_tag"],
@@ -3497,13 +3592,28 @@ def bills_list(user: dict = Depends(_user()),
             yy, mm = want_month
             as_of = dt.date(yy, mm, _calendar.monthrange(yy, mm)[1])
             month_key, month_final = f"{yy:04d}-{mm:02d}", True
-        stats = _month_bill_stats(conn, cfg, as_of)
+        stats = _month_bill_stats(conn, cfg, as_of, closed=month_final)
         caps = cfg.get("occurrence_caps") or {}
+        listed = conn.execute(
+            "SELECT payee, amount, frequency, due_on, raw, category, "
+            "merchant FROM bills "
+            "WHERE active=1 ORDER BY (amount>0), payee").fetchall()
+        if month_final:
+            # a closed month is shown as it was judged: its snapshot says
+            # which bills were budget bills then, and a bill archived since
+            # still gets its row, or the rent the Month lens calls paid
+            # would vanish from the page that month
+            snap_cfg = budget.snapshot_config(conn, yy, mm)
+            if snap_cfg is not None:
+                disabled_bills = set(snap_cfg.get("disabled_bills") or [])
+            frozen = budget.snapshot_bill_rows(conn, yy, mm) or []
+            live = {b["payee"] for b in listed}
+            listed = list(listed) + sorted(
+                ({**r, "frequency": None, "due_on": None} for r in frozen
+                 if r["payee"] not in live),
+                key=lambda r: ((r["amount"] or 0) > 0, r["payee"]))
         rows = []          # response rows ("bills" key) — `bills` is the module
-        for b in conn.execute(
-                "SELECT payee, amount, frequency, due_on, raw, category, "
-                "merchant FROM bills "
-                "WHERE active=1 ORDER BY (amount>0), payee").fetchall():
+        for b in listed:
             raw = as_dict(b["raw"])
             rec = raw.get("recurrence")
             if not isinstance(rec, dict):
@@ -3519,7 +3629,11 @@ def bills_list(user: dict = Depends(_user()),
                              # `recurrence` (they have no due dates)
                              budget.envelope_months(raw)
                              if raw.get("bill_type") == "envelope"
-                             else rec.get("interval")),
+                             else rec.get("interval"),
+                             rec.get("byMonthDay")),
+                         # the days of a rule on several days of the month,
+                         # which `cadence_value` cannot say
+                         "by_month_day": budget.monthly_rule_days(rec) or None,
                          "due_on": (b["due_on"].isoformat()
                                     if b["due_on"] else None),
                          "health": h.get("health"),
@@ -3617,24 +3731,28 @@ def bills_list(user: dict = Depends(_user()),
         conn.close()
 
 
-@router.post("/bills/detect")
+@router.post("/bills/detect",
+             dependencies=[Depends(limit("bills_detect", 6, 600))])
 def bills_detect_api(user: dict = Depends(_user())):
+    # the whole-ledger pass: rate-limited and one at a time per household
     from ..engine import bills
     conn = _conn(user)
     try:
-        stats = bills.run(conn)
+        stats = bills.run_single_flight(conn)
     finally:
         conn.close()
+    if stats is None:
+        raise HTTPException(409, "bill detection is already running")
     return {"proposed_add": stats["proposed_add"],
             "proposed_income": stats.get("proposed_income", 0),
             "drift_applied": stats["drift_applied"]}
 
 
 def _proposal_superseded(conn, pid: str) -> bool:
-    """Was this offer withdrawn because what it offered already exists?"""
-    row = conn.execute("SELECT status FROM bill_proposals WHERE id=%s",
-                       (pid,)).fetchone()
-    return bool(row and row["status"] == "superseded")
+    """bills.proposal_superseded: the offer was withdrawn because what it
+    offered already exists."""
+    from ..engine import bills
+    return bills.proposal_superseded(conn, pid)
 
 
 def _proposal_adjust(raw) -> dict:
@@ -3659,6 +3777,8 @@ def _proposal_adjust(raw) -> dict:
     cadence = _body_text(raw, "cadence")
     if cadence:
         out["cadence"] = _parse_cadence(cadence)
+    if raw.get("by_month_day") is not None:
+        out["by_month_day"] = _rule_days_or_400(raw["by_month_day"])
     if raw.get("due_day") not in (None, ""):
         day = raw["due_day"]
         if isinstance(day, bool) or not isinstance(day, int) \
@@ -3743,7 +3863,8 @@ def _adjust_bill_now(conn, payee: str, adj: dict) -> str:
         if (bills.get_bill(conn, new) is not None
                 or bills.rename_bill(conn, payee, new) == 0):
             raise HTTPException(409, f"a bill named {new!r} already exists")
-    if not any(k in adj for k in ("amount", "cadence", "due_day")):
+    if not any(k in adj for k in ("amount", "cadence", "due_day",
+                                  "by_month_day")):
         return new
     bill = conn.execute("SELECT * FROM bills WHERE payee = %s FOR UPDATE",
                         (new,)).fetchone()
@@ -3753,6 +3874,9 @@ def _adjust_bill_now(conn, payee: str, adj: dict) -> str:
     else:
         f, _, i = _bill_cadence(raw).partition(":")
         freq, interval = f.upper(), int(i or 1)
+    days = adj.get("by_month_day")
+    if days and (freq, interval) != ("MONTHLY", 1):
+        raise HTTPException(400, _DAYS_NEED_MONTHLY)
     rec = raw.get("recurrence") or {}
     bmd = rec.get("byMonthDay") if isinstance(rec, dict) else None
     # the day a monthly bill is anchored to, kept unless the person moved
@@ -3766,6 +3890,11 @@ def _adjust_bill_now(conn, payee: str, adj: dict) -> str:
                                 adj["due_day"], freq, interval,
                                 bill["due_on"])
         anchor = adj["due_day"]
+        # a 409, as every refusal about what the person typed in this form
+        # is: the wizard shows it where they are typing
+        off = bills.due_off_rule(raw, freq, interval, days, next_due)
+        if off:
+            raise HTTPException(409, off)
     try:
         bills.save_bill(
             conn, payee=new,
@@ -3776,7 +3905,7 @@ def _adjust_bill_now(conn, payee: str, adj: dict) -> str:
             category=bill["category"],
             source=raw.get("source", "detected"),
             last_seen=raw.get("lastDueOn"),
-            by_month_day=anchor if freq == "MONTHLY" else None,
+            by_month_day=days or (anchor if freq == "MONTHLY" else None),
             income=(bill["amount"] or 0) > 0,
             manual_touch="amount" in adj)
     except ValueError as e:
@@ -3788,17 +3917,11 @@ def _adjust_bill_now(conn, payee: str, adj: dict) -> str:
 
 
 def _hold_bill_claims(conn) -> None:
-    """Inside the caller's transaction: wait until no other approval in
-    the household is between its check for a bill already claiming these
-    charges and the commit of the bill it creates. Two approvals of
-    different offers (one renamed onto the other's charges) would each
-    check before the other's bill was visible and both create one, and
-    the plan would count the charge twice. Household-wide rather than per
-    charge: what a bill claims includes its merchant's names, which are
-    not known until the check reads them."""
-    conn.execute(
-        "SELECT pg_advisory_xact_lock(hashtext('oikonome:bill-claims:' ||"
-        " COALESCE(current_setting('app.tenant_id', true), '')))")
+    """The household's bill-claim lock (bills.hold_bill_claims), held
+    here across the approval AND its adjustment, so a rename onto another
+    offer's charges is inside the same turn."""
+    from ..engine import bills
+    bills.hold_bill_claims(conn)
 
 
 def _decide_proposal(conn, pid: str, action: str, adj: dict) -> dict:
@@ -3840,9 +3963,9 @@ def bills_proposal_api(user: dict = Depends(_user()),
         raise HTTPException(400, "action must be approve or reject")
     adj = (_proposal_adjust(body.get("adjust")) if action == "approve"
            else {})
+    pid = _body_text(body, "pid")
     conn = _conn(user)
     try:
-        pid = body.get("pid") or ""
         r = _decide_proposal(conn, pid, action, adj)
         if not r.get("error"):
             _log_proposal(conn, user, pid, action, r)
@@ -3914,6 +4037,22 @@ CADENCES = [("DAILY:1", "daily"),
             ("ENVELOPE:12", "envelope (annual pool)")]
 
 
+_DAYS_NEED_MONTHLY = "by_month_day goes with a monthly cadence"
+
+
+def _rule_days_or_400(value) -> list[int]:
+    """The days of the month a client names for a monthly rule: one or two,
+    each 1 to 31 or -1 for the last day. Naming them is what changes a
+    rule's days, so anything else is refused, never read as a guess."""
+    if (not isinstance(value, list) or not 1 <= len(value) <= 2
+            or any(isinstance(d, bool) or not isinstance(d, int)
+                   or not (d == -1 or 1 <= d <= 31) for d in value)):
+        raise HTTPException(
+            400, "by_month_day must be one or two days of the month, "
+                 "1 to 31 or -1 for the last day")
+    return list(dict.fromkeys(value))
+
+
 def _parse_cadence(value: str) -> tuple[str, int]:
     """A CADENCES value ("<FREQ>:<interval>") → (FREQ, interval), or a 400.
     Both doors that write a bill's schedule read it here: the bill save and
@@ -3983,6 +4122,9 @@ def bills_bill_api(user: dict = Depends(_user()), payee: str = ""):
             "amount": abs(row["amount"] or 0),
             "income": (row["amount"] or 0) > 0,
             "cadence": _bill_cadence(raw),
+            "by_month_day": budget.monthly_rule_days(
+                raw.get("recurrence") if isinstance(raw.get("recurrence"), dict)
+                else {}) or None,
             "next_due": row["due_on"].isoformat() if row["due_on"] else "",
             "bill_type": raw.get("bill_type", "occurrence"),
             "source": raw.get("source", "seed"),
@@ -4017,8 +4159,10 @@ def bills_save_api(user: dict = Depends(_user()), body: dict = Body(...)):
     """Add or edit a bill.
 
     Body: payee, amount (positive $), cadence "<FREQ>:<interval>" (see
-    CADENCES), next_due (ISO date or ""), income (bool), orig_payee (set on
-    rename), cap (int occurrence cap; ""/null clears; only touched when the
+    CADENCES), by_month_day (a monthly rule's days; present only when the
+    person changed them, since absent keeps the bill's own), next_due (ISO
+    date or ""; a typed date off a several-day rule is a 400), income
+    (bool), orig_payee (set on rename), cap (int occurrence cap; ""/null clears; only touched when the
     key is present), merchant (match key for NEW bills only), merchants
     (the display names of the merchants the bill pays — its identity),
     show_today / match_category (bools) and category (string) — each only
@@ -4129,6 +4273,8 @@ def bills_save_api(user: dict = Depends(_user()), body: dict = Body(...)):
     # Validate next_due up front too: save_bill parses it via as_date only
     # AFTER the rename commits, so a malformed date would otherwise leave a
     # half-applied rename behind (same partial-mutation window as amount).
+    days_v = (_rule_days_or_400(body["by_month_day"])
+              if body.get("by_month_day") is not None else None)
     next_due_in = _body_text(body, "next_due")
     if next_due_in:
         # the same year range save_bill's as_date enforces, or a year it
@@ -4190,6 +4336,11 @@ def bills_save_api(user: dict = Depends(_user()), body: dict = Body(...)):
         renamed = bool(orig_payee and orig_payee != payee)
         revive = False
         with conn.transaction():
+            # first, as an approval takes it: a bill added, renamed or
+            # re-pointed here while an approval is between its check for a
+            # bill claiming these charges and its commit would be invisible
+            # to that check
+            _hold_bill_claims(conn)
             if not orig_payee:
                 held = conn.execute(
                     "SELECT payee, active FROM bills WHERE id=%s FOR UPDATE",
@@ -4255,6 +4406,14 @@ def bills_save_api(user: dict = Depends(_user()), body: dict = Body(...)):
                         # until a new cadence was picked by hand
                         and not bills.cadence_too_long(_f.upper(), _n)):
                     freq, interval = _f.upper(), _n
+            if days_v and (freq, interval) != ("MONTHLY", 1):
+                raise HTTPException(400, _DAYS_NEED_MONTHLY)
+            # inside the transaction, so a refusal takes the rename with it
+            off_rule = bills.due_off_rule(
+                as_dict(old["raw"]) if old is not None else {}, freq, interval,
+                days_v, next_due_in or None)
+            if off_rule:
+                raise HTTPException(400, off_rule)
             src, last_seen = "manual", None
             if old is not None:
                 old_raw = as_dict(old["raw"])
@@ -4288,6 +4447,7 @@ def bills_save_api(user: dict = Depends(_user()), body: dict = Body(...)):
                     frequency=None if freq in ("ONE_TIME", "ENVELOPE") else freq,
                     interval=interval,
                     next_due=next_due_in or None,
+                    by_month_day=days_v,
                     source=src,
                     category=(category_v if "category" in body
                               else old["category"] if old is not None else None),
@@ -4299,22 +4459,7 @@ def bills_save_api(user: dict = Depends(_user()), body: dict = Body(...)):
                     merchants=merchants_v, revive=revive)
             except ValueError as e:     # $0 amount / slug collision / bad date
                 raise HTTPException(400, str(e))
-        if renamed:
-            # payee-keyed settings follow the rename once it has committed
-            def _migrate(cfg):
-                changed = False
-                dis = cfg.get("disabled_bills") or []
-                if orig_payee in dis:
-                    cfg["disabled_bills"] = [payee if p == orig_payee else p
-                                             for p in dis]
-                    changed = True
-                caps = cfg.get("occurrence_caps") or {}
-                if orig_payee in caps:
-                    caps[payee] = caps.pop(orig_payee)
-                    cfg["occurrence_caps"] = caps
-                    changed = True
-                return changed
-            _save_payee_config(conn, _migrate)
+        # (a rename moved its payee-keyed settings inside bills.rename_bill)
         # (re)stamp this bill's rows right away — an edit that sets or
         # changes the transaction category should show on the ledger on
         # the next load, not after the nightly pass. Also on a plain edit:
@@ -4391,7 +4536,7 @@ def bills_delete_api(user: dict = Depends(_user()),
                          body: dict = Body(...)):
     """mode=archive (default): soft-remove, restorable, keeps payee config.
     mode=purge: hard delete (from the archived list) + drop payee-keyed
-    config leftovers (occurrence cap, disabled flag)."""
+    config leftovers (bills.PAYEE_KEYED_CONFIG)."""
     from ..engine import bills
     payee = _body_text(body, "payee")
     if not payee:
@@ -4400,28 +4545,8 @@ def bills_delete_api(user: dict = Depends(_user()),
     conn = _conn(user)
     try:
         if mode == "purge":
+            # drops the payee-keyed config with the row
             n = bills.delete_bill(conn, payee)
-
-            def _cleanup(cfg):
-                changed = False
-                caps = cfg.get("occurrence_caps") or {}
-                if payee in caps:
-                    caps.pop(payee)
-                    if caps:
-                        cfg["occurrence_caps"] = caps
-                    else:
-                        cfg.pop("occurrence_caps", None)
-                    changed = True
-                dis = cfg.get("disabled_bills") or []
-                if payee in dis:
-                    dis = [p for p in dis if p != payee]
-                    if dis:
-                        cfg["disabled_bills"] = dis
-                    else:
-                        cfg.pop("disabled_bills", None)
-                    changed = True
-                return changed
-            _save_payee_config(conn, _cleanup)
         else:
             n = bills.archive_bill(conn, payee)
         # a bill that is gone (or resting) lets go of the rows it categorized
@@ -4444,7 +4569,10 @@ def bills_restore_api(user: dict = Depends(_user()),
         raise HTTPException(400, "payee required")
     conn = _conn(user)
     try:
-        n = bills.restore_bill(conn, payee)
+        try:
+            n = bills.restore_bill(conn, payee)
+        except ValueError as e:     # past the active-bill ceiling
+            raise HTTPException(400, str(e))
         # back in service: its transaction category applies again
         bills.apply_txn_categories(conn, bill_id=bills._slug(payee))
         if n:
@@ -4542,6 +4670,7 @@ def bills_hint_api(user: dict = Depends(_user()), body: dict = Body(...)):
                 if fit:
                     dismissed[payee] = {"kind": fit.get("kind"),
                                         "cadence": fit.get("cadence"),
+                                        "by_month_day": fit.get("by_month_day"),
                                         "amount": fit.get("amount"),
                                         "dismissed": today.isoformat()}
             if dismissed:
@@ -4624,6 +4753,10 @@ def bills_history_api(user: dict = Depends(_user()), payee: str = "",
                          "bill_type": raw.get("bill_type", "occurrence"),
                          "source": raw.get("source", "seed"),
                          "cadence": _bill_cadence(raw),
+                         "by_month_day": budget.monthly_rule_days(
+                             raw.get("recurrence")
+                             if isinstance(raw.get("recurrence"), dict)
+                             else {}) or None,
                          "due_on": (bill["due_on"].isoformat()
                                     if bill["due_on"] else None),
                          "income": (bill["amount"] or 0) > 0,
@@ -4633,9 +4766,12 @@ def bills_history_api(user: dict = Depends(_user()), payee: str = "",
         summaries = {p["id"]: (bills.merchant_offer_summary(conn, p)
                                if p["kind"] == "merchant"
                                else _proposal_summary(p)) for p in props}
-        # highlight: rows the bill/proposal matcher would count
-        ref = (abs(bill["amount"]) if bill is not None else
-               props[0]["amount"] if props else None)
+        # highlight: rows the bill/proposal matcher would count — by charge
+        # SIZE, as bill_info reads it: an empty amount (a restore can land
+        # one) is $0 and a signed one is its size, never a 500 or a band
+        # on the wrong side of zero
+        ref = (abs(bill["amount"] or 0) if bill is not None else
+               abs(props[0]["amount"] or 0) if props else None)
         bands = (budget.bill_amount_bands(bill["amount"], bill["raw"])
                  if bill is not None else
                  [(ref, budget.bill_tolerance(ref), None)] if ref else None)
@@ -4671,7 +4807,9 @@ def bills_history_api(user: dict = Depends(_user()), payee: str = "",
                            "bill_type": p["bill_type"], "payee": p["payee"],
                            "amount": p["amount"],
                            "cadence": _cadence_label(p["frequency"],
-                                                     p["interval"]),
+                                                     p["interval"],
+                                                     bills.offer_days(p)),
+                           "by_month_day": bills.offer_days(p),
                            "summary": summaries[p["id"]]}
                           for p in props],
             "covered_by": covered_by, "hint_dismissed": hint_dismissed,
@@ -4692,7 +4830,8 @@ def bills_history_api(user: dict = Depends(_user()), payee: str = "",
 # write that reshapes a whole merchant's history and rules for every
 # visitor in between is the kind the instance does not host.
 
-@router.post("/bills/merchant-category/preview")
+@router.post("/bills/merchant-category/preview",
+             dependencies=[Depends(limit("merchant_category_preview", 60, 60))])
 def merchant_category_preview_api(user: dict = Depends(_user()),
                                   body: dict = Body(...),
                                   canon_only: bool = False):
@@ -4897,7 +5036,9 @@ def assistant_status_api(user: dict = Depends(_user())):
     from ..engine import assistant
     conn = _conn(user)
     try:
-        return assistant.status(conn)
+        # status plus, per task, where its data goes — the one answer every
+        # "stays on this instance" line in the clients reads — from one load
+        return assistant.status_view(conn)
     finally:
         conn.close()
 
@@ -4944,11 +5085,12 @@ def assistant_ask_api(user: dict = Depends(_user()), body: dict = Body(...)):
             # a view-only login continues only its own conversations: the
             # household's others are not shown to it, and the answer the
             # same question would get for an unknown thread says nothing
-            # about whether one exists
-            if _own_log_only(user) and not assistant.thread_is_own(
-                    conn, thread_id, user.get("user_id")):
-                raise HTTPException(404, "no such conversation")
-            context = assistant.thread_context(conn, thread_id)
+            # about whether one exists. Its check and its context are one
+            # read, so a turn landing between them cannot slip in.
+            context = (assistant.own_thread_context(
+                           conn, thread_id, user.get("user_id"))
+                       if _own_log_only(user)
+                       else assistant.thread_context(conn, thread_id))
             if not context:
                 raise HTTPException(404, "no such conversation")
         out = assistant.ask(conn, question, context=context)
@@ -5174,8 +5316,13 @@ def connections_api(user: dict = Depends(_user())):
     conn = _conn(user)
     try:
         rows = [_ser(r) for r in _connections(conn)]
+        # not max(last_ok) over the rows above: the chip also counts the
+        # log's bookkeeping rows and items the list leaves out. Written
+        # as newest-first LIMIT 1 so the time-ordered partial index
+        # answers it without reading the whole log.
         last = conn.execute(
-            "SELECT MAX(ran_at) AS t FROM sync_log WHERE error IS NULL"
+            "SELECT ran_at AS t FROM sync_log WHERE error IS NULL "
+            "ORDER BY ran_at DESC LIMIT 1"
         ).fetchone()
         # is a sync running RIGHT NOW, whoever started it. Folded
         # into this endpoint rather than given its own, because the header
@@ -5183,32 +5330,31 @@ def connections_api(user: dict = Depends(_user())):
         # have doubled the app's idle request rate to answer a question this
         # response was already 90% of the way to answering.
         #
-        # Same staleness window as the claim in /jobs/sync/start — see
-        # SYNC_STALE_AFTER. A deploy that restarts the container mid-sync
+        # Same test as the claim in /jobs/sync/start — see jobs/sync_row.py.
+        # A deploy that restarts the container mid-sync
         # leaves state='running' with no owner, and these two must agree
-        # about when that row stops meaning anything: two different windows
+        # about when that row stops meaning anything: two different tests
         # leave this endpoint reporting no sync running while the other
         # refuses to start one, and a click does nothing with nothing to
         # explain it.
         job = conn.execute(
             "SELECT state, progress, updated_at FROM job_progress "
             "WHERE id='sync'").fetchone()
+        job_live = bool(job) and sync_row_live(conn, job)
     finally:
         conn.close()
     syncing, sync_progress = False, None
-    if job and job["state"] == "running":
-        age = dt.datetime.now(job["updated_at"].tzinfo) - job["updated_at"]
-        if age.total_seconds() < 3 * 60:      # SYNC_STALE_AFTER
-            from ..engine.compat import as_dict
-            prog = as_dict(job["progress"]) or {}
-            syncing = True
-            total, done = prog.get("total"), prog.get("done")
-            if isinstance(total, int) and isinstance(done, int) and total > 0:
-                # `phase` names what the tail is doing once every
-                # bank has answered, so a full counter that is still moving
-                # reads as a named stage rather than a stuck one.
-                sync_progress = {"done": min(done, total), "total": total,
-                                 "phase": prog.get("phase") or None}
+    if job_live:
+        from ..engine.compat import as_dict
+        prog = as_dict(job["progress"]) or {}
+        syncing = True
+        total, done = prog.get("total"), prog.get("done")
+        if isinstance(total, int) and isinstance(done, int) and total > 0:
+            # `phase` names what the tail is doing once every
+            # bank has answered, so a full counter that is still moving
+            # reads as a named stage rather than a stuck one.
+            sync_progress = {"done": min(done, total), "total": total,
+                             "phase": prog.get("phase") or None}
     last_sync = None
     if last and last["t"]:
         then = last["t"]
@@ -5228,15 +5374,23 @@ def connections_api(user: dict = Depends(_user())):
 def holdings_api(user: dict = Depends(_user())):
     """Top investment holdings across accounts — the Accounts page's
     'Top holdings' table (value-ranked, top 60)."""
+    from ..engine import budget, links
     conn = _conn(user)
     try:
+        # only positions the net-worth figures count: a linked shadow
+        # would list every fund twice, a hidden account counts toward
+        # nothing, and a business entity's account stays out of the
+        # personal view unless the household combines them
         rows = conn.execute(
             """SELECT COALESCE(a.display_name, a.name) AS acct,
                       h.symbol, h.name AS fund, h.quantity AS qty,
                       h.price, h.value
                FROM holdings h JOIN accounts a ON a.id = h.account_id
                WHERE h.value IS NOT NULL
-               ORDER BY h.value DESC LIMIT 60""").fetchall()
+                 AND NOT (h.account_id = ANY(%s))
+                 AND (""" + budget.COMBINE_OR + """a.entity_id IS NULL)
+               ORDER BY h.value DESC LIMIT 60""",
+            (links.shadow_ids(conn),)).fetchall()
         return {"holdings": [_ser(r) for r in rows]}
     finally:
         conn.close()
@@ -5249,23 +5403,31 @@ def accounts_rename_api(user: dict = Depends(_user()), body: dict = Body(...)):
     account_id = _body_text(body, "account_id")
     if not account_id:
         raise HTTPException(400, "account_id required")
+    name = _label_or_400(body, "name")
     conn = _conn(user)
     try:
         prev = conn.execute(
             "SELECT COALESCE(NULLIF(display_name, ''), name) AS name "
             "FROM accounts WHERE id=%s", (account_id,)).fetchone()
-        if not data.set_account_display_name(conn, account_id,
-                                             _body_text(body, "name")):
+        if not data.set_account_display_name(conn, account_id, name):
             raise HTTPException(404, "account not found")
         now = conn.execute(
             "SELECT COALESCE(NULLIF(display_name, ''), name) AS name "
             "FROM accounts WHERE id=%s", (account_id,)).fetchone()
         if prev and now and prev["name"] != now["name"]:
+            # the label before this rename may have been stored by a door
+            # that did not cut a typed card number; the activity log is
+            # exported, so it is cut here rather than copied whole
+            from ..sync.account_sources import (
+                stored_account_name as _cut_name)
+            before = _cut_name(prev["name"]) if prev["name"] else prev["name"]
             _activity.record(conn, user, "account", "renamed",
-                             target=account_id, label=prev["name"] or account_id,
-                             detail={"before": prev["name"],
+                             target=account_id, label=before or account_id,
+                             detail={"before": before,
                                      "after": now["name"]})
-        return {"ok": True}
+        # the stored label, which the cut may have changed from the typed
+        # one: a client caches and shows this, never what was typed
+        return {"ok": True, "name": now["name"] if now else None}
     finally:
         conn.close()
 
@@ -5369,8 +5531,7 @@ def accounts_exclude_api(user: dict = Depends(_user()),
 
 @router.post("/accounts/add")
 def accounts_add_api(user: dict = Depends(_user()), body: dict = Body(...)):
-    import re
-    name = _body_text(body, "name")
+    name = _label_or_400(body, "name")
     if not name:
         raise HTTPException(400, "name required")
     kind = _body_text(body, "kind", default="depository/checking")
@@ -5387,27 +5548,13 @@ def accounts_add_api(user: dict = Depends(_user()), body: dict = Body(...)):
     if typ not in ("depository", "credit", "investment", "loan", "other"):
         raise HTTPException(400, "unknown account type")
     bal = _money_float(body.get("balance") or "0", "balance")
-    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "account"
+    # a name spelling a full card number ("Visa 4111…") keeps only its
+    # last four in the stored name, and the id is opaque, minted under the
+    # household's account lock (bulk_import.create_manual_account)
+    from .bulk_import import create_manual_account
     conn = _conn(user)
     try:
-        conn.execute(
-            """INSERT INTO items (id, aggregator, institution_name, access_token)
-               VALUES ('manual','manual','Manual',NULL)
-               ON CONFLICT (tenant_id, id) DO NOTHING""")
-        aid = f"manual:{slug}"
-        n = 2
-        while conn.execute("SELECT 1 FROM accounts WHERE id=%s",
-                           (aid,)).fetchone():
-            aid = f"manual:{slug}-{n}"      # "Checking!" vs "Checking?" must
-            n += 1                          # not silently collapse into one
-        # balance defaults to 0, never NULL: a NULL balance files the
-        # brand-new account under archived/closed and the cash runway
-        # screams 'out of money' on day one
-        conn.execute(
-            """INSERT INTO accounts (id, item_id, name, type, subtype,
-                                     balance_current, updated_at)
-               VALUES (%s,'manual',%s,%s,%s,%s,now())""",
-            (aid, name, typ, sub or None, bal))
+        aid = create_manual_account(conn, name, typ, sub or None, bal)
         return {"ok": True, "account_id": aid}
     finally:
         conn.close()
@@ -5419,6 +5566,12 @@ def accounts_balance_api(user: dict = Depends(_user()),
     aid = str(body.get("account_id") or "")
     conn = _conn(user)
     try:
+        # an id a migrate moved off a full number reaches the account it
+        # moved to, as the import door's does (bulk_import.moved_account)
+        from .bulk_import import moved_account
+        found = moved_account(conn, aid) if aid else []
+        if len(found) == 1:
+            aid = found[0]
         row = conn.execute(
             "SELECT i.aggregator FROM accounts a JOIN items i ON i.id=a.item_id "
             "WHERE a.id=%s", (aid,)).fetchone()
@@ -5530,15 +5683,11 @@ _SETTINGS_FIELDS = ("food_monthly", "other_monthly", "custom_buckets",
                     # connector's default). Enrich is billed per row, so the
                     # ceiling is the whole cost control.
                     "plaid_enrich_cap",
-                    # explicit city names stripped from the TAIL
-                    # of merchant labels (banks truncate the store's city
-                    # into the descriptor at different lengths). Empty = off;
-                    # never inferred — see merchant_dedup.cities_for.
-                    "merchant_strip_cities",
-                    # read-only mirror of what the aggregator itself
-                    # reported, so the Settings card can show what is
-                    # already handled without the user retyping it
-                    "merchant_cities_seen",
+                    # (merchant_strip_cities is deliberately absent: no
+                    # client renders it, so it is an operator knob set in
+                    # the stored tenant settings — neither shown here nor
+                    # taken by the save. merchant_dedup.cities_for still
+                    # reads a stored value.)
                     # {daily,monthly,yearly} local-time schedule
                     "email_schedule",
                     # the Net Worth page's investment fee estimate and
@@ -5878,7 +6027,8 @@ def _settings_view(cfg: dict) -> dict:
         for b in _bks]
     from ..engine.llm_categorize import ROLES as _LLM_ROLES
     from ..engine.llm_categorize import resolve_role as _resolve_role
-    out["llm_roles"] = {k: v for k, v in (cfg.get("llm_roles") or {}).items()
+    from ..engine.llm_categorize import live_roles as _live_roles
+    out["llm_roles"] = {k: v for k, v in _live_roles(cfg).items()
                         if k in _LLM_ROLES}
     _own_url = str(cfg.get("llm_url") or "").strip()
     _cfg_vision = str(cfg.get("llm_vision_model") or "").strip()
@@ -6178,6 +6328,7 @@ def settings_get(user: dict = Depends(_user())):
         user["tenant_id"], cfg.get("email_recipients") or [],
         cfg.get("email_muted") or [], cfg)
     _hide_people(view, user)
+    view = settings_exposure.view_for(user.get("role"), view)
     if demoguard.is_demo(user["tenant_id"]):
         # Feedback is OFF on a demo and cannot be switched on: the tab
         # would invite bug reports about synthetic
@@ -6195,14 +6346,7 @@ def settings_get(user: dict = Depends(_user())):
 # reconfiguring the instance for every later visitor. This set is kept
 # because it names the keys that must NEVER be writable on a demo even if
 # the blanket rule is ever relaxed.
-_DEMO_DOOR_KEYS = frozenset({
-    "smtp_host", "smtp_port", "smtp_user", "smtp_password", "smtp_from",
-    "smtp_starttls",
-    "llm_url", "llm_model", "llm_api_key", "llm_vision_model",
-    "llm_extra_body", "llm_backends", "llm_roles",
-    "email_recipients", "email_recipients_added", "email_recipients_removed",
-    "taxdocs_allow_remote_llm",
-})
+_DEMO_DOOR_KEYS = settings_exposure.DEMO_DOOR_KEYS
 
 
 def _secret_values(conn, cfg: dict) -> set[str]:
@@ -6277,6 +6421,26 @@ def _outbound_repointed(conn, before: dict, after: dict) -> list[str]:
     return changed
 
 
+def _scheduled_channels_switched_on(before: dict, after: dict) -> list[str]:
+    """The scheduled text and push channels this save switches ON, as
+    "<cadence>.<channel>" — read from the effective schedules the worker
+    runs before and after, so re-saving what is already on switches nothing
+    on and switching one off is never listed. A scheduled text or push goes,
+    every day or month, to the phone the owner verified and to every
+    member's devices: a recurring send to people the caller may never have
+    been shown."""
+    from ..notify.schedule import effective_email_schedule
+    was, now = effective_email_schedule(before), effective_email_schedule(after)
+    on = []
+    for cad, entry in now.items():
+        if not isinstance(entry, dict):
+            continue
+        prior = was.get(cad) if isinstance(was.get(cad), dict) else {}
+        on += [f"{cad}.{ch}" for ch in ("sms", "push")
+               if entry.get(ch) and not prior.get(ch)]
+    return on
+
+
 # Investment fee / basis settings: a household names a handful of
 # institutions and accounts, so the cap only stops a runaway client.
 _INVEST_MAX_ROWS = 50
@@ -6300,7 +6464,28 @@ def _invest_mask(v, field: str) -> str:
     return m
 
 
-@router.post("/settings")
+# The most AI backends one household may route between — one ceiling for
+# the settings save and the bundle import.
+from ..sync.connections_bundle import _MAX_BACKENDS as _MAX_LLM_BACKENDS  # noqa: E402
+
+
+def _check_supplied_endpoints(chost, curl, smtp_host, llm_url, backends):
+    """The SSRF check on every endpoint a settings body supplies, in one
+    place so the lookup budget around it covers all of them."""
+    if smtp_host:
+        chost(smtp_host, what="the SMTP host")
+    if llm_url:
+        curl(llm_url, what="llm_url")
+    for u in backends:
+        if u:
+            curl(u, what="llm backend url")
+
+
+# One save per few seconds, sustained, from one address is well past any
+# person at the settings page or the wizard (each step posts once); the
+# limit is the backstop for a script, not a pace a person can reach.
+@router.post("/settings",
+             dependencies=[Depends(limit("settings_save", 300, 600))])
 def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
     # The demo instance is READ-ONLY: its credentials
     # are shared and printed publicly, so ANY settings write is one visitor
@@ -6329,6 +6514,20 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                                                  requested, stored)
         if why:
             raise HTTPException(403, why)
+    # The shape of every list whose entries cost a lookup is judged HERE,
+    # before a pooled connection is taken and before any name is resolved:
+    # a body is up to a megabyte, and a list refused only after each of its
+    # entries was looked up would hold a connection and a worker for as
+    # long as the resolver takes over all of them.
+    if "llm_backends" in body:
+        _bk_in = body["llm_backends"] or []
+        if not isinstance(_bk_in, list):
+            raise HTTPException(400, "llm_backends must be a list")
+        if len(_bk_in) > _MAX_LLM_BACKENDS:
+            raise HTTPException(
+                400, f"llm_backends: {_MAX_LLM_BACKENDS} backends max")
+        if not all(isinstance(e, dict) for e in _bk_in):
+            raise HTTPException(400, "each llm backend must be an object")
     from ..engine import budget
     conn = _conn(user)
     # set inside the lock when the wizard's connect step is left; the pin
@@ -6366,14 +6565,13 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
             from .netguard import BlockedURL as _BURL
             from .netguard import check_host as _chost
             from .netguard import check_url as _curl
+            from .netguard import lookup_budget as _lbudget
+            # every name this body can carry, and a few seconds in all: a
+            # slow resolver is not multiplied by the number of endpoints
             try:
-                if _sup_smtp:
-                    _chost(_sup_smtp, what="the SMTP host")
-                if _sup_llm:
-                    _curl(_sup_llm, what="llm_url")
-                for _u in _sup_bk:
-                    if _u:
-                        _curl(_u, what="llm backend url")
+                with _lbudget(_MAX_LLM_BACKENDS + 2, seconds=6.0):
+                    _check_supplied_endpoints(_chost, _curl, _sup_smtp,
+                                              _sup_llm, _sup_bk)
             except _BURL as e:
                 raise HTTPException(400, str(e))
         with budget.config_txn(conn) as cfg:
@@ -6579,25 +6777,6 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                             entry["summary"] = True
                         clean[cad] = entry
                     cfg["email_schedule"] = clean
-            if "merchant_strip_cities" in body:
-                # explicit extras on top of the auto-harvested list: city names
-                # stripped from the END of a merchant label. Accepts a list or a
-                # comma/newline separated string; empty clears it.
-                v = body["merchant_strip_cities"]
-                if isinstance(v, str):
-                    v = re.split(r"[,;\n]", v)
-                if not isinstance(v, list):
-                    raise HTTPException(400, "merchant_strip_cities must be a "
-                                             "list or comma-separated string")
-                clean = []
-                for x in v[:100]:                     # bounded
-                    x = str(x).strip()[:60]
-                    if x and x.lower() not in {c.lower() for c in clean}:
-                        clean.append(x)
-                if clean:
-                    cfg["merchant_strip_cities"] = clean
-                else:
-                    cfg.pop("merchant_strip_cities", None)
             if "merchant_logos" in body:
                 if body["merchant_logos"] in (True, None, ""):
                     cfg.pop("merchant_logos", None)      # absent = on
@@ -6826,9 +7005,13 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                         if not isinstance(e, dict):
                             raise HTTPException(400, "each bucket must be an object")
                         name = str(e.get("name") or "").strip()
-                        if not name or len(name) > 40:
+                        if not name:
                             raise HTTPException(
                                 400, "each bucket needs a name (1-40 chars)")
+                        if len(name) > 40:
+                            raise HTTPException(
+                                400, f"bucket '{name[:40]}…': name must be "
+                                     "1-40 characters")
                         if name.lower() in RESERVED_BUCKET_NAMES:
                             raise HTTPException(400, f"'{name}' is a reserved name")
                         if name.lower() in seen:
@@ -7154,10 +7337,10 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                     cfg.pop("savings_goal_state", None)
             if "manual_assets" in body:
                 # property/vehicle/mortgage entries edited on the Net
-                # Worth page. Auto-valuation keys (auto/rate/monthly_delta)
-                # ride through untouched; a value edit arrives with
-                # as_of cleared and gets stamped today, so "manual override
-                # wins until the next auto update" is visible in the source tag.
+                # Worth page. An entry keeps only what the net-worth report
+                # reads: nothing revalues an asset on its own, so any other
+                # key would be stored unchecked. A value edit arrives with
+                # as_of cleared and gets stamped today.
                 assets_in = body["manual_assets"] or []
                 if not isinstance(assets_in, list):
                     raise HTTPException(400, "manual_assets must be a list")
@@ -7168,8 +7351,8 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                     name = str(a.get("name") or "").strip()[:60]
                     if not name:
                         raise HTTPException(400, "every asset needs a name")
-                    # as_of is read back as a date by the net-worth report and
-                    # the auto-valuation step, so a string that is not one
+                    # as_of is read back as a date by the net-worth report,
+                    # so a string that is not one
                     # must stop here as a 400 rather than surface there later
                     as_of = _today(conn)
                     if a.get("as_of"):
@@ -7183,9 +7366,6 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                              "kind": str(a.get("kind") or "other").strip()[:30],
                              "value": round(_num(a.get("value", 0), "value"), 2),
                              "as_of": as_of.isoformat()}
-                    for k in ("auto", "rate", "monthly_delta"):
-                        if a.get(k) is not None:
-                            entry[k] = a[k]
                     out_assets.append(entry)
                 if out_assets:
                     cfg["manual_assets"] = out_assets
@@ -7457,8 +7637,9 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                 raw_bk = body["llm_backends"] or []
                 if not isinstance(raw_bk, list):
                     raise HTTPException(400, "llm_backends must be a list")
-                if len(raw_bk) > 12:
-                    raise HTTPException(400, "llm_backends: 12 backends max")
+                if len(raw_bk) > _MAX_LLM_BACKENDS:
+                    raise HTTPException(
+                        400, f"llm_backends: {_MAX_LLM_BACKENDS} backends max")
                 prior_bk = {str(b.get("id")): b
                             for b in (cfg.get("llm_backends") or [])
                             if isinstance(b, dict)}
@@ -7580,9 +7761,10 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                 ids_now = {str(b.get("id"))
                            for b in (cfg.get("llm_backends") or [])
                            if isinstance(b, dict)}
-                bundled_ok = (bool(os.environ.get("OIKONOME_LLM_URL",
-                                                  "").strip())
-                              and not env_flag("OIKONOME_HOSTED"))
+                from ..engine.llm_categorize import (
+                    bundled_available as _bundled_available)
+                bundled_ok = _bundled_available()
+                stored_r = cfg.get("llm_roles") or {}
                 roles_out = {}
                 for k, v in raw_r.items():
                     if k not in _LLM_ROLES:
@@ -7591,6 +7773,8 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                     if not v:
                         continue                 # explicit unroute
                     if v == "bundled":
+                        if not bundled_ok and stored_r.get(k) == "bundled":
+                            continue             # stale route: dropped
                         if not bundled_ok:
                             raise HTTPException(
                                 400, "no bundled backend on this instance")
@@ -7670,6 +7854,14 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
                     user, password=_proof.get("password", ""),
                     totp_code=_proof.get("totp_code", ""),
                     recovery_code=_proof.get("recovery_code", ""))
+            # The shared demonstration login is refused the one-off test
+            # text and push; switching the schedule's texts or pushes on
+            # would make that same send recurring, so it is refused here
+            # too. Switching them off stays open — it only takes a send
+            # away.
+            if demoguard.is_shared_login(user) and \
+                    _scheduled_channels_switched_on(_cfg_was, cfg):
+                demoguard.deny_shared_grant(user)
             if _smtp_from_missing:
                 raise HTTPException(
                     400, "smtp_from: enter the From address mail is sent "
@@ -7711,7 +7903,8 @@ def settings_set(user: dict = Depends(_user()), body: dict = Body(...)):
         view["email_recipient_status"] = _recipient_status(
             user["tenant_id"], cfg.get("email_recipients") or [],
             cfg.get("email_muted") or [], cfg)
-        return _hide_people(view, user)
+        return settings_exposure.view_for(user.get("role"),
+                                          _hide_people(view, user))
     finally:
         conn.close()
 
@@ -8335,6 +8528,10 @@ def activity_api(user: dict = Depends(_user()),
             return value
         for r in out["rows"]:
             r["actor"] = demoguard.own_address_only(user, r.get("actor"))
+            # another member's id is a handle on that member; the shared
+            # login is told only its own
+            if r.get("actor_user_id") not in (None, str(user.get("user_id"))):
+                r["actor_user_id"] = None
             label = r.get("label")
             masked = _mask(label)
             if masked != label:
@@ -8353,13 +8550,26 @@ def activity_api(user: dict = Depends(_user()),
     return out
 
 
+def _alert_key(body: dict) -> tuple[str, str]:
+    """The kind + message that name an alert row. A lookup key, matched as
+    stored, so unlike _body_text it is never trimmed: a message that happens
+    to end in a space could then not be dismissed at all."""
+    key = []
+    for field in ("kind", "message"):
+        v = body.get(field)
+        if v is not None and not isinstance(v, str):
+            raise HTTPException(400, f"{field} must be a string")
+        key.append(v or "")
+    return key[0], key[1]
+
+
 @router.post("/alerts/dismiss")
 def alerts_dismiss_api(user: dict = Depends(_user()), body: dict = Body(...)):
     from ..engine import alerts as _alerts
+    kind, message = _alert_key(body)
     conn = _conn(user)
     try:
-        n = _alerts.dismiss(conn, body.get("kind") or "",
-                            body.get("message") or "")
+        n = _alerts.dismiss(conn, kind, message)
         return {"ok": True, "dismissed": n}
     finally:
         conn.close()
@@ -8368,10 +8578,10 @@ def alerts_dismiss_api(user: dict = Depends(_user()), body: dict = Body(...)):
 @router.post("/alerts/restore")
 def alerts_restore_api(user: dict = Depends(_user()), body: dict = Body(...)):
     from ..engine import alerts as _alerts
+    kind, message = _alert_key(body)
     conn = _conn(user)
     try:
-        n = _alerts.restore(conn, body.get("kind") or "",
-                            body.get("message") or "")
+        n = _alerts.restore(conn, kind, message)
         return {"ok": True, "restored": n}
     finally:
         conn.close()
@@ -8390,7 +8600,8 @@ def alerts_history_api(user: dict = Depends(_user())):
         conn.close()
 
 
-@router.get("/calendar")
+@router.get("/calendar",
+            dependencies=[Depends(limit("engine", 60, 60))])
 def calendar_api(user: dict = Depends(_user()), days: int = 35):
     """Dated money events for the next N days — bills out, paychecks in,
     card payments (full-balance scenario only; the statement scenario would
@@ -8443,12 +8654,16 @@ def _parse_receipt_async(tenant_id: str, receipt_id: str) -> None:
     import threading
 
     def _run() -> None:
+        from ..engine import receipts
         conn = None
+        turn = receipts.wait_for_parse_turn()
         try:
-            from ..engine import receipts
             conn = tenancy.tenant_connect(tenant_id)
-            # claimed=True: the route claim()ed before spawning us
-            receipts.parse_one(conn, receipt_id, claimed=True)
+            if turn:
+                # claimed=True: the route claim()ed before spawning us
+                receipts.parse_one(conn, receipt_id, claimed=True)
+            else:
+                receipts.fail_busy(conn, receipt_id)
         except Exception as e:                    # noqa: BLE001
             # class only at WARNING; the text can carry receipt contents
             # or a backend URL, so it stays out of the feedback log ring
@@ -8460,6 +8675,8 @@ def _parse_receipt_async(tenant_id: str, receipt_id: str) -> None:
         finally:
             if conn is not None:
                 conn.close()
+            if turn:
+                receipts.end_parse_turn()
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -8494,6 +8711,8 @@ async def receipt_upload(txn_id: str, user: dict = Depends(_user()),
             # the shared worker (pixel size is separately capped in receipts).
             rid = await run_in_threadpool(receipts.add, conn, txn_id, data,
                                           mime, kind)
+        except storage_quota.StorageQuotaExceeded as e:
+            raise HTTPException(413, str(e))
         except ValueError as e:
             raise HTTPException(400, str(e))
         # add attaches to the row the charge stands as NOW: a pending hold
@@ -8540,6 +8759,8 @@ async def receipt_snap(user: dict = Depends(_user()),
         try:
             rid = await run_in_threadpool(receipts.add, conn, None, data,
                                           mime, "receipt")
+        except storage_quota.StorageQuotaExceeded as e:
+            raise HTTPException(413, str(e))
         except ValueError as e:
             raise HTTPException(400, str(e))
         _activity.record(conn, user, "receipt", "snapped",
@@ -8586,7 +8807,15 @@ def receipt_match_by_hand(rid: str, user: dict = Depends(_user()),
         raise HTTPException(400, "txn_id required")
     conn = _conn(user)
     try:
-        ok = receipt_match.match_by_hand(conn, rid, txn_id)
+        # A charge offered while pending may have posted since: the pair
+        # goes on the posted row the hold became, resolved under the
+        # pairing lock the match takes (exclusive up front, as it does),
+        # so no settlement can retire the row between the two.
+        from ..engine import entities
+        with conn.transaction():
+            receipt_match._lock(conn)
+            txn_id = entities.live_txn_id(conn, txn_id) or txn_id
+            ok = receipt_match.match_by_hand(conn, rid, txn_id)
         if not ok:
             raise HTTPException(
                 404, "no such waiting receipt, or that transaction is gone")
@@ -8594,7 +8823,8 @@ def receipt_match_by_hand(rid: str, user: dict = Depends(_user()),
                          label=_activity.txn_label(conn, txn_id),
                          detail={"receipt_kind": "receipt",
                                  "receipt_id": rid})
-        return _ser(receipt_match.waiting(conn, today=_today(conn)))
+        return {"txn_id": txn_id,
+                **_ser(receipt_match.waiting(conn, today=_today(conn)))}
     finally:
         conn.close()
 
@@ -8843,6 +9073,10 @@ def receipt_report(request: Request, user: dict = Depends(_user()),
     import io as _io
 
     from ..engine import receipts
+    if format == "csv":
+        # the expense file is a download of the household's books, the
+        # owner's to take like every other ledger file
+        _owner_only(user)
     conn = _conn(user)
     try:
         today = _today(conn)
@@ -8938,6 +9172,8 @@ def tokens_mint_api(user: dict = Depends(_user()), body: dict = Body(...)):
         token, row = api_tokens.mint(conn, user["tenant_id"],
                                      user.get("user_id"),
                                      str(body.get("name") or ""), scope)
+    from .app import _notify_security_change
+    _notify_security_change(user, "api_token_created")
     return {"token": token, **_ser(row)}
 
 
@@ -9086,8 +9322,13 @@ async def import_bulk_analyze(user: dict = Depends(_user()),
                                  f"{restore_mb} MB) — upload it by itself")
             # one export ZIP and nothing else is a restore, whatever its
             # size: say which door takes it
+            # — unless the plan already refused it as not an export, which
+            # the clients would otherwise hand to the restore (and its
+            # step-up) anyway
             if (len(staged) == 1
-                    and staged[0][0].lower().endswith(".zip")):
+                    and staged[0][0].lower().endswith(".zip")
+                    and not any(e.get("kind") == "unsupported"
+                                for e in plan.get("files", []))):
                 plan["restore_door"] = bulk_import.RESTORE_DOOR
             return plan
         finally:
@@ -9288,8 +9529,17 @@ async def import_api(user: dict = Depends(_user()),
         # here, where the filename is what separates the two.
         if not permissions.may_restore(user["role"]):
             raise HTTPException(403, permissions.RESTORE_DENIED)
-        from ..sync import restore_job
-        return {"result": restore_job.start(str(user["tenant_id"]), data),
+        from ..sync import restore, restore_job
+        # a ZIP that is not an Oikonome export (a budget app's export) is
+        # told so now, not by a job that starts and merges nothing
+        # off the event loop: a central directory of millions of entries
+        # takes seconds to parse
+        refusal = await run_in_threadpool(restore.foreign_archive_refusal,
+                                          data)
+        if refusal:
+            return {"result": {"error": refusal}, "mapping_needed": None}
+        return {"result": await run_in_threadpool(
+                    restore_job.start, str(user["tenant_id"]), data),
                 "mapping_needed": None}
 
     # parse + upsert are CPU- and DB-bound (a 50 MB OFX/ZIP takes seconds
@@ -9340,19 +9590,92 @@ async def import_api(user: dict = Depends(_user()),
                             from .bulk_import import hold_ledger_write_locks
                             hold_ledger_write_locks(conn)
                         dest = account_id
+                        refusal = None
+                        if dest:
+                            # a script pushing by the id an account had
+                            # before a migrate moved it off a full number
+                            # follows the move's record when it leads to
+                            # one account; anything else is answered as
+                            # the id always was
+                            from .bulk_import import moved_account
+                            found = moved_account(conn, dest)
+                            if len(found) == 1:
+                                dest = found[0]
+                            elif not found:
+                                raise HTTPException(
+                                    404, "that account no longer exists — "
+                                         "pick another")
+                            else:
+                                raise HTTPException(
+                                    409, "that account moved to several — "
+                                         "pick one of them")
                         # the single-file page can create the destination
-                        # account inline, like bulk already could — same
-                        # slug-collision-safe helper, so two different
+                        # account inline, like bulk already could — the same
+                        # helper mints an opaque id once, so two different
                         # "Chase" accounts never merge
+                        def run(aid):
+                            return _dispatch_import_unlocked(
+                                conn, aid, amount_sign, filename, data,
+                                role=str(user.get("role") or ""), **choice)
+                        ran = None
                         if not dest and new_account_name.strip():
-                            from .bulk_import import _ensure_account
+                            from .bulk_import import (AccountChoiceNeeded,
+                                                      import_named)
+                            # the name becomes the account's id and label:
+                            # _ensure_account cuts it to the folder import's
+                            # bound; a control character is refused as the
+                            # account-add and rename doors refuse it
+                            if _CONTROL_CHARS_RE.search(new_account_name):
+                                raise HTTPException(
+                                    400, "name holds control characters")
+                            typed_name = new_account_name
                             # the sign convention also types the account
                             # (card / investment), as the bulk path does
-                            dest = _ensure_account(
-                                conn, new_account_name.strip(), amount_sign)
-                        result, mapping_needed = _dispatch_import_unlocked(
-                            conn, dest, amount_sign, filename, data,
-                            role=str(user.get("role") or ""), **choice)
+                            # (or the earlier account that already holds
+                            # this file's rows: bulk_import.import_named)
+                            try:
+                                dest, ran = import_named(
+                                    conn, typed_name.strip(), amount_sign,
+                                    run)
+                            except AccountChoiceNeeded as e:
+                                # two cards share the last four the name
+                                # leads to: the person picks one, as the
+                                # folder import asks per file
+                                # each described, as the two can
+                                # read the same and the pick is kept
+                                # — but only to the person: a push token
+                                # may import, never read, and the cards'
+                                # balances and dates are a read
+                                from .bulk_import import _describe
+                                refusal = {"error": str(e)}
+                                if not user.get("script_token"):
+                                    refusal["choices"] = _describe(
+                                        conn, e.choices)
+                        if refusal:
+                            result, mapping_needed = refusal, None
+                        else:
+                            result, mapping_needed = ran or run(dest)
+                            if account_id and mapping_needed:
+                                # parked to be mapped or placed: the pick
+                                # is remembered when the finish lands it
+                                from .bulk_import import _stem
+                                from .pages import remember_when_landed
+                                remember_when_landed(
+                                    conn, mapping_needed,
+                                    {new_account_name, _stem(filename)})
+                        if account_id and not mapping_needed and not (
+                                isinstance(result, dict)
+                                and result.get("error")):
+                            # an account picked for a name two cards share
+                            # is remembered once its file has landed, as
+                            # the folder import does, so the next file of
+                            # that card is not asked again: under the typed
+                            # name and the file's own. A file still to be
+                            # mapped, or refused, settles nothing.
+                            from .bulk_import import _stem, remember_choice
+                            for typed in {new_account_name.strip(),
+                                          _stem(filename)} - {""}:
+                                remember_choice(conn, typed, dest)
             if result and not mapping_needed and not (
                     isinstance(result, dict) and result.get("error")):
                 _categorize_after_import(str(user["tenant_id"]))
@@ -9416,10 +9739,16 @@ def import_ynab_accounts_api(user: dict = Depends(_user()),
         raise HTTPException(400, "token must be a string")
     if not isinstance(accounts, dict) or not all(
             isinstance(k, str) and (isinstance(v, str) or (
-                isinstance(v, dict) and isinstance(v.get("new"), str)))
+                isinstance(v, dict) and (
+                    isinstance(v.get("new"), str)
+                    or (isinstance(v.get("id"), str)
+                        and isinstance(v.get("typed", ""), str)))))
             for k, v in accounts.items()):
+        # {"id", "typed"}: an account picked from those a typed new-account
+        # name could mean, with the name, so the pick is kept under it
         raise HTTPException(400, "accounts must map each YNAB account to "
-                                 "an account id, \"skip\" or {\"new\": name}")
+                                 "an account id, \"skip\", {\"new\": name} "
+                                 "or {\"id\": id, \"typed\": name}")
     if remove_earlier is None:
         remove_earlier = {}
     if not isinstance(remove_earlier, dict) or not all(
@@ -9711,9 +10040,9 @@ def _backfill_status(conn) -> tuple[dict, list]:
              AND COALESCE(i.status,'') != 'archived'
            ORDER BY i.linked_at""").fetchall()
     running = conn.execute(
-        """SELECT 1 FROM job_progress WHERE id='sync'
-           AND state='running'
-           AND updated_at > now() - %s::interval""",
+        f"""SELECT 1 FROM job_progress WHERE id='sync'
+            AND state='running'
+            AND (updated_at > now() - %s::interval OR {SYNC_LOCK_HELD_SQL})""",
         (SYNC_STALE_AFTER,)).fetchone() is not None
     items = []
     today = _today(conn)
@@ -9973,8 +10302,10 @@ def business_list(user: dict = Depends(_user()), year: int | None = None,
 @router.get("/business/export.csv")
 def business_export(request: Request, user: dict = Depends(_user()),
                     year: int | None = None):
+    """The Schedule C worksheet: flagged transactions as CSV. Owner-only,
+    as the ledger download is."""
     _same_site_download(request)
-    """The Schedule C worksheet: flagged transactions as CSV."""
+    _owner_only(user)
     import io as _io
 
     from fastapi.responses import Response
@@ -10022,7 +10353,7 @@ def entities_create(user: dict = Depends(_user()), body: dict = Body(...)):
     try:
         _require_business(conn)
         try:
-            ent = entities.create_entity(
+            ent = entities.create_entity_once(
                 conn, name=_body_text(body, "name"),
                 structure=_body_text(body, "structure"),
                 state=_body_text(body, "state") or None,
@@ -10370,6 +10701,48 @@ def equity_delete(entity_id: str, movement_id: str,
         conn.close()
 
 
+@router.get("/doctor/unlinked-movements")
+def doctor_unlinked_movements(user: dict = Depends(_user())):
+    """Capital contributions and reimbursements left behind by a charge
+    deleted before deletes took them along — still counted, explaining
+    nothing. Listed for the owner to remove by hand; none goes on its own."""
+    from ..engine import equity
+    conn = _conn(user)
+    try:
+        return {"movements": equity.unlinked_fronted(conn)}
+    finally:
+        conn.close()
+
+
+@router.delete("/doctor/unlinked-movements/{movement_id}")
+def doctor_unlinked_movement_delete(movement_id: str,
+                                    user: dict = Depends(_user())):
+    """Remove one listed movement. Owner-only, as the other Doctor writes
+    are. A movement still linked to its charge, or entered by hand, is not
+    this door's to remove: the business's own equity list removes those."""
+    demoguard.deny(user)
+    _may_edit(user)
+    if user.get("role") != "owner":
+        raise HTTPException(403, "only the household owner can do this")
+    from ..engine import equity
+    conn = _conn(user)
+    try:
+        gone = equity.delete_unlinked_fronted(
+            conn, _require_record_id(movement_id, "movement"))
+        if gone is None:
+            raise HTTPException(404, "no such unlinked movement")
+        _activity.record(
+            conn, user, "business", "removed", target=None,
+            label=(f"{gone['kind']} of {_activity.money(gone['amount'])} "
+                   f"for {gone['entity_name'] or 'a business'} whose "
+                   "charge was deleted"),
+            detail={"movement": {k: v for k, v in gone.items()
+                                 if k != "entity_name"}})
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
 @router.post("/business/entities/{entity_id}/reimburse")
 def equity_reimburse(entity_id: str, user: dict = Depends(_user()),
                      body: dict = Body(...)):
@@ -10622,9 +10995,10 @@ def _year_end_sheet(conn, entity_id: str, year: int | None,
         (entity_id, as_of)).fetchall()}
     upto = [t for t in lifetime
             if (books._row_date(t) or as_of) <= as_of]
-    net_income = float(books._pnl_core(conn, entity_id, None, upto,
-                                       lifetime=upto)
-                       .get("net_operating") or 0)
+    # the same retained earnings the live capital account counts, start-up
+    # allowance deducted through this year included
+    net_income = books.net_income_through(conn, entity_id, year, upto,
+                                         lifetime)
     capital = (by.get("contribution", 0.0) + net_income
                - by.get("draw", 0.0) - by.get("distribution", 0.0))
     return {"assets": assets, "liabilities": liabilities,
@@ -10640,7 +11014,6 @@ def _year_end_sheet(conn, entity_id: str, year: int | None,
 def business_year_package(entity_id: str, request: Request,
                           user: dict = Depends(_user()),
                           year: int | None = None):
-    _same_site_download(request)
     """Everything a CPA asks for, in one file.
 
     One button producing P&L, balance sheet, 1099s, mileage log and the
@@ -10653,7 +11026,12 @@ def business_year_package(entity_id: str, request: Request,
     numbers they can open in a spreadsheet and re-foot, not a PDF they have
     to retype. A README states what the figures are and, importantly, what
     they are not.
+
+    Owner-only: it carries the entity's categorized ledger, so it is the
+    P&L CSV's door at a larger size.
     """
+    _same_site_download(request)
+    _owner_only(user)
     import io as _io
     import zipfile as _z
 
@@ -10802,8 +11180,10 @@ def business_year_package(entity_id: str, request: Request,
 def business_pnl_csv(entity_id: str, request: Request,
                      user: dict = Depends(_user()),
                      year: int | None = None):
+    """A CPA-consumable export: entity, P&L summary, and every classified
+    line. Owner-only, as the ledger download is."""
     _same_site_download(request)
-    """A CPA-consumable export: entity, P&L summary, and every classified line."""
+    _owner_only(user)
     import io as _io
 
     from fastapi.responses import Response
@@ -11098,11 +11478,17 @@ def se_vendor_mark(entity_id: str, user: dict = Depends(_user()),
         if not merchant:
             raise HTTPException(400, "merchant required")
         tin = body.get("tin_last4")
+        keep_tin = "tin_last4" not in body
         if tin is not None and (isinstance(tin, bool)
                                 or not isinstance(tin, (str, int))):
             raise HTTPException(400, "tin_last4 must be a string")
         try:
             with _entity_write(conn, entity_id):
+                if keep_tin:
+                    # a toggle that does not speak of the TIN keeps the one
+                    # on file, read under the same write lock as the save;
+                    # only an explicit "" or null clears it
+                    tin = selfemploy.vendor_tin(conn, entity_id, merchant)
                 selfemploy.mark_vendor(
                     conn, entity_id, merchant,
                     reportable=bool(body.get("reportable", True)),
@@ -11205,9 +11591,10 @@ def _refuse_moving_a_fronted_expense(conn, txn_id: str,
     row = conn.execute(
         "SELECT a.entity_id AS acct FROM transactions t "
         "LEFT JOIN accounts a ON a.id = t.account_id "
-        "WHERE t.id = %s FOR UPDATE OF t", (txn_id,)).fetchone()
-    if row is None:
-        return                        # assign_transaction answers the 404
+        "WHERE t.id = %s AND t.removed = 0 FOR UPDATE OF t",
+        (txn_id,)).fetchone()
+    if row is None:                   # gone, or off the ledger with no posted
+        return                        # row: assign_transaction answers the 404
     after = entity_id or row["acct"]
     after = str(after) if after else None
     p = conn.execute(
@@ -11859,7 +12246,15 @@ def accounts_remove_api(account_id: str, user: dict = Depends(_user()),
                         "affected_accounts": [account_id]}
 
         if mode == "hide":
-            _hide_account(conn, account_id)
+            # check and write under the row lock, as /hidden does: a
+            # reconnect adoption renaming this id commits with the old row
+            # gone, and an unlocked write would match nothing yet answer
+            # "hidden" while the renamed account went on counting
+            with conn.transaction():
+                if conn.execute("SELECT 1 FROM accounts WHERE id=%s "
+                                "FOR UPDATE", (account_id,)).fetchone() is None:
+                    raise HTTPException(404, "no such account")
+                _hide_account(conn, account_id)
             if pull_live and not siblings:
                 result["note"] = (
                     "Account hidden. This was the only active account on "
@@ -12010,42 +12405,67 @@ def _with_kept_rows(note: str, purged: dict | None) -> str:
 # progress callback, so any web process can serve the poll.
 
 
-# How long a job_progress row may go unheard from before its owner is
-# treated as dead. ONE constant, because the claim below and the liveness
-# read in /api/connections must agree: two different windows leave
+# jobs/sync_row.py says when a job_progress row has lost its owner: unheard
+# from for SYNC_STALE_AFTER and nobody holding the sync lock. ONE test, because
+# the claim below and the liveness reads must agree: two different tests leave
 # /api/connections reporting no sync running while this endpoint refuses to
 # start one, because the same orphaned row still looks alive to it. A click
 # does nothing, with nothing to say why.
 #
-# A short claim window is safe because the claim is not the real guard.
-# sync_tenant holds a Postgres advisory lock for the whole pull, and a
-# second run that gets past this check returns immediately on that lock.
+# The claim is still not the real guard. sync_tenant holds a Postgres advisory
+# lock for the whole pull, and a second run that gets past this check returns
+# immediately on that lock.
 # This row is bookkeeping; the lock is the mutex.
-SYNC_STALE_AFTER = "3 minutes"
 
 
 @router.post("/jobs/sync/start",
              dependencies=[Depends(limit("jobs-sync", 6, 600))])
 def jobs_sync_start(user: dict = Depends(_user())):
     """Kick off the full-tenant sync in the background; returns at once.
-    One running job per tenant — a stale 'running' row (no update for 15
-    minutes: a died worker) is reclaimed."""
+    One running job per tenant — a stale 'running' row (no update for
+    SYNC_STALE_AFTER and its lock gone: a died worker) is reclaimed."""
     demoguard.deny(user)
     import threading
 
     from ..engine.compat import jsonb
     tid = str(user["tenant_id"])
     conn = _conn(user)
-    try:
-        claimed = conn.execute(
-            """INSERT INTO job_progress (id, state, progress)
-               VALUES ('sync', 'running', '{}'::jsonb)
+
+    def claim():
+        return conn.execute(
+            f"""INSERT INTO job_progress (id, state, progress)
+               VALUES ('sync', 'running', '{{}}'::jsonb)
                ON CONFLICT (tenant_id, id) DO UPDATE SET
-                   state='running', progress='{}'::jsonb,
+                   state='running', progress='{{}}'::jsonb,
                    started_at=now(), updated_at=now()
                WHERE job_progress.state != 'running'
-                  OR job_progress.updated_at < now() - %s::interval
+                  OR (job_progress.updated_at < now() - %s::interval
+                      AND NOT {SYNC_LOCK_HELD_SQL})
                RETURNING id""", (SYNC_STALE_AFTER,)).fetchone()
+    try:
+        claimed = claim()
+        if claimed is None and conn.execute(
+                "SELECT 1 FROM job_progress WHERE id='sync' "
+                "AND updated_at < now() - %s::interval",
+                (SYNC_STALE_AFTER,)).fetchone():
+            # A quiet row kept only by the lock: its holder may be no sync
+            # at all (an import, a disconnect, a restore), which lets go
+            # without pulling. Leave the ask behind, as sync_tenant does
+            # when it finds the lock held, so the holder queues it.
+            from ..jobs import worker
+            worker._nudge_sync(conn)
+            # The holder answers only AFTER it lets go, so one that let go
+            # between the claim and the nudge never sees it: look again,
+            # and with the lock free take the ask back and claim the row.
+            if not conn.execute(
+                    f"SELECT {SYNC_LOCK_HELD_SQL} AS held").fetchone()["held"]:
+                # only an ask still there is ours to take back: one the
+                # holder already answered means it queued the sync itself
+                if worker._claim_sync_nudge(conn):
+                    claimed = claim()
+                    if claimed is None:
+                        # someone took the lock in between: the ask stands
+                        worker._nudge_sync(conn)
     finally:
         conn.close()
     if claimed is None:
@@ -12138,8 +12558,16 @@ def jobs_sync_status(user: dict = Depends(_user())):
         if row is None:
             return {"state": "none", "progress": {}}
         progress = as_dict(row["progress"]) or {}
+        state = row["state"]
+        if state == "running" and not sync_row_live(conn, row):
+            # the run died without settling its row, and the start door will
+            # already take a new one: "running" here would hold the client's
+            # button disabled over a sync that no longer exists
+            state = "error"
+            progress = {**progress,
+                        "error": "it stopped before finishing — sync again"}
         items = progress.get("items") or []
-        if items and row["state"] in ("done", "error"):
+        if items and state in ("done", "error"):
             for it in items:
                 iid = it.get("id")
                 if not iid or iid == "mx":
@@ -12151,7 +12579,7 @@ def jobs_sync_status(user: dict = Depends(_user())):
                 # with a zero (test fakes / MX multi-member).
                 if n > (it.get("transactions") or 0):
                     it["transactions"] = n
-        return {"state": row["state"],
+        return {"state": state,
                 "progress": progress,
                 "started_at": row["started_at"].isoformat(),
                 "updated_at": row["updated_at"].isoformat()}
@@ -12162,8 +12590,13 @@ def jobs_sync_status(user: dict = Depends(_user())):
 @router.post("/jobs/email", dependencies=[Depends(limit("jobs-email", 3, 600))])
 def jobs_email_api(user: dict = Depends(_user())):
     """Build and send today's verdict email NOW (the daily email's task
-    body, run inline — same recipients rules). Returns the subject line."""
-    demoguard.deny(user)
+    body, run inline — same recipients rules). Returns the subject line.
+
+    Owner-only (the request gate's list says so too), and refused to the
+    shared demonstration login: the mail goes to every recipient, and
+    every holder of that password, from any address, could repeat it."""
+    demoguard.deny_shared_grant(user)
+    _owner_only(user)
     from ..jobs import worker
     try:
         # force_email: this is the explicit "email me now" button — it must
@@ -12372,8 +12805,8 @@ def notify_phone_api(user: dict = Depends(_user()), body: dict = Body(...)):
                 3, 86400):
             raise HTTPException(429, "too many codes sent to that number "
                                      "recently")
-        import secrets as _secrets
-        code = f"{_secrets.randbelow(1_000_000):06d}"
+        from ..auth import otp_code
+        code, code_rec = otp_code.issue("sms-phone", user["tenant_id"])
         # TCPA / carrier evidence: the SPA
         # gates the send-code button on an explicit SMS-only consent checkbox,
         # and the timestamp of that affirmative action is recorded HERE, with
@@ -12391,12 +12824,10 @@ def notify_phone_api(user: dict = Depends(_user()), body: dict = Body(...)):
         # takes the row lock for the read-modify-write.
         with budget.config_txn(conn) as locked:
             locked["notify_phone_pending"] = {
+                **code_rec,
                 "number": number,
-                "code_hash": hashlib.sha256(code.encode()).hexdigest(),
                 "consent_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                "consent_programs": programs,
-                "expires": (dt.datetime.now(dt.timezone.utc)
-                            + dt.timedelta(minutes=10)).isoformat()}
+                "consent_programs": programs}
     finally:
         conn.close()
     if not _sms.send(number, f"Oikonome verification code: {code}"):
@@ -12412,38 +12843,50 @@ def notify_phone_verify_api(user: dict = Depends(_user()),
     # reason as the number itself
     demoguard.deny_shared_grant(user)
     _owner_only(user)
-    import hashlib
+    from ..auth import otp_code
     from ..engine import budget
-    code = str(body.get("code") or "").strip()
+    # the per-address limit above is spent once per address; this one is
+    # spent once per account, whichever address the guesses come from
+    otp_code.charge_attempt("sms-phone", user["user_id"])
     conn = _conn(user)
     try:
         # Verify reads the pending record, promotes it and drops it
         # — a read-modify-write of the whole blob, so it takes the same lock
         # as the send path above. Without it a concurrent settings save can
         # resurrect the consumed pending record or lose the verified number.
+        # A miss is WRITTEN (the counter, or the burned record dropped) and
+        # the refusal raised only after the block commits: raising inside
+        # it would roll the miss back, and the cap with it.
         with budget.config_txn(conn) as cfg:
             pending = cfg.get("notify_phone_pending") or {}
-            exp = pending.get("expires")
-            expired = (not exp or dt.datetime.fromisoformat(exp)
-                       < dt.datetime.now(dt.timezone.utc))
-            if (not pending.get("number") or expired
-                    or hashlib.sha256(code.encode()).hexdigest()
-                    != pending.get("code_hash")):
-                raise HTTPException(400, "wrong or expired code")
-            # consent_at travels with the verified record: the pending row is
-            # dropped below, and losing the consent timestamp there would
-            # leave a verified number with no evidence of how it opted in.
-            cfg["notify_phone"] = {"number": pending["number"],
-                                   "verified": True,
-                                   "consent_at": pending.get("consent_at"),
-                                   "consent_programs":
-                                       pending.get("consent_programs"),
-                                   "verified_at": dt.datetime.now(
-                                       dt.timezone.utc).isoformat()}
-            cfg.pop("notify_phone_pending", None)
+            verdict = (otp_code.check(pending, body.get("code"), "sms-phone",
+                                      user["tenant_id"])
+                       if pending.get("number") else otp_code.INVALID)
+            if verdict == otp_code.WRONG:
+                cfg["notify_phone_pending"] = pending
+            elif verdict != otp_code.OK:
+                cfg.pop("notify_phone_pending", None)
+            else:
+                _promote_verified_phone(cfg, pending)
     finally:
         conn.close()
+    if verdict != otp_code.OK:
+        raise HTTPException(400, "wrong or expired code")
     return {"ok": True}
+
+
+def _promote_verified_phone(cfg: dict, pending: dict) -> None:
+    # consent_at travels with the verified record: the pending row is
+    # dropped below, and losing the consent timestamp there would
+    # leave a verified number with no evidence of how it opted in.
+    cfg["notify_phone"] = {"number": pending["number"],
+                           "verified": True,
+                           "consent_at": pending.get("consent_at"),
+                           "consent_programs":
+                               pending.get("consent_programs"),
+                           "verified_at": dt.datetime.now(
+                               dt.timezone.utc).isoformat()}
+    cfg.pop("notify_phone_pending", None)
 
 
 # Push endpoints are server-POSTed by the worker fan-out, so an
@@ -12555,8 +12998,12 @@ def push_unsubscribe_api(user: dict = Depends(_user()),
 @router.post("/notify/test",
              dependencies=[Depends(limit("notify-test", 5, 3600))])
 def notify_test_api(user: dict = Depends(_user()), body: dict = Body(...)):
-    """Send today's short verdict through one channel, right now."""
-    demoguard.deny(user)
+    """Send today's short verdict through one channel, right now.
+
+    Refused to the shared demonstration login: the text goes to the
+    household's verified phone and the push to every member's devices,
+    people that login is never shown."""
+    demoguard.deny_shared_grant(user)
     _owner_only(user)
     from ..engine import budget
     from ..notify import push as _push, render as _short, sms as _sms

@@ -166,8 +166,8 @@ def cities_for(conn) -> tuple[str, ...]:
     # here. They are applied PER MERCHANT (harvest_city_map) because real
     # town names collide with ordinary business words — a global 'Center'
     # rewrites 'Brightline Auto Center'. merchant_cities_seen is kept in
-    # config for display only, so the Settings card can show what is
-    # already handled automatically.
+    # config as the operator's record of what is already handled
+    # automatically; no client renders it.
     names: set[str] = set()
     for x in list(raw):
         for v in _city_variants(str(x)):
@@ -392,6 +392,33 @@ def _short_tokens_kept(toks: list[tuple[str, bool]]) -> list[str]:
     return out
 
 
+def cut_card_numbers(text):
+    """`text` as a machine may write it into a merchant's name: a card number
+    or a long run of digits cut to its last four, the cut a file row's own
+    name takes (sync.base.mask_account_name). What a person typed never comes
+    through here. Migration 204 is this cut in SQL, for names already stored."""
+    from ..sync import base
+    return base.mask_account_name(text)
+
+
+def _edge_token_is_brand(tok: str, word: str, leading: bool) -> bool:
+    """Is `tok`, standing just before (`leading`) or after a name that cleaned
+    down to the one `word`, part of that business's name?
+
+    A single letter is, on either edge: "Q DEPOT" and "V DEPOT" are two
+    stores, "HOOPLA Q" is not "HOOPLA". A short number is only beside a
+    generic word, where it is the brand ("88 GAS", "MOTEL 9") rather than a
+    location; leading it may run to three digits, trailing to two, since a
+    longer trailing run is a store number. A number led by zero is always a
+    reference."""
+    if len(tok) == 1 and tok.isalpha():
+        return True
+    return (tok.isdigit() and not tok.startswith("0")
+            and len(tok) <= (3 if leading else 2)
+            and word.lower() in (_NUMBERED_BRAND_WORDS if leading
+                                 else _NUMBERED_BRAND_WORDS | {"super"}))
+
+
 def canonical_merchant(name: str, cities=()) -> str:
     """Deterministic Layer-1 canonical form. Safe: strips known noise, never
     reduces a name to a lone shared word, so it under-merges rather than
@@ -471,20 +498,39 @@ def canonical_merchant(name: str, cities=()) -> str:
     if out and len(first := out.split(" ", 1)[0]) == 2 and first.isalpha() \
             and first.lower() not in _LEADING_WORD:
         out = first.upper() + out[2:]
-    if (out.lower() in _NUMBERED_BRAND_WORDS and len(words) >= 2
-            and words[0].isdigit() and len(words[0]) <= 3
-            and not words[0].startswith("0")
-            and words[1].lower() == out.lower()):
-        # "88 GAS 0123": the number IS the brand, and without it every
-        # such line falls to the one shared word "Gas"
-        out = f"{words[0]} {out}"
+    # A lone word with one letter or a short number beside it in the line is
+    # that word plus the token, on either edge ("Q DEPOT", "HOOPLA Q",
+    # "88 GAS 0123", "MOTEL 9"): cut to the word alone, every business of
+    # that word fuses into one merchant. Leading edge first; a name that
+    # already took a token is no longer a lone word.
+    if out and " " not in out:
+        at = next((i for i, w in enumerate(words)
+                   if w.lower() == out.lower()), None)
+        if at is not None:
+            prev = words[at - 1] if at > 0 else ""
+            nxt = words[at + 1] if at + 1 < len(words) else ""
+            if _edge_token_is_brand(prev, out, leading=True):
+                out = f"{prev.upper()} {out}"
+            elif _edge_token_is_brand(nxt, out, leading=False):
+                out = f"{out} {nxt.upper()}"
     if len(out) <= 2 and " " not in out:
         # two letters standing ALONE are not a name (the same judgement
         # _keepable makes about a city strip): a descriptor that shrank to
         # 'CC' has lost the payee, so keep the raw string instead of minting
         # a merchant out of an abbreviation
         out = ""
-    out = out or (name or "").strip()
+    if not out and name:
+        # No name was found, and the descriptor itself is about to become
+        # the name. A number in it must not: read it as its cut spelling,
+        # which also stops the junk rule above taking what follows the number
+        # ("ACH 4111 1111 1111 1234 ACME"), so a feed row and a file row of
+        # one payee land on one merchant.
+        cut = cut_card_numbers(name)
+        if cut != name:
+            return canonical_merchant(cut, cities)
+    # the line itself as the name, less the control characters every
+    # merchant endpoint refuses (a merchant named with one is unopenable)
+    out = out or re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", name or "").strip()
     return _strip_cities(out, cities)
 
 
@@ -528,6 +574,7 @@ def load_llm_map(conn, mapping: dict[str, str]) -> int:
         for raw, canon in mapping.items():
             if not raw or not canon:
                 continue
+            canon = cut_card_numbers(canon)
             conn.execute(
                 "INSERT INTO merchant_canonical (raw_merchant, canonical, method, as_of) "
                 "VALUES (%s,%s,'llm',now()) "

@@ -674,6 +674,50 @@ class SharedDemoLoginGrants(unittest.TestCase):
                             "platform": "fcm"})
         self.assertEqual(r.status_code, 200, r.text)
 
+    def _sched(self, **daily):
+        return {"email_schedule": {
+            "daily": {"on": True, "hour": 7, **daily},
+            "monthly": {"on": False, "hour": 7},
+            "yearly": {"on": False, "hour": 7}}}
+
+    def test_the_shared_login_cannot_switch_on_scheduled_sms_or_push(self):
+        """A scheduled text or push is the one-off test send made
+        recurring: every day it reaches the phone the real owner verified
+        and every member's devices. Switching a channel ON is refused to
+        the shared login on every cadence; switching one OFF stays open,
+        and an ordinary owner still switches them on."""
+        c, _, row = self._login(waived=True)
+        tid = row["tenant_id"]
+        for flag in ("sms", "push"):
+            for cad in ("daily", "monthly", "yearly"):
+                body = self._sched()
+                body["email_schedule"][cad][flag] = True
+                r = c.post("/api/settings", json=body)
+                self.assertEqual(r.status_code, 403, f"{cad} {flag}")
+                self.assertIn("shared demonstration login", r.text)
+                stored = self._stored(tid).get("email_schedule") or {}
+                self.assertFalse((stored.get(cad) or {}).get(flag),
+                                 f"{cad} {flag}")
+        # a schedule the real owner set up: the visitor may switch it off
+        conn = tenancy.tenant_connect(tid)
+        try:
+            from oikonome.engine import budget
+            budget.save_config(conn, {**budget.load_config(conn),
+                                      **self._sched(sms=True, push=True)})
+            conn.commit()
+        finally:
+            conn.close()
+        r = c.post("/api/settings", json=self._sched(sms=True, push=True))
+        self.assertEqual(r.status_code, 200, r.text)
+        r = c.post("/api/settings", json=self._sched())
+        self.assertEqual(r.status_code, 200, r.text)
+        daily = self._stored(tid)["email_schedule"]["daily"]
+        self.assertFalse(daily.get("sms") or daily.get("push"))
+        ordinary, _, _ = self._login(waived=False)
+        r = ordinary.post("/api/settings", json=self._sched(sms=True,
+                                                            push=True))
+        self.assertEqual(r.status_code, 200, r.text)
+
     def test_an_ordinary_owner_still_mints_invites(self):
         c, _, _ = self._login(waived=False)
         r = c.post("/api/invites", json={"password": PW, "role": "member",

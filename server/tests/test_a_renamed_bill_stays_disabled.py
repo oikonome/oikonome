@@ -53,6 +53,32 @@ class ARenameCarriesTheDisabledMark(unittest.TestCase):
         self.assertEqual(cfg["disabled_bills"], ["Zenith Net"])
         self.assertEqual(cfg["occurrence_caps"], {"Zenith Net": 2})
 
+    def test_the_rename_moves_hint_and_health_dismissals(self):
+        with budget.config_txn(self.conn) as cfg:
+            cfg["dismissed_hints"] = {"Zenith Fibre": {"kind": "cadence"}}
+            cfg["dismissed_health"] = {"Zenith Fibre": {"health": "stale"},
+                                       "Other": {"health": "stale"}}
+        bills.rename_bill(self.conn, "Zenith Fibre", "Zenith Net")
+        cfg = budget.load_config(self.conn)
+        self.assertEqual(cfg["dismissed_hints"],
+                         {"Zenith Net": {"kind": "cadence"}})
+        self.assertEqual(cfg["dismissed_health"],
+                         {"Zenith Net": {"health": "stale"},
+                          "Other": {"health": "stale"}})
+
+    def test_a_purge_drops_every_payee_keyed_entry(self):
+        with budget.config_txn(self.conn) as cfg:
+            cfg["disabled_bills"] = ["Zenith Fibre", "Other"]
+            cfg["occurrence_caps"] = {"Zenith Fibre": 2}
+            cfg["dismissed_hints"] = {"Zenith Fibre": {"kind": "cadence"}}
+            cfg["dismissed_health"] = {"Zenith Fibre": {"health": "stale"}}
+        bills.archive_bill(self.conn, "Zenith Fibre")
+        self.assertEqual(1, bills.delete_bill(self.conn, "Zenith Fibre"))
+        cfg = budget.load_config(self.conn)
+        self.assertEqual(cfg.get("disabled_bills"), ["Other"])
+        for k in ("occurrence_caps", "dismissed_hints", "dismissed_health"):
+            self.assertNotIn("Zenith Fibre", cfg.get(k) or {}, k)
+
     def test_a_rename_that_is_refused_changes_no_config(self):
         add_bill(self.conn, "Zenith Net", 40, next_due=TODAY)
         self._disable("Zenith Fibre", cap=2)

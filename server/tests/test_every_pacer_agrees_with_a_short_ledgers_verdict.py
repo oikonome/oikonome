@@ -16,6 +16,7 @@ into an OVER verdict.
 import datetime as dt
 import re
 import unittest
+from unittest import mock
 import uuid
 
 from oikonome.engine import budget, forecast
@@ -361,10 +362,11 @@ class HeroAgreesWithTheTilesTests(unittest.TestCase):
         d = client.get("/api/today/full").json()
         tiles = [d["allow"]["food"], d["allow"]["other"]] + d["allow_kids"]
         # a tile with spend today keeps what is left of today and spreads
-        # the rest over the days after it
+        # the rest over the days after it — on the month's last day there
+        # are none, so what is left of today is the whole remainder
         tiles_total = sum(
             (max(0.0, a["left_today"]) + a["rate"]
-             * max(1, d["days_left"] - 1)) if a["spent_today"] > 0
+             * (d["days_left"] - 1)) if a["spent_today"] > 0
             else a["rate"] * d["days_left"]
             for a in tiles)
         self.assertAlmostEqual(d["month_remaining_paced"], tiles_total,
@@ -445,6 +447,17 @@ class ClosedFirstMonthTests(unittest.TestCase):
 class LensesNeedASavedBudgetTests(unittest.TestCase):
     """The Month and Year lenses judge only a budget the household made:
     with none saved, the loader's first-month guess gets no verdict."""
+
+    def setUp(self):
+        # the loader seeds from the last three full months by the
+        # household's clock, not the `today` these lenses are asked for:
+        # once the calendar passed the fixture's October, its ledger became
+        # a full closed month and the guess a persisted budget. Pin the clock
+        # to the day the fixture is written for.
+        p = mock.patch("oikonome.localtime.now_local",
+                       return_value=dt.datetime(2026, 10, 16, 12, 0))
+        p.start()
+        self.addCleanup(p.stop)
 
     def test_no_saved_budget_shows_no_verdict(self):
         conn = make_db()

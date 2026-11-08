@@ -189,9 +189,19 @@ class DemoResetTests(unittest.TestCase):
     def tearDownClass(cls):
         tenancy.ADMIN_DSN, tenancy.APP_DSN = cls._saved
 
+    def setUp(self):
+        from oikonome import demo
+        admin = tenancy.admin_connect()
+        try:
+            for r in admin.execute("SELECT id FROM tenants").fetchall():
+                tenancy.delete_tenant_rows(admin, str(r["id"]))
+        finally:
+            admin.close()
+        self.first = demo.seed(seed=4242, years=2)
+
     def test_reset_replays_the_household_and_keeps_login(self):
         from oikonome import demo
-        first = demo.seed(seed=4242, years=2)
+        first = self.first
         # simulate visitor damage: recategorize + delete rows
         conn = tenancy.tenant_connect(first["tenant_id"])
         try:
@@ -206,7 +216,9 @@ class DemoResetTests(unittest.TestCase):
         self.assertEqual(r["email"], first["email"])
         self.assertEqual(r["password"], first["password"])
         self.assertEqual(r["transactions"], first["transactions"])
-        self.assertNotEqual(r["tenant_id"], first["tenant_id"])
+        # the household is rebuilt inside the tenant it already is, so a
+        # sign-in never lands on a tenant that is still being written
+        self.assertEqual(r["tenant_id"], first["tenant_id"])
         # single pristine tenant, damage gone
         admin = tenancy.admin_connect()
         try:
@@ -219,6 +231,156 @@ class DemoResetTests(unittest.TestCase):
             rec = admin.execute(
                 "SELECT count(*) AS n FROM bills").fetchone()
             self.assertGreater(rec["n"], 0)
+        finally:
+            admin.close()
+
+    def _login_row(self, admin):
+        return admin.execute(
+            "SELECT id, email, password_hash FROM users WHERE tenant_id = %s",
+            (self.first["tenant_id"],)).fetchall()
+
+    def test_reset_signs_everyone_out_and_restores_the_one_login(self):
+        """A reset is a fresh start for the shared login: every session and
+        device sign-in made on it ends, any login added on it goes, and the
+        demo login is back with the printed password and no second factor
+        — while the household keeps its tenant."""
+        from oikonome import demo
+        from oikonome.auth import passwords, sessions
+        tid = self.first["tenant_id"]
+        admin = tenancy.admin_connect()
+        try:
+            uid = self._login_row(admin)[0]["id"]
+            sessions.create_session(admin, uid, tid)
+            admin.execute(
+                "INSERT INTO device_tokens (token_hash, user_id, tenant_id, "
+                "expires_at) VALUES ('dt-x', %s, %s, now() + interval '1 day')",
+                (uid, tid))
+            admin.execute(
+                "UPDATE users SET password_hash = 'changed', "
+                "totp_secret = 'x' WHERE id = %s", (uid,))
+            admin.execute(
+                "INSERT INTO users (tenant_id, email, password_hash) "
+                "VALUES (%s, 'visitor-added@example.com', 'x')", (tid,))
+            admin.commit()
+            r = demo.reset()
+            self.assertEqual(r["tenant_id"], tid)
+            users = admin.execute(
+                "SELECT email, password_hash, totp_secret FROM users "
+                "WHERE tenant_id = %s", (tid,)).fetchall()
+            self.assertEqual([u["email"] for u in users],
+                             [self.first["email"]])
+            self.assertTrue(passwords.verify_password(
+                users[0]["password_hash"], self.first["password"]))
+            self.assertIsNone(users[0]["totp_secret"])
+            for t in ("sessions", "device_tokens"):
+                n = admin.execute(
+                    f"SELECT count(*) AS n FROM {t} WHERE tenant_id = %s",
+                    (tid,)).fetchone()["n"]
+                self.assertEqual(n, 0, f"{t} survived the reset")
+        finally:
+            admin.close()
+
+    def test_a_reader_never_sees_the_household_empty_during_a_reset(self):
+        """A visitor signed in while the hourly reset runs must see the old
+        household or the new one, never an empty or half-written one. The
+        rebuild is held at its start until a reader on another connection
+        has counted the ledger there."""
+        import threading
+        from unittest import mock
+
+        from oikonome import demo
+        tid = self.first["tenant_id"]
+        mid, counted, done = (threading.Event(), threading.Event(),
+                              threading.Event())
+        counts, mid_counts = [], []
+        real_write = demo._write
+
+        def held_write(*a, **kw):
+            mid.set()
+            counted.wait(10)
+            return real_write(*a, **kw)
+
+        def reader():
+            conn = tenancy.tenant_connect(tid)
+            try:
+                while not done.is_set():
+                    during = mid.is_set()   # read BEFORE the count starts
+                    n = conn.execute("SELECT count(*) AS n FROM "
+                                     "transactions").fetchone()["n"]
+                    conn.rollback()
+                    counts.append(n)
+                    if during:
+                        mid_counts.append(n)
+                        counted.set()
+            finally:
+                conn.close()
+
+        def total():
+            admin = tenancy.admin_connect()
+            try:
+                return admin.execute(
+                    "SELECT count(*) AS n FROM transactions "
+                    "WHERE tenant_id = %s", (tid,)).fetchone()["n"]
+            finally:
+                admin.close()
+
+        old = total()
+        self.assertGreater(old, 0)
+        t = threading.Thread(target=reader)
+        t.start()
+        try:
+            with mock.patch.object(demo, "_write", side_effect=held_write):
+                r = demo.reset()
+        finally:
+            done.set()
+            t.join(30)
+        self.assertEqual(r["tenant_id"], tid)
+        self.assertTrue(mid_counts, "the reader never counted mid-reset")
+        self.assertLessEqual(set(counts), {old, total()},
+                             f"partial counts seen: {sorted(set(counts))[:5]}")
+
+    def test_a_reset_that_fails_midway_leaves_the_previous_household(self):
+        """A rebuild that raises after the generated rows are written must
+        leave the demo exactly as it was: its ledger, its settings (still a
+        demo, still the same login), its tenant and its sign-ins."""
+        from unittest import mock
+
+        from oikonome import demo
+        from oikonome.auth import sessions
+        tid = self.first["tenant_id"]
+        admin = tenancy.admin_connect()
+        try:
+            uid = self._login_row(admin)[0]["id"]
+            sessions.create_session(admin, uid, tid)
+            # age it, so a rebuild that got through would differ
+            admin.execute("UPDATE transactions SET date = date - 40 "
+                          "WHERE tenant_id = %s", (tid,))
+            admin.commit()
+
+            def snapshot():
+                out = (
+                    admin.execute(
+                        "SELECT md5(string_agg(id || date || amount, ',' "
+                        "ORDER BY id)) AS h, count(*) AS n FROM transactions "
+                        "WHERE tenant_id = %s", (tid,)).fetchone(),
+                    admin.execute(
+                        "SELECT config FROM tenant_settings "
+                        "WHERE tenant_id = %s", (tid,)).fetchone(),
+                    [dict(r) for r in admin.execute(
+                        "SELECT id FROM tenants").fetchall()],
+                    self._login_row(admin),
+                    admin.execute(
+                        "SELECT count(*) AS n FROM sessions "
+                        "WHERE tenant_id = %s", (tid,)).fetchone())
+                admin.commit()
+                return out
+            before = snapshot()
+            self.assertGreater(before[0]["n"], 0)
+            with mock.patch.object(demo, "_configure",
+                                   side_effect=RuntimeError("midway")):
+                with self.assertRaises(RuntimeError):
+                    demo.reset()
+            self.assertEqual(snapshot(), before)
         finally:
             admin.close()
 
@@ -907,7 +1069,7 @@ class SecretReencryptSweepTests(unittest.TestCase):
     Runs in a THROWAWAY DB so it can control the master-key env without
     disturbing the shared suite."""
 
-    DB = "oikonome_test_reencrypt"
+    DB = f"{TEST_DB}_reencrypt"
 
     @classmethod
     def setUpClass(cls):

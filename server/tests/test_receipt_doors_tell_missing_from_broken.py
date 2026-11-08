@@ -124,21 +124,18 @@ class MissingVersusBrokenTests(unittest.TestCase):
         self.assertIsNone(gone.json()["txn"])
 
     def test_a_charge_with_no_amount_still_lists_its_receipts(self):
-        # a restored row can carry a NULL (or non-finite) amount: nothing
-        # to rank against, but the panel must still open
+        # a restored row can carry a non-finite amount: nothing to rank
+        # against, but the panel must still open (a NULL amount is refused
+        # by the column since migration 205)
         conn = tenancy.tenant_connect(self.tid)
         try:
-            bare = add_txn(conn, dt.date.today(), 9.99, "LANTERN HARDWARE",
-                           account="chk")
-            conn.execute("UPDATE transactions SET amount = NULL"
-                         " WHERE id = %s", (bare,))
             nan = add_txn(conn, dt.date.today(), 9.99, "LANTERN HARDWARE",
                           account="chk")
             conn.execute("UPDATE transactions SET amount = 'NaN'"
                          " WHERE id = %s", (nan,))
         finally:
             conn.close()
-        for tid in (bare, nan):
+        for tid in (nan,):
             got = self.owner.get(f"/api/transactions/{tid}/receipts")
             self.assertEqual(got.status_code, 200, got.text)
             self.assertEqual(got.json(), {"receipts": [], "txn": None})

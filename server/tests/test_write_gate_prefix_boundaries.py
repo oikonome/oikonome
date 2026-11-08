@@ -51,3 +51,15 @@ class GatePrefixBoundaryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AFactorlessOwnerCanStillErase(unittest.TestCase):
+    def test_account_delete_is_open_before_a_factor_exists(self):
+        """Under forced second-factor enrollment the account delete stays
+        reachable (it demands its own fresh elevation), as leave does."""
+        from oikonome.web import app
+        self.assertTrue(app.path_within("/api/account/delete",
+                                        app.NEEDS_2FA_OK))
+        self.assertTrue(app.path_within("/api/account/leave",
+                                        app.NEEDS_2FA_OK))
+

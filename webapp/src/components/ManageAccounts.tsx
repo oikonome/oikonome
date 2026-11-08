@@ -48,7 +48,7 @@ export default function ManageAccounts() {
   const done: DoneFn = (msg, moved) => {
     setNotice(msg);
     const keys: Moved[] = moved
-      ?? ["accounts", "connections", "settings", "today", "me"];
+      ?? ["accounts", "connections", "settings", "today", "me", "holdings"];
     for (const k of keys) qc.invalidateQueries({ queryKey: [k] });
     // Belt and braces for a caller that named "connections" without "me":
     // the institutions-used figure rides /api/me, and every path that
@@ -311,8 +311,14 @@ function Editor({ a, isPrimary, isExcluded, live, hidden, onDone }: {
       // changes landed and which didn't, or the person retries from a
       // state they believe is untouched.
       const steps: [string, () => Promise<unknown>][] = [];
+      // the name as the server stored it (a typed card number is cut to
+      // its last four), which is what the cache and the editor then hold
+      // (a holder, not a bare let: the step that sets it is a closure)
+      const stored: { name: string | null } = { name: null };
       if (name.trim() && name !== a.name)
-        steps.push(["name", () => api.accountRename(a.id, name)]);
+        steps.push(["name", async () => {
+          stored.name = (await api.accountRename(a.id, name)).name ?? null;
+        }]);
       // the exclusion goes before the pin: the pin door refuses an
       // excluded account, so including it and pinning it in one save
       // only works in this order
@@ -344,16 +350,20 @@ function Editor({ a, isPrimary, isExcluded, live, hidden, onDone }: {
         }
         saved.push(label);
       }
+      return stored.name;
     },
-    onSuccess: () => {
+    onSuccess: (stored) => {
       // `dirty` and the row header both read the cache, so seed it with
       // what was just written: Save greys out and the header shows the new
-      // name in the same frame, instead of after two refetches. Every door
-      // above is a plain field write, so the prediction is exact.
+      // name in the same frame, instead of after two refetches. The name
+      // is the one the server answered with (it may cut what was typed);
+      // every other door is a plain field write, so its prediction is exact.
       const newBal = (parseMoneyDraft(bal) ?? NaN);
+      const savedName = stored ?? (name.trim() || a.name);
+      if (stored !== null) setName(stored);
       patchList<{ accounts: Account[] }, Account>(qc, ["accounts"], "accounts",
         (x) => x.id === a.id,
-        { name: name.trim() || a.name, kind, owner: ownerLbl.trim() || null,
+        { name: savedName, kind, owner: ownerLbl.trim() || null,
           ...(manual && bal.trim() !== "" && Number.isFinite(newBal)
               ? { balance_current: newBal } : {}) });
       const moved = primMoved || exclMoved;
@@ -374,7 +384,7 @@ function Editor({ a, isPrimary, isExcluded, live, hidden, onDone }: {
       // starting point for the next save
       setSeed({ primary: prim, excluded: excl });
       // the anchor and the exclusion move the verdict; a rename does not
-      onDone(`Saved ${name || a.name}.`,
+      onDone(`Saved ${savedName}.`,
              moved ? ["accounts", "today"] : ["accounts"]);
     },
     // a save is several doors in a row: one that fails can leave the
@@ -392,7 +402,8 @@ function Editor({ a, isPrimary, isExcluded, live, hidden, onDone }: {
         (x) => x.id === a.id,
         h ? { user_removed_at: new Date().toISOString(), balance_current: null }
           : { user_removed_at: null });
-      onDone(r.note, ["accounts", "today"]);
+      // top holdings leaves a hidden account's positions out
+      onDone(r.note, ["accounts", "today", "holdings"]);
     },
     onError: (e) => onDone(errText(e)),
   });

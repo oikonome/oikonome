@@ -125,6 +125,17 @@ class NetWorthTests(unittest.TestCase):
         self.assertEqual(nw["property_net"], 300000.0)
         self.assertEqual(nw["full_total"], 404750.0)
 
+    def test_a_crypto_position_with_no_value_or_quantity_still_renders(self):
+        """A crypto_holdings row may carry no USD value or no quantity (a
+        restored blank cell); net worth reads it as $0 rather than raising
+        on every load."""
+        self.conn.execute(
+            "INSERT INTO crypto_holdings (account_id, currency, quantity, "
+            "native_usd) VALUES ('inv1','BTC',1.5,NULL), "
+            "('inv1','ETH',NULL,300)")
+        nw = reporting.compute_networth(self.conn)
+        self.assertTrue(nw["trend"])
+
     def test_unrelated_loan_does_not_delete_the_manual_mortgage(self):
         """Only a live MORTGAGE supersedes a manual mortgage entry.
 
@@ -401,8 +412,9 @@ class CashflowTests(unittest.TestCase):
 
     def test_savings_by_year(self):
         # the checking feed covers all of 2025 (income is known only for
-        # months on or after its first row), opened by a transfer that is
-        # neither spend nor income
+        # months on or after its first row; Jan 1 never posts, so a feed
+        # from Jan 1 shows its first row on Jan 2), opened by a transfer
+        # that is neither spend nor income
         add_txn(self.conn, dt.date(2025, 1, 2), 25, "FEED OPENED",
                 account="chk", primary="TRANSFER_OUT", txn_id="feed-open")
         cf = reporting.compute_cashflow(self.conn)
@@ -419,8 +431,9 @@ class CashflowTests(unittest.TestCase):
         # inflow row too — it stops being a transfer
         # to the effective-category test, but it is still not income.
         # the checking feed covers all of 2025 (income is known only for
-        # months on or after its first row), opened by a transfer that is
-        # neither spend nor income
+        # months on or after its first row; Jan 1 never posts, so a feed
+        # from Jan 1 shows its first row on Jan 2), opened by a transfer
+        # that is neither spend nor income
         add_txn(self.conn, dt.date(2025, 1, 2), 25, "FEED OPENED",
                 account="chk", primary="TRANSFER_OUT", txn_id="feed-open")
         self.conn.execute(
@@ -588,6 +601,77 @@ class FeesTests(unittest.TestCase):
             # include the exempt account (which would be $465)
             self.assertLess(adv[1], 0.003 * 140000)
             self.assertEqual(f["total"], adv[1])
+        finally:
+            conn.close()
+
+    def test_advisory_fee_estimate_starts_on_the_day_the_account_opened(self):
+        """An account whose ledger opens at funding held nothing before it:
+        its first year's fee covers the days since it opened, at the value
+        it was funded with, not a whole year averaged up from $0."""
+        conn = make_db()
+        try:
+            add_item(conn, "rb", "Evergreen Robo")
+            add_account(conn, "rba", "Managed Portfolio", "investment",
+                        "brokerage", 100000, item="rb")
+            add_raw_txn(conn, dt.date(2026, 10, 1), 100000, "BUY VTI", "rba",
+                        {"units": 1000, "ticker": "VTI", "unitprice": 100,
+                         "type": "buy"})
+            add_holding(conn, "rba", "VTI", 1000, 100, 100000)
+            est = reporting._managed_fee_by_year(
+                conn, ["rba"], 0.0025, dt.date(2026, 10, 31))
+            # 31 days of 0.25% on $100k, not 304 days of it on $50k
+            self.assertAlmostEqual(est["2026"], 0.0025 * 100000 * 31 / 365,
+                                   delta=0.01)
+            # a closed first year counts its days from the opening too
+            est = reporting._managed_fee_by_year(
+                conn, ["rba"], 0.0025, dt.date(2027, 3, 1))
+            self.assertAlmostEqual(est["2026"], 0.0025 * 100000 * 92 / 365,
+                                   delta=0.01)
+        finally:
+            conn.close()
+
+    def test_advisory_fee_estimate_opens_at_the_first_buy_after_a_deposit(self):
+        """A robo account is funded by a cash deposit days before the first
+        buy. The deposit holds no security, so the account's managed value
+        opens at the buy: the first year runs from it at the bought value,
+        never averaged up from the $0 of the deposit day."""
+        conn = make_db()
+        try:
+            add_item(conn, "rb", "Evergreen Robo")
+            add_account(conn, "rba", "Managed Portfolio", "investment",
+                        "brokerage", 100000, item="rb")
+            add_raw_txn(conn, dt.date(2026, 10, 1), -100000, "ACH DEPOSIT",
+                        "rba", {"type": "deposit"})
+            add_raw_txn(conn, dt.date(2026, 10, 3), 100000, "BUY VTI", "rba",
+                        {"units": 1000, "ticker": "VTI", "unitprice": 100,
+                         "type": "buy"})
+            add_holding(conn, "rba", "VTI", 1000, 100, 100000)
+            est = reporting._managed_fee_by_year(
+                conn, ["rba"], 0.0025, dt.date(2026, 10, 31))
+            self.assertAlmostEqual(est["2026"], 0.0025 * 100000 * 29 / 365,
+                                   delta=0.01)
+        finally:
+            conn.close()
+
+    def test_advisory_fee_estimate_deposit_and_buy_across_new_year(self):
+        """Funded on Dec 30, first buy on Jan 5: nothing was managed in the
+        deposit's year, and the next year runs from the buy at full value."""
+        conn = make_db()
+        try:
+            add_item(conn, "rb", "Evergreen Robo")
+            add_account(conn, "rba", "Managed Portfolio", "investment",
+                        "brokerage", 100000, item="rb")
+            add_raw_txn(conn, dt.date(2025, 12, 30), -100000, "ACH DEPOSIT",
+                        "rba", {"type": "deposit"})
+            add_raw_txn(conn, dt.date(2026, 1, 5), 100000, "BUY VTI", "rba",
+                        {"units": 1000, "ticker": "VTI", "unitprice": 100,
+                         "type": "buy"})
+            add_holding(conn, "rba", "VTI", 1000, 100, 100000)
+            est = reporting._managed_fee_by_year(
+                conn, ["rba"], 0.0025, dt.date(2026, 3, 31))
+            self.assertNotIn("2025", est)
+            self.assertAlmostEqual(est["2026"], 0.0025 * 100000 * 86 / 365,
+                                   delta=0.01)
         finally:
             conn.close()
 

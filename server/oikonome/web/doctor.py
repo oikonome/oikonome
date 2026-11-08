@@ -18,6 +18,7 @@ from ..envnum import env_flag
 import shutil
 
 from ..db import crypto, tenancy
+from ..jobs.sync_row import sync_row_live
 
 
 def _row(section: str, name: str, ok: bool, detail: str,
@@ -40,8 +41,14 @@ def _fmt_bytes(n: float) -> str:
     return f"{n:.1f} TB"
 
 
-def _ago(t, now) -> str:
+def _ago(t, now, public: bool = False) -> str:
+    """How long ago, for a person. The public bundle (attached to public
+    issues, stamped with generated_at) gets whole days only: an age to the
+    tenth of an hour against that stamp is a UTC time, and a job that runs
+    at a known local hour then gives away the instance's UTC offset."""
     h = (now - t).total_seconds() / 3600
+    if public:
+        return "within the last day" if h < 24 else f"{h // 24:.0f}d ago"
     if h < 1:
         return f"{h * 60:.0f}m ago"
     if h < 48:
@@ -93,7 +100,8 @@ def _system_rows(conn) -> list[dict]:
     return out
 
 
-def _service_rows(conn, now, demo: bool = False) -> list[dict]:
+def _service_rows(conn, now, demo: bool = False,
+                  public: bool = False) -> list[dict]:
     """One row per stack service, probed from inside the app container —
     the closest an in-app page can get to `podman ps` (engine-level detail
     stays with `./oikonome.sh status`)."""
@@ -138,7 +146,10 @@ def _service_rows(conn, now, demo: bool = False) -> list[dict]:
     else:
         h = (now - last).total_seconds() / 3600
         out.append(_row("Services", "worker", h <= 26,
-                        f"last job {_ago(last, now)}"
+                        # public: no age (see age_ok — it is the offset)
+                        ("ran within the day" if public and h <= 26
+                         else "overdue" if public
+                         else f"last job {_ago(last, now)}")
                         + ("" if h <= 26 else
                            " — expected at least daily; check the worker "
                            "container"), "warn"))
@@ -222,10 +233,11 @@ def _connection_rows(conn, now, public: bool = False) -> list[dict]:
     out = []
     rows = conn.execute(
         """SELECT i.id, i.aggregator, i.institution_name, i.status,
-                  MAX(s.ran_at) FILTER (WHERE s.error IS NULL) AS last_ok
-           FROM items i LEFT JOIN sync_log s ON s.item_id = i.id
+                  (SELECT s.ran_at FROM sync_log s
+                    WHERE s.item_id = i.id AND s.error IS NULL
+                    ORDER BY s.ran_at DESC LIMIT 1) AS last_ok
+           FROM items i
            WHERE COALESCE(i.status,'') != 'archived'
-           GROUP BY i.id, i.aggregator, i.institution_name, i.status
            ORDER BY i.aggregator, i.institution_name""").fetchall()
     label = {"plaid": "Plaid", "mx": "MX", "coinbase": "Coinbase",
              "simplefin": "SimpleFIN", "simplefin-org": "SimpleFIN"}
@@ -256,7 +268,7 @@ def _connection_rows(conn, now, public: bool = False) -> list[dict]:
             fresh, when = False, "never synced"
         else:
             fresh = (now - it["last_ok"]).total_seconds() < 26 * 3600
-            when = f"last sync {_ago(it['last_ok'], now)}"
+            when = f"last sync {_ago(it['last_ok'], now, public)}"
         agg = label.get(it["aggregator"], it["aggregator"])
         if public:
             seen[agg] = seen.get(agg, 0) + 1
@@ -432,14 +444,14 @@ def _llm_tail_rows(conn, configured: bool,
         if last and last.get("state") == "error":
             out.append(_row(
                 "Smart categorization", "last run", False,
-                f"failed {_ago(last['at'], dt.datetime.now(dt.timezone.utc))}"
+                f"failed {_ago(last['at'], dt.datetime.now(dt.timezone.utc), public)}"
                 + ("" if public else f" — {last.get('error')}")
                 + " · merchant categories and Amazon "
                 "summaries are stalled until it is fixed", "warn"))
         elif last:
             out.append(_row(
                 "Smart categorization", "last run", True,
-                f"{_ago(last['at'], dt.datetime.now(dt.timezone.utc))} · "
+                f"{_ago(last['at'], dt.datetime.now(dt.timezone.utc), public)} · "
                 f"{last.get('produced', 0)} answers"))
     by_src = {r["source"]: r["n"] for r in conn.execute(
         "SELECT source, COUNT(*) AS n FROM merchant_categories "
@@ -466,7 +478,7 @@ def _llm_tail_rows(conn, configured: bool,
         if "parsing" in rc:
             n = rc["parsing"]["n"]
             oldest = rc["parsing"]["oldest"]
-            age = f" (started {_ago(oldest, now)})" if oldest else ""
+            age = f" (started {_ago(oldest, now, public)})" if oldest else ""
             bits.append(f"{n} parsing now{age}")
             busy = True
         if "uploaded" in rc:
@@ -492,9 +504,9 @@ def _llm_tail_rows(conn, configured: bool,
         out.append(_row("Smart categorization", "receipt queue", True,
                         "empty — receipts parse on upload"))
     jp = conn.execute(
-        "SELECT state, progress FROM job_progress WHERE id='sync'"
+        "SELECT state, progress, updated_at FROM job_progress WHERE id='sync'"
     ).fetchone()
-    if jp and jp["state"] == "running":
+    if jp and sync_row_live(conn, jp):
         from ..engine.compat import as_dict
         prog = as_dict(jp["progress"]) or {}
         cat = prog.get("categorize") or {}
@@ -509,6 +521,20 @@ def _llm_tail_rows(conn, configured: bool,
                             "sync running — categorization follows",
                             busy=True))
     return out
+
+
+def _nightly_at(public: bool = False) -> str:
+    """The nightly job's wall time, read from its own cron entry, in the
+    zone the worker reads cron hours in (the instance's). The public
+    bundle says "instance local time": a zone key narrows where the
+    instance's owner lives, and the bundle is attached to public issues."""
+    from .. import localtime
+    from ..jobs import worker
+    job = next(j for j in worker.WorkerSettings.cron_jobs
+               if j.name == "cron:nightly_all")
+    zone = ("instance local time" if public
+            else localtime.instance_tz_name())
+    return f"{job.hour:02d}:{job.minute:02d} {zone}"
 
 
 def checks(tenant_id: str, public: bool = False) -> list[dict]:
@@ -550,7 +576,7 @@ def checks(tenant_id: str, public: bool = False) -> list[dict]:
         # so plainly instead of letting the absence read as a problem
         demo = bool(_cfg.get("demo_mode"))
         out += _system_rows(conn)
-        out += _service_rows(conn, now, demo=demo)
+        out += _service_rows(conn, now, demo=demo, public=public)
         _oll = _ollama_target(conn)
         if _oll:
             deferred.append((len(out), lambda: [_ollama_row(_oll)]))
@@ -571,6 +597,13 @@ def checks(tenant_id: str, public: bool = False) -> list[dict]:
             if t is None:
                 return False, "never ran"
             h = (now - t).total_seconds() / 3600
+            if public:
+                # a job that runs at a fixed local hour (nightly, the daily
+                # mail at its default hour, both in the source): its age
+                # against the bundle's generated_at is the UTC offset. The
+                # public view says only whether it ran on time.
+                return h <= hours, ("ran on schedule" if h <= hours
+                                    else "overdue")
             return h <= hours, f"last ran {_ago(t, now)}"
 
         has_items = conn.execute(
@@ -594,7 +627,8 @@ def checks(tenant_id: str, public: bool = False) -> list[dict]:
             # a just-seeded demo hasn't been through a night yet
             ok, d = True, "not yet run (fresh demo)"
         out.append(_row("Jobs", "nightly detection (worker)", ok,
-                        d + " · expected daily at 04:00 UTC", "warn"))
+                        d + " · expected daily at " + _nightly_at(public),
+                        "warn"))
         _sched = _cfg.get("email_schedule")
         # a restore can plant a non-dict under "daily" (settings are
         # validated on the API write path, not on restore), so .get on it
@@ -661,12 +695,15 @@ def checks(tenant_id: str, public: bool = False) -> list[dict]:
             out.append(_row(
                 "Jobs", f"collector: {who}",
                 fresh and not gone,
-                f"last push {s['age_hours']:.1f}h ago · expected every "
+                ("pushed on schedule" if public and fresh
+                 else "overdue" if public
+                 else f"last push {s['age_hours']:.1f}h ago")
+                + f" · expected every "
                 f"{s['expected_hours']}h · via "
                 f"{_via.get(s.get('via') or '', s.get('via') or 'unknown')}"
                 + (f" — its script token was revoked "
                    f"{gone.strftime('%m/%d/%y')}; mint a new one under "
-                   f"Settings → Scripts and update the host" if gone else
+                   f"Settings → Connections → Script tokens and update the host" if gone else
                    "" if fresh else
                    " — check the host-side script's timer/journal"),
                 "warn"))
@@ -709,7 +746,8 @@ def checks(tenant_id: str, public: bool = False) -> list[dict]:
                 since = (mh.get("since") or "")[:19]
                 out.append(_row("Email", "outbound mail", False,
                                 f"mail is currently FAILING ({klass}"
-                                + (f" since {since}" if since else "")
+                                + (f" since {since}" if since and not public
+                                   else "")
                                 + ")", "warn"))
             # On hosted the resolved host is the OPERATOR's
             # relay — _settings_view withholds it ("the host owns mail"),
@@ -825,6 +863,19 @@ def checks(tenant_id: str, public: bool = False) -> list[dict]:
             if counts["txns"] else
             "no transactions yet — connect a bank or import a CSV/OFX file",
             "warn"))
+        # a capital contribution or reimbursement whose charge was deleted
+        # before deletes took it along still counts; the owner decides
+        from ..engine import equity as _equity
+        n_unlinked = len(_equity.unlinked_fronted(conn))
+        if n_unlinked:
+            out.append(_row(
+                "Data", "unlinked capital", False,
+                f"{n_unlinked} capital "
+                + ("contribution or reimbursement has"
+                   if n_unlinked == 1 else
+                   "contributions or reimbursements have")
+                + " lost the charge they were recorded for and still "
+                "count — review them under Unlinked capital", "warn"))
     finally:
         conn.close()
     # latest first, so each insertion leaves the earlier positions put

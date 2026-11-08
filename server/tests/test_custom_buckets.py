@@ -211,12 +211,58 @@ class TestSuggest(CustomBucketBase):
         # another outlier and is dropped the same way.
         self.assertEqual(out["suggestions"]["buckets"]["Fun"], 120.0)
         self.assertEqual(out["suggestions"]["food_monthly"], 50.0)
-        self.assertEqual(out["suggestions"]["other_monthly"], 80.0)  # 77→$10
+        # Everything else is the WHOLE non-food pool the verdict judges,
+        # carve-outs included: Fun's months (100..140, 1000 dropped) + the
+        # $77 of Target → median 197 → $200. A carve-out-free $80 would
+        # read OVER every month once accepted.
+        self.assertEqual(out["suggestions"]["other_monthly"], 200.0)
         # Window is 6 trailing full months + the in-progress month (MTD
         # food on the 20th must be visible — see suggest_budgets docstring).
         cur = f"{TODAY.year:04d}-{TODAY.month:02d}"
         self.assertIn(cur, out["months"])
         self.assertEqual(len(out["months"]), 7)
+
+    def test_parent_suggestion_is_the_pool_the_verdict_judges(self):
+        """Accepting the suggested Food and Everything-else figures on
+        steady spending must read on budget: each parent's suggestion
+        holds the spend its carve-outs claim, because the verdict counts
+        those rows inside the parent and the carve-out budgets inside the
+        parent's budget. The carve-out keeps its own suggestion too."""
+        write_config(self.conn, custom_buckets=[COFFEE, FUN])
+        for m in range(1, 7):
+            d = dt.date(2026, m, 10)
+            add_txn(self.conn, d, 30.0, "BEAN HAUS", primary="FOOD_AND_DRINK")
+            add_txn(self.conn, d, 50.0, "SAFEWAY", primary="FOOD_AND_DRINK")
+            add_txn(self.conn, d, 60.0, "CINEMA", primary="ENTERTAINMENT")
+            add_txn(self.conn, d, 40.0, "TARGET")
+        sug = budget.suggest_budgets(self.conn, TODAY)["suggestions"]
+        self.assertEqual(sug["buckets"], {"Coffee": 30.0, "Fun": 60.0})
+        self.assertEqual(sug["food_monthly"], 80.0)
+        self.assertEqual(sug["other_monthly"], 100.0)
+
+    def test_carve_out_candidates_are_names_the_settings_save_accepts(self):
+        """The planner fills its first plan with these candidates and saves
+        them as bucket names: every one must be a name /api/settings takes
+        (1-40 chars, not a reserved word, unique ignoring case), or the
+        whole plan's save fails on a row the person never typed. The full
+        category stays the matcher."""
+        write_config(self.conn)
+        long_cat = "EVERYDAY EXPENSES: RESTAURANTS AND TAKEOUT ORDERS"
+        for m in range(1, 7):
+            d = dt.date(2026, m, 10)
+            add_txn(self.conn, d, 300.0, "BISTRO", override=long_cat)
+            add_txn(self.conn, d, 200.0, "MISC", override="Fixed")
+            add_txn(self.conn, d, 150.0, "GAS ONE", override="GAS")
+            add_txn(self.conn, d, 100.0, "GAS TWO", override="Gas")
+        cands = budget.suggest_budgets(self.conn, TODAY)["bucket_candidates"]
+        names = [c["name"] for c in cands]
+        for n in names:
+            self.assertTrue(1 <= len(n) <= 40, n)
+            self.assertNotIn(n.lower(), budget.RESERVED_BUCKET_NAMES)
+        self.assertEqual(len({n.lower() for n in names}), len(names), names)
+        bistro = next(c for c in cands if c["category"].startswith("EVERYDAY"))
+        self.assertEqual(bistro["category"], long_cat.replace(" ", "_"))
+        self.assertLessEqual(len(cands), 40)
 
     def test_months_before_ledger_are_no_data_not_zero(self):
         """A ledger that starts in April must not drag the median down with

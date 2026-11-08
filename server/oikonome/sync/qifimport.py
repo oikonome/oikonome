@@ -43,8 +43,9 @@ import re
 from ..engine.compat import as_date
 from . import flowmap
 from .base import (FileImportIds, Transaction, check_split_accounts,
-                   drop_before_history, ensure_split_account, split_former,
-                   mask_long_digits, tally_split, upsert_transactions)
+                   drop_before_history, ensure_split_account, held_forms,
+                   split_former, tally_split,
+                   upsert_transactions)
 from .csvimport import date_order, parse_money_text, scrub_identifiers
 from .rowcap import MAX_IMPORT_ROWS, check_len
 from .dedup import Deduper
@@ -256,6 +257,7 @@ def import_qif(conn, account_id: str, text: str,
         total = {"imported": 0, "rows": 0, "skipped_duplicates": 0,
                  "split_accounts": {}}
         check_split_accounts(by_acct)
+        run_ids: dict = {}          # one FileImportIds per target across the run
         for qif_name in sorted(by_acct):
             declared = next((r["account_type"] for r in by_acct[qif_name]
                              if r.get("account_type")), None)
@@ -269,10 +271,12 @@ def import_qif(conn, account_id: str, text: str,
                                           lines=_lines(by_acct[qif_name]))
             out = _import_into(conn, target, by_acct[qif_name],
                                batch_id=batch_id,
-                               former=split_former("qif", qif_name, target))
+                               former=split_former("qif", qif_name, target),
+                               ids=run_ids.setdefault(
+                                   target, FileImportIds("qif", target)))
             for k in ("imported", "rows", "skipped_duplicates"):
                 total[k] += out[k]
-            tally_split(total["split_accounts"], mask_long_digits(qif_name),
+            tally_split(total["split_accounts"], qif_name,
                    out["imported"])
         total["note"] = (f"file contains {len(by_acct)} accounts — split "
                          f"into one account per Quicken account (the "
@@ -296,10 +300,14 @@ def _lines(rows: list[dict]):
 
 
 def _import_into(conn, account_id: str, rows: list[dict], *,
-                 batch_id: str | None, former: tuple[str, ...] = ()) -> dict:
+                 batch_id: str | None, former: tuple[str, ...] = (),
+                 ids: "FileImportIds | None" = None) -> dict:
     deduper = Deduper(conn, account_id, "qif", [r["date"] for r in rows])
     txns: list[Transaction] = []
-    ids = FileImportIds("qif", account_id, former=former)
+    if ids is None:
+        ids = FileImportIds("qif", account_id, former=former)
+    else:
+        ids.also_former(former)
     # The ids an earlier release gave investment records, which it signed
     # as written (-T) and named by payee or memo alone, for every action —
     # share-only ones included. Counted on their own, over every record, so
@@ -373,7 +381,7 @@ def _import_into(conn, account_id: str, rows: list[dict], *,
     written = {t.id for t in every}
     no_cash_legacy = [p for p in no_cash_legacy if p[0] not in written]
     if no_cash_legacy:
-        _retire_legacy_no_cash(conn, account_id, no_cash_legacy)
+        _retire_legacy_no_cash(conn, account_id, no_cash_legacy, written)
     return {"imported": added, "rows": len(txns),
             "skipped_duplicates": skipped_dupes,
             "skipped_older": skipped_older}
@@ -394,39 +402,56 @@ def _adopt_legacy_invst(conn, account_id: str, txns: list[Transaction],
     candidates = [x for t in txns for x, _ in legacy_of.get(t.id, ())]
     if not candidates:
         return txns
-    rows = conn.execute(
+    # an old id may be held under its keyed form (base.held_forms): the
+    # row was re-id'd under the household's secret since that import
+    held = held_forms(conn, candidates + [t.id for t in txns], account_id)
+    rows = {r["id"]: r for r in conn.execute(
         "SELECT id, lower(COALESCE(raw->>'section', '')) AS section,"
         " lower(trim(raw->>'action')) AS action"
         " FROM transactions WHERE account_id = %s AND id = ANY(%s)",
-        (account_id, candidates + [t.id for t in txns])).fetchall()
-    have = {r["id"] for r in rows}
+        (account_id, sorted(set(held.values())))).fetchall()}
     # a row written before actions were kept says nothing either way
-    invst = {r["id"]: r["action"] for r in rows if r["section"] == "invst"}
+    invst = {x: rows[h]["action"] for x, h in held.items()
+             if h in rows and rows[h]["section"] == "invst"}
     taken: set[str] = set()
     out = []
     for t in txns:
         old = next((x for x, act in legacy_of.get(t.id, ())
                     if x in invst and invst[x] in (None, act)
                     and x not in taken), None)
-        if old is not None and t.id not in have:
+        if old is not None and t.id not in held:
             taken.add(old)
-            t = dataclasses.replace(t, id=old)
+            t = dataclasses.replace(t, id=held[old])
         out.append(t)
     return out
 
 
 def _retire_legacy_no_cash(conn, account_id: str,
-                           legacy: list[tuple[str, str]]) -> None:
+                           legacy: list[tuple[str, str]],
+                           written=frozenset()) -> None:
     """Retire the rows an earlier import made for share-only investment
     records (a reinvested dividend, a split): they moved no cash, and left
     in place they read as income or spend that never happened. Only rows
     still standing as investment records of this account, written for the
-    same action as the share-only record that named the id."""
-    conn.execute(
-        "UPDATE transactions t SET removed = 1"
-        " FROM unnest(%s::text[], %s::text[]) AS v(id, action)"
-        " WHERE t.account_id = %s AND t.id = v.id AND t.removed = 0"
-        " AND lower(COALESCE(t.raw->>'section', '')) = 'invst'"
-        " AND (t.raw->>'action' IS NULL"
-        "      OR lower(trim(t.raw->>'action')) = v.action)",
-        ([x for x, _ in legacy], [a for _, a in legacy], account_id))
+    same action as the share-only record that named the id, wherever it
+    is held now (base.held_forms)."""
+    held = held_forms(conn, [x for x, _ in legacy], account_id)
+    # a keyed id is never one of `written`'s plain ones, so the rows this
+    # import just wrote are left out again by the id they are held under
+    legacy = [(held[x], a) for x, a in legacy
+              if x in held and held[x] not in written]
+    if not legacy:
+        return
+    # a retire, so under the pairing lock and before its row (reanchor);
+    # a transaction of its own holds the lock on a door that has none
+    from .reanchor import hold_pairing_lock
+    with conn.transaction():
+        hold_pairing_lock(conn)
+        conn.execute(
+            "UPDATE transactions t SET removed = 1"
+            " FROM unnest(%s::text[], %s::text[]) AS v(id, action)"
+            " WHERE t.account_id = %s AND t.id = v.id AND t.removed = 0"
+            " AND lower(COALESCE(t.raw->>'section', '')) = 'invst'"
+            " AND (t.raw->>'action' IS NULL"
+            "      OR lower(trim(t.raw->>'action')) = v.action)",
+            ([x for x, _ in legacy], [a for _, a in legacy], account_id))

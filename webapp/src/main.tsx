@@ -9,6 +9,7 @@ import { HOME_KEY } from "./launchhome";
 import { warmRoute } from "./pageChunks";
 import { api, AuthError } from "./api/client";
 import { ElevationProvider } from "./elevation";
+import ErrorBoundary from "./components/ErrorBoundary";
 import { isReauthReply } from "./reauth";
 import "./index.css";
 
@@ -160,16 +161,21 @@ qc.prefetchQuery({ queryKey: ["me"], queryFn: api.me, retry: false });
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <QueryClientProvider client={qc}>
-      {/* above the router: the elevation sheet must sit over every page,
-          the 2FA gate included, and the request wrapper needs it mounted
-          before the first guarded click */}
-      <ElevationProvider>
-        <BrowserRouter basename="/app">
-          <App />
-        </BrowserRouter>
-      </ElevationProvider>
-    </QueryClientProvider>
+    {/* outermost: a throw in the shell itself, a lockout screen or the
+        elevation sheet has no page boundary above it. App holds a second one
+        around the routes, which keeps the nav usable when only a page fails. */}
+    <ErrorBoundary>
+      <QueryClientProvider client={qc}>
+        {/* above the router: the elevation sheet must sit over every page,
+            the 2FA gate included, and the request wrapper needs it mounted
+            before the first guarded click */}
+        <ElevationProvider>
+          <BrowserRouter basename="/app">
+            <App />
+          </BrowserRouter>
+        </ElevationProvider>
+      </QueryClientProvider>
+    </ErrorBoundary>
   </StrictMode>,
 );
 

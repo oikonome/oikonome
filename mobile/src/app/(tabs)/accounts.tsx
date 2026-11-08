@@ -15,7 +15,8 @@ import PullRefresh from "../../components/pull-refresh";
 import StaleBanner from "../../components/stale-banner";
 import { Card, H, HelpLink, KV, Pill, SharedLock } from "../../components/ui";
 import { Account, AccountRemoveMode, countsInTotals, errText,
-         linkCardVisible } from "../../lib/api";
+         linkCardVisible, releasedHoldDays,
+         removedConnectionNote } from "../../lib/api";
 import { patchList, patchQuery, removeFromList } from "../../lib/cache";
 import { plaidHostedLink, type PlaidLinkOutcome, startPlaidLink,
          useFirstSyncLanding, useRelinkingItems } from "../../lib/plaid";
@@ -354,7 +355,8 @@ export default function Accounts() {
       }
       // "not the same" only hides a suggestion: no account changed
       if (v.dismiss) return;
-      for (const k of ["account-links", "accounts", "today"])
+      // a linked shadow's positions drop out of top holdings
+      for (const k of ["account-links", "accounts", "today", "holdings"])
         qc.invalidateQueries({ queryKey: [k] });
     },
     onError: (e) => {
@@ -401,8 +403,11 @@ export default function Accounts() {
       // the server serves the bank's name again and follows its changes
       const trimmed = f.name.trim();
       const revert = !trimmed || trimmed === a.bank_name;
-      if ((revert ? a.bank_name || a.name : trimmed) !== a.name)
-        writes.push(client!.accountRename(a.id, revert ? "" : trimmed));
+      // the name as the server stored it (a typed card number is cut to
+      // its last four), which is what the cache then holds
+      const renamed = (revert ? a.bank_name || a.name : trimmed) !== a.name
+        ? client!.accountRename(a.id, revert ? "" : trimmed) : null;
+      if (renamed) writes.push(renamed);
       // the exclusion lands BEFORE the pin is sent: the pin door refuses
       // an excluded account, so including and pinning in one save must
       // not race (the web's order)
@@ -418,16 +423,17 @@ export default function Accounts() {
           && (parseMoneyDraft(f.bal) ?? NaN) !== a.balance_current)
         writes.push(client!.accountBalance(a.id, f.bal));
       await Promise.all(writes);
+      return renamed ? (await renamed).name ?? null : null;
     },
-    onSuccess: (_r, f) => {
+    onSuccess: (stored, f) => {
       const a = editing!;
       setEditing(null);
       const balChanged = isManual(a) && f.bal.trim() !== ""
         && (parseMoneyDraft(f.bal) ?? NaN) !== a.balance_current;
       patchList<{ accounts: Account[] }, Account>(qc, ["accounts"],
         "accounts", (x) => x.id === a.id, {
-          name: !f.name.trim() || f.name.trim() === a.bank_name
-            ? a.bank_name || a.name : f.name.trim(),
+          name: stored ?? (!f.name.trim() || f.name.trim() === a.bank_name
+            ? a.bank_name || a.name : f.name.trim()),
           kind: f.kind,
           owner: f.owner.trim() || null,
           ...(balChanged
@@ -477,6 +483,8 @@ export default function Accounts() {
       qc.invalidateQueries({ queryKey: ["accounts"] });
       qc.invalidateQueries({ queryKey: ["today"], refetchType: "none" });
       qc.invalidateQueries({ queryKey: ["transactions"], refetchType: "none" });
+      // top holdings leaves a hidden account's positions out
+      qc.invalidateQueries({ queryKey: ["holdings"] });
     },
   });
   // A disconnected MX bank is still alive at MX, so it comes back on the
@@ -835,7 +843,7 @@ export default function Accounts() {
                 {(c.status ?? "").toUpperCase().includes("LOGIN_REQUIRED")
                   ? "sign-in expired — re-authenticate at the bank"
                   : c.status === "reaped"
-                    ? "connection removed after 30 days of failure"
+                    ? removedConnectionNote(c)
                     : c.status === "new_accounts"
                       ? "new accounts to share"
                       : "sync failing"}
@@ -1022,7 +1030,7 @@ export default function Accounts() {
                 {/* a reaped Item is GONE upstream — say so where the
                     accounts live, not only in the connect card */}
                 {reaped && (
-                  <Pill text="connection removed after 30 days of failure"
+                  <Pill text={removedConnectionNote(conn ?? {})}
                         tone="warn" />
                 )}
                 {/* a billed product this connection cannot answer for —
@@ -1480,10 +1488,11 @@ export default function Accounts() {
                   </Text>
                   {/* at the allowance, the likely reason to disconnect
                       is to make room — and a released bank keeps its
-                      place for 30 days (the web panel says the same) */}
+                      place for a while (the web panel says the same) */}
                   {liveConn && isPlaid && instFull && (
                     <Text style={[s.mut, { color: C.warn }]}>
-                      Disconnecting does not free a slot for 30 days.
+                      Disconnecting does not free a slot for{" "}
+                      {releasedHoldDays()} days.
                     </Text>
                   )}
                   {[opts.filter(([m]) => m.startsWith("disconnect")),

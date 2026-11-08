@@ -13,9 +13,12 @@ import PullRefresh from "../components/pull-refresh";
 import Sparkline from "../components/sparkline";
 import StaleBanner from "../components/stale-banner";
 import { Card, H, HelpLink, KV, Pill } from "../components/ui";
-import { whatIfRefusal } from "../lib/api";
+import { ApiError, errText, whatIfRefusal } from "../lib/api";
 import { saveSettings } from "../lib/cache";
-import { numv, parseMoneyDraft, whatIfQuery } from "../lib/pure";
+import { rebaseSsDraft, ssDraftOf } from "../lib/ss-draft";
+import { SS_CLAIM_AGES, ssEstimatesBody } from "../lib/ss-estimates";
+import { birthdateIso, numv, parseMoneyDraft, whatIfQuery }
+  from "../lib/pure";
 import { useSession } from "../lib/session";
 import { useViewer } from "../lib/viewer";
 import { C, money } from "../lib/theme";
@@ -43,6 +46,64 @@ function Fld({ label, value, placeholder, onChange }: {
   );
 }
 
+// Unlike the what-if fields above it, this one is saved: the estimates are
+// the projection's only source of Social Security income.
+function SsEstimates({ saved }: { saved: Record<string, number> | null }) {
+  const { client } = useSession();
+  const qc = useQueryClient();
+  const seeded = ssDraftOf(saved);
+  const [draft, setDraft] = useState(seeded);
+  // the schedule the untouched boxes show; a newer one moves them over
+  const [base, setBase] = useState(seeded);
+  if (JSON.stringify(base) !== JSON.stringify(seeded)) {
+    setBase(seeded);
+    setDraft(rebaseSsDraft(draft, base, seeded));
+  }
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [done, setDone] = useState(false);
+  const save = () => {
+    setDone(false);
+    const b = ssEstimatesBody(draft, parseMoneyDraft);
+    if (!b.ok) { setErr(b.error); return; }
+    setErr(null);
+    setBusy(true);
+    saveSettings(qc, client!, { ss_estimates: b.body })
+      .then(() => {
+        setDone(true);
+        // what went up is now what the boxes were based on: the server's
+        // copy replaces it, and anything typed since stays
+        setBase(draft);
+        qc.invalidateQueries({ queryKey: ["retirement"] });
+      })
+      .catch((x) => setErr(errText(x)))
+      .finally(() => setBusy(false));
+  };
+  return (
+    <View style={{ backgroundColor: C.hover, borderRadius: 8,
+                   padding: 10, marginTop: 8, gap: 8 }}>
+      <Text style={s.mut}>Social Security $/mo by claim age</Text>
+      <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+        {SS_CLAIM_AGES.map((age) => (
+          <Fld key={age} label={`at ${age}`} value={draft[age] ?? ""}
+               onChange={(v) => {
+                 setDone(false);
+                 setDraft((d) => ({ ...d, [age]: v }));
+               }} />
+        ))}
+      </View>
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+        <Pressable style={[s.btn, busy && { opacity: 0.5 }]}
+                   disabled={busy} onPress={save}>
+          <Text style={s.btnText}>{busy ? "Saving…" : "Save"}</Text>
+        </Pressable>
+        {done ? <Text style={{ color: C.good, fontSize: 12 }}>Saved</Text> : null}
+      </View>
+      {err ? <Text style={[s.mut, { color: C.bad }]}>{err}</Text> : null}
+    </View>
+  );
+}
+
 export default function Retire() {
   const { client } = useSession();
   const qc = useQueryClient();
@@ -65,8 +126,13 @@ export default function Retire() {
   if (query.data && query.data !== lastGood) setLastGood(query.data);
   // first visit with no birthdate and no wizard mark → offer the
   // walkthrough; "done" OR "skipped" both mean finished
+  // refetched on every visit: the Social Security editor below waits for a
+  // read made since the screen opened, and a young cache would never get one
   const settings = useQuery({ queryKey: ["settings"],
-    queryFn: () => client!.settingsFull(), enabled: !!client });
+    queryFn: () => client!.settingsFull(), enabled: !!client,
+    refetchOnMount: "always" });
+  const [openedAt] = useState(() => Date.now());
+  const ssFresh = settings.dataUpdatedAt >= openedAt;
   const sp = useLocalSearchParams<{ wizard?: string }>();
   const [wizard, setWizard] =
     useState<boolean | null>(sp.wizard === "1" ? true : null);
@@ -129,7 +195,10 @@ export default function Retire() {
     <ScrollView style={s.wrap} contentContainerStyle={{ paddingBottom: 24 }}
       refreshControl={<PullRefresh tintColor={C.accent} colors={[C.accent]}
                                       progressBackgroundColor={C.card}
-                                      onRefresh={() => query.refetch()} />}>
+                                      onRefresh={() => {
+                                        query.refetch();
+                                        settings.refetch();
+                                      }} />}>
       <StaleBanner query={query} />
       {query.isPending && !r && <Text style={s.center}>Loading…</Text>}
       {query.isError && !r && (
@@ -177,11 +246,15 @@ export default function Retire() {
             <KV k={`Retire today (${inp.age}) supports`}
                 v={`${m$(r.spend_now)}/yr — after-tax, today's dollars`} />
             <KV k="You have today"
-                v={`${m$(r.buckets.total)} → ~${m$(r.grow_to_67)} by 67`} />
-            <Text style={s.mut}>
-              at {(r.real_return * 100).toFixed(1)}%/yr real
-              {!inp.saving_yr ? " (saving nothing)" : ""}
-            </Text>
+                v={r.grow_to_67 != null
+                  ? `${m$(r.buckets.total)} → ~${m$(r.grow_to_67)} by 67`
+                  : m$(r.buckets.total)} />
+            {r.grow_to_67 != null ? (
+              <Text style={s.mut}>
+                at {(r.real_return * 100).toFixed(1)}%/yr real
+                {!inp.saving_yr ? " (saving nothing)" : ""}
+              </Text>
+            ) : null}
             <KV k={`Crash-proof spend at ${r.stress_ref_age}`}
                 v={`${m$(worst)}/yr`}
                 tone={margin >= 0 ? "good" : "bad"} />
@@ -197,7 +270,14 @@ export default function Retire() {
               {inp.cash != null ? ` · cash ${inp.cash}%` : ""} · to {inp.end} ·
               SS at {inp.ssage}
               {inp.has_sched ? ` (${m$(inp.your_ss)}/mo)`
-                             : " (no SSA statement)"}
+                : !viewer ? (
+                  <Text>
+                    {" ("}
+                    <Text style={{ color: C.accent }}
+                          onPress={() => setAdjust(true)}>no SSA statement</Text>
+                    {")"}
+                  </Text>
+                ) : " (no SSA statement)"}
               {" · "}{inp.stockpct}% stocks ·{" "}
               {inp.saving_yr
                 ? `saving ${m$(inp.saving_yr)}/yr`
@@ -251,6 +331,20 @@ export default function Retire() {
                   </Text>
                 </Pressable>
               </View>
+            )}
+            {/* a saved copy may be older than another device's save, and
+                saving these boxes replaces the schedule: they wait for a read
+                made since the screen opened */}
+            {adjust && !viewer && settings.data && ssFresh && (
+              <SsEstimates saved={(settings.data.ss_estimates ?? null) as
+                Record<string, number> | null} />
+            )}
+            {adjust && !viewer && !ssFresh && (
+              <Text style={[s.mut, { marginTop: 8 }]}>
+                {settings.isError
+                  ? "Couldn't load your Social Security estimates — pull down to retry."
+                  : "Loading your Social Security estimates…"}
+              </Text>
             )}
             {whatIfErr
               ? <Text style={[s.mut, { color: C.bad, marginTop: 6 }]}>
@@ -428,6 +522,30 @@ function RetireWizard({ defaults, onDone, onSkip }: {
   const [infl, setInfl] = useState(String(defaults.infl || 3));
   const [end, setEnd] = useState(String(defaults.end || 95));
   const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  // The birthdate is the one answer that persists — every later visit
+  // derives the starting age from it — so a save the server refuses as
+  // invalid (a 400 with a reason the user can correct) is shown and Finish
+  // waits, rather than finishing with the age silently left out. Any other
+  // refusal — a viewer's or the demo login's read-only 403, a dropped
+  // connection — is nothing the user can fix here, so it never traps them
+  // in the walkthrough. Resolves true when the wizard may move on.
+  const saveBirth = async (): Promise<boolean> => {
+    const b = birthdateIso(birth);
+    if ("error" in b) { setErr(b.error); return false; }
+    if (!b.iso) return true;
+    setBusy(true);
+    try {
+      await saveSettings(qc, client!, { birthdate: b.iso });
+      qc.invalidateQueries({ queryKey: ["retirement"] });
+      return true;
+    } catch (e) {
+      if (e instanceof ApiError && (e.status === 400 || e.status === 422)) {
+        setErr(errText(e)); return false;
+      }
+      return true;
+    } finally { setBusy(false); }
+  };
   const STEPS = ["How old are you?",
                  "What do you want to spend in retirement?",
                  "How much are you saving each month?",
@@ -436,13 +554,15 @@ function RetireWizard({ defaults, onDone, onSkip }: {
   // rather than sent as an empty value — the adjust panel does the same.
   const params = () => whatIfParams({
     age, spend, employer_mo: employer, taxable_mo: taxable, ret, infl, end });
-  const next = () => {
+  const next = async () => {
     setErr(null);
     if (i === 0) {
       const a = Number(age);
       if (!Number.isFinite(a) || a < 18 || a > 100) {
         setErr("Enter an age between 18 and 100."); return;
       }
+      const b = birthdateIso(birth);
+      if ("error" in b) { setErr(b.error); return; }
     }
     // "60,000" is a spend, not a typo, and "12,50" is twelve-fifty: judge
     // it by the server's separator rules, as the query will send it
@@ -451,8 +571,7 @@ function RetireWizard({ defaults, onDone, onSkip }: {
     if (i === 1 && (!Number.isFinite(spendN) || spendN < 0)) {
       setErr("Enter a non-negative annual spend."); return;
     }
-    if (i === 3 && birth.trim())
-      saveSettings(qc, client!, { birthdate: birth.trim() }).catch(() => {});
+    if (i === 3 && !(await saveBirth())) return;
     setI(i + 1);
   };
   return (
@@ -480,6 +599,7 @@ function RetireWizard({ defaults, onDone, onSkip }: {
                      value={age} onChangeText={setAge} />
           <TextInput style={s.input} autoCapitalize="none"
                      placeholder="birthdate (optional, YYYY-MM-DD)"
+                     keyboardType="numbers-and-punctuation"
                      placeholderTextColor={C.mut}
                      value={birth} onChangeText={setBirth} />
         </>)}
@@ -557,7 +677,8 @@ function RetireWizard({ defaults, onDone, onSkip }: {
             </Pressable>
           )}
           {i < 4 ? (
-            <Pressable style={s.btn} onPress={next}>
+            <Pressable style={[s.btn, busy && { opacity: 0.5 }]}
+                       disabled={busy} onPress={next}>
               <Text style={s.btnText}>
                 {i === 3 ? "Finish →" : "Continue →"}
               </Text>
@@ -570,13 +691,15 @@ function RetireWizard({ defaults, onDone, onSkip }: {
         </View>
         {i < 4 && (
           <Text style={{ color: C.mut, fontSize: 12 }}
-                onPress={() => {
+                onPress={async () => {
                   // Skip abandons the remaining questions, not a typed
                   // answer — a birthdate already entered persists
                   // exactly as finishing the wizard would have saved it
-                  if (birth.trim())
-                    saveSettings(qc, client!, { birthdate: birth.trim() })
-                      .catch(() => {});
+                  // and is never held back by a save that failed: the
+                  // person asked to leave the walkthrough
+                  setErr(null);
+                  if (busy) return;
+                  if (!("error" in birthdateIso(birth))) await saveBirth();
                   onSkip();
                 }}>
             Skip — open the full model

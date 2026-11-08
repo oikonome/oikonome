@@ -109,6 +109,11 @@ ACCOUNT_REFS = (
     ("crypto_holdings", "account_id"),
     ("import_batches", "account_id"),
     ("business_entity", "tax_reserve_account_id"),
+    # no foreign key (its rows outlive an account a restore has not landed
+    # yet), but a source row left on a moved id leads to its account only
+    # through the move's record, and to none once that record cannot say
+    # which of two cards it meant
+    ("account_sources", "account_id"),
 )
 
 
@@ -582,13 +587,94 @@ def _rewrite_txn_id(conn, old_id: str, new_id: str) -> bool:
     False when the new id is already held — then there is nothing to carry
     and renaming would collide with a row we have — and False when the old
     row is gone by the time the lock is taken.
-    """
-    if conn.execute("SELECT 1 FROM transactions WHERE id = %s",
-                    (new_id,)).fetchone():
-        return False
+
+    The one-pair case of `rewrite_txn_ids`, so there is one list of what
+    follows a row, not two."""
+    return rewrite_txn_ids(conn, [(old_id, new_id)])[0]
+
+
+# Pairs moved per transaction by `rewrite_txn_ids`. Each slice holds the
+# pairing lock and its rows until it commits, so a slice is kept small
+# enough that the matcher and a web edit wait a moment, not a whole re-id.
+_REWRITE_SLICE = 1000
+
+
+def _txn_children(refs) -> tuple[tuple[str, str], ...]:
+    """Every column a row's id must follow it into: the declared foreign
+    keys plus the references no catalog scan can see.
+
+    transactions.pending_transaction_id is a plain TEXT self-reference,
+    NOT a declared foreign key — and restore.py round-trips the column, so
+    two restored rows in one ledger can point at each other through it.
+    Without it the sibling's pointer would keep naming an id the rename
+    just deleted. manual_categories.transaction_id is the pin that records
+    "a person decided this category"; it is listed explicitly so a schema
+    that drops its foreign key still carries it — left behind, the renamed
+    row would lose its protection against re-stamping."""
+    out = list(refs)
+    for extra in (("transactions", "pending_transaction_id"),
+                  ("manual_categories", "transaction_id")):
+        if extra not in out:
+            out.append(extra)
+    return tuple(out)
+
+
+def _independent_slices(pairs):
+    """Cut `pairs` into runs, in order, in which no pair shares an id with
+    an earlier pair of the same run.
+
+    Inside such a run the moves cannot see one another — no move frees,
+    takes or deletes an id another one reads — so carrying the run in one
+    set of statements lands exactly where carrying it one pair at a time,
+    in order, would. A pair that does share one (a chain a->b then b->c,
+    a second move onto one new id) opens the next run, which runs after
+    the first has landed, as it would have one at a time."""
+    run: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for o, n in pairs:
+        if len(run) >= _REWRITE_SLICE or o in seen or n in seen:
+            yield run
+            run, seen = [], set()
+        run.append((o, n))
+        seen.update((o, n))
+    if run:
+        yield run
+
+
+def rewrite_txn_ids(conn, pairs) -> list[bool]:
+    """Move many transaction rows, each with everything pointing at it,
+    old id -> new id: `_rewrite_txn_id` for a list, with a constant number
+    of statements per slice rather than a dozen per row.
+
+    Per row, the carry costs a full-ledger scan (the pending pointer and
+    the refused-receipt arrays have no index on the id), so a re-id of
+    every file row of a long statement history one row at a time is
+    moved x ledger work — and it runs while the deploy's migrate holds
+    app start. Set-based, each slice is one pass per child table.
+
+    Same outcome as calling `_rewrite_txn_id` on each pair in order (see
+    `_independent_slices`), each slice in its own transaction. Returns,
+    aligned with `pairs`, whether each pair moved."""
+    pairs = list(pairs)
+    done: list[bool] = []
+    for run in _independent_slices(pairs):
+        done.extend(_rewrite_txn_slice(conn, run))
+    return done
+
+
+def _rewrite_txn_slice(conn, run) -> list[bool]:
+    news = [n for _, n in run]
+    held = {r["id"] for r in conn.execute(
+        "SELECT id FROM transactions WHERE id = ANY(%s)",
+        (news,)).fetchall()}
+    want = [(o, n) for o, n in run if n not in held]
+    if not want:
+        return [False] * len(run)
     cols, refs = _txn_shape(conn)
     collist = ", ".join(cols)
+    from_old = ", ".join(f"t.{c}" for c in cols)
     from .reanchor import hold_pairing_lock
+    moved: set[str] = set()
     with conn.transaction():
         # The pairing lock first, before any row, as every carry takes it
         # (pairing lock, then rows): the rename moves a person's "not this
@@ -597,9 +683,23 @@ def _rewrite_txn_id(conn, old_id: str, new_id: str) -> bool:
         # id — must either finish before the move or start after it, never
         # pair the receipt with the new id in between.
         hold_pairing_lock(conn)
-        # LOCK the row being renamed before reading it. The insert below is
-        # a snapshot copy and the delete at the end drops whatever the row
-        # holds at that moment, so a web edit committing in between (a
+        # A held merchant-wide undo that names any of these rows is locked
+        # BEFORE the rows, the order the undo door keeps (its own row, then
+        # the rows it restores): the carry below rewrites that undo in this
+        # transaction, and taking the rows first would let an undo claimed
+        # meanwhile hold its row while waiting on ours, each waiting on the
+        # other until one is aborted.
+        conn.execute(
+            "SELECT 1 FROM category_undo u WHERE EXISTS ("
+            "  SELECT 1 FROM jsonb_array_elements("
+            "    CASE WHEN jsonb_typeof(u.payload->'affected') = 'array'"
+            "         THEN u.payload->'affected' ELSE '[]'::jsonb END) AS a(v)"
+            "   WHERE jsonb_typeof(a.v) = 'object'"
+            "     AND a.v->>'id' = ANY(%s)) FOR UPDATE",
+            ([o for o, _ in want],))
+        # LOCK the rows being renamed before reading them. The insert below
+        # is a snapshot copy and the delete at the end drops whatever the
+        # row holds at that moment, so a web edit committing in between (a
         # category override, an owner, a note) is copied by neither and
         # destroyed by the delete — silently, with a 200 already returned
         # for the write that vanished. This runs in the worker while the
@@ -609,40 +709,40 @@ def _rewrite_txn_id(conn, old_id: str, new_id: str) -> bool:
         # old id is gone. Every API door that mutates a transaction by id
         # re-checks existence and answers 404 for an id it cannot find, so
         # the person is told their edit did not land instead of being told
-        # it did.
-        if not conn.execute(
-                "SELECT 1 FROM transactions WHERE id = %s FOR UPDATE",
-                (old_id,)).fetchone():
-            return False
+        # it did. Rows are locked in id order so two re-ids over
+        # overlapping rows cannot deadlock on each other.
+        moved = {r["id"] for r in conn.execute(
+            "SELECT id FROM transactions WHERE id = ANY(%s) "
+            "ORDER BY id FOR UPDATE",
+            ([o for o, _ in want],)).fetchall()}
+        go = [(o, n) for o, n in want if o in moved]
+        if not go:
+            return [False] * len(run)
+        olds = [o for o, _ in go]
+        news = [n for _, n in go]
         conn.execute(
             f"INSERT INTO transactions (id, {collist}) "
-            f"SELECT %s, {collist} FROM transactions WHERE id = %s",
-            (new_id, old_id))
-        for table, col in refs:
-            conn.execute(f"UPDATE {table} SET {col} = %s WHERE {col} = %s",
-                         (new_id, old_id))
-        # transactions.pending_transaction_id is a plain TEXT self-reference,
-        # NOT a declared foreign key, so the catalog scan above cannot see
-        # it — and restore.py round-trips the column, so two restored rows
-        # in one ledger can point at each other through it. Without this the
-        # sibling's pointer would keep naming an id this rename just deleted.
-        conn.execute(
-            "UPDATE transactions SET pending_transaction_id = %s "
-            "WHERE pending_transaction_id = %s", (new_id, old_id))
-        # manual_categories.transaction_id is the same FK-less class: the
-        # pin that records "a person decided this category" — left behind,
-        # the renamed row would lose its protection against re-stamping
-        conn.execute(
-            "UPDATE manual_categories SET transaction_id = %s "
-            "WHERE transaction_id = %s", (new_id, old_id))
+            f"SELECT m.new_id, {from_old} "
+            "FROM unnest(%s::text[], %s::text[]) AS m(old_id, new_id) "
+            "JOIN transactions t ON t.id = m.old_id",
+            (olds, news))
+        for table, col in _txn_children(refs):
+            conn.execute(
+                f"UPDATE {table} AS c SET {col} = m.new_id "
+                "FROM unnest(%s::text[], %s::text[]) AS m(old_id, new_id) "
+                f"WHERE c.{col} = m.old_id",
+                (olds, news))
         # a person's "not this charge" names the charge by id and lives in
         # an array, which no foreign key scan can see: left on the old id,
         # the matcher would read the renamed row as a charge the receipt
         # was never refused and pair it straight back
-        from .base import carry_unmatch_memory
-        carry_unmatch_memory(conn, [old_id], [new_id])
-        conn.execute("DELETE FROM transactions WHERE id = %s", (old_id,))
-    return True
+        from .base import carry_undo_payloads, carry_unmatch_memory
+        carry_unmatch_memory(conn, olds, news)
+        # a held category undo names its rows by id too: moved here, in the
+        # slice's own transaction, it is never seen naming a gone row
+        carry_undo_payloads(conn, olds, news)
+        conn.execute("DELETE FROM transactions WHERE id = ANY(%s)", (olds,))
+    return [n not in held and o in moved for o, n in run]
 
 
 # How many times an adoption may find the settings row busy and start over
@@ -852,7 +952,7 @@ def dedupe_twins(conn, account_id: str, *, apply: bool = True) -> list[dict]:
                   category_override, override_source, owner_override,
                   entity_id, merchant_id
              FROM transactions
-            WHERE account_id = %s AND removed = 0
+            WHERE account_id = %s AND removed = 0 AND amount IS NOT NULL
             ORDER BY date, amount, id""", (account_id,)).fetchall()
     cells: dict[tuple, list] = {}
     for r in rows:
@@ -1108,6 +1208,7 @@ class _Absorbed:
             """SELECT id, date, amount, name, merchant_name
                   FROM transactions t
                  WHERE account_id = %s AND removed = 0
+                   AND amount IS NOT NULL
                    AND date <= %s
                    AND date BETWEEN %s - INTERVAL '3 days'
                                  AND %s + INTERVAL '3 days'
@@ -1129,28 +1230,45 @@ class _Absorbed:
                 continue
             cell = (round(float(r["amount"]) * 100), r["date"])
             self._cells.setdefault(cell, []).append(
-                {"id": r["id"], "used": False,
+                {"id": r["id"],
                  "tokens": _tokens(r["name"], r["merchant_name"])})
 
-    def take(self, date: dt.date, amount: float, tokens: set) -> str | None:
+    def carries(self, claims: list) -> dict:
+        """{handle: restored id to carry the incoming id onto} for the
+        claims (handle, date, amount, tokens, paired id) the seam matcher
+        made.
+
+        A claim carries when the row it paired with is the ONE candidate
+        in reach a person could take it for — none other of the same
+        amount within WINDOW_DAYS whose name does not contradict — and
+        that row shares a name token with it. A candidate another claim
+        has already carried onto is accounted for and no longer counts
+        against the rest. That is asked to a fixed point rather than in
+        the order the claims arrived: carrying one row can only make
+        another provable, never less, so every order reaches the same
+        answer, where a single walk would carry more or less depending on
+        which identical-looking charge happened to come first."""
         from .dedup import WINDOW_DAYS, _distinct_names
-        cents = round(amount * 100)
-        hits: list[dict] = []
-        for delta in range(WINDOW_DAYS + 1):
-            days = ((date,) if delta == 0
-                    else (date - dt.timedelta(days=delta),
-                          date + dt.timedelta(days=delta)))
-            for d in days:
-                for c in self._cells.get((cents, d), ()):
-                    if c["used"] or _distinct_names(tokens, c["tokens"]):
-                        continue
-                    hits.append(c)
-                    if len(hits) > 1:
-                        return None            # never rename a guess
-        if len(hits) != 1 or not (tokens & hits[0]["tokens"]):
-            return None
-        hits[0]["used"] = True
-        return hits[0]["id"]
+        out: dict = {}
+        onto: set = set()
+        changed = True
+        while changed:
+            changed = False
+            for h, date, amount, tokens, paired in claims:
+                if h in out:
+                    continue
+                cents = round(amount * 100)
+                hits = [c for k in range(-WINDOW_DAYS, WINDOW_DAYS + 1)
+                        for c in self._cells.get(
+                            (cents, date + dt.timedelta(days=k)), ())
+                        if c["id"] not in onto
+                        and not _distinct_names(tokens, c["tokens"])]
+                if (len(hits) == 1 and hits[0]["id"] == paired
+                        and tokens & hits[0]["tokens"]):
+                    out[h] = paired
+                    onto.add(paired)
+                    changed = True
+        return out
 
 
 def filter_incoming(conn, account_id: str, txns: list) -> tuple[list, dict]:
@@ -1292,6 +1410,12 @@ def filter_incoming(conn, account_id: str, txns: list) -> tuple[list, dict]:
     # restored one can be confused, so they get the real matcher rather
     # than a date rule: same amount, within three days, and a shared name
     # token, each existing row absorbing at most one incoming.
+    #
+    # Which restored row each incoming one is gets decided for the whole
+    # page at once (`_seam_decisions`), never row by row in the order the
+    # page arrived: Plaid promises no order, and a walk in arrival order
+    # let a charge made the morning after the backup take the cutoff day's
+    # restored row before that row's own re-delivery reached it.
     dates = [d for t, d, b in buckets if b == "overlap" and d is not None]
     kept, carried, settled_holds = [], 0, 0
     deduped = len(redelivered)
@@ -1299,71 +1423,75 @@ def filter_incoming(conn, account_id: str, txns: list) -> tuple[list, dict]:
     # file rows a carried id landed on: see _note_file_rows_relied_on
     absorbed_by_held: list[tuple[dt.date, float]] = []
     renamed_file_rows: list[str] = []
-    absorbed = None                 # built on the first claim, not before
     m = None
     if overlap:
         m = _seam_matcher(conn, account_id, dates, cutoff, spoken_for)
     holds = (_awaiting_settlement(conn, account_id, awaiting, dates)
              if awaiting and dates else [])
-    for t, d, bucket in buckets:
+    rows = [(i, d, float(_f(t, "amount")),
+             _tokens(_f(t, "name"), _f(t, "merchant_name")))
+            for i, (t, d, bucket) in enumerate(buckets)
+            if bucket == "overlap" and d is not None
+            and _f(t, "amount") is not None]
+    claims, settles = _seam_decisions(
+        m, holds, rows, cutoff,
+        in_key=lambda i: (buckets[i][1], _f(buckets[i][0], "id") or "",
+                          _f(buckets[i][0], "name") or "", i),
+        pending=lambda i: bool(_f(buckets[i][0], "pending")))
+    carries: dict = {}
+    if dates and any(_f(buckets[i][0], "id") for i in claims):
+        absorbed = _Absorbed(conn, account_id, min(dates), max(dates),
+                             cutoff, skip_ids=set(ids),
+                             spoken_for=spoken_for)
+        carries = absorbed.carries(
+            [(i, d, amt, toks, claims[i]) for i, d, amt, toks in rows
+             if i in claims and _f(buckets[i][0], "id")])
+    for i, (t, d, bucket) in enumerate(buckets):
         if bucket == "older":
             continue
         amt = _f(t, "amount")
         if bucket == "after" or d is None or amt is None:
             kept.append(t)
             continue
-        hold = (_settles(holds, m, d, float(amt), _tokens(
-                    _f(t, "name"), _f(t, "merchant_name")))
-                if holds else None)
+        hold = settles.get(i)
         if hold is not None:
             # the posted charge of a hold the merge retired: a charge the
             # restore never held as posted, so it is the account's own
             if _f(t, "id"):
-                new_settled[hold["id"]] = _f(t, "id")
+                new_settled[hold] = _f(t, "id")
             settled_holds += 1
             kept.append(t)
             continue
-        used = _claim(m, d, float(amt), _f(t, "name"),
-                      _f(t, "merchant_name"))
-        if used is not None:
-            deduped += 1
-            new_id = _f(t, "id")
-            if new_id:
-                # Which restored row this copy used up, so that no later
-                # page offers it again. Rows the matcher cannot tell apart
-                # are interchangeable to it, so naming any one of them is
-                # exactly as good as naming the right one — for the pool.
-                # Moving an identity onto it is a different matter, and
-                # waits for `_Absorbed` to prove the row.
-                new_absorbed[new_id] = used["id"]
-            if new_id and dates:
-                if absorbed is None:
-                    absorbed = _Absorbed(conn, account_id, min(dates),
-                                         max(dates), cutoff,
-                                         skip_ids=set(ids),
-                                         spoken_for=spoken_for)
-                old_id = absorbed.take(
-                    d, float(amt),
-                    _tokens(_f(t, "name"), _f(t, "merchant_name")))
-                # Carrying the id is a repair, not the job: if it
-                # fails the tenant still gets one copy of the charge,
-                # which is what the guard is for.
-                try:
-                    if old_id and _rewrite_txn_id(conn, old_id, new_id):
-                        # the row now wears the incoming id: that is the
-                        # row this charge used up, whichever the matcher
-                        # happened to tick off
-                        new_absorbed[new_id] = new_id
-                        carried += 1
-                        if is_file_import_id(old_id):
-                            renamed_file_rows.append(new_id)
-                        continue
-                except Exception:                    # noqa: BLE001
-                    log.warning("reconnect: could not carry %s onto %s",
-                                new_id, old_id, exc_info=True)
-            absorbed_by_held.append((d, float(amt)))
-        else:
+        used = claims.get(i)
+        if used is None:
             kept.append(t)
+            continue
+        deduped += 1
+        new_id = _f(t, "id")
+        if new_id:
+            # Which restored row this copy used up, so that no later page
+            # offers it again. Rows the matcher cannot tell apart are
+            # interchangeable to it, so naming any one of them is exactly
+            # as good as naming the right one — for the pool. Moving an
+            # identity onto it is a different matter, and waits for
+            # `_Absorbed` to prove the row.
+            new_absorbed[new_id] = used
+        old_id = carries.get(i)
+        # Carrying the id is a repair, not the job: if it fails the tenant
+        # still gets one copy of the charge, which is what the guard is for.
+        try:
+            if old_id and _rewrite_txn_id(conn, old_id, new_id):
+                # the row now wears the incoming id: that is the row this
+                # charge used up
+                new_absorbed[new_id] = new_id
+                carried += 1
+                if is_file_import_id(old_id):
+                    renamed_file_rows.append(new_id)
+                continue
+        except Exception:                            # noqa: BLE001
+            log.warning("reconnect: could not carry %s onto %s",
+                        new_id, old_id, exc_info=True)
+        absorbed_by_held.append((d, float(amt)))
     for t in older:
         d, amt = _day(t), _f(t, "amount")
         if d is not None and amt is not None:
@@ -1411,7 +1539,7 @@ def _seam_matcher(conn, account_id: str, dates: list, cutoff: dt.date,
     hi = min(max(dates) + dt.timedelta(days=3), cutoff)
     rows = conn.execute(
         """SELECT id, date, amount, name, merchant_name FROM transactions
-            WHERE removed = 0 AND account_id = %s
+            WHERE removed = 0 AND account_id = %s AND amount IS NOT NULL
               AND date BETWEEN %s::date - INTERVAL '3 days' AND %s
             LIMIT %s""",
         (account_id, min(dates), hi, limit + 1)).fetchall()
@@ -1426,18 +1554,117 @@ def _seam_matcher(conn, account_id: str, dates: list, cutoff: dt.date,
     return m
 
 
-def _claim(m, d: dt.date, amount: float, name, merchant_name) -> dict | None:
-    """`Deduper.claim`, answering WHICH candidate it used up (None: no
-    match). The claim only ever ticks off a candidate of the same amount
-    within its reach, so those are the only ones to watch."""
-    from .dedup import WINDOW_DAYS
-    cents = round(amount * 100)
-    watch = [c for k in range(-WINDOW_DAYS, WINDOW_DAYS + 1)
-             for c in m._by_cell.get((cents, d + dt.timedelta(days=k)), ())
-             if not c["used"]]
-    if not m.claim(d, amount, name, merchant_name):
-        return None
-    return next((c for c in watch if c["used"]), {"id": None})
+def _seam_decisions(m, holds: list[dict], rows: list, cutoff: dt.date, *,
+                    in_key, pending) -> tuple[dict, dict]:
+    """({row: restored id it duplicates}, {row: hold id it settles}) for
+    one page's overlap rows, decided for the page as a whole.
+
+    `rows` are (handle, date, amount, tokens, ...) and `m` the seam pool
+    (`_seam_matcher`). The rule per row is the importers' (`dedup.
+    Deduper.claim`): a restored row of the same amount on the same day
+    whose name shares a token, else one whose name merely does not
+    contradict, else the nearest within WINDOW_DAYS sharing a token. What
+    this adds is that the rule is applied to every row at once through
+    `pairing.pair`, in three tiers:
+
+      1. every same-day pair, before anything else — so a charge made the
+         morning after the backup can never take the cutoff day's restored
+         row from that row's own re-delivery, and a daily same-price run
+         pairs day for day;
+      2. what is left may be the posted charge of a hold the merge retired
+         (the same amount, dated on or after the hold within the reach,
+         sharing a name token), nearest first. The same bank's feed dates
+         a posted charge the same day whichever link delivers it, so a row
+         with a same-day restored twin is that twin's re-delivery and
+         never reaches this tier;
+      3. what is still left may be a restored row a few days off, nearest
+         first. Never for a PENDING row dated after the cutoff: a hold the
+         backup could not have held is a purchase made since, not a
+         re-delivery, and claiming it would also hand the restored row the
+         hold's id, which the hold's removal then deletes.
+
+    Ties go by the rows' own date and id, so the order the page arrived in
+    never changes the answer."""
+    from .dedup import SCAN_CEILING, WINDOW_DAYS, _distinct_names
+    from .pairing import pair
+    claims: dict = {}
+    settles: dict = {}
+    if not rows:
+        return claims, settles
+    cells = m._by_cell if m is not None else {}
+    by_id: dict[str, tuple] = {}
+    for (_cents, day), cs in cells.items():
+        for c in cs:
+            if c.get("id"):
+                by_id[c["id"]] = (day, c)
+
+    def cand_key(cid):
+        return (by_id[cid][0], cid)
+
+    def nearby(d, cents, deltas):
+        # each row looks at no more than the importers' scan ceiling, in a
+        # fixed order, so a pathological cell bounds the work the same way
+        # whatever else the page holds
+        seen = 0
+        for delta in deltas:
+            days = ((d,) if delta == 0
+                    else (d - dt.timedelta(days=delta),
+                          d + dt.timedelta(days=delta)))
+            for day in days:
+                for c in sorted(cells.get((cents, day), ()),
+                                key=lambda c: c.get("id") or ""):
+                    if c["used"] or not c.get("id"):
+                        continue
+                    seen += 1
+                    if seen > SCAN_CEILING:
+                        return
+                    yield delta, c
+
+    def keyed(r):
+        return round(r[2] * 100)
+
+    edges = []
+    for r in rows:
+        h, d, _amt, toks = r[0], r[1], r[2], r[3]
+        for _delta, c in nearby(d, keyed(r), (0,)):
+            if toks & c["tokens"]:
+                edges.append((h, c["id"], 0, (0,)))
+            elif not _distinct_names(toks, c["tokens"]):
+                edges.append((h, c["id"], 0, (1,)))
+    claims.update(pair(edges, in_key=in_key, cand_key=cand_key))
+    taken = set(claims.values())
+
+    rest = [r for r in rows if r[0] not in claims]
+    if holds and rest:
+        hold_by_id = {h["id"]: h for h in holds}
+        edges = []
+        for r in rest:
+            h, d, toks = r[0], r[1], r[3]
+            for hd in holds:
+                lag = (d - hd["date"]).days
+                if (not hd["used"] and hd["cents"] == keyed(r)
+                        and 0 <= lag <= WINDOW_DAYS
+                        and toks & hd["tokens"]):
+                    edges.append((h, hd["id"], lag, ()))
+        settles.update(pair(
+            edges, in_key=in_key,
+            cand_key=lambda hid: (hold_by_id[hid]["date"], hid)))
+        for hid in settles.values():
+            hold_by_id[hid]["used"] = True
+        rest = [r for r in rest if r[0] not in settles]
+
+    edges = []
+    for r in rest:
+        h, d, toks = r[0], r[1], r[3]
+        if d > cutoff and pending(h):
+            continue
+        for delta, c in nearby(d, keyed(r), range(WINDOW_DAYS + 1)):
+            if delta and c["id"] not in taken and toks & c["tokens"]:
+                edges.append((h, c["id"], delta, ()))
+    claims.update(pair(edges, in_key=in_key, cand_key=cand_key))
+    for cid in claims.values():
+        by_id[cid][1]["used"] = True
+    return claims, settles
 
 
 def _remember(conn, adopt: dict, absorbed: dict, settled: dict) -> None:
@@ -1466,41 +1693,13 @@ def _awaiting_settlement(conn, account_id: str, hold_ids: list,
     rows = conn.execute(
         """SELECT id, date, amount, name, merchant_name FROM transactions
             WHERE id = ANY(%s) AND account_id = %s AND removed = 1
+              AND amount IS NOT NULL
               AND date BETWEEN %s::date - %s::int AND %s::date""",
         (list(hold_ids), account_id, min(dates), WINDOW_DAYS,
          max(dates))).fetchall()
     return [{"id": r["id"], "date": r["date"],
              "cents": round(float(r["amount"]) * 100), "used": False,
              "tokens": _tokens(r["name"], r["merchant_name"])} for r in rows]
-
-
-def _settles(holds: list[dict], m, d: dt.date, amount: float,
-             tokens: set) -> dict | None:
-    """The retired hold an incoming row is the posted charge of, or None.
-
-    The same bank's feed dates a posted charge the same day whichever link
-    delivers it, so a row with an unclaimed same-day restored twin is that
-    twin's re-delivery and goes to the matcher, even when a hold is also in
-    reach. Otherwise the nearest unclaimed hold of the same amount, dated
-    on or before the row within the matcher's reach and sharing a name
-    token, is the one it settles."""
-    from .dedup import WINDOW_DAYS, _distinct_names
-    cents = round(amount * 100)
-    if m is not None and any(
-            not c["used"] and not _distinct_names(tokens, c["tokens"])
-            for c in m._by_cell.get((cents, d), ())):
-        return None
-    best = None
-    for h in holds:
-        lag = (d - h["date"]).days
-        if (h["used"] or h["cents"] != cents or not 0 <= lag <= WINDOW_DAYS
-                or not tokens & h["tokens"]):
-            continue
-        if best is None or lag < (d - best["date"]).days:
-            best = h
-    if best is not None:
-        best["used"] = True
-    return best
 
 
 def _note_file_rows_relied_on(conn, account_id: str,
@@ -1678,6 +1877,9 @@ def list_adoptions(conn, item_id: str | None = None) -> list[dict]:
 # inside a restore; past it the account is left unmerged and the person is
 # told, rather than settling it on a partial read.
 _MERGE_MAX_ROWS = 200_000
+# the most candidate pairs one merge weighs (identical rows on one day each
+# offer every one of their twins)
+_MERGE_MAX_EDGES = 500_000
 
 
 def _same_bank_sql(alias_live: str, alias_rest: str) -> str:
@@ -1829,73 +2031,72 @@ def _pair_overlap(conn, restored_id: str, live_id: str) -> list[tuple[str, str]]
             """SELECT id, date, amount, name, merchant_name, pending
                  FROM transactions
                 WHERE account_id = %s AND removed = 0
+                  AND amount IS NOT NULL
                   AND date BETWEEN %s AND %s
                 ORDER BY date, id LIMIT %s""",
             (aid, lo, hi, _MERGE_MAX_ROWS + 1)).fetchall()
     live, mine = rows(live_id), rows(restored_id)
     if len(live) > _MERGE_MAX_ROWS or len(mine) > _MERGE_MAX_ROWS:
         return None
+    from .pairing import pair
     cells: dict[tuple[int, dt.date], list[dict]] = {}
     for r in live:
         cells.setdefault((round(float(r["amount"]) * 100), r["date"]),
-                         []).append({"id": r["id"], "used": False,
+                         []).append({"id": r["id"], "date": r["date"],
                                      "pending": bool(r["pending"]),
                                      "tokens": _tokens(r["name"],
                                                        r["merchant_name"])})
-    mine = [(r, round(float(r["amount"]) * 100),
-             _tokens(r["name"], r["merchant_name"])) for r in mine]
-    out: list[tuple[str, str]] = []
-    paired: set[str] = set()
-    # Pass one: the same amount on the same day, one to one — a shared name
-    # token first, then names that merely do not contradict. It runs over
-    # every row before any off-day match is tried, so a recurring charge
-    # held by both lineages (the same coffee every morning) pairs day for
-    # day; a greedy nearest-day walk would let one morning's row take the
-    # next morning's partner and shift the whole run by a day.
+    mine = {r["id"]: (r, round(float(r["amount"]) * 100),
+                      _tokens(r["name"], r["merchant_name"])) for r in mine}
+    live_day = {r["id"]: r["date"] for r in live}
+    # Every pair is chosen at once by `pairing.pair`, never row by row: the
+    # same amount on the same day before anything off-day, so a recurring
+    # charge held by both lineages (the same coffee every morning) pairs
+    # day for day; a greedy nearest-day walk would let one morning's row
+    # take the next morning's partner and shift the whole run by a day.
     #
-    # A posted live row is taken before a pending one: on the day the bank
-    # holds both a hold and the charge it became, the restored copy is the
-    # posted charge, and paired with the hold, everything a person put on
-    # it would follow the hold the bank is about to remove.
-    for want_pending in (False, True):
-        for want_token in (True, False):
-            for r, cents, toks in mine:
-                if r["id"] in paired:
-                    continue
-                for c in cells.get((cents, r["date"]), ()):
-                    if c["used"] or c["pending"] != want_pending:
-                        continue
-                    if (toks & c["tokens"] if want_token
-                            else not _distinct_names(toks, c["tokens"])):
-                        c["used"] = True
-                        paired.add(r["id"])
-                        out.append((r["id"], c["id"]))
-                        break
-    # Pass two: what is still unpaired may match a live row a few days off
-    # (the two feeds dated the charge differently), nearest day first, on a
-    # shared name token. Only for a restored row inside the days the live
-    # lineage covers: one dated before the link's first row is history the
-    # link never held, and pairing it off-day would retire a real charge.
-    for r, cents, toks in mine:
-        if r["id"] in paired or not (span["lo"] <= r["date"] <= span["hi"]):
-            continue
-        hit = None
-        for delta in range(1, WINDOW_DAYS + 1):
-            for d in (r["date"] - dt.timedelta(days=delta),
-                      r["date"] + dt.timedelta(days=delta)):
+    # Same-day: a shared name token first, then names that merely do not
+    # contradict — and a posted live row before a pending one, whatever
+    # the names: on the day the bank holds both a hold and the charge it
+    # became, the restored copy is the posted charge, and paired with the
+    # hold, everything a person put on it would follow the hold the bank
+    # is about to remove.
+    #
+    # Off-day (the two feeds dated the charge differently): nearest day
+    # first, on a shared name token, and only for a restored row inside
+    # the days the live lineage covers — one dated before the link's first
+    # row is history the link never held, and pairing it off-day would
+    # retire a real charge.
+    from .dedup import SCAN_CEILING
+    # a pile of identical rows on one day bigger than the importers' scan
+    # ceiling cannot be paired row for row without an edge list the size
+    # of its square; it is refused before any edge is built (a slice would
+    # leave the rows past it unpaired, and the merge would double them)
+    if any(len(v) > SCAN_CEILING for v in cells.values()):
+        return None
+    edges = []
+    for rid, (r, cents, toks) in mine.items():
+        inside = span["lo"] <= r["date"] <= span["hi"]
+        for delta in range(WINDOW_DAYS + 1 if inside else 1):
+            days = ((r["date"],) if delta == 0
+                    else (r["date"] - dt.timedelta(days=delta),
+                          r["date"] + dt.timedelta(days=delta)))
+            for d in days:
                 for c in cells.get((cents, d), ()):
-                    if not c["used"] and toks & c["tokens"]:
-                        hit = c
-                        break
-                if hit:
-                    break
-            if hit:
-                break
-        if hit:
-            hit["used"] = True
-            paired.add(r["id"])
-            out.append((r["id"], hit["id"]))
-    return out
+                    shared = bool(toks & c["tokens"])
+                    if delta:
+                        if shared:
+                            edges.append((rid, c["id"], delta, (0, 0)))
+                    elif shared or not _distinct_names(toks, c["tokens"]):
+                        edges.append((rid, c["id"], 0,
+                                      (int(c["pending"]), int(not shared))))
+            if len(edges) > _MERGE_MAX_EDGES:
+                # a pathological pile of identical rows: past the bound,
+                # like an overlap too long to pair at all
+                return None
+    got = pair(edges, in_key=lambda rid: (mine[rid][0]["date"], rid),
+               cand_key=lambda lid: (live_day[lid], lid))
+    return sorted(got.items(), key=lambda p: (mine[p[0]][0]["date"], p[0]))
 
 
 def _move_account_children(conn, old_id: str, new_id: str) -> None:
@@ -1913,6 +2114,13 @@ def _move_account_children(conn, old_id: str, new_id: str) -> None:
             f"DELETE FROM {table} WHERE account_id = %s AND EXISTS"
             f" (SELECT 1 FROM {table} WHERE account_id = %s)",
             (old_id, new_id))
+    # a source both accounts answer to (the same stored name, the same
+    # card) is one row on the account that stays, not a duplicate key
+    conn.execute(
+        "DELETE FROM account_sources o WHERE o.account_id = %s AND EXISTS"
+        " (SELECT 1 FROM account_sources n WHERE n.account_id = %s"
+        "    AND n.door = o.door AND n.source_hmac = o.source_hmac)",
+        (old_id, new_id))
     for table, col in ACCOUNT_REFS:
         conn.execute(f"UPDATE {table} SET {col} = %s WHERE {col} = %s",
                      (new_id, old_id))

@@ -16,6 +16,8 @@ import { SIMPLE_CADENCES } from "./Bills";
 import { canEdit } from "../role";
 import { CUSTOM_UNITS, cadenceChoices, cadenceWords, customCadence, customMax }
   from "../cadence";
+import { TWICE_A_MONTH, cadenceFields, cadencePick, onSeveralDays, severalDaysWords,
+         withSeveralDays } from "../monthdays";
 const money = (v: number | null | undefined) => money$(v, true);  // cents on transaction/recurring surfaces
 
 
@@ -139,7 +141,8 @@ export default function RecurringHistory() {
         </h2>
         <div className="mut" style={{ fontSize: 13 }}>
           {bill ? (
-            <>Configured: {money(bill.amount)} {cadLabel(bill.cadence)}
+            <>Configured: {money(bill.amount)} {onSeveralDays(bill.by_month_day)
+                ? severalDaysWords(bill.by_month_day) : cadLabel(bill.cadence)}
               {bill.due_on && <> · next due {mmdd(bill.due_on)}</>}
               {" "}· source {bill.source}</>
           ) : d.covered_by ? (
@@ -162,7 +165,9 @@ export default function RecurringHistory() {
                 <Link className="btn" style={{ marginLeft: ".6rem" }}
                       to={`/bills?edit=${encodeURIComponent(d.payee)}` +
                           `&pamt=${fit.amount}&pcad=${encodeURIComponent(fit.cadence)}` +
-                          `&pdue=${fit.next_due || ""}`}>
+                          `&pdue=${fit.next_due || ""}` +
+                          (onSeveralDays(fit.by_month_day)
+                            ? `&pdays=${fit.by_month_day.join(",")}` : "")}>
                   edit with these values</Link>
                 {d.hint_dismissed ? (
                   <>
@@ -424,7 +429,9 @@ function RestoreArchived({ payee, onDone }: { payee: string; onDone: () => void 
 
 function AddAsBill({ d, onDone }: { d: BillsHistoryData; onDone: () => void }) {
   const [amount, setAmount] = useState(d.fit ? d.fit.amount.toFixed(2) : "");
-  const [cadence, setCadence] = useState(d.fit?.cadence ?? "MONTHLY:1");
+  const fitDays = d.fit?.by_month_day;
+  const [cadence, setCadence] = useState(
+    cadencePick(d.fit?.cadence ?? "MONTHLY:1", fitDays));
   const [nextDue, setNextDue] = useState(d.fit?.next_due ?? "");
   const [err, setErr] = useState<string | null>(null);
   // "Custom interval…" → any FREQ:interval (every X days … years) for
@@ -443,14 +450,14 @@ function AddAsBill({ d, onDone }: { d: BillsHistoryData; onDone: () => void }) {
   const suggest = () => {
     if (!d.fit) return;
     setAmount(d.fit.amount.toFixed(2));
-    setCadence(d.fit.cadence);
+    setCadence(cadencePick(d.fit.cadence, fitDays));
     setNextDue(d.fit.next_due ?? "");
     setSuggested(true);
   };
   const add = useMutation({
     mutationFn: () => api.billsSave({
       payee: d.payee, merchant: d.payee, amount,
-      cadence: effCadence, next_due: nextDue,
+      ...cadenceFields(effCadence, null, fitDays, nextDue), next_due: nextDue,
       // a mostly-inflow merchant (a paycheck) is recurring income; saved
       // as a bill it would wait on a charge that never comes
       income: !!d.inflow,
@@ -470,8 +477,8 @@ function AddAsBill({ d, onDone }: { d: BillsHistoryData; onDone: () => void }) {
         {/* a ledger suggestion may be an unusual cadence not in the short
             list — keep it selectable/visible rather than silently
             mis-showing, and still there after another option is tried */}
-        {cadenceChoices(SIMPLE_CADENCES,
-                        [d.fit?.cadence, cadence === "CUSTOM" ? null : cadence])
+        {withSeveralDays(cadenceChoices(SIMPLE_CADENCES, [d.fit?.cadence,
+           cadence === "CUSTOM" || cadence === TWICE_A_MONTH ? null : cadence]), fitDays)
           .map(([v, label]) => (
             <option key={v} value={v}>{label}</option>
           ))}

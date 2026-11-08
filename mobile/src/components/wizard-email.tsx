@@ -235,8 +235,12 @@ export function EmailPane({ hosted }: { hosted: boolean }) {
                 {r.email}<Text style={{ color: C.mut }}> · {role}</Text>
               </Text>
               {r.owner ? (
-                <Text style={[ws.chip, { color: C.good, borderColor: C.good }]}>
-                  on</Text>
+                // the owner's own mute lives in Settings; the wizard only
+                // says which way it is set
+                <Text style={[ws.chip, muted
+                  ? { color: C.mut, borderColor: C.mut }
+                  : { color: C.good, borderColor: C.good }]}>
+                  {muted ? "off — change in Settings" : "on"}</Text>
               ) : (
                 <Pressable disabled={recip.isPending}
                            accessibilityRole="switch"
@@ -300,6 +304,7 @@ export function recipientCount(sv: Record<string, unknown> | undefined,
                                ownerEmail: string | undefined): number {
   const muted = ((sv?.email_muted as string[] | null) ?? [])
     .map((x) => x.toLowerCase());
+  // the owner counts only when not self-muted, as on the web
   return recipientRows(sv, ownerEmail).filter((r) =>
-    r.owner || !(r.muted ?? muted.includes(r.email.toLowerCase()))).length;
+    !(r.muted ?? muted.includes(r.email.toLowerCase()))).length;
 }

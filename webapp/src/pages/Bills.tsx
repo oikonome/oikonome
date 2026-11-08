@@ -7,10 +7,13 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createContext, Fragment, useContext, useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import { api, errText, mmdd, money as money$, toast, type Bill, type BillsData, type Settings, catLabel, proposalSuperseded } from "../api/client";
-import { patchList, patchQuery, removeFromList, saveSettings } from "../api/cache";
+import { patchList, patchQuery, removeFromList, SETTINGS_SAVES, saveSettings } from "../api/cache";
 import { canEdit, isOwner } from "../role";
+import { householdDay, scanAlreadyRunning, SCAN_RUNNING_RETRY_MS } from "../moneymath";
 import { ADD_CADENCES, CUSTOM_UNITS, cadenceChoices, customCadence, customMax }
   from "../cadence";
+import { TWICE_A_MONTH, cadenceFields, cadencePick, onSeveralDays, withSeveralDays }
+  from "../monthdays";
 const money = (v: number | null | undefined) => money$(v, true);  // cents on transaction/recurring surfaces
 
 // ---- stepping back through the months ----
@@ -35,7 +38,8 @@ export const ymLabel = (ym: string) => {
 // cadence select value → group heading (the list order is the rank)
 const GROUPS: [string, string][] = [
   ["WEEKLY:1", "Weekly"], ["DAILY:14", "Every 14 days"],
-  ["WEEKLY:2", "Every 2 weeks"], ["MONTHLY:1", "Monthly"],
+  ["WEEKLY:2", "Every 2 weeks"], [TWICE_A_MONTH, "Twice a month"],
+  ["MONTHLY:1", "Monthly"],
   ["ENVELOPE:1", "Monthly envelope"], ["ENVELOPE:12", "Annual envelope"],
   ["WEEKLY:8", "Every 8 weeks"],
   ["MONTHLY:2", "Every 2 months"], ["MONTHLY:3", "Every 3 months"],
@@ -65,8 +69,11 @@ interface Row extends Bill {
 // cycle bar: how far through the billing cycle the row is — fills as the
 // due date approaches, in the envelopes' own visual language
 const DAY = 86_400_000;
-const daysUntil = (isoDate: string) => {
-  const today = new Date(); today.setHours(0, 0, 0, 0);
+// "due today" / "1 day late" count from the household's day (/api/me
+// timezone), the day the server, Today and the mail judge a due date by
+const ZoneCtx = createContext<string | undefined>(undefined);
+const daysUntil = (isoDate: string, zone?: string) => {
+  const today = householdDay(new Date(), zone);
   return Math.round((new Date(isoDate + "T00:00:00").getTime() - today.getTime()) / DAY);
 };
 const cycleDays = (cad: string) => {
@@ -132,6 +139,7 @@ function NightlyFinderSwitch() {
   const qc = useQueryClient();
   const s = useQuery({ queryKey: ["settings"], queryFn: api.settings });
   const save = useMutation({
+    scope: SETTINGS_SAVES,
     mutationFn: (on: boolean) => saveSettings(qc, { bill_detection_auto: on }),
     // the box flips on the click; saveSettings then seeds the cache with
     // the server's full view, and a failed write refetches the stored one
@@ -182,7 +190,10 @@ export default function Bills({ autoDetect = false }:
   // the month on view: absent = this month (the live key every write
   // patches); a past month has its own key, so stepping back never
   // overwrites the live list in the cache
-  const curYm = ymOf(new Date());
+  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
+  // "this month" is the household's — the month GET /api/bills answers
+  // for — so ‹ reaches the month that just closed there, not the device's
+  const curYm = ymOf(householdDay(new Date(), me.data?.timezone));
   const month = sp.get("month") ?? "";
   const isPast = !!month && month < curYm;
   const q = useQuery({
@@ -200,7 +211,6 @@ export default function Bills({ autoDetect = false }:
   useQuery({ queryKey: ["calendar"], queryFn: () => api.calendar(35) });
   // detect / approve / edit / archive are editing writes — viewers keep
   // the full read view (groups, calendar, proposals as information)
-  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const mayEdit = canEdit(me);
   const [adding, setAdding] = useState(false);
   // the triage queue's undo affordance: one reversible action at a time
@@ -324,7 +334,15 @@ export default function Bills({ autoDetect = false }:
           : "") + ".");
       refetchAll();
     },
-    onError: (e) => toast(errText(e)),
+    onError: (e) => {
+      if (scanAlreadyRunning(e)) {
+        // another pass (the nightly, another tab) is finding the bills now
+        toast("A scan is already running — the list updates when it ends.");
+        window.setTimeout(refetchAll, SCAN_RUNNING_RETRY_MS);
+        return;
+      }
+      toast(errText(e));
+    },
   });
 
   const toggle = useMutation({
@@ -355,12 +373,12 @@ export default function Bills({ autoDetect = false }:
   // Just an edit of the bill, so Undo is saving the old amount back.
   const acceptAmount = useMutation({
     mutationFn: ({ b, amt }: { b: Bill; amt: number }) =>
-      // no next_due: an amount change keeps the date, and this row's copy
-      // may predate the server rolling it on to the next cycle
+      // amount only: no cadence, income or next_due, so the server keeps
+      // the bill's stored values — this row's copy may predate an edit made
+      // elsewhere, and resending its cadence or direction would revert it.
       // orig_payee marks this an edit of the bill the row shows, so a bill
       // deleted since the list loaded is refused instead of recreated
-      api.billsSave({ payee: b.payee, orig_payee: b.payee, amount: amt,
-                      cadence: b.cadence_value, income: b.income }),
+      api.billsSave({ payee: b.payee, orig_payee: b.payee, amount: amt }),
     onSuccess: (_r, v) => {
       setUndo({ label: `${v.b.payee} updated to ${money(v.amt)}.`,
                 act: () => acceptAmount.mutate(
@@ -471,7 +489,8 @@ export default function Bills({ autoDetect = false }:
   const groups = new Map<string, Row[]>();
   for (const r of rows) {
     if (r.income) continue;
-    const g = r.cadence_value ? groupOf(r.cadence_value)
+    const g = r.cadence_value
+      ? groupOf(cadencePick(r.cadence_value, r.by_month_day))
       : r.cadenceLabel === "annual envelope" ? "Annual envelope"
       : r.cadenceLabel === "envelope" ? "Monthly envelope"
       : GROUPS.find(([, name]) => name.toLowerCase() === r.cadenceLabel)?.[1]
@@ -506,11 +525,12 @@ export default function Bills({ autoDetect = false }:
     togglePending: toggle.isPending,
     pendingDelete: del.isPending && del.variables ? del.variables.mode : null,
     prefill: { pamt: sp.get("pamt") ?? "", pcad: sp.get("pcad") ?? "",
-               pdue: sp.get("pdue") ?? "" },
+               pdue: sp.get("pdue") ?? "", pdays: sp.get("pdays") ?? "" },
     cadences,
   };
   const shownYm = isPast ? month : curYm;
   return (
+    <ZoneCtx.Provider value={me.data?.timezone}>
     <PastMonthCtx.Provider value={isPast ? ymLabel(month) : null}>
       <h1>{autoDetect ? "Bills & Income" : "Bills"}</h1>
       {/* step back through the months: the per-bill paid/received below
@@ -723,8 +743,10 @@ export default function Bills({ autoDetect = false }:
                   <td className="mut c-cad">
                     {p.bill_type === "envelope" ? "~/mo pooled"
                       : p.frequency
-                        ? <>{p.frequency.toLowerCase()}
-                            {(p.interval ?? 1) > 1 ? ` ×${p.interval}` : ""}
+                        ? <>{onSeveralDays(p.by_month_day) ? p.cadence
+                              : p.frequency.toLowerCase()}
+                            {!onSeveralDays(p.by_month_day) && (p.interval ?? 1) > 1
+                              ? ` ×${p.interval}` : ""}
                             {p.next_due ? ` · next ${mmdd(p.next_due)}` : ""}</>
                         : p.cadence}
                   </td>
@@ -828,6 +850,7 @@ export default function Bills({ autoDetect = false }:
         </div>
       )}
     </PastMonthCtx.Provider>
+    </ZoneCtx.Provider>
   );
 }
 
@@ -861,7 +884,7 @@ function BillTableInner({ past, groups, isEnv, income, edit, mayEdit, onEdit, on
   hintBusy: string | null;
   togglePending: boolean;
   pendingDelete: "archive" | "purge" | null;
-  prefill: { pamt: string; pcad: string; pdue: string };
+  prefill: { pamt: string; pcad: string; pdue: string; pdays: string };
   cadences: [string, string][];
 }) {
   const cols = isEnv ? 5 : 6;
@@ -932,7 +955,7 @@ function BillRows({ b, isEnv, cols, editing, mayEdit, onEdit,
   hintBusy: boolean;
   togglePending: boolean;
   pendingDelete: "archive" | "purge" | null;
-  prefill: { pamt: string; pcad: string; pdue: string };
+  prefill: { pamt: string; pcad: string; pdue: string; pdays: string };
   cadences: [string, string][];
 }) {
   const { disabled } = b;
@@ -943,8 +966,10 @@ function BillRows({ b, isEnv, cols, editing, mayEdit, onEdit,
   // a past month has no countdown: its occurrences were paid, missed, or
   // not due, and the cycle bar has nothing to measure
   const past = useContext(PastMonthCtx);
-  const daysTo = !past && !isEnv && b.due_on ? daysUntil(b.due_on) : null;
-  const cyc = cycleDays(cadVal);
+  const zone = useContext(ZoneCtx);
+  const daysTo = !past && !isEnv && b.due_on ? daysUntil(b.due_on, zone) : null;
+  const cyc = onSeveralDays(b.by_month_day)
+    ? cycleDays("MONTHLY:1") / b.by_month_day.length : cycleDays(cadVal);
   const settled = b.occurrences > 0 && b.paid >= b.occurrences;
   const missed = !!past && !settled && b.occurrences > 0;
   const overdue = !settled && daysTo !== null && daysTo < 0;
@@ -1290,7 +1315,7 @@ function AddBillForm({ onCancel, onSaved }:
 function EditRow({ d, cadences, cols, prefill, togglePending, pendingDelete,
                    onCancel, onSaved, onToggle, onArchive, onPurge }: {
   d: Bill; cadences: [string, string][]; cols: number;
-  prefill: { pamt: string; pcad: string; pdue: string };
+  prefill: { pamt: string; pcad: string; pdue: string; pdays: string };
   togglePending: boolean; pendingDelete: "archive" | "purge" | null;
   onCancel: () => void; onSaved: () => void;
   onToggle: () => void;
@@ -1298,7 +1323,13 @@ function EditRow({ d, cadences, cols, prefill, togglePending, pendingDelete,
 }) {
   const [payee, setPayee] = useState(d.payee);
   const [amount, setAmount] = useState(prefill.pamt || d.amount.toFixed(2));
-  const [cadence, setCadence] = useState(prefill.pcad || d.cadence_value);
+  // the days the picker's several-days option stands for: a ledger-fit
+  // prefill speaks for itself, else the bill's own rule
+  const days = prefill.pcad
+    ? prefill.pdays.split(",").map(Number).filter(Number.isInteger)
+    : d.by_month_day;
+  const [cadence, setCadence] = useState(
+    cadencePick(prefill.pcad || d.cadence_value, days));
   const [nextDue, setNextDue] = useState(prefill.pdue || d.due_on || "");
   // the stored due date when the form opened: a save sends next_due only
   // when the field differs from it, so a name or amount edit leaves the
@@ -1336,7 +1367,8 @@ function EditRow({ d, cadences, cols, prefill, togglePending, pendingDelete,
   const [err, setErr] = useState<string | null>(null);
   const save = useMutation({
     mutationFn: () => api.billsSave({
-      payee, amount, cadence, income: d.income,
+      payee, amount, income: d.income,
+      ...cadenceFields(cadence, d.by_month_day, days, nextDue),
       ...(nextDue && nextDue !== seededDue ? { next_due: nextDue } : {}),
       orig_payee: d.payee, ...(cadence !== "ENVELOPE:1" ? { cap } : {}),
       ...(d.income ? {} : { show_today: pinned }),
@@ -1371,7 +1403,8 @@ function EditRow({ d, cadences, cols, prefill, togglePending, pendingDelete,
           <select value={cadence} onChange={(e) => setCadence(e.target.value)}>
             {/* the bill's saved interval (and a ledger-fit prefill) stay
                 pickable even when the server's standard list lacks them */}
-            {cadenceChoices(cadences, [d.cadence_value, prefill.pcad])
+            {withSeveralDays(cadenceChoices(cadences, [d.cadence_value, prefill.pcad]),
+                             onSeveralDays(days) ? days : d.by_month_day)
               .map(([v, label]) => (
               <option key={v} value={v}>{label}</option>
             ))}

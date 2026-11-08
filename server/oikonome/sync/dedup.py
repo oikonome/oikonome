@@ -101,6 +101,7 @@ class Deduper:
         rows = conn.execute(
             """SELECT date, amount, name, merchant_name FROM transactions
                WHERE removed = 0 AND account_id = %s
+                 AND amount IS NOT NULL   -- never a same-amount twin
                  AND id NOT LIKE %s
                  AND date BETWEEN %s - INTERVAL '3 days' AND %s
                LIMIT %s""",

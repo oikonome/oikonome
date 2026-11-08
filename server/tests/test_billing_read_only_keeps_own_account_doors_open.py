@@ -89,18 +89,24 @@ class BillingReadOnlyOwnDoorsTests(unittest.TestCase):
     def test_a_write_to_the_household_is_still_refused(self):
         r = self.owner.post("/api/accounts/classify", json={})
         self.assertEqual(r.status_code, 402, r.text)
-        r = self.owner.post("/api/users/x/role", json={"role": "viewer"})
+        # making somebody view-only is a way out; promoting them is a grant
+        r = self.owner.post(f"/api/users/{self.member_id}/role",
+                            json={"role": "member", "password": PW})
         self.assertEqual(r.status_code, 402, r.text)
 
     def test_every_own_account_door_is_open_while_read_only(self):
-        for door in permissions.SELF_WRITE_OK:
-            self.assertTrue(self.appmod.billing_write_ok(door), door)
-            self.assertTrue(self.appmod.billing_write_ok(door + "/x"), door)
-        self.assertTrue(self.appmod.billing_write_ok(
-            f"/api/users/{uuid.uuid4()}/notify"))
-        for shut in ("/api/users/x/notify/more", "/api/users/x/role",
-                     "/api/users", "/api/accounts/classify"):
-            self.assertFalse(self.appmod.billing_write_ok(shut), shut)
+        # every own-account door (a SELF_WRITE_OK family) that is mounted
+        # is an exit, spelled out exactly
+        from .util import all_routes
+        ok = self.appmod.billing_write_ok
+        for r in all_routes(self.app):
+            if permissions.path_within(r.path, permissions.SELF_WRITE_OK):
+                for m in set(r.methods) - {"GET", "HEAD", "OPTIONS"}:
+                    self.assertTrue(ok(m, r.path), (m, r.path))
+        self.assertTrue(ok("POST", f"/api/users/{uuid.uuid4()}/notify"))
+        for shut in ("/api/users/x/notify/more", "/api/users",
+                     "/api/accounts/classify", "/api/totp/enroll/x"):
+            self.assertFalse(ok("POST", shut), shut)
 
 
 if __name__ == "__main__":

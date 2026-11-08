@@ -68,9 +68,11 @@ Each row is `label · actual / budget · delta`:
 
 Checking-now and card-debt-now are **point-in-time facts**, not plan
 rows — they live as plain numbers at the top of Today's Cash timeline
-card (**checking now**, **card debt**, **after cards & bills**), the
-last shown red when checking doesn't cover the cards and the bills
-still due. The one-line plan flow at the bottom of the verdict card
+card (**checking now**, **card debt**, **paychecks still due**, **after
+cards, bills & paychecks** — **after cards & bills** while no income
+series is set up), the last shown red when checking plus the paychecks
+still due don't cover the cards and the bills still due. The one-line
+plan flow at the bottom of the verdict card
 carries no cash numbers. Cash *warnings* have exactly one home: the
 verdict card.
 

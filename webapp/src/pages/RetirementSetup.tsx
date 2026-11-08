@@ -9,7 +9,7 @@ import { useRef } from "react";
 import { Navigate, useNavigate } from "react-router";
 import { isViewer } from "../role";
 import { api } from "../api/client";
-import { saveSettings } from "../api/cache";
+import { SETTINGS_SAVES, saveSettings } from "../api/cache";
 import RetireWizard from "../components/RetireWizard";
 
 export default function RetirementSetup() {
@@ -25,6 +25,7 @@ export default function RetirementSetup() {
   // the wizard reports each birthdate keystroke here so Skip can save it
   const birthRef = useRef("");
   const mark = useMutation({
+    scope: SETTINGS_SAVES,
     mutationFn: (body: Record<string, unknown>) => saveSettings(qc, body),
     onSuccess: (_s, body) => {
       // a birthdate saved on the way out changes the model's starting age;
@@ -68,9 +69,12 @@ export default function RetirementSetup() {
                   // Skip abandons the remaining questions, not an answer
                   // already given — a typed birthdate still lands in
                   // settings
+                  // settings — in its own save, because the server refuses
+                  // a whole body over one bad field and a refused birthdate
+                  // must not take the skip mark down with it
                   const b = birthRef.current.trim();
-                  mark.mutate({ ret_wizard_steps: { done: "skipped" },
-                                ...(b ? { birthdate: b } : {}) });
+                  mark.mutate({ ret_wizard_steps: { done: "skipped" } });
+                  if (b) mark.mutate({ birthdate: b });
                   nav("/retirement");
                 }}>
           Skip — open the full model

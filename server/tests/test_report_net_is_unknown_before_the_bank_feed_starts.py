@@ -23,9 +23,11 @@ def _seed(conn, first_bank_month: int) -> None:
     for m in range(1, 7):
         add_txn(conn, dt.date(2026, m, 10), 1000.0, "HARBOR GROCER",
                 primary="FOOD_AND_DRINK")
-    # the checking feed starts with an outflow and no deposit that month,
-    # so that month is covered with $0 income
-    add_txn(conn, dt.date(2026, first_bank_month, 12), 50.0, "CITY WATER",
+    # the checking feed opens on the 1st with an outflow and no deposit
+    # that month, so that month is covered with $0 income (a feed opening
+    # later in the month, beside a card imported since January, leaves
+    # the month unknown: its early paychecks were never imported)
+    add_txn(conn, dt.date(2026, first_bank_month, 1), 50.0, "CITY WATER",
             primary="RENT_AND_UTILITIES", account="chk")
     for m in range(first_bank_month + 1, 7):
         add_txn(conn, dt.date(2026, m, 1), -3000.0, "PAYROLL",

@@ -133,5 +133,23 @@ class RetirementsWaitForPairingLockTests(unittest.TestCase):
         self.assertTrue(waited)
         self.assertEqual(self._removed(old), 1)
 
+    def test_qif_share_only_retire_waits_for_a_link_in_flight(self):
+        """A re-import retiring the cash rows an older build made for
+        share-only investment records retires under the lock too, even on
+        a door that runs it outside any transaction of its own."""
+        from oikonome.sync import qifimport
+        old = add_txn(self.conn, "2026-07-01", -12.0, "INDEX FUND",
+                      account="chk")
+        self.conn.execute(
+            "UPDATE transactions SET raw = '{\"section\": \"Invst\","
+            " \"action\": \"ReinvDiv\"}'::jsonb WHERE id=%s", (old,))
+        dep = self._deposit()
+        waited = self._race(
+            lambda: qifimport._retire_legacy_no_cash(
+                self.conn, "chk", [(old, "reinvdiv")]),
+            self._link(old, dep))
+        self.assertTrue(waited)
+        self.assertEqual(self._removed(old), 1)
+
 if __name__ == "__main__":
     unittest.main()

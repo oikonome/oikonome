@@ -18,7 +18,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRef, useState } from "react";
 import { api, errText, kindIs, type BusinessSummary } from "../api/client";
-import { patchQuery, saveSettings } from "../api/cache";
+import { patchQuery, SETTINGS_SAVES, saveSettings } from "../api/cache";
 import { bizWizardEntryStep } from "../bizmath";
 import { isOwner } from "../role";
 import { openPlaidHostedLink, plaidLinkOutcome } from "./ConnectHub";
@@ -112,6 +112,7 @@ export default function BusinessWizard({ resume, onDone, onCancel }: {
                              queryFn: api.businessSummary });
   const flagged = summary.data?.flagged_unassigned ?? 0;
   const mark = useMutation({
+    scope: SETTINGS_SAVES,
     // the save returns the full settings view and seeds the cache with it,
     // so the Business page's prompt sees the marks without a refetch
     mutationFn: (m: Record<string, string | null>) =>
@@ -172,7 +173,8 @@ export default function BusinessWizard({ resume, onDone, onCancel }: {
       // reports those transactions just left — not the whole cache
       for (const k of ["accounts", "today", "biz-summary", "pnl", "biz-txns",
                        "balancesheet", "esttax", "biz-suggestions", "vendors",
-                       "txns", "lens-month", "lens-year", "report"])
+                       "txns", "lens-month", "lens-year", "report",
+                       "holdings"])
         qc.invalidateQueries({ queryKey: [k] });
       setErr(null);
       go(3, "accounts");

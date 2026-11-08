@@ -14,6 +14,7 @@ Direction rule (engine sign, positive = money out):
 """
 
 from __future__ import annotations
+import re
 
 CC_PAYMENT_DETAILED = "LOAN_PAYMENTS_CREDIT_CARD_PAYMENT"
 
@@ -262,6 +263,13 @@ def sale_of_security(desc: str | None) -> bool:
                      or _FUND_TICKER_RE.search(desc)))
 
 
+_INCOME_LABEL = re.compile(
+    r"^(income|paychecks?|pay ?cheques?|salary|wages|payroll|direct deposit)"
+    r"(\b|$)")
+# ...unless the label says the deposit is money coming BACK, not pay
+_NOT_INCOME = re.compile(r"reimburs|reversal|refund|adjust|transfer|correction")
+
+
 def flow_category(category: str | None, amount: float,
                   name: str | None = None) -> tuple[str | None, str | None]:
     """(category_primary, category_detailed) when `category` is a vendor
@@ -272,6 +280,15 @@ def flow_category(category: str | None, amount: float,
     s = (category or "").strip().lower()
     if s in _CC_PAYMENT:
         return "LOAN_PAYMENTS", CC_PAYMENT_DETAILED
+    # A bank's or budgeting app's own income label on a deposit is the
+    # canonical INCOME primary, not a free-text category of its own: the
+    # paycheck detector, the month's income and the spend exclusions all
+    # key on the literal, so a CSV household whose export says "Income"
+    # or "Paycheck" otherwise never has its pay detected or counted.
+    # Inflows only (Plaid sign: negative is money in) — an outflow filed
+    # under "Income" is a correction or a reversal, left as written.
+    if amount < 0 and _INCOME_LABEL.match(s) and not _NOT_INCOME.search(s):
+        return "INCOME", None
     if s in _TRANSFER:
         return transfer_category(amount), None
     if s == "payments and credits":

@@ -68,7 +68,8 @@ class RotationIsAtomicTests(unittest.TestCase):
             raise HTTPException(403, detail={"error": "elevation_required",
                                              "fresh": False})
 
-        with mock.patch.object(self.appmod, "_evict_passkeys", refuse):
+        from oikonome.auth import posture
+        with mock.patch.object(posture, "_evict_passkeys", refuse):
             r = self.client.post("/api/password/change", json={
                 "current_password": PW, "new_password": NEW_PW})
         self.assertEqual(r.status_code, 403, r.text)

@@ -1,6 +1,17 @@
 import type { Glance } from "./glance-pure";
 import type { AnswerBlock, HistoryCursor } from "./answer-pure";
 
+/** where one AI task's data goes, judged by the server from the endpoint
+ *  that task would call: on this server or its network, to a remote AI
+ *  service (`host` named only when the household configured it), or
+ *  nowhere. Every "stays on this instance" line reads this — absent
+ *  (loading, an older server) is never read as "stays here". */
+export interface AiDestination { where: "local" | "remote" | "off"; host: string }
+export interface AssistantStatus {
+  available: boolean; local: boolean; host?: string | null;
+  roles?: Partial<Record<"categorize" | "assistant" | "vision", AiDestination>>;
+}
+
 export interface AssistantTurn {
   id: string; asked_at: string; asked_by: string; question: string;
   answer: string; blocks: AnswerBlock[]; tools_used: string[];
@@ -107,6 +118,11 @@ export interface TodayFull {
   overdue_unpaid?: [string, number, string, (string | null)?][];
   mtd: [string, number][];
   bills_remaining_month: number | null;
+  /** the paychecks still due this month: ISO dates and their sum (null = no income series) */
+  income_due_dates?: string[] | null;
+  income_due_total?: number | null;
+  /** why there is no paycheck figure (null when there is one) */
+  income_due_note?: "none" | "budgeted" | "off" | null;
   forecast_rows: { date: string; amount: number; label: string;
                    bal_now: number | null; bal_stmt: number | null }[];
   pace_line?: string;
@@ -292,6 +308,14 @@ export interface MemberNotify {
   push_muted: boolean; push_browsers: number; push_phones: number;
 }
 export interface Me {
+  /** The day counts the Accounts copy prints, from the server's own
+   *  settings: how long a failing connection lasts before it is removed
+   *  (null while the instance does not remove them) and how long a
+   *  released bank keeps its place under the allowance. Absent from an
+   *  older server; read them through `plaidReapDays()` /
+   *  `releasedHoldDays()`, which fall back to the defaults. */
+  day_counts?: { plaid_reap_days?: number | null;
+                 released_hold_days?: number | null };
   // this login's own switch for the household's push notices (absent on
   // older servers)
   push_muted?: boolean;
@@ -334,6 +358,7 @@ export interface Me {
                // false when the plan does not include Plaid's recurring
                // cross-check
                plaid_recurring?: boolean;
+               enrich?: boolean;
                // true when no bank can be connected until an owner
                // confirms their email address — the server's own reason
                // for an allowance of 0; absent from an older server
@@ -433,6 +458,10 @@ export interface Connection {
   // reauth (sign in again / share accounts) | gone | attention. Never
   // re-derive it from `status` — an outage is not a broken login.
   status_kind?: "ok" | "retrying" | "reauth" | "gone" | "attention";
+  // why a 'reaped' connection was removed: the reaper after its run of
+  // failures, Plaid no longer holding the Item, or the plan ending.
+  // Absent from an older server — the clients then name no cause.
+  archived_reason?: "auto-reap" | "plaid-gone" | "sub-ended" | null;
   // Plaid's fleet-wide login health for the bank (HEALTHY | DEGRADED |
   // DOWN), cached hourly server-side; stale readings are dropped there
   institution_health?: string | null;
@@ -462,12 +491,15 @@ export interface Proposal {
   /** the cadence's raw pieces (MONTHLY + 1) — what the Adjust form's
    *  cadence picker starts on, in the bill forms' FREQ:interval values */
   frequency?: string | null; interval?: number | null;
+  /** the days of an offer on several days of the month, else null */
+  by_month_day?: number[] | null;
   /** an "attach" (fee) or "merchant" proposal: the bill it would join */
   bill_payee?: string | null;
 }
 /** The Adjust form's changes to a proposal, sent with its approve. */
 export type ProposalAdjust = { name?: string; amount?: number;
-                               cadence?: string; due_day?: number };
+                               cadence?: string; due_day?: number;
+                               by_month_day?: number[] };
 
 /** GET /api/onboarding — the wizard's counts, step marks and the three
  *  first-run choices it asks for. */
@@ -513,6 +545,9 @@ export interface Bill {
   suggestion?: { action: "accept_amount" | "disable" | "review";
                  amount?: number; reason: string } | null;
   cadence_value?: string;
+  // the days of a rule on several days of the month, else null: the
+  // FREQ:interval value above cannot say them
+  by_month_day?: number[] | null;
   fit?: LedgerFit | null; fit_diverges?: boolean;
   hint_dismissed?: boolean;
   occurrences: number; paid: number; paid_amount: number;
@@ -776,6 +811,7 @@ export interface WaitingReceipts {
 
 export interface BillDetail {
   payee: string; amount: number; income: boolean; cadence: string;
+  by_month_day?: number[] | null;
   next_due: string; bill_type: string; source: string;
   category: string | null; merchant: string | null; active: boolean;
   cap: number | null; disabled: boolean;
@@ -793,6 +829,8 @@ export interface Companion { tokens: string; amount: number; window_days: number
 export interface LedgerFit {
   kind: string; amount: number; cadence: string; next_due: string;
   short: string; label: string; cycle_days?: number; hits?: number;
+  // the two days a twice-a-month fit landed on; `cadence` reads MONTHLY:1
+  by_month_day?: number[] | null;
 }
 // history rows are the Transactions-page shape plus the matcher verdict
 export type HistoryTxn = Txn & { txn_id: string; hit: boolean };
@@ -807,7 +845,8 @@ export interface BillsHistoryData {
               active_months: number; avg_monthly_active: number };
   inflow: boolean;
   bill: { amount: number; bill_type: string; source: string;
-          cadence: string; due_on: string | null; income: boolean } | null;
+          cadence: string; by_month_day?: number[] | null;
+          due_on: string | null; income: boolean } | null;
   health: { health: string; last_match: string | null;
             matched?: number; fit_diverges?: boolean;
             // behind a "withdrawn" verdict: when the feed took the charge back
@@ -894,6 +933,9 @@ export interface DebtSchedule {
   monthly: number;                  // every minimum + the extra
   starting: number;
   growing: boolean;                 // the minimums do not cover the interest
+  // false = the walk stopped at fifty years: total_interest is a cut-off
+  // figure, never shown as what the plan costs (absent from an older server)
+  finishes?: boolean;
   series: [string, number][];       // today, then each month's first
   debts: { id: string; order: number; paid_off: string | null;
            interest: number; paid: number; remaining: number }[];
@@ -923,7 +965,10 @@ export interface RetirementData {
              total: number };
   earliest: number | null;
   real_return: number;
-  spend: number; spend_now: number; grow_to_67: number;
+  spend: number; spend_now: number;
+  // null when the curve has no point at 67 (already past it, or the plan
+  // ends first)
+  grow_to_67: number | null;
   growth_path: [string, number][];
   rows: { age: number; at_retire: number; feasible: boolean;
           fail_age: number | null; max_spend: number;
@@ -952,8 +997,18 @@ export interface RestoreProgress {
     error?: string; result?: ImportResult;
   };
 }
+// An account a refusal asks the person to choose, described by what tells
+// two cards sharing their last four apart when their names read the same.
+export interface AccountChoice {
+  id: string; name: string; mask: string | null;
+  rows: number; first_date: string | null; last_date: string | null;
+  balance_cents: number | null;
+}
 export interface ImportResult {
   error?: string; imported?: number; skipped_duplicates?: number;
+  // a typed new-account name that leads to several accounts: the ones it
+  // could mean, and (on the YNAB card) the YNAB account it was typed for
+  choices?: AccountChoice[]; choice_for?: string;
   // Mapped-CSV refusals only. `token` is a fresh claim token for the same
   // upload — the mapping is correctable, submit again with it. `expired`
   // says the upload is gone for good and the file has to be re-uploaded.
@@ -993,7 +1048,10 @@ export interface YnabAccountsNeeded {
 }
 export type MappingNeeded = ColumnMappingNeeded | YnabAccountsNeeded;
 // Where one YNAB account goes: an account id, "skip", or a new account.
-export type YnabDestination = string | { new: string };
+// an account id, "skip", a new account, or an account picked from those a
+// typed new-account name could mean, with that name (remembered under it)
+export type YnabDestination = string | { new: string }
+  | { id: string; typed: string };
 export interface ImportOutcome {
   result: ImportResult | null;
   mapping_needed: MappingNeeded | null;
@@ -1005,6 +1063,10 @@ export interface PlanFile {
   sign_certain: boolean; note: string; oversized?: boolean;
   // an export ZIP too large to read here names the door that takes it
   restore_door?: string;
+  // the accounts the file could mean when the server cannot say which
+  // (two cards sharing their last four): the person picks one
+  // each described (AccountChoice)
+  choices?: AccountChoice[];
 }
 export interface TaxdocRow {
   year: number; exists?: boolean;
@@ -1013,7 +1075,8 @@ export interface TaxdocRow {
   wages?: number | null; ss_earnings?: number | null;
   medicare_earnings?: number | null;
   employer?: string | null; ein?: string | null;
-  box1?: number | null;
+  // a W-2's boxes as read ("1" = wages); the commit stores this object
+  boxes?: Record<string, number>; box1?: number | null;
 }
 export interface TaxdocPlan { token: string; kind: string; rows: TaxdocRow[] }
 export interface SyncStatus {
@@ -1150,7 +1213,8 @@ export interface MileageTrip {
 }
 export interface Vendor {
   merchant: string; paid: number; paid_by_card: number; reportable: boolean;
-  needs_1099: boolean;
+  // last four of the payee's TIN on file, null when none was given
+  tin_last4: string | null; needs_1099: boolean;
 }
 
 export interface CustomBucket {
@@ -1302,6 +1366,7 @@ export interface MonthLensData {
   income: { actual: number | null; budgeted: number | null };
   spend_total: number;
   saved_month?: number | null;
+  savings_goal?: { monthly_plan: number; rate_90d: number | null } | null;
   plan_surplus?: number | null;
   // "snapshot": closed month judged against its frozen budget; "live":
   // today's config (the page notes the retroactive judgment)
@@ -1340,6 +1405,10 @@ export interface BudgetSnapshots {
 export interface YearLensData {
   y: number; cells: YearCell[];
   totals: YearTotals; prev_totals: YearTotals;
+  // the last day of the prior year the comparison counts ("YYYY-MM-DD"):
+  // a year in progress is set against the same span of the year before,
+  // so the column reads "2025 (to Jun 30)"; null when both years are whole
+  prev_through?: string | null;
   // [display label, this year, last year, the STORED category key]; the
   // key is what the ledger filters on, null when no single category
   // stands behind the row
@@ -1353,6 +1422,7 @@ export interface YearLensData {
     remaining_budget?: number;
   }>;
   saved_ytd?: number | null;
+  savings_goal?: { monthly_plan: number; rate_90d: number | null } | null;
   plan_surplus?: number | null;
 }
 
@@ -1545,6 +1615,41 @@ export function exportWarnings(raw: string | null): string[] {
  *  `String(e)` prints "Error: 400: display too long (200 chars max)",
  *  which reads as a crash rather than as an answer. Prefer the server's
  *  own detail, and fall back to whatever the failure carried. */
+// The last /api/me answer's day counts. Kept here, beside the one fetch
+// that delivers them, so every sentence that names a number of days — the
+// allowance note in the extension slot included, which is not a hook —
+// reads the instance's value instead of writing its own.
+let dayCounts: Me["day_counts"] = undefined;
+const posInt = (v: unknown): number | null =>
+  typeof v === "number" && Number.isInteger(v) && v > 0 ? v : null;
+/** Days of failure before a connection is removed; null when the
+ *  instance does not remove them. An older server says nothing: 30, the
+ *  default. */
+export function plaidReapDays(): number | null {
+  if (!dayCounts || !("plaid_reap_days" in dayCounts)) return 30;
+  return posInt(dayCounts.plaid_reap_days);
+}
+/** Days a released bank keeps its place under the allowance. */
+export function releasedHoldDays(): number {
+  return posInt(dayCounts?.released_hold_days) ?? 30;
+}
+/** What the Accounts screens say about a connection the server removed,
+ *  by the reason it was removed. A removal whose reason the server did
+ *  not send names no cause rather than guessing one. */
+export function removedConnectionNote(
+    c: { archived_reason?: string | null }): string {
+  switch (c.archived_reason) {
+    case "plaid-gone": return "connection no longer exists at Plaid";
+    case "sub-ended": return "connection removed when the subscription ended";
+    case "auto-reap": {
+      const n = plaidReapDays();
+      return n ? `connection removed after ${n} days of failure`
+               : "connection removed after failing for weeks";
+    }
+    default: return "connection removed";
+  }
+}
+
 export function errText(e: unknown): string {
   if (e instanceof ApiError && e.detail) return e.detail;
   const raw = e instanceof Error ? e.message : String(e);
@@ -1648,7 +1753,8 @@ export function getHandedOffTxn(id: string | undefined): Txn | null {
 // payee; the values wait here, where only the in-app button can put them,
 // and are taken once.
 export type BillPrefill = { amount: string; cadence: string;
-                            next_due: string };
+                            next_due: string;
+                            by_month_day?: number[] | null };
 let billPrefill: { payee: string; values: BillPrefill } | null = null;
 
 /** bill-history deposits the fit here right before pushing /bill. */
@@ -1992,7 +2098,8 @@ export function makeClient(baseUrl: string, token: string,
       await Sharing.shareAsync(r.uri);
       return { warnings: exportWarnings(h ? String(h[1]) : null) };
     },
-    me: () => req<Me>("/api/me"),
+    me: () => req<Me>("/api/me").then((m) => {
+      dayCounts = m?.day_counts; return m; }),
     // who changed which category, bill, note… and when — newest first;
     // `before` pages by the last row's timestamp, kind/who filter
     activity: (params: Record<string, string> = {}) =>
@@ -2115,11 +2222,18 @@ export function makeClient(baseUrl: string, token: string,
             devices_revoked?: number;
             tokens_revoked?: number; invites_removed?: number;
             sms_number_needs_verify?: boolean;
-            members_removed?: RemovedMember[] }>(
+            members_removed?: RemovedMember[];
+            other_sessions_signed_out?: number;
+            // the rotation voided the recovery sheet; this is the one
+            // that stands (null when the account has no second factor)
+            recovery_codes?: string[] | null }>(
         "/api/password/change", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ current_password, new_password }),
+        // this app shows a reissued sheet; one that does not omits it and
+        // keeps its codes
+        body: JSON.stringify({ current_password, new_password,
+                               reissue_codes: true }),
       }),
     // on hosted the address does not move yet: `email` is still the
     // sign-in address and `pending_email` the one awaiting its button
@@ -2129,12 +2243,19 @@ export function makeClient(baseUrl: string, token: string,
             hint?: string | null; passkeys_removed?: number;
             passkeys_kept?: number; mail_list_entry_dropped?: boolean;
             sms_number_needs_verify?: boolean;
-            members_removed?: RemovedMember[] }>(
+            members_removed?: RemovedMember[];
+            other_sessions_signed_out?: number;
+            // the rotation voided the recovery sheet; this is the one
+            // that stands (null when the account has no second factor)
+            recovery_codes?: string[] | null }>(
         "/api/email/change", {
         method: "POST",
         headers: { "Content-Type":
                      "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({ new_email }).toString(),
+        // this app shows a reissued sheet; one that does not omits it and
+        // keeps its codes
+        body: new URLSearchParams({ new_email,
+                                    reissue_codes: "1" }).toString(),
       }),
     totpEnroll: () =>
       req<{ secret: string; qr: string }>("/api/totp/enroll", {
@@ -2157,13 +2278,18 @@ export function makeClient(baseUrl: string, token: string,
     // being switched off is still in hand), kept beside elevation; being
     // single-use, it is never resent after the sheet
     totpDisable: (code: string) =>
+      // turned off while a passkey stays, the old recovery sheet is voided
+      // and the new one returned (null when no factor remains)
       sendOneTimeCode<{ ok: boolean; sms_number_needs_verify?: boolean;
+                        recovery_codes?: string[] | null;
                         members_removed?: RemovedMember[] }>(
         "/api/totp/disable", {
         method: "POST",
         headers: { "Content-Type":
                      "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({ code }).toString(),
+        // this client shows a reissued sheet; an older build omits it
+        // and keeps its codes
+        body: new URLSearchParams({ code, reissue_codes: "1" }).toString(),
       }),
     // stop a factor-clearing recovery on this account (no step-up:
     // cancelling is the safe direction)
@@ -2174,8 +2300,13 @@ export function makeClient(baseUrl: string, token: string,
     cancelPendingRecovery: () =>
       req<{ ok: boolean; cancelled: number }>(
         "/api/recovery/cancel-pending", { method: "POST" }),
+    // the old sheet is voided, and what it could have reached is swept
+    // with it — the same fields turning 2FA off answers with
     recoveryRegenerate: () =>
-      req<{ ok: boolean; recovery_codes: string[] }>(
+      req<{ ok: boolean; recovery_codes: string[];
+            other_sessions_signed_out?: number;
+            sms_number_needs_verify?: boolean;
+            members_removed?: RemovedMember[] }>(
         "/api/totp/recovery-regenerate", {
           method: "POST",
           headers: { "Content-Type":
@@ -2770,8 +2901,10 @@ export function makeClient(baseUrl: string, token: string,
       req<{ vendors: Vendor[]; threshold?: number }>(
         `/api/business/entities/${encodeURIComponent(id)}/vendors` +
         (year ? `?year=${year}` : "")),
+    // the door stores the TIN it is sent and an omitted one clears it, so
+    // a caller toggling `reportable` sends the TIN already on file back
     vendorMark: (id: string, body: { merchant: string;
-                   reportable: boolean }) =>
+                   reportable: boolean; tin_last4?: string | null }) =>
       req<{ ok: boolean }>(
         `/api/business/entities/${encodeURIComponent(id)}/vendors`, {
           method: "POST",
@@ -3139,8 +3272,9 @@ export function makeClient(baseUrl: string, token: string,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ account_id, balance }),
       }),
+    // answers the label as stored: a typed card number keeps its last four
     accountRename: (account_id: string, name: string) =>
-      req<unknown>("/api/accounts/rename", {
+      req<{ ok: boolean; name?: string | null }>("/api/accounts/rename", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ account_id, name }),
@@ -3192,6 +3326,7 @@ export function makeClient(baseUrl: string, token: string,
       req<BillDetail>(`/api/bills/bill?payee=${encodeURIComponent(payee)}`),
     billsSave: (body: {
       payee: string; amount: string | number; cadence?: string;
+      by_month_day?: number[];
       next_due?: string; income?: boolean; orig_payee?: string;
       cap?: string | number | null; category?: string | null;
       show_today?: boolean; match_category?: boolean;
@@ -3428,6 +3563,16 @@ export function makeClient(baseUrl: string, token: string,
       req<{ ok: boolean; checks: { section: string; name: string;
             ok: boolean; severity: string; detail: string }[] }>(
         "/api/doctor"),
+    // capital contributions and reimbursements whose charge was deleted
+    doctorUnlinked: () =>
+      req<{ movements: { id: string; entity_id: string;
+            entity_name: string | null; kind: string; amount: number;
+            date: string | null }[] }>(
+        "/api/doctor/unlinked-movements"),
+    doctorUnlinkedRemove: (id: string) =>
+      req<{ ok: boolean }>(
+        `/api/doctor/unlinked-movements/${encodeURIComponent(id)}`,
+        { method: "DELETE" }),
     doctorScripts: () =>
       req<{ scripts: { source: string; label?: string;
             last_push: string | null; ok: boolean;
@@ -3616,8 +3761,7 @@ export function makeClient(baseUrl: string, token: string,
     // local = the bundled/env backend or a loopback/compose host: nothing
     // leaves the box; otherwise host names where the questions go
     assistantStatus: () =>
-      req<{ available: boolean; local: boolean; host?: string | null }>(
-        "/api/assistant"),
+      req<AssistantStatus>("/api/assistant"),
     // `answer` is the prose alone; `blocks` the ordered text + chart /
     // table pieces the screen draws (components/answer-blocks); absent
     // on an older server

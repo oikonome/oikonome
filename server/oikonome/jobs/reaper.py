@@ -54,6 +54,17 @@ def reap_days() -> int:
         return 0
 
 
+def client_day_counts() -> dict:
+    """The day counts the Accounts screens print, from the values the
+    reaper and the allowance count actually use, so the clients never
+    spell them out. `plaid_reap_days` is None while the reaper is off: a
+    connection removed under an earlier setting has no current number."""
+    from ..sync import base
+    days = reap_days()
+    return {"plaid_reap_days": days if days > 0 else None,
+            "released_hold_days": base.RELEASED_HOLD_DAYS}
+
+
 def _unrecoverable(effective_status: str | None) -> bool:
     """True for states only the USER can fix (re-auth / revoked consent)
     — the reap classes. Institution outages and transient errors are

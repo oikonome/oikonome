@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import logging
 
+from ..settings_sections import settings_link
+
 log = logging.getLogger("oikonome.notify")
 
 
 def export_line(url: str) -> tuple[str, str]:
     """Points at Settings → Data, where the export lives."""
-    ex = url.replace("/settings/billing", "/settings/data") if url else ""
+    ex = (url.replace(settings_link("billing"), settings_link("data"))
+          if url else "")
     plain = ("Everything you have in Oikonome — accounts, transactions, "
              "bills, budgets, notes — can be downloaded any time as a "
              "standard-format archive from Settings → Data → Export"

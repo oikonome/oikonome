@@ -97,11 +97,12 @@ export default function RetireWizard({
   const back = () => { setErr(null); setI(Math.max(0, i - 1)); };
 
   const field = (label: string, value: string, set: (v: string) => void,
-                 hint?: string, type = "number") => (
+                 hint?: string, type = "number", max?: string) => (
     <label style={{ display: "flex", flexDirection: "column", gap: ".25rem",
                     fontSize: 13, color: "var(--mut)", minWidth: "10rem" }}>
       {label}
-      <input type={type} value={value} onChange={(e) => set(e.target.value)}
+      <input type={type} value={value} max={max}
+             onChange={(e) => set(e.target.value)}
              style={{ padding: ".5rem", background: "var(--hover)",
                       border: "1px solid var(--line)", borderRadius: "var(--rs)",
                       color: "var(--ink)", fontSize: 15 }} />
@@ -121,7 +122,9 @@ export default function RetireWizard({
           {field("Current age", age, setAge)}
           {field("Birthdate (optional)", birth,
                  (v) => { setBirth(v); onBirthChange?.(v); },
-                 "YYYY-MM-DD preferred", "date")}
+                 "YYYY-MM-DD preferred", "date",
+                 // a birthdate is in the past; the server refuses today on
+                 new Date(Date.now() - 864e5).toLocaleDateString("en-CA"))}
         </div>
       )}
       {step.key === "spend" &&

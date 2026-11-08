@@ -78,7 +78,7 @@ from arq.worker import func as arq_func
 from .. import ext
 from ..db import tenancy
 from ..engine import alerts, bills
-from ..envnum import env_flag, env_num
+from ..envnum import env_flag, env_int, env_num
 from ..sync import base as sync_base
 from ..sync import plaid, simplefin
 from . import link_alert
@@ -1429,7 +1429,11 @@ def nightly_tenant(tenant_id: str) -> dict:
             log.info("bill detection off for tenant %s — no new bill or "
                      "income offers tonight", tenant_id)
         try:
-            stats = bills.run(conn, propose=detect_new)
+            # waits behind an on-demand pass already running for this
+            # household rather than skipping: that pass may predate the
+            # night's sync
+            stats = bills.run_single_flight(conn, propose=detect_new,
+                                            wait=True)
         except Exception as e:                   # noqa: BLE001
             # Unguarded, this is the one step that can cost a household
             # EVERYTHING else: a single tenant-specific data defect here
@@ -1448,13 +1452,15 @@ def nightly_tenant(tenant_id: str) -> dict:
         # Plaid's own recurring streams as a cross-check on detection —
         # proposals only, never auto-applied; off with plaid_recurring=false.
         # It is a separately billed aggregator product, like liabilities
-        # and investments, so the installed gate is asked first: the
+        # and investments, so the operator's opt-out and then the installed
+        # gate are asked first: the
         # household's own setting can turn it off but never back on past
         # the gate. With nothing installed tier_allows says yes.
         try:
             from ..engine import budget as _bcfg
             from ..sync import plaid as _plaid
-            if detect_new and ext.gate.tier_allows(conn, "plaid_recurring") \
+            if detect_new and _plaid.plaid_product_allowed(conn, "recurring") \
+                    and ext.gate.tier_allows(conn, "plaid_recurring") \
                     and _bcfg.load_config(conn).get("plaid_recurring",
                                                     True) is not False:
                 streams = []
@@ -2104,6 +2110,19 @@ def _needs_you(conn, tenant_id: str, d: dict):
     return personal
 
 
+def report_url(cadence: str, today_local: dt.date) -> str:
+    """Where a link to this cadence's report opens in the web app: the
+    monthly and yearly reports cover the month or year that just ended, so
+    their push opens that period (the native app's tap opens the same one,
+    worked out from when the push was sent); the daily verdict is Today."""
+    if cadence == "monthly":
+        last = today_local.replace(day=1) - dt.timedelta(days=1)
+        return f"/app/?lens=month&y={last.year}&m={last.month}"
+    if cadence == "yearly":
+        return f"/app/?lens=year&y={today_local.year - 1}"
+    return "/app/"
+
+
 def email_tenant(tenant_id: str, send_it: bool = True,
                  cadence: str = "daily", force_email: bool = False) -> str:
     """Build (and send) one cadence's email for one tenant. daily = the
@@ -2348,7 +2367,8 @@ def email_tenant(tenant_id: str, send_it: bool = True,
                     # the report was built must stop this too
                     if not _household_active(cc, tenant_id):
                         raise _HouseholdGone()
-                    _push.send_tenant(cc, tenant_id, subject, short)
+                    _push.send_tenant(cc, tenant_id, subject, short,
+                                      url=report_url(cadence, today_local))
                     # the phones get a tickle on the same user-facing
                     # "push" preference; the daily one carries the verdict
                     # line so the lock screen answers the question, the
@@ -2421,7 +2441,7 @@ def _sweep(fn, label: str, prioritize: bool = False,
 # a longer one trades only balance/holdings freshness, which no webhook
 # covers. Env-overridable so it can be tuned without a
 # deploy.
-SYNC_BUCKETS = max(1, int(env_num("OIKONOME_SYNC_BUCKETS", "12")))
+SYNC_BUCKETS = env_int("OIKONOME_SYNC_BUCKETS", 12, lo=1)
 
 
 def _tenant_bucket(tid) -> int:
@@ -2444,6 +2464,13 @@ async def sync_all(ctx):
     return await asyncio.to_thread(_sweep, sync_tenant, "sync", True, slot)
 
 
+async def sync_all_now(ctx):
+    """The operator's "sync everyone now": every tenant, every slot. The
+    cron job above serves one slot per firing, so enqueuing it by hand
+    reached about one tenant in SYNC_BUCKETS."""
+    return await asyncio.to_thread(_sweep, sync_tenant, "sync", True, None)
+
+
 # How long each nightly step may take before the run moves on to the next
 # one, in seconds. One arq job has one timeout and a cron job is never
 # retried, so without a budget per step a detection pass that ran long
@@ -2462,6 +2489,7 @@ NIGHTLY_STEP_BUDGET = {
     "unverified": 1800,
     "purge": 3600,
     "plaid-release-retry": 1800,
+    "retention": 1800,
 }
 # the job's own timeout: every budget plus a margin, so arq never cancels
 # the run from outside before the steps' own budgets have had their say
@@ -2562,9 +2590,13 @@ async def _nightly_all_body():
     stale_signups = await _nightly_step("unverified", _unverified.sweep)
     # finish deletions whose grace window has lapsed
     purged = await _nightly_step("purge", purge_scheduled_deletions)
+    # logs that grow without a reader needing the old rows (sync_log keeps
+    # each connection's newest success and every error after it)
+    from . import retention as _retention
+    retained = await _nightly_step("retention", _retention.sweep)
     return {"detect": detect, "snapshot": snapshot, "script_alerts": stale,
             "plaid_reap": reap, "frozen": frozen, "purged": purged,
-            "unverified": stale_signups}
+            "unverified": stale_signups, "retention": retained}
 
 
 def _gate_unavailable() -> bool:
@@ -3568,7 +3600,13 @@ async def demo_reset_all(ctx):
     if not env_flag("OIKONOME_DEMO"):
         return "not-a-demo"
     from .. import demo
-    r = await asyncio.to_thread(demo.reset)
+    try:
+        r = await asyncio.to_thread(demo.reset)
+    except SystemExit as e:
+        # demo.reset refuses with SystemExit (it is also the CLI's door); a
+        # BaseException escaping a job ends the whole worker process
+        log.warning("demo reset skipped: %s", e)
+        return f"skipped: {e}"
     log.info("demo reset: seed=%s transactions=%s",
              r.get("seed"), r.get("transactions"))
     return f"reset seed={r.get('seed')}"
@@ -3980,10 +4018,8 @@ WORKER_THREAD_HEADROOM = 2
 
 
 def _pool_max() -> int:
-    try:
-        return max(1, int(os.environ.get("OIKONOME_POOL_MAX") or "10"))
-    except ValueError:
-        return 10
+    # the reader tenancy sizes the pool with: one value, one parse
+    return env_int("OIKONOME_POOL_MAX", 10, lo=1)
 
 
 def _worker_threads() -> int:
@@ -4069,6 +4105,9 @@ class WorkerSettings:
     # timeout, not the cron entry's
     max_jobs = WORKER_MAX_JOBS
     functions = [sync_all, arq_func(nightly_all, timeout=NIGHTLY_TIMEOUT),
+                 # a whole fleet in one job: the time the cron takes to
+                 # cover it, one default job timeout per slot
+                 arq_func(sync_all_now, timeout=SYNC_BUCKETS * 300),
                  email_all, demo_reset_all,
                  arq_func(sync_one, timeout=SYNC_TIMEOUT),
                  arq_func(sync_item, timeout=SYNC_TIMEOUT,

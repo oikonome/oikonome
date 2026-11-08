@@ -1,6 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, type ScriptHeartbeat } from "../api/client";
-import { patchList } from "../api/cache";
+import { useState } from "react";
+import { api, errText, mmdd, money, req, toast,
+         type ScriptHeartbeat } from "../api/client";
+import { patchList, removeFromList } from "../api/cache";
 import { isOwner } from "../role";
 
 function age(hours: number): string {
@@ -76,6 +78,76 @@ function ScriptRow({ s, viewer }: { s: ScriptHeartbeat; viewer: boolean }) {
   );
 }
 
+// A capital contribution or reimbursement booked for a charge that was
+// later deleted, from before deletes took the movement along.
+type UnlinkedMovement = { id: string; entity_id: string;
+  entity_name: string | null; kind: string; amount: number;
+  date: string | null };
+type Unlinked = { movements: UnlinkedMovement[] };
+// the business equity list's names for the two kinds
+const KIND_LABEL: Record<string, string> = {
+  contribution: "Capital contribution", reimbursement: "Reimbursement" };
+const UNLINKED = ["doctor-unlinked"];
+
+// `asPage`: the list is all a hosted Doctor has to show, so its heading
+// becomes the page's own title instead of a card heading
+function UnlinkedCapital({ viewer, asPage = false }:
+                         { viewer: boolean; asPage?: boolean }) {
+  const qc = useQueryClient();
+  const q = useQuery({ queryKey: UNLINKED,
+    queryFn: () => req<Unlinked>("/api/doctor/unlinked-movements") });
+  // one DELETE per click; a second click while it is in flight would
+  // ask for a row that is already gone
+  const [removing, setRemoving] = useState<string | null>(null);
+  const remove = (m: UnlinkedMovement) => {
+    setRemoving(m.id);
+    req<{ ok: boolean }>(
+      `/api/doctor/unlinked-movements/${encodeURIComponent(m.id)}`,
+      { method: "DELETE" }).then(() => {
+        removeFromList<Unlinked, UnlinkedMovement>(
+          qc, UNLINKED, "movements", (r) => r.id === m.id);
+        // the check row and the business's own capital figures moved
+        qc.invalidateQueries({ queryKey: ["doctor"] });
+        qc.invalidateQueries({ queryKey: ["equity", m.entity_id] });
+        qc.invalidateQueries({ queryKey: ["entity", m.entity_id] });
+        qc.invalidateQueries({ queryKey: ["balancesheet", m.entity_id] });
+      }).catch((e) => toast(errText(e))).finally(() => setRemoving(null));
+  };
+  const rows = q.data?.movements ?? [];
+  if (!rows.length) return null;
+  return (<>
+    {asPage && <h1>Unlinked capital</h1>}
+    <div className="card">
+      {!asPage && <h2 style={{ marginTop: 0 }}>Unlinked capital</h2>}
+      <p className="mut">Recorded for a charge that was later deleted. Each
+        still counts on its business&apos;s capital account.</p>
+      <table>
+        <tbody>
+          {rows.map((m) => (
+            <tr key={m.id}>
+              <td className="mut" style={{ whiteSpace: "nowrap" }}>
+                {mmdd(m.date)}</td>
+              <td>{m.entity_name ?? "a business"}</td>
+              <td className="mut">{KIND_LABEL[m.kind] ?? m.kind}</td>
+              <td className="num">{money(m.amount, true)}</td>
+              <td style={{ whiteSpace: "nowrap", width: "1%" }}>
+                <button disabled={viewer || !!removing}
+                  onClick={() => {
+                    if (window.confirm("Remove this movement? It changes "
+                                       + "the capital-account balance."))
+                      remove(m);
+                  }}>
+                  {removing === m.id ? "removing…" : "Remove"}
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  </>);
+}
+
 export default function Doctor({ embedded = false }:
                                     { embedded?: boolean } = {}) {
   // the page keeps itself current, like the wizard's sync step —
@@ -96,11 +168,22 @@ export default function Doctor({ embedded = false }:
     queryKey: ["doctor-scripts"], queryFn: api.doctorScripts,
     enabled: relevant, refetchInterval: 30_000 });
   const viewer = !isOwner(me);
+  // the same cache entry the list reads, so a hosted page knows whether
+  // the list is all it has — the Business page links here when it has rows
+  const unlinked = useQuery({ queryKey: UNLINKED,
+    queryFn: () => req<Unlinked>("/api/doctor/unlinked-movements"),
+    enabled: !!me.data?.hosted && !embedded });
   // Hosted: instance health is the operator's job — hide entirely
+  // the household's own records, so they show on hosted too
+  if (me.data?.hosted && !embedded
+      && (unlinked.data?.movements.length ?? 0) > 0)
+    return <UnlinkedCapital viewer={viewer} asPage />;
   if (me.data?.hosted)
-    return embedded ? null : (
+    return embedded ? null : (<>
       <div className="card">System health is managed by the host on this
-        instance.</div>);
+        instance.</div>
+      <UnlinkedCapital viewer={viewer} />
+    </>);
 
   if (q.isPending)
     return <div className="centered"><span className="mut">running checks…</span></div>;
@@ -167,6 +250,8 @@ export default function Doctor({ embedded = false }:
           </table>
         </div>
       ))}
+
+      <UnlinkedCapital viewer={viewer} />
 
       {(scripts.data?.scripts.length ?? 0) > 0 && (
         <div className="card">

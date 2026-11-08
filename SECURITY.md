@@ -88,10 +88,39 @@ email are signed links for one action on one object, addressed to the
 recipient, and expire after seven days. Pressing one is a write like any
 other: the address must still hold an owner or member account in good
 standing — a suspended, deleting or read-only household, or a hosted
-account with no second factor, gets a refusal — and a button whose object
-has changed since the mail went out does nothing. They (and the
+account with no second factor, gets a refusal (muting an alert is the
+exception for a read-only household, as it is in the app) — and a button
+whose object has changed since the mail went out does nothing.
+
+A **read-only** household (a lapsed or cancelled subscription, when an
+add-on gates one) can still read everything and still take every way
+out: export its data, delete or leave the account, remove a member or
+make them view-only, revoke script tokens, invites and support access,
+unlink a bank, delete a webhook and mute an alert — plus the person's own
+account security (password, second factor, passkeys, sessions, devices).
+Those writes are one declared list of exact routes; every other write is
+refused. They (and the
 unsubscribe link) are keyed from `OIKONOME_MASTER_KEY`, so rotating the
 key voids the ones already sent.
+
+What each credential change takes away is fixed per change, in one place,
+and does not vary by which screen made it. **Regenerating recovery codes**
+is the routine top-up: it signs out the person's other sessions and
+devices, ends their browser notifications elsewhere and cancels their
+unspent reset links and pending recoveries — nothing else, so script
+tokens, webhooks, invitations, members and the household's settings are
+untouched. **A second factor turned on or off**, a first passkey, and
+removing a passkey while another factor stays (which issues a new sheet)
+add the rest: script tokens, webhooks, the household's outbound settings
+and text number, pending invitations and recently invited members, and
+support access. **A password or email change** adds the passkeys (the one
+that confirmed the change is kept when it is the only second factor);
+it replaces the recovery sheet when the client can show the new one and
+voids it when no second factor remains. **A mailed reset or an operator
+clear** takes everything, including every factor and code. Whenever a
+new sheet is issued every code from the old one stops working, and a
+sign-in that spent an old code moments before the reissue gets no
+session. The door-by-door list is in the Security guide (in-app Help).
 
 Every change to a sign-in credential (password, authenticator, passkey,
 recovery codes) is announced to the account's own address, so a change

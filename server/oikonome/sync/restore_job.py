@@ -47,6 +47,24 @@ STALE_AFTER = f"{STALE_SECONDS} seconds"
 SETTLED_VISIBLE_SECONDS = 60 * 60
 
 
+def _restores_at_once() -> int:
+    from ..envnum import env_int
+    return env_int("OIKONOME_RESTORES_AT_ONCE", 2, lo=1, hi=64)
+
+
+# Restores run on threads inside the WEB process, each holding a tenant
+# connection for its whole transaction and doing CPU-bound merging under
+# the GIL. The per-tenant claim stops a household racing itself; this cap
+# stops several households at once starving every other request on the
+# instance of the pooled connections it serves them from. Taken without
+# waiting: a restore past the cap is refused, never queued behind a lock
+# a request thread would then sit on.
+RESTORES_AT_ONCE = _restores_at_once()
+_slots = threading.BoundedSemaphore(RESTORES_AT_ONCE)
+BUSY_MSG = ("another restore is running on this server — try again in a "
+            "few minutes")
+
+
 def status(conn) -> dict:
     """The tenant's restore job as the client should see it."""
     row = conn.execute(
@@ -78,7 +96,21 @@ def start(tenant_id: str, data: bytes) -> dict:
 
     Returns the import hub's `result` dict — either the started marker the
     client polls on, or an error when a restore is already in flight.
+    Blocking (a pooled connection and an INSERT): async doors call it
+    through run_in_threadpool.
     """
+    if not _slots.acquire(blocking=False):
+        return {"error": BUSY_MSG}
+    try:
+        return _claim_and_spawn(tenant_id, data)
+    except BaseException:
+        _slots.release()
+        raise
+
+
+def _claim_and_spawn(tenant_id: str, data: bytes) -> dict:
+    """Entered holding a slot. A return that does not hand the slot to a
+    running worker gives it back (an exception is start's to release)."""
     conn = tenancy.tenant_connect(tenant_id)
     try:
         claimed = conn.execute(
@@ -95,6 +127,7 @@ def start(tenant_id: str, data: bytes) -> dict:
     finally:
         conn.close()
     if claimed is None:
+        _slots.release()
         return {"error": "a restore is already running on this account — "
                          "wait for it to finish"}
 
@@ -102,29 +135,58 @@ def start(tenant_id: str, data: bytes) -> dict:
     # started the restore is captured here, where the request still is
     from ..web import security
     starter = security.current_credential()
-    threading.Thread(target=_run, args=(tenant_id, data, starter),
-                     name="oikonome-restore", daemon=True).start()
+    threading.Thread(target=_run_holding_slot,
+                     args=(tenant_id, data, starter), name="oikonome-restore", daemon=True).start()
     return {"restore_started": True, "job": JOB_ID}
 
 
+def _run_holding_slot(tenant_id: str, data: bytes, starter: str) -> None:
+    try:
+        _run(tenant_id, data, starter)
+    finally:
+        _slots.release()
+
+
+def _write_progress(tenant_id: str, sql: str, params: tuple) -> None:
+    """One job_progress write on a connection borrowed for that write only.
+    Not the restore's own connection: it holds one transaction from first
+    row to last, so a progress write sharing it would be rolled back with a
+    failure or keep the transaction alive for reasons unrelated to the
+    data. Nor a second connection held for the whole restore: that doubles
+    what each restore takes from the pool every request is served from."""
+    c = tenancy.tenant_connect(tenant_id)
+    try:
+        c.execute(sql, params)
+    finally:
+        c.close()
+
+
+# a tick borrows a pooled connection, so ticks are spaced in time as well as
+# in rows; the stale window (minutes) is all they must stay inside
+_TICK_MIN_SECONDS = 1.0
+
+
 def _run(tenant_id: str, data: bytes, starter: str = "") -> None:
+    import time
+
     from ..web.pages import restore_result
     from . import restore
 
     conn = tenancy.tenant_connect(tenant_id)
-    # the ticker writes on its OWN connection: the restore holds one
-    # transaction from first row to last, so a progress write sharing it
-    # would either be rolled back with a failure or, worse, keep the
-    # transaction alive for reasons unrelated to the data
-    prog_conn = tenancy.tenant_connect(tenant_id)
     seen: set[str] = set()
     locked = False
+    last_write = [0.0]
 
     def tick(table: str, rows: int, done: bool) -> None:
         if done:
             seen.add(table)
+        now = time.monotonic()
+        if now - last_write[0] < _TICK_MIN_SECONDS:
+            return
+        last_write[0] = now
         try:
-            prog_conn.execute(
+            _write_progress(
+                tenant_id,
                 "UPDATE job_progress SET progress=%s::jsonb, updated_at=now() "
                 "WHERE id=%s",
                 (jsonb({"table": table, "rows": rows,
@@ -151,7 +213,9 @@ def _run(tenant_id: str, data: bytes, starter: str = "") -> None:
         counts = restore.restore_zip(conn, data, progress=tick,
                                      starter=starter)
         result = restore_result(counts)
-        prog_conn.execute(
+        # the merge's transaction is over, so the job's own connection
+        # settles the row — no second borrow from a pool that may be busy
+        conn.execute(
             "UPDATE job_progress SET state='done', progress=%s::jsonb, "
             "updated_at=now() WHERE id=%s", (jsonb({"result": result}), JOB_ID))
         # the inline path ran this after every successful import; going
@@ -168,7 +232,8 @@ def _run(tenant_id: str, data: bytes, starter: str = "") -> None:
                else "the restore failed — the file was not applied")
         log.warning("restore job failed", exc_info=True)
         try:
-            prog_conn.execute(
+            _write_progress(
+                tenant_id,
                 "UPDATE job_progress SET state='error', progress=%s::jsonb, "
                 "updated_at=now() WHERE id=%s",
                 (jsonb({"error": msg}), JOB_ID))
@@ -187,4 +252,3 @@ def _run(tenant_id: str, data: bytes, starter: str = "") -> None:
             from ..jobs import worker
             worker.answer_sync_nudge(conn, tenant_id)
         conn.close()
-        prog_conn.close()

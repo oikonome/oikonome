@@ -422,7 +422,8 @@ def run_job(tenant_id: str, job_id: str) -> str:
             except Exception:                            # noqa: BLE001
                 log.exception("folder import %s failed", job_id)
                 try:
-                    _finish(conn, str(job["id"]), "error")
+                    _finish(conn, str(job["id"]), "error",
+                            owner=job["runner"])
                 except Exception:                        # noqa: BLE001
                     log.warning("could not record folder import failure",
                                 exc_info=True)
@@ -436,7 +437,11 @@ def run_job(tenant_id: str, job_id: str) -> str:
 def _claim(conn, job_id) -> dict | None:
     """Take the job: a queued one, or a live one whose heartbeat went
     quiet (its worker is gone). One conditional UPDATE, so two workers
-    never both run it."""
+    never both claim it at once; the fresh `runner` token it stamps is
+    what every later write of the job matches, so a worker that went
+    quiet without dying (a pool timeout, a long wait for the sync lock)
+    finds at its next write that the job is no longer its own, and
+    stops."""
     jid = _uuid(job_id)
     if jid is None:
         return None
@@ -445,51 +450,64 @@ def _claim(conn, job_id) -> dict | None:
               SET state = CASE WHEN state = 'queued' THEN 'running'
                                ELSE state END,
                   started_at = coalesce(started_at, now()),
-                  heartbeat_at = now()
+                  heartbeat_at = now(), runner = gen_random_uuid()
             WHERE id = %s
               AND (state = 'queued'
                    OR (state IN ('running', 'cancelling')
                        AND (heartbeat_at IS NULL OR heartbeat_at
                             < now() - make_interval(secs => %s))))
-            RETURNING id, decisions, starter_via""",
+            RETURNING id, decisions, starter_via, runner""",
         (jid, STALE_SECONDS)).fetchone()
 
 
 class _Heartbeat(threading.Thread):
     """Refreshes the job's heartbeat on a connection of its own while the
-    job runs, so a long file never reads as a dead worker."""
+    job runs, so a long file never reads as a dead worker. A connect or a
+    beat that fails is tried again at the next beat on a fresh
+    connection: one pool timeout must not leave a live job looking dead
+    for the rest of its run. It beats only while the job is still this
+    worker's (`runner`), and ends once it is not."""
 
-    def __init__(self, tenant_id: str, job_id: str):
+    def __init__(self, tenant_id: str, job_id: str, runner):
         super().__init__(name=f"bulk-import-heartbeat-{job_id}",
                          daemon=True)
-        self.tenant_id, self.job_id = tenant_id, job_id
+        self.tenant_id, self.job_id, self.runner = tenant_id, job_id, runner
         self.stopped = threading.Event()
 
     def run(self):
-        try:
-            conn = tenancy.tenant_connect(self.tenant_id)
-        except Exception:                                # noqa: BLE001
-            log.warning("folder import heartbeat could not connect",
-                        exc_info=True)
-            return
+        conn = None
         try:
             while not self.stopped.wait(HEARTBEAT_SECONDS):
                 try:
-                    conn.execute(
+                    if conn is None:
+                        conn = tenancy.tenant_connect(self.tenant_id)
+                    held = conn.execute(
                         "UPDATE bulk_import_jobs SET heartbeat_at = now()"
-                        " WHERE id = %s AND state IN ('running',"
-                        " 'cancelling')", (self.job_id,))
+                        " WHERE id = %s AND runner = %s AND state IN"
+                        " ('running', 'cancelling') RETURNING 1",
+                        (self.job_id, self.runner)).fetchone()
                 except Exception:                        # noqa: BLE001
-                    log.debug("folder import heartbeat failed",
-                              exc_info=True)
+                    log.warning("folder import heartbeat failed; retrying",
+                                exc_info=True)
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:                # noqa: BLE001
+                            pass
+                    conn = None
+                    continue
+                if held is None:
+                    # settled, or taken over by another worker
+                    return
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
 
 def _job_now(conn, job_id: str):
     return conn.execute(
         """SELECT state, cancel_requested_at, rows_total, starter_user_id,
-                  starter_cred, starter_via,
+                  starter_cred, starter_via, runner,
                   extract(epoch FROM now() - started_at) AS age
              FROM bulk_import_jobs WHERE id = %s""", (job_id,)).fetchone()
 
@@ -497,6 +515,7 @@ def _job_now(conn, job_id: str):
 def _run(conn, tenant_id: str, job: dict) -> None:
     from ..web import bulk_import
     job_id = str(job["id"])
+    owner = job["runner"]
     via = job["starter_via"] or "app"
     plan = {int(d["file_id"]): d
             for d in (as_dict(job["decisions"]) or {}).get("files") or []
@@ -504,8 +523,8 @@ def _run(conn, tenant_id: str, job: dict) -> None:
     # the file a lost worker was in the middle of: reported, never re-run
     _settle_files(conn, job_id, "failed",
                   {"ok": False, "error": INTERRUPTED_NOTE},
-                  states=("running",))
-    ticker = _Heartbeat(tenant_id, job_id)
+                  states=("running",), owner=owner)
+    ticker = _Heartbeat(tenant_id, job_id, owner)
     ticker.start()
     work = tenancy.tenant_connect(tenant_id)
     imported = False
@@ -513,8 +532,9 @@ def _run(conn, tenant_id: str, job: dict) -> None:
     try:
         while True:
             now = _job_now(conn, job_id)
-            if now is None:
-                # erased under the job: nothing left to report to
+            if now is None or now["runner"] != owner:
+                # erased under the job: nothing left to report to; or
+                # taken over by another worker, whose job it now is
                 return
             nxt = conn.execute(
                 """SELECT file_id, filename FROM bulk_import_files
@@ -523,10 +543,10 @@ def _run(conn, tenant_id: str, job: dict) -> None:
             if nxt is None:
                 break
             if now["cancel_requested_at"] is not None:
-                _settle_rest(conn, job_id, CANCELLED_NOTE)
+                _settle_rest(conn, job_id, CANCELLED_NOTE, owner=owner)
                 break
             if ran and (now["age"] or 0) >= JOB_MAX_SECONDS:
-                _settle_rest(conn, job_id, NOT_REACHED_NOTE)
+                _settle_rest(conn, job_id, NOT_REACHED_NOTE, owner=owner)
                 break
             fid, name = nxt["file_id"], nxt["filename"] or ""
             if (now["rows_total"] or 0) >= bulk_import.MAX_TOTAL_ROWS:
@@ -534,12 +554,14 @@ def _run(conn, tenant_id: str, job: dict) -> None:
                     "ok": False,
                     "error": f"batch row budget reached (max "
                              f"{bulk_import.MAX_TOTAL_ROWS:,} rows per run)"
-                             f" — run this file in a new batch"})
+                             f" — run this file in a new batch"}, owner=owner)
                 continue
             result = _run_file(conn, work, tenant_id, job_id, fid, name,
-                               plan.get(fid) or {"file_id": fid}, via)
+                               plan.get(fid) or {"file_id": fid}, via,
+                               owner=owner)
             if result is None:
-                # the job row went (erasure) while the file waited its turn
+                # the job row went (erasure) or passed to another worker
+                # while the file waited its turn
                 return
             ran += 1
             stop = result.pop("stop", None)
@@ -548,11 +570,12 @@ def _run(conn, tenant_id: str, job: dict) -> None:
                 imported = True
             state = ("done" if result.get("ok") else
                      "skipped" if result.pop("skipped", False) else "failed")
-            _settle_file(conn, job_id, fid, state, result, rows=rows)
+            _settle_file(conn, job_id, fid, state, result, rows=rows,
+                         owner=owner)
             if stop:
-                _stop(conn, job_id, stop)
+                _stop(conn, job_id, stop, owner=owner)
                 return
-        _finish(conn, job_id, "done")
+        _finish(conn, job_id, "done", owner=owner)
     finally:
         ticker.stopped.set()
         work.close()
@@ -562,9 +585,10 @@ def _run(conn, tenant_id: str, job: dict) -> None:
 
 
 def _run_file(conn, work, tenant_id: str, job_id: str, fid: int, name: str,
-              decision: dict, via: str) -> dict | None:
+              decision: dict, via: str, *, owner) -> dict | None:
     """Wait for this file's turn, check that the job may still go on, import
-    it, and let the turn go. None when the job vanished meanwhile.
+    it, and let the turn go. None when the job vanished meanwhile, or is
+    no longer this worker's (`owner`, its claim's token).
 
     The turn is the household's sync lock and then, for a PDF, the
     worker's one PDF slot, taken without waiting while the lock is held:
@@ -577,9 +601,10 @@ def _run_file(conn, work, tenant_id: str, job_id: str, fid: int, name: str,
     deadline = time.monotonic() + LOCK_GIVE_UP_SECONDS
     while True:
         now = _job_now(conn, job_id)
-        if now is None or now["state"] not in LIVE:
-            # gone, or settled under it (an expiry, a cancel that landed):
-            # nothing to wait for, and the slot it holds goes back
+        if (now is None or now["state"] not in LIVE
+                or now["runner"] != owner):
+            # gone, settled under it (an expiry, a cancel that landed) or
+            # taken over: nothing to wait for, and the slot goes back
             return None
         if now["cancel_requested_at"] is not None:
             # read on every tick, so "Cancel the rest" reaches a file still
@@ -592,7 +617,7 @@ def _run_file(conn, work, tenant_id: str, job_id: str, fid: int, name: str,
                 if slot:
                     try:
                         return _run_turn(conn, work, tenant_id, job_id, fid,
-                                         name, decision, via)
+                                         name, decision, via, owner=owner)
                     finally:
                         if pdf:
                             _pdf_slot.release()
@@ -619,13 +644,13 @@ def _run_file(conn, work, tenant_id: str, job_id: str, fid: int, name: str,
 
 
 def _run_turn(conn, work, tenant_id: str, job_id: str, fid: int, name: str,
-              decision: dict, via: str) -> dict | None:
+              decision: dict, via: str, *, owner) -> dict | None:
     """The file's turn has come (the caller holds the sync lock, and the
     PDF slot for a PDF): check again, now, everything that may have
     changed while it waited — a rotation or a suspension landing in the
     wait must not let the file in — then claim the file and import it."""
     now = _job_now(conn, job_id)
-    if now is None:
+    if now is None or now["runner"] != owner:
         return None
     if now["cancel_requested_at"] is not None:
         return {"ok": False, "skipped": True, "error": CANCELLED_NOTE}
@@ -634,14 +659,24 @@ def _run_turn(conn, work, tenant_id: str, job_id: str, fid: int, name: str,
         return {"ok": False, "skipped": True,
                 "error": STOP_NOTES.get(reason, reason), "stop": reason}
     row = conn.execute(
-        """UPDATE bulk_import_files SET state = 'running'
-            WHERE job_id = %s AND file_id = %s AND state = 'pending'
-        RETURNING data""", (job_id, fid)).fetchone()
+        f"""UPDATE bulk_import_files SET state = 'running'
+            WHERE job_id = %(job)s AND file_id = %(fid)s AND state = 'pending'
+              AND EXISTS ({_HELD})
+        RETURNING data""", {"job": job_id, "fid": fid, "owner": owner}
+    ).fetchone()
     if row is None:
-        # settled meanwhile (the job expired or was erased)
+        # settled meanwhile (the job expired or was erased), or the job
+        # passed to another worker
         return None
     return _run_one(work, tenant_id, decision, name,
                     bytes(row["data"] or b""), via=via)
+
+
+MOVED_GONE_NOTE = ("the account this file was planned for no longer "
+                   "exists — import the file again and choose an account")
+MOVED_SHARED_NOTE = ("the account this file was planned for has moved, and "
+                     "more than one account shares its last four digits — "
+                     "import the file again and choose one")
 
 
 class _Refused(Exception):
@@ -665,7 +700,9 @@ def _run_one(work, tenant_id: str, decision: dict, name: str, data: bytes,
     from .. import erasure
     from ..sync import heartbeat
     from ..web import pages
-    from ..web.bulk_import import _ensure_account, hold_ledger_write_locks
+    from ..web.bulk_import import (_stem, hold_ledger_write_locks,
+                                   import_named, moved_account,
+                                   remember_choice)
     _watch = heartbeat.AUTO_WATCH.set(via == "token")
     _via = heartbeat.PUSH_VIA.set(via)
     sign = str(decision.get("amount_sign") or "bank")
@@ -687,19 +724,43 @@ def _run_one(work, tenant_id: str, decision: dict, name: str, data: bytes,
                     # household would wait out each statement's read.
                     hold_ledger_write_locks(work)
                 account_id = decision.get("account_id")
-                if not account_id:
+                if account_id:
+                    # the plan named the account when it was submitted; a
+                    # migrate may have moved it off a full number since (a
+                    # queued job holds no lock), and the move's record says
+                    # where it went
+                    found = moved_account(work, account_id)
+                    if not found:
+                        raise _Refused(MOVED_GONE_NOTE)
+                    if len(found) > 1:
+                        raise _Refused(MOVED_SHARED_NOTE)
+                    account_id = found[0]
+
+                def run(aid):
+                    return pages._dispatch_import_unlocked(
+                        work, aid, sign, name, data, role="")
+                if account_id:
+                    result, mapping = run(account_id)
+                else:
                     new_name = str(decision.get("new_account_name") or "")
                     if not new_name.strip():
                         raise _Refused("needs an account")
-                    account_id = _ensure_account(work, new_name.strip(),
-                                                 sign)
-                result, mapping = pages._dispatch_import_unlocked(
-                    work, account_id, sign, name, data, role="")
+                    # the account the name fills, or the earlier one that
+                    # already holds this file's rows
+                    account_id, (result, mapping) = import_named(
+                        work, new_name.strip(), sign, run)
                 if mapping is not None:
                     raise _Refused("CSV columns not recognized — import it "
                                    "alone to map them")
                 if isinstance(result, dict) and result.get("error"):
                     raise _Refused(str(result["error"]))
+                if decision.get("account_id"):
+                    # an account picked between cards sharing the file's
+                    # last four is remembered under the file's name once
+                    # the file has landed, in its transaction, so the next
+                    # statement of that card is not asked again; a file
+                    # refused, failed or still to be mapped settles nothing
+                    remember_choice(work, _stem(name), account_id)
         except _Refused as e:
             out = {"ok": False, "error": str(e)}
             if e.stop:
@@ -850,61 +911,80 @@ def _standing(tenant_id: str, job) -> str | None:
 
 # ---- bookkeeping -----------------------------------------------------------------
 
+# The job row while it is still the caller's: `owner` is the token its
+# claim stamped, and None (a person's cancel of a queued job, which no
+# worker holds) matches the job whoever holds it. Every write a running
+# job makes goes through this, so a worker that lost the job to a
+# takeover writes nothing more.
+_HELD = ("SELECT 1 FROM bulk_import_jobs j WHERE j.id = %(job)s"
+         " AND (%(owner)s::uuid IS NULL OR j.runner = %(owner)s::uuid)")
+
+
 def _settle_file(conn, job_id: str, fid: int, state: str, result: dict,
-                 rows: int = 0) -> None:
+                 rows: int = 0, *, owner=None) -> None:
     """One file's outcome, the progress count and the heartbeat, in one
-    statement; the file's bytes go with it."""
+    statement; the file's bytes go with it. A file already settled (by a
+    worker that took the job over) is not settled or counted again."""
     conn.execute(
-        """WITH f AS (
-               UPDATE bulk_import_files SET state = %s, result = %s,
-                      data = NULL
-                WHERE job_id = %s AND file_id = %s RETURNING 1)
+        f"""WITH f AS (
+               UPDATE bulk_import_files SET state = %(state)s,
+                      result = %(result)s, data = NULL
+                WHERE job_id = %(job)s AND file_id = %(fid)s
+                  AND state IN ('pending', 'running')
+                  AND EXISTS ({_HELD}) RETURNING 1)
            UPDATE bulk_import_jobs
               SET done = done + (SELECT count(*) FROM f),
-                  rows_total = rows_total + %s, heartbeat_at = now()
-            WHERE id = %s""",
-        (state, jsonb(result), job_id, fid, rows, job_id))
+                  rows_total = rows_total + %(rows)s, heartbeat_at = now()
+            WHERE id = %(job)s AND EXISTS ({_HELD})""",
+        {"state": state, "result": jsonb(result), "job": job_id,
+         "fid": fid, "rows": rows, "owner": owner})
 
 
 def _settle_files(conn, job_id: str, state: str, result: dict,
-                  states=("pending",)) -> None:
+                  states=("pending",), *, owner=None) -> None:
     conn.execute(
-        """WITH f AS (
-               UPDATE bulk_import_files SET state = %s, result = %s,
-                      data = NULL
-                WHERE job_id = %s AND state = ANY(%s) RETURNING 1)
+        f"""WITH f AS (
+               UPDATE bulk_import_files SET state = %(state)s,
+                      result = %(result)s, data = NULL
+                WHERE job_id = %(job)s AND state = ANY(%(states)s)
+                  AND EXISTS ({_HELD}) RETURNING 1)
            UPDATE bulk_import_jobs
               SET done = done + (SELECT count(*) FROM f),
                   heartbeat_at = now()
-            WHERE id = %s""",
-        (state, jsonb(result), job_id, list(states), job_id))
+            WHERE id = %(job)s AND EXISTS ({_HELD})""",
+        {"state": state, "result": jsonb(result), "job": job_id,
+         "states": list(states), "owner": owner})
 
 
-def _settle_rest(conn, job_id: str, note: str) -> None:
-    _settle_files(conn, job_id, "skipped", {"ok": False, "error": note})
+def _settle_rest(conn, job_id: str, note: str, *, owner=None) -> None:
+    _settle_files(conn, job_id, "skipped", {"ok": False, "error": note},
+                  owner=owner)
 
 
-def _finish(conn, job_id: str, state: str) -> None:
+def _finish(conn, job_id: str, state: str, *, owner=None) -> None:
     """Settle the job (a cancel that arrived during the last file still
     reads as cancelled) and clear every byte it still holds."""
+    args = {"state": state, "job": job_id, "owner": owner}
     conn.execute(
-        """UPDATE bulk_import_jobs
+        f"""UPDATE bulk_import_jobs
               SET state = CASE WHEN state = 'cancelling' THEN 'cancelled'
-                               ELSE %s END,
+                               ELSE %(state)s END,
                   finished_at = now(), heartbeat_at = now()
-            WHERE id = %s AND state IN ('queued', 'running', 'cancelling')""",
-        (state, job_id))
-    conn.execute("UPDATE bulk_import_files SET data = NULL WHERE job_id = %s"
-                 " AND data IS NOT NULL", (job_id,))
+            WHERE id = %(job)s AND state IN ('queued', 'running', 'cancelling')
+              AND EXISTS ({_HELD})""", args)
+    conn.execute(
+        f"""UPDATE bulk_import_files SET data = NULL WHERE job_id = %(job)s
+              AND data IS NOT NULL AND EXISTS ({_HELD})""", args)
 
 
-def _stop(conn, job_id: str, reason: str) -> None:
+def _stop(conn, job_id: str, reason: str, *, owner=None) -> None:
     """End the job for good: what it had not reached is skipped, with the
     reason, and its bytes cleared. Continuing means a new upload."""
-    _settle_rest(conn, job_id, STOP_NOTES.get(reason, reason))
+    _settle_rest(conn, job_id, STOP_NOTES.get(reason, reason), owner=owner)
     conn.execute(
-        """UPDATE bulk_import_jobs SET state = 'stopped', stop_reason = %s,
-                  finished_at = now()
-            WHERE id = %s AND state IN ('queued', 'running', 'cancelling')""",
-        (reason, job_id))
-    _finish(conn, job_id, "stopped")
+        f"""UPDATE bulk_import_jobs SET state = 'stopped',
+                  stop_reason = %(reason)s, finished_at = now()
+            WHERE id = %(job)s AND state IN ('queued', 'running', 'cancelling')
+              AND EXISTS ({_HELD})""",
+        {"reason": reason, "job": job_id, "owner": owner})
+    _finish(conn, job_id, "stopped", owner=owner)

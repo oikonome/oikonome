@@ -14,7 +14,7 @@ import { api, BULK_CHUNK, BULK_MAX, errText, mmdd, money as money$, type Entity,
 import { invalidateRollups, patchQueries } from "../api/cache";
 import MerchantAvatar from "./MerchantAvatar";
 import { isViewer } from "../role";
-import { spendPickerGroups } from "../moneymath";
+import { rowSpend, spendPickerGroups } from "../moneymath";
 const money = (v: number | null | undefined) => money$(v, true);  // cents on transaction/recurring surfaces
 
 // ---- day dividers -------------------------------------------------------
@@ -30,25 +30,8 @@ const money = (v: number | null | undefined) => money$(v, true);  // cents on tr
 // with the verdict, the daily email and the Business worksheet — three
 // surfaces that all already exclude exactly these.
 //
-// The server sends each row's share of spending (spend_amount) by the
-// verdict's own math — net of a partial reimbursement, a split row's
-// matching parts' share under the search's category filter, 0 for rows the
-// verdict does not count (excluded or hidden accounts, linked shadows
-// included). Summing that, not `amount`,
-// is what makes a day subtotal agree with the month hero; the client must
-// not re-derive spend semantics, because the display category can't see
-// overrides collapsing to transfers or loan-account rows. The fallbacks
-// exist only for a NEW client against an OLDER server: counts_as_spend
-// with the gross amount, then a category rule — without them every day
-// would total $0. Mirrored by mobile's rowSpend/daySpend in lib/pure.ts.
-const rowSpend = (t: Pick<Txn, "amount" | "category"
-                                 | "counts_as_spend" | "spend_amount">) => {
-  if (typeof t.spend_amount === "number") return t.spend_amount;
-  const counts = typeof t.counts_as_spend === "boolean"
-    ? t.counts_as_spend
-    : t.amount > 0 && !(t.category || "").includes("TRANSFER");
-  return counts ? t.amount : 0;
-};
+// Each row's share of spending is rowSpend (moneymath.ts): the verdict's
+// own figure, never the amount column.
 const daySpend = (group: Txn[]) =>
   group.reduce((sum, t) => sum + rowSpend(t), 0);
 
@@ -89,7 +72,12 @@ export function NoteEditor({ txnId, initial, onDone }:
   { txnId: string; initial: string; onDone: (note?: string) => void }) {
   const [text, setText] = useState(initial);
   const [busy, setBusy] = useState(false);
+  // the demo instance refuses note writes — disabled-in-place, the same
+  // treatment Merchants gives its writes, beats a refusal after typing
+  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
+  const demo = !!me.data?.demo;
   const save = () => {
+    if (demo) return;
     setBusy(true);
     api.setTxnNote(txnId, text)
       .then((r) => onDone(r.note))
@@ -100,7 +88,11 @@ export function NoteEditor({ txnId, initial, onDone }:
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: ".4rem",
       padding: ".2rem 0" }}>
-      <textarea value={text} autoFocus rows={2}
+      {demo && (
+        <span className="sub" style={{ color: "var(--amber)" }}>
+          Not available on the demo instance — synthetic data only.</span>
+      )}
+      <textarea value={text} autoFocus rows={2} disabled={demo}
         placeholder="Add a note — anything you want to remember about this transaction"
         style={{ width: "100%", resize: "vertical", fontSize: 13 }}
         onChange={(e) => setText(e.target.value)}
@@ -108,7 +100,7 @@ export function NoteEditor({ txnId, initial, onDone }:
           if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) save();
         }} />
       <div style={{ display: "flex", gap: ".5rem", alignItems: "center" }}>
-        <button className="pri" disabled={busy} onClick={save}>Save note</button>
+        <button className="pri" disabled={busy || demo} onClick={save}>Save note</button>
         <button disabled={busy} onClick={() => onDone()}>Cancel</button>
         <span className="mut" style={{ fontSize: 11 }}>
           {initial ? "Clear the box and save to remove." : "⌘/Ctrl+Enter saves."}</span>
@@ -1012,8 +1004,14 @@ export default memo(function TxnTable({ rows, showAccount = true,
         {tooMany && (
           <span className="mut">select fewer than {BULK_MAX.toLocaleString()}</span>
         )}
+        {/* the demo instance refuses bulk writes; row-by-row edits still
+            go through, so the bar stays (and can clear) but cannot act */}
+        {demo && (
+          <span className="sub" style={{ color: "var(--amber)" }}>
+            Not available on the demo instance — synthetic data only.</span>
+        )}
         <select value="" aria-label="set a category for the selected rows"
-                disabled={bulk.isPending || tooMany}
+                disabled={bulk.isPending || tooMany || demo}
                 onChange={(e) => {
                   if (e.target.value) bulk.mutate({ action: "category",
                                                     category: e.target.value });
@@ -1022,16 +1020,16 @@ export default memo(function TxnTable({ rows, showAccount = true,
           <option value="">recategorize…</option>
           {catGroups}
         </select>
-        <button disabled={bulk.isPending || tooMany}
+        <button disabled={bulk.isPending || tooMany || demo}
                 onClick={() => bulk.mutate({ action: "biz_on" })}>
           mark business</button>
-        <button disabled={bulk.isPending || tooMany}
+        <button disabled={bulk.isPending || tooMany || demo}
                 onClick={() => bulk.mutate({ action: "biz_off" })}>
           unmark business</button>
-        <button disabled={bulk.isPending || tooMany}
+        <button disabled={bulk.isPending || tooMany || demo}
                 onClick={() => bulk.mutate({ action: "reimb_flag" })}>
           ⚑ expect reimbursement</button>
-        <button disabled={bulk.isPending || tooMany}
+        <button disabled={bulk.isPending || tooMany || demo}
                 onClick={() => bulk.mutate({ action: "reimb_unflag" })}>
           unflag</button>
         <button style={{ marginLeft: "auto" }}

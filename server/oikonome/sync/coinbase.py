@@ -369,20 +369,39 @@ def rollback(conn, label: str) -> int:
         # a pair on a row about to go is unlinked first, so its
         # counterpart lets go of the transfer category the link gave it
         from ..web.data import detach_pairs
-        from .base import release_matched_receipts
+        from .base import (release_fronted_movements,
+                           release_matched_receipts)
         from .reanchor import hold_pairing_lock
         hold_pairing_lock(conn)
-        doomed = [r["id"] for r in conn.execute(
-            "SELECT id FROM transactions WHERE account_id=%s", (aid,))]
+        # the rows first, then any business (see lock_account_rows)
+        from .base import lock_account_rows
+        doomed = lock_account_rows(conn, aid)
+        # an archived business's rows are retention records only its
+        # delete-forever may remove (batches._archived_business_rows)
+        from .batches import _archived_business_rows
+        archived = _archived_business_rows(conn, doomed)
+        doomed = [d for d in doomed if d not in archived]
         detach_pairs(conn, doomed)
         # a receipt paired with one of these rows goes back to waiting
         # rather than down with it
         release_matched_receipts(conn, doomed)
+        release_fronted_movements(conn, doomed, "an unlinked wallet")
         n = conn.execute(
-            "DELETE FROM transactions WHERE account_id=%s", (aid,)).rowcount
+            "DELETE FROM transactions WHERE account_id=%s"
+            " AND NOT id = ANY(%s)", (aid, list(archived))).rowcount
         conn.execute("DELETE FROM crypto_holdings WHERE account_id=%s", (aid,))
-        conn.execute("DELETE FROM accounts WHERE id=%s", (aid,))
-        conn.execute("DELETE FROM items WHERE id=%s", (item_id(label),))
+        if archived:
+            # the account (and its connection) stays to hold the kept rows;
+            # its balance does not — nothing will refresh it, so it is
+            # filed as closed and leaves net worth (as base's purge does)
+            conn.execute("UPDATE accounts SET balance_current = NULL,"
+                         " balance_available = NULL WHERE id = %s", (aid,))
+            from .base import _purge_kept_note
+            log_sync(conn, "coinbase-unlink", 0, error=f"account {aid}: "
+                     + _purge_kept_note(0, len(archived)))
+        else:
+            conn.execute("DELETE FROM accounts WHERE id=%s", (aid,))
+            conn.execute("DELETE FROM items WHERE id=%s", (item_id(label),))
         # the connection's entity scope was stamped at checkout
         from ..db import tenancy
         tenancy.set_entity_scope(conn)

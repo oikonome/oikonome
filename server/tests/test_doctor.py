@@ -63,6 +63,56 @@ class DoctorTests(unittest.TestCase):
         self.assertFalse(rows[0]["ok"])
         self.assertTrue(broken.closed)
 
+    def test_nightly_row_names_the_schedule_the_worker_runs(self):
+        """The nightly job runs at its cron entry's wall time in the
+        instance's own zone; the Doctor row must say that time and zone,
+        not a fixed hour in UTC that sends an operator to the logs at the
+        wrong time."""
+        from oikonome import localtime
+        from oikonome.jobs import worker
+        job = next(j for j in worker.WorkerSettings.cron_jobs
+                   if j.name == "cron:nightly_all")
+        with patch.object(localtime, "instance_tz_name",
+                          return_value="Pacific/Auckland"):
+            rows = self._checks()
+        row = next(r for r in rows
+                   if r["name"] == "nightly detection (worker)")
+        self.assertIn(f"expected daily at {job.hour:02d}:{job.minute:02d} "
+                      "Pacific/Auckland", row["detail"])
+
+    def test_the_public_bundle_names_no_zone(self):
+        """The bundle is attached to public issues: the nightly row gives
+        the wall time in "instance local time", never the zone key."""
+        from oikonome import localtime
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("OIKONOME_LLM")}
+        with patch.dict(os.environ, env, clear=True), \
+                patch.object(localtime, "instance_tz_name",
+                             return_value="Pacific/Auckland"):
+            rows = doctor.checks(self.tid, public=True)
+        row = next(r for r in rows
+                   if r["name"] == "nightly detection (worker)")
+        self.assertNotIn("Pacific/Auckland", row["detail"])
+        # no age to the tenth of an hour: with generated_at it is the offset
+        self.assertNotRegex(row["detail"], r"\d+(\.\d+)?\s*h ago")
+        self.assertIn("instance local time", row["detail"])
+
+    def test_the_public_bundle_gives_no_job_age(self):
+        """Every heartbeat row: the daily mail runs at a default local hour
+        in the source, so its age is the offset as surely as the nightly's."""
+        self.conn.execute("DELETE FROM job_runs")
+        self.conn.execute(
+            "INSERT INTO job_runs (job, ran_at) VALUES "
+            "('nightly-detect', now() - interval '5 hours 17 minutes'), "
+            "('daily-email', now() - interval '5 hours 17 minutes')")
+        self.conn.commit()
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("OIKONOME_LLM")}
+        with patch.dict(os.environ, env, clear=True):
+            rows = doctor.checks(self.tid, public=True)
+        for r in rows:
+            self.assertNotRegex(r["detail"], r"\d(\.\d)?h ago|\dm ago", r["name"])
+
     def test_rows_are_sectioned(self):
         rows = self._checks()
         sections = {r["section"] for r in rows}

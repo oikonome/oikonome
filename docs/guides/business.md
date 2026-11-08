@@ -31,8 +31,8 @@ operating. The **EIN is encrypted at rest** — only its last four digits
 are ever shown back. You can run more than one entity. Under its
 **Settings** tab you can also list **members** (name, ownership %,
 manager, and **this is us** on the member this household is — the
-estimated tax and the capital account then also show that member's
-share, by their ownership %; the mark applies once every member has a
+estimated tax then shows that member's share by their ownership %, and
+the capital account shows that member's own account; the mark applies once every member has a
 share and the shares total 100%, and a business has at most one such
 member), and under **Tax** set an **income-tax rate %** and
 **home-office sq ft** that feed the estimates below; the API additionally
@@ -83,13 +83,29 @@ Capital contributions, owner's draws and distributions, and
 reimbursements are their own classes — they hit the entity's **capital
 account**, never spend or income. The capital balance is contributions
 plus retained earnings (cumulative net operating income) minus draws
-and distributions — the page spells the sum out beside the figure. A
+and distributions — the page spells the sum out beside the figure. With
+a member marked **this is us**, the page also shows that member's own
+capital account: the contributions, draws and distributions recorded
+against them, plus their ownership share of the retained earnings.
+Movements that name no member are split by ownership, so a sole owner's
+account is the whole capital account. A
 business cost you paid personally can be **capitalized** (recorded as a
 contribution) or **reimbursed** (the business owes you back) — both keep
 the books straight. Do it right from the **Transactions page**: open any
 expense's category menu and pick **capitalize (owner contribution)** or
 **reimburse from business** under your business; the transaction moves
 to the entity and the equity movement is recorded in one step.
+When the charge itself leaves the ledger — an import undone, an account's
+data deleted, a wallet or plan unlinked — its capitalized or reimbursable
+movement goes with it, with a line in the activity log saying what was
+removed, so importing the charge again and booking it counts once. A draw
+or distribution that merely names the charge is an entry of its own and
+stays.
+Movements recorded before deletes took them along may have lost their
+charge and still count; when the household has any, the owner sees one
+line at the top of the Business page with the count and a link to the
+**Unlinked capital** list, where each one can be removed by hand — see
+[troubleshooting](../troubleshooting.md#unlinked-capital).
 
 ## Books, P&L, and Schedule C
 
@@ -131,7 +147,10 @@ off the P&L and out of the 1099 list; the P&L reports it separately as
 the year before, since the fourth estimate falls due then). Give such a
 payment a Schedule C line yourself if it really is a business tax. These figures are
 informational — Oikonome categorizes and exports; your CPA decides the
-tax treatment.
+tax treatment. The CSVs — including the itemized expense CSV on the
+Receipts tab — and the year-end package are the household owner's to
+download, like every file that carries the ledger; a member or
+view-only login is not offered the button.
 
 ## Self-employed tax hygiene
 

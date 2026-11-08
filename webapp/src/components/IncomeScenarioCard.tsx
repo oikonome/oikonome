@@ -1,7 +1,7 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useRef, useState } from "react";
 import { api, errText, money, type Settings as SettingsData } from "../api/client";
-import { saveSettings } from "../api/cache";
+import { SETTINGS_SAVES, saveSettings } from "../api/cache";
 import { mergeIncomeScenarios, takeHomeOf, type ScenarioDraft }
   from "../incomescenarios";
 
@@ -25,6 +25,7 @@ export default function IncomeScenarioCard({ data, onSaved }: {
   const baseActive = useRef(data.active_scenario ?? "");
   const qc = useQueryClient();
   const save = useMutation({
+    scope: SETTINGS_SAVES,
     mutationFn: async () => {
       // The server replaces the list wholesale, and these rows were
       // seeded at mount; merge against its CURRENT list so a scenario

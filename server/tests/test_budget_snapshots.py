@@ -61,6 +61,56 @@ class BackfillTests(unittest.TestCase):
         y = lenses.year_summary(self.conn, 2026, today=TODAY)
         self.assertEqual(y["cells"][5]["status"], "final")
 
+    def test_a_frozen_months_junk_settings_never_crash_its_lenses(self):
+        """A snapshot is a full copy of the settings at close, so it carries
+        whatever an older door let into them, and a restored ZIP lands it
+        verbatim. It is read through the same cleaners a restored live
+        config goes through: the Month lens, the Year lens and the
+        bucket ledger render, and the frozen budget still applies."""
+        from oikonome.engine.compat import jsonb
+        junk = [
+            {"income_scenarios": [{"name": "a", "take_home": "abc"}]},
+            {"income_scenarios": ["a"]},
+            {"custom_buckets": [{"name": "Bakery", "parent": "food",
+                                 "monthly": 10, "categories": 5}]},
+            {"savings_goals": [{"name": "Trip", "monthly_plan": "lots"}]},
+            {"occurrence_caps": ["not", "a", "map"]},
+        ]
+        for extra in junk:
+            with self.subTest(extra=extra):
+                self.conn.execute("DELETE FROM budget_snapshots")
+                self.conn.execute(
+                    "INSERT INTO budget_snapshots (year, month, config) "
+                    "VALUES (2026, 6, %s)",
+                    (jsonb({"food_monthly": 300, "other_monthly": 500,
+                            **extra}),))
+                cfg = budget.snapshot_config(self.conn, 2026, 6)
+                self.assertEqual(cfg["food_monthly"], 300)
+                r = lenses.month_summary(self.conn, 2026, 6, today=TODAY)
+                self.assertEqual(r["budget_source"], "snapshot")
+                lenses.year_summary(self.conn, 2026, today=TODAY)
+                lenses.year_bucket_ledger(self.conn, "food", 2026,
+                                          today=TODAY)
+
+    def test_a_snapshot_is_written_clean(self):
+        """Freezing a month (and backfilling one) stores the settings
+        cleaned, so the stored copy is never the one with the junk."""
+        cfg = budget.load_config(self.conn)
+        cfg["income_scenarios"] = [{"name": "a", "take_home": "abc"}]
+        cfg["disabled_bills"] = "Harbor"
+        budget.save_config(self.conn, cfg)
+        budget.snapshot_month(self.conn, dt.date(2026, 6, 1))
+        add_txn(self.conn, dt.date(2026, 5, 5), 50.0, "FIRST")
+        budget.backfill_snapshots(self.conn, TODAY)
+        rows = self.conn.execute(
+            "SELECT config FROM budget_snapshots").fetchall()
+        self.assertEqual(len(rows), 2)
+        for r in rows:
+            stored = r["config"]
+            self.assertEqual(stored["food_monthly"], 3000)
+            self.assertNotIn("income_scenarios", stored)
+            self.assertNotIn("disabled_bills", stored)
+
     def test_backfill_without_ledger_or_budget_is_a_noop(self):
         self.assertEqual(budget.backfill_snapshots(self.conn, TODAY), 0)
         write_config(self.conn, food_monthly=0, other_monthly=0)

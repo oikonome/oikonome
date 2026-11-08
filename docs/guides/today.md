@@ -79,7 +79,7 @@ just what happened.
 
 ## The one number to hit
 
-By default (the **summary** face) the card shows it as literally one number: what's still
+On the **summary** face (a new account opens on **detail**; the toggle below switches) the card shows it as literally one number: what's still
 spendable **today** across all your variable budgets, over a day
 meter (today's spend of today's allowance), with a small chip per
 category ("Groceries $12
@@ -189,15 +189,36 @@ fold into a footnote instead of drawing empty bars.
 Cash warnings have one home — the verdict card — and three states:
 
 - **OK** — no cash line at all. Silence is the signal.
-- **Tight** — one calm line ("Cash gets tight around 9/10").
+- **Tight** — one calm line ("Cash gets tight around 9/10", or "Cash
+  is tight — $X left after cards & bills before the next paycheck
+  (6/14/24)").
 - **Critical** — a red block that says what to do ("Short $2,100 by
-  7/16 — cover from savings or slow spending to $X/day").
+  7/16 — cover from savings or slow spending to $X/day"; when checking
+  is short today, "Short $X today … before the next paycheck (6/14/24)").
+  The lines that stop at the next paycheck name its date.
 
 ## The cash timeline
 
-Cash lives in one card: **checking now**, **card debt**, **after cards
-& bills** (checking − card debt − bills still due this month), and the
-forecast's **low point**, over a 60-day chart. Below it, one
+Cash lives in one card: **checking now**, **card debt**, **paychecks
+still due** (the paychecks your income series still have due this
+month, each at its series' latest deposit, with up to three of the
+dates), **after cards, bills & paychecks** (checking − card debt −
+bills still due this month + paychecks still due this month), and the
+forecast's **low point**, over a 60-day chart. Without an income series
+that is switched on under Bills & Income the tile reads **after cards &
+bills** — the figure counts bills and no income — and says why: "no
+paycheck set up — add your income under Bills & Income and this counts
+it"; or, when your income is a budgeted amount rather than a schedule of
+paychecks, "your income is budgeted, not scheduled — this counts no
+paycheck"; or, when your income series are all switched off, "your
+income is switched off under Bills & Income — this counts no paycheck".
+Both sides stop at the same month end: on the month's last day a
+bill or paycheck due that day and not yet posted still counts, while one
+due on the 1st belongs to next month. A bill from last month that has
+not posted yet stays reserved — in this figure, the forecast and the
+headroom — for as long as a payment could still be that bill's (its
+matching window), so the number does not jump by the bill on the 1st
+and then drop again when it posts. Below it, one
 chronological table: the month's paid bills and your recent
 transactions, a **TODAY** divider, then every scheduled event —
 bills on their due dates, envelopes spread evenly, paychecks on their

@@ -137,10 +137,14 @@ class SplitIdTests(unittest.TestCase):
     def test_a_source_named_by_its_number_never_spells_it(self):
         out = qifimport.import_qif(self.conn, "chk", _qif(
             (NUMBER, A_ROWS), ("Harbor Savings", H_ROWS)))
-        self.assertIn("manual:qif-0123", self._accounts())
+        for aid in self._accounts():
+            self.assertIsNone(re.search(r"\d", aid), aid)
+        (aid,) = [r["id"] for r in self.conn.execute(
+            "SELECT id FROM accounts WHERE name = '…0123'"
+            "   AND id LIKE 'manual:qif-%'").fetchall()]
         raw = self.conn.execute(
             "SELECT raw::text AS r FROM transactions"
-            " WHERE account_id = 'manual:qif-0123'").fetchall()
+            " WHERE account_id = %s", (aid,)).fetchall()
         self.assertTrue(raw)
         for r in raw:
             self.assertIsNone(LONG_DIGITS.search(r["r"]), r["r"])
@@ -233,10 +237,13 @@ class NumberedIdMoveTests(unittest.TestCase):
     def test_a_taken_masked_id_gets_a_suffix_that_is_no_number(self):
         """The masked id is already an account: the moved one carries a
         digest of the cut old id spelled in letters, and a re-import of
-        both files adds nothing."""
-        qifimport.import_qif(self.conn, "chk", _qif(("0123", B_ROWS),
-                                                      ("Harbor Savings",
-                                                       H_ROWS)))
+        both files adds nothing. (The source named "0123" is made as an
+        earlier release made it, under the readable id the move wants.)"""
+        with mock.patch.object(qifimport, "ensure_split_account",
+                               _legacy_ensure):
+            qifimport.import_qif(self.conn, "chk", _qif(("0123", B_ROWS),
+                                                          ("Harbor Savings",
+                                                           H_ROWS)))
         before = self._rows(self.conn)
         self.conn.execute(MIGRATION.read_text())
         self.conn.execute(MIGRATION.read_text())          # idempotent

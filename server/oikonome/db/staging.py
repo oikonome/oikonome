@@ -58,6 +58,10 @@ def put(conn, kind: str, files: list[tuple[str, bytes]] | None = None,
                 f"pending, budget {TENANT_BUDGET // (1024*1024)} MB) — "
                 f"finish or abandon the imports in flight, or upload "
                 f"smaller batches")
+        # and the household's file-storage quota, which every kept upload
+        # (receipts above all) shares with the stage
+        from ..engine import storage_quota
+        storage_quota.reserve(conn, incoming)
         for i, (name, data) in enumerate(files):
             conn.execute(
                 """INSERT INTO import_staging (token, idx, kind, filename,

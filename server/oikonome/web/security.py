@@ -29,6 +29,7 @@ Rate limiting: sliding window per (route, client IP).
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import logging
@@ -637,7 +638,42 @@ _PROTECTED_NS = frozenset({
     "risk-ip",      # human-check risk signal. Clearing any of the three
     "risk-acct",    # buys an attacker un-challenged sign-in attempts, which
     "risk-site",    # is exactly what the site-wide bucket exists to stop.
+    "otp-verify",   # per-account budget on one-time codes (SMS verify):
+                    # evicting it would hand back the guesses it spent
 })
+
+
+# A key is sized by the code, never by the client. Every per-account
+# bucket keys on `account_key_part` — a fixed-size digest of the normalized
+# address, never the address — because a sign-in door is anonymous and the
+# email it was sent can be as long as the request body: stored as-is, each
+# junk address would be a megabyte-sized key that the eviction protects
+# (the risk and lockout namespaces above), and `_MAX_KEYS` would bound a
+# count of keys that each cost whatever the client chose. Redis also holds
+# key names in the clear, and an address is personal. `_small_key` is the
+# backstop inside both stores: a part longer than `_KEY_PART_MAX` is
+# replaced by its digest, so a future door that builds a key from client
+# text cannot bring the class back. Short parts pass through untouched, so
+# route/IP buckets keep their names.
+_KEY_PART_MAX = 128
+
+
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+
+
+def account_key_part(email: str) -> str:
+    """The limiter-key form of an email: the same person (any case, any
+    surrounding space) is always the same bucket, and the key is 32 hex
+    characters whatever was typed."""
+    return _digest((email or "").strip().lower())
+
+
+def _small_key(key: tuple) -> tuple:
+    if all(not isinstance(p, str) or len(p) <= _KEY_PART_MAX for p in key):
+        return key
+    return tuple("#" + _digest(p) if isinstance(p, str)
+                 and len(p) > _KEY_PART_MAX else p for p in key)
 
 
 class _Window(deque):
@@ -726,6 +762,7 @@ class RateLimiter:
 
     def check(self, key: tuple, limit: int, window_s: float) -> bool:
         """True if the request is allowed; False when over the limit."""
+        key = _small_key(key)
         now = time.monotonic()
         with self._lock:
             q = self._bucket(key, window_s, now)
@@ -742,6 +779,7 @@ class RateLimiter:
         """Read-only, and it stays that way: an unknown key is not created
         (a count must never be able to grow the table) and one that has
         drained is dropped rather than left behind as a permanent entry."""
+        key = _small_key(key)
         now = time.monotonic()
         with self._lock:
             q = self._hits.get(key)
@@ -755,18 +793,21 @@ class RateLimiter:
             return len(q)
 
     def add(self, key: tuple, window_s: float) -> bool:
+        key = _small_key(key)
         now = time.monotonic()
         with self._lock:
             self._bucket(key, window_s, now).append(now)
         return True
 
     def clear(self, key: tuple) -> None:
+        key = _small_key(key)
         with self._lock:
             self._hits.pop(key, None)
 
     def reserve(self, key: tuple, limit: int, window_s: float):
         """`check` that hands back the entry it added (a token for
         `release`), or False when over the limit."""
+        key = _small_key(key)
         now = time.monotonic()
         with self._lock:
             q = self._bucket(key, window_s, now)
@@ -779,6 +820,7 @@ class RateLimiter:
 
     def release(self, key: tuple, token) -> None:
         """Take back one entry `reserve` added."""
+        key = _small_key(key)
         with self._lock:
             q = self._hits.get(key)
             if q is None:
@@ -791,6 +833,7 @@ class RateLimiter:
     # temporary hard-block primitives (auto-ban) — a marker with its own TTL,
     # independent of the sliding-window buckets above.
     def block(self, key: tuple, ttl_s: float) -> None:
+        key = _small_key(key)
         with self._lock:
             self._blocks[key] = time.monotonic() + ttl_s
 
@@ -800,6 +843,7 @@ class RateLimiter:
         one lock hold, so concurrent callers agree on exactly one winner —
         which is what lets ban escalation count offenses instead of
         requests."""
+        key = _small_key(key)
         now = time.monotonic()
         with self._lock:
             exp = self._blocks.get(key)
@@ -810,6 +854,7 @@ class RateLimiter:
 
     def blocked(self, key: tuple) -> float | None:
         """Seconds remaining on an active block, else None."""
+        key = _small_key(key)
         now = time.monotonic()
         with self._lock:
             exp = self._blocks.get(key)
@@ -821,6 +866,7 @@ class RateLimiter:
             return exp - now
 
     def unblock(self, key: tuple) -> None:
+        key = _small_key(key)
         with self._lock:
             self._blocks.pop(key, None)
 
@@ -1051,7 +1097,7 @@ class RedisRateLimiter:
             return None
 
     def _k(self, key: tuple) -> str:
-        return "oikonome:rl:" + ":".join(str(p) for p in key)
+        return "oikonome:rl:" + ":".join(str(p) for p in _small_key(key))
 
     def count(self, key: tuple, window_s: float) -> int | None:
         import redis
@@ -1108,7 +1154,7 @@ class RedisRateLimiter:
     # hard-block marker with a native key TTL (own namespace so it can't
     # collide with the sliding-window sorted sets).
     def _bk(self, key: tuple) -> str:
-        return "oikonome:ban:" + ":".join(str(p) for p in key)
+        return "oikonome:ban:" + ":".join(str(p) for p in _small_key(key))
 
     def block(self, key: tuple, ttl_s: float) -> bool | None:
         import redis
@@ -1461,7 +1507,7 @@ _ACCT_FAIL_WINDOW = 900      # 15-minute sliding window / cooldown
 
 
 def _acct_key(email: str) -> tuple:
-    return ("login-fail", (email or "").strip().lower())
+    return ("login-fail", account_key_part(email))
 
 
 def account_login_locked(email: str) -> bool:
@@ -1659,7 +1705,7 @@ def _risk_keys(ip: str, email: str = "") -> list[tuple]:
             # can never collide with a /64 or IPv4 key
             keys.append((("risk-ip", wide), _RISK_IP48_MAX))
     if email:
-        keys.append((("risk-acct", email.strip().lower()), _RISK_ACCT_MAX))
+        keys.append((("risk-acct", account_key_part(email)), _RISK_ACCT_MAX))
     return keys
 
 

@@ -48,7 +48,8 @@ class SnapshotTests(unittest.TestCase):
                          [worker.nightly_tenant, worker.snapshot_tenant,
                           worker.script_alert_tenant, reaper.reap_tenant])
         self.assertEqual(set(out), {"detect", "snapshot", "script_alerts", "purged",
-                                    "plaid_reap", "frozen", "unverified"})
+                                    "plaid_reap", "frozen", "unverified",
+                                    "retention"})
 
 
 class ProductsCadenceTests(unittest.TestCase):

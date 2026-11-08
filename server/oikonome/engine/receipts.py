@@ -16,7 +16,7 @@ import datetime as dt
 import logging
 import math
 
-from ..envnum import env_num
+from ..envnum import env_float, env_int
 import threading
 
 from ..engine.compat import as_date, jsonb
@@ -53,12 +53,10 @@ except Exception:                                 # noqa: BLE001
 # The heavy deskew/warp additionally runs at a bounded working resolution
 # (_OPTIMIZE_WORK_PX) — the stored copy is thumbnailed to OPTIMIZED_MAX_PX
 # anyway, so nothing is lost.
-MAX_OPTIMIZE_PX = int(env_num("OIKONOME_RECEIPT_MAX_OPTIMIZE_PX",
-                               "12000000"))
-_OPTIMIZE_WORK_PX = int(env_num("OIKONOME_RECEIPT_OPTIMIZE_WORK_PX",
-                                 "2400"))
+MAX_OPTIMIZE_PX = env_int("OIKONOME_RECEIPT_MAX_OPTIMIZE_PX", 12000000, lo=1)
+_OPTIMIZE_WORK_PX = env_int("OIKONOME_RECEIPT_OPTIMIZE_WORK_PX", 2400, lo=1)
 _OPTIMIZE_GATE = threading.BoundedSemaphore(
-    int(env_num("OIKONOME_RECEIPT_OPTIMIZE_CONCURRENCY", "3")))
+    env_int("OIKONOME_RECEIPT_OPTIMIZE_CONCURRENCY", 3, lo=1))
 
 # The PARSE path decodes too — _shrink_image opens the stored image and a
 # PDF is rasterized — and every upload/parse-now spawns its own thread, so a
@@ -69,9 +67,27 @@ _OPTIMIZE_GATE = threading.BoundedSemaphore(
 # _DECODE_WAIT_S so a stuck decoder can't pin the queue forever. The gate
 # covers the decode only, not the (long) vision call, so it turns over fast.
 _DECODE_GATE = threading.BoundedSemaphore(
-    int(env_num("OIKONOME_RECEIPT_PARSE_CONCURRENCY", "2")))
-_DECODE_WAIT_S = float(env_num("OIKONOME_RECEIPT_PARSE_WAIT_S", "120"))
+    env_int("OIKONOME_RECEIPT_PARSE_CONCURRENCY", 2, lo=1))
+_DECODE_WAIT_S = env_float("OIKONOME_RECEIPT_PARSE_WAIT_S", 120.0, lo=0.0)
 BUSY_ERROR = "server is busy reading receipts — try again in a minute"
+# Each background read holds a pooled tenant connection for the whole vision
+# call, up to the LLM client's ten-minute timeout, and that pool serves every
+# request on the instance. So reads take a turn BEFORE they take a connection:
+# a backlog waits holding nothing. A read that gets no turn fails as busy (the
+# sweep retries it), and the wait stays well inside STALE_PARSE so a queued
+# read is never still around when its claim becomes reclaimable.
+# Operators size both: more reads at once costs that many pooled
+# connections, and the wait is held under the ten-minute stale window
+# whatever is set.
+def _knob(name: str, default: float) -> float:
+    # a typo in the env file falls back to the default, never a 500 on
+    # every receipt request
+    return env_float(name, default)
+
+
+PARSE_SLOTS = max(1, int(min(_knob("OIKONOME_RECEIPT_READ_SLOTS", 3), 64)))
+_PARSE_TURNS = threading.BoundedSemaphore(PARSE_SLOTS)
+_PARSE_SLOT_WAIT_S = min(480.0, max(1.0, _knob("OIKONOME_RECEIPT_READ_WAIT_S", 300)))
 # A receipt that failed only because the gate was busy is taken up again by
 # the nightly sweep while it is younger than this. The bound is what stops
 # one that can never get a turn from queueing for ever: a handful of nights,
@@ -152,6 +168,12 @@ def add(conn, txn_id: str | None, image: bytes, mime: str,
         raise ValueError("kind must be 'receipt' or 'check'")
     if txn_id is None and kind != "receipt":
         raise ValueError("a check image is attached to its transaction")
+    from . import storage_quota
+    # a cleaned-up optimized copy is stored next to the original
+    # (best-effort — None never blocks the upload). Made before the insert
+    # so both copies are counted against the household's storage quota
+    # together, and no lock is held while the image is decoded.
+    opt = _optimize(image, mime)
     # The check and the insert are one step under the pairing lock the
     # pending-to-posted settlement holds from its carry to its retire, and a
     # hold that has already posted hands the receipt to its posted charge
@@ -159,24 +181,22 @@ def add(conn, txn_id: str | None, image: bytes, mime: str,
     # snapped while its charge settled could land on the retired hold after
     # the carry had run — shown as attached, then on no screen at all.
     with conn.transaction():
+        # the storage lock first, then the pairing lock: the order a
+        # restore takes them in (it reserves its receipts before it re-keys
+        # an account under the pairing lock), so the two never deadlock
+        storage_quota.reserve(conn, len(image) + (len(opt[0]) if opt else 0))
         if txn_id is not None:
             from .entities import live_txn_id
             txn_id = live_txn_id(conn, txn_id)
             if txn_id is None:
                 raise ValueError("no such transaction")
         row = conn.execute(
-            """INSERT INTO receipts (txn_id, image, mime, kind)
-               VALUES (%s,%s,%s,%s) RETURNING id""",
-            (txn_id, image, mime, kind)).fetchone()
-    rid = str(row["id"])
-    # store a cleaned-up optimized copy next to the original
-    # (best-effort — never block the upload if optimization fails).
-    opt = _optimize(image, mime)
-    if opt:
-        conn.execute(
-            "UPDATE receipts SET image_optimized=%s, optimized_mime=%s "
-            "WHERE id=%s::uuid", (opt[0], opt[1], rid))
-    return rid
+            """INSERT INTO receipts (txn_id, image, mime, kind,
+                                     image_optimized, optimized_mime)
+               VALUES (%s,%s,%s,%s,%s,%s) RETURNING id""",
+            (txn_id, image, mime, kind, opt[0] if opt else None,
+             opt[1] if opt else None)).fetchone()
+    return str(row["id"])
 
 
 def for_txn(conn, txn_id: str) -> list[dict]:
@@ -289,6 +309,27 @@ def is_manual(conn, receipt_id: str) -> bool:
         "SELECT parsed->>'source' AS source FROM receipts"
         " WHERE id = %s::uuid", (receipt_id,)).fetchone()
     return bool(r) and r["source"] == MANUAL
+
+
+def wait_for_parse_turn() -> bool:
+    """Queue for a background read's turn; False when none came in time.
+    Called holding no connection. The caller gives a True back through
+    end_parse_turn, after closing the connection the read used."""
+    return _PARSE_TURNS.acquire(timeout=_PARSE_SLOT_WAIT_S)
+
+
+def end_parse_turn() -> None:
+    _PARSE_TURNS.release()
+
+
+def fail_busy(conn, receipt_id: str) -> int:
+    """Settle a claimed receipt whose read never got a turn: retryable, and
+    the nightly sweep takes it up again. Only a claim still open is touched;
+    details typed in meanwhile stay as they are."""
+    return conn.execute(
+        "UPDATE receipts SET status='failed', error=%s WHERE id=%s::uuid"
+        f" AND status='parsing' AND {_NOT_MANUAL}",
+        (BUSY_ERROR, receipt_id)).rowcount
 
 
 def claim(conn, receipt_id: str) -> bool:
@@ -537,6 +578,14 @@ def _pdf_first_page_png(pdf_bytes: bytes) -> bytes:
         doc.close()
 
 
+def _is_busy(e: Exception) -> bool:
+    """A read that got no model slot in time is the same case as a full
+    read gate: nothing is wrong with the receipt, so it is recorded as busy
+    and the sweep tries it again rather than leaving it failed."""
+    from . import llm_categorize as llm
+    return isinstance(e, llm.LLMBusy)
+
+
 def _friendly_error(e: Exception, vision_set: bool) -> str:
     """Say what to DO about a failed parse, in words we wrote.
 
@@ -556,6 +605,8 @@ def _friendly_error(e: Exception, vision_set: bool) -> str:
     """
     if isinstance(e, ReceiptRefusal):
         return str(e)[:400]          # our own words — nothing to classify
+    if _is_busy(e):
+        return BUSY_ERROR            # no model slot came free: the sweep retries it
     if isinstance(e, ProseAnswer):
         log.warning("receipt parse failed: the reply held no JSON object")
         return PROSE_ERROR
@@ -745,7 +796,8 @@ def parse_one(conn, receipt_id: str, transport=None,
             "UPDATE receipts SET status='failed', error=%s WHERE id=%s"
             f" AND {_NOT_MANUAL} AND {_ATTEMPT}",
             (_friendly_error(e, bool(vision)), r["id"], attempt))
-        return {"status": "failed", "error": str(e)}
+        return {"status": "failed",
+                "error": BUSY_ERROR if _is_busy(e) else str(e)}
     # bound everything the model returned BEFORE any write: a line whose
     # amount is not a finite number is dropped, a qty that is not becomes
     # unknown, strings are capped — and the writes below then run as one
@@ -805,7 +857,8 @@ def parse_one(conn, receipt_id: str, transport=None,
             "UPDATE receipts SET status='failed', error=%s WHERE id=%s"
             f" AND {_NOT_MANUAL} AND {_ATTEMPT}",
             (_friendly_error(e, bool(vision)), r["id"], attempt))
-        return {"status": "failed", "error": str(e)}
+        return {"status": "failed",
+                "error": BUSY_ERROR if _is_busy(e) else str(e)}
     if r["txn_id"] is None and not is_check:
         # a receipt snapped before its charge: now that its total, date and
         # store are known, look for the charge. Best-effort like the check

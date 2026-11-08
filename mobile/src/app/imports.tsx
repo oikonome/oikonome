@@ -12,13 +12,14 @@ import PullRefresh from "../components/pull-refresh";
 
 import StaleBanner from "../components/stale-banner";
 import { Card, H, HelpLink, KV, Pill } from "../components/ui";
-import { discardPicked, errText, Batch, ColumnMappingNeeded, ImportOutcome,
+import { AccountChoice, discardPicked, errText, Batch, ColumnMappingNeeded, ImportOutcome,
          ImportResult, MappingNeeded, PickedFile, PlanFile, SyncStatus,
          TaxdocPlan, TaxdocRow, YnabAccountsNeeded, YnabDestination }
   from "../lib/api";
 import { BulkJob, BulkJobStatus, bulkJobHeadline, bulkJobLive, bulkJobPoll,
-         keptRowsNote, keptRowsQuestion, parseMoneyDraft, YNAB_SEVERAL,
-         ynabAllAnswered } from "../lib/pure";
+         choiceDetail, describedChoiceOptions,
+         keptRowsNote, keptRowsQuestion, money, parseMoneyDraft,
+         planUnplaced, YNAB_SEVERAL, ynabAllAnswered } from "../lib/pure";
 import { patchQuery, removeFromList } from "../lib/cache";
 import { useSession } from "../lib/session";
 import { useOwner, useSharedLock, useViewer } from "../lib/viewer";
@@ -218,6 +219,27 @@ const SIGNS: [string, string][] = [
 ];
 
 /** Bottom-sheet single-select — the app's <select>. */
+function AccountChoices({ choices, busy, onPick }: {
+  choices: AccountChoice[]; busy?: boolean; onPick: (id: string) => void;
+}) {
+  return (
+    <View style={{ marginTop: 6 }}>
+      {choices.map((c) => (
+        <View key={c.id} style={{ marginTop: 6 }}>
+          <Pressable style={[s.btn, s.btnQuiet, { alignSelf: "flex-start" },
+                             busy && { opacity: 0.5 }]}
+                     disabled={busy} onPress={() => onPick(c.id)}>
+            <Text style={s.btnText}>
+              {c.name}{c.mask ? ` …${c.mask}` : ""}
+            </Text>
+          </Pressable>
+          <Text style={s.mut}>{choiceDetail(c)}</Text>
+        </View>
+      ))}
+    </View>
+  );
+}
+
 function OptionSheet({ title, open, options, onPick, onClose }: {
   title: string; open: boolean;
   options: [string, string][];
@@ -443,9 +465,10 @@ export default function Imports() {
             : st === "error"
               ? `Last sync failed: ${status.data?.progress.error ?? "unknown"}`
               : st === "done" ? "Last sync finished."
-                : "Pull from your connected banks now."}
+                : demo ? "Not available on the demo instance — synthetic data only."
+                  : "Pull from your connected banks now."}
         </Text>
-        {!viewer && (
+        {!viewer && !demo && (
         <View style={{ flexDirection: "row", marginTop: 8 }}>
           <Pressable
             style={[s.btn, (st === "running" || start.isPending)
@@ -463,6 +486,11 @@ export default function Imports() {
             {start.data.reason === "already running"
               ? "A sync is already running."
               : "Could not start a sync just now — try again shortly."}
+          </Text>
+        )}
+        {start.isError && (
+          <Text style={{ color: C.warn, fontSize: 12, marginTop: 6 }}>
+            {errText(start.error)}
           </Text>
         )}
         {/* which connection ended how — the web Maintenance card's
@@ -535,9 +563,19 @@ export default function Imports() {
           {res && (
             <Card>
               {res.error ? (
-                <Text style={{ color: C.bad, fontSize: 13 }}>
-                  {res.error}
-                </Text>
+                <>
+                  <Text style={{ color: C.bad, fontSize: 13 }}>
+                    {res.error}
+                  </Text>
+                  {/* the file goes to the card picked; the YNAB card asks
+                      on its own row */}
+                  {!!res.choices?.length && !mapping && escalate.variables && (
+                    <AccountChoices choices={res.choices}
+                      busy={escalate.isPending}
+                      onPick={(id) => escalate.mutate(
+                        { ...escalate.variables!, accountId: id })} />
+                  )}
+                </>
               ) : (
                 <>
                   <Text style={{ color: C.good, fontSize: 13,
@@ -769,9 +807,18 @@ function PlanReview({ files, onSubmitted, onTaxDocs, onRestore }: {
   if (!plan && !analyze.isPending && !err) return null;
   const importable = (plan?.files ?? []).filter(
     (f) => f.action === "import");
-  const acctName = (id: string | null) =>
-    id === null ? "new account…"
-      : accounts.data?.accounts.find((a) => a.id === id)?.name ?? id;
+  // a row the server could not place (cards sharing their last four)
+  // waits for a pick; the server would refuse the whole plan without one
+  const unplaced = planUnplaced(plan?.files ?? []).length > 0;
+  const acctName = (f: PlanFile) => {
+    if (f.choices?.length)
+      return describedChoiceOptions(f.choices).find(([id]) =>
+        id === f.account_id)?.[1] ?? "choose one…";
+    return f.account_id === null ? "new account…"
+      : accounts.data?.accounts.find((a) => a.id === f.account_id)?.name
+        ?? f.account_id;
+  };
+  const destRow = plan?.files.find((f) => f.index === destFor);
   return (
     <Card>
       {analyze.isPending && (
@@ -819,11 +866,11 @@ function PlanReview({ files, onSubmitted, onTaxDocs, onRestore }: {
                       onPress={() => setDestFor(f.index)}>
                   into:{" "}
                   <Text style={{ color: C.accent }}>
-                    {acctName(f.account_id)} ▾
+                    {acctName(f)} ▾
                   </Text>
                 </Text>
               )}
-              {f.account_id === null
+              {f.account_id === null && !f.choices?.length
                 && f.kind !== "Oikonome export ZIP" && (
                 <TextInput style={s.input} placeholder="new account name"
                            placeholderTextColor={C.mut}
@@ -853,9 +900,10 @@ function PlanReview({ files, onSubmitted, onTaxDocs, onRestore }: {
           ) : null}
           <Pressable style={[s.btn, { alignSelf: "flex-start",
                        marginTop: 8 },
-                       (run.isPending || !importable.length)
+                       (run.isPending || !importable.length || unplaced)
                          && { opacity: 0.5 }]}
-                     disabled={run.isPending || !importable.length}
+                     disabled={run.isPending || !importable.length
+                               || unplaced}
                      onPress={() => run.mutate()}>
             <Text style={s.btnText}>
               {run.isPending ? "starting…"
@@ -871,10 +919,14 @@ function PlanReview({ files, onSubmitted, onTaxDocs, onRestore }: {
           && patch(signFor, { amount_sign: v, sign_certain: true })}
         onClose={() => setSignFor(null)} />
       <OptionSheet title="Destination account" open={destFor !== null}
-        options={[["__new__", "new account…"],
-          ...(accounts.data?.accounts ?? []).map((a) =>
-            [a.id, `${a.name}${a.mask ? ` …${a.mask}` : ""}`] as
-              [string, string])]}
+        options={destRow?.choices?.length
+          // only the accounts the file could mean: a new account under
+          // the same number would lead back to the same question
+          ? describedChoiceOptions(destRow.choices)
+          : [["__new__", "new account…"],
+            ...(accounts.data?.accounts ?? []).map((a) =>
+              [a.id, `${a.name}${a.mask ? ` …${a.mask}` : ""}`] as
+                [string, string])]}
         onPick={(v) => destFor !== null
           && patch(destFor,
                    { account_id: v === "__new__" ? null : v })}
@@ -907,6 +959,14 @@ function YnabAccountsCard({ need, onDone }: {
     Object.fromEntries(need.accounts.map((a) => [a.name,
                                                  a.stored_on_pick > 0])));
   const [destFor, setDestFor] = useState<string | null>(null);
+  // a new-account name that leads to several cards: the ones it could
+  // mean, asked under the YNAB account it was typed for
+  const [asked, setAsked] = useState<{ for: string;
+                                       choices: AccountChoice[] } | null>(null);
+  // the account picked from those choices, with the name typed that led
+  // there: sent together, so the pick is remembered under that name
+  const [picked, setPicked] = useState<Record<string, { id: string;
+                                                        typed: string }>>({});
   const names = need.accounts.map((a) => a.name);
   const nameOf = (id: string) =>
     accounts.data?.accounts.find((a) => a.id === id)?.name ?? id;
@@ -920,13 +980,16 @@ function YnabAccountsCard({ need, onDone }: {
       const removing: Record<string, boolean> = {};
       for (const n of names) {
         answers[n] = dest[n] === "__new__"
-          ? { new: (newName[n] ?? "").trim() } : dest[n];
+          ? { new: (newName[n] ?? "").trim() }
+          : picked[n]?.id === dest[n] ? picked[n] : dest[n];
         removing[n] = !!remove[n] && dest[n] !== need.pick;
       }
       return client!.importYnabAccounts(token, answers, removing);
     },
     onSuccess: (r) => {
       if (r.result.token) setToken(r.result.token);
+      setAsked(r.result.choices?.length && r.result.choice_for !== undefined
+        ? { for: r.result.choice_for, choices: r.result.choices } : null);
       onDone(r.result);
     },
     onError: (e) => onDone({ error: errText(e) }),
@@ -963,6 +1026,14 @@ function YnabAccountsCard({ need, onDone }: {
                        value={newName[a.name] ?? ""}
                        onChangeText={(v) =>
                          setNewName({ ...newName, [a.name]: v })} />
+          )}
+          {asked?.for === a.name && dest[a.name] === "__new__" && (
+            <AccountChoices choices={asked.choices}
+              onPick={(id) => {
+                setDest({ ...dest, [a.name]: id });
+                setPicked({ ...picked, [a.name]:
+                  { id, typed: (newName[a.name] ?? "").trim() } });
+                setAsked(null); }} />
           )}
           {a.stored_on_pick > 0 && !!dest[a.name]
             && dest[a.name] !== need.pick && (
@@ -1134,9 +1205,55 @@ function MappingCard({ need, onDone }: {
 }
 
 // ---- tax & income documents ----
+// The W-2 rows as corrected in the preview, checked the way the commit door
+// checks them, so a misread year or box 1 is fixed before it is stored
+// instead of being stored wrong: a year is a whole 1900–2100, box 1 a
+// finite amount inside the money bound (blank clears it), the employer
+// trimmed (blank is none). Drafts are the typed TEXT, keyed "row:field".
+function settleW2Rows(rows: TaxdocRow[], drafts: Record<string, string>,
+                      parse: (v: string) => number | null):
+    { ok: true; rows: TaxdocRow[] } | { ok: false; error: string } {
+  const out = rows.map((r) => ({ ...r, boxes: { ...(r.boxes ?? {}) } }));
+  for (const [k, v] of Object.entries(drafts)) {
+    const cut = k.indexOf(":");
+    const r = out[Number(k.slice(0, cut))];
+    const f = k.slice(cut + 1);
+    const t = v.trim();
+    if (!r) continue;
+    if (f === "year") {
+      if (!/^\d{4}$/.test(t) || Number(t) < 1900 || Number(t) > 2100)
+        return { ok: false, error: `"${t}" is not a tax year (1900–2100)` };
+      r.year = Number(t);
+    } else if (f === "employer") {
+      r.employer = t ? t.slice(0, 120) : null;
+    } else if (f === "box1") {
+      if (t === "") { delete r.boxes["1"]; r.box1 = null; continue; }
+      const n = parse(t);
+      if (n === null || Math.abs(n) > 1e12)
+        return { ok: false, error: `box 1: "${t}" is not an amount` };
+      r.boxes["1"] = n; r.box1 = n;
+    }
+  }
+  return { ok: true, rows: out };
+}
+
 function TaxDocsCard({ file }: { file: PickedFile | null }) {
   const { client } = useSession();
   const qc = useQueryClient();
+  // where a document goes is the server's answer for the vision task —
+  // the reader of every tax document — never assumed while it loads, and
+  // asked afresh on every visit: a cached "stays here" from before a
+  // Settings → AI change is exactly the claim this line must not make
+  const status = useQuery({ queryKey: ["assistant-status"],
+    queryFn: () => client!.assistantStatus(), enabled: !!client,
+    staleTime: 0 });
+  const vision = status.isFetchedAfterMount ? status.data?.roles?.vision : undefined;
+  const whereLine = !status.isFetchedAfterMount ? " Checking where documents are read…"
+    : !vision ? ""
+    : vision.where === "remote"
+      ? ` Reading a W-2 or 1040 sends the whole document — Social Security numbers included — to ${
+          vision.host || "the remote AI service this instance is configured with"}.`
+      : " Everything stays on this instance.";
   const [plan, setPlan] = useState<TaxdocPlan | null>(null);
   const [rows, setRows] = useState<TaxdocRow[]>([]);
   // the TEXT of each edited cell ("row:field"), parsed only at save — a
@@ -1182,6 +1299,8 @@ function TaxDocsCard({ file }: { file: PickedFile | null }) {
        ["tax_paid", "Total tax"]];
   const setField = (i: number, f: keyof TaxdocRow, v: string) =>
     setDrafts((d) => ({ ...d, [`${i}:${String(f)}`]: v }));
+  const setDraft = (i: number, f: string, v: string) =>
+    setDrafts((d) => ({ ...d, [`${i}:${f}`]: v }));
   // settle the typed cells; one that is not a number stops the save and
   // names the year, instead of going out as NaN (sent as null → dropped)
   const save = () => {
@@ -1215,7 +1334,9 @@ function TaxDocsCard({ file }: { file: PickedFile | null }) {
                 + "tax-documents.md")}>
           docs/tax-documents.md
         </Text>
-        . Everything stays on this instance.
+        .
+        <Text style={vision?.where === "remote"
+          ? { color: C.bad, fontWeight: "600" } : undefined}>{whereLine}</Text>
       </Text>
       {msg && (
         <Text style={{ color: msg.bad ? C.bad : C.good, fontSize: 13 }}
@@ -1288,20 +1409,53 @@ function TaxDocsCard({ file }: { file: PickedFile | null }) {
       )}
       {plan && plan.kind === "w2" && (
         <>
-          {rows.map((r, i) => (
-            <Text key={i} style={[s.mut, { fontSize: 13 }]}>
-              W-2 ·{" "}
-              <Text style={{ color: C.text, fontWeight: "700" }}>
-                {r.employer ?? "unknown employer"}
-              </Text>
-              {" · "}{r.year} · box 1 ${r.box1 ?? "?"}
-              {r.ein ? ` · EIN ${r.ein}` : ""}
-            </Text>
-          ))}
+          {/* what the reader saw, correctable before it is stored: a
+              misread year or box 1 is otherwise stored wrong or discarded */}
+          {rows.map((r, i) => {
+            const cell = (f: string, shown: unknown) =>
+              drafts[`${i}:${f}`] ?? (shown == null ? "" : String(shown));
+            return (
+              <View key={i} style={s.planRow}>
+                <Text style={[s.mut, { fontSize: 13 }]}>
+                  W-2{r.ein ? ` · EIN ${r.ein}` : ""}
+                </Text>
+                <Text style={{ color: C.mut, fontSize: 10 }}>Employer</Text>
+                <TextInput style={[s.input, { paddingVertical: 4 }]}
+                           placeholder="unknown employer"
+                           placeholderTextColor={C.mut}
+                           value={cell("employer", r.employer)}
+                           onChangeText={(v) => setDraft(i, "employer", v)} />
+                <View style={{ flexDirection: "row", gap: 6 }}>
+                  <View style={{ width: "40%" }}>
+                    <Text style={{ color: C.mut, fontSize: 10 }}>Year</Text>
+                    <TextInput style={[s.input, { paddingVertical: 4 }]}
+                               keyboardType="number-pad"
+                               value={cell("year", r.year)}
+                               onChangeText={(v) => setDraft(i, "year", v)} />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ color: C.mut, fontSize: 10 }}>
+                      Box 1 wages
+                    </Text>
+                    <TextInput style={[s.input, { paddingVertical: 4 }]}
+                               keyboardType="numbers-and-punctuation"
+                               placeholder="unread"
+                               placeholderTextColor={C.mut}
+                               value={cell("box1", r.boxes?.["1"] ?? r.box1)}
+                               onChangeText={(v) => setDraft(i, "box1", v)} />
+                  </View>
+                </View>
+              </View>
+            );
+          })}
           <View style={{ flexDirection: "row", gap: 8, marginTop: 8 }}>
             <Pressable style={[s.btn, commit.isPending && { opacity: 0.5 }]}
                        disabled={commit.isPending}
-                       onPress={() => commit.mutate(rows)}>
+                       onPress={() => {
+                         const v = settleW2Rows(rows, drafts, parseMoneyDraft);
+                         if (!v.ok) { setMsg({ text: v.error, bad: true }); return; }
+                         commit.mutate(v.rows);
+                       }}>
               <Text style={s.btnText}>
                 {commit.isPending ? "saving…" : "Store W-2"}
               </Text>

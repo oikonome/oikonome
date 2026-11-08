@@ -248,6 +248,23 @@ class CreateInstanceRaceTests(_Base):
                         "WHERE u.tenant_id = t.id)", (email,)), [])
 
 
+class CreatedInstanceSettingsTests(_Base):
+    def test_a_household_the_operator_creates_opens_today_on_detail(self):
+        """Every way a household is born opens Today on the detail face —
+        signup and first-run setup do, and the operator's door must not
+        leave its households on the absent-means-summary default."""
+        self._login()
+        email = f"face-{uuid.uuid4().hex[:8]}@x.dev"
+        with unittest.mock.patch("oikonome.web.app._deliver_welcome"):
+            r = self.client.post("/admin/console/create-instance",
+                                 data={"email": email})
+        self.assertEqual(r.status_code, 200, r.text[:300])
+        rows = _admin_rows(
+            "SELECT s.config->>'today_view' AS face FROM tenant_settings s "
+            "JOIN tenants t ON t.id = s.tenant_id WHERE t.name=%s", (email,))
+        self.assertEqual([r["face"] for r in rows], ["detail"])
+
+
 class PrivilegeTests(_Base):
     def test_app_role_has_no_grants_on_console_tables(self):
         # migration 026 + the migrate.py re-grant block: SQLi through the

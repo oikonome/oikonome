@@ -18,14 +18,17 @@ import contextlib
 import dataclasses
 import datetime as dt
 import hashlib
+import hmac
 import logging
 import math
 from ..envnum import env_flag
 import re
+import secrets
 from collections import defaultdict
 from typing import Protocol
 
 from ..db import crypto, tenancy
+from . import account_sources, card_number
 from ..engine.compat import MAX_AMOUNT, jsonb, strip_nul
 from . import flowmap, rowcap
 
@@ -335,6 +338,49 @@ def disconnect_item(conn, item_id: str, *,
             "aggregator": agg}
 
 
+def release_fronted_movements(conn, txn_ids: list[str], actor: str) -> int:
+    """Remove the fronted movements (a capitalized cost or one marked
+    reimbursable) on rows about to be hard-deleted. For the writers
+    release_matched_receipts serves, under the same pairing lock, which a
+    booking holds too (entities.live_txn_id), so none lands in between.
+
+    Such a movement is the other half of the cost on the business's books,
+    and the books stop holding that cost when the row goes. The foreign key's
+    SET NULL would keep it, unlinked: capital counts money for a cost that is
+    gone, and neither the one-per-charge check nor its unique index sees a
+    NULL link, so booking the same row after a re-import counts it twice. A
+    draw or distribution that merely names a row is an entry of its own, and
+    keeps only losing the link. So does a movement on a business no longer
+    active: its books are retention records only delete-forever may destroy,
+    and it takes no new booking that could double the cost. FOR SHARE on the
+    business orders this look against an archive committing at the same
+    moment. Each removal is written to the activity log with what it was, so
+    it is never silent (as equity.release_withdrawn_fronted). Returns how
+    many went."""
+    from ..engine import activity, equity
+    ids = [i for i in dict.fromkeys(txn_ids) if i]
+    if not ids:
+        return 0
+    rows = conn.execute(
+        """SELECT m.*, e.name AS entity_name, t.name AS txn_name
+             FROM equity_movement m
+             JOIN transactions t ON t.id = m.txn_id
+             JOIN business_entity e ON e.id = m.entity_id
+            WHERE m.txn_id = ANY(%s) AND m.kind = ANY(%s)
+              AND e.status = 'active'
+              FOR UPDATE OF m FOR SHARE OF e""",
+        (ids, list(equity.FRONTED_KINDS))).fetchall()
+    for r in rows:
+        conn.execute("DELETE FROM equity_movement WHERE id = %s", (r["id"],))
+        activity.record(
+            conn, actor, "business", "released", target=r["txn_id"],
+            label=(f"{r['kind']} of {activity.money(r['amount'])} for "
+                   f"{r['entity_name']} on "
+                   f"{r['txn_name'] or 'a charge'} deleted from the ledger"),
+            detail={"movement": equity._row(r)})
+    return len(rows)
+
+
 def release_matched_receipts(conn, txn_ids: list[str]) -> int:
     """Put every receipt that was PAIRED with one of these rows back to
     waiting. For writers about to hard-delete rows: a receipt snapped
@@ -438,14 +484,19 @@ def _purge_account_data_locked(conn, account_id: str,
         # the delete in one transaction under it: the matcher cannot hang
         # a receipt on one of these rows in between
         hold_pairing_lock(conn)
-        doomed = [r["id"] for r in conn.execute(
-            "SELECT id FROM transactions WHERE account_id=%s", (account_id,))]
-        keep = relied_on_by_feed(conn, doomed, dropping,
-                                 release_accountless=force_kept)
+        doomed = lock_account_rows(conn, account_id)
+        # an archived business's rows are retention records only its
+        # delete-forever may remove (batches._archived_business_rows)
+        from .batches import _archived_business_rows
+        archived = _archived_business_rows(conn, doomed)
+        keep = archived | relied_on_by_feed(
+            conn, [d for d in doomed if d not in archived], dropping,
+            release_accountless=force_kept)
         if keep:
             doomed = [d for d in doomed if d not in keep]
         detach_pairs(conn, doomed)
         release_matched_receipts(conn, doomed)
+        release_fronted_movements(conn, doomed, "a deleted account")
         n_txn = conn.execute(
             "DELETE FROM transactions WHERE account_id=%s"
             " AND NOT id = ANY(%s)", (account_id, list(keep))).rowcount
@@ -464,12 +515,18 @@ def _purge_account_data_locked(conn, account_id: str,
     conn.execute("DELETE FROM liabilities WHERE account_id=%s", (account_id,))
     if keep:
         # The account stays to hold the kept rows, so everything that
-        # names it — its links, the budget settings — stays as it was.
-        note = kept_rows_note(len(keep))
+        # names it — its links, the budget settings — stays as it was. Its
+        # balance does not: the person deleted the account, and no feed
+        # will refresh it again, so it is filed as closed (a NULL balance)
+        # and leaves net worth, card debt and the runway.
+        conn.execute("UPDATE accounts SET balance_current = NULL,"
+                     " balance_available = NULL WHERE id = %s", (account_id,))
+        note = _purge_kept_note(len(keep) - len(archived), len(archived))
         log_sync(conn, "account-purge", 0,
                  error=f"account {account_id}: {note}")
         return {"accounts": 0, "transactions": n_txn, "holdings": n_hold,
                 "crypto_holdings": n_crypto, "kept_transactions": len(keep),
+                "kept_archived": len(archived),
                 "note": note + " The account stays to hold them."}
     conn.execute("DELETE FROM account_links WHERE account_id=%s", (account_id,))
     # budget excluded list may name this account — scrub it. Under the row
@@ -512,6 +569,10 @@ def _purge_account_data_locked(conn, account_id: str,
                         cfg.pop("link_dismissed", None)
     except Exception:                                        # noqa: BLE001
         pass
+    # which sources fill it: a row left behind rides every export and
+    # reads as orphaned on every restore
+    conn.execute("DELETE FROM account_sources WHERE account_id=%s",
+                 (account_id,))
     n_acct = conn.execute(
         "DELETE FROM accounts WHERE id=%s", (account_id,)).rowcount
     # the per-connection entity scope was stamped at checkout; an account
@@ -519,7 +580,52 @@ def _purge_account_data_locked(conn, account_id: str,
     tenancy.set_entity_scope(conn)
     return {"accounts": n_acct, "transactions": n_txn,
             "holdings": n_hold, "crypto_holdings": n_crypto,
-            "kept_transactions": 0}
+            "kept_transactions": 0, "kept_archived": 0}
+
+
+def lock_account_rows(conn, account_id: str) -> list[str]:
+    """Lock, in id order, every row an account delete is about to write —
+    the account's own rows and the rows paired with them (and the rows
+    paired with those), which unlinking a pair rewrites — and return the
+    ids of the account's own rows.
+
+    For the deletes of a whole account, after the pairing lock and before
+    anything looks at a business: the archived-business check and the
+    fronted-cost release take the business row FOR SHARE, and
+    entities.delete_forever takes the booked rows first and the business
+    row last. A delete that held the share lock and only then reached for
+    a row delete-forever holds would deadlock with it; taking the rows
+    first keeps the one order (rows, then business) every writer keeps."""
+    return [r["id"] for r in conn.execute(
+        """WITH own AS (
+               SELECT id FROM transactions WHERE account_id = %s),
+           hop AS (
+               SELECT reimburse_id AS id FROM reimbursements
+                WHERE expense_id IN (SELECT id FROM own)
+               UNION
+               SELECT expense_id FROM reimbursements
+                WHERE reimburse_id IN (SELECT id FROM own)),
+           hop2 AS (
+               SELECT reimburse_id AS id FROM reimbursements
+                WHERE expense_id IN (SELECT id FROM hop)
+               UNION
+               SELECT expense_id FROM reimbursements
+                WHERE reimburse_id IN (SELECT id FROM hop))
+           SELECT t.id, t.account_id FROM transactions t
+            WHERE t.id IN (SELECT id FROM own UNION SELECT id FROM hop
+                           UNION SELECT id FROM hop2)
+            ORDER BY t.id FOR UPDATE OF t""", (account_id,)).fetchall()
+        if r["account_id"] == account_id]
+
+
+def _purge_kept_note(fed: int, archived: int) -> str:
+    """What a delete says about the rows it kept, by why each was kept."""
+    parts = [kept_rows_note(fed)] if fed else []
+    if archived:
+        parts.append(f"{archived} row{'s' if archived != 1 else ''} of an "
+                     "archived business kept: restore the business to "
+                     "remove them, or they stay as its records.")
+    return " ".join(parts)
 
 
 def purge_item_accounts(conn, item_id: str,
@@ -543,7 +649,8 @@ def _purge_item_accounts_locked(conn, item_id: str,
                                 force_kept: bool = False) -> dict:
     ids = item_account_ids(conn, item_id)
     totals = {"accounts": 0, "transactions": 0, "holdings": 0,
-              "crypto_holdings": 0, "kept_transactions": 0}
+              "crypto_holdings": 0, "kept_transactions": 0,
+              "kept_archived": 0}
     for aid in ids:
         # every account of the item goes in this one delete, so a note
         # naming any of them protects nothing (see relied_on_by_feed)
@@ -552,8 +659,9 @@ def _purge_item_accounts_locked(conn, item_id: str,
         for k in totals:
             totals[k] += part[k]
     if totals["kept_transactions"]:
-        totals["note"] = (kept_rows_note(totals["kept_transactions"])
-                          + " The accounts holding them stay.")
+        totals["note"] = (_purge_kept_note(
+            totals["kept_transactions"] - totals["kept_archived"],
+            totals["kept_archived"]) + " The accounts holding them stay.")
     # drop empty child items (bridge itself stays archived for audit)
     conn.execute(
         "DELETE FROM items WHERE aggregator='simplefin-org' AND id LIKE %s "
@@ -850,14 +958,36 @@ _FUEL_WORD = "(gas|fuel)"
 _MIN_BRAND = 3          # two letters match too much to be evidence of anything
 
 
-def _brand_pattern(brand: str) -> str | None:
-    """A regex for this brand followed immediately by a fuel word."""
-    letters = re.sub(r"[^A-Za-z0-9]", "", brand)
-    if len(letters) < _MIN_BRAND:
+# The brand is matched by reading, never by a pattern built from it: a
+# pattern per merchant name is a compile per distinct name (the re module
+# caches a few hundred), tens of milliseconds for a long one, and every
+# upsert and every restored row asks. The text's alphanumerics, lowercased,
+# are searched for the brand's; where they occur with a separator (or the
+# start) before the first, the fixed pattern below must follow the last.
+_ALNUM_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz"
+                         "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+_FUEL_BRAND_RE = re.compile(rf"\b{_FUEL_WORD}\b", re.IGNORECASE)
+_FUEL_AFTER_RE = re.compile(
+    r"[^A-Za-z0-9]+" + _FUEL_WORD + r"(?:[^A-Za-z0-9]|$)", re.IGNORECASE)
+
+
+def _brand_then_fuel(letters: str, text: str):
+    """The fuel-word match following `letters` (lowercased alphanumerics)
+    spelled in `text` with any non-alphanumerics between them and a
+    separator or the start before them; None when no such place exists."""
+    if not _FUEL_AFTER_RE.search(text):
         return None
-    spaced = r"[^A-Za-z0-9]*".join(letters)
-    return (r"(?:^|[^A-Za-z0-9])" + spaced
-            + r"[^A-Za-z0-9]+" + _FUEL_WORD + r"(?:[^A-Za-z0-9]|$)")
+    where = [i for i, ch in enumerate(text) if ch in _ALNUM_CHARS]
+    read = "".join(text[i] for i in where).lower()
+    k = read.find(letters)
+    while k >= 0:
+        first = where[k]
+        if first == 0 or text[first - 1] not in _ALNUM_CHARS:
+            m = _FUEL_AFTER_RE.match(text, where[k + len(letters) - 1] + 1)
+            if m:
+                return m
+        k = read.find(letters, k + 1)
+    return None
 
 
 def fuel_arm(merchant: str | None, orig_desc: str | None,
@@ -870,15 +1000,15 @@ def fuel_arm(merchant: str | None, orig_desc: str | None,
     # already the fuel arm's own name — nothing to promote. This is also
     # what keeps a natural-gas utility ("Northwind Gas") from being
     # renamed "Northwind Gas Gas".
-    if re.search(rf"\b{_FUEL_WORD}\b", brand, re.IGNORECASE):
+    if _FUEL_BRAND_RE.search(brand):
         return None
-    pattern = _brand_pattern(brand)
-    if not pattern:
+    letters = "".join(ch for ch in brand if ch in _ALNUM_CHARS).lower()
+    if len(letters) < _MIN_BRAND:
         return None
     for text in (name, orig_desc):
         if not text:
             continue
-        m = re.search(pattern, text, re.IGNORECASE)
+        m = _brand_then_fuel(letters, text)
         if m:
             return f"{brand} {m.group(1).capitalize()}"
     return None
@@ -930,7 +1060,7 @@ def enrichment_from_raw(raw: dict | None) -> dict:
         for k in ("lat", "lon"):
             try:
                 out[f"location_{k}"] = float(loc[k]) if loc.get(k) is not None else None
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 out[f"location_{k}"] = None
     ad = _s(raw.get("authorized_date"))
     if ad:
@@ -1001,17 +1131,21 @@ def _descriptor(v):
 # under eight consecutive digits, so genuine ledger content survives.
 # Aggregator rows are left alone: their name is the feed's own word, which
 # every sync restates. The id prefixes are the file importers' own; keep
-# migrations 153, 178 and 181 and restore in step with this list.
-LONG_DIGITS_RE = re.compile(r"\d{8,}")
+# migrations 153, 178, 181 and 203 and restore in step with this list.
+LONG_DIGITS_RE = card_number.LONG_RUN_RE
 FILE_IMPORT_ID_PREFIXES = ("pdf:", "csv:", "ofx:", "qif:", "mint:", "ynab:",
                            "monarch:", "copilot:", "simplifi:")
 
 
-def mask_long_digits(text):
-    """`text` with every run of 8+ digits cut to "…" and its last four."""
-    if not isinstance(text, str):
-        return text
-    return LONG_DIGITS_RE.sub(lambda m: "…" + m.group()[-4:], text)
+# What a card or account number is, and its cut, are sync.card_number's;
+# these are the names the rest of the product has always called them by.
+# The hash input of a file row (FileImportIds.id_for) stays on the
+# unbroken-run cut, so widening the stored-name cut never re-ids a row: a
+# row whose hash input still holds a number in groups is stored under its
+# keyed form from the moment it lands (FileImportIds._key_hashed_over_a_number),
+# and the keying pass (key_file_import_ids) takes one stored before.
+mask_long_digits = card_number.cut_for_hash
+mask_account_name = card_number.cut
 
 
 # The source cells of a file row that hold free text a statement prints a
@@ -1024,7 +1158,7 @@ def mask_long_digits(text):
 # under each spelling it missed. The cells a row has beyond its header
 # arrive under the key None (an unquoted comma in the last free-text
 # column) — stored as "null" — and are that column's text by position,
-# so they count as free text too. Migrations 178 and 181 apply the same
+# so they count as free text too. Migrations 178, 181 and 203 apply the same
 # keys to rows already stored; keep them in step. The source account's
 # name (_SPLIT_SOURCE_KEYS) is cut the same way, migration 199 for the
 # rows already stored.
@@ -1053,8 +1187,8 @@ def _free_text_key(k) -> bool:
 
 
 def mask_file_raw(raw, *texts):
-    """A file row's raw with long digit runs masked (mask_long_digits) in
-    every cell that holds the row's name or merchant, or that a statement
+    """A file row's raw with card and long numbers masked
+    (mask_account_name, as the stored name is) in every cell that holds the row's name or merchant, or that a statement
     fills with free text (a memo, a payee, a description, the overflow
     cells past the header).
 
@@ -1067,24 +1201,221 @@ def mask_file_raw(raw, *texts):
     it was."""
     if not isinstance(raw, dict):
         return raw
-    want = {mask_long_digits(x.strip()).lower() for x in texts
+    want = {mask_account_name(x.strip()).lower() for x in texts
             if isinstance(x, str) and x.strip()}
 
-    def cut(v, free):
+    def cut(v, free, source):
         if isinstance(v, str) and (
-                free or mask_long_digits(v.strip()).lower() in want):
-            return mask_long_digits(v)
+                source or free
+                or mask_account_name(v.strip()).lower() in want):
+            return mask_account_name(v)
         return v
 
     out = {}
     for k, v in raw.items():
         free = _free_text_key(k)
+        # a source account's name is a typed name, cut as one: a card
+        # number in groups too (mask_account_name), as the account's id
+        # and name are
+        source = (k is not None
+                  and str(k).strip().lower() in _SPLIT_SOURCE_KEYS)
         if isinstance(v, (list, tuple)):
-            v = [cut(x, free) for x in v]
+            v = [cut(x, free, source) for x in v]
         else:
-            v = cut(v, free)
+            v = cut(v, free, source)
         out[k] = v
     return out
+
+
+# A file row's id is an unkeyed hash of "<account id>|date|cents|name|n",
+# and every input rides the export beside the row, the name with any long
+# number cut to its last four. Two kinds of row hashed a full number the
+# export no longer shows. An account an earlier release named by its full
+# number (a split source, see rekey_numbered_accounts) had it in its
+# id, and the last four show in the moved account's id. A row imported
+# before names were masked (FileImportIds.legacy_id) had it in its name,
+# and the last four show in the masked name. Either way the number was a
+# short search away. Those rows are re-id'd as "<prefix>:k" plus the HMAC
+# of their old id under a secret each household keeps and no export
+# carries (txn_id_keys, migration 202). The "k" can never begin a hex
+# digest, so a keyed id is never keyed twice, and the prefix is kept, so
+# every test of where a row came from still holds. A re-import recomputes
+# the old id (the file spells the old account id and the full name again)
+# and finds the row under its keyed form. The secret never travels, so a
+# row restored from another household's archive is re-keyed on the way in
+# under the id an import here mints for its line (restore.
+# _plan_foreign_keyed_txns), and a keyed row no secret here explains is
+# still found by its content (FileImportIds._adopt_by_content).
+KEYED_ID_MARK = "k"
+_PREFIX_ALTS = "|".join(p.rstrip(":") for p in FILE_IMPORT_ID_PREFIXES)
+# an unkeyed file-row id, in a pattern Python and PostgreSQL both read:
+# the 40-hex digest FileImportIds mints, or the same digest cut to 20,
+# which a ledger migrated in from another tool may carry under the same
+# prefixes and hash the same kind of line into
+UNKEYED_FILE_ID_PATTERN = (
+    rf"^({_PREFIX_ALTS}):[0-9a-f]{{20}}([0-9a-f]{{20}})?$")
+_UNKEYED_FILE_ID_RE = re.compile(UNKEYED_FILE_ID_PATTERN)
+# the mark mask_long_digits leaves where it cut a run of digits: a name
+# holding it may once have held the whole run, and its id been hashed so
+MASKED_RUN_PATTERN = card_number.CUT_MARK_PATTERN
+# an OFX row keyed by the bank's FITID names its account in plain text
+# ("ofx:<account id>:<fitid>"); one that names a numbered manual id is
+# moved onto the account it is on now, the id an OFX re-import makes
+NUMBERED_OFX_ID_PATTERN = r"^ofx:manual:[^:]*[0-9]{8}"
+_NUMBERED_OFX_ID_RE = re.compile(r"^ofx:(manual:[^:]*):(.*)$", re.S)
+# the id an account moved off that spelled a full number: in full (an
+# adoption recorded before re-keys cut it) or cut (split_lineage_id)
+NUMBERED_LINEAGE_PATTERN = (
+    f"^manual:[^:]*({card_number.CUT_MARK_PATTERN}|[0-9]{{8}})")
+
+
+def keyed_file_id(secret: bytes, tid: str) -> str:
+    """The keyed form of the file-row id `tid` under a household's secret."""
+    prefix = tid.split(":", 1)[0]
+    return f"{prefix}:{KEYED_ID_MARK}" + hmac.new(
+        secret, tid.encode("utf-8"), hashlib.sha1).hexdigest()
+
+
+def txn_id_secret(conn, *, create: bool = False) -> bytes | None:
+    """The household's secret for keyed file-row ids; None when it has none
+    and `create` is false. Read on the household's own connection only: the
+    filter is spelled out so a connection outside RLS fails rather than
+    reading another household's."""
+    row = conn.execute(
+        "SELECT secret FROM txn_id_keys WHERE tenant_id ="
+        " NULLIF(current_setting('app.tenant_id', true), '')::uuid"
+    ).fetchone()
+    if row is None:
+        if not create:
+            return None
+        conn.execute(
+            "INSERT INTO txn_id_keys (secret) VALUES (%s)"
+            " ON CONFLICT (tenant_id) DO NOTHING",
+            (crypto.encrypt(conn, secrets.token_hex(32)),))
+        row = conn.execute(
+            "SELECT secret FROM txn_id_keys WHERE tenant_id ="
+            " NULLIF(current_setting('app.tenant_id', true), '')::uuid"
+        ).fetchone()
+    return crypto.decrypt(conn, row["secret"]).encode("utf-8")
+
+
+def _held_ids(conn, ids, account_id: str | None = None) -> set[str]:
+    """Which of `ids` the household holds (on `account_id`, when given),
+    looked up a slice at a time."""
+    ids = sorted(set(ids))
+    out: set[str] = set()
+    for i in range(0, len(ids), ADOPT_SLICE):
+        part = ids[i:i + ADOPT_SLICE]
+        if account_id is None:
+            rows = conn.execute(
+                "SELECT id FROM transactions WHERE id = ANY(%s)", (part,))
+        else:
+            rows = conn.execute(
+                "SELECT id FROM transactions WHERE id = ANY(%s)"
+                "   AND account_id = %s", (part, account_id))
+        out.update(r["id"] for r in rows.fetchall())
+    return out
+
+
+def held_forms(conn, ids, account_id: str | None = None) -> dict[str, str]:
+    """Each of `ids` the household holds (on `account_id`, when given) ->
+    the id it is held under: itself, or its keyed form (keyed_file_id)
+    when the row was re-id'd under the household's secret after the id
+    was minted. Every door that recomputes the id an earlier import gave a
+    line (a sign or year reading since corrected) asks through here, so a
+    keyed row is found where its plain id would have been. Only an
+    unkeyed file-row id has a keyed form, and only this household's secret
+    is tried, so a household with none hashes nothing: a row keyed under
+    another household's secret is re-keyed when a restore brings it
+    (restore._plan_foreign_keyed_txns), and an import finds one that was
+    not by its content (FileImportIds._adopt_by_content)."""
+    ids = {i for i in ids if i}
+    if not ids:
+        return {}
+    out = {i: i for i in _held_ids(conn, ids, account_id)}
+    rest = [i for i in ids if i not in out and _UNKEYED_FILE_ID_RE.match(i)]
+    if rest:
+        secret = txn_id_secret(conn)
+        if secret is not None:
+            keyed = {keyed_file_id(secret, i): i for i in rest}
+            for k in _held_ids(conn, keyed, account_id):
+                out[keyed[k]] = k
+    return out
+
+
+# a keyed file-row id, as keyed_file_id writes it, in a pattern Python and
+# PostgreSQL both read. Spelled out to the digest: an OFX row keyed by the
+# bank's FITID ("ofx:<account id>:<fitid>") may begin with the same mark
+# when the account id does.
+KEYED_FILE_ID_PATTERN = (
+    rf"^({_PREFIX_ALTS}):{KEYED_ID_MARK}[0-9a-f]{{40}}$")
+
+
+def line_shape(date, amount, name) -> tuple | None:
+    """What a file row's plain id hashes besides its account id and its
+    occurrence — the date, the signed cents, the name with any long run of
+    digits cut — read the way the row is stored (the name kept to
+    MAX_DESCRIPTOR, without the NULs the upsert drops), so a line in a
+    file and its stored row compare equal. None when the amount or date
+    cannot be read."""
+    try:
+        cents = round(float(amount) * 100)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if date is None:
+        return None
+    if not isinstance(date, dt.date):
+        try:
+            date = dt.date.fromisoformat(str(date)[:10])
+        except ValueError:
+            return None
+    return (date, cents,
+            (_descriptor(mask_account_name((name or "").replace("\x00", "")))
+             or "").lower())
+
+
+def file_id_pattern(prefix: str, *, plain: bool = False) -> str:
+    """The ids importer `prefix` mints, in a pattern Python and PostgreSQL
+    both read: its keyed ids, and with `plain` its unkeyed hashes too —
+    never an OFX row keyed by the bank's FITID, which is its own line."""
+    keyed = f"{KEYED_ID_MARK}[0-9a-f]{{40}}"
+    body = f"({keyed}|[0-9a-f]{{20}}([0-9a-f]{{20}})?)" if plain else keyed
+    return rf"^{re.escape(prefix)}:{body}$"
+
+
+def rows_by_line_shape(conn, prefix: str, account_id: str, dates, *,
+                       plain: bool = False, skip=()) -> dict[tuple, list]:
+    """The rows importer `prefix` holds on `account_id` on any of `dates`
+    under an id file_id_pattern matches, by line_shape, each shape's ids
+    in id order; `skip` left out. The pool a line no id finds is matched
+    against by its content (FileImportIds._adopt_by_content, restore.
+    _plan_foreign_keyed_txns): each row stands for one line, so a caller
+    takes from the front of a shape's list and never takes a row twice."""
+    pool: dict[tuple, list[str]] = defaultdict(list)
+    dates = sorted(set(dates))
+    if not dates:
+        return pool
+    skip = set(skip)
+    for r in conn.execute(
+            "SELECT id, date, amount, name FROM transactions"
+            " WHERE account_id = %s AND id ~ %s AND date = ANY(%s)"
+            " ORDER BY id",
+            (account_id, file_id_pattern(prefix, plain=plain),
+             dates)).fetchall():
+        shape = line_shape(r["date"], r["amount"], r["name"])
+        if shape is not None and r["id"] not in skip:
+            pool[shape].append(r["id"])
+    return pool
+
+
+def file_row_id(prefix: str, account_id: str, date, amount, name: str,
+                n: int) -> str:
+    """The plain id FileImportIds gives the n-th identical line on an
+    account, its name hashed masked: the id an import mints for it now."""
+    ids = FileImportIds(prefix, account_id)
+    return ids._hash(f"{account_id}|{date.isoformat()}|"
+                     f"{round(amount * 100)}|{mask_long_digits(name).lower()}",
+                     n)
 
 
 class FileImportIds:
@@ -1111,12 +1442,35 @@ class FileImportIds:
         # id, which a re-key records only with its number cut (see
         # split_lineage_id); the file being imported spells it again
         self._known_former = tuple(a for a in former if a and a != account_id)
+        # one instance may serve several source groups of one file that
+        # resolved to the same account (two sources whose names cut alike):
+        # their occurrence numbering is then shared, so identical lines
+        # from both get distinct ids instead of the second overwriting the
+        # first, and each group's former ids are added as it joins
+
         self._occ: dict[str, int] = {}
         self._legacy_occ: dict[str, int] = {}
         self._legacy_of: dict[str, str] = {}
         # every id this import minted -> the hash inputs after the account
         # id, so the same line can be re-hashed under a former account id
         self._tails: dict[str, list[str]] = {}
+        # the household's secret for keyed ids, read once on first need;
+        # False until then (None is "the household has none")
+        self._secret: bytes | None | bool = False
+        # every stored id this instance has resolved a line to: one
+        # instance may serve several source groups of a file, and a row
+        # handed to one group's line is not free for another's
+        self._issued: set[str] = set()
+        # the ids this import minted over text still holding a card number
+        # in groups, which the hash input keeps whole (see sync.card_number)
+        self._over_a_number: set[str] = set()
+
+    def also_former(self, former) -> None:
+        """Add a source group's former ids (see __init__) to this shared
+        instance."""
+        more = tuple(a for a in former if a and a != self.account_id
+                     and a not in self._known_former)
+        self._known_former = self._known_former + more
 
     def _hash(self, base: str, n: int) -> str:
         return f"{self.prefix}:" + hashlib.sha1(
@@ -1130,6 +1484,8 @@ class FileImportIds:
         self._occ[base] = self._occ.get(base, 0) + 1
         tid = self._hash(base, self._occ[base])
         tails = [f"{tail}{masked.lower()}|{self._occ[base]}"]
+        if mask_account_name(masked) != masked:
+            self._over_a_number.add(tid)
         if masked != name:
             old = head + name.lower()
             self._legacy_occ[old] = self._legacy_occ.get(old, 0) + 1
@@ -1145,16 +1501,133 @@ class FileImportIds:
 
     def resolve(self, conn, txns: list[Transaction]) -> list[Transaction]:
         """`txns` with each id swapped for the id its row already stands
-        under: the pre-masking id, or the id an earlier import of the same
-        line gave it while the account had another id."""
+        under: the pre-masking id, the keyed form of either (see
+        keyed_file_id), or the id an earlier import of the same line gave
+        it while the account had another id, plain or keyed. A new line
+        whose id hashes a whole card number takes its keyed form at once."""
         if self._legacy_of:
             have = {x["id"] for x in conn.execute(
                 "SELECT id FROM transactions WHERE id = ANY(%s)",
                 (list(self._legacy_of.values()),)).fetchall()}
+            have -= self._issued
             txns = [dataclasses.replace(t, id=self._legacy_of[t.id])
                     if self._legacy_of.get(t.id) in have else t
                     for t in txns]
-        return self._adopt_renamed(conn, txns)
+        txns = self._adopt_keyed(conn, txns)
+        txns = self._adopt_renamed(conn, txns)
+        out = self._key_hashed_over_a_number(
+            conn, self._adopt_by_content(conn, txns))
+        self._issued.update(t.id for t in out)
+        return out
+
+    def _key_hashed_over_a_number(self, conn, txns: list[Transaction]
+                                  ) -> list[Transaction]:
+        """Swap in the keyed form of an id hashed over a whole card number
+        for a line no stored row holds. The stored name shows the last four
+        and every other hash input rides the export beside the row, so the
+        plain id would leave the number a short search away from anyone
+        holding an export. A row already held under the plain id stays there
+        for the keying pass (key_file_import_ids), which moves it with every
+        reference to it."""
+        mine = [t for t in txns if t.id in self._over_a_number]
+        if not mine:
+            return txns
+        held = _held_ids(conn, [t.id for t in mine])
+        fresh = {t.id for t in mine} - held
+        if not fresh:
+            return txns
+        if not self._secret_of(conn):
+            self._secret = txn_id_secret(conn, create=True)
+        return [dataclasses.replace(t, id=keyed_file_id(self._secret, t.id))
+                if t.id in fresh else t for t in txns]
+
+    def _adopt_by_content(self, conn, txns: list[Transaction]
+                          ) -> list[Transaction]:
+        """Swap in a keyed row of this importer on this account that holds
+        the same line, when no id found one.
+
+        A keyed id is a function of the secret of the household that
+        keyed it, and an archive carries the ids but never the secret, so
+        a household that restored them from another (or lost its own)
+        cannot recompute them; without this a re-import adds every such
+        line again beside its restored row, counting it twice, and the
+        cross-source dedup deliberately skips the importer's own rows. The
+        fields compared are the ones the plain id hashes besides the
+        account id (line_shape), so the row taken is the one the id would
+        have found; each stored row stands for one line, and identical
+        lines take identical rows in file order, as their occurrence
+        numbers would. Nothing is read unless the account holds a keyed
+        row of this importer."""
+        mine = [t for t in txns if t.id in self._tails
+                and t.account_id == self.account_id]
+        if not mine:
+            return txns
+        if not conn.execute(
+                "SELECT 1 FROM transactions WHERE account_id = %s"
+                "   AND id ~ %s LIMIT 1",
+                (self.account_id, file_id_pattern(self.prefix))).fetchone():
+            return txns
+        held = _held_ids(conn, [t.id for t in mine])
+        mine = [t for t in mine if t.id not in held]
+        if not mine:
+            return txns
+        pool = rows_by_line_shape(conn, self.prefix, self.account_id,
+                                  [t.date for t in mine],
+                                  skip={t.id for t in txns} | self._issued)
+        swap: dict[str, str] = {}
+        for t in mine:
+            shape = line_shape(t.date, t.amount, t.name)
+            rows = pool.get(shape) if shape is not None else None
+            if rows:
+                swap[t.id] = rows.pop(0)
+        if not swap:
+            return txns
+        return [dataclasses.replace(t, id=swap[t.id]) if t.id in swap else t
+                for t in txns]
+
+    def _secret_of(self, conn) -> bytes | None:
+        if self._secret is False:
+            self._secret = txn_id_secret(conn)
+        return self._secret
+
+    def _adopt_keyed(self, conn, txns: list[Transaction]
+                     ) -> list[Transaction]:
+        """Swap in the keyed form of an id this import minted, or of its
+        pre-masking twin, when that is what the household holds: the row
+        was re-id'd under the household's secret after it was imported.
+        A household with no secret hashes nothing here; a keyed row no
+        secret here explains is _adopt_by_content's."""
+        mine = [t for t in txns if t.id in self._tails]
+        if not mine:
+            return txns
+        secret = self._secret_of(conn)
+        if secret is None:
+            return txns
+        present = _held_ids(conn, [t.id for t in mine])
+        want: dict[str, list[str]] = {}
+        for t in mine:
+            if t.id in present:
+                continue
+            forms = [t.id]
+            if t.id in self._legacy_of:
+                forms.append(self._legacy_of[t.id])
+            want[t.id] = [keyed_file_id(secret, f) for f in forms]
+        if not want:
+            return txns
+        have = _held_ids(conn, [k for ks in want.values() for k in ks])
+        # a row an earlier source group of this file took is spoken for
+        taken = {t.id for t in txns} | self._issued
+        swap: dict[str, str] = {}
+        for tid, keyed in want.items():
+            for k in keyed:
+                if k in have and k not in taken:
+                    swap[tid] = k
+                    taken.add(k)
+                    break
+        if not swap:
+            return txns
+        return [dataclasses.replace(t, id=swap[t.id]) if t.id in swap else t
+                for t in txns]
 
     def _former_account_ids(self, conn) -> list[str]:
         """Every id this account has stood under before: the ids adoption
@@ -1233,7 +1706,11 @@ class FileImportIds:
         former = self._former_account_ids(conn)
         if not former:
             return txns
-        per_former = sum(len(self._tails[t.id]) for t in missing)
+        # a row re-id'd under the household's secret is found by the keyed
+        # form of the same guess, so each guess counts twice then
+        secret = self._secret_of(conn)
+        per_former = sum(len(self._tails[t.id]) for t in missing) * (
+            1 if secret is None else 2)
         keep = max(1, ADOPT_MAX_GUESSES // max(1, per_former))
         if keep < len(former):
             log.warning("file import into %s: id adoption limited to %d of "
@@ -1241,7 +1718,8 @@ class FileImportIds:
                         len(former))
             former = former[:keep]
         budget = ADOPT_MAX_GUESSES
-        taken = {t.id for t in txns}
+        # a row an earlier source group of this file took is spoken for
+        taken = {t.id for t in txns} | self._issued
         swap: dict[str, str] = {}
         for i in range(0, len(missing), ADOPT_SLICE):
             if budget <= 0:
@@ -1252,6 +1730,8 @@ class FileImportIds:
                 gs = [self._hash(a + tail.rsplit("|", 1)[0],
                                  int(tail.rsplit("|", 1)[1]))
                       for a in former for tail in self._tails[t.id]]
+                if secret is not None:
+                    gs += [keyed_file_id(secret, g) for g in gs]
                 budget -= len(gs)
                 guess[t.id] = gs
                 part.append(t)
@@ -1465,8 +1945,10 @@ def _write_rows(conn, txns: list[Transaction], hidden: set,
         # payee name actually come in (see MAX_DESCRIPTOR) — read from here
         # on, so every derivation below and the row itself agree
         filed = is_file_import_id(t.id)
-        line = _descriptor(mask_long_digits(t.name) if filed else t.name)
-        named = _descriptor(mask_long_digits(t.merchant_name) if filed
+        # the stored text is cut wider than the id's hash input: see
+        # sync.card_number
+        line = _descriptor(mask_account_name(t.name) if filed else t.name)
+        named = _descriptor(mask_account_name(t.merchant_name) if filed
                             else t.merchant_name)
         # who decided category_primary — the row can say WHY it is what it
         # is (Plaid's own PFC / an importer's map / a flow normalization /
@@ -1487,7 +1969,7 @@ def _write_rows(conn, txns: list[Transaction], hidden: set,
         # quadratically on a long enough run of brackets or spaces.
         raw = t.raw
         desc = (raw or {}).get("original_description")
-        desc = (_descriptor(mask_long_digits(desc) if filed else desc)
+        desc = (_descriptor(mask_account_name(desc) if filed else desc)
                 if isinstance(desc, str) else None)
         if filed and isinstance(raw, dict) and isinstance(
                 raw.get("original_description"), str) and len(
@@ -1510,7 +1992,7 @@ def _write_rows(conn, txns: list[Transaction], hidden: set,
         # above do write merchant_name, and the difference is real — they
         # fire only when the aggregator supplied nothing usable, so they
         # recover a merchant rather than override a correct one.
-        merchant = _descriptor(mask_long_digits(merchant) if filed
+        merchant = _descriptor(mask_account_name(merchant) if filed
                                else merchant)
         outlet = fuel_arm(merchant, desc, line)
         # A row the bank itself labels as this brand's pump is fuel,
@@ -2094,8 +2576,11 @@ def check_split_accounts(names) -> None:
 
 
 def tally_split(counts: dict, name: str, n: int) -> None:
-    """Add `n` rows to a split result keyed by account name; two source
-    names that mask alike share one key rather than one hiding the other."""
+    """Add `n` rows to a split result keyed by account name, cut as the
+    account's own name is (mask_account_name: the result is shown and
+    logged); two source names that mask alike share one key rather than
+    one hiding the other."""
+    name = mask_account_name(name)
     counts[name] = counts.get(name, 0) + n
 
 
@@ -2118,12 +2603,16 @@ def infer_account_type(name: str | None) -> tuple[str, str | None]:
     return "depository", "checking"
 
 
-def _split_source(text: str) -> str:
+def _split_source(text: str, *, grouped_whole: bool = False) -> str:
     """A source account name as its identity is compared: the full account
-    number cut to its last four (mask_long_digits), case and spacing
-    folded. Rows store the source name masked, so both sides of every
-    comparison are masked."""
-    return " ".join(mask_long_digits((text or "").strip()).casefold().split())
+    number cut to its last four, typed in groups or not (mask_account_name),
+    case and spacing folded. Rows store the source name masked, so both
+    sides of every comparison are masked; a row an earlier build stored
+    with a grouped number whole is cut here on the way in. `grouped_whole`
+    cuts only unbroken runs, as those builds did, to recompute an id they
+    minted."""
+    cut = mask_long_digits if grouped_whole else mask_account_name
+    return " ".join(cut((text or "").strip()).casefold().split())
 
 
 def _holds_source(conn, aid: str, prefix: str, me: str) -> bool | None:
@@ -2174,15 +2663,16 @@ def _adopted_split_account(conn, starts, prefix: str, me: str,
     todo: list[str] = []
     for s in starts:
         todo.append(s)
-        cut = split_lineage_id(s)
-        if cut == s:
-            continue
-        if len(_lineage_targets(conn, cut)) > 1:
-            found = _lineage_by_rows(conn, prefix, s, cut, lines)
-            if found is not None and _holds_source(conn, found, prefix, me):
-                return found
-            continue
-        todo.append(cut)
+        for cut in lineage_keys(s):
+            if cut == s:
+                continue
+            if len(_lineage_targets(conn, cut)) > 1:
+                found = _lineage_by_rows(conn, prefix, s, cut, lines)
+                if (found is not None
+                        and _holds_source(conn, found, prefix, me)):
+                    return found
+                continue
+            todo.append(cut)
     todo = list(dict.fromkeys(todo))
     seen = set(todo)
     while todo and len(seen) < 32:
@@ -2244,6 +2734,10 @@ def _lineage_by_rows(conn, prefix: str, legacy: str, cut: str, lines
             probe.add(ids.legacy_id(tid))
     if not probe:
         return None
+    # rows re-id'd under the household's secret answer to the keyed form
+    secret = txn_id_secret(conn)
+    if secret is not None:
+        probe |= {keyed_file_id(secret, p) for p in probe}
     held = [r["account_id"] for r in conn.execute(
         "SELECT DISTINCT account_id FROM transactions"
         " WHERE id = ANY(%s) AND account_id = ANY(%s)",
@@ -2271,6 +2765,49 @@ def split_legacy_id(prefix: str, src: str) -> str:
     return f"manual:{prefix}-{_split_slug(src.strip())}"
 
 
+# The "-N" an account door appends when the slug a name gives is taken
+# ("Checking!" beside "Checking?": web/api and web/bulk_import count from
+# 2). The cut never takes a short group after a number into it
+# (sync.card_number), so "visa-4111-1111-1111-1111-2" cuts to
+# "visa-…1111-2" either way; what this decides is whether the "-2" is a
+# door's mark, which a move records beside the cut last four, or the
+# number's own last group. It reads as a mark only when the digits before
+# it still spell a full number on their own (card_number.ends_in_number). A door counts from 2
+# and cut_lineage_candidates walks no further than CUT_LINEAGE_MAX_SUFFIX,
+# so a longer or zero-led group ("-0012-3456-7890-123") is the number's
+# own. Shape alone cannot tell "-12" the door wrote from a number's own
+# last group, so what a move STORES asks the household too (door_suffix).
+_COLLISION_SUFFIX_RE = re.compile(r"^(.*\d)(-[1-9]\d?)$", re.S)
+
+
+def collision_suffix(old: str) -> tuple[str, str]:
+    """(`old` without its trailing "-N" collision suffix, the suffix), or
+    (`old`, "") when it has none: see _COLLISION_SUFFIX_RE."""
+    m = _COLLISION_SUFFIX_RE.match(old or "")
+    if (m and 2 <= int(m.group(2)[1:]) <= CUT_LINEAGE_MAX_SUFFIX
+            and card_number.ends_in_number(m.group(1))):
+        return m.group(1), m.group(2)
+    return old, ""
+
+
+def door_suffix(conn, old: str) -> tuple[str, str]:
+    """collision_suffix, kept only when the id without it is an account
+    or a move recorded one (a door appends "-N" only because that id was
+    taken). Otherwise the digits are the number's own last group, and
+    keeping them beside a cut last four would store more of the number
+    than four digits."""
+    head, suffix = collision_suffix(old)
+    if suffix and (conn.execute("SELECT 1 FROM accounts WHERE id = %s",
+                                (head,)).fetchone()
+                   or _has_lineage_record(conn, head)):
+        return head, suffix
+    return old, ""
+
+
+def _cut_lineage(head: str, suffix: str = "") -> str:
+    return mask_account_name(head) + suffix
+
+
 def split_lineage_id(old: str) -> str:
     """What a re-key records as the id an account moved off: the old id
     with every full number cut to its last four. The record must not keep
@@ -2279,8 +2816,29 @@ def split_lineage_id(old: str) -> str:
     whose last four the new id shows is a short search away from any
     unkeyed hash. A re-import needs the full id only to recompute its rows'
     ids, and the file it reads spells that id again (split_legacy_id).
-    Keep in step with migration 199."""
-    return mask_long_digits(old)
+    A run of eight digits is cut first, exactly as migration 199 cut it,
+    so every record it wrote is still found under this form; a card
+    number typed in groups ("visa-4111-1111-1111-1111", which holds no
+    run of eight) is cut after, the way mask_account_name cuts a typed
+    name. A door's "-N" collision suffix after the number is kept after its
+    cut last four (collision_suffix), so each suffixed account keeps a
+    lineage of its own. What a move stores is recorded_lineage_id, which
+    keeps the suffix only when the household shows a door wrote it; a
+    lookup tries both forms (lineage_keys)."""
+    return _cut_lineage(*collision_suffix(old))
+
+
+def recorded_lineage_id(conn, old: str) -> str:
+    """The cut form a move records for `old`: split_lineage_id with a
+    trailing "-N" kept only when door_suffix confirms it."""
+    return _cut_lineage(*door_suffix(conn, old))
+
+
+def lineage_keys(old: str) -> list[str]:
+    """Every cut form a move may have recorded `old` under: its door's
+    suffix kept (split_lineage_id) or cut with the number
+    (recorded_lineage_id when no door wrote it)."""
+    return sorted({split_lineage_id(old), _cut_lineage(old)})
 
 
 def split_former(prefix: str, src: str, target: str) -> tuple[str, ...]:
@@ -2293,24 +2851,30 @@ def split_former(prefix: str, src: str, target: str) -> tuple[str, ...]:
 
 
 def split_account_id(prefix: str, src: str, *, taken: bool = False,
-                     hex_digest: bool = False) -> str:
-    """The id a source account gets when nothing earlier claims it.
+                     hex_digest: bool = False,
+                     grouped_whole: bool = False) -> str:
+    """The id a build before opaque ids gave a source account when nothing
+    earlier claimed it — only for finding the accounts those builds made
+    (ensure_split_account); a new split account's id is minted
+    (account_sources.mint_id), never derived from the source.
 
     The slug of the source name with any full account number cut to its
-    last four (an id is permanent and rides every export row). A slug that
-    drops what tells two names apart — cut at 40 characters, or a name in
-    a script the slug cannot spell — carries a short digest of the source,
-    so two such accounts never share an id; so does one whose readable id
-    another source already holds (`taken`). `hex_digest` spells that
-    digest as a build before letter_digest did, for finding its accounts."""
-    masked = mask_long_digits(src.strip())
+    last four. A slug that dropped what tells two names apart — cut at 40
+    characters, or a name in a script the slug cannot spell — carried a
+    short digest of the source; so did one whose readable id another
+    source already held (`taken`). `hex_digest` spells that digest as a
+    build before letter_digest did, and `grouped_whole` cuts only unbroken
+    runs as a build before grouped numbers were cut did."""
+    masked = (mask_long_digits if grouped_whole else mask_account_name)(
+        src.strip())
     full = re.sub(r"[^a-z0-9]+", "-", masked.lower()).strip("-")
     slug = full[:40]
     lossy = (not slug or len(full) > 40
              or any(ch.isalpha() and not ch.isascii() for ch in masked))
     if not lossy and not taken:
         return f"manual:{prefix}-{slug}"
-    digest = hashlib.sha1(_split_source(src).encode("utf-8")).hexdigest()
+    digest = hashlib.sha1(_split_source(
+        src, grouped_whole=grouped_whole).encode("utf-8")).hexdigest()
     digest = digest[:8] if hex_digest else letter_digest(digest)
     return f"manual:{prefix}-{(slug or 'x')[:31]}-{digest}"
 
@@ -2319,15 +2883,137 @@ def ensure_split_account(conn, prefix: str, name: str, *,
                          key: str | None = None,
                          type_: str | None = None,
                          subtype: str | None = None,
-                         lines=None) -> str:
+                         lines=None, source: str | None = None,
+                         fitids=None) -> str:
     """A manual account for one source-side account of a multi-account
-    file (the competitor exports, Mint, OFX). Stable id from `key`
-    (default: the source's account name) → re-imports land on the same
-    account; existing rows — including a user rename or reclassification —
-    are never overwritten. Type defaults to the name-based inference
-    unless the caller knows better (OFX statements do).
+    file (Mint CSV, OFX, QIF). Re-imports land on the
+    same account; existing rows — including a user rename or
+    reclassification — are never overwritten. Type defaults to the
+    name-based inference unless the caller knows better (OFX statements
+    do).
 
-    Where the rows already are decides, and the import never re-keys:
+    The source is `source` when the importer has the account's own number
+    (OFX's ACCTID), else `key` or the source name. Its row in
+    account_sources names the account it fills. A source with none yet is
+    found where a build before opaque ids put it, and the import never
+    re-keys (_earlier_split_account), then remembered there. Otherwise —
+    or when that account already answers to a DIFFERENT full number (two
+    cards sharing their last four, which every derived id and every cut
+    name made one) — a new account under an opaque id. Except that a
+    source whose rows that account already holds stays on it, however many
+    cards it holds: a new account's rows would be hashed under a new id,
+    and the re-import would insert its whole history a second time
+    (_holds_file_rows over the file's `lines` and, for OFX, its `fitids`).
+    For the same reason a source no row of this household names (its rows
+    were keyed under another household's secret, which a restore does not
+    carry) goes to the split account that holds its rows
+    (_split_account_holding) before one is minted. The importer passes
+    split_legacy_id to FileImportIds whenever the answer is not the legacy
+    id, so rows hashed under it are found."""
+    from . import account_sources as srcs
+    if type_ is None:
+        type_, subtype = infer_account_type(name)
+    conn.execute(
+        """INSERT INTO items (id, aggregator, institution_name, access_token)
+           VALUES ('manual','manual','Manual',NULL)
+           ON CONFLICT (tenant_id, id) DO NOTHING""")
+    src = (key or name).strip()
+    who = (source or src).strip()
+    with conn.transaction():
+        # check-then-act, serialized with every account door
+        srcs.hold_lock(conn)
+        found = srcs.lookup(conn, prefix, who)
+        if found:
+            return found
+        earlier = _earlier_split_account(conn, prefix, name, src, lines)
+        if earlier and (
+                not srcs.claimed_by_another(conn, prefix, who, earlier)
+                or _holds_file_rows(conn, prefix, earlier, src, lines,
+                                    fitids)):
+            srcs.remember(conn, prefix, who, earlier)
+            return earlier
+        held = _split_account_holding(conn, prefix, name, who, src, lines,
+                                      fitids, skip=earlier)
+        if held:
+            srcs.remember(conn, prefix, who, held)
+            return held
+        aid = srcs.mint_id(conn, prefix)
+        # The stored name keeps only the last four, the rule every
+        # hand-made account follows.
+        conn.execute(
+            """INSERT INTO accounts (id, item_id, name, type, subtype,
+                                     updated_at)
+               VALUES (%s,'manual',%s,%s,%s,now())""",
+            (aid, mask_account_name(name.strip()), type_, subtype))
+        srcs.remember(conn, prefix, who, aid)
+        return aid
+
+
+def _holds_file_rows(conn, prefix: str, aid: str, src: str, lines,
+                     fitids) -> bool:
+    """Whether account `aid` holds a row of this file's source: a row
+    whose id the file's own `lines` (date, amount, name) recompute, or an
+    OFX row under one of its `fitids`, hashed under `aid`, under the id
+    the source had before (split_legacy_id), or under an id a move took
+    the account off — plain or keyed under the household's secret. Only
+    the first LINEAGE_PROBE_LINES lines are hashed."""
+    heads = {aid, split_legacy_id(prefix, src)} | {
+        r["old_account_id"] for r in conn.execute(
+            "SELECT old_account_id FROM account_adoptions"
+            " WHERE account_id = %s", (aid,)).fetchall()}
+    probe: set[str] = set()
+    for head in sorted(heads):
+        ids = FileImportIds(prefix, head)
+        for n, (date, amount, name) in enumerate(lines or ()):
+            if n >= LINEAGE_PROBE_LINES:
+                break
+            tid = ids.id_for(date, amount, name)
+            probe.add(tid)
+            if ids.legacy_id(tid):
+                probe.add(ids.legacy_id(tid))
+        probe |= {f"ofx:{head}:{f}" for f in (fitids or ()) if f}
+    if not probe:
+        return False
+    secret = txn_id_secret(conn)
+    if secret is not None:
+        probe |= {keyed_file_id(secret, p) for p in probe}
+    probe_ids = sorted(probe)
+    # an OFX id a reused FITID suffixed ("~<date>…") is still that line's
+    return conn.execute(
+        "SELECT 1 FROM transactions WHERE account_id = %s"
+        "   AND (id = ANY(%s) OR split_part(id, '~', 1) = ANY(%s)) LIMIT 1",
+        (aid, probe_ids, probe_ids)).fetchone() is not None
+
+
+def _split_account_holding(conn, prefix: str, name: str, who: str,
+                           src: str, lines, fitids, *,
+                           skip: str | None = None) -> str | None:
+    """The live split account of this importer that holds this source's
+    rows (_holds_source, then _holds_file_rows) and answers to no other
+    card here, for a source no row of this household names: restored from
+    another household's archive, its source rows are keyed under a secret
+    that never travels, and its opaque id is not one any earlier build
+    derived. The first by id when several do; None when none does, so a
+    source with no rows anywhere gets an account of its own."""
+    from . import account_sources as srcs
+    me = _split_source(name)
+    for r in conn.execute(
+            "SELECT id FROM accounts WHERE item_id = 'manual'"
+            "   AND left(id, %s) = %s AND user_removed_at IS NULL"
+            "   AND id IS DISTINCT FROM %s ORDER BY id",
+            (len(prefix) + 8, f"manual:{prefix}-", skip)).fetchall():
+        aid = r["id"]
+        if (_holds_source(conn, aid, prefix, me)
+                and not srcs.claimed_by_another(conn, prefix, who, aid)
+                and _holds_file_rows(conn, prefix, aid, src, lines, fitids)):
+            return aid
+    return None
+
+
+def _earlier_split_account(conn, prefix: str, name: str, src: str,
+                           lines) -> str | None:
+    """The account a build before opaque ids made for this source, if one
+    holds it:
       1. the id every earlier release derived (the plain slug), when it
          holds this source. A slug that mapped two sources onto one id
          stays that one account: moving one source off it here would mint
@@ -2338,19 +3024,10 @@ def ensure_split_account(conn, prefix: str, name: str, *,
          record of that move names several accounts, the one holding
          rows the file's `lines` (date, amount, name) recompute under the
          full id, else none;
-      3. the current id (split_account_id), or its taken form, when it
+      3. the readable id (split_account_id), or its taken form, when it
          holds this source; then the account an adoption moved either to;
-      4. the id a build that spelled the digest in hex digits gave it;
-      5. otherwise the current id, made if absent.
-    The importer passes split_legacy_id to FileImportIds whenever the
-    answer is not the legacy id, so rows hashed under it are found."""
-    if type_ is None:
-        type_, subtype = infer_account_type(name)
-    conn.execute(
-        """INSERT INTO items (id, aggregator, institution_name, access_token)
-           VALUES ('manual','manual','Manual',NULL)
-           ON CONFLICT (tenant_id, id) DO NOTHING""")
-    src = (key or name).strip()
+      4. the id a build that spelled the digest in hex digits gave it.
+    None when none does."""
     # rows hold the source NAME (OFX passes a key and keeps no source
     # cell, so it is matched on the account name, which is `name` too)
     me = _split_source(name)
@@ -2367,25 +3044,22 @@ def ensure_split_account(conn, prefix: str, name: str, *,
         return aid
     if held is False and _holds_source(conn, alt, prefix, me):
         return alt
-    moved = _adopted_split_account(conn, [aid, alt], prefix, me)
+    # the ids earlier builds minted for this source: a digest spelled in
+    # hex, or a card number typed in groups left whole (its account moved
+    # by a re-key when the id kept the number, else still where it was)
+    older = [o for o in dict.fromkeys(
+        split_account_id(prefix, src, taken=t, hex_digest=h,
+                         grouped_whole=g)
+        for g in (False, True) for t in (False, True) for h in (False, True))
+        if o not in (aid, alt)]
+    moved = _adopted_split_account(
+        conn, [aid, alt] + [o for o in older if o != legacy], prefix, me)
     if moved is not None:
         return moved
-    for hexed in dict.fromkeys(
-            split_account_id(prefix, src, taken=t, hex_digest=True)
-            for t in (False, True)):
-        if hexed not in (aid, alt) and _holds_source(conn, hexed, prefix,
-                                                     me):
+    for hexed in older:
+        if _holds_source(conn, hexed, prefix, me):
             return hexed
-    if held is False:
-        aid = alt
-    # The stored name keeps only the last four, the rule every hand-made
-    # account follows; ON CONFLICT leaves an existing account's name alone.
-    conn.execute(
-        """INSERT INTO accounts (id, item_id, name, type, subtype, updated_at)
-           VALUES (%s,'manual',%s,%s,%s,now())
-           ON CONFLICT (tenant_id, id) DO NOTHING""",
-        (aid, mask_long_digits(name.strip()), type_, subtype))
-    return aid
+    return None
 
 
 # The split importers whose ids were the slug of the source name, which
@@ -2395,6 +3069,40 @@ def ensure_split_account(conn, prefix: str, name: str, *,
 # id carries is spelled in letters (letter_digest).
 NUMBERED_SPLIT_ID_RE = re.compile(
     r"^manual:(?:qif|mint|monarch|copilot|simplifi)-.*\d{8,}")
+# The split importers' own ids, numbered or not: rows hashed under one
+# that spelled a number are keyed rather than re-hashed (see
+# rekey_numbered_accounts).
+SPLIT_ID_RE = re.compile(r"^manual:(?:qif|mint|monarch|copilot|simplifi)-")
+
+# Every hand-made id that spells a full account number, as the selector of
+# sync.card_number reads it: a run of eight digits, or a card layout (a
+# slug turns "Visa 4111 1111 1111 1111" into "visa-4111-1111-1111-1111",
+# which no eight-digit test sees). An id minted from a masked name never
+# matches, and every digest an id carries is spelled in letters. In a
+# pattern Python and PostgreSQL both read; it may over-select, and the
+# re-key asks the lineage cut before moving anything. NUMBERED_SPLIT_ID_RE
+# is the subset migration 199 moved.
+NUMBERED_MANUAL_ID_PATTERN = f"^manual:[^:]*({card_number.sql_selector()})"
+NUMBERED_MANUAL_ID_RE = re.compile(NUMBERED_MANUAL_ID_PATTERN)
+
+
+def renumbered_manual_id(old: str) -> str:
+    """The id a hand-made account whose id spells a full account number
+    moves to: the one the bulk door minted, before ids were opaque, for
+    the name the old id was slugged from (web/bulk_import._legacy_slug —
+    the dashes read back as spaces, the name cut, slugged), so a later
+    file naming the same account finds it by the slug walk. Cut to 40 like
+    every split id, with a door's "-N" collision suffix put back after the
+    cut (collision_suffix), as the door appends it to the cut slug. A split
+    importer's id keeps renumbered_split_id."""
+    return _renumbered_manual_id(old, keep_suffix=True)
+
+
+def _renumbered_manual_id(old: str, *, keep_suffix: bool) -> str:
+    body = old.split(":", 1)[1] if ":" in old else old
+    body, suffix = collision_suffix(body) if keep_suffix else (body, "")
+    body = card_number.cut_slug(body, width=40)
+    return f"manual:{body or 'account'}{suffix}"
 
 
 def renumbered_split_id(old: str) -> str:
@@ -2422,49 +3130,930 @@ def renumbered_split_suffix(cut: str, n: int) -> str:
         f"{cut}#{n}".encode("utf-8")).hexdigest())
 
 
-def rekey_numbered_split_accounts(conn) -> dict[str, str]:
-    """Move every split account whose id spells a full account number onto
-    its masked id, the way migration 199 moves the ones already stored —
-    restore runs it, so an archive written before the migration does not
-    bring the number back. Each move leaves an adoption record (reconciled,
-    so no reconnect guard arms) from the old id with its number cut
-    (split_lineage_id), which a re-import follows to the moved account;
-    the file it reads spells the original id again, and its rows' ids are
-    recomputed under that. Transaction ids are left as they are: they are
-    hashes, the number is not readable from them.
+def _free_renumbered_id(conn, old: str) -> str | None:
+    """The id a re-key moves `old` to: renumbered_split_id for a split
+    importer's id (as migration 199 names it), else renumbered_manual_id;
+    when that is taken, the first free suffix of renumbered_split_suffix.
+    None when every suffix is taken."""
+    base_id = (renumbered_split_id(old) if NUMBERED_SPLIT_ID_RE.search(old)
+               else old)
+    if NUMBERED_MANUAL_ID_RE.search(base_id):
+        base_id = _renumbered_manual_id(
+            base_id, keep_suffix=bool(door_suffix(conn, old)[1]))
+    cut = recorded_lineage_id(conn, old)
+    candidates = [base_id] + [
+        f"{base_id}-{renumbered_split_suffix(cut, n)}"
+        for n in range(1, RENUMBER_MAX_SUFFIXES + 1)]
+    return next((c for c in candidates if not conn.execute(
+        "SELECT 1 FROM accounts WHERE id=%s", (c,)).fetchone()), None)
 
-    An id whose masked form is taken gets the first free suffix of
-    renumbered_split_suffix. Accounts are taken in the order of the md5 of
-    their old id, as the migration takes them, so both name the same ids;
-    the md5 orders and is never stored, and ordering by the id itself
-    would let the suffix tell which of two cards has the smaller number.
-    Returns old -> new."""
+
+def rekey_numbered_accounts(conn) -> dict[str, str]:
+    """Move every hand-made account whose id spells a full account number
+    (NUMBERED_MANUAL_ID_RE) onto an id that keeps only the last four, and
+    cut the number from every adoption record that still names it in full
+    (rekey_numbered_adoptions). `oikonome migrate` runs it for every
+    household (migrate.key_numbered_file_rows) and restore runs it after
+    an archive's rows land, so an archive written before the move does
+    not bring the number back.
+
+    A split importer's account (SPLIT_ID_RE) moves the way migration 199
+    moves the ones already stored: its rows keep their ids, each an
+    unkeyed hash over the old id, and key_file_import_ids — which every
+    caller runs next — keys them; the split file names its source, so the
+    importer recomputes the old id from it (split_former). Any other
+    account's file never spells its id, so its rows are re-hashed under
+    the new id first (rehash_file_rows), while the old one is still in
+    hand: a re-import then mints exactly the ids they hold.
+
+    Each move, the rows, the account and the settings that name it, and
+    an adoption record (reconciled, so no reconnect guard arms) from the
+    old id with its number cut (split_lineage_id), is one transaction.
+    Accounts are taken in the order of the md5 of their old id, as the
+    migration takes them, so both name the same ids; the md5 orders and
+    is never stored, and ordering by the id itself would let the suffix
+    tell which of two cards has the smaller number. Returns old -> new."""
     from .adopt import (_rewrite_account_id, _rewrite_account_id_in_config)
     moved: dict[str, str] = {}
     olds = sorted((r["id"] for r in conn.execute(
         "SELECT id FROM accounts WHERE id ~ %s",
-        (NUMBERED_SPLIT_ID_RE.pattern,)).fetchall()),
+        (NUMBERED_MANUAL_ID_PATTERN,)).fetchall()),
         key=lambda o: hashlib.md5(o.encode("utf-8")).hexdigest())
     for old in olds:
-        cut = split_lineage_id(old)
-        base_id = renumbered_split_id(old)
-        candidates = [base_id] + [
-            f"{base_id}-{renumbered_split_suffix(cut, n)}"
-            for n in range(1, RENUMBER_MAX_SUFFIXES + 1)]
-        new = next((c for c in candidates if not conn.execute(
-            "SELECT 1 FROM accounts WHERE id=%s", (c,)).fetchone()), None)
-        if new is None:
-            continue
+        if split_lineage_id(old) == old:
+            continue            # nothing to cut: the pattern over-selected
+        # the id is chosen INSIDE the held transaction, under the account
+        # doors' per-household lock, so a concurrent add of the same last
+        # four neither takes the id first nor aborts this move
+        new = None
+        # read before the move: whether a door's "-N" stands beside the
+        # number depends on the account without it, which may move here
+        lineage = recorded_lineage_id(conn, old)
         with conn.transaction():
+            conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                         ("oikonome:ensure-account:" + str(conn.execute(
+                             "SELECT current_setting('app.tenant_id', true) AS t"
+                         ).fetchone()["t"]),))
+            new = _free_renumbered_id(conn, old)
+            if new is None:
+                continue
+            if not _hold_account_for_move(conn, old):
+                continue
+            if not SPLIT_ID_RE.search(old):
+                rehash_file_rows(conn, old, new)
             if not _rewrite_account_id(conn, old, new, "manual"):
                 continue
             _rewrite_account_id_in_config(conn, old, new)
+            # the names were copied across whole: an id cut of the number
+            # beside a name still spelling it hides nothing
+            _cut_account_names(conn, "id = %s", (new,))
             conn.execute(
                 "INSERT INTO account_adoptions (account_id, old_account_id,"
                 " item_id, reconciled_at) VALUES (%s, %s, 'manual', now())",
-                (new, cut))
+                (new, lineage))
         moved[old] = new
+    rekey_numbered_adoptions(conn)
     return moved
+
+
+# The name every caller before the hand-made ids were covered used.
+rekey_numbered_split_accounts = rekey_numbered_accounts
+
+# The name columns of an account a person or a file typed, which may spell
+# a card number in groups; and a stored name that still does, in the
+# selector sync.card_number builds from its grammar for PostgreSQL. It is
+# wider than the cut, which decides exactly: a name the cut leaves
+# unchanged is not written.
+ACCOUNT_NAME_COLUMNS = ("name", "display_name", "official_name")
+NUMBERED_NAME_PATTERN = card_number.sql_selector()
+
+# The accounts whose stored names may still spell a number: any account's
+# rename, a hand-made account's name and institution name. Each column is
+# read the way the name rows read it (account_sources.FOLDED_SQL), so a
+# number spaced by underscores, commas or en dashes is selected as one,
+# never left whole while its name row waits for a cut that never comes.
+# Run with {"p": NUMBERED_NAME_PATTERN}.
+NUMBERED_NAMES_WHERE = (
+    "(item_id = 'manual' AND ({name} ~ %(p)s OR {official} ~ %(p)s))"
+    " OR {display} ~ %(p)s").format(
+        **{k: account_sources.FOLDED_SQL.format(expr=c) for k, c in (
+            ("name", "name"), ("official", "official_name"),
+            ("display", "display_name"))})
+
+
+def _cut_account_names(conn, where: str, args) -> int:
+    """Cut every account name column (ACCOUNT_NAME_COLUMNS) of the
+    accounts `where` selects the way the account doors store a name
+    (account_sources.stored_account_name: cut, and cut as the slug reads
+    it when the slug still spells a number), writing only what changes.
+    Returns the accounts written.
+
+    Each write is compare-and-set on the values it read: the caller's
+    connection may be in autocommit, and a rename committed between the
+    read and the write must not be overwritten with the old name's cut.
+    A lost race re-reads the row and cuts what it holds now."""
+    cols = ", ".join(ACCOUNT_NAME_COLUMNS)
+    done = 0
+    for r in conn.execute(
+            f"SELECT id, {cols} FROM accounts WHERE {where}",
+            args).fetchall():
+        for _ in range(8):
+            cut = {c: account_sources.stored_account_name(r[c])
+                   for c in ACCOUNT_NAME_COLUMNS}
+            cut = {c: v for c, v in cut.items() if v != r[c]}
+            if not cut:
+                break
+            if conn.execute(
+                    "UPDATE accounts SET "
+                    + ", ".join(f"{c} = %s" for c in cut)
+                    + " WHERE id = %s AND "
+                    + " AND ".join(f"{c} IS NOT DISTINCT FROM %s"
+                                   for c in cut),
+                    [*cut.values(), r["id"], *(r[c] for c in cut)]
+            ).rowcount:
+                done += 1
+                break
+            r = conn.execute(
+                f"SELECT id, {cols} FROM accounts WHERE id = %s",
+                (r["id"],)).fetchone()
+            if r is None:
+                break
+    if done:
+        # a cut name's c-row is written, and the one over the name it had
+        # (a digest of the whole number) dropped
+        account_sources.backfill(conn)
+    return done
+
+
+def mask_manual_account_names(conn) -> int:
+    """Cut a full number from every hand-made account's stored names —
+    its name, the name a person renamed it to and the institution's name
+    — typed in groups or not, or spaced by separators only its slug
+    reads (NUMBERED_NAMES_WHERE, _cut_account_names), which a plain
+    run match on `name` alone misses. Runs from `oikonome migrate`
+    (migrate.key_numbered_file_rows) for every household holding one;
+    idempotent, since a cut name holds no run to cut. Returns the
+    accounts written."""
+    return _cut_account_names(conn, NUMBERED_NAMES_WHERE,
+                              {"p": NUMBERED_NAME_PATTERN})
+
+
+def _live_end(conn, account_id: str) -> str | None:
+    """`account_id` if it is an account, else the account later moves
+    took it to (the first in id order where a move branched); None when
+    the line ends nowhere."""
+    seen = {account_id}
+    cur = account_id
+    for _ in range(32):
+        if conn.execute("SELECT 1 FROM accounts WHERE id = %s",
+                        (cur,)).fetchone():
+            return cur
+        nxt = sorted({r["account_id"] for r in conn.execute(
+            "SELECT account_id FROM account_adoptions"
+            " WHERE old_account_id = %s", (cur,)).fetchall()} - seen)
+        if not nxt:
+            return None
+        cur = nxt[0]
+        seen.add(cur)
+    return None
+
+
+def cut_lineage_targets(conn, full_id: str) -> list[str]:
+    """The live accounts an id spelling a full number now lives on, when
+    a re-key moved it (rekey_numbered_accounts) or an adoption record
+    naming it was cut (rekey_numbered_adoptions): the targets of the
+    record under its cut form (split_lineage_id) — and under the full
+    form, on an instance not yet re-keyed — each followed through later
+    moves to an account that exists, sorted. Two cards sharing their
+    last four leave one cut key pointing at both, so more than one answer
+    means the id alone cannot tell which account is meant; none means
+    nothing moved it."""
+    starts = sorted({full_id, *lineage_keys(full_id)})
+    firsts = {r["account_id"] for r in conn.execute(
+        "SELECT account_id FROM account_adoptions"
+        " WHERE old_account_id = ANY(%s)", (starts,)).fetchall()}
+    return sorted({e for e in (_live_end(conn, a) for a in firsts)
+                   if e is not None})
+
+
+# How far cut_lineage_candidates walks a full id's "-N" suffixes.
+CUT_LINEAGE_MAX_SUFFIX = 32
+
+
+def _has_lineage_record(conn, full_id: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM account_adoptions WHERE old_account_id = ANY(%s)"
+        " LIMIT 1",
+        (sorted({full_id, *lineage_keys(full_id)}),)).fetchone() is not None
+
+
+def cut_lineage_candidates(conn, full_id: str, *,
+                           max_suffix: int = CUT_LINEAGE_MAX_SUFFIX
+                           ) -> list[tuple[str, list[str]]]:
+    """Every id a door could have given a name spelling the full number
+    `full_id` stands for, with the live accounts each now lives on
+    (cut_lineage_targets): `full_id` itself, then `full_id`-2, -3, … — the
+    suffixes the account doors append when the slug is taken — while a
+    move recorded one (under its full or cut form), up to `max_suffix`. Only
+    ids leading somewhere are listed, bare id first, so a door asks which
+    of several accounts a typed number means exactly as it walked the
+    suffixes before the re-key (bulk_import._slug_walk). Each
+    suffixed id is cut with its suffix kept (split_lineage_id), so "-2"
+    leads to the "-2" account only."""
+    out: list[tuple[str, list[str]]] = []
+    for n in range(1, max_suffix + 1):
+        cand = full_id if n == 1 else f"{full_id}-{n}"
+        if n > 1 and not _has_lineage_record(conn, cand):
+            break
+        targets = cut_lineage_targets(conn, cand)
+        if targets:
+            out.append((cand, targets))
+    return out
+
+
+def _hold_account_for_move(conn, account_id: str) -> bool:
+    """Lock `account_id`'s row for the rest of the caller's transaction,
+    after the pairing lock (reanchor.hold_pairing_lock, the order every
+    carry keeps: pairing lock, then rows); False when it is gone.
+
+    A re-key reads the account's rows and re-hashes them before it moves
+    the account. Held first, the row lock makes any writer adding a row
+    to the account — a hand-entered row, a door that does not take the
+    household's sync lock — wait for the move (its foreign-key check
+    needs a share of the row) and then find the account gone, instead of
+    landing a row in between that the move carries across unproved."""
+    from .reanchor import hold_pairing_lock
+    hold_pairing_lock(conn)
+    return conn.execute(
+        "SELECT 1 FROM accounts WHERE id = %s FOR UPDATE",
+        (account_id,)).fetchone() is not None
+
+
+def rekey_numbered_adoptions(conn) -> int:
+    """Cut the full number from every adoption record that names the id an
+    account moved off in full (one written before re-keys cut the number:
+    a numbered hand-made account later adopted by a reconnect). The
+    record rides /export and the portability archive, and a re-import
+    recomputes the rows' ids from it, so the rows hashed under it are
+    first re-hashed under the account
+    they live on now (rehash_file_rows), which is the id a re-import there
+    mints, and only then is the record cut. A split importer's record is
+    only cut: its rows are keyed (key_file_import_ids) and its file spells
+    the full id again. A cut record that already stands beside it (an
+    older archive restored the full one again) makes the full one a
+    duplicate, removed once reconciled. Returns the records cut."""
+    rows = conn.execute(
+        "SELECT account_id, old_account_id, adopted_at, reconciled_at"
+        "  FROM account_adoptions WHERE old_account_id ~ %s"
+        " ORDER BY adopted_at",
+        (NUMBERED_MANUAL_ID_PATTERN,)).fetchall()
+    done = 0
+    for r in rows:
+        full = r["old_account_id"]
+        if conn.execute("SELECT 1 FROM accounts WHERE id = %s",
+                        (full,)).fetchone():
+            continue        # an account again: rekey_numbered_accounts'
+        cut = recorded_lineage_id(conn, full)
+        if cut == full:
+            continue            # nothing to cut: the pattern over-selected
+        with conn.transaction():
+            if not SPLIT_ID_RE.search(full):
+                live = _live_end(conn, r["account_id"])
+                if live is not None and _hold_account_for_move(conn, live):
+                    rehash_file_rows(conn, full, live, on=live)
+            twin = r["reconciled_at"] is not None and conn.execute(
+                "SELECT 1 FROM account_adoptions WHERE account_id = %s"
+                "   AND old_account_id = %s", (r["account_id"], cut)
+            ).fetchone()
+            if twin:
+                conn.execute(
+                    "DELETE FROM account_adoptions WHERE account_id = %s"
+                    "   AND adopted_at = %s AND old_account_id = %s",
+                    (r["account_id"], r["adopted_at"], full))
+            else:
+                conn.execute(
+                    "UPDATE account_adoptions SET old_account_id = %s"
+                    " WHERE account_id = %s AND adopted_at = %s"
+                    "   AND old_account_id = %s",
+                    (cut, r["account_id"], r["adopted_at"], full))
+        done += 1
+    return done
+
+
+# The most identical lines (one importer, account, date, amount and
+# name) a proof of a row's id walks. A real statement repeats a line a
+# handful of times — two coffees, a run of parking meters — and every
+# proof hashes each occurrence up to the count, so an uncapped count is
+# the lever a crafted archive of one line repeated pulls to keep the web
+# process hashing for hours. A row past it is not proved: rehash_file_rows
+# keys it and counts it, as it does a row edited since.
+FILE_ROW_MAX_OCCURRENCES = 64
+
+
+def _line_parts(date, amount, name):
+    """(iso date, cents without sign, masked name, stored name), lower-
+    cased, as a file row's hash inputs read them; None when the date or
+    amount cannot be read."""
+    try:
+        cents = abs(round(float(amount) * 100))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if date is None:
+        return None
+    if not isinstance(date, dt.date):
+        try:
+            date = dt.date.fromisoformat(str(date)[:10])
+        except ValueError:
+            return None
+    return (date.isoformat(), cents, mask_long_digits(name or "").lower(),
+            (name or "").lower())
+
+
+def _name_tails(iso: str, cents: int, name: str, occurrences: int):
+    """The hash inputs after the account id for one name of a line: at
+    either sign, at each occurrence up to a little past `occurrences`
+    (rows deleted since may have numbered it higher), clamped to
+    FILE_ROW_MAX_OCCURRENCES."""
+    top = min(max(occurrences, 1), FILE_ROW_MAX_OCCURRENCES)
+    for c in dict.fromkeys((cents, -cents)):
+        for n in range(1, top + 3):
+            yield f"|{iso}|{c}|{name}|{n}"
+
+
+def file_row_shape(tid: str, date, amount, name) -> tuple:
+    """What identical lines of one importer on one account share, for
+    numbering them: the prefix, the date, the cents without their sign
+    and the masked name."""
+    try:
+        cents = abs(round(float(amount) * 100))
+    except (TypeError, ValueError, OverflowError):
+        cents = None
+    return (tid.split(":", 1)[0], str(date)[:10], cents,
+            mask_long_digits(name or "").lower())
+
+
+def _sha1_id(prefix: str, text: str) -> str:
+    return f"{prefix}:" + hashlib.sha1(text.encode()).hexdigest()
+
+
+def rehashed_file_ids(old_aid: str, new_aid: str, rows,
+                      secret: bytes | None = None) -> dict[str, str]:
+    """rehashed_file_id for many rows of one move: `rows` holds
+    (tid, date, amount, name, occurrences) per row; returns tid -> the id
+    it takes, for each row proved (an id already hashed under `new_aid`
+    maps to itself).
+
+    The candidate hashes of one name of one line are the same for every
+    row of that line, so they are hashed once and each row looked up:
+    rows sorted by line, only the current line's candidates held. A row
+    whose id is not one an importer writes (its prefix, a 40-hex digest,
+    or the keyed form when `secret` is given) is skipped before anything
+    is hashed. With the occurrence clamp (FILE_ROW_MAX_OCCURRENCES) the
+    work is a bounded number of hashes per row, however many identical
+    lines arrive."""
+    out: dict[str, str] = {}
+    todo = []
+    for tid, date, amount, name, occ in rows:
+        tid = str(tid)
+        m = _NUMBERED_OFX_ID_RE.match(tid)
+        if m and m.group(1) == old_aid:
+            out[tid] = f"ofx:{new_aid}:{m.group(2)}"
+            continue
+        prefix, _, digest = tid.partition(":")
+        if prefix + ":" not in FILE_IMPORT_ID_PREFIXES:
+            continue
+        keyed = (len(digest) == 41 and digest.startswith(KEYED_ID_MARK))
+        if keyed and secret is None:
+            continue
+        if not keyed and len(digest) != 40:
+            continue
+        parts = _line_parts(date, amount, name)
+        if parts is None:
+            continue
+        iso, cents, masked, stored = parts
+        try:
+            k = min(max(int(occ), 1), FILE_ROW_MAX_OCCURRENCES)
+        except (TypeError, ValueError):
+            k = 1
+        todo.append(((prefix, iso, cents, k, masked), stored, tid, keyed))
+    todo.sort(key=lambda x: (x[0], x[1]))
+    cur = None
+    held: dict[str, list] = {}
+
+    def _maps(head, nm, keyed):
+        maps = held.get(nm)
+        if maps is None:
+            prefix, iso, cents, k, _ = head
+            plain = {_sha1_id(prefix, f"{old_aid}{t}"): t
+                     for t in _name_tails(iso, cents, nm, k)}
+            maps = held[nm] = [plain, None]
+        if keyed and maps[1] is None:
+            maps[1] = {keyed_file_id(secret, p): t
+                       for p, t in maps[0].items()}
+        return maps[1] if keyed else maps[0]
+
+    for head, stored, tid, keyed in todo:
+        if head != cur:
+            cur, held = head, {}
+        masked = head[4]
+        # the masked name's candidates serve the whole line; a stored
+        # name that differs is kept only while rows of it run
+        for nm in list(held):
+            if nm not in (masked, stored):
+                del held[nm]
+        tail = None
+        for nm in dict.fromkeys((masked, stored)):
+            tail = _maps(head, nm, keyed).get(tid)
+            if tail is not None:
+                break
+        if tail is not None:
+            out[tid] = _sha1_id(head[0], f"{new_aid}{tail}")
+    return out
+
+
+def rehashed_file_id(tid: str, old_aid: str, new_aid: str, date, amount,
+                     name, occurrences: int,
+                     secret: bytes | None = None) -> str | None:
+    """The id the file row `tid` takes when the account it was hashed
+    under moves from `old_aid` to `new_aid`: the same line hashed under
+    the new id (what FileImportIds mints for it there), or an OFX row
+    keyed by the bank's FITID renamed onto the new id. Exact: a row is
+    re-hashed only when one of its possible hash inputs (its masked name
+    and, while it differs, its stored name, each at either sign and every
+    occurrence _name_tails walks, from its own stored date, amount and
+    name) hashed
+    under `old_aid` gives `tid`, or its keyed form under `secret` does —
+    a sha1 cannot match by chance. None when nothing proves it. For more
+    than one row, rehashed_file_ids hashes each line once."""
+    return rehashed_file_ids(
+        old_aid, new_aid, [(tid, date, amount, name, occurrences)],
+        secret).get(tid)
+
+
+def rehash_file_rows(conn, old_aid: str, new_aid: str, *,
+                     on: str | None = None) -> tuple[int, int, int]:
+    """Re-hash the file rows on account `on` (default `old_aid`) whose id
+    was hashed under the account id `old_aid` so it is hashed under
+    `new_aid`: the id a file import into `new_aid` mints for the same
+    line, so a re-import there finds every row by its id alone — no former
+    id, no record lookup, no guess budget. Run while `old_aid` is still
+    in hand (rekey_numbered_accounts, rekey_numbered_adoptions), because
+    afterwards nothing spells it.
+
+    Each move is proved (rehashed_file_id). A row of this importer family
+    that no input proves under `old_aid` — an amount or date edited since,
+    a name stored cut — is re-id'd under the household's secret instead
+    (keyed_file_id) and counted, since its id may still hash the number;
+    one already keyed stays as it is. With `on` given the account holds
+    rows from other lines too, so a row whose id its own account explains
+    is left alone, as is one already hashed under `new_aid` (a pass run
+    again). A row whose new id is already held is a copy that
+    existed before: left where it is, and logged. Every reference to a
+    moved row follows it (adopt.rewrite_txn_ids, carry_txn_mentions).
+    Returns (moved, keyed, left)."""
+    on = on or old_aid
+    ofx_prefix = f"ofx:{old_aid}:"
+    rows = conn.execute(
+        "SELECT id, date, amount, name FROM transactions"
+        " WHERE account_id = %s"
+        "   AND (id ~ %s OR id ~ %s OR left(id, %s) = %s)"
+        " ORDER BY id",
+        (on, UNKEYED_FILE_ID_PATTERN, KEYED_FILE_ID_PATTERN,
+         len(ofx_prefix), ofx_prefix)).fetchall()
+    if not rows:
+        return (0, 0, 0)
+    same: dict[tuple, int] = defaultdict(int)
+    for r in rows:
+        same[file_row_shape(r["id"], r["date"], r["amount"], r["name"])] += 1
+    if max(same.values()) > FILE_ROW_MAX_OCCURRENCES:
+        log.warning("a re-keyed account holds more than %d identical "
+                    "lines; the ones past that are keyed, not proved",
+                    FILE_ROW_MAX_OCCURRENCES)
+    secret = txn_id_secret(conn)
+    keyed_re = re.compile(KEYED_FILE_ID_PATTERN)
+    pairs: list[tuple[str, str]] = []
+    keyed: list[tuple[str, str]] = []
+    lines = [(r["id"], r["date"], r["amount"], r["name"],
+              same[file_row_shape(r["id"], r["date"], r["amount"],
+                                  r["name"])]) for r in rows]
+    proved = rehashed_file_ids(old_aid, new_aid, lines, secret)
+    rest = [x for x in lines if x[0] not in proved
+            and not keyed_re.match(x[0])]
+    # hashed under the new id already, or under the account's own
+    own: set[str] = set()
+    for a in dict.fromkeys((new_aid, on)):
+        if a != old_aid and rest:
+            own |= {t for t, n in rehashed_file_ids(a, a, rest).items()
+                    if n == t}
+    for tid, *_ in lines:
+        new = proved.get(tid)
+        if new is not None:
+            if new != tid:
+                pairs.append((tid, new))
+            continue
+        if keyed_re.match(tid):
+            continue                     # keyed already
+        if tid in own:
+            continue
+        if secret is None:
+            secret = txn_id_secret(conn, create=True)
+        keyed.append((tid, keyed_file_id(secret, tid)))
+    from .adopt import rewrite_txn_ids
+    done = rewrite_txn_ids(conn, pairs + keyed)
+    ok = [p for p, d in zip(pairs + keyed, done) if d]
+    n_moved = sum(done[:len(pairs)])
+    n_keyed = sum(done[len(pairs):])
+    left = len(done) - len(ok)
+    if n_keyed:
+        log.warning("%d file row(s) on a re-keyed account could not be "
+                    "proved hashed under its old id and were keyed "
+                    "instead; a re-import may add those lines again", n_keyed)
+    if left:
+        log.warning("%d file row(s) on a re-keyed account were left as "
+                    "they are: the id they move to is already held", left)
+    carry_txn_mentions(conn, ok)
+    return (n_moved, n_keyed, left)
+
+
+# Every file row whose id may hash a full account number. One kind: the
+# rows of an importer on each account reached from an id that spelled one
+# (cut by a re-key, or in full on an older adoption), following later
+# moves, whose id is an unkeyed file-row id or an OFX id naming such an
+# account (`numbered`). The other: an unkeyed file-row id on any account
+# whose name carries the mark of a cut run of digits, which may have been
+# hashed while the name still held the whole run; key_file_import_ids
+# leaves the ones whose id the masked name explains. Written over
+# tenant_id so `oikonome migrate` can ask it of every household at once;
+# on a household's own connection RLS narrows it.
+NUMBERED_FILE_ROWS_SQL = """
+    WITH RECURSIVE reach (tenant_id, account_id, hops) AS (
+        SELECT tenant_id, account_id, 0 FROM account_adoptions
+         WHERE old_account_id ~ %(lineage)s
+        UNION
+        SELECT a.tenant_id, a.account_id, r.hops + 1
+          FROM account_adoptions a
+          JOIN reach r ON a.tenant_id = r.tenant_id
+                      AND a.old_account_id = r.account_id
+         WHERE r.hops < 32),
+    reached AS (SELECT DISTINCT tenant_id, account_id FROM reach)
+    SELECT t.tenant_id, t.id, t.account_id, t.date, t.amount, t.name,
+           true AS numbered
+      FROM transactions t
+      JOIN reached r
+        ON t.tenant_id = r.tenant_id AND t.account_id = r.account_id
+     WHERE t.id ~ %(unkeyed)s OR t.id ~ %(ofx)s
+    UNION ALL
+    SELECT t.tenant_id, t.id, t.account_id, t.date, t.amount, t.name,
+           false
+      FROM transactions t
+     -- the name first: the id pattern costs a scan of every row
+     WHERE t.name ~ %(cut)s AND t.id ~ %(unkeyed)s
+       AND NOT EXISTS (SELECT 1 FROM reached r
+                        WHERE r.tenant_id = t.tenant_id
+                          AND r.account_id = t.account_id)"""
+NUMBERED_FILE_ROWS_ARGS = {"lineage": NUMBERED_LINEAGE_PATTERN,
+                           "unkeyed": UNKEYED_FILE_ID_PATTERN,
+                           "ofx": NUMBERED_OFX_ID_PATTERN,
+                           "cut": MASKED_RUN_PATTERN}
+
+
+def _explained_by_own_account(rows, occurrences) -> set[str]:
+    """The ids of `rows` (file rows, any accounts) that _hashed_over_masked_name
+    holds for, `occurrences(r)` giving each row's count of identical
+    lines: one rehashed_file_ids pass per account, so each line is
+    hashed once."""
+    by_aid: dict[str, list] = defaultdict(list)
+    for r in rows:
+        by_aid[r["account_id"] or ""].append(
+            (r["id"], r["date"], r["amount"], r["name"], occurrences(r)))
+    out: set[str] = set()
+    for aid, lines in by_aid.items():
+        out |= {t for t, n in rehashed_file_ids(aid, aid, lines).items()
+                if n == t}
+    return out
+
+
+def _hashed_over_masked_name(r, occurrences: int) -> bool:
+    """True when the file row `r`'s id is the one FileImportIds gives its
+    stored name on the account it is on now (masked, or as stored while
+    that still differs), at either sign and any occurrence up to a little
+    past `occurrences`: a row imported after names were masked, or one
+    re-hashed onto its account when the account moved off a numbered id
+    (rehash_file_rows), whose id never held the number. A sha1 cannot
+    match by chance, so a False is only ever a row keyed that needed no
+    keying, never the reverse."""
+    aid = r["account_id"] or ""
+    return rehashed_file_id(r["id"], aid, aid, r["date"], r["amount"],
+                            r["name"], occurrences) == r["id"]
+
+
+def key_file_import_ids(conn) -> int:
+    """Re-id every file row whose id may hash a full account number
+    (NUMBERED_FILE_ROWS_SQL) onto its keyed form (keyed_file_id), under
+    the household's secret, minted here when there is work and none yet.
+    A row whose id its own account explains is left
+    (_hashed_over_masked_name): one the SQL finds only by the mark in its
+    name and hashed masked, and every row a hand-made account's re-key
+    re-hashed (rehash_file_rows), so what this keys on a once-numbered
+    lineage is what no re-hash could reach — a split account moved off
+    its numbered id without its rows, whose full id is no longer recorded.
+    An OFX row keyed
+    by the bank's FITID moves instead onto the id an OFX import gives the
+    line on the account it is on now. Each move carries every reference
+    to the row (adopt._rewrite_txn_id), and then every record that names
+    it by id with no foreign key to follow (carry_txn_mentions), with any
+    such record an earlier move left behind (carry_stale_mentions). A row
+    whose new id is already held is left where it is and logged: that id
+    is the same line, already here. Idempotent: a keyed id is never
+    matched again. Runs from `oikonome migrate`
+    (migrate.key_numbered_file_rows) and from restore after
+    rekey_numbered_accounts. Returns the rows moved."""
+    rows = conn.execute(
+        NUMBERED_FILE_ROWS_SQL + " ORDER BY id",
+        NUMBERED_FILE_ROWS_ARGS).fetchall()
+    # identical lines on one account share a base and are numbered
+    # 1..n among themselves
+    same: dict[tuple, int] = defaultdict(int)
+
+    def _shape(r):
+        try:
+            cents = abs(round(float(r["amount"]) * 100))
+        except (TypeError, ValueError):
+            cents = None
+        return (r["account_id"], r["date"], cents,
+                mask_long_digits(r["name"] or "").lower())
+
+    for r in rows:
+        same[_shape(r)] += 1
+    from .adopt import rewrite_txn_ids
+    secret = None
+    left = 0
+    pairs: list[tuple[str, str]] = []
+    # a row its own account explains never held the number — on a
+    # once-numbered account too, where a re-key re-hashed it or an import
+    # after the move minted it (_hashed_over_masked_name, a line at a time)
+    explained = _explained_by_own_account(
+        [r for r in rows if _UNKEYED_FILE_ID_RE.match(r["id"])],
+        lambda r: same[_shape(r)])
+    for r in rows:
+        old = r["id"]
+        if old in explained:
+            continue
+        m = _NUMBERED_OFX_ID_RE.match(old)
+        if m and LONG_DIGITS_RE.search(m.group(1)):
+            if LONG_DIGITS_RE.search(r["account_id"] or ""):
+                left += 1          # its account is not moved yet
+                continue
+            new = f"ofx:{r['account_id']}:{m.group(2)}"
+        else:
+            if secret is None:
+                secret = txn_id_secret(conn, create=True)
+            new = keyed_file_id(secret, old)
+        if new != old:
+            pairs.append((old, new))
+        else:
+            left += 1
+    # one set-based carry per slice, not one ledger scan per row: a large
+    # household moves tens of thousands of rows while migrate holds the
+    # startup lock
+    done = rewrite_txn_ids(conn, pairs)
+    moved = [p for p, ok in zip(pairs, done) if ok]
+    left += len(done) - len(moved)
+    if left:
+        log.warning("%d file row(s) whose id may hash a full account "
+                    "number were left as they are: the new id is already "
+                    "held, or the account has not moved off its own", left)
+    carry_txn_mentions(conn, moved)
+    carry_stale_mentions(conn)
+    return len(moved)
+
+
+# Every id a record names a transaction by with no foreign key to carry
+# it. In the activity log, the target of a one-row act and the rows a
+# bulk act lists in its detail: kept for years, beside a sentence giving
+# the row's date, amount and name. In an adoption's guard ledger, the
+# restored row each feed row was dropped as a copy of: the reconnect
+# guard reads it back to know which rows are spoken for. In a feed row's
+# raw, the row an earlier guard noted it was carried from. All three ride
+# /export and the portability archive, so an id left in any of them after
+# the row was re-id'd keeps the exposure the re-id closed. (The other
+# unforeign mentions — a receipt's refused charges, the pending pointer —
+# move with the row in adopt._rewrite_txn_id; the guard ledger's other
+# lists name feed rows, which are never re-id'd.) A merchant-wide undo is
+# a week of scratch that never leaves the instance; it moves with its rows
+# (carry_undo_payloads) and is searched here too, so one left on a dead
+# id by a move that died before the carry is still found.
+_MENTIONS_SQL = """
+    SELECT a.tenant_id, n.v FROM activity_log a
+     CROSS JOIN LATERAL (
+        SELECT a.target AS v
+        UNION ALL
+        SELECT e FROM jsonb_array_elements_text(
+            CASE WHEN jsonb_typeof(a.detail->'ids') = 'array'
+                 THEN a.detail->'ids' ELSE '[]'::jsonb END) AS e) n
+    UNION ALL
+    SELECT x.tenant_id, g.value FROM account_adoptions x
+     CROSS JOIN LATERAL jsonb_each_text(
+        CASE WHEN jsonb_typeof(x.guard_ledger->'absorbed') = 'object'
+             THEN x.guard_ledger->'absorbed' ELSE '{}'::jsonb END) AS g
+    UNION ALL
+    SELECT t.tenant_id, t.raw->>'_carried_from' FROM transactions t
+     WHERE t.raw ? '_carried_from'
+    UNION ALL
+    SELECT u.tenant_id, e.v->>'id' FROM category_undo u
+     CROSS JOIN LATERAL jsonb_array_elements(
+        CASE WHEN jsonb_typeof(u.payload->'affected') = 'array'
+             THEN u.payload->'affected' ELSE '[]'::jsonb END) AS e(v)
+     WHERE jsonb_typeof(e.v) = 'object' AND e.v ? 'id'"""
+_MENTIONED_IDS_SQL = (
+    "SELECT DISTINCT m.v FROM (" + _MENTIONS_SQL + ") m"
+    " WHERE m.v ~ %(unkeyed)s OR m.v ~ %(ofx)s")
+# The households a stale mention may stand in, over all of them at once
+# for `oikonome migrate`: an unkeyed file-row id the household no longer
+# holds where it keeps a secret (a keyed row may stand for it), or an OFX
+# id spelling a full number it no longer holds on an account the
+# household moved off that number (the account it moved to tells where
+# the line is now; on one never moved, no row was moved off the id
+# either). A mention of a row deleted since matches too: an unkeyed one's
+# visit changes nothing, and an OFX one is carried to the id the line has
+# on the moved account all the same, so it never matches again. The
+# account the OFX id names is compared in full and cut (split_lineage_id
+# in SQL), as an adoption records it either way.
+STALE_MENTION_TENANTS_SQL = (
+    "SELECT DISTINCT m.tenant_id FROM (" + _MENTIONS_SQL + ") m"
+    """
+     WHERE ((m.v ~ %(unkeyed)s
+             AND EXISTS (SELECT 1 FROM txn_id_keys k
+                          WHERE k.tenant_id = m.tenant_id))
+            OR (m.v ~ %(ofx)s
+                AND EXISTS (
+                    SELECT 1 FROM account_adoptions x
+                     WHERE x.tenant_id = m.tenant_id
+                       AND x.old_account_id IN (
+                           substring(m.v from %(ofx_account)s),
+                           regexp_replace(
+                               substring(m.v from %(ofx_account)s),
+                               %(long_run)s, %(long_cut)s, 'g')))))
+       AND NOT EXISTS (SELECT 1 FROM transactions t
+                        WHERE t.tenant_id = m.tenant_id AND t.id = m.v)""")
+MENTION_ARGS = {"unkeyed": UNKEYED_FILE_ID_PATTERN,
+                "ofx": NUMBERED_OFX_ID_PATTERN,
+                "ofx_account": r"^ofx:(manual:[^:]*):",
+                # mask_long_digits: a run of 8+ digits keeps its last four
+                "long_run": "[0-9]{4,}([0-9]{4})",
+                "long_cut": "…\\1"}
+
+
+def carry_txn_mentions(conn, pairs) -> None:
+    """Point every record that names a transaction by id with no foreign
+    key (see _MENTIONS_SQL) from each old id of `pairs` to its new one. A
+    sibling of the carry adopt._rewrite_txn_id does for the rows that do
+    have one; a bulk act's list keeps its order and every other entry it
+    holds, and a guard ledger every feed row it maps."""
+    pairs = [(o, n) for o, n in pairs if o and n and o != n]
+    if not pairs:
+        return
+    olds = [o for o, _ in pairs]
+    news = [n for _, n in pairs]
+    conn.execute(
+        "UPDATE activity_log a SET target = m.new_id"
+        "  FROM unnest(%s::text[], %s::text[]) AS m(old_id, new_id)"
+        " WHERE a.target = m.old_id", (olds, news))
+    conn.execute(
+        """UPDATE activity_log a
+              SET detail = jsonb_set(a.detail, '{ids}', (
+                  SELECT jsonb_agg(COALESCE(to_jsonb(m.new_id), e.v)
+                                   ORDER BY e.i)
+                    FROM jsonb_array_elements(
+                         CASE WHEN jsonb_typeof(a.detail->'ids') = 'array'
+                              THEN a.detail->'ids' ELSE '[]'::jsonb END)
+                         WITH ORDINALITY AS e(v, i)
+                    LEFT JOIN unnest(%s::text[], %s::text[])
+                         AS m(old_id, new_id)
+                      ON e.v = to_jsonb(m.old_id)))
+            WHERE jsonb_typeof(a.detail->'ids') = 'array'
+              AND a.detail->'ids' ?| %s::text[]""", (olds, news, olds))
+    conn.execute(
+        """UPDATE account_adoptions x
+              SET guard_ledger = jsonb_set(x.guard_ledger, '{absorbed}', (
+                  SELECT jsonb_object_agg(
+                             e.key, COALESCE(to_jsonb(m.new_id), e.value))
+                    FROM jsonb_each(x.guard_ledger->'absorbed') AS e
+                    LEFT JOIN unnest(%s::text[], %s::text[])
+                         AS m(old_id, new_id)
+                      ON e.value = to_jsonb(m.old_id)))
+            WHERE jsonb_typeof(x.guard_ledger->'absorbed') = 'object'
+              AND EXISTS (
+                  SELECT 1 FROM jsonb_each_text(
+                         x.guard_ledger->'absorbed') AS g
+                   WHERE g.value = ANY(%s::text[]))""", (olds, news, olds))
+    conn.execute(
+        "UPDATE transactions t SET raw = jsonb_set(t.raw, '{_carried_from}',"
+        "                                          to_jsonb(m.new_id))"
+        "  FROM unnest(%s::text[], %s::text[]) AS m(old_id, new_id)"
+        " WHERE t.raw ? '_carried_from'"
+        "   AND t.raw->>'_carried_from' = m.old_id", (olds, news))
+    carry_undo_payloads(conn, olds, news)
+
+
+def carry_undo_payloads(conn, olds: list[str], news: list[str]) -> int:
+    """Rewrite a merchant-wide write's held undo (category_undo) from each
+    old id onto its new one. The undo restores each row it moved by id,
+    for a week; left on the old id it would skip the row and still answer
+    that it undid the write. Each entry keeps its order and every other
+    key it holds. adopt._rewrite_txn_slice runs it inside the transaction
+    that moves the rows, so no undo claimed between a slice and a later
+    carry finds its rows gone. Returns the undos rewritten."""
+    if not olds:
+        return 0
+    return conn.execute(
+        """UPDATE category_undo u
+              SET payload = jsonb_set(u.payload, '{affected}', (
+                  SELECT jsonb_agg(
+                             CASE WHEN m.new_id IS NULL THEN e.v
+                                  ELSE jsonb_set(e.v, '{id}',
+                                                 to_jsonb(m.new_id)) END
+                             ORDER BY e.i)
+                    FROM jsonb_array_elements(
+                             CASE WHEN jsonb_typeof(u.payload->'affected')
+                                       = 'array'
+                                  THEN u.payload->'affected'
+                                  ELSE '[]'::jsonb END)
+                         WITH ORDINALITY AS e(v, i)
+                    LEFT JOIN unnest(%s::text[], %s::text[])
+                         AS m(old_id, new_id)
+                      ON jsonb_typeof(e.v) = 'object'
+                     AND e.v->>'id' = m.old_id))
+            WHERE jsonb_typeof(u.payload->'affected') = 'array'
+              AND jsonb_array_length(
+                      CASE WHEN jsonb_typeof(u.payload->'affected') = 'array'
+                           THEN u.payload->'affected'
+                           ELSE '[]'::jsonb END) > 0
+              AND EXISTS (
+                  SELECT 1 FROM jsonb_array_elements(
+                             CASE WHEN jsonb_typeof(u.payload->'affected')
+                                       = 'array'
+                                  THEN u.payload->'affected'
+                                  ELSE '[]'::jsonb END) AS a(v)
+                   WHERE jsonb_typeof(a.v) = 'object'
+                     AND a.v->>'id' = ANY(%s::text[]))""",
+        (olds, news, olds)).rowcount
+
+
+def _moved_on(conn, account_id: str) -> str | None:
+    """The account the numbered id `account_id` (in full; an adoption may
+    record it cut) moved to, followed through every later move: the last
+    one reached, the first in id order where a move branched. None when
+    nothing moved off it."""
+    at = sorted({account_id, *lineage_keys(account_id)})
+    seen = set(at)
+    last = None
+    for _ in range(32):
+        nxt = sorted({r["account_id"] for r in conn.execute(
+            "SELECT account_id FROM account_adoptions"
+            " WHERE old_account_id = ANY(%s)", (at,)).fetchall()} - seen)
+        if not nxt:
+            break
+        last = nxt[0]
+        seen.update(nxt)
+        at = [last]
+    return last
+
+
+def carry_stale_mentions(conn) -> int:
+    """Carry the mentions an earlier move left on an id the household no
+    longer holds: an unkeyed file-row id whose keyed form it holds, and an
+    OFX id spelling a full number, onto the id an OFX import gives that
+    FITID on the account the number moved to (the one key_file_import_ids
+    moved its row to) — held or not, and never a row of another account
+    repeating the FITID, as banks do. A mention of an unkeyed id whose row
+    is simply gone, or of an OFX id on an account nothing moved off, is
+    left as it is: the row may come back under that plain id (a re-import
+    on an account with no number), and a mention rewritten to a keyed form
+    nothing will ever hold is lost for good. Returns the ids carried."""
+    named = {r["v"] for r in conn.execute(
+        _MENTIONED_IDS_SQL, MENTION_ARGS).fetchall()}
+    if not named:
+        return 0
+    named -= _held_ids(conn, named)
+    pairs: dict[str, str] = {}
+    unkeyed = [i for i in named if _UNKEYED_FILE_ID_RE.match(i)]
+    secret = txn_id_secret(conn) if unkeyed else None
+    if secret is not None:
+        keyed = {keyed_file_id(secret, i): i for i in unkeyed}
+        for k in _held_ids(conn, keyed):
+            pairs[keyed[k]] = k
+    moved_to: dict[str, str | None] = {}
+    for i in sorted(named):
+        m = _NUMBERED_OFX_ID_RE.match(i)
+        if not (m and LONG_DIGITS_RE.search(m.group(1))):
+            continue
+        if m.group(1) not in moved_to:
+            moved_to[m.group(1)] = _moved_on(conn, m.group(1))
+        if moved_to[m.group(1)] is not None:
+            pairs[i] = f"ofx:{moved_to[m.group(1)]}:{m.group(2)}"
+    carry_txn_mentions(conn, pairs.items())
+    return len(pairs)
 
 
 # Two equity movements on one transaction that answer the same question:

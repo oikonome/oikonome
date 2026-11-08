@@ -21,6 +21,11 @@ where you settle the rest by hand — and your answer outranks every
 automatic rule, because you were there and the app was only reading
 strings.
 
+A card or account number never becomes part of a merchant's name: when a
+bank prints little but a number ("ONLINE PMT" and a card number), the
+name the app derives keeps only its last four digits. A name you type
+yourself is kept exactly as typed.
+
 ## The page
 
 Reach it from **Settings → Merchants** (web and mobile — it is a
@@ -132,6 +137,14 @@ merchants-repair-splits` prints what it would merge and why it refused
 the rest; add `--apply` to merge, `--tenant <id>` to scope it to one
 household, and `--limit <n>` to cap the merges per household (the default
 is the nightly job's own cap).
+
+An operator can also name city names to strip from the end of every
+merchant label (banks cut a store's city into the descriptor at
+different lengths). There is no Settings card and no command for it: set
+`merchant_strip_cities` — a JSON list of names — in the household's
+`tenant_settings.config` row, and the nightly merchant pass applies it.
+An export does not carry the list and a restore never sets it, so it stays
+with the instance it was set on.
 
 ## Undo
 

@@ -17,7 +17,7 @@ import AreaChart from "../components/AreaChart";
 import MoneyMap, { Track } from "../components/MoneyMap";
 import { planRows } from "../components/PlanBars";
 import { canEdit } from "../role";
-import { isPlanSavingsGoal, monthSavings } from "../moneymath";
+import { isPlanSavingsGoal, localDayOf, monthSavings, rowSpend } from "../moneymath";
 
 /** Card autopays as chart marks: the series is one point per day starting
  *  today, so a due date is found by its own index. A date the window does
@@ -52,6 +52,15 @@ export const VERDICT = {
 // where a demo instance keeps the hero face, since it cannot keep it on
 // the account (see the toggle below)
 const FACE_KEY = "oiko-today-face";
+
+// The cash tile's line when it has no paycheck figure, keyed by the
+// payload's `income_due_note` (the server decides why; never re-derived
+// here). Same strings as the email render and the mobile Today screen.
+const NO_PAYCHECK_NOTE: Record<string, string> = {
+  none: "no paycheck set up — add your income under Bills & Income and this counts it",
+  budgeted: "your income is budgeted, not scheduled — this counts no paycheck",
+  off: "your income is switched off under Bills & Income — this counts no paycheck",
+};
 
 // date = a past day (YYYY-MM-DD) the user stepped back to; null = live
 // today. The cache key must carry the date — every day is its own payload.
@@ -216,7 +225,10 @@ export default function Today({ date = null }: { date?: string | null }) {
 
   // start of the recent window: yesterday, or today itself on the 1st
   const yesterday = d.yesterday ?? d.date;
-  const recentSum = d.recent.reduce((s, r) => s + r.amount, 0);
+  // the verdict's per-row figure (net of a partial reimbursement), the same
+  // amounts the email's recent-spending total adds — the gross `amount`
+  // would print a different number than the email for the same window
+  const recentSum = d.recent.reduce((s, r) => s + rowSpend(r), 0);
   // the footnote's two kinds of missed bill: never posted, and posted then
   // withdrawn by the bank feed (the fourth slot; an older server omits it)
   const lateBills = d.overdue_unpaid.filter((o) => !o[3]);
@@ -248,6 +260,18 @@ export default function Today({ date = null }: { date?: string | null }) {
 
   return (
     <>
+      {/* a two-factor recovery pending on this account — the notice
+          can still be undone, and only Settings > Security cancels it */}
+      {me.data?.factor_reset_pending && (
+        <div className="note bad" style={{ margin: "1rem 0 0" }}>
+          <span style={{ flex: 1 }}>
+            Someone asked for a recovery that removes this account's
+            two-factor methods. It lands {mmdd(localDayOf(me.data.factor_reset_pending))}.
+            {" "}Not you?{" "}
+            <Link to="/settings/security">Cancel it in Security</Link>
+          </span>
+        </div>
+      )}
       {/* ---- past-day view (back-nav): the banner is THE way home. The
            forward-looking panes — cash forecast card/chart, alert strips,
            the cash notice — are now-facts, not that-day facts; the server
@@ -561,7 +585,8 @@ export default function Today({ date = null }: { date?: string | null }) {
             <span>
             {d.headroom !== null && d.headroom < 0 ? (
               <>Short <b>{money(-d.headroom)}</b> today — checking doesn't
-                cover cards &amp; bills before the next paycheck. Cover it from
+                cover cards &amp; bills before the next paycheck{d.next_paycheck
+                  ? ` (${mmdd(d.next_paycheck)})` : ""}. Cover it from
                 savings{slowTo !== null
                   ? <>, or slow spending to <b>{money(slowTo)}/day</b></>
                   : ""}.</>
@@ -581,7 +606,8 @@ export default function Today({ date = null }: { date?: string | null }) {
               ? <><b>Cash gets tight</b> around {mmdd(p0.min_date)}{" "}
                   (low {money(p0.min)}).</>
               : <><b>Cash is tight</b> — {money(d.headroom)} left after
-                  cards &amp; bills before the next paycheck.</>}
+                  cards &amp; bills before the next paycheck{d.next_paycheck
+                    ? ` (${mmdd(d.next_paycheck)})` : ""}.</>}
             </span>
           </div>
         ) : null}
@@ -801,14 +827,39 @@ export default function Today({ date = null }: { date?: string | null }) {
                 <div className="kpi sm">{money(fc.card_debt)}</div></div>
               {/* typeof guard: a mixed-deploy payload without
                   the field must not render $NaN */}
+              {/* the month-end figure counts the paychecks still due as
+                  well as the bills still due — bills alone reads as if the
+                  product forgot the household's pay. Without an income
+                  series the tile says why (`income_due_note`); the figure
+                  stays cash. */}
               {rw && rw.checking !== null && typeof d.bills_remaining_month === "number" && (
-                <div><span className="sub"
-                    title="checking − card debt − bills still due this month">
-                    after cards &amp; bills</span>
-                  <div className={`kpi sm ${rw.checking - rw.card_debt
-                        - d.bills_remaining_month >= 0 ? "pos" : "neg"}`}>
-                    {money(rw.checking - rw.card_debt
-                           - d.bills_remaining_month)}</div></div>
+                typeof d.income_due_total === "number" ? (<>
+                  <div><span className="sub" title="paychecks still due this month">
+                      paychecks still due</span>
+                    <div className="kpi sm pos">+{money(d.income_due_total)}</div>
+                    {(d.income_due_dates ?? []).length > 0 && (
+                      <div className="sub" style={{ fontSize: 11 }}>
+                        {(d.income_due_dates ?? []).slice(0, 3).map(mmdd).join(", ")}</div>)}
+                  </div>
+                  <div><span className="sub"
+                      title="checking − card debt − bills still due this month + paychecks still due this month">
+                      after cards, bills &amp; paychecks</span>
+                    <div className={`kpi sm ${rw.checking - rw.card_debt
+                          - d.bills_remaining_month + d.income_due_total >= 0 ? "pos" : "neg"}`}>
+                      {money(rw.checking - rw.card_debt
+                             - d.bills_remaining_month + d.income_due_total)}</div></div>
+                </>) : (
+                  <div><span className="sub"
+                      title="checking − card debt − bills still due this month">
+                      after cards &amp; bills</span>
+                    <div className={`kpi sm ${rw.checking - rw.card_debt
+                          - d.bills_remaining_month >= 0 ? "pos" : "neg"}`}>
+                      {money(rw.checking - rw.card_debt
+                             - d.bills_remaining_month)}</div>
+                    <div className="sub" style={{ fontSize: 11 }}>
+                      {NO_PAYCHECK_NOTE[d.income_due_note ?? "none"]
+                        ?? NO_PAYCHECK_NOTE.none}</div></div>
+                )
               )}
               {converged ? (() => {
                 const s = lows[0].s;

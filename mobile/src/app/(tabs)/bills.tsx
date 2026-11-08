@@ -13,11 +13,12 @@ import { Card, H, HelpLink, KV, Meter, Pill } from "../../components/ui";
 import { ApiError, errText, Bill, BillsData, Proposal, SettingsView }
   from "../../lib/api";
 import { patchDismissedHint, patchList, patchQuery, removeFromList,
-         saveSettings } from "../../lib/cache";
+         SETTINGS_SAVES, saveSettings } from "../../lib/cache";
 import { useRouter, useScrollToTop } from "expo-router";
 import { useMemo, useRef, useState } from "react";
 
 import { useRefetchWhenShown } from "../../lib/focus";
+import { onSeveralDays } from "../../lib/monthdays";
 import { useSession } from "../../lib/session";
 
 const BILLS_KEY = ["bills"];
@@ -32,17 +33,20 @@ export const ymLabel = (ym: string) => {
   const [y, m] = ym.split("-").map(Number);
   return new Date(y, m - 1, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" });
 };
-import { useOwner, useViewer } from "../../lib/viewer";
+import { useMe, useOwner, useViewer } from "../../lib/viewer";
 import { C, mmddyy, money } from "../../lib/theme";
 import { ADD_CADENCES, CUSTOM_UNITS, catLabel, customCadence, customMax,
          filterCategories, missedBillPill,
-         proposalSuperseded } from "../../lib/pure";
+         proposalSuperseded, scanAlreadyRunning,
+         SCAN_RUNNING_RETRY_MS, householdDay } from "../../lib/pure";
 
 // the web row's status column, ported whole: a quiet row IS the ✓ —
 // only a bill wanting a decision says anything
 const DAY = 86_400_000;
-function daysUntil(iso: string): number {
-  const today = new Date(); today.setHours(0, 0, 0, 0);
+// counted from the household's day (/api/me timezone): the day the server,
+// Today and the mail judge "due today" / "1 day late" by
+function daysUntil(iso: string, zone?: string): number {
+  const today = householdDay(new Date(), zone);
   return Math.round(
     (new Date(iso + "T00:00:00").getTime() - today.getTime()) / DAY);
 }
@@ -81,12 +85,14 @@ function BillRow({ b, onPress, onHint, past }: {
 }) {
   const envelope = b.used !== null;
   const isAnnualEnv = envelope && b.period_months === 12;
-  const daysTo = !past && !envelope && b.due_on ? daysUntil(b.due_on) : null;
+  const zone = useMe().data?.timezone;
+  const daysTo = !past && !envelope && b.due_on ? daysUntil(b.due_on, zone) : null;
   const settled = b.occurrences > 0 && b.paid >= b.occurrences;
   const missed = !!past && !settled && b.occurrences > 0;
   const overdue = !settled && daysTo !== null && daysTo < 0;
   const soon = !settled && daysTo !== null && daysTo >= 0 && daysTo <= SOON_DAYS;
-  const cyc = cycleDays(b.cadence);
+  const cyc = onSeveralDays(b.by_month_day)
+    ? cycleDays("monthly") / b.by_month_day.length : cycleDays(b.cadence);
   const cycleFrac = daysTo === null || cyc <= 0 ? null
     : Math.min(1, Math.max(0, 1 - daysTo / cyc));
 
@@ -212,7 +218,8 @@ function BillRow({ b, onPress, onHint, past }: {
 
 // the web page's cadence groups, in its rank order — every interval gets
 // its own heading instead of an "Other" catch-all
-const GROUP_ORDER = ["Weekly", "Every 14 days", "Every 2 weeks", "Monthly",
+const GROUP_ORDER = ["Weekly", "Every 14 days", "Every 2 weeks",
+                     "Twice a month", "Monthly",
                      "Monthly envelope", "Annual envelope",
                      "Every 8 weeks", "Every 2 months", "Every 3 months",
                      "Every 6 months", "Yearly", "Every 2 years",
@@ -220,6 +227,7 @@ const GROUP_ORDER = ["Weekly", "Every 14 days", "Every 2 weeks", "Monthly",
 function cadenceGroup(b: Bill): string {
   if (b.used !== null)
     return b.period_months === 12 ? "Annual envelope" : "Monthly envelope";
+  if (onSeveralDays(b.by_month_day)) return "Twice a month";
   const c = b.cadence.toLowerCase();
   const named: Record<string, string> = {
     weekly: "Weekly", "every 14 days": "Every 14 days",
@@ -245,6 +253,7 @@ function NightlyFinderSwitch({ onError }: { onError: (m: string) => void }) {
   const settings = useQuery({ queryKey: ["settings"],
     queryFn: () => client!.settingsFull(), enabled: !!client });
   const save = useMutation({
+    scope: SETTINGS_SAVES,
     mutationFn: (on: boolean) =>
       saveSettings(qc, client!, { bill_detection_auto: on }),
     // the switch flips on the tap; saveSettings then seeds the cache with
@@ -302,7 +311,10 @@ export default function Bills() {
   // the month on view: null = this month (the live key every write
   // patches); a past month has its own key, so stepping back never
   // overwrites the live list in the cache
-  const curYm = ymOf(new Date());
+  // "this month" is the household's — the month GET /api/bills answers
+  // for — so ‹ reaches the month that just closed there
+  const me = useMe();
+  const curYm = ymOf(householdDay(new Date(), me.data?.timezone));
   const [ym, setYm] = useState<string | null>(null);
   const isPast = ym !== null && ym < curYm;
   const queryKey = isPast ? ["bills", "month", ym] : BILLS_KEY;
@@ -390,7 +402,16 @@ export default function Bills() {
   const detect = useMutation({
     mutationFn: () => client!.billsDetect(),
     onSuccess: refetchSchedule,
-    onError: (e) => Alert.alert("Scan failed", errText(e)),
+    onError: (e) => {
+      if (scanAlreadyRunning(e)) {
+        Alert.alert("Scan already running",
+                    "Another scan is finding bills now — the list updates "
+                    + "when it ends.");
+        setTimeout(refetchSchedule, SCAN_RUNNING_RETRY_MS);
+        return;
+      }
+      Alert.alert("Scan failed", errText(e));
+    },
   });
   const restore = useMutation({
     mutationFn: (payee: string) => client!.billsRestore(payee),
@@ -473,14 +494,13 @@ export default function Bills() {
                           // so a bill deleted since the list loaded is
                           // refused instead of recreated
                           orig_payee: b.payee,
-                          // omitted when unknown: the server keeps the
-                          // bill's own cadence rather than defaulting
-                          ...(b.cadence_value ? { cadence: b.cadence_value }
-                                              : {}),
-                          // no next_due: an amount edit keeps the date,
-                          // and this row's copy may predate the server
-                          // rolling it to the next cycle
-                          income: b.income }),
+                          // amount only: no cadence, income or next_due, so
+                          // the server keeps the bill's stored values. This
+                          // row may be a persisted copy older than an edit
+                          // made elsewhere, and resending its cadence or
+                          // direction would silently revert that edit
+                        }),
+
     onSuccess: (_r, v) => {
       setUndoAct({
         label: `${v.b.payee} updated to ${money(v.amt)}.`,

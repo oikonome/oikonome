@@ -57,13 +57,25 @@ SUDO=""
 
 ABS_DATA=$(data_dir_resolve "$PWD" ../data/postgres)
 
-WANT=$(grep -oE 'image: docker.io/library/postgres:[0-9]+' compose.yaml | head -1 | grep -oE '[0-9]+$')
+# The bundled postgres is built from the base_image compose.yaml names
+# (docker/postgres/Dockerfile), under a tag that stays the same across
+# majors — so that line, not the image tag, says which major this release runs.
+WANT=$(grep -oE 'base_image: docker.io/library/postgres:[0-9]+' compose.yaml | head -1 | grep -oE '[0-9]+$')
 [ -n "$WANT" ] || exit 0
 # "No cluster here" (a fresh install) and "a cluster this user cannot read"
 # are different answers: the second must stop the upgrade, because starting
 # the new major on an old folder leaves postgres crash-looping.
 rc=0
-HAVE=$(pg_data_version "$ABS_DATA" "$ENGINE" "docker.io/library/postgres:${WANT}-alpine") || rc=$?
+# A folder this user cannot open is read through a container. It only reads
+# one file, so any postgres image will do: the one this install already
+# built when there is one (nothing pulled), else the base.
+PROBE_IMG="docker.io/library/postgres:${WANT}-alpine"
+if [ -e "$ABS_DATA" ] && ! { [ -r "$ABS_DATA" ] && [ -x "$ABS_DATA" ]; }; then
+  OURS="oikonome-postgres:${COMPOSE_PROJECT_NAME:-$(dotenv_get .env COMPOSE_PROJECT_NAME)}"
+  [ "$OURS" != "oikonome-postgres:" ] || OURS=oikonome-postgres:local
+  $ENGINE image inspect "$OURS" >/dev/null 2>&1 && PROBE_IMG=$OURS
+fi
+HAVE=$(pg_data_version "$ABS_DATA" "$ENGINE" "$PROBE_IMG") || rc=$?
 if [ "$rc" -ne 0 ]; then
   die "can't read which Postgres version wrote $ABS_DATA (its files belong to the database container and a probe container could not read them either) — nothing was changed. Check that $ENGINE can run containers, or re-run the upgrade as root."
 fi
@@ -93,6 +105,13 @@ fi
 
 say "Database folder is Postgres $HAVE; this release runs Postgres $WANT."
 say "Migrating in place (dump with $HAVE → reload into $WANT)…"
+# Build the new major's image FIRST. Compose builds a tag only when it is
+# missing, and every existing install has this one cached from the OLD
+# major: a plain `up` would initialise and reload into an old-major cluster,
+# report success, and leave the next rebuild crash-looping on that folder.
+# Built while the old stack still runs, so a failed build changes nothing.
+$COMPOSE build postgres >/dev/null 2>&1 \
+  || die "couldn't build the Postgres $WANT image — nothing was changed. Run '$COMPOSE build postgres' in $PWD to see why, then re-run the upgrade."
 STAMP=$(date +%Y%m%d-%H%M%S)
 DUMP="$(dirname "$ABS_DATA")/pg${HAVE}-to-${WANT}-${STAMP}.sql"
 $COMPOSE stop >/dev/null 2>&1 || true
@@ -155,7 +174,7 @@ sed -i -e '/^DROP ROLE IF EXISTS postgres;$/d' -e '/^CREATE ROLE postgres;$/d' "
 # upgrade destroyed the database — one panicked `reset` or `rm -rf` away
 # from actually destroying the folder that still holds it.
 OLD_DIR="$ABS_DATA.pg${HAVE}-${STAMP}"
-ROLLBACK="old data untouched at $OLD_DIR; put it back with: $COMPOSE stop; rm -rf $ABS_DATA; mv $OLD_DIR $ABS_DATA"
+ROLLBACK="old data untouched at $OLD_DIR; put it back with: $COMPOSE stop; rm -rf $ABS_DATA; mv $OLD_DIR $ABS_DATA — then go back to the previous release and rebuild its database image ($COMPOSE build postgres) before starting it, since the image now built is Postgres $WANT"
 $SUDO mv "$ABS_DATA" "$OLD_DIR"
 $SUDO mkdir -p "$ABS_DATA"
 $COMPOSE up -d postgres >/dev/null 2>&1 \
@@ -163,6 +182,13 @@ $COMPOSE up -d postgres >/dev/null 2>&1 \
 for i in $(seq 1 90); do $COMPOSE exec -T postgres pg_isready -U postgres -q 2>/dev/null && break; sleep 1; done
 if ! $COMPOSE exec -T postgres pg_isready -U postgres -q 2>/dev/null; then
   die "postgres:$WANT never became ready (90s) — YOUR DATABASE IS SAFE: $ROLLBACK"
+fi
+# The server that came up must BE the new major: reloading into any other
+# one passes every check below and strands the data in a folder the
+# release's server cannot open.
+RUNNING=$($COMPOSE exec -T postgres psql -U postgres -tAc "SHOW server_version_num" 2>/dev/null | tr -dc '0-9' || true)
+if [ -z "$RUNNING" ] || [ $((RUNNING / 10000)) != "$WANT" ]; then
+  die "the database container runs Postgres ${RUNNING:+$((RUNNING / 10000))}${RUNNING:-of an unknown version}, not $WANT — nothing was reloaded. YOUR DATABASE IS SAFE: $ROLLBACK"
 fi
 if ! $COMPOSE exec -T postgres psql -U postgres -q -v ON_ERROR_STOP=1 -f - < "$DUMP" >/dev/null 2>"$DUMP.log"; then
   chmod 600 "$DUMP.log" 2>/dev/null || true

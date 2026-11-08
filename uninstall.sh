@@ -235,13 +235,15 @@ POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-gone} \
   OIKONOME_ADMIN_PASSWORD=${OIKONOME_ADMIN_PASSWORD:-gone} \
   OIKONOME_MASTER_KEY=${OIKONOME_MASTER_KEY:-gone} \
   $C down -v >/dev/null 2>&1 || true
-# each install owns image oikonome:<project> — remove it too.
-# An install without a project name shares its tag (oikonome:local
-# historically, oikonome:oikonome now) with whatever else built it, so
-# those are left alone.
+# each install owns images oikonome:<project> and oikonome-postgres:<project>
+# — remove them too. An install without a project name shares its tags
+# (oikonome:local historically, oikonome:oikonome now) with whatever else
+# built them, so those are left alone.
 if [ -n "$PROJ" ]; then
-  { docker rmi "oikonome:$PROJ" 2>/dev/null \
-    || podman rmi "oikonome:$PROJ" 2>/dev/null; } >/dev/null || true
+  for img in "oikonome:$PROJ" "oikonome-postgres:$PROJ"; do
+    { docker rmi "$img" 2>/dev/null \
+      || podman rmi "$img" 2>/dev/null; } >/dev/null || true
+  done
 fi
 fi # HALF_REMOVED: no docker/ dir — teardown already ran on a prior pass
 cd /

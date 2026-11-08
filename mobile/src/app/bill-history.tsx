@@ -18,6 +18,8 @@ import { errText, setBillPrefill, setHandedOffTxn, type Bill, type BillsData, ty
          type Proposal } from "../lib/api";
 import { patchDismissedHint, patchList, patchQueries, patchQuery,
          removeFromList } from "../lib/cache";
+import { cadenceFields, cadencePick, onSeveralDays, severalDaysWords,
+         withSeveralDays } from "../lib/monthdays";
 import { useSession } from "../lib/session";
 import { useDemo, useViewer } from "../lib/viewer";
 import { C, mmddyy, money } from "../lib/theme";
@@ -173,7 +175,8 @@ export default function BillHistory() {
             <Text style={s.mut}>
               {bill ? (
                 <>
-                  Configured: {money(bill.amount)} {cadLabel(bill.cadence)}
+                  Configured: {money(bill.amount)} {onSeveralDays(bill.by_month_day)
+                    ? severalDaysWords(bill.by_month_day) : cadLabel(bill.cadence)}
                   {bill.due_on ? ` · next due ${mmddyy(bill.due_on)}` : ""}
                   {" · source "}{bill.source}
                 </>
@@ -219,7 +222,8 @@ export default function BillHistory() {
                              setBillPrefill(d.payee, {
                                amount: fit.amount.toFixed(2),
                                cadence: fit.cadence,
-                               next_due: fit.next_due ?? "" });
+                               next_due: fit.next_due ?? "",
+                               by_month_day: fit.by_month_day ?? null });
                              router.push({ pathname: "/bill",
                                params: { payee: d.payee } } as never); }}>
                   <Text style={[s.btnText, { color: C.accent }]}>
@@ -559,12 +563,15 @@ function AddAsBill({ payee, fit, inflow, onDone }: {
   // bill it would wait for a charge that never comes
   inflow: boolean;
   fit: { kind: string; amount: number; cadence: string;
-         next_due: string; label: string } | null;
+         next_due: string; label: string;
+         by_month_day?: number[] | null } | null;
   onDone: () => void;
 }) {
   const { client } = useSession();
   const [amount, setAmount] = useState(fit ? fit.amount.toFixed(2) : "");
-  const [cadence, setCadence] = useState(fit?.cadence ?? "MONTHLY:1");
+  const fitDays = fit?.by_month_day;
+  const [cadence, setCadence] = useState(
+    cadencePick(fit?.cadence ?? "MONTHLY:1", fitDays));
   const [nextDue, setNextDue] = useState(fit?.next_due ?? "");
   const [customN, setCustomN] = useState("2");
   const [customUnit, setCustomUnit] = useState("YEARLY");
@@ -574,7 +581,8 @@ function AddAsBill({ payee, fit, inflow, onDone }: {
     ? customCadence(customUnit, customN) : cadence;
   const add = useMutation({
     mutationFn: () => client!.billsSave({
-      payee, amount, cadence: effCadence, next_due: nextDue || undefined,
+      payee, amount, ...cadenceFields(effCadence, null, fitDays, nextDue),
+      next_due: nextDue || undefined,
       income: inflow }),
     onSuccess: onDone,
     onError: (e) => setErr(errText(e)),
@@ -582,7 +590,7 @@ function AddAsBill({ payee, fit, inflow, onDone }: {
   // a ledger suggestion may be an unusual cadence not in the short list —
   // keep it selectable/visible rather than silently mis-showing
   const options: [string, string][] = [
-    ...cadenceChoices(ADD_CADENCES, [fit?.cadence]),
+    ...withSeveralDays(cadenceChoices(ADD_CADENCES, [fit?.cadence]), fitDays),
     ["CUSTOM", "custom interval…"],
   ];
   return (
@@ -638,7 +646,7 @@ function AddAsBill({ payee, fit, inflow, onDone }: {
         {fit ? (
           <Pressable style={[s.btn, s.btnQuiet]}
                      onPress={() => { setAmount(fit.amount.toFixed(2));
-                                      setCadence(fit.cadence);
+                                      setCadence(cadencePick(fit.cadence, fitDays));
                                       setNextDue(fit.next_due ?? "");
                                       setSuggested(true); }}>
             <Text style={[s.btnText, { color: C.accent }]}>

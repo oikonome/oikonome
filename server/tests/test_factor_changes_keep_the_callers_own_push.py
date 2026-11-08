@@ -137,7 +137,8 @@ class TotpDisableEvictsInsideItsTransaction(_Base):
         secret = self._enroll()
         client = TestClient(self.appmod.app, raise_server_exceptions=False)
         client.cookies = self.client.cookies
-        with mock.patch.object(self.appmod, "_revoke_bearer_persistence",
+        from oikonome.auth import posture
+        with mock.patch.object(posture, "rotate",
                                side_effect=RuntimeError("boom")):
             r = client.post("/api/totp/disable", data={
                 "code": _code(secret), "password": PW})

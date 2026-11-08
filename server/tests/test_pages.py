@@ -128,14 +128,16 @@ class PagesTests(unittest.TestCase):
                                    "kind": "depository/savings"},
                              follow_redirects=False)
         self.assertEqual(r.status_code, 303)
-        self.client.post("/accounts/balance",
-                         data={"account_id": "manual:cash-stash",
-                               "balance": "1,234.56"})
         conn = tenancy.tenant_connect(self.tid)
         try:
+            aid = conn.execute("SELECT id FROM accounts"
+                               " WHERE name = 'Cash Stash'").fetchone()["id"]
+            self.assertRegex(aid, r"^manual:[a-z]{16}$")
+            self.client.post("/accounts/balance",
+                             data={"account_id": aid, "balance": "1,234.56"})
             row = conn.execute(
                 "SELECT balance_current, type, subtype FROM accounts "
-                "WHERE id='manual:cash-stash'").fetchone()
+                "WHERE id=%s", (aid,)).fetchone()
             self.assertEqual(row["balance_current"], 1234.56)
             self.assertEqual(row["subtype"], "savings")
             # balance endpoint refuses non-manual accounts

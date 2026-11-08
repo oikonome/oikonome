@@ -17,25 +17,29 @@ The defaults come from your own data, not placeholders:
   last-12-months spending (the product's spend definition — see the
   concepts guide), rounded to the nearest $1,000. Too little history
   to be meaningful and a generic fallback is used instead.
-- **SS at claim age** comes from Social Security estimates stored with
-  your settings — the monthly amounts from your SSA statement, keyed by
-  claim age 62–70. There is no screen for entering them: they are
-  loaded through the settings JSON API (`ss_estimates`, an object of
-  `{age: monthly $}`), and nothing in the app computes a benefit for
+- **SS at claim age** comes from the Social Security estimates you enter
+  from your SSA statement: open **adjust ▾** on the Assumptions line (or
+  click **no SSA statement** there) and fill **Social Security $/mo by
+  claim age**, one monthly amount for each age from 62 to 70 you have a
+  figure for, then **Save** (the phone app's Retirement screen has the
+  same fields under its own **adjust ▾**; a viewer sees the page but not
+  the fields). Nothing in the app computes a benefit for
   you. The page picks the estimate for your exact chosen claim age; if
-  no estimate exists for that age (or none are loaded), Social Security
-  is $0 — there is no interpolation between entered ages. The hero's
-  **Assumptions** line tells you which case you are in: it reads
-  **SS at 67 ($X/mo)** when an estimate was found and **(no SSA
-  statement)** when none was.
+  no estimate exists for that age (or none are entered), Social Security
+  is $0 — there is no interpolation between entered ages, so enter every
+  age you might claim at. The hero's **Assumptions** line tells you which
+  case you are in: **SS at 67 ($X/mo)** with the estimate for that age,
+  **$0/mo** when you have estimates but none for that age, and **(no SSA
+  statement)** when you have none at all.
 
-Every field on the page is a **what-if override**. The form sits behind
-**adjust ▾** on the Assumptions line — spend, return, inflation, plan-to
+Every other field on the page is a **what-if override**. The form sits
+behind **adjust ▾** on the Assumptions line — spend, return, inflation, plan-to
 age, SS claim age, stock %, employer and taxable saving per month, and
 the age to resume saving — and **Recalculate** reruns the model with
-your figures. Nothing you type there is saved; the wizard's own answers
-(spend, saving, market assumptions) likewise only pre-fill this form for
-the visit, with the birthdate the one thing it stores.
+your figures. Nothing you type in that form is saved; the wizard's own
+answers (spend, saving, market assumptions) likewise only pre-fill it for
+the visit, with the birthdate the one thing it stores. The Social Security
+amounts below it are the exception: **Save** keeps them for the household.
 
 ## The projection model
 

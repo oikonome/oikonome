@@ -371,7 +371,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     account_id             TEXT,
     date                   DATE,
     authorized_date        DATE,
-    amount                 DOUBLE PRECISION,     -- positive = money out (Plaid)
+    amount                 DOUBLE PRECISION NOT NULL,  -- positive = money out (Plaid); 0 with raw._amount_missing when an archive had none
     name                   TEXT,
     merchant_name          TEXT,
     category_primary       TEXT,                 -- working machine category
@@ -1240,6 +1240,7 @@ CREATE TABLE IF NOT EXISTS bulk_import_jobs (
     heartbeat_at TIMESTAMPTZ,
     finished_at TIMESTAMPTZ,
     cancel_requested_at TIMESTAMPTZ,
+    runner      UUID,                       -- the claiming worker's token (migration 210)
     PRIMARY KEY (tenant_id, id),
     UNIQUE (tenant_id, stage_token_hash)
 );
@@ -1310,6 +1311,33 @@ CREATE TABLE IF NOT EXISTS category_undo (
     PRIMARY KEY (tenant_id, id)
 );
 
+-- the household's secret that file-row ids hashed over a full account
+-- number are keyed with (migration 202): never exported, gone with the
+-- household
+CREATE TABLE IF NOT EXISTS txn_id_keys (
+    tenant_id   UUID NOT NULL DEFAULT NULLIF(current_setting('app.tenant_id', true), '')::uuid,
+    secret      TEXT NOT NULL,
+    PRIMARY KEY (tenant_id)
+);
+
+-- which account each source name fills (migration 207): keyed HMACs of
+-- the source and of the card it spells under txn_id_keys' secret ("s:",
+-- "d:"), or ("c:") a digest of a hand-made account's stored name; never
+-- the name itself (sync/account_sources.py)
+CREATE TABLE IF NOT EXISTS account_sources (
+    tenant_id   UUID NOT NULL DEFAULT NULLIF(current_setting('app.tenant_id', true), '')::uuid,
+    door        TEXT NOT NULL,
+    source_hmac TEXT NOT NULL,
+    account_id  TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, door, source_hmac, account_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS account_sources_one_account_per_source
+    ON account_sources (tenant_id, door, source_hmac)
+    WHERE left(source_hmac, 2) = 's:';
+CREATE INDEX IF NOT EXISTS account_sources_by_account
+    ON account_sources (tenant_id, account_id);
+
 DO $$
 DECLARE t TEXT;
 BEGIN
@@ -1325,7 +1353,7 @@ BEGIN
         'import_staging','business_entity','entity_membership','equity_movement',
         'business_txn_class','compliance_obligation','mileage_log','vendor_1099',
         'bulk_import_jobs','bulk_import_files','assistant_turns',
-        'category_undo']
+        'category_undo','txn_id_keys','account_sources']
     LOOP
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
         EXECUTE format('DROP POLICY IF EXISTS tenant_isolation ON %I', t);
@@ -1366,7 +1394,8 @@ CREATE TABLE IF NOT EXISTS plaid_link_sessions (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     exchanged       JSONB NOT NULL DEFAULT '{}'::jsonb,
     done_at         TIMESTAMPTZ,
-    reply           JSONB
+    reply           JSONB,
+    days_requested  INTEGER                -- the window its link token asked for (migration 213)
 );
 CREATE INDEX IF NOT EXISTS plaid_link_sessions_open
     ON plaid_link_sessions (tenant, created_at) WHERE done_at IS NULL;

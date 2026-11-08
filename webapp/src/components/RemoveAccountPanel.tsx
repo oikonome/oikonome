@@ -3,7 +3,7 @@
 // its own so the card does not import the whole Accounts page for them.
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import { api, errText, type Account, type AccountRemoveMode,
+import { api, errText, releasedHoldDays, type Account, type AccountRemoveMode,
          type AccountRemoveResult, type Connection }
   from "../api/client";
 import { patchList, removeFromList } from "../api/cache";
@@ -29,7 +29,7 @@ export const KINDS: [string, string][] = [
 // disabled, behind a count cached from before the very change that freed
 // the slot.
 export type Moved = "accounts" | "settings" | "connections" | "today"
-  | "calendar" | "me";
+  | "calendar" | "me" | "holdings";
 export type DoneFn = (msg: string, moved?: Moved[]) => void;
 type AccountsData = { accounts: Account[] };
 
@@ -52,7 +52,8 @@ export function accountRemoveNote(r: AccountRemoveResult): string {
 }
 
 export function accountRemoveMoved(mode: AccountRemoveMode): Moved[] {
-  const keys: Moved[] = ["accounts", "today"];
+  // top holdings leaves hidden and removed accounts out
+  const keys: Moved[] = ["accounts", "today", "holdings"];
   if (mode !== "hide") keys.push("connections", "me");
   // a purge can take the checking anchor or an excluded account with it,
   // and the bill calendar's balances — the settings view and the calendar
@@ -106,7 +107,7 @@ export function RemoveAccountPanel({ a, liveConn, onDone, onCancel }: {
   const meQ = useQuery({ queryKey: ["me"], queryFn: api.me });
   const credLock = liveConn ? sharedLock(meQ.data, "credential") : null;
   // at the allowance, the likely reason to disconnect is to make room —
-  // and a released bank keeps its place for 30 days, so say that first
+  // and a released bank keeps its place for a while, so say that first
   const cap = meQ.data?.features?.institution_cap;
   const used = meQ.data?.features?.institutions_used;
   const atCap = liveConn && isPlaid && typeof cap === "number"
@@ -220,7 +221,7 @@ export function RemoveAccountPanel({ a, liveConn, onDone, onCancel }: {
       </div>
       {atCap && (
         <div style={{ color: "var(--amber)", marginBottom: ".5rem" }}>
-          Disconnecting does not free a slot for 30 days.</div>
+          Disconnecting does not free a slot for {releasedHoldDays()} days.</div>
       )}
       {credLock && (
         <div style={{ marginBottom: ".5rem", color: "var(--amber)" }}>

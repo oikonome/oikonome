@@ -395,7 +395,12 @@ class WizardGateWiringTests(unittest.TestCase):
         w = self._src("pages/Welcome.tsx")
         m = re.search(r"const backfillReady = (.*?);", w, re.S)
         self.assertIsNotNone(m, "the wizard must compute backfillReady")
-        self.assertIn("isError", m.group(1))
+        # an error opens the gate only while nothing was ever read; the rule
+        # may live in a named helper, which must itself read isError
+        fails_open = re.search(r"const backfillFailsOpen = (.*?);", w, re.S)
+        self.assertTrue("isError" in m.group(1) or (
+            "backfillFailsOpen(" in m.group(1) and fails_open
+            and "isError" in fails_open.group(1)))
         self.assertIn("all_ready", m.group(1))
         bills = re.search(r"label: \"Confirm bills & income\".*?body:", w,
                           re.S)

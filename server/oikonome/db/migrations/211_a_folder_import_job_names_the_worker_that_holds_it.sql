@@ -1,0 +1,13 @@
+-- A folder import names the worker that holds it.
+--
+-- A job whose heartbeat goes quiet is taken over by the sweep, but the
+-- worker that went quiet may still be running (a pool timeout, a dead
+-- connection, a long wait for the sync lock). Each claim now stamps a
+-- fresh token here, and every write the job makes — a file's turn, its
+-- outcome, the progress count, the heartbeat, the final state — matches
+-- it, so a worker that lost the job stops at its next write instead of
+-- walking the folder beside the one that took it over.
+--
+-- Additive and nullable: a job claimed by an older build has no token,
+-- and the next claim stamps one.
+ALTER TABLE bulk_import_jobs ADD COLUMN IF NOT EXISTS runner UUID;

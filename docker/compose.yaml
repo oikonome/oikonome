@@ -73,7 +73,7 @@ services:
       # the app names no address)
       OIKONOME_SUPPORT_EMAIL: ${OIKONOME_SUPPORT_EMAIL:-}
       # the operator's site and privacy policy, linked from the sign-in
-      # page when set
+      # page when set (the site link on hosted only; see .env.example)
       OIKONOME_SITE_URL: ${OIKONOME_SITE_URL:-}
       OIKONOME_PRIVACY_URL: ${OIKONOME_PRIVACY_URL:-}
       # "Support development" link override (default: shown on
@@ -132,6 +132,7 @@ services:
       OIKONOME_SETUP_TOKEN: ${OIKONOME_SETUP_TOKEN:-}
       # where /testing feedback packages go: the operator's own inbox
       OIKONOME_FEEDBACK_TO: ${OIKONOME_FEEDBACK_TO:-}
+      OIKONOME_FEEDBACK_SKIP: ${OIKONOME_FEEDBACK_SKIP:-}
       # git describe at install time (GUI footer, doctor bundle)
       OIKONOME_VERSION: ${OIKONOME_VERSION:-dev}
       OIKONOME_SMTP_HOST: ${OIKONOME_SMTP_HOST:-}
@@ -145,11 +146,16 @@ services:
       # verification click, the worker clears when a scheduled send lands.
       OIKONOME_POSTMARK_TOKEN: ${OIKONOME_POSTMARK_TOKEN:-}
       OIKONOME_RECEIPT_MAX_OPTIMIZE_PX: ${OIKONOME_RECEIPT_MAX_OPTIMIZE_PX:-}
+      OIKONOME_HOUSEHOLD_STORAGE_MB: ${OIKONOME_HOUSEHOLD_STORAGE_MB:-}
       OIKONOME_RECEIPT_OPTIMIZE_WORK_PX: ${OIKONOME_RECEIPT_OPTIMIZE_WORK_PX:-}
       OIKONOME_RECEIPT_OPTIMIZE_CONCURRENCY: ${OIKONOME_RECEIPT_OPTIMIZE_CONCURRENCY:-}
       OIKONOME_RECEIPT_PARSE_CONCURRENCY: ${OIKONOME_RECEIPT_PARSE_CONCURRENCY:-}
       OIKONOME_RECEIPT_PARSE_WAIT_S: ${OIKONOME_RECEIPT_PARSE_WAIT_S:-}
+      OIKONOME_RECEIPT_READ_SLOTS: ${OIKONOME_RECEIPT_READ_SLOTS:-}
+      OIKONOME_RECEIPT_READ_WAIT_S: ${OIKONOME_RECEIPT_READ_WAIT_S:-}
       OIKONOME_ASSISTANT_CONCURRENCY: ${OIKONOME_ASSISTANT_CONCURRENCY:-}
+      OIKONOME_LLM_CONCURRENCY: ${OIKONOME_LLM_CONCURRENCY:-}
+      OIKONOME_LLM_SLOT_WAIT_S: ${OIKONOME_LLM_SLOT_WAIT_S:-}
       OIKONOME_PLAID_WEBHOOK_NEG_TTL: ${OIKONOME_PLAID_WEBHOOK_NEG_TTL:-}
       OIKONOME_PLAID_WEBHOOK_FETCH_CEILING: ${OIKONOME_PLAID_WEBHOOK_FETCH_CEILING:-}
       OIKONOME_LLM_URL: ${OIKONOME_LLM_URL:-}
@@ -202,6 +208,9 @@ services:
       OIKONOME_CONTROL_POOL_MAX: ${OIKONOME_CONTROL_POOL_MAX:-}
       OIKONOME_TENANT_POOL_TIMEOUT: ${OIKONOME_TENANT_POOL_TIMEOUT:-}
       OIKONOME_CONTROL_POOL_TIMEOUT: ${OIKONOME_CONTROL_POOL_TIMEOUT:-}
+      # whole-export restores at once in this web process (each holds one
+      # tenant-pool connection); empty == the code's default of 2
+      OIKONOME_RESTORES_AT_ONCE: ${OIKONOME_RESTORES_AT_ONCE:-}
       # Password-hash concurrency (argon2 holds 64 MiB per hash; the cap
       # keeps a burst of sign-ins inside the container's memory) and the
       # worker's thread count — same rule: forwarded or they do nothing.
@@ -292,11 +301,16 @@ services:
       # verification click, the worker clears when a scheduled send lands.
       OIKONOME_POSTMARK_TOKEN: ${OIKONOME_POSTMARK_TOKEN:-}
       OIKONOME_RECEIPT_MAX_OPTIMIZE_PX: ${OIKONOME_RECEIPT_MAX_OPTIMIZE_PX:-}
+      OIKONOME_HOUSEHOLD_STORAGE_MB: ${OIKONOME_HOUSEHOLD_STORAGE_MB:-}
       OIKONOME_RECEIPT_OPTIMIZE_WORK_PX: ${OIKONOME_RECEIPT_OPTIMIZE_WORK_PX:-}
       OIKONOME_RECEIPT_OPTIMIZE_CONCURRENCY: ${OIKONOME_RECEIPT_OPTIMIZE_CONCURRENCY:-}
       OIKONOME_RECEIPT_PARSE_CONCURRENCY: ${OIKONOME_RECEIPT_PARSE_CONCURRENCY:-}
       OIKONOME_RECEIPT_PARSE_WAIT_S: ${OIKONOME_RECEIPT_PARSE_WAIT_S:-}
+      OIKONOME_RECEIPT_READ_SLOTS: ${OIKONOME_RECEIPT_READ_SLOTS:-}
+      OIKONOME_RECEIPT_READ_WAIT_S: ${OIKONOME_RECEIPT_READ_WAIT_S:-}
       OIKONOME_ASSISTANT_CONCURRENCY: ${OIKONOME_ASSISTANT_CONCURRENCY:-}
+      OIKONOME_LLM_CONCURRENCY: ${OIKONOME_LLM_CONCURRENCY:-}
+      OIKONOME_LLM_SLOT_WAIT_S: ${OIKONOME_LLM_SLOT_WAIT_S:-}
       OIKONOME_PLAID_WEBHOOK_NEG_TTL: ${OIKONOME_PLAID_WEBHOOK_NEG_TTL:-}
       OIKONOME_PLAID_WEBHOOK_FETCH_CEILING: ${OIKONOME_PLAID_WEBHOOK_FETCH_CEILING:-}
       OIKONOME_LLM_URL: ${OIKONOME_LLM_URL:-}
@@ -406,7 +420,16 @@ services:
       postgres: { condition: service_healthy }
 
   postgres:
-    image: docker.io/library/postgres:18-alpine
+    # Built from the official image with su-exec in place of its gosu, whose
+    # Go runtime carries unfixed CVEs (docker/postgres/Dockerfile); same
+    # postgres, entrypoint and data format. install.sh and
+    # scripts/pg-major-migrate.sh read the major from the base_image line;
+    # the build fails if the Dockerfile's pinned digest is another major.
+    build:
+      context: postgres
+      args:
+        base_image: docker.io/library/postgres:18-alpine
+    image: oikonome-postgres:${COMPOSE_PROJECT_NAME:-local}
     restart: unless-stopped
     mem_limit: 512m
     pids_limit: 256

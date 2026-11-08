@@ -3,6 +3,7 @@ import { useState } from "react";
 import { Link } from "react-router";
 import { api, mmdd, type AlertRow } from "../api/client";
 import { patchList } from "../api/cache";
+import { localDayOf } from "../moneymath";
 import { canEdit } from "../role";
 
 const SEV_PILL: Record<string, string> = { good: "g", warn: "a", bad: "r", info: "m" };
@@ -22,7 +23,7 @@ const KIND_ROUTE: Record<string, string> = {
   setup: "/bills", proposals: "/bills", drift: "/bills", merges: "/merchants",
   reimb: "/reimburse", funding: "/networth", transfer: "/transactions",
   anomaly: "/transactions", bonus: "/transactions",
-  "llm-backend": "/doctor", "collector-token-revoked": "/settings/scripts",
+  "llm-backend": "/doctor", "collector-token-revoked": "/settings/connections",
 };
 // "fix this" is the right verb for something BROKEN — a dead connection, a
 // funding gap. It is the wrong verb for a queue: a detected bill waiting on
@@ -45,6 +46,9 @@ export default function Alerts() {
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const mayEdit = canEdit(me);
   const [filter, setFilter] = useState<Filter>("all");
+  // what needs attention is the page; the six-month log opens on request,
+  // so three live alerts never read as three more rows of history
+  const [showHistory, setShowHistory] = useState(false);
 
   type Hist = { alerts: AlertRow[] };
   const act = useMutation({
@@ -95,6 +99,18 @@ export default function Alerts() {
   return (
     <>
       <h1>Alerts</h1>
+      {/* a two-factor recovery pending on this account — the notice
+          can still be undone, and only Settings > Security cancels it */}
+      {me.data?.factor_reset_pending && (
+        <div className="note bad" style={{ margin: "0 0 1rem" }}>
+          <span style={{ flex: 1 }}>
+            Someone asked for a recovery that removes this account's
+            two-factor methods. It lands {mmdd(localDayOf(me.data.factor_reset_pending))}.
+            {" "}Not you?{" "}
+            <Link to="/settings/security">Cancel it in Security</Link>
+          </span>
+        </div>
+      )}
       {/* HERO: the page's state, which a bare "Active alerts" heading
           does not say. */}
       <div className="card" style={{ marginTop: 0 }}>
@@ -150,8 +166,14 @@ export default function Alerts() {
         <div style={{ display: "flex", gap: ".8rem", alignItems: "baseline",
                       flexWrap: "wrap" }}>
           <h2 style={{ margin: 0 }}>History</h2>
+          <button className="btn" style={{ fontSize: 12.5 }}
+                  onClick={() => setShowHistory((v) => !v)}>
+            {showHistory ? "hide history"
+              : `show history (${rows.length} ${rows.length === 1 ? "alert" : "alerts"})`}
+          </button>
           {/* a six-month log is unreadable without these, and "dismissed"
               stops being a state you have to scan for */}
+          {showHistory && (
           <span style={{ marginLeft: "auto", display: "flex", gap: ".35rem",
                          flexWrap: "wrap" }}>
             {FILTERS.map((f) => (
@@ -159,8 +181,9 @@ export default function Alerts() {
                       onClick={() => setFilter(f)}>{f}</button>
             ))}
           </span>
+          )}
         </div>
-        {rows.length === 0 ? (
+        {!showHistory ? null : rows.length === 0 ? (
           <p className="sub" style={{ marginBottom: 0 }}>No alerts logged yet —
             they appear here as the daily checks find things worth telling
             you about.</p>

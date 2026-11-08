@@ -232,7 +232,7 @@ def gather(conn, *, members: list[dict], base_url: str = "",
             paid_from = f"{n} ····{m}" if m else (n or "")
         row = {"payee": b["payee"], "amount": abs(b["amount"] or 0),
                "cadence": _cadence_label(rec.get("frequency") or b["frequency"],
-                                         interval),
+                                         interval, rec.get("byMonthDay")),
                "due_on": _date(b["due_on"]), "category": b["category"] or "",
                "account": paid_from,
                "note": str(raw.get("note") or "")}

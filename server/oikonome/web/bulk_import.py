@@ -93,9 +93,11 @@ def _guess_account_name(filename: str) -> str:
     base = filename.rsplit("/", 1)[-1]
     base = re.sub(r"\.[A-Za-z]+$", "", base)
     # a long digit run is an account or card number wherever it sits —
-    # "Checking1234567890123" has no word boundary to catch it below — and
-    # the name becomes the account's permanent slug-derived id
-    base = re.sub(r"\d{8,}", " ", base)
+    # "Checking1234567890123" has no word boundary to catch it below; the
+    # numbers a file name spells are added back whole by _new_account_name,
+    # which the stored name cuts
+    from ..sync.card_number import LONG_RUN_RE
+    base = LONG_RUN_RE.sub(" ", base)
     base = re.sub(r"[_\-.]+", " ", base)
     base = re.sub(r"\b(19|20)\d{2}\b|\b\d{4,}\b", "", base)  # years/numbers
     base = re.sub(r"\b(export|statement|transactions|download|history)\b",
@@ -186,6 +188,25 @@ def _csv_sign_guess(data: bytes) -> tuple[str, bool]:
     return "plaid", False             # all-positive: could be either — flag
 
 
+# Filename words that mark an investment export. Brand and wrapper names
+# long enough to be unambiguous match anywhere, so a CamelCase export like
+# "VanguardIRA.csv" or "SchwabBrokerage.csv" is still recognised. The short
+# tokens are guarded, because a bare substring match typed ordinary bank
+# files as investments: "ira" sits inside ordinary words like admiral or
+# spiral, "roth" inside Brothers, and "401" inside any date stamp from
+# January 2024 or an April 1st. So "ira" and "roth" count only as a word of
+# their own or as a capitalised CamelCase part ("RothIRA", "VanguardRoth"),
+# and a retirement plan number only with its letter (401k, 401(k), 403b)
+# and never as part of a longer digit run.
+_INVESTMENT_NAME_RE = re.compile(
+    r"(?i:invest|broker|vanguard|fidelity|schwab|wealthfront|etrade|"
+    r"holdings|portfolio|retirement)"
+    r"|(?<![A-Za-z])(?i:ira)(?![a-z])|(?<=[a-z])IRA(?![a-z])"
+    r"|(?<![A-Za-z])(?i:roth)(?![a-z])|(?<=[a-z])Roth(?![a-z])"
+    r"|(?<![A-Z])ROTH(?![A-Z])|(?<![a-z])Roth(?=[A-Z])"
+    r"|(?<!\d)(?i:401\s*\(?k|(?:403|457)\s*\(?b)")
+
+
 def analyze(conn, files: list[tuple[str, bytes]]) -> dict:
     """Build the plan. `files` = (filename, data). Returns
     {token, files:[{index, name, kind, size, action, account_id,
@@ -197,6 +218,7 @@ def analyze(conn, files: list[tuple[str, bytes]]) -> dict:
     accounts = conn.execute(
         """SELECT a.id, COALESCE(a.display_name, a.name) AS name, a.mask
            FROM accounts a WHERE a.user_removed_at IS NULL""").fetchall()
+    from ..sync import account_sources as srcs
     plan = []
     for i, (name, data) in enumerate(files):
         ext = _ext(name)
@@ -208,23 +230,28 @@ def analyze(conn, files: list[tuple[str, bytes]]) -> dict:
                          "amount_sign": "bank", "sign_certain": True,
                          "note": f"unsupported file type '{ext}'"})
             continue
-        # destination: filename last-4 ↔ account mask, else name overlap,
-        # else a new account named from the file
-        match = None
-        for d in _digits(name):
-            match = next((a for a in accounts if a["mask"] == d), None)
+        # destination: the account a filename spelling a full number
+        # already has, else filename last-4 ↔ account mask, else name
+        # overlap, else a new account named from the file
+        match, choices = _source_match(conn, name)
+        # an account already answering to another full number is another
+        # card, however alike the names
+        other_cards = (set() if match or choices else
+                       srcs.claimed_accounts(conn, srcs.DOOR_MANUAL,
+                                             _stem(name)))
+        open_ = [] if match or choices else [
+            a for a in accounts if a["id"] not in other_cards]
+        for d in _digits(name) if open_ else []:
+            match = next((a for a in open_ if a["mask"] == d), None)
             if match:
                 break
-        if match is None:
+        if match is None and not choices:
             tokens = _name_tokens(name)
-            match = next((a for a in accounts
+            match = next((a for a in open_
                           if tokens & _name_tokens(a["name"] or "")), None)
         sign, certain = ("bank", True)
         if ext == ".csv":
-            if re.search(
-                    r"invest|broker|ira|401|roth|vanguard|fidelity|schwab|"
-                    r"wealthfront|etrade|holdings|portfolio|retirement",
-                    name, re.I):
+            if _INVESTMENT_NAME_RE.search(name):
                 sign, certain = "investment", True
             else:
                 sign, certain = _csv_sign_guess(data)
@@ -232,10 +259,8 @@ def analyze(conn, files: list[tuple[str, bytes]]) -> dict:
             if re.search(
                     r"card|credit|visa|amex|mastercard|discover", name, re.I):
                 sign, certain = "card", True
-            elif re.search(
-                    r"invest|broker|ira|401|roth|vanguard|fidelity|schwab|"
-                    r"wealthfront|etrade|holdings|portfolio|retirement|"
-                    r"summary", name, re.I):
+            elif (_INVESTMENT_NAME_RE.search(name)
+                  or re.search(r"(?<![a-z])summary", name, re.I)):
                 sign, certain = "investment", True
             elif re.search(r"statement|checking|savings|bank", name, re.I):
                 sign, certain = "statement", True
@@ -245,8 +270,19 @@ def analyze(conn, files: list[tuple[str, bytes]]) -> dict:
                  "action": "import", "amount_sign": sign,
                  "sign_certain": certain, "note": ""}
         if ext == ".zip":
+            from ..sync.restore import foreign_archive_refusal
+            refusal = foreign_archive_refusal(data)
             entry.update(account_id=None, new_account_name="",
-                         note="full export restore — no account needed")
+                         note=refusal or "full export restore — no account "
+                                         "needed")
+            if refusal:
+                entry.update(kind="unsupported", action="skip")
+        elif choices:
+            # the person picks one before running: the job has nobody to ask
+            entry.update(account_id=None, new_account_name="",
+                         choices=choices,
+                         note=_choice_message(stored_name(_stem(name)),
+                                              len(choices)))
         elif match is not None:
             entry.update(account_id=match["id"], new_account_name="",
                          note=f"matches existing “{match['name']}”"
@@ -254,7 +290,7 @@ def analyze(conn, files: list[tuple[str, bytes]]) -> dict:
                                  else ""))
         else:
             entry.update(account_id=None,
-                         new_account_name=_guess_account_name(name),
+                         new_account_name=_new_account_name(name),
                          note="no existing account matched — creates a new one")
         if ext == ".csv":
             n = _ynab_accounts(data)
@@ -267,6 +303,46 @@ def analyze(conn, files: list[tuple[str, bytes]]) -> dict:
         plan.append(entry)
     token = staging.put(conn, "bulk", files=files)
     return {"token": token, "files": plan}
+
+
+def _stem(filename: str) -> str:
+    return re.sub(r"\.[A-Za-z]+$", "", filename.rsplit("/", 1)[-1]).strip()
+
+
+def _source_match(conn, filename: str) -> tuple[dict | None, list[dict]]:
+    """(the account a file's name is recorded as filling, []), or (None,
+    the accounts a filename spelling a full number could mean) when it
+    cannot say which, or (None, []) when the ordinary matching places it.
+    The recorded source is the file's stem or the name a new account
+    would be given from it (account_sources), so a renamed account still
+    receives its file. Reads only."""
+    from ..sync import account_sources as srcs
+    from ..sync import card_number
+    full = _stem(filename)[:NEW_ACCOUNT_NAME_MAX]
+    if not full:
+        return None, []
+    for typed in dict.fromkeys((full, _new_account_name(filename))):
+        found = srcs.lookup(conn, srcs.DOOR_MANUAL, typed)
+        if found:
+            return (_describe(conn, [found]) or [None])[0], []
+    if not card_number.holds_number(full):
+        return None, []
+    ids, shared, _ = _candidates(conn, full, stored_name(full))
+    if len(ids) == 1 and not shared:
+        return _describe(conn, ids)[0], []
+    return None, (_describe(conn, ids) if ids else [])
+
+
+def _new_account_name(filename: str) -> str:
+    """The name a new account is offered for a file: words from the file
+    name, and every full number it spells, which the stored name cuts to
+    its last four and account_sources keys the account by — so two cards
+    sharing their last four are two accounts, not one called "Visa"."""
+    from ..sync import card_number
+    nums = card_number.find(_stem(filename))
+    guess = _guess_account_name(filename)
+    return (" ".join([guess, *nums]) if nums else guess
+            )[:NEW_ACCOUNT_NAME_MAX]
 
 
 def _ynab_accounts(data: bytes) -> int:
@@ -310,65 +386,409 @@ def hold_ledger_write_locks(conn) -> None:
     merchant_identity._lock_identity(conn)
 
 
-def _ensure_account(conn, name: str, amount_sign: str = "bank") -> str:
-    """Create a NEW manual account, disambiguating the slug so two files
-    named 'Chase' and 'chase!' — or a new file colliding with a
-    pre-existing same-slug account for a DIFFERENT real-world account —
-    never silently merge into one. Only reuse an existing account when the
-    display name matches exactly (idempotent re-run).
+def hold_restore_write_locks(conn) -> None:
+    """The locks a full-export restore takes, for the rest of its one
+    transaction, before its first row: the household's file-storage lock,
+    then the two hold_ledger_write_locks takes.
 
-    amount_sign tips type: investment → investment/brokerage, card →
-    credit/credit card, else name-based inference.
-    """
-    base = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "account"
-    conn.execute(
-        """INSERT INTO items (id, aggregator, institution_name, access_token)
-           VALUES ('manual','manual','Manual',NULL)
-           ON CONFLICT (tenant_id, id) DO NOTHING""")
-    # The probe-then-insert below is a check-then-act: two imports naming
-    # the same new account at once (web + phone, a double submit) would both
-    # see no row and the second INSERT would hit the primary key. Serialize
-    # the slug decision per tenant for the length of this call.
-    with conn.transaction():
-        conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
-                     ("oikonome:ensure-account:" + str(conn.execute(
-                         "SELECT current_setting('app.tenant_id', true) AS t"
-                     ).fetchone()["t"]),))
-        return _ensure_account_locked(conn, name, base, amount_sign)
+    A restore reserves room for every receipt it brings (the storage lock)
+    and later re-keys accounts and re-ids rows under the pairing lock and
+    names merchants under the identity lock; a receipt snapped meanwhile
+    takes storage, then pairing, then its row (engine.receipts.add). Asked
+    for after the restore's rows, either lock closes a cycle with that
+    snap or with any edit holding the pairing lock while it waits on a
+    restored row, and Postgres kills the restore. Storage is only ever
+    locked when a quota is set (storage_quota.reserve), so without one
+    nothing waits on it here either. The key is the one reserve takes."""
+    from ..engine import storage_quota
+    if storage_quota.quota_bytes() is not None:
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtext("
+            "'oikonome:storage:' || current_setting('app.tenant_id')))")
+    hold_ledger_write_locks(conn)
 
 
-def _ensure_account_locked(conn, name: str, base: str,
-                           amount_sign: str) -> str:
-    slug, n = base, 2
+NEW_ACCOUNT_NAME_MAX = 120
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
+def stored_name(name: str) -> str:
+    """The name a new hand-made account stores for `name`: every full
+    number cut to its last four (sync.card_number). A name whose slug
+    still spells a number after that — a separator the grammar does not
+    take ("4000_0000_0000_0002") — is cut the way the slug reads it
+    (card_number.cut_as_slug_reads), as the ids every earlier build
+    derived from it were moved, so the name keeps no more digits than
+    those ids."""
+    from ..sync import card_number
+    from ..sync.base import NUMBERED_MANUAL_ID_RE
+    shown = card_number.cut(name)
+    if NUMBERED_MANUAL_ID_RE.search(f"manual:{_slug(shown)}"):
+        shown = card_number.cut_as_slug_reads(shown)
+    return shown
+
+
+def _legacy_slug(typed: str) -> str:
+    """The slug a build before opaque ids gave a hand-made account named
+    `typed`: the slug of the cut name, moved off any number it still
+    spelled the way a re-key moves it. Only for finding such accounts."""
+    from ..sync import card_number
+    from ..sync.base import NUMBERED_MANUAL_ID_RE, renumbered_manual_id
+    slug = _slug(card_number.cut(typed)) or "account"
+    if NUMBERED_MANUAL_ID_RE.search(f"manual:{slug}"):
+        slug = renumbered_manual_id(f"manual:{slug}").split(":", 1)[1]
+    return slug
+
+
+def _lineage_names(full: str, shown: str) -> set[str]:
+    """Every stored name an account made for `full` may carry: the full
+    one an early build made it with, the cut one a door stores now, and
+    what each stored-name scrub (unbroken runs, then grouped ones) left."""
+    from ..sync import card_number
+    return {full.strip(), shown.strip(), card_number.cut_for_hash(full).strip(),
+            card_number.cut(full).strip()}
+
+
+def _slug_walk(conn, base: str, names: set[str]) -> list[str]:
+    """The live accounts a build before opaque ids made under `base` or a
+    "-N" beside it whose stored name is one of `names`, walked as those
+    builds handed the suffixes out."""
+    out, slug, n = [], base, 2
     while True:
         row = conn.execute(
             "SELECT name, user_removed_at FROM accounts WHERE id=%s",
             (f"manual:{slug}",)).fetchone()
         if row is None:
-            break
-        # a HIDDEN account of the same name is not a destination: the
-        # upsert refuses its rows, so the import would land nothing and
-        # say "0 transactions". The new account takes the next slug.
-        if ((row["name"] or "").strip() == name.strip()
-                and row["user_removed_at"] is None):
-            return f"manual:{slug}"      # same account, re-run — reuse
-        slug, n = f"{base}-{n}", n + 1   # different account — new slug
-    # Type from the name (shared inference): always depository/checking
-    # would type card-named imports as cash and break the credit
-    # sign/exclusion rules. The user can still reclassify.
-    from ..sync.base import infer_account_type
-    if amount_sign == "investment":
-        type_, subtype = "investment", "brokerage"
-    elif amount_sign == "card":
-        type_, subtype = "credit", "credit card"
-    else:
-        type_, subtype = infer_account_type(name)
+            return out
+        if (row["user_removed_at"] is None
+                and (row["name"] or "").strip() in names):
+            out.append(f"manual:{slug}")
+        slug, n = f"{base}-{n}", n + 1
+
+
+def _candidates(conn, typed: str, shown: str
+                ) -> tuple[list[str], bool, list[str]]:
+    """(the live hand-made accounts a source with no account_sources row
+    of its own could mean, best first; whether nothing can say which of
+    them it is; the accounts the name leads to that already answer to
+    another card, which only the file's own rows can claim for it —
+    import_named). Reads only.
+
+    By the digest of the stored name each account was made with (the
+    c-rows, backfilled for every account made before them); then, for an
+    account made before opaque ids, the slug walk those builds made; then
+    the accounts a re-key moved a full-number id to — the one whose stored
+    name is this name when every record leads to one account, every one
+    when a record leads to several (two cards sharing their last four left
+    one cut record, which cannot tell them apart whichever is hidden). A
+    source spelling a full number never means an account that already
+    answers to a different number: two cards sharing their last four share
+    a cut name and nothing else."""
+    from ..sync import account_sources as srcs
+    from ..sync.base import cut_lineage_candidates
+    names = _lineage_names(typed, shown)
+    found = srcs.by_name(conn, names)
+    for base in dict.fromkeys((_legacy_slug(typed), _slug(typed))):
+        if base:
+            found += _slug_walk(conn, base, names)
+    shared = False
+    if typed != shown and _slug(typed):
+        records = cut_lineage_candidates(conn, f"manual:{_slug(typed)}")
+        targets = list(dict.fromkeys(t for _, ts in records for t in ts))
+        rows = conn.execute(
+            "SELECT id, name FROM accounts WHERE id = ANY(%s)"
+            "   AND user_removed_at IS NULL ORDER BY id",
+            (targets,)).fetchall()
+        shared = any(len(ts) > 1 for _, ts in records)
+        named = [r["id"] for r in rows if (r["name"] or "").strip() in names]
+        found += ([r["id"] for r in rows] if shared
+                  else named or [r["id"] for r in rows])
+    live = {r["id"] for r in conn.execute(
+        "SELECT id FROM accounts WHERE id = ANY(%s) AND item_id = 'manual'"
+        "   AND user_removed_at IS NULL", (list(set(found)),)).fetchall()}
+    other_cards = srcs.claimed_accounts(conn, srcs.DOOR_MANUAL, typed)
+    lineage = [a for a in dict.fromkeys(found) if a in live]
+    return ([a for a in lineage if a not in other_cards], shared,
+            [a for a in lineage if a in other_cards])
+
+
+def _manual_item(conn) -> None:
+    conn.execute(
+        """INSERT INTO items (id, aggregator, institution_name, access_token)
+           VALUES ('manual','manual','Manual',NULL)
+           ON CONFLICT (tenant_id, id) DO NOTHING""")
+
+
+def _insert_manual(conn, typed: str, type_: str, subtype: str | None,
+                   balance: float = 0.0, *, claim: bool) -> str:
+    """Mint and insert a hand-made account for the typed name `typed`, with
+    its source and stored-name rows. `claim`: the typed name's source row
+    moves to this account even when another holds it (an import making a
+    new account beside a hidden one); otherwise an existing one stays."""
+    from ..sync import account_sources as srcs
+    name = stored_name(typed)
+    aid = srcs.mint_id(conn)
+    # balance defaults to 0, never NULL: a NULL balance files the brand-
+    # new account under archived/closed and the cash runway screams
+    # 'out of money' on day one
     conn.execute(
         """INSERT INTO accounts (id, item_id, name, type, subtype,
                                  balance_current, updated_at)
-           VALUES (%s,'manual',%s,%s,%s,0,now())""",
-        (f"manual:{slug}", name.strip(), type_, subtype))
-    return f"manual:{slug}"
+           VALUES (%s,'manual',%s,%s,%s,%s,now())""",
+        (aid, name.strip(), type_, subtype, balance))
+    srcs.remember(conn, srcs.DOOR_MANUAL, typed, aid, replace=claim)
+    srcs.remember_name(conn, aid, name)
+    return aid
+
+
+def create_manual_account(conn, name: str, type_: str,
+                          subtype: str | None, balance: float = 0.0) -> str:
+    """A NEW hand-made account, as the account-add doors make one: always
+    a new account (two typed "Chase" are two accounts), under an opaque id,
+    with the typed name's source row unless an earlier account holds it."""
+    from ..sync import account_sources as srcs
+    typed = name.strip()[:NEW_ACCOUNT_NAME_MAX]
+    _manual_item(conn)
+    with conn.transaction():
+        srcs.hold_lock(conn)
+        return _insert_manual(conn, typed, type_, subtype, balance,
+                              claim=False)
+
+
+def _ensure_account(conn, name: str, amount_sign: str = "bank") -> str:
+    """The hand-made account a new-account name fills: the one its source
+    row names (account_sources), else the one account made before that
+    row existed which the name leads to (_candidates) — remembered, so it
+    is found by its row from then on — else a NEW account under an opaque
+    id. A name spelling a full number that leads to several accounts (two
+    cards sharing their last four) raises AccountChoiceNeeded instead of
+    landing on either; the choice the person makes is remembered.
+
+    amount_sign tips type: investment → investment/brokerage, card →
+    credit/credit card, else name-based inference."""
+    from ..sync import account_sources as srcs
+    from ..sync import card_number
+    typed = name.strip()[:NEW_ACCOUNT_NAME_MAX]
+    shown = stored_name(typed)
+    _manual_item(conn)
+    with conn.transaction():
+        # check-then-act: two imports naming the same new account at once
+        # (web + phone, a double submit) make one account
+        srcs.hold_lock(conn)
+        found = srcs.lookup(conn, srcs.DOOR_MANUAL, typed)
+        if found:
+            return found
+        cands, shared, _ = _candidates(conn, typed, shown)
+        if cands and (len(cands) > 1 or shared) \
+                and card_number.holds_number(typed):
+            raise AccountChoiceNeeded(_choice_message(shown, len(cands)),
+                                      cands)
+        if cands:
+            srcs.remember(conn, srcs.DOOR_MANUAL, typed, cands[0])
+            return cands[0]
+        # Type from the name (shared inference): always depository/checking
+        # would type card-named imports as cash and break the credit
+        # sign/exclusion rules. The user can still reclassify.
+        from ..sync.base import infer_account_type
+        if amount_sign == "investment":
+            type_, subtype = "investment", "brokerage"
+        elif amount_sign == "card":
+            type_, subtype = "credit", "credit card"
+        else:
+            type_, subtype = infer_account_type(shown)
+        return _insert_manual(conn, typed, type_, subtype, claim=True)
+
+
+def import_named(conn, name: str, amount_sign: str, run):
+    """Import a file into the hand-made account the new-account name
+    `name` fills: (that account's id, what `run(account_id)` — the
+    import itself — returned).
+
+    _ensure_account decides from the name alone, and a name spelling a
+    full number never lands on an account that already answers to another
+    card. That account may still hold THIS card's rows: a build before
+    opaque ids filed two cards sharing their last four on one account,
+    each card's rows hashed under its id. A fresh account would hash them
+    under a fresh id, and the re-import would insert the card's whole
+    history a second time. So when the name leads to such an account and
+    the decision made a fresh one, the import runs there in a savepoint,
+    its rows are recomputed under each such account's id
+    (sync.base._holds_file_rows), and when one holds any of them the
+    savepoint is rolled back — the fresh account with it — and the file
+    lands there instead, remembered for the next statement. The file is
+    parsed twice only on that one re-import.
+
+    A file that cannot be imported yet — a CSV whose columns the person
+    must map, a YNAB register whose accounts they must place — has no rows
+    to probe, so a new account is not made for it: the account's creation
+    is rolled back and the file is parked under the typed name and sign
+    (_park_by_name), and the mapped submit comes back here with the rows.
+    The id is then None."""
+    from ..sync import account_sources as srcs
+    typed = name.strip()[:NEW_ACCOUNT_NAME_MAX]
+    if srcs.lookup(conn, srcs.DOOR_MANUAL, typed):
+        aid = _ensure_account(conn, name, amount_sign)
+        return aid, run(aid)
+    cands, _, held = _candidates(conn, typed, stored_name(typed))
+    parked = None
+    with conn.transaction() as trial:
+        aid = _ensure_account(conn, name, amount_sign)
+        fresh = aid not in held and conn.execute(
+            "SELECT 1 FROM transactions WHERE account_id = %s LIMIT 1",
+            (aid,)).fetchone() is None
+        result = run(aid)
+        if result[1] is not None and aid not in cands:
+            parked = _parked(conn, result[1])
+            raise psycopg.Rollback(trial)
+        earlier = _holding_this_file(conn, aid, typed, held) \
+            if fresh and held else None
+        if earlier is None:
+            return aid, result
+        raise psycopg.Rollback(trial)
+    if parked is not None:
+        return None, _park_by_name(conn, parked, typed, amount_sign)
+    with conn.transaction():
+        srcs.hold_lock(conn)
+        srcs.remember(conn, srcs.DOOR_MANUAL, typed, earlier)
+    return earlier, run(earlier)
+
+
+def _parked(conn, need: dict) -> tuple[str, dict | None, dict]:
+    """The upload an import parked to ask the person something (`need`,
+    what the dispatcher answered), read before the savepoint that parked
+    it is rolled back: (stage kind, the stage, `need`)."""
+    kind = "ynab" if need.get("kind") == "ynab_accounts" else "csv"
+    return kind, staging.peek(conn, kind, str(need.get("token") or "")), need
+
+
+def _park_by_name(conn, parked, typed: str, amount_sign: str):
+    """Park the upload again with no account: a CSV under the typed
+    new-account name and sign, which the mapped submit resolves through
+    import_named once its rows can be read; a YNAB register with no
+    picked account, each of its accounts placed by the person. Returns
+    what the dispatcher returns: (result, what to ask)."""
+    kind, stash, need = parked
+    if stash is None:
+        return {"error": "upload expired — please upload the file "
+                         "again"}, None
+    meta = dict(stash["meta"] or {}, account_id=None)
+    if kind == "csv":
+        meta.update(new_account_name=typed, amount_sign=amount_sign)
+    try:
+        token = staging.put(conn, kind, stash["files"], meta)
+    except ValueError as e:                    # the staging budget
+        return {"error": str(e)}, None
+    need = dict(need, token=token)
+    if kind == "ynab":
+        need["pick"] = ""
+    return {}, need
+
+
+def _holding_this_file(conn, aid: str, typed: str,
+                       accounts: list[str]) -> str | None:
+    """The first of `accounts` holding a row of the file just imported
+    into the fresh account `aid`: its rows, as the importer hashed them
+    (date, amount, name, and an OFX row's FITID), recomputed under each
+    account's id by sync.base._holds_file_rows."""
+    from ..sync.base import LINEAGE_PROBE_LINES, _holds_file_rows
+    groups: dict[str, tuple[list, list]] = {}
+    for r in conn.execute(
+            "SELECT id, date, amount, name FROM transactions"
+            " WHERE account_id = %s ORDER BY date, id LIMIT %s",
+            (aid, LINEAGE_PROBE_LINES)).fetchall():
+        prefix = r["id"].split(":", 1)[0]
+        lines, fitids = groups.setdefault(prefix, ([], []))
+        lines.append((r["date"], float(r["amount"]), r["name"] or ""))
+        head = f"{prefix}:{aid}:"
+        if prefix == "ofx" and r["id"].startswith(head):
+            fitids.append(r["id"][len(head):].split("~", 1)[0])
+    for earlier in accounts:
+        if any(_holds_file_rows(conn, prefix, earlier, typed, lines, fitids)
+               for prefix, (lines, fitids) in sorted(groups.items())):
+            return earlier
+    return None
+
+
+class AccountChoiceNeeded(ValueError):
+    """A typed name spelling a full number leads to more than one account
+    (two cards sharing their last four): the person picks one. Worded for
+    the person, as the importers' own refusals are; `choices` holds the
+    candidate account ids."""
+
+    def __init__(self, message: str, choices=()):
+        super().__init__(message)
+        self.choices = list(choices)
+
+
+def _choice_message(shown: str, n: int) -> str:
+    many = "two" if n == 2 else str(n)
+    return (f"“{shown}” matches {many} accounts that share those "
+            f"last four digits — choose one for this file")
+
+
+def _describe(conn, ids: list[str]) -> list[dict]:
+    """Each account as a picker shows it: its name and mask, and what
+    tells two cards sharing their last four apart when those read the
+    same — the rows it holds, the dates they span (ISO) and its latest
+    balance in cents (None when it has none)."""
+    rows = {r["id"]: r for r in conn.execute(
+        "SELECT a.id, COALESCE(a.display_name, a.name) AS name, a.mask,"
+        "       a.balance_current, t.n, t.first_date, t.last_date"
+        "  FROM accounts a LEFT JOIN LATERAL ("
+        "       SELECT count(*) AS n, min(date) AS first_date,"
+        "              max(date) AS last_date"
+        "         FROM transactions"
+        "        WHERE account_id = a.id AND removed = 0) t ON true"
+        " WHERE a.id = ANY(%s)", (ids,)).fetchall()}
+    iso = (lambda d: d.isoformat() if d else None)
+    return [{"id": i, "name": r["name"], "mask": r["mask"],
+             "rows": r["n"] or 0, "first_date": iso(r["first_date"]),
+             "last_date": iso(r["last_date"]),
+             "balance_cents": (None if r["balance_current"] is None
+                               else round(r["balance_current"] * 100))}
+            for i in ids if (r := rows.get(i))]
+
+
+def _choices_for(conn, typed: str) -> list[str]:
+    """The account ids a name spelling a full number could mean when it
+    cannot say which; [] when it finds or makes one account. Reads only."""
+    from ..sync import account_sources as srcs
+    from ..sync import card_number
+    if not card_number.holds_number(typed) \
+            or srcs.lookup(conn, srcs.DOOR_MANUAL, typed):
+        return []
+    cands, shared, _ = _candidates(conn, typed, stored_name(typed))
+    return cands if len(cands) > 1 or shared else []
+
+
+def account_choices(conn, typed: str) -> list[dict]:
+    """The accounts a new-account name could mean when it cannot say which
+    ({id, name, mask} each), or [] when it makes or finds one account.
+    Reads only: a plan asks it before anything is written, so the person
+    chooses before the file runs rather than after."""
+    return _describe(conn, _choices_for(
+        conn, (typed or "").strip()[:NEW_ACCOUNT_NAME_MAX]))
+
+
+def remember_choice(conn, typed: str, account_id: str) -> None:
+    """Record the account the person chose for a name spelling a full
+    number that could mean several (account_choices), so it is asked once:
+    the next file spelling the same number lands there."""
+    from ..sync import account_sources as srcs
+    typed = (typed or "").strip()[:NEW_ACCOUNT_NAME_MAX]
+    if account_id in _choices_for(conn, typed):
+        srcs.remember(conn, srcs.DOOR_MANUAL, typed, account_id)
+
+
+def moved_account(conn, account_id: str) -> list[str]:
+    """[account_id] while it is an account; else the accounts a move took
+    it to (sync.account_sources.moved). For a decision made before a move
+    and carried out after it."""
+    from ..sync import account_sources
+    return account_sources.moved(conn, account_id)
 
 
 def _index(d) -> int | None:
@@ -499,6 +919,7 @@ def submit(conn, token: str, decisions: list, user: dict, *,
     if not staged:
         raise ValueError("this batch expired — re-analyze the files")
     files, archives = _frozen(decisions, staged)
+    _refuse_unplaceable(conn, files, staged)
     role = str(user.get("role") or "")
     notes: list[dict] = []
     restore: list[int] = []
@@ -524,6 +945,11 @@ def submit(conn, token: str, decisions: list, user: dict, *,
     archive_bytes: dict[int, bytes] = {}
     try:
         with conn.transaction():
+            # a choice made between accounts sharing a file's last four is
+            # remembered by the job once that file has landed
+            # (jobs/bulk_import_job._run_one): settled here, a file that
+            # then fails, needs mapping or is refused would decide where
+            # every later file of that number goes
             job_id = str(conn.execute(
                 """INSERT INTO bulk_import_jobs
                        (stage_token_hash, state, starter_user_id,
@@ -579,6 +1005,42 @@ class _Spent(Exception):
     pass
 
 
+def _refuse_unplaceable(conn, files: list[dict], staged: dict) -> None:
+    """Refuse, before anything is consumed, a plan whose new-account name
+    leads to several accounts (account_choices): the job runs later with
+    nobody to ask, so the person chooses one here and posts the same
+    plan again. A row naming no account at all (a plan's "choose one"
+    row left unchosen) is refused the same way, rather than spending the
+    upload on a job that can only refuse it. The job keeps its own
+    refusal for a move that lands between this check and the file's
+    turn."""
+    asks = []
+    for f in files:
+        if f["account_id"]:
+            # a hidden account takes no rows (the upsert refuses them), so
+            # a plan naming one would spend the upload on a file that
+            # lands nowhere and says ok
+            if conn.execute(
+                    "SELECT 1 FROM accounts WHERE id = %s"
+                    "   AND user_removed_at IS NOT NULL",
+                    (f["account_id"],)).fetchone():
+                asks.append(f"{staged[f['file_id']]['filename'] or 'a file'}: "
+                            "that account is hidden — un-hide it on Accounts "
+                            "or choose another")
+            continue
+        if not f["new_account_name"]:
+            asks.append(f"{staged[f['file_id']]['filename'] or 'a file'}: "
+                        "choose an account for this file")
+            continue
+        choices = account_choices(conn, f["new_account_name"])
+        if choices:
+            asks.append(f"{staged[f['file_id']]['filename'] or 'a file'}: "
+                        + _choice_message(stored_name(f["new_account_name"]),
+                                          len(choices)))
+    if asks:
+        raise ValueError("; ".join(asks))
+
+
 def _start_restores(tid: str, restore: list[int], staged: dict,
                     archive_bytes: dict[int, bytes]) -> list[dict]:
     """Start each archive's restore from the submitting request, whose
@@ -596,7 +1058,11 @@ def _start_restores(tid: str, restore: list[int], staged: dict,
                             f"upload this file again to retry")
         else:
             if started.get("error"):
-                row["error"] = started["error"]
+                # the plan's staged copy is already spent: a refusal here
+                # (busy server, a restore already running) needs the file
+                # uploaded again, not just a retry
+                row["error"] = (started["error"].rstrip(".")
+                                + " — upload this file again then")
             else:
                 row.update(ok=True, imported=0, restore_started=True)
         rows.append(row)

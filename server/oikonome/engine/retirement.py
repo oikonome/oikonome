@@ -93,8 +93,11 @@ def current_buckets(conn) -> dict:
         elif sub in ("hsa", "hra"):
             b["td"] += v
         # education savings pay for tuition, not a retirement: never part of
-        # the nest egg the simulation spends
-        elif sub in ("529", "education savings account"):
+        # the nest egg the simulation spends. A UGMA/UTMA custodial account
+        # (and a Canadian RESP) is the same story with a stronger reason:
+        # the money legally belongs to the child, the parents cannot spend it
+        elif sub in ("529", "education savings account", "ugma", "utma",
+                     "resp"):
             continue
         elif sub == "crypto":
             b["taxable"] += v                               # crypto = cap gains
@@ -439,25 +442,48 @@ def age_from_birthdate(birthdate: str, today: dt.date | None = None) -> int:
     return today.year - bd.year - ((today.month, today.day) < (bd.month, bd.day))
 
 
+# Under this many days of ledger a spend rate is too short to stretch over
+# a year (one month of history can be a holiday month or a move).
+MIN_SPEND_DAYS = 90
+
+
 def default_spend(conn, floor: float = 24_000, fallback: int = 250_000) -> int:
     """The page's honest starting point: the household's OWN last-12-months
     spend (the product's spend definition), rounded to $1k. A fixed
     default is wrong for any household whose real spend differs from it,
     and reads as broken; the ledger is the right source. Falls back only
-    when the ledger is too thin to mean anything."""
+    when the ledger is too thin to mean anything.
+
+    A ledger younger than a year is annualized from the days it covers:
+    days before its first row are no data, not days of no spending, so
+    three months of history are read as a quarter of a year at the same
+    rate, never as a whole year of a quarter of the spending."""
     from .reporting import (NET_AMOUNT_JOINED, REIMB_PARTIAL_JOIN,
                             SPEND_WHERE, excluded_accounts_sql)
     # net of partial reimbursements, like every other spend aggregate — an
     # expensed-and-repaid card charge is not money the household lives on —
     # and without the accounts the household excluded, as every spend
-    # report drops them
+    # report drops them. The first date comes from the SAME rows the sum
+    # reads: an old business, loan or shadow account the spend leaves out
+    # must not make a young personal ledger look a year deep.
     excl, ex_p = excluded_accounts_sql(conn)
     row = conn.execute(
-        f"SELECT COALESCE(SUM({NET_AMOUNT_JOINED}),0) AS s "
+        f"SELECT MIN(t.date) AS first, COALESCE(SUM({NET_AMOUNT_JOINED})"
+        f" FILTER (WHERE t.date >= CURRENT_DATE - 365),0) AS s "
         f"FROM transactions t {REIMB_PARTIAL_JOIN} "
-        f"WHERE {SPEND_WHERE} AND t.date >= CURRENT_DATE - 365 {excl}",
+        f"WHERE {SPEND_WHERE} {excl}",
         ex_p).fetchone()
+    first = row["first"]
+    if first is None:
+        return fallback
+    if isinstance(first, str):
+        first = dt.date.fromisoformat(first[:10])
+    covered = (dt.date.today() - first).days + 1
+    if covered < MIN_SPEND_DAYS:
+        return fallback
     s = float(row["s"] or 0)
+    if covered < 365:
+        s = s * 365 / covered
     return int(round(s, -3)) if s >= floor else fallback
 
 
@@ -548,10 +574,9 @@ def _project_cached(key: tuple) -> dict:
     path = _growth_path(b, age, horizon, rr, td_annual, taxable_annual, resume_age,
                         cash_rr=cash_rr, rmd_start=rmd_start, eff_ord=eff_ord,
                         debt_rr=kw["debt_rr"])
-    at67 = next((v for y, v in path
-                 if y == f"{dt.date.today().year + (67 - age)}-06"), None)
-    if at67 is None:
-        at67 = path[-1][1] if path else b["total"]
+    # point k is the balance at age + k; with no point at 67 (already past
+    # it, or a plan ending first) there is no "by 67" figure to show
+    at67 = path[67 - age][1] if 0 <= 67 - age < len(path) else None
     return {
         "buckets": b, "rows": rows, "earliest": earliest,
         "real_return": rr, "cash_real_return": cash_rr, "rmd_start": rmd_start,

@@ -120,18 +120,25 @@ class AccountNumbersKeptOutOfImportFilenames(unittest.TestCase):
         self.assertEqual(got["pl1"], f"Linked{FULL}")
         self.assertEqual(self.conn.execute(sql).rowcount, 0)
 
-    def test_a_restored_manual_account_name_is_masked_and_its_id_named(self):
+    def test_a_restored_manual_account_name_is_masked_and_its_id_rekeyed(
+            self):
+        """An archive written before hand-made ids were re-keyed brings
+        the account under the id that spells the number; it lands under
+        one keeping the last four, as `oikonome migrate` moves the stored
+        ones, and nothing the restore reports spells the number."""
         aid = f"manual:csv-vault{FULL}"
         self._manual_account(self.conn, aid, f"Vault{FULL}")
         data = export.build_zip(self.conn)
         dest = make_db()
         self.addCleanup(dest.close)
         counts = restore.restore_zip(dest, data)
-        row = dest.execute("SELECT id, name FROM accounts WHERE id = %s",
-                           (aid,)).fetchone()
+        self.assertIsNone(dest.execute(
+            "SELECT 1 FROM accounts WHERE id = %s", (aid,)).fetchone())
+        row = dest.execute(
+            "SELECT id, name FROM accounts WHERE id = %s",
+            (f"manual:csv-vault-{FULL[-4:]}",)).fetchone()
         self.assertEqual(row["name"], f"Vault…{FULL[-4:]}")
         notes = " ".join(counts.get("_notes") or [])
-        self.assertIn(f"Vault…{FULL[-4:]}", notes)
         self.assertNotIn(FULL, notes)
 
 

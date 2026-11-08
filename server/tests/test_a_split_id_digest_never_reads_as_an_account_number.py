@@ -11,6 +11,7 @@ two accounts, growing by one more on every restore.
 """
 import hashlib
 import unittest
+from unittest import mock
 
 from oikonome.sync import adopt, base, qifimport
 
@@ -26,6 +27,22 @@ def _all_decimal_source() -> str:
         if hexed[:8].isdigit():
             return name
     raise AssertionError("no all-decimal digest in range")
+
+
+def _readable_ensure(conn, prefix, name, *, key=None, type_=None,
+                     subtype=None, lines=None):
+    """The split account under the id a build before opaque ids derived
+    (base.split_account_id)."""
+    conn.execute(
+        "INSERT INTO items (id, aggregator, institution_name, access_token)"
+        " VALUES ('manual','manual','Manual',NULL)"
+        " ON CONFLICT (tenant_id, id) DO NOTHING")
+    aid = base.split_account_id(prefix, key or name)
+    conn.execute(
+        "INSERT INTO accounts (id, item_id, name, type, subtype)"
+        " VALUES (%s,'manual',%s,'depository','checking')"
+        " ON CONFLICT (tenant_id, id) DO NOTHING", (aid, name))
+    return aid
 
 
 def _qif(*accounts):
@@ -80,7 +97,11 @@ class DigestIdTests(unittest.TestCase):
         import lands on the moved account rather than minting the id
         again, and adds none of the rows it made before."""
         text = _qif((self.name, ROWS), ("Harbor Savings", OTHER))
-        qifimport.import_qif(self.conn, "chk", text)
+        # the accounts as a build before opaque ids made them: under the
+        # readable id, their rows hashed over it, no account_sources row
+        with mock.patch.object(qifimport, "ensure_split_account",
+                               _readable_ensure):
+            qifimport.import_qif(self.conn, "chk", text)
         aid = base.split_account_id("qif", self.name)
         self.assertIn(aid, self._split())
         moved = "manual:qif-epargne-fabrikam"

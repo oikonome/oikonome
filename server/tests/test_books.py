@@ -133,7 +133,9 @@ class PnlTests(unittest.TestCase):
         with mock.patch.object(books, "entity_transactions", counting):
             p = books.pnl(self.conn, self.ent["id"], TODAY.year)
             self.assertEqual(calls.count(None), 1, calls)
-            self.assertEqual(p["capital"]["net_income"], 500.0)
+            # 500 revenue less the 120 organizational cost, deducted in
+            # full the year the business begins
+            self.assertEqual(p["capital"]["net_income"], 380.0)
             self.assertEqual(p["organizational_deduction"]["total"], 120.0)
             calls.clear()
             books.pnl(self.conn, self.ent["id"])
@@ -160,11 +162,15 @@ class PnlTests(unittest.TestCase):
         self.assertEqual(row["sched_c_line"], "Supplies")   # the rest survived
         self.assertEqual(row["note"], "box of pens")
 
-    def test_entity_transactions_tolerates_null_amount(self):
-        # a business-assigned txn with NULL amount must not crash the
-        # worksheet (float(None) → TypeError 500); it renders as 0.0.
-        add_txn(self.conn, TODAY, None, "AMOUNTLESS", account="biz",
+    def test_entity_transactions_show_a_restored_amountless_row_as_zero(self):
+        # an archive row that had no amount is restored at 0 with a marker
+        # (the column refuses NULL since migration 205); the worksheet
+        # renders it as 0.0 rather than failing on the row
+        add_txn(self.conn, TODAY, 0.0, "AMOUNTLESS", account="biz",
                 txn_id="nullamt")
+        self.conn.execute(
+            "UPDATE transactions SET raw = COALESCE(raw, '{}'::jsonb) || "
+            "'{\"_amount_missing\": true}'::jsonb WHERE id = 'nullamt'")
         rows = books.entity_transactions(self.conn, self.ent["id"])
         row = next(r for r in rows if r["id"] == "nullamt")
         self.assertEqual(row["amount"], 0.0)

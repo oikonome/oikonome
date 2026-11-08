@@ -15,17 +15,23 @@ import { useRefetchWhenShown } from "../lib/focus";
 import { useSession } from "../lib/session";
 import { C, mmddyy, money } from "../lib/theme";
 import { VERDICT } from "../lib/verdict";
-import { catLabel, isPlanSavingsGoal, routeYm } from "../lib/pure";
+import { catLabel, householdDay, isPlanSavingsGoal, routeYm } from "../lib/pure";
+import { useMe } from "../lib/viewer";
 import { labelSavingsRow, monthSavings } from "../lib/planner";
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
+/** The plan savings goal as the lens payload carries it. */
+type LensGoal = { monthly_plan: number; rate_90d: number | null } | null;
 const TODAY_KEY = ["today"];
 
 export default function MonthLens() {
   const { client } = useSession();
-  const now = new Date();
+  // the household's day, not the device's: near midnight across zones
+  // the device would open the wrong month or year
+  const me = useMe();
+  const now = householdDay(new Date(), me.data?.timezone);
   // the year lens deep-links a specific month; default is the live one
   const p = useLocalSearchParams<{ y?: string; m?: string }>();
   const router = useRouter();
@@ -39,15 +45,21 @@ export default function MonthLens() {
     // the whole body unmounting to "Loading…" on every tap read as lag
     placeholderData: (prev) => prev,
   });
-  // the savings goal for the money map's row — the lens payload carries
-  // no standing goal, so it comes from the Today payload (web pattern)
+  // the savings goal for the money map's row: the lens payload names it
+  // (savings_goal; null = none). Only an older server's payload, which
+  // lacks the key, sends the screen to the whole Today payload for it.
+  const lensGoal = (query.data as { savings_goal?: LensGoal } | undefined)
+    ?.savings_goal;
+  const needToday = query.isSuccess && lensGoal === undefined;
   const today = useQuery({ queryKey: ["today"],
-    queryFn: () => client!.todayFull(), enabled: !!client });
+    queryFn: () => client!.todayFull(), enabled: !!client && needToday });
   // a write on a screen pushed over this one defers its ["today"]
-  // refetch to whoever shows it — this screen does, on the way back
-  useRefetchWhenShown(today, TODAY_KEY);
-  const goal = (today.data?.savings_goals ?? [])
-    .find((g) => isPlanSavingsGoal(g.name));
+  // refetch to whoever shows it — this screen does, on the way back, but
+  // only while it reads the goal from Today at all
+  useRefetchWhenShown({ isStale: today.isStale, isFetching: today.isFetching,
+    refetch: () => (needToday ? today.refetch() : undefined) }, TODAY_KEY);
+  const goal = lensGoal !== undefined ? lensGoal
+    : (today.data?.savings_goals ?? []).find((g) => isPlanSavingsGoal(g.name));
   const d = query.data;
   // the lens's own month figure only — the goal's saved_this_month is
   // TODAY's month and would be wrong on any other

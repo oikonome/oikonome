@@ -39,7 +39,7 @@ log = logging.getLogger(__name__)
 DEFAULT_MIN_CONF = 0.55
 # the learned overlay writes durable rules from a much smaller training
 # set than the shipped artifact, so it holds a stricter bar, trading some
-# coverage for precision. What it abstains on still reaches the shipped model and
+# coverage for precision. What it abstains on still reaches the operator-provided model and
 # the LLM, so the higher bar costs little and keeps bad rules out of the
 # ledger.
 DEFAULT_OVERLAY_MIN_CONF = 0.70

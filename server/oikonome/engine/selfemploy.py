@@ -730,6 +730,20 @@ def _merchant_named(conn, name: str) -> str | None:
     return ids[0] if len(ids) == 1 else None
 
 
+def vendor_tin(conn, entity_id: str, merchant: str) -> str | None:
+    """The TIN last four on file for the payee shown as `merchant`, found
+    the way mark_vendor finds its mark (by the merchant behind the name,
+    else the name), or None."""
+    mid = _merchant_named(conn, merchant)
+    row = conn.execute(
+        "SELECT tin_last4 FROM vendor_1099 WHERE entity_id = %s"
+        " AND (merchant = %s OR (%s::text IS NOT NULL"
+        "      AND merchant_id::text = %s::text))"
+        " ORDER BY (merchant_id::text = %s::text) DESC NULLS LAST LIMIT 1",
+        (entity_id, merchant, mid, mid, mid)).fetchone()
+    return row["tin_last4"] if row else None
+
+
 def mark_vendor(conn, entity_id: str, merchant: str, *, reportable: bool = True,
                 tin_last4=None) -> None:
     """Mark the payee shown as `merchant` 1099-reportable (or not). The

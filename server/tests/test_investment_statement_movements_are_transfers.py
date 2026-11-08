@@ -165,7 +165,8 @@ class InvestmentCsvMatchesThePdfTests(unittest.TestCase):
     def test_cash_account_spending_and_pay_in_an_investment_csv(self):
         """The CSV of a cash-management account reads card spending and
         paychecks the way its PDF does: spending stays spending (its own
-        category or none), a paycheck keeps the file's category."""
+        category or none), a paycheck's label becomes the canonical income
+        category (both readers route it through the one flow map)."""
         csv = "Date,Description,Amount,Category\n" + "".join(
             f"2026-01-{7 + i:02d},{name},-{10 + i}.00,\n"
             for i, name in enumerate(CASH_ACCOUNT_SPENDING)) + (
@@ -179,7 +180,7 @@ class InvestmentCsvMatchesThePdfTests(unittest.TestCase):
         for name in CASH_ACCOUNT_SPENDING:
             self.assertIsNone(rows[name][0], name)
             self.assertGreater(rows[name][1], 0, name)
-        self.assertEqual(rows[PAYCHECK], ("Paycheck", -2000.00))
+        self.assertEqual(rows[PAYCHECK], ("INCOME", -2000.00))
 
 
 class StockTradesAndShopNamesTests(unittest.TestCase):

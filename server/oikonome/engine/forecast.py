@@ -535,11 +535,11 @@ def _scenario_caps(income_bills: list[dict], cadence: str,
     an empty answer when no series runs at it, because a take-home figure
     for one cadence says nothing about income paid at another.
 
-    Semimonthly is the exception: detection rarely stores a 1st-and-15th
-    payroll as one series reading semimonthly — it stores the two paydays
-    as two MONTHLY series of the same payer, and a scenario that matched
-    nothing there would silently stop reaching the forecast. So with no
-    semimonthly series, the payer with two or more MONTHLY series (the
+    Semimonthly is the exception: detection stores a 1st-and-15th payroll
+    as one series reading semimonthly, but a household can have entered the
+    two paydays by hand as two MONTHLY series of the same payer, and a
+    scenario that matched nothing there would silently stop reaching the
+    forecast. So with no semimonthly series, the payer with two or more MONTHLY series (the
     most money among such payers) is the one described: its two largest series are each one of the two
     deposits (capped at the take-home), and when no payer has two, the
     largest lone monthly series is paid the whole month at once (capped at

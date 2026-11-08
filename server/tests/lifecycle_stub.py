@@ -67,6 +67,10 @@ if [ "$1" = compose ]; then
   exit 0
 fi
 case "$1" in
+  image)
+    # STUB_NO_IMAGE: `image inspect` finds no locally built image
+    [ -n "${STUB_NO_IMAGE:-}" ] && exit 1
+    exit 0 ;;
   run)
     [ -n "${STUB_RUN_OUT:-}" ] && echo "$STUB_RUN_OUT"
     exit "${STUB_RUN_RC:-0}" ;;

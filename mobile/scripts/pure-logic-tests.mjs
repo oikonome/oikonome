@@ -14,7 +14,7 @@ import test from "node:test";
 import { ApiError, busyText, countsInTotals, downloadRefusal, errText,
          inOperatingProfit, signInErrText, whatIfRefusal }
   from "../src/lib/api.ts";
-import { accountTheme, billToggleNote, categoryForServer, CLEAR_CATEGORY, composeBugReport,
+import { alertSections, historyToggleLabel, accountTheme, billToggleNote, categoryForServer, CLEAR_CATEGORY, composeBugReport,
          filterCategories, dominantCategory, dayLabel, daySpend, rowSpend,
          elevationProof, recoveryNeedsPassword, hostOf,
          hueOf, isPlanSavingsGoal, isPrivateHost, isValidYmd, logoProxyUrl,
@@ -402,6 +402,25 @@ test("the contribution mode survives the merge in both directions", () => {
     ["Trip", "Car"]);
   assert.equal(out.find((g) => g.name === "Trip").mode, "sweep");
   assert.equal(out.find((g) => g.name === "Car").mode, "sweep");
+});
+
+test("a goal added and saved here, then removed, stays removed", () => {
+  // the card re-bases on the saved view after every save; with the
+  // mount-time base kept, the saved goal looked "added elsewhere" and the
+  // second save carried the removed goal back
+  const first = mergeSavingsGoals(
+    [draft("Emergency"), draft("Car", { touched: true })],
+    [goal("Emergency")], ["Emergency"]);
+  assert.deepEqual(names(first), ["Car", "Emergency"]);
+  const base = first.map((g) => g.name);      // the saved view
+  const second = mergeSavingsGoals(
+    [draft("Emergency")],                     // the Car row removed
+    first, base);
+  assert.deepEqual(names(second), ["Emergency"]);
+  // and against the stale mount-time base it would have come back
+  assert.deepEqual(names(mergeSavingsGoals([draft("Emergency")], first,
+                                           ["Emergency"])),
+                   ["Car", "Emergency"]);
 });
 
 test("blank rows are dropped, not saved as empty goals", () => {
@@ -1730,7 +1749,14 @@ test("hiding an account moves nothing the server counts", () => {
   const keys = accountRemoveMoved("hide");
   assert.ok(!keys.includes("me"));
   assert.ok(!keys.includes("connections"));
-  assert.deepEqual(keys, ["accounts", "today", "transactions"]);
+  assert.deepEqual(keys, ["accounts", "today", "transactions", "holdings"]);
+});
+
+test("every removal refreshes the top-holdings list", () => {
+  // /holdings leaves out hidden and removed accounts; without the key the
+  // removed account's funds stay listed (and saved offline) after it went.
+  for (const mode of ["hide", "disconnect", "disconnect_purge", "purge"])
+    assert.ok(accountRemoveMoved(mode).includes("holdings"), mode);
 });
 
 test("only a purge disturbs the settings view and the bill calendar", () => {
@@ -1742,6 +1768,50 @@ test("only a purge disturbs the settings view and the bill calendar", () => {
   }
   assert.ok(!accountRemoveMoved("disconnect").includes("settings"));
   assert.ok(!accountRemoveMoved("disconnect").includes("calendar"));
+});
+
+// /holdings leaves out hidden, linked-shadow and business accounts and
+// follows the combined-view setting, so every write that changes one of
+// those must refresh it — on mobile it is also an offline key, so a stale
+// list would outlive a restart. Read from source: the key lists sit inside
+// mutation callbacks no test can call.
+test("writes that change what top holdings counts refresh it", () => {
+  const read = (rel) => readFileSync(new URL(rel, import.meta.url), "utf8");
+  // the text from an anchor to the end of its call, close enough to hold
+  // the refresh list without reaching the next mutation
+  const after = (src, anchor, n, file) => {
+    const i = src.indexOf(anchor);
+    assert.ok(i >= 0, `${file}: anchor ${anchor} not found`);
+    return src.slice(i, i + n);
+  };
+  const sites = [
+    ["../src/lib/cache.ts", "export const personalKeys", 160, '["holdings"]'],
+    ["../src/app/(tabs)/accounts.tsx", "const setHidden = useMutation", 900,
+     '"holdings"'],
+    ["../src/app/(tabs)/accounts.tsx", "const linkAct = useMutation", 1100,
+     '"holdings"'],
+    ["../src/app/business.tsx", "client!.businessCombine(on)", 700,
+     '["accounts"]'],
+    ["../../webapp/src/pages/Accounts.tsx", "function LinkSuggestions", 900,
+     '"holdings"'],
+    ["../../webapp/src/pages/Accounts.tsx", "function LinkControls", 900,
+     '"holdings"'],
+    ["../../webapp/src/pages/Accounts.tsx", "const setHidden = useMutation",
+     900, '"holdings"'],
+    ["../../webapp/src/components/ManageAccounts.tsx",
+     "const setHidden = useMutation", 900, '"holdings"'],
+    ["../../webapp/src/pages/Business.tsx", "const afterAccountsMoved", 600,
+     '"holdings"'],
+    ["../../webapp/src/pages/Business.tsx", "api.businessCombine(v)", 500,
+     '"holdings"'],
+    ["../../webapp/src/components/BusinessWizard.tsx",
+     "const assign = useMutation", 900, '"holdings"'],
+    ["../../webapp/src/components/RemoveAccountPanel.tsx",
+     "export function accountRemoveMoved", 200, '"holdings"'],
+  ];
+  for (const [file, anchor, n, key] of sites)
+    assert.ok(after(read(file), anchor, n, file).includes(key),
+              `${file} @ ${anchor}: must refresh ${key}`);
 });
 
 test("an empty category filter shows every option, not none", () => {
@@ -3068,6 +3138,23 @@ test("a 401 code_used keeps the phone signed in; a bare 401 does not",
 // ---- where a tapped alert goes: the server's own link when the alert has
 // one, the web's kind map for history rows ----
 import { alertCta, alertRoute } from "../src/lib/alert-routes.ts";
+
+test("alerts: what needs attention is split from the history it sits in", () => {
+  const rows = [
+    { kind: "drift", active: 1, dismissed: 0 },
+    { kind: "merges", active: 1, dismissed: 1 },
+    { kind: "proposals", active: 0, dismissed: 1 },
+    { kind: "anomaly", active: 0, dismissed: 0 },
+  ];
+  const s = alertSections(rows);
+  assert.deepEqual(s.active.map((r) => r.kind), ["drift"]);
+  assert.deepEqual(s.dismissed.map((r) => r.kind), ["merges"]);
+  assert.deepEqual(s.resolved.map((r) => r.kind), ["proposals", "anomaly"]);
+  assert.equal(s.history.length, 4);
+  assert.equal(historyToggleLabel(false, 4), "Show history (4 alerts)");
+  assert.equal(historyToggleLabel(false, 1), "Show history (1 alert)");
+  assert.equal(historyToggleLabel(true, 4), "Hide history");
+});
 
 test("alerts: a live alert follows its own link to the native screen", () => {
   // the finder lives on Bills, which is where the setup alert says to go
@@ -4653,8 +4740,8 @@ test("wizard Done: one summary line per step", () => {
   assert.equal(deliverySummary("both", 18, 1),
                "Email and push at 6:00 pm · 1 recipient");
   assert.equal(deliverySummary("push", 7, 3), "Push at 7:00 am · 3 recipients");
-  // the owner always receives: never "0 recipients"
-  assert.equal(deliverySummary("off", 7, 0), "Off · 1 recipient");
+  // nobody mailed (every address muted, a self-muted owner too) says so
+  assert.equal(deliverySummary("off", 7, 0), "Off · nobody");
   assert.equal(recipientRole({ owner: true }), "owner");
   assert.equal(recipientRole({ via: "member" }), "member");
   assert.equal(recipientRole({ invite: "accepted" }), "accepted");
@@ -4969,4 +5056,567 @@ test("richtext: a numbered item keeps its own number", () => {
 test("richtext: copy carries the words without the asterisks, numbers kept", () => {
   assert.equal(plainText("**Cash** is small.\n\n- **A** x\n- B\n\n1. one\n\n2. two"),
     "Cash is small.\n\n- A x\n- B\n\n1. one\n\n2. two");
+});
+
+// ---- the retirement wizard's birthdate: the one answer that persists,
+// so a shape the settings door would refuse is caught before the save ----
+
+import { birthdateIso } from "../src/lib/pure.ts";
+
+test("birthdateIso reads ISO and US dates, refuses the rest", () => {
+  const now = new Date(2026, 0, 15);
+  assert.deepEqual(birthdateIso("", now), { iso: "" });
+  assert.deepEqual(birthdateIso("1970-03-09", now), { iso: "1970-03-09" });
+  assert.deepEqual(birthdateIso(" 3/9/1970 ", now), { iso: "1970-03-09" });
+  assert.ok("error" in birthdateIso("9 March 1970", now));
+  assert.ok("error" in birthdateIso("1970-02-30", now));   // no such day
+  assert.ok("error" in birthdateIso("13/1/1970", now));    // no such month
+  assert.ok("error" in birthdateIso("2027-01-01", now));   // future
+});
+
+// ---- the split editor reads each part the way every other money field
+// does, so a decimal-comma keypad can enter cents ----
+
+import { splitDraftCheck } from "../src/lib/pure.ts";
+
+test("split editor: a part typed with a decimal comma counts its cents", () => {
+  const got = splitDraftCheck(-45.67, [
+    { category: "GROCERIES", amount: "33,17" },
+    { category: "DINING", amount: "12,50" }]);
+  assert.deepEqual(got.cents, [3317, 1250]);
+  assert.equal(got.left, 0);
+  assert.equal(got.ready, true);
+  // pasted forms with a currency sign or a thousands separator read too
+  const big = splitDraftCheck(1250.5, [
+    { category: "A", amount: "$1,234.56" }, { category: "B", amount: "15.94" }]);
+  assert.equal(big.left, 0);
+  assert.equal(big.ready, true);
+  // a part that is not an amount yet is not ready and adds nothing
+  const half = splitDraftCheck(10, [
+    { category: "A", amount: "10" }, { category: "B", amount: "-" }]);
+  assert.deepEqual(half.cents, [1000, null]);
+  assert.equal(half.ready, false);
+});
+
+// ---- restarting the wizard clears every step mark the server keeps ----
+
+import { wizardRestartMarks } from "../src/components/wizard-logic.ts";
+
+test("wizard restart: every step key is cleared, the first step included", () => {
+  const marks = wizardRestartMarks();
+  for (const k of WIZARD_STEPS) assert.equal(marks[k], null, k);
+  assert.ok(Object.values(marks).every((v) => v === null));
+});
+
+// The ledger and business-books downloads are owner-only on the server: a
+// member or a viewer is refused. Both clients must not draw a control that
+// can only fail, so every download of those doors sits behind the owner
+// gate, and a new screen reaching one must be added here to be checked.
+// Read from source: the gate is a render condition no test can call.
+test("ledger and business-book downloads are owner-only on both clients", () => {
+  const read = (rel) => readFileSync(new URL(rel, import.meta.url), "utf8");
+  const doors = /\/api\/transactions\/export|\/api\/business\/export\.csv|\/pnl\.csv|\/package\.zip/;
+  // [file, the control's anchor, the gate that must precede it closely]
+  const sites = [
+    ["../../webapp/src/pages/Transactions.tsx",
+     "<a href={`/api/transactions/export", "isOwner(me)"],
+    ["../../webapp/src/pages/Business.tsx", "href={csv}", "isOwner(meQ)"],
+    ["../../webapp/src/pages/Business.tsx", "href={exportHref}", "isOwner(me)"],
+    ["../src/app/(tabs)/transactions.tsx", "onPress={exportRows}", "mayExport &&"],
+    ["../src/app/business.tsx", "/api/business/export.csv", "owner &&"],
+    ["../src/app/business.tsx", "/pnl.csv", "owner &&"],
+    ["../../webapp/src/pages/Business.tsx", "/package.zip", "isOwner(meQ) &&"],
+    ["../src/app/business.tsx", "/package.zip", "owner &&"],
+  ];
+  for (const [file, anchor, gate] of sites) {
+    const src = read(file);
+    const i = src.indexOf(anchor);
+    assert.ok(i >= 0, `${file}: anchor ${anchor} not found`);
+    assert.ok(src.slice(Math.max(0, i - 600), i).includes(gate),
+              `${file} @ ${anchor}: must sit behind ${gate}`);
+  }
+  // every file that names one of the doors is one of the sites above
+  const known = new Set(sites.map(([f]) => new URL(f, import.meta.url).pathname));
+  known.add(new URL("../../webapp/src/api/client.ts", import.meta.url).pathname);
+  const walk = (dir) => readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
+    e.isDirectory() ? walk(new URL(e.name + "/", dir))
+      : /\.tsx?$/.test(e.name) ? [new URL(e.name, dir)] : []);
+  for (const root of ["../src/", "../../webapp/src/"])
+    for (const f of walk(new URL(root, import.meta.url)))
+      if (doors.test(readFileSync(f, "utf8")))
+        assert.ok(known.has(f.pathname),
+                  `${f.pathname} reaches an owner-only download: gate it and list it here`);
+});
+
+import { describedChoiceOptions, planUnplaced } from "../src/lib/pure.ts";
+
+test("cards sharing a name are told apart in the plan's choice picker", () => {
+  // invented accounts: two cards stored as the same "Visa …1111"
+  const card = { name: "Visa …1111", mask: null };
+  const opts = describedChoiceOptions([
+    { id: "manual:visa-1111", ...card, rows: 3, first_date: "2021-05-01",
+      last_date: "2021-05-03", balance_cents: -5100 },
+    { id: "manual:visa-1111-2", ...card, rows: 1, first_date: "2022-02-10",
+      last_date: "2022-02-10", balance_cents: 12345 },
+    { id: "manual:visa-1111-3", ...card, rows: 1, first_date: "2022-02-10",
+      last_date: "2022-02-10", balance_cents: 12345 },
+    { id: "chk", name: "Checking", mask: "0042", rows: 0, first_date: null,
+      last_date: null, balance_cents: null }]);
+  // the web Import page's planChoiceOptions, word for word
+  assert.deepEqual(opts, [
+    ["manual:visa-1111",
+     "Visa …1111 — 3 rows · 05/01/21–05/03/21 · balance -$51.00"],
+    ["manual:visa-1111-2", "Visa …1111 — 1 row · 02/10/22–02/10/22 · "
+                           + "balance $123.45 (manual:visa-1111-2)"],
+    ["manual:visa-1111-3", "Visa …1111 — 1 row · 02/10/22–02/10/22 · "
+                           + "balance $123.45 (manual:visa-1111-3)"],
+    ["chk", "Checking …0042 — 0 rows"]]);
+});
+
+test("a choose-one row holds the import until a card is picked", () => {
+  const row = { action: "import", kind: "CSV", account_id: null,
+                new_account_name: "",
+                choices: [{ id: "a", name: "Visa …1111", mask: null }] };
+  assert.equal(planUnplaced([row]).length, 1);
+  assert.equal(planUnplaced([{ ...row, account_id: "a" }]).length, 0);
+  assert.equal(planUnplaced([{ ...row, action: "skip" }]).length, 0);
+  assert.equal(planUnplaced([{ ...row, kind: "Oikonome export ZIP" }])
+    .length, 0);
+  assert.equal(planUnplaced([{ ...row, new_account_name: "  " }]).length, 1);
+  assert.equal(planUnplaced([{ ...row, new_account_name: "Card" }]).length,
+               0);
+});
+
+// ---- a rule on several days of the month ----
+
+import * as webDays from "../../webapp/src/monthdays.ts";
+import * as mobDays from "../src/lib/monthdays.ts";
+
+test("the two copies of the several-days helpers are the same text", () => {
+  assert.equal(
+    readFileSync(new URL("../src/lib/monthdays.ts", import.meta.url), "utf8"),
+    readFileSync(new URL("../../webapp/src/monthdays.ts", import.meta.url), "utf8"));
+});
+
+test("the several-days words read as the server's", () => {
+  const w = mobDays.severalDaysWords;
+  assert.equal(w([15, -1]), "twice a month (15th and last day)");
+  assert.equal(w([-1, 15]), "twice a month (15th and last day)");
+  assert.equal(w([1, 15]), "twice a month (1st and 15th)");
+  assert.equal(w([2, 23]), "twice a month (2nd and 23rd)");
+});
+
+test("the picker offers two days only when there are days to offer", () => {
+  const list = [["MONTHLY:1", "monthly"]];
+  assert.deepEqual(mobDays.withSeveralDays(list, null), list);
+  assert.deepEqual(mobDays.withSeveralDays(list, [15]), list);
+  assert.equal(mobDays.withSeveralDays(list, [15, -1])[0][0], mobDays.TWICE_A_MONTH);
+  assert.equal(mobDays.cadencePick("MONTHLY:1", [15, -1]), mobDays.TWICE_A_MONTH);
+  assert.equal(mobDays.cadencePick("MONTHLY:1", null), "MONTHLY:1");
+});
+
+test("a save names days only when the person changed them", () => {
+  const f = mobDays.cadenceFields, T = mobDays.TWICE_A_MONTH;
+  // untouched: the bill's rule stands, and a stale form cannot restate it
+  assert.deepEqual(f(T, [15, -1], [15, -1], "2031-02-15"), { cadence: "MONTHLY:1" });
+  // a fit's days onto a bill or a new one
+  assert.deepEqual(f(T, null, [1, 15], "2031-02-01"),
+                   { cadence: "MONTHLY:1", by_month_day: [1, 15] });
+  assert.deepEqual(f(T, [15, -1], [1, 15], "2031-02-01"),
+                   { cadence: "MONTHLY:1", by_month_day: [1, 15] });
+  // leaving two days for one names the one
+  assert.deepEqual(f("MONTHLY:1", [15, -1], [15, -1], "2031-02-20"),
+                   { cadence: "MONTHLY:1", by_month_day: [20] });
+  // a plain monthly bill stays what the old clients send
+  assert.deepEqual(f("MONTHLY:1", null, null, "2031-02-20"), { cadence: "MONTHLY:1" });
+  assert.deepEqual(f("WEEKLY:2", [15, -1], [15, -1], "2031-02-20"), { cadence: "WEEKLY:2" });
+});
+
+test("the wizard's Adjust leaves an offer's two days only on request", () => {
+  const p = { payee: "Payer", amount: 100, next_due: "2031-02-15",
+              frequency: "MONTHLY", interval: 1, by_month_day: [15, -1] };
+  const form = (o) => ({ name: "Payer", amount: "100.00", dueDay: "15", ...o });
+  const T = mobDays.TWICE_A_MONTH;
+  assert.equal(proposalCadenceValue(p), T);
+  assert.equal(cadenceTakesDueDay(T), false);
+  assert.deepEqual(adjustOf(p, form({ cadence: T })).adjust, {});
+  // a day the hidden field still holds is not a move
+  assert.deepEqual(adjustOf(p, form({ cadence: T, dueDay: "14" })).adjust, {});
+  assert.deepEqual(adjustOf(p, form({ cadence: "MONTHLY:1" })).adjust,
+                   { cadence: "MONTHLY:1", by_month_day: [15] });
+  assert.deepEqual(adjustOf(p, form({ cadence: "MONTHLY:1", dueDay: "20" })).adjust,
+                   { cadence: "MONTHLY:1", due_day: 20, by_month_day: [20] });
+  assert.deepEqual(adjustOf(p, form({ cadence: "WEEKLY:2" })).adjust,
+                   { cadence: "WEEKLY:2" });
+});
+
+// ---- copying a one-time secret ----
+import { copySecretWith, SECRET_CLIPBOARD_TTL_MS, SecretClipboardClear,
+         signedOutOthers } from "../src/lib/pure.ts";
+
+function fakeClipboard({ failSet = false, setReturns = true,
+                         failGet = false } = {}) {
+  const cb = { value: "", timers: [] };
+  cb.ops = {
+    set: async (t) => { if (failSet) throw new Error("refused");
+                        cb.value = t; return setReturns; },
+    get: async () => { if (failGet) throw new Error("denied");
+                       return cb.value; },
+  };
+  cb.schedule = (fn, ms) => { cb.timers.push({ fn, ms }); };
+  return cb;
+}
+
+test("a copied secret is cleared from the clipboard once its time is up", async () => {
+  const cb = fakeClipboard();
+  assert.equal(await copySecretWith(cb.ops, "aaaa-bbbb", cb.schedule), true);
+  assert.equal(cb.value, "aaaa-bbbb");
+  assert.equal(cb.timers.length, 1);
+  assert.equal(cb.timers[0].ms, SECRET_CLIPBOARD_TTL_MS);
+  await cb.timers[0].fn();
+  assert.equal(cb.value, "");
+});
+
+test("the timed clear leaves alone whatever the user copied since", async () => {
+  const cb = fakeClipboard();
+  await copySecretWith(cb.ops, "aaaa-bbbb", cb.schedule);
+  cb.value = "something else";
+  await cb.timers[0].fn();
+  assert.equal(cb.value, "something else");
+});
+
+test("a refused copy reports failure instead of throwing, and schedules nothing", async () => {
+  const thrown = fakeClipboard({ failSet: true });
+  assert.equal(await copySecretWith(thrown.ops, "x", thrown.schedule), false);
+  assert.equal(thrown.timers.length, 0);
+  const refused = fakeClipboard({ setReturns: false });
+  assert.equal(await copySecretWith(refused.ops, "x", refused.schedule), false);
+  assert.equal(refused.timers.length, 0);
+});
+
+test("a clipboard that cannot be read back is never cleared blind", async () => {
+  // no reader (a platform where reading prompts the user): no timer at all
+  const cb = fakeClipboard();
+  assert.equal(await copySecretWith({ set: cb.ops.set }, "x", cb.schedule), true);
+  assert.equal(cb.timers.length, 0);
+  // a read that fails when the timer fires is swallowed and clears nothing
+  const denied = fakeClipboard({ failGet: true });
+  await copySecretWith(denied.ops, "x", denied.schedule);
+  await denied.timers[0].fn();
+  assert.equal(denied.value, "x");
+});
+
+function clockedClear() {
+  const clock = { t: 1_000_000 };
+  const clear = new SecretClipboardClear(() => clock.t);
+  return { clock, clear };
+}
+
+test("coming back to the app after the minute clears a secret the paused timer never did", async () => {
+  // Android stops JS timers while the app is in the background, which is
+  // exactly when the user is pasting elsewhere: the foreground return is
+  // the first moment the clear can run.
+  const cb = fakeClipboard();
+  const { clock, clear } = clockedClear();
+  await copySecretWith(cb.ops, "aaaa-bbbb", cb.schedule,
+                       SECRET_CLIPBOARD_TTL_MS, clear);
+  await clear.appStateChanged("background");
+  clock.t += SECRET_CLIPBOARD_TTL_MS + 1;
+  assert.equal(cb.value, "aaaa-bbbb");
+  await clear.appStateChanged("active");
+  assert.equal(cb.value, "");
+});
+
+test("coming back before the minute is up leaves the secret to be pasted", async () => {
+  const cb = fakeClipboard();
+  const { clock, clear } = clockedClear();
+  await copySecretWith(cb.ops, "aaaa-bbbb", cb.schedule,
+                       SECRET_CLIPBOARD_TTL_MS, clear);
+  await clear.appStateChanged("background");
+  clock.t += SECRET_CLIPBOARD_TTL_MS - 1;
+  await clear.appStateChanged("active");
+  assert.equal(cb.value, "aaaa-bbbb");
+  // ...and the later return, once the minute has passed, still clears it
+  clock.t += 2;
+  await clear.appStateChanged("active");
+  assert.equal(cb.value, "");
+});
+
+test("leaving the screen after the minute clears the secret, before it does not", async () => {
+  const cb = fakeClipboard();
+  const { clock, clear } = clockedClear();
+  await copySecretWith(cb.ops, "aaaa-bbbb", cb.schedule,
+                       SECRET_CLIPBOARD_TTL_MS, clear);
+  await clear.released();  // Copy & dismiss unmounts at once: keep the clip
+  assert.equal(cb.value, "aaaa-bbbb");
+  clock.t += SECRET_CLIPBOARD_TTL_MS;
+  await clear.released();
+  assert.equal(cb.value, "");
+});
+
+test("the foreground-return clear keeps whatever the user copied since", async () => {
+  const cb = fakeClipboard();
+  const { clock, clear } = clockedClear();
+  await copySecretWith(cb.ops, "aaaa-bbbb", cb.schedule,
+                       SECRET_CLIPBOARD_TTL_MS, clear);
+  cb.value = "something else";
+  clock.t += SECRET_CLIPBOARD_TTL_MS + 1;
+  await clear.appStateChanged("active");
+  assert.equal(cb.value, "something else");
+});
+
+test("a read refused on the return is tried again on the next return", async () => {
+  const cb = fakeClipboard();
+  let refuse = true;
+  const ops = { set: cb.ops.set,
+                get: async () => { if (refuse) throw new Error("no focus");
+                                   return cb.value; } };
+  const { clock, clear } = clockedClear();
+  await copySecretWith(ops, "aaaa-bbbb", cb.schedule,
+                       SECRET_CLIPBOARD_TTL_MS, clear);
+  clock.t += SECRET_CLIPBOARD_TTL_MS + 1;
+  await clear.appStateChanged("active");
+  assert.equal(cb.value, "aaaa-bbbb");
+  refuse = false;
+  await clear.appStateChanged("active");
+  assert.equal(cb.value, "");
+});
+
+test("an older copy's timer does not clear a newer secret early", async () => {
+  const cb = fakeClipboard();
+  const { clear } = clockedClear();
+  await copySecretWith(cb.ops, "first", cb.schedule,
+                       SECRET_CLIPBOARD_TTL_MS, clear);
+  await copySecretWith(cb.ops, "second", cb.schedule,
+                       SECRET_CLIPBOARD_TTL_MS, clear);
+  await cb.timers[0].fn();
+  assert.equal(cb.value, "second");
+  await cb.timers[1].fn();
+  assert.equal(cb.value, "");
+});
+
+test("a clear in flight when a newer secret is copied leaves the newer secret alone", async () => {
+  // The clear reads the clipboard; in that bridge round trip the user
+  // copies a new secret shown once. The native side applies writes in
+  // order, so a clear dispatched after the new copy would empty it — and
+  // the sheet has already been dismissed as copied.
+  const cb = { value: "" };
+  let holdGet = null, holdSet = null;
+  const ops = {
+    get: () => {
+      const seen = cb.value;  // read when dispatched, answered later
+      return new Promise((r) => { holdGet = () => r(seen); });
+    },
+    set: (t) => {
+      cb.value = t;  // applied on dispatch, acknowledged later
+      if (t === "second") return new Promise((r) => { holdSet = () => r(true); });
+      return Promise.resolve(true);
+    },
+  };
+  const { clock, clear } = clockedClear();
+  await copySecretWith(ops, "first", () => {}, SECRET_CLIPBOARD_TTL_MS, clear);
+  clock.t += SECRET_CLIPBOARD_TTL_MS + 1;
+  const sweeping = clear.appStateChanged("active");  // reads "first"
+  const copying = copySecretWith(ops, "second", () => {},
+                                 SECRET_CLIPBOARD_TTL_MS, clear);
+  assert.equal(cb.value, "second");
+  holdGet();
+  await sweeping;
+  holdSet();
+  assert.equal(await copying, true);
+  assert.equal(cb.value, "second");
+  // ...and the newer secret's own clear still runs once its minute is up
+  clock.t += SECRET_CLIPBOARD_TTL_MS + 1;
+  const later = clear.appStateChanged("active");
+  holdGet();
+  await later;
+  assert.equal(cb.value, "");
+});
+
+test("a factor change says every other session was signed out", () => {
+  assert.equal(signedOutOthers("Two-factor is off"),
+               "Two-factor is off — every other session was signed out.");
+});
+
+test("a pasted grouped one-time code keeps all six digits", () => {
+  assert.equal(pureModule.oneTimeCodeDigits("123 456"), "123456");
+  assert.equal(pureModule.oneTimeCodeDigits(" 123-456\n"), "123456");
+  assert.equal(pureModule.oneTimeCodeDigits("12345"), "12345");
+  // typing past six digits stops at six, as the old field cap did
+  assert.equal(pureModule.oneTimeCodeDigits("1234567"), "123456");
+  assert.equal(pureModule.oneTimeCodeDigits(""), "");
+});
+
+test("no one-time-code field caps the raw text at six characters", () => {
+  // the cap would cut a grouped paste ("123 456") before it is cleaned
+  for (const rel of ["../src/components/elevation-modal.tsx",
+                     "../src/app/security.tsx",
+                     "../src/app/notifications.tsx",
+                     "../../webapp/src/elevation.tsx"]) {
+    const src = readFileSync(new URL(rel, import.meta.url), "utf8");
+    assert.doesNotMatch(src, /maxLength=\{6\}/, rel);
+  }
+});
+
+test("a failed refetch over a loaded business summary keeps the wizard open", () => {
+  // Only a FIRST load that failed may replace the wizard with the error
+  // card; a background refetch failing over loaded data must not unmount
+  // the wizard and throw away the answers typed so far.
+  const src = readFileSync(
+    new URL("../src/app/business-wizard.tsx", import.meta.url), "utf8");
+  assert.doesNotMatch(src, /if \(summary\.isError\)/);
+  assert.match(src, /if \(summary\.isLoadingError\)/);
+});
+
+test("an alert push opens Security while a two-factor recovery is pending", () => {
+  // The relay sends one textless "alert" event for budget alerts and
+  // security notices alike; the pending recovery is what tells them apart,
+  // and Alerts has no control that can cancel it.
+  const lands = "2026-11-14T10:00:00+00:00";
+  assert.equal(pureModule.pushTapRoute("/alerts",
+    { factor_reset_pending: lands }), "/security");
+  assert.equal(pureModule.pushTapRoute("/alerts",
+    { factor_reset_pending: null }), "/alerts");
+  assert.equal(pureModule.pushTapRoute("/alerts", undefined), "/alerts");
+  // a report push still opens its report
+  assert.equal(pureModule.pushTapRoute("/month?y=2026&m=10",
+    { factor_reset_pending: lands }), "/month?y=2026&m=10");
+});
+
+test("a pending two-factor recovery is announced with its landing date", () => {
+  const fmt = (iso) => iso.slice(0, 10);
+  const line = pureModule.pendingRecoveryLine(
+    "2026-11-14T10:00:00+00:00", fmt);
+  assert.match(line, /2026-11-14/);
+  assert.match(line, /Not you\?/);
+  assert.equal(pureModule.pendingRecoveryLine(null, fmt), null);
+  assert.equal(pureModule.pendingRecoveryLine(undefined, fmt), null);
+  assert.equal(pureModule.pendingRecoveryLine("", fmt), null);
+});
+
+test("Today and Alerts link a pending recovery to the card that cancels it", () => {
+  for (const rel of ["../src/app/alerts.tsx", "../src/app/(tabs)/index.tsx"]) {
+    const src = readFileSync(new URL(rel, import.meta.url), "utf8");
+    assert.match(src, /pendingRecoveryLine\(/, rel);
+    assert.match(src, /router\.push\("\/security"/, rel);
+  }
+  const layout = readFileSync(
+    new URL("../src/app/_layout.tsx", import.meta.url), "utf8");
+  assert.match(layout, /pushTapRoute\(/);
+  for (const rel of ["../../webapp/src/pages/Alerts.tsx",
+                     "../../webapp/src/pages/Today.tsx"]) {
+    const src = readFileSync(new URL(rel, import.meta.url), "utf8");
+    assert.match(src, /me\.data\?\.factor_reset_pending &&/, rel);
+    assert.match(src, /to="\/settings\/security"/, rel);
+  }
+});
+
+test("a pending recovery's landing day is the local day of the instant, not its UTC day", () => {
+  // 01:30 UTC on the 14th is 5:30 pm on the 13th in Pacific time; telling
+  // that household "the 14th" gives an attacker a day they think they have
+  withTz("America/Los_Angeles", () => {
+    const line = pureModule.pendingRecoveryLine(
+      "2026-11-14T01:30:00+00:00", (iso) => iso);
+    assert.match(line, /lands 2026-11-13\./);
+  });
+  withTz("Asia/Tokyo", () => {
+    assert.match(pureModule.pendingRecoveryLine(
+      "2026-11-14T01:30:00+00:00", (iso) => iso), /lands 2026-11-14\./);
+  });
+  // the web banner renders the same instant through the local-day helper
+  const today = readFileSync(
+    new URL("../../webapp/src/pages/Today.tsx", import.meta.url), "utf8");
+  assert.match(today, /mmdd\(localDayOf\(me\.data\.factor_reset_pending\)\)/);
+});
+
+test("a scan refused because another pass runs is told apart from a failure", () => {
+  const { scanAlreadyRunning } = pureModule;
+  assert.equal(scanAlreadyRunning({ status: 409, message: "x" }), true);
+  assert.equal(scanAlreadyRunning(new Error("bill detection is already running")), true);
+  assert.equal(scanAlreadyRunning({ status: 500, message: "boom" }), false);
+});
+
+// ---- the household's calendar day, on both clients ----
+//
+// The server answers "today" and "this month" on the household's clock
+// (/api/me `timezone`); a browser or phone in another zone must ask the
+// same clock, or near midnight the live day is a day off — its yesterday
+// unreachable, its new month greyed out.
+
+for (const [side, m] of [["mobile", mobileRecip], ["web", webMoney]]) {
+  test(`${side}: today is the household's calendar day, not the device's`, () => {
+    // 01:00 UTC on Nov 7: already the 7th in London, still the 6th in LA
+    const at = new Date("2026-11-07T01:00:00Z");
+    withTz("America/Los_Angeles", () => {
+      assert.equal(m.householdYmd(at, "Europe/London"), "2026-11-07");
+      assert.equal(m.householdYmd(at, "America/Los_Angeles"), "2026-11-06");
+      // before /api/me answers, or a zone this runtime can't read: the device
+      assert.equal(m.householdYmd(at, undefined), "2026-11-06");
+      assert.equal(m.householdYmd(at, "Not/AZone"), "2026-11-06");
+      // a month boundary: London is on Dec 1 while LA is on Nov 30
+      const d = m.householdDay(new Date("2026-12-01T00:30:00Z"), "Europe/London");
+      assert.deepEqual([d.getFullYear(), d.getMonth() + 1, d.getDate()], [2026, 12, 1]);
+    });
+  });
+}
+
+test("the lenses and the business screen read today from the household clock", () => {
+  const home = readFileSync(
+    new URL("../../webapp/src/pages/Home.tsx", import.meta.url), "utf8");
+  assert.doesNotMatch(home, /const now = new Date\(\)/);
+  assert.match(home, /householdDay\(new Date\(\), me\.data\?\.timezone\)/);
+  const biz = readFileSync(new URL("../src/app/business.tsx", import.meta.url), "utf8");
+  assert.doesNotMatch(biz, /ymd\(new Date\(\)\)|new Date\(\)\.getFullYear\(\)|TaxYears?\(new Date\(\)/);
+});
+
+test("a channel switch already on can always be turned off, even once the channel is gone", () => {
+  // the web's chanBox rule: a ticked box can always be unticked
+  const src = readFileSync(new URL("../src/app/notifications.tsx", import.meta.url), "utf8");
+  assert.match(src, /value=\{!!c\.sms\} disabled=\{!smsOk && !c\.sms\}/);
+  assert.match(src, /value=\{!!c\.push\} disabled=\{!pushOk && !c\.push\}/);
+});
+
+test("the welcome summary counts a self-muted owner as not mailed and can say nobody", () => {
+  const src = readFileSync(
+    new URL("../../webapp/src/pages/Welcome.tsx", import.meta.url), "utf8");
+  assert.doesNotMatch(src, /off: !r\.owner &&/);
+  assert.doesNotMatch(src, /Math\.max\(1, recipientRows/);
+});
+
+test("transactions and bills read this month and due days from the household clock", () => {
+  const read = (rel) => readFileSync(new URL(rel, import.meta.url), "utf8");
+  for (const rel of ["../../webapp/src/pages/Transactions.tsx",
+                     "../../webapp/src/pages/Bills.tsx",
+                     "../src/app/(tabs)/transactions.tsx",
+                     "../src/app/(tabs)/bills.tsx"]) {
+    const src = read(rel);
+    // the device's midnight or month standing in for the household's
+    assert.doesNotMatch(src, /const (now|n|today) = new Date\(\);|ymOf\(new Date\(\)\)/, rel);
+    assert.match(src, /householdDay\(new Date\(\), (me\.data\?\.timezone|zone)\)/, rel);
+  }
+  // the due countdown is handed the zone, on both clients
+  assert.match(read("../../webapp/src/pages/Bills.tsx"), /daysUntil\(b\.due_on, zone\)/);
+  assert.match(read("../src/app/(tabs)/bills.tsx"), /daysUntil\(b\.due_on, zone\)/);
+});
+
+test("the month and year lenses read the savings goal off the lens, not the whole Today payload", () => {
+  const read = (rel) => readFileSync(new URL(rel, import.meta.url), "utf8");
+  for (const rel of ["../../webapp/src/pages/MonthLens.tsx",
+                     "../../webapp/src/pages/YearLens.tsx",
+                     "../src/app/month.tsx", "../src/app/year.tsx"]) {
+    const src = read(rel);
+    assert.match(src, /savings_goal\?: LensGoal/, rel);
+    // Today is asked only when the lens payload lacks the goal (an older server)
+    assert.match(src, /enabled: [^}]*lensGoal === undefined|enabled: !!client && needToday/, rel);
+  }
+});
+
+test("the tab warm-ups run once per session, after Today's own fresh answer", () => {
+  const src = readFileSync(new URL("../src/app/_layout.tsx", import.meta.url), "utf8");
+  const pre = src.slice(src.indexOf("function Prefetcher"), src.indexOf("function Gate"));
+  // once: a ref remembers the session it warmed for
+  assert.match(pre, /warmedFor\.current === client\) return;/);
+  // after Today: a persisted answer restored at launch does not count
+  assert.match(pre, /dataUpdatedAt/);
+  assert.match(pre, /\[phase, client, todayFresh\]/);
 });

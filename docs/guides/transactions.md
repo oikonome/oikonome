@@ -90,7 +90,9 @@ holds up to 50,000 rows; the full-household export under Settings is the
 way to take everything. A household prepares one download at a time: a
 second one asked for while the first is still being written is refused
 with "an export is already running", and a busy instance may answer
-"try again in a minute"; wait for the first, then click again.
+"try again in a minute"; wait for the first, then click again. Downloading
+is the owner's: a member or view-only login reads the same rows on the
+page but is not offered the file.
 
 ## The date range
 

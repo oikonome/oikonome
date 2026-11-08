@@ -11,19 +11,26 @@ import { api, mmdd, money, type MonthLensData, catLabel } from "../api/client";
 import { VERDICT } from "./Today";
 import { isPlanSavingsGoal, monthSavings } from "../moneymath";
 
+/** The plan savings goal as the lens payload carries it. */
+type LensGoal = { monthly_plan: number; rate_90d: number | null } | null;
+
 export default function MonthLens({ y, m }: { y: number; m: number }) {
   const q = useQuery({ queryKey: ["lens-month", y, m],
                        queryFn: () => api.lensMonth(y, m) });
-  // the money map's Savings row — the lens payload carries no savings
-  // figure, so the standing goal comes from the Today payload (the Budget
-  // page's existing pattern; shares Today's cache key)
+  // the money map's Savings row: the lens payload names the plan goal
+  // (savings_goal; null = none). Only an older server's payload, which
+  // lacks the key, sends the page to the Today payload for it — the
+  // costliest request the server answers, for one field.
+  const lensGoal = (q.data as { savings_goal?: LensGoal } | undefined)
+    ?.savings_goal;
   const today = useQuery({ queryKey: ["today", "now"],
-                           queryFn: () => api.todayFull() });
+                           queryFn: () => api.todayFull(),
+                           enabled: q.isSuccess && lensGoal === undefined });
   if (q.isPending) return <p className="mut" style={{ marginTop: "2rem" }}>loading…</p>;
   if (q.isLoadingError) return <div className="note bad">Couldn't load: {String(q.error)}</div>;
   const d: MonthLensData = q.data;
-  const goal = (today.data?.savings_goals ?? [])
-    .find((g) => isPlanSavingsGoal(g.name));
+  const goal = lensGoal !== undefined ? lensGoal
+    : (today.data?.savings_goals ?? []).find((g) => isPlanSavingsGoal(g.name));
   // no budget the household saved stands behind the month: no verdict,
   // the Today page's no-budget rule (mobile: month.tsx unjudged)
   const unjudged = d.verdict === null;

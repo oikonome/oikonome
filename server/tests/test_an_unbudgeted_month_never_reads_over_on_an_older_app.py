@@ -13,6 +13,7 @@ there is no budget to be over, so no client may say there is.
 
 import datetime as dt
 import unittest
+from unittest import mock
 
 from oikonome.engine import budget
 from oikonome.web import lenses
@@ -31,6 +32,17 @@ def _spend(conn, start: dt.date, end: dt.date, food=40.0, other=60.0):
 
 
 class UnbudgetedMonthSpendableTests(unittest.TestCase):
+
+    def setUp(self):
+        # the loader seeds from the last three full months by the
+        # household's clock, not the TODAY the lenses are asked for: once
+        # the calendar passed the fixture's October, its ledger became a
+        # full closed month and the guess a persisted budget. Pin the clock
+        # to the day the fixture is written for.
+        p = mock.patch("oikonome.localtime.now_local",
+                       return_value=dt.datetime.combine(TODAY, dt.time(12)))
+        p.start()
+        self.addCleanup(p.stop)
 
     def _assert_never_over(self, m: dict):
         self.assertIsNone(m["verdict"])

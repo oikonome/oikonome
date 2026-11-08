@@ -69,7 +69,7 @@ class MobileBudgetShapeTests(unittest.TestCase):
 
     def test_savings_goals_save_uses_the_extracted_merge(self):
         src = self._read("app/budget.tsx")
-        self.assertIn("mergeSavingsGoals(rows, cur.savings_goals ?? []", src)
+        self.assertIn("mergeSavingsGoals(sent, cur.savings_goals ?? []", src)
 
     def test_pure_logic_unit_tests_exist_and_pass_under_node(self):
         if not _MOBILE.exists():
@@ -87,6 +87,23 @@ class MobileBudgetShapeTests(unittest.TestCase):
         if r.returncode != 0 and "bad option" in (r.stderr or ""):
             self.skipTest("node too old for --experimental-strip-types")
         self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
+
+    def test_every_mobile_logic_test_script_passes_under_node(self):
+        """Every mobile/scripts/*-tests.mjs runs here, so a new script is
+        gated by the suite the day it is added."""
+        if not _MOBILE.exists():
+            self.skipTest("mobile/ not present")
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not installed")
+        for script in sorted((_MOBILE / "scripts").glob("*-tests.mjs")):
+            r = subprocess.run(
+                [node, "--experimental-strip-types", str(script)],
+                capture_output=True, text=True, cwd=str(_MOBILE), timeout=120)
+            if r.returncode != 0 and "bad option" in (r.stderr or ""):
+                self.skipTest("node too old for --experimental-strip-types")
+            self.assertEqual(r.returncode, 0,
+                             f"{script.name}: {r.stderr or r.stdout}")
 
 
 if __name__ == "__main__":

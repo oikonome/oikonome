@@ -92,6 +92,30 @@ class StoreSplitTests(unittest.TestCase):
         data.set_category(self.conn, self.txn, "GENERAL_MERCHANDISE")
         self.assertEqual(len(self._parts()), 2)
 
+    def test_bulk_filing_a_store_split_charge_drops_the_store_parts(self):
+        """The selection's bulk write is the same answer as the row's own
+        picker: the store's parts go, or every rollup keeps reading them."""
+        _store_split(self.conn, self.txn, [(FOOD, 60.0), (HOME, 40.0)])
+        other = add_txn(self.conn, TODAY.replace(day=6), 20.0, "ACME",
+                        account="chk")
+        r = data.bulk_apply(self.conn, [other, self.txn], "category",
+                            "GENERAL_MERCHANDISE")
+        self.assertEqual(r["applied"], 2)
+        self.assertEqual(self._parts(), [])
+        row = self.conn.execute(
+            "SELECT category_override, override_source FROM transactions "
+            "WHERE id=%s", (self.txn,)).fetchone()
+        self.assertEqual((row["category_override"], row["override_source"]),
+                         ("GENERAL_MERCHANDISE", "user"))
+
+    def test_bulk_filing_keeps_a_persons_split(self):
+        from oikonome.engine import splits
+        splits.set_split(self.conn, self.txn, [{"category": FOOD, "amount": 60},
+                                               {"category": HOME, "amount": 40}])
+        data.bulk_apply(self.conn, [self.txn], "category",
+                        "GENERAL_MERCHANDISE")
+        self.assertEqual(len(self._parts()), 2)
+
     def test_a_mailed_button_is_not_refused_as_split_for_store_parts(self):
         _store_split(self.conn, self.txn, [(FOOD, 60.0), (HOME, 40.0)])
         exp = (dt.datetime.now(dt.timezone.utc)

@@ -322,6 +322,14 @@ def bootstrap(email: str, password: str, simplefin_token: str = "",
                 """INSERT INTO users (tenant_id, email, password_hash, verified_at)
                    VALUES (%s,%s,%s,now()) RETURNING id""",
                 (tid, email, pw_hash)).fetchone()
+            # the first owner opens Today on the detail face, the same as a
+            # signed-up account; existing accounts keep the absent default
+            admin.execute(
+                """INSERT INTO tenant_settings (tenant_id, config)
+                   VALUES (%s, '{"today_view": "detail"}'::jsonb)
+                   ON CONFLICT (tenant_id) DO UPDATE SET config =
+                     tenant_settings.config || '{"today_view": "detail"}'::jsonb""",
+                (tid,))
     finally:
         admin.close()
     sync_result = None

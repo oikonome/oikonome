@@ -104,6 +104,24 @@ class FrontedExpenseMoveTests(unittest.TestCase):
         self.assertEqual(r.status_code, 409, r.text)
         self.assertEqual(self._owner(posted), a)
 
+    def test_a_row_off_the_ledger_is_not_found_rather_than_in_conflict(self):
+        """A charge the feed withdrew (or a retired hold with no posted
+        row) is not a row the door can move at all. Its leftover movement
+        must not answer for it: the answer is 'no such transaction', not an
+        instruction to delete a movement on a row nobody can see."""
+        a, b = self._entity("Gone"), self._entity("Away")
+        t = self._txn()
+        self._front(a, t, "contribute")
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            conn.execute("UPDATE transactions SET removed=1 WHERE id=%s", (t,))
+        finally:
+            conn.close()
+        r = self.client.post(f"/api/transactions/{t}/entity",
+                             json={"entity_id": b})
+        self.assertEqual(r.status_code, 404, r.text)
+        self.assertEqual(self._owner(t), a)
+
     def test_reassigning_to_the_same_entity_still_works(self):
         a = self._entity("Same")
         t = self._txn()

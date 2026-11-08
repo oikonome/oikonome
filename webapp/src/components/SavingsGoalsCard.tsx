@@ -7,7 +7,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRef, useState } from "react";
 import { api, errText, mmdd, money, type SavingsGoal,
          type Settings as SettingsData } from "../api/client";
-import { saveSettings } from "../api/cache";
+import { saveSettings, SETTINGS_SAVES } from "../api/cache";
 import { parseMoneyDraft } from "../moneymath";
 
 export default function SavingsGoalsCard({ data, onSaved, onDirtyChange }: {
@@ -20,16 +20,20 @@ export default function SavingsGoalsCard({ data, onSaved, onDirtyChange }: {
   const qc = useQueryClient();
   const accts = useQuery({ queryKey: ["accounts"], queryFn: api.accounts });
   const today = useQuery({ queryKey: ["today", "now"], queryFn: () => api.todayFull() });
+  const goalRow = (g: SavingsGoal): Row => ({
+    name: g.name, target: String(g.target),
+    target_date: g.target_date ?? "",
+    monthly_plan: String(g.monthly_plan || ""),
+    account_id: g.account_id ?? "",
+    tokens: (g.tokens ?? []).join(", "),
+    start_balance: g.start_balance ? String(g.start_balance) : "",
+    mode: g.mode === "sweep" ? "sweep" : "monthly" });
   const [rows, setRows] = useState<Row[]>(
-    (data.savings_goals ?? []).map((g) => ({
-      name: g.name, target: String(g.target),
-      target_date: g.target_date ?? "",
-      monthly_plan: String(g.monthly_plan || ""),
-      account_id: g.account_id ?? "",
-      tokens: (g.tokens ?? []).join(", "),
-      start_balance: g.start_balance ? String(g.start_balance) : "",
-      mode: g.mode === "sweep" ? "sweep" : "monthly" })));
+    () => (data.savings_goals ?? []).map(goalRow));
   const [err, setErr] = useState<string | null>(null);
+  // the rows on screen now, for a save that lands after more typing
+  const rowsNow = useRef(rows);
+  rowsNow.current = rows;
   // mount-time server copy (save-time merge base) + the dirty signal
   // the Budget page's remount guard reads
   const baseline = useRef<SavingsGoal[]>(data.savings_goals ?? []);
@@ -52,7 +56,13 @@ export default function SavingsGoalsCard({ data, onSaved, onDirtyChange }: {
     r.tokens.split(",").some((t) => t.trim() !== "");
   const needsAccount = (r: Row) => r.account_id === "" && hasWords(r);
   const save = useMutation({
-    mutationFn: async () => {
+    // every Budget-page list save reads the server fresh, merges and
+    // writes the whole list back: one shared queue, so no two of them
+    // interleave and erase each other's rows
+    scope: SETTINGS_SAVES,
+    // the rows being saved ride along as the variables, so success can
+    // tell whether the person kept typing while the save was in flight
+    mutationFn: async (sent: Row[]) => {
       // the goals list is replaced wholesale, but these rows were
       // seeded at mount — the planner writes the "Savings" goal and
       // may have saved since. Merge against the server's CURRENT list:
@@ -63,7 +73,7 @@ export default function SavingsGoalsCard({ data, onSaved, onDirtyChange }: {
       const baseNames = new Set(baseline.current.map((g) => g.name));
       const curByName = new Map(curG.map((g) => [g.name, g]));
       const out: SavingsGoal[] = [];
-      for (const r of rows) {
+      for (const r of sent) {
         const name = r.name.trim();
         if (!name) continue;
         if (!r.touched) {
@@ -88,7 +98,19 @@ export default function SavingsGoalsCard({ data, onSaved, onDirtyChange }: {
       // row reads the same list
       return saveSettings(qc, { savings_goals: out });
     },
-    onSuccess: () => { setErr(null); onDirtyChange?.(false); onSaved(); },
+    onSuccess: (v, sent) => {
+      // the saved view is the new merge base: a goal added here and saved
+      // is no longer "added elsewhere", so removing or renaming it in a
+      // later save must not carry it back through
+      const goals = v.savings_goals ?? [];
+      baseline.current = goals;
+      // every edit makes a new rows array: the same array means nothing
+      // was typed since the save began, and only then does the saved view
+      // replace the rows — edits typed in flight stay, still unsaved
+      const edited = rowsNow.current !== sent;
+      if (!edited) setRows(goals.map(goalRow));
+      setErr(null); if (!edited) onDirtyChange?.(false); onSaved();
+    },
     onError: (e) => setErr(errText(e)),
   });
   const upd = (i: number, patch: Partial<Row>) => {
@@ -192,7 +214,7 @@ export default function SavingsGoalsCard({ data, onSaved, onDirtyChange }: {
             touched: true }]); }}>
           Add goal</button>
         <button className="pri" disabled={save.isPending}
-                onClick={() => save.mutate()}>
+                onClick={() => save.mutate(rows)}>
           {save.isPending ? "saving…" : "Save savings goals"}</button>
       </div>
     </div>

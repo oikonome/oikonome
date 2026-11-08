@@ -62,6 +62,20 @@ class InterestAndFeesPaidTests(unittest.TestCase):
         self.assertEqual(r["interest_ever"], 42.10)
         self.assertEqual(r["earned_ytd"], 2.00)
 
+    def test_interest_the_bank_reversed_is_not_interest_ever_paid(self):
+        _fee(self.conn, dt.date(2026, 3, 2), 38.12, "PURCHASE INTEREST CHARGE",
+             account="card", detailed="BANK_FEES_INTEREST_CHARGE")
+        _fee(self.conn, dt.date(2026, 3, 6), -38.12,
+             "PURCHASE INTEREST CHARGE REVERSAL", account="card",
+             detailed="BANK_FEES_INTEREST_CHARGE")
+        # a refunded FEE never reduces what interest cost
+        _fee(self.conn, dt.date(2026, 4, 2), -5, "ATM FEE REIMBURSEMENT",
+             detailed="BANK_FEES_ATM_FEES")
+        r = self.report()
+        self.assertEqual(r["interest_ever"], 0)
+        y = r["by_year"][0]
+        self.assertEqual((y["interest"], y["refunds"]), (38.12, 43.12))
+
     def test_an_investment_custodian_fee_and_an_excluded_account_stay_out(self):
         self.conn.execute(
             "INSERT INTO accounts (id,item_id,name,type,subtype,balance_current)"

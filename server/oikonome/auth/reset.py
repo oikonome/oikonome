@@ -119,9 +119,9 @@ def consume(conn, reset_id, user_id, new_password_hash: str,
         if gate is not None and not gate(conn):
             raise SecondProofWithdrawn()
         # the eviction first: it writes the household's settings (the SMS
-        # number) before it writes the users row, and the password must
-        # not put a users row lock ahead of that — see revoke_everything
-        revoke_everything(conn, user_id)
+        # number) before the users row, and the password must not put a
+        # users row lock ahead of that (auth/posture lock order)
+        revoke_everything(conn, user_id, reason="reset")
         conn.execute("UPDATE users SET password_hash=%s WHERE id=%s",
                      (new_password_hash, user_id))
     drop_recovery_codes(user_id)
@@ -138,12 +138,14 @@ class MembersChanged(Exception):
         self.members = members
 
 
-def revoke_everything(conn, user_id, expect_members=None) -> list[dict]:
+def revoke_everything(conn, user_id, expect_members=None,
+                      reason: str = "rotation") -> list[dict]:
     """Every session, factor and foothold on the account, gone — inside the
     CALLER's transaction, so a reset and the operator's clear-second-factor
-    evict identically and a failure part-way rolls the lot back. The
-    password is the caller's business; this touches nothing else of it.
-    Recovery codes are NOT here: see `drop_recovery_codes`.
+    evict identically and a failure part-way rolls the lot back: the
+    RECOVERY level of auth/posture, which says what that takes. The
+    password is the caller's business. The recovery sheet goes after the
+    caller commits: see `drop_recovery_codes`.
 
     Returns the household members it removed, read from the deletes
     themselves, so whoever reports the removal names exactly those rows.
@@ -151,86 +153,12 @@ def revoke_everything(conn, user_id, expect_members=None) -> list[dict]:
     confirmation listed: if the members this would remove (read under the
     member lock, the same query the preview runs) are any other set,
     `MembersChanged` is raised and nobody is removed by a step whose
-    prompt never named them."""
-    # The per-user factor lock, before anything is removed. Every door that
-    # plants a factor or a bearer credential writes under it and re-checks
-    # there that its caller is still signed in, so a request that passed
-    # its checks before this eviction either commits first (and what it
-    # wrote is removed below) or finds itself signed out and writes
-    # nothing. Without the lock, a TOTP secret or passkey enrolled by a
-    # hijacker's in-flight request could land just after it was cleared.
-    lock_user_factors(conn, user_id)
-    conn.execute("DELETE FROM sessions WHERE user_id=%s", (user_id,))
-    # An unspent device-mint ticket is a bearer stand-in for a full
-    # login (issued on EVERY sign-in, spent only by phones) — left
-    # alive it would plant a fresh 90-day device token right after
-    # this reset revoked the old ones. Before the device tokens: a
-    # ticket being redeemed holds its row until its new token commits,
-    # so the revoke below then sees that token.
-    conn.execute("DELETE FROM webauthn_challenges "
-                 "WHERE purpose='device-mint-ticket' AND user_id=%s",
-                 (user_id,))
-    # mobile device tokens are the same pre-plantable persistence —
-    # every device re-authenticates after the reset
-    conn.execute("UPDATE device_tokens SET revoked_at=now() "
-                 "WHERE user_id=%s AND revoked_at IS NULL",
-                 (user_id,))
-    # Passkeys must die with the credential too — otherwise a hijacker who
-    # enrolled one before the victim reset keeps a permanent backdoor
-    # (POST /api/login/passkey).
-    conn.execute("DELETE FROM passkeys WHERE user_id=%s", (user_id,))
-    # Script tokens are the other persistence a hijacker plants before the
-    # reset — a leaked oik_ token outlives the password otherwise. Revoke
-    # every token this user minted (revoked_at, not delete — keeps the
-    # audit row).
-    conn.execute("UPDATE api_tokens SET revoked_at=now() "
-                 "WHERE created_by=%s AND revoked_at IS NULL",
-                 (user_id,))
-    # A support-access grant opens the household's data to the operator
-    # for up to a week, and the account that granted it is the one being
-    # recovered: a window a hijacker opened must not outlive the recovery.
-    # Revoked, never deleted — the row is the audit of who granted what.
-    conn.execute("UPDATE support_consents SET revoked_at=now() "
-                 "WHERE granted_by=%s AND revoked_at IS NULL", (user_id,))
-    # A webhook is the same foothold pointed at a URL: paused, not
-    # deleted, so the owner's own receiver is one click from back on.
-    from ..notify import outbound_pause, webhooks
-    webhooks.pause_for_rotation(conn, user_id)
-    # The household's own outbound settings — the Settings relay, extra
-    # recipients, the AI endpoint — are the last foothold: left alone, a
-    # recovery keeps mailing through a relay the hijacker pointed. Paused
-    # until the owner confirms them (notify/outbound_pause).
-    outbound_pause.pause_for_rotation(conn, user_id,
-                                      reason=outbound_pause.RECOVERY)
-    # Members the owner's recent invites created are removed below; their
-    # addresses come off the mail lists and they are named on the pause
-    # record here, while the settings row is the only row this has written.
-    _, invitees = _cancel_invites_and_read_invitees(
-        conn, user_id, expect_members)
-    outbound_pause.note_removed_members(conn, user_id, invitees)
-    # A web-push subscription outlives its session, so a reset drops it
-    # like every other posture change (web.app._drop_web_push) — otherwise
-    # a hijacker's browser keeps receiving the verdict text and alert
-    # titles after the owner recovers the account.
-    conn.execute("DELETE FROM push_subscriptions WHERE user_id=%s",
-                 (user_id,))
-    # The settings row before the users row below, never after: a settings
-    # save holds tenant_settings on one connection while its step-up burns
-    # a TOTP counter on the users row through another, and a transaction
-    # here that held the users row while waiting on tenant_settings would
-    # close a loop the deadlock detector cannot see (one side merely looks
-    # idle). Taken in this order, the eviction waits holding no users row.
-    _drop_sms_number(conn, user_id)
-    # TOTP is the LAST persistence a hijacker can plant before the victim
-    # recovers — enrolled TOTP otherwise survives a password reset and locks
-    # the real owner out (they don't have the attacker's authenticator or
-    # recovery codes). Email-proven
-    # recovery legitimately clears 2FA; the owner re-enrolls.
-    conn.execute("UPDATE users SET totp_secret=NULL, totp_last_counter=NULL "
-                 "WHERE id=%s", (user_id,))
-    # Last, after the settings row above: removing a member writes a users
-    # row, and the settings-before-users order holds for that row too.
-    return _remove_members(conn, invitees)
+    prompt never named them. `reason`: what a cancelled cooling-off
+    recovery records."""
+    from . import posture
+    return posture.rotate(conn, None, {"user_id": user_id}, posture.RECOVERY,
+                          expect_members=expect_members,
+                          reason=reason).members
 
 
 def _cancel_invites_and_read_invitees(conn, user_id, expect_members=None
@@ -414,91 +342,19 @@ def _remove_members(conn, members: list[dict]) -> list[dict]:
 
 
 def _drop_sms_number(conn, user_id) -> bool:
-    """The household's SMS number, verified or pending, goes with an
-    OWNER's recovery: an emailed reset or a cleared set of factors, the
-    paths for someone who has lost the account. An owner's routine change
-    of password, login address or second factor marks it unverified
-    instead (_unverify_sms_number), so the owner's own number is one
-    confirmation from working again. Returns whether a number was cleared. A verified number keeps
-    receiving the daily summary with no session at all, and its
-    verification code went to the number
-    itself, so whoever held the account could have verified their own
-    phone. It is tenant config rather than a row keyed to the user, so
-    nothing above reaches it. Only an owner can set it, so only an
-    owner's recovery clears it — a member's reset must not switch off the
-    owner's texts. The owner re-adds the number, which texts a fresh code.
-
-    Runs on a control-plane or admin connection: the tenant is pinned
-    for this transaction only, and the row is also named by tenant id,
-    because an admin connection sees every household's settings."""
-    u = conn.execute("SELECT tenant_id FROM users "
-                     "WHERE id=%s AND role='owner'", (user_id,)).fetchone()
-    if not u:
-        return False
-    with conn.transaction():
-        conn.execute("SELECT set_config('app.tenant_id', %s, true)",
-                     (str(u["tenant_id"]),))
-        return conn.execute(
-            "UPDATE tenant_settings "
-            "SET config = config - 'notify_phone' - 'notify_phone_pending' "
-            "WHERE tenant_id=%s AND (config ? 'notify_phone' "
-            "OR config ? 'notify_phone_pending')",
-            (u["tenant_id"],)).rowcount > 0
+    """See auth/posture: RECOVERY drops the household's SMS number."""
+    from . import posture
+    return posture._drop_sms_number(conn, user_id)
 
 
 def _unverify_sms_number(conn, user_id) -> bool:
-    """An OWNER's routine credential rotation — a password or login-address
-    change, a new or removed second factor — marks the household's SMS
-    number unverified rather than dropping it. Texts stop until a fresh
-    code sent to that number is typed back, so a phone a hijacker verified
-    stops receiving the moment the owner rotates, while the owner's own
-    number is one confirmation away from working again and the clients can
-    say why the texts paused. Any half-finished verification goes too: its
-    code went to whichever number was being set. Recovery (an emailed
-    reset, a cleared set of factors) still drops the number outright, see
-    _drop_sms_number. Returns whether a verified number was marked, so the
-    door can tell the owner to confirm it again. A member's rotation does
-    nothing here: only an owner can set the number.
-
-    Runs on a control-plane or admin connection, like _drop_sms_number."""
-    u = conn.execute("SELECT tenant_id FROM users "
-                     "WHERE id=%s AND role='owner'", (user_id,)).fetchone()
-    if not u:
-        return False
-    with conn.transaction():
-        conn.execute("SELECT set_config('app.tenant_id', %s, true)",
-                     (str(u["tenant_id"]),))
-        conn.execute(
-            "UPDATE tenant_settings "
-            "SET config = config - 'notify_phone_pending' "
-            "WHERE tenant_id=%s AND config ? 'notify_phone_pending'",
-            (u["tenant_id"],))
-        return conn.execute(
-            "UPDATE tenant_settings SET config = jsonb_set("
-            "config, '{notify_phone}', (config->'notify_phone') "
-            "|| jsonb_build_object('verified', false, "
-            "'unverified_at', now()::text)) "
-            "WHERE tenant_id=%s "
-            "AND jsonb_typeof(config->'notify_phone') = 'object' "
-            "AND config->'notify_phone'->'verified' = 'true'::jsonb",
-            (u["tenant_id"],)).rowcount > 0
+    """See auth/posture: FACTOR and CREDENTIAL mark it unverified."""
+    from . import posture
+    return posture._unverify_sms_number(conn, user_id)
 
 
 def drop_recovery_codes(user_id) -> None:
-    """Recovery codes go with the factors. They are not inert once the
-    secret is gone: passkey-only sign-in and every passkey step-up accept a
-    recovery code with no TOTP enrolled, so a batch a hijacker saw — or a
-    printed sheet the owner believed this reset voided — would keep working
-    the moment a passkey is re-enrolled. The table is admin-write-only (the
-    app role may only mark a code used), so this rides its own connection,
-    AFTER the caller's transaction committed: a rollback there leaves the
-    codes in place, and a failure here leaves the account reset with no
-    codes to lose."""
-    from ..db import tenancy
-    admin = tenancy.admin_connect()
-    try:
-        admin.execute("DELETE FROM recovery_codes WHERE user_id=%s",
-                      (user_id,))
-        admin.commit()
-    finally:
-        admin.close()
+    """RECOVERY's sheet, voided after the caller's transaction committed:
+    see auth/posture.drop_sheet_after_commit."""
+    from . import posture
+    posture.drop_sheet_after_commit(user_id)

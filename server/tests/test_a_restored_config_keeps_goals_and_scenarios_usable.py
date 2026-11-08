@@ -112,6 +112,33 @@ class ARestoredConfigStaysReadable(unittest.TestCase):
         self.assertIn("20 savings goals", notes)
         self._pages_read_it(cfg)
 
+    def test_an_asset_keeps_only_what_the_settings_door_stores(self):
+        # the Settings save keeps name, kind, value and as-of; a crafted
+        # archive's other keys, of any size, must not ride into settings
+        cfg, _ = self._restore({"manual_assets": [
+            {"name": "Home", "kind": "property", "value": 250000,
+             "as_of": "2026-01-01", "auto": "x" * 100_000,
+             "rate": float("nan"), "monthly_delta": [1] * 1000}]})
+        self.assertEqual(cfg["manual_assets"], [
+            {"name": "Home", "kind": "property", "value": 250000.0,
+             "as_of": "2026-01-01"}])
+        self._pages_read_it(cfg)
+
+    def test_a_non_finite_number_in_an_unchecked_key_never_aborts(self):
+        # Python's JSON reader takes NaN and 1e999, PostgreSQL's jsonb
+        # refuses them: one in a key no cleaner reads must not fail the
+        # whole restore at the settings write
+        cfg, _ = self._restore({
+            "savings_goals": [{"name": "Fund", "monthly_plan": 10,
+                               "x": float("nan")}],
+            "income_scenarios": [{"name": "job", "take_home": 100,
+                                  "x": float("inf")}],
+            "anything": float("-inf")})
+        self.assertEqual(cfg["savings_goals"][0]["name"], "Fund")
+        self.assertIsNone(cfg["savings_goals"][0].get("x"))
+        self.assertIsNone(cfg["income_scenarios"][0].get("x"))
+        self._pages_read_it(cfg)
+
     def test_a_well_formed_config_comes_through(self):
         cfg, notes = self._restore({
             "income_scenarios": [{"name": "job", "take_home": 2000,

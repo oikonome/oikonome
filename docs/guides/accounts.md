@@ -147,7 +147,10 @@ row can carry one extra line of context beside it:
   turns up only on connections made before that — or where the bank
   declined. An operator who would rather not pay their aggregator for
   them sets `OIKONOME_PLAID_PRODUCTS_EXTRA=none`: then nothing is
-  asked for and nothing is pulled, and the note stays put. (Leaving the
+  asked for and nothing is pulled, and the note stays put. The same
+  word also stops the other billed calls — the nightly cross-check
+  against Plaid's recurring streams and enriching imported history —
+  so nothing beyond transactions is billed. (Leaving the
   value blank is *not* the opt-out — a blank means "use the default",
   which for a self-hosted install is both.)
 
@@ -174,16 +177,21 @@ Whatever it pulls is categorized right away —
 new merchants classified, bill charges matched — so the rows do not sit
 under the bank's generic category until the next scheduled run. It is
 limited to 20 presses in ten minutes from one address and 30 per
-household; past that it says so and asks you to try again shortly. There is no global "sync now" button: everything
+household; past that it says so and asks you to try again shortly. There is no global "sync now" button on the web: everything
 it could reach is already on a schedule, and where webhooks are
 available new transactions arrive within seconds of the bank sending
-them.
+them. The phone app's **Imports** screen does have **Sync now**, which
+pulls every connection at once: it says so when a sync is already
+running, and shows the reason when one is refused (more than six presses
+in ten minutes from one address, say). It is not
+offered on a demo instance.
 
-## The 30-day auto-removal (Plaid)
+## The auto-removal (Plaid, 30 days by default)
 
 A **Plaid** connection that stays **unrecoverably** broken — a state
 only you can fix, like an expired login or revoked consent — for **30
-consecutive days** is automatically released (a Plaid Item keeps
+consecutive days** (the operator sets the count with
+`OIKONOME_PLAID_REAP_DAYS`) is automatically released (a Plaid Item keeps
 billing for as long as it exists, even while dead). Other connection
 types are never auto-removed — they just stay red until you fix or
 disconnect them. Institution outages and transient errors never count
@@ -191,8 +199,9 @@ toward the 30 days; they heal on their own and must never cost you a
 re-link. Any successful sync resets the clock.
 
 After removal, your transaction history is kept. The row shows a
-persistent **connection removed after 30 days of failure — reconnect**
-pill, and the daily email carries a one-line notice until you relink. Reconnecting is one
+persistent **connection removed after N days of failure — reconnect**
+pill (or, when Plaid itself dropped the connection or the subscription
+ended, a pill naming that cause), and the daily email carries a one-line notice until you relink. Reconnecting is one
 click — **reconnect ↗** starts a fresh link (the old connection no
 longer exists, so there is nothing to "fix").
 
@@ -322,7 +331,10 @@ sync never overwrites it. The bank's own name is kept underneath: the
 editor shows it beside the field, and **revert** (or simply clearing
 the field) drops the custom name and goes back to it — including any
 future rename the bank makes. Transaction search finds the account by
-**either** name (see the Transactions guide).
+**either** name (see the Transactions guide). A full card or account
+number typed into the name is cut to its last four digits before it is
+stored, the same rule imports follow, and the field then shows the
+name as saved.
 
 ## Removing an account
 
@@ -358,6 +370,14 @@ the row, so the delete stops first and asks: **Delete anyway** removes
 those rows with the account; cancelling changes nothing. Undoing an
 import asks the same question for the same rows — see
 [Import history](import-history.md).
+
+**An archived business's rows are kept too.** A transaction booked to a
+business you have archived (or sitting on an account that business owns)
+is one of its retained records, so deleting the account, disconnecting
+and deleting the institution, or unlinking a retirement plan or crypto
+wallet keeps it — with its Schedule C class — and keeps the account that
+holds it, until the business is restored or deleted forever (see
+[Business](business.md)). The other rows on the account still go.
 
 Plaid cannot drop a single sub-account under an Item — disconnect is
 always per institution.

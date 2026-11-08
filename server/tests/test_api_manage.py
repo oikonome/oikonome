@@ -292,9 +292,12 @@ class NumberParsingAndClassifyTests(unittest.TestCase):
         b = self.client.post("/api/accounts/add",
                              json={"name": "Wallet?", "kind": "depository/savings"})
         self.assertNotEqual(a.json()["account_id"], b.json()["account_id"])
+        # opaque, minted once: no "-2" for the name the other one took
+        for r in (a, b):
+            self.assertRegex(r.json()["account_id"], r"^manual:[a-z]{16}$")
         accounts = self.client.get("/api/accounts").json()["accounts"]
-        kinds = {x["id"]: x["kind"] for x in accounts
-                 if x["id"].startswith("manual:wallet")}
+        made = {a.json()["account_id"], b.json()["account_id"]}
+        kinds = {x["id"]: x["kind"] for x in accounts if x["id"] in made}
         self.assertEqual(len(kinds), 2)
         self.assertIn("savings", kinds[b.json()["account_id"]])
 
@@ -570,9 +573,11 @@ class OnboardingApiTests(unittest.TestCase):
         conn = tenancy.tenant_connect(c.get("/api/me").json()["tenant_id"])
         try:
             seed_accounts(conn)
-            # a week of this month's spend and nothing older
+            # a week of finished days and nothing older: today is not
+            # over, so the seed never counts it, and on the 1st a fixture
+            # of today alone seeds nothing at all
             today = dt.date.today()
-            for i in range(min(7, today.day)):
+            for i in range(1, 8):
                 add_txn(conn, today - dt.timedelta(days=i), 120.0,
                         f"FIRST WEEK {i}")
             cfg = budget.load_config(conn)

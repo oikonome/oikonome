@@ -18,7 +18,7 @@ import { ELEVATION_CANCELLED, errText, registerElevationPrompter,
          type ElevationPrompt, type ElevationProof,
          type ElevationStatus } from "../lib/api";
 import { passkeyMaybeAvailable } from "../lib/passkey";
-import { elevationProof, oneTimeCodeSentence,
+import { elevationProof, oneTimeCodeDigits, oneTimeCodeSentence,
          recoveryNeedsPassword } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { stepupTicket } from "../lib/stepup";
@@ -33,6 +33,12 @@ function explain(e: unknown): string {
     return "Two-factor is on — enter the current 6-digit code too.";
   const codeSentence = oneTimeCodeSentence(t);
   if (codeSentence) return codeSentence;
+  // the server wants a recovery code (a passkey-only account) — not one
+  // that failed: none may have been typed
+  // a code typed and refused comes back as recovery_required too: that is
+  // a code that didn't match, not a factor the account lacks
+  if (/recovery_required/i.test(t) && !/not valid/i.test(t))
+    return "This account confirms with its passkey or a recovery code.";
   if (/recovery/i.test(t))
     return "That recovery code didn't match.";
   if (/too many/i.test(t))
@@ -60,6 +66,11 @@ export default function ElevationModal() {
   const [rc, setRc] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // the status read failed: no form is guessed (a bare password form
+  // cannot confirm a TOTP or passkey-only account) — the sheet offers
+  // Retry, which re-runs the read through `tries`, and Cancel
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [tries, setTries] = useState(0);
 
   useEffect(() => {
     registerElevationPrompter((p) => {
@@ -79,7 +90,7 @@ export default function ElevationModal() {
   const finish = useCallback((p: ElevationPrompt, ok: boolean) => {
     if (ok) p.resolve(); else p.reject(new Error(ELEVATION_CANCELLED));
     setPw(""); setCode(""); setRc(""); setErr(null); setBusy(false);
-    setStatus(null); setForm(null);
+    setStatus(null); setForm(null); setLoadFailed(false);
     current.current = queue.current.shift() ?? null;
     setPrompt(current.current);
   }, []);
@@ -130,13 +141,14 @@ export default function ElevationModal() {
     }).catch((e) => {
       if (gone) return;
       // the door itself failed (self-host server older than the app, a
-      // network drop): nothing to type into, so say so and let go
+      // network drop): which proof this account takes is unknown, so no
+      // form is shown — say so, and offer Retry beside Cancel
       setErr(explain(e));
-      setForm("password");
+      setLoadFailed(true);
     });
     return () => { gone = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [prompt]);
+  }, [prompt, tries]);
 
   if (!prompt) return null;
   const passkeyAccount = !!status?.methods.includes("passkey");
@@ -176,7 +188,13 @@ export default function ElevationModal() {
                 + "again."}
           </Text>
           {!form ? (
-            <ActivityIndicator color={C.accent} style={{ marginTop: 8 }} />
+            loadFailed ? (
+              <Text style={s.mut}>
+                Couldn&apos;t check how this account confirms.
+              </Text>
+            ) : (
+              <ActivityIndicator color={C.accent} style={{ marginTop: 8 }} />
+            )
           ) : form === "password" ? (
             <>
               <TextInput style={s.input} placeholder="your password"
@@ -187,8 +205,9 @@ export default function ElevationModal() {
                 <TextInput style={s.input}
                            placeholder="6-digit code from your authenticator"
                            placeholderTextColor={C.mut}
-                           keyboardType="number-pad" maxLength={6}
-                           value={code} onChangeText={setCode}
+                           keyboardType="number-pad"
+                           value={code}
+                           onChangeText={(t) => setCode(oneTimeCodeDigits(t))}
                            onSubmitEditing={submit} />
               )}
             </>
@@ -237,6 +256,13 @@ export default function ElevationModal() {
           )}
           <View style={{ flexDirection: "row", gap: 8, marginTop: 4,
                          alignItems: "center" }}>
+            {!form && loadFailed && (
+              <Pressable style={s.btn}
+                         onPress={() => { setErr(null); setLoadFailed(false);
+                                          setTries((n) => n + 1); }}>
+                <Text style={s.btnText}>Retry</Text>
+              </Pressable>
+            )}
             {form && (
               <Pressable style={[s.btn, (!ready || busy) && { opacity: 0.5 }]}
                          disabled={!ready || busy} onPress={submit}>

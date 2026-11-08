@@ -1,8 +1,8 @@
 // local ledger assistant. Ask plain-language questions about your
 // own finances; the model routes to read-only tools and answers from what
-// the engine computes. On the bundled LLM your data never leaves the box;
-// when the assistant backend is a remote host the header says where
-// answers go. The whole page hides (via the nav gate) when no LLM is
+// the engine computes. The header says where answers come from, on the
+// server's word only (status.local is judged from the endpoint's address,
+// the operator's included) — the page waits for it rather than assume. The whole page hides (via the nav gate) when no LLM is
 // configured.
 //
 // Answered questions are the household's log, kept on the server as
@@ -311,14 +311,20 @@ export default function Assistant() {
   const qc = useQueryClient();
   const [sp, setSp] = useSearchParams();
   const openKey = sp.get("c");
-  const status = useQuery({ queryKey: ["assistant-status"], queryFn: assistant.status });
+  // asked afresh on every visit: a cached "nothing leaves the box" from
+  // before a Settings → AI change is exactly the claim the page must not make
+  const status = useQuery({ queryKey: ["assistant-status"], queryFn: assistant.status,
+                            staleTime: 0 });
+  // a status read that failed is not "no assistant": the page stays, with
+  // its history, and says it could not check
+  const statusFailed = status.isError && !status.data;
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   // `denied` is the server refusing the shared login all the same
   const [denied, setDenied] = useState<string | null>(null);
   const mayEdit = canEdit(me) && !me.data?.shared_login && !denied;
   const history = useQuery({ queryKey: ["assistant-history"],
                              queryFn: () => assistant.history(),
-                             enabled: !!status.data?.available });
+                             enabled: !!status.data?.available || statusFailed });
   const [q, setQ] = useState("");
   const [pending, setPending] = useState<Pending[]>([]);
   const [older, setOlder] = useState<AssistantTurn[]>([]);
@@ -533,7 +539,7 @@ export default function Assistant() {
   }, [openKey, openTurnCount, pendingCount]);
 
   if (status.isPending) return <p className="mut" style={{ marginTop: "2rem" }}>loading…</p>;
-  if (!status.data?.available) {
+  if (!statusFailed && !status.data?.available) {
     return (
       <>
         <h1>Assistant</h1>
@@ -581,10 +587,14 @@ export default function Assistant() {
   // read handed back; a page with no more ends it
   const cursor = noMore ? null : nextCursor(lastOlder ?? history.data);
   const title = (th: Thread) => th.turns[0]?.question ?? "";
-  const whereLine = status.data.local
+  // only a reading taken on this visit may promise where questions go
+  const sure = status.isFetchedAfterMount && status.isSuccess;
+  const local = sure && !!status.data?.local;
+  const whereLine = !sure ? "read-only tools — checking where questions go…"
+    : local
     ? "answered by the model on this server — read-only tools, nothing leaves the box"
     : `read-only tools — your questions and the figures they return go to ${
-        status.data.host || "the model host this instance is configured with"}`;
+        status.data?.host || "the model host this instance is configured with"}`;
   const onKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(q); }
   };
@@ -599,6 +609,12 @@ export default function Assistant() {
         <button className="pri" disabled={ask.isPending || !q.trim()} onClick={() => submit(q)}>
           {ask.isPending ? "thinking…" : "Send"}</button>
       </div>
+      {status.isError && (
+        <div className="note bad" style={{ marginTop: ".4rem" }}>
+          Couldn&apos;t check the assistant: {errText(status.error)}{" "}
+          <button style={{ fontSize: 12 }} onClick={() => void status.refetch()}>try again</button>
+        </div>
+      )}
       <div className="hint"><span>Enter to send · Shift+Enter for a new line</span><span>{whereLine}</span></div>
     </div>
   );
@@ -663,7 +679,7 @@ export default function Assistant() {
             <div className="head">
               <button className="back" style={{ fontSize: 12 }} onClick={() => show(null)}>‹ Conversations</button>
               <div className="t" title={title(open)}>{title(open)}</div>
-              {status.data.local && <span className="pill g">local</span>}
+              {local && <span className="pill g">local</span>}
               {/* the whole conversation — every answer, charts included,
                   every figure also as a table — as one self-contained
                   HTML file to keep or send */}
@@ -723,7 +739,7 @@ export default function Assistant() {
             <div className="head">
               <button className="back" style={{ fontSize: 12 }} onClick={() => show(null)}>‹ Conversations</button>
               <div className="t">New conversation</div>
-              {status.data.local && <span className="pill g">local</span>}
+              {local && <span className="pill g">local</span>}
             </div>
             <div className="chat-msgs" ref={msgsRef}>
               {unresolved && cursor && !pageFailed ? (

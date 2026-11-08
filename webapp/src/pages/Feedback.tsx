@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { api, type TestingState } from "../api/client";
-import { patchQuery, saveSettings } from "../api/cache";
+import { patchQuery, SETTINGS_SAVES, saveSettings } from "../api/cache";
 
 /** The feedback pipeline: message + optional screenshot, emailed
  *  to the maintainer (or handed back as a zip when SMTP isn't set up).
@@ -133,6 +133,7 @@ function FeedbackToggle({ enabled }: { enabled: boolean }) {
   const qc = useQueryClient();
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const flip = useMutation({
+    scope: SETTINGS_SAVES,
     mutationFn: () => saveSettings(qc, { feedback_enabled: !enabled }),
     onSuccess: () => {
       // the page flips on ["testing"] — write the one bit it changed now,

@@ -65,7 +65,7 @@ def _submit_feedback(user: dict, message: str,
     conn = tenancy.tenant_connect(user["tenant_id"])
     try:
         return feedback_mod.submit(conn, str(user["tenant_id"]), message, shot,
-                                   kind=kind)
+                                   kind=kind, sender=user.get("email"))
     finally:
         conn.close()
 

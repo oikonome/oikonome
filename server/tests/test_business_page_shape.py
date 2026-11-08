@@ -70,7 +70,8 @@ class BusinessShapeTests(unittest.TestCase):
         or owner contribution defaulted to tomorrow — on Dec 31, into the
         next tax year."""
         self.assertNotIn("toISOString().slice(0, 10)", self.src)
-        self.assertIn("date: localYmd(new Date())", self.src)
+        # the household's day (useHouseholdDay), never the browser's raw clock
+        self.assertIn("date: localYmd(useHouseholdDay())", self.src)
 
 
 

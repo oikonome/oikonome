@@ -130,75 +130,146 @@ class RestoreTests(unittest.TestCase):
 
 
 class RoundTripKeepsEveryColumnTests(unittest.TestCase):
-    """Restore's fixed column lists must cover every column the export ships.
+    """Restore's fixed column lists must cover every column the export ships,
+    in every table it loads.
 
     The export is SELECT * against the LIVE table, so a column added by an
     ALTER TABLE migration rides the ZIP the moment the migration runs. A
     guard that derives the expected set from schema.sql's CREATE TABLE block
     never sees ALTER TABLE columns, and would stay green while restore
-    silently dropped them. The live
-    migrated database is the only honest source: what SELECT * reads there
-    is exactly what restore must write back.
+    silently dropped them. The live migrated database is the only honest
+    source: what SELECT * reads there is exactly what restore must write
+    back. A NOT NULL column with no default must be written by the restore
+    itself, or every archived row of its table would abort the restore.
     """
 
     # Columns that legitimately do not round-trip, each with its reason.
     # Anything NOT here that exists on the live table must be restored.
+    # tenant_id is ambient via RLS in every table: never in the ZIP.
     SKIP = {
-        "transactions": {
-            # ambient via RLS — never travels in the ZIP, never restored
-            "tenant_id",
-        },
         "accounts": {
-            "tenant_id",       # ambient via RLS, same as above
             # when THIS instance's sync loop last wrote the row. The source
             # instance's stamp would claim a sync that never happened here;
             # restored accounts are honestly "never synced here" (NULL).
-            "updated_at",
+            "updated_at": "this instance's sync stamp",
         },
+        "account_adoptions": {
+            # only the lineage travels: a restored adoption lands
+            # reconciled, so the one-shot reconnect guard stays off here
+            "cutoff_date": "the reconnect guard this instance never held",
+            "guard_ledger": "the reconnect guard this instance never held",
+            "history_from": "the reconnect guard this instance never held",
+            "live_from": "the reconnect guard this instance never held",
+        },
+        "account_links": {
+            "created_at": "when the link was made here; ranks are restored",
+            "failover_alerted": "this instance's alert state",
+        },
+        "bills": {
+            "account_id": "no door writes it (the upsert stores NULL)",
+        },
+        "alerts_log": {
+            "id": "an identity of this instance",
+            "mute_changed_at": "when the mute last flipped HERE: an emailed "
+                               "mute link compares it to its own mail",
+            "seen_at": "the view of the world a snapshot here applied; a "
+                       "restored row is none, so the next snapshot decides",
+        },
+        "business_entity": {
+            "ein_enc": "the EIN never leaves its instance",
+            "updated_at": "when this instance last wrote the row",
+        },
+        "business_txn_class": {
+            "updated_at": "when this instance last wrote the row",
+        },
+        "income_documents": {
+            "ein": "only the last four are kept (_ein_last4_for_restore)",
+        },
+        "items": {
+            "access_token": "credentials never travel",
+            "bank_failed_at": "this instance's pull state",
+            "bank_updated_at": "this instance's pull state",
+            "link_session_id": "this instance's link session",
+            "resync_from": "this instance's pull bookkeeping",
+            "tx_cursor": "this instance's pull cursor",
+            "tx_update_status": "this instance's pull state",
+            "webhook_status": "this instance's webhook state",
+            "webhook_status_at": "this instance's webhook state",
+        },
+        "merchant_renames": {
+            "id": "fresh from the shared sequence, in the archive's order",
+        },
+        "merchants": {
+            "updated_at": "when this instance last wrote the row",
+        },
+        "recipient_invites": {
+            "id": "a control-plane serial of this instance",
+        },
+        "transaction_notes": {
+            "updated_at": "when this instance last wrote the row",
+        },
+    }
+    # members whose rows are not written by a column list of their own
+    NOT_TABLES = {
+        "recurring": "bills' old member name, read by the bills pass",
+        "tenant_settings": "one document merged over the destination's",
     }
 
     @staticmethod
-    def _live_columns(conn, table: str) -> set:
+    def _live_columns(conn, table: str, *, required=False) -> set:
         # generated columns (is_generated) are the database's own — never
         # exported, never restorable — so they are not "live" for this check
+        extra = (" AND is_nullable = 'NO' AND column_default IS NULL"
+                 if required else "")
         return {r["column_name"] for r in conn.execute(
             """SELECT column_name FROM information_schema.columns
                WHERE table_schema='public' AND table_name=%s
-                 AND is_generated = 'NEVER'""",
-            (table,)).fetchall()}
+                 AND is_generated = 'NEVER'""" + extra,
+            (table,)).fetchall()} - {"tenant_id"}
 
     @staticmethod
-    def _listed_columns(stmt: str) -> set:
+    def _listed_columns(src: str, table: str) -> set:
         """Column names inside the INSERT's parenthesised column list."""
         import re as _re
-        return set(_re.findall(r"[a-z_]+",
-                               stmt.split("(", 1)[1].split(")", 1)[0]))
+        m = _re.search(r"INSERT INTO " + table + r"\s*\(([^)]*)\)", src)
+        assert m, f"no INSERT INTO {table} in the restore"
+        return set(_re.findall(r"[a-z_0-9]+", m.group(1)))
 
-    def test_restore_covers_every_live_column_export_ships(self):
+    @staticmethod
+    def _catalog():
+        _ensure_db()
+        import psycopg
+        from psycopg.rows import dict_row
+        return psycopg.connect(tenancy.ADMIN_DSN, row_factory=dict_row,
+                               autocommit=True)
+
+    def _source(self) -> str:
         import inspect
 
         from oikonome.sync import restore as _restore
 
-        # the body, not the public wrapper: restore_zip() is now a thin
-        # shell that installs the progress callback and delegates, so
-        # reading its source would find no SQL at all — and this test
-        # would pass by finding nothing, which is the one way it must
-        # never pass
-        src = inspect.getsource(_restore._restore_zip)
+        # the bodies, not the public wrapper: restore_zip() is a thin
+        # shell that delegates, so reading its source would find no SQL at
+        # all — and this test would pass by finding nothing, which is the
+        # one way it must never pass
+        src = (inspect.getsource(_restore._restore_zip)
+               + inspect.getsource(_restore._restore_recipient_invites))
         self.assertIn("INSERT INTO accounts", src)
-        listed = {
-            "transactions": self._listed_columns(
-                src[src.index("_TXN_SQL = "):src.index("CHUNK = 1000")]),
-            "accounts": self._listed_columns(
-                src[src.index("INSERT INTO accounts"):]),
-        }
+        return src
 
-        conn = make_db()
+    def test_restore_covers_every_live_column_export_ships(self):
+        src = self._source()
+        # the catalog as the owner sees it: the app role is granted nothing
+        # on the control-plane table, so its view of the columns is empty
+        conn = self._catalog()
         try:
-            for table, skip in self.SKIP.items():
+            for table in sorted(restore.RESTORED_MEMBERS - set(self.NOT_TABLES)):
                 live = self._live_columns(conn, table)
                 self.assertTrue(live, f"no live columns found for {table}")
-                missing = live - skip - listed[table]
+                skip = self.SKIP.get(table, {})
+                self.assertEqual(sorted(set(skip) - live), [],
+                                 f"{table}: SKIP names a column that is gone")
+                missing = live - set(skip) - self._listed_columns(src, table)
                 self.assertEqual(
                     missing, set(),
                     f"restore silently drops {table} column(s) "
@@ -206,6 +277,72 @@ class RoundTripKeepsEveryColumnTests(unittest.TestCase):
                     "either restore them or add them to SKIP with a reason")
         finally:
             conn.close()
+
+    def test_every_required_column_is_written_by_the_restore(self):
+        src = self._source()
+        conn = self._catalog()
+        try:
+            for table in sorted(restore.RESTORED_MEMBERS - set(self.NOT_TABLES)):
+                required = self._live_columns(conn, table, required=True)
+                # an identity column fills itself
+                ident = {r["column_name"] for r in conn.execute(
+                    """SELECT column_name FROM information_schema.columns
+                        WHERE table_schema='public' AND table_name=%s
+                          AND is_identity = 'YES'""", (table,)).fetchall()}
+                missing = (required - ident
+                           - self._listed_columns(src, table))
+                self.assertEqual(
+                    missing, set(),
+                    f"{table}: NOT NULL column(s) {sorted(missing)} with no "
+                    "default are not written by the restore, so every "
+                    "archived row of the table would abort it")
+        finally:
+            conn.close()
+
+    def test_a_blank_required_cell_never_aborts_the_restore(self):
+        """Each NOT NULL column with no default, blanked in an archived row,
+        is either coerced to a value or the row is refused — never a NULL
+        that rolls back the whole archive."""
+        from .test_a_household_round_trips_through_its_export import (
+            fill_every_table, fresh_tenant)
+        import csv as _csv
+
+        src = make_db()
+        try:
+            fill_every_table(src)
+            from oikonome.sync import export
+            data = export.build_zip(src)
+            required = {t: self._live_columns(src, t, required=True)
+                        for t in restore.RESTORED_MEMBERS
+                        - set(self.NOT_TABLES) - {"recipient_invites"}}
+        finally:
+            src.close()
+        zin = zipfile.ZipFile(io.BytesIO(data))
+        for table, cols in sorted(required.items()):
+            member = f"{table}.csv"
+            if member not in zin.namelist():
+                continue
+            text = zin.read(member).decode("utf-8")
+            rows = list(_csv.DictReader(io.StringIO(text)))
+            for col in sorted(cols):
+                if not rows or col not in rows[0]:
+                    continue
+                buf = io.StringIO()
+                w = _csv.DictWriter(buf, fieldnames=list(rows[0]))
+                w.writeheader()
+                for r in rows:
+                    w.writerow({**r, col: ""})
+                out = io.BytesIO()
+                with zipfile.ZipFile(out, "w") as z:
+                    for n in zin.namelist():
+                        z.writestr(n, buf.getvalue() if n == member
+                                   else zin.read(n))
+                dest = fresh_tenant()
+                try:
+                    with self.subTest(table=table, column=col):
+                        restore.restore_zip(dest, out.getvalue())
+                finally:
+                    dest.close()
 
 
 class RestoreKeepsOwnershipAndOutletTests(unittest.TestCase):

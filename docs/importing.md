@@ -56,6 +56,14 @@ the older files from Accounts → Import.
 | Monarch / Copilot / Simplifi | each app's CSV export | auto-detected |
 | Oikonome export ZIP | Settings → Data & maintenance on another instance | runs in the background with progress on the page (a big archive takes minutes; leaving the page doesn't stop it) — full restore: transactions, bills, your answers to recurring-bill and merchant-merge offers (something you declined is not offered again), the import history (so a file import that came along can still be undone under Recent imports), overrides, settings, and business-entity data (entities, equity, mileage, 1099 vendors, compliance, classifications). **Note:** a business entity's full EIN is never included in the export for security — after restoring, re-enter it (only the last 4 digits carry over). The daily email's recipient answers travel, with one narrowing: a **decline** always carries over, so somebody who said no stays off the list; an **acceptance** carries over only for an address that already has its own login on the destination household (in hosted mode, one whose email is confirmed). Everyone else — and anybody who had not answered yet — lands as *not invited* with an **Invite** button, because the invite *link* itself never travels. The restore summary tells you how many people have to accept a fresh invite before their mail resumes; Settings → Email & Push is where you send it. |
 
+**Income labels.** When a CSV, Mint or other-app import files a deposit under an income label of its own — "Income",
+"Paycheck", "Salary", "Payroll", "Direct Deposit", "Income:Interest" and
+the like — the deposit is stored in the standard Income category, so
+paycheck detection and the month's income count it. A label that means
+money coming back (a reimbursement, refund, reversal, adjustment,
+correction or transfer) stays as written, and so does an income label on
+money going out.
+
 **Restoring after you have already linked your banks.** You can restore
 an export before or after linking the same banks here; either way you end
 up with one copy of each account. When a bank is already linked, every
@@ -68,6 +76,73 @@ days stay on them. If two accounts at one bank share the last four digits
 and type, nothing is guessed — the restore summary names the accounts that
 may now appear twice, so you can link or remove the extra copy on the
 Accounts page.
+
+**Restoring an older export.** A restore cuts every full account or card
+number it finds to its last four as it writes each row — in account names,
+merchant names, bills, offers and the activity log — whatever the export
+says about its own age, so an export written before those numbers were cut
+comes back cut, and any export this app has ever written still restores.
+A detected bill whose name spelled a number lands on the bill you already
+have under the cut name. Two such bills for two cards that share the last
+four stay two bills, and a bill you made yourself is never merged with one.
+
+An export from an older version comes back the way an upgrade left the
+households that were already here. Its transactions get what later versions
+read out of each bank record: the bank's own category and confidence, check
+number, location, merchant category code and payment app; a Venmo or Zelle
+payment is named for the person paid ("Venmo — …", "Zelle — …"); a card
+payment the bank filed as something else is filed as a card payment; and a
+store's fuel pump is shown as its own outlet and filed as fuel. A category
+you set yourself, or one a rule of yours decided, is never changed by any of
+this. Connections that a script feeds come back as that script's, a business
+you had closed keeps a closing date, and a 1099 vendor is tied to its
+merchant when exactly one merchant has its name. An export from before
+merchant rules were kept by merchant gets your rules derived from your own
+corrections (only where every correction of a merchant agrees), and an
+export from before daily-email invites keeps sending the daily email to the
+recipients who have their own login on this household; anyone else on the
+list has to accept an invite here first.
+
+**A data-portability archive is not a backup.** The JSON archive the
+admin console exports for a data-portability request is for a person to
+read, not for restoring: the restore refuses it before anything is written, with
+*"This is a data-portability archive, not a backup to restore; restore the
+export ZIP from Settings → Data ("Download export ZIP") instead. Nothing
+was imported."*
+
+**A ZIP that is not an Oikonome export** is refused the same way, before
+anything starts: *"This ZIP isn't an Oikonome export, so there is nothing
+in it to restore."* If it came from another budgeting app, unzip it and
+import the transactions CSV inside (a YNAB export: its `Register.csv`).
+An Oikonome export that was unzipped and then zipped again **with its
+folder** (Safari unzips downloads) is told so: open the folder, select
+the files in it and zip the files themselves, then upload that ZIP.
+
+**One restore at a time.** A household runs one restore at a time, and a
+server runs at most a couple at once across all households
+(`OIKONOME_RESTORES_AT_ONCE`, default 2); past that the restore is
+refused with *"another restore is running on this server — try again in
+a few minutes"*. Nothing was written, so drop the ZIP again later.
+
+**A transaction with no amount.** An export written by an older version
+can hold a transaction whose amount cell is blank. It restores at 0, with
+its notes, splits and receipts, and the restore summary says how many
+came back that way so you can edit each amount. (Upgrading does the same
+to any such row an older restore had already stored: every transaction
+now has an amount.)
+
+**What the restore summary counts.** Each table's number is the rows the
+restore actually wrote. A row it did not write is counted once, under the
+reason: *already present* (this household already had it — restoring the
+same export twice writes nothing the second time), *orphaned* (it belongs
+to a transaction, account, business or receipt the export does not
+carry), *out of range* (an amount larger than any real sum), *malformed*
+(a required cell blank, an unreadable id or image, a split that does not
+add up to its charge), *over cap* (a receipt image over the upload size),
+or *merged* (the same merchant this household already has under its own
+id; everything that pointed at it now points at that one). Split parts a
+store receipt made are not copied: the store match rebuilds them from the
+restored receipts.
 
 **Amount signs:** most bank CSVs use negative-for-spending — that's the
 default. If your import shows spending as income, undo it and re-import
@@ -84,6 +159,11 @@ decimals — `12,50` is 12.50 and `1.234,56` is 1,234.56 — in every
 import format, in restored settings and in any amount you type into a
 form. A comma followed by exactly three digits (`1,234`) is a thousands
 separator.
+
+**Unreadable amounts:** a CSV amount cell longer than 40 characters, or
+one that is not an ordinary finite number (`inf`, `nan`, or exponent
+notation past a quadrillion such as `1e999`), stops the import with
+*unrecognized amount*; nothing from the file is imported. Fix the cell and import again.
 
 **Re-importing after a reading changed.** When the importer reads a line
 differently from the way an earlier version did — the sign a Debit/Credit
@@ -166,10 +246,19 @@ for what the refusals look like.
 after its file, and banks often name an export after the full account
 number. Only the last four digits of any run of eight or more are kept
 in the account's name and in the import history, and older names and
-archives are cut the same way.
+archives are cut the same way. A card number typed in its usual groups — four groups of four or the 4-6-5 layout, separated by spaces, dashes, dots or slashes, singly, doubled or mixed ("4000.0000.0000.0002", "4000-0000 0000-0002") — is cut to its last four as well; any other grouping is kept as typed. A short group after the number ("…0002 123") is kept, and so is anything joined to it differently ("…0002 - 2025"). Dates, phone numbers and a single year range are never account numbers: an account named "CD 03/15/2025 09/15/2025" or "FY 2023-2024" keeps its digits; two year ranges typed side by side ("2023-2024 2024-2025") read as four groups of four and are cut. The same cut applies to a name you type for a new account or a rename, and the app then shows the name as it was stored.
 
-An account's internal id is a different matter, and it depends on how
-the account was made:
+An account's internal id is a different matter. A new account — made
+with *Add account*, a single upload's *new account* box, a folder import
+or a multi-account file — gets an opaque id (`manual:` and a run of
+letters) minted once; it never spells the account's name, so a rename or
+a cut name changes nothing about where its rows go. Which source fills
+which account (a name you typed, a file's name, a split file's source
+account) is recorded as a keyed digest under this instance's own secret,
+never as the name, so the next file of the same card lands on the same
+account without the number being kept anywhere, and a second card sharing
+its last four gets an account of its own. Accounts made by an earlier
+version keep the id they have and still take their re-imports:
 
 - **An account split out of a multi-account file** (QIF, Mint, Monarch,
   Copilot, Simplifi) whose source name was a full account number is moved
@@ -178,12 +267,41 @@ the account was made:
   restore brings one back from an older export. Your history, settings
   and earlier imports follow it, and re-importing the same file still
   lands on the same account.
-- **An account a folder import named after its file** keeps its id: it is
-  permanent, so an account created before the name rule above still
-  carries the number there, and it travels in exports; a restore lists
-  any such account by name. To be rid of it, undo that account's imports
-  under *Recent imports*, rename the files without the number, import
-  them again, and remove the old, now empty account.
+- **An account you named with a full card or account number** — typed
+  into a folder import, a single upload's *new account* box or *Add
+  account*, or taken from a file name by an earlier version — is moved,
+  once, onto an id that keeps only the last four digits, the same way.
+  Its history, settings and earlier imports follow it, and importing the
+  same file again lands on the same account and adds nothing. If two
+  such accounts share their last four digits, a file naming one of the
+  numbers is not guessed at: the folder import's plan shows a picker on
+  that file and holds *Import* until you choose an account, a single
+  upload is refused with *"choose one for this file"* so you can pick the
+  account yourself, and a YNAB register's *new account* answer for that
+  name is refused the same way, so you pick one of the accounts listed.
+  Every one of these pickers lists each account with what tells the two
+  apart — how many rows it holds, the dates they span and its latest
+  balance. The account you pick is remembered for that name — on all
+  three — once that file has imported into it (a file whose columns you
+  still have to map, or a register whose accounts you still have to
+  place, counts when you finish it; one that is refused settles
+  nothing), so the next file of the same card is not asked again. Two
+  sources in one file whose numbers share their last four likewise get
+  separate accounts rather than one, and a split file imported again
+  keeps each source on the account that already holds its rows.
+
+The recorded sources travel in an export, but the digests are keyed
+under the secret of the instance that wrote them, so after a restore into
+another household or instance they match nothing there: each source finds
+its account again by the account's (cut) name or its old id, is asked
+once if that leads to more than one, and the answer is recorded anew.
+
+A script that pushes a file to the single-file import by an account id
+that a migrate moved is still sent to the account, when the move led to
+exactly one. Otherwise the import answers *"that account no longer exists
+— pick another"* or *"that account moved to several — pick one of
+them"* and imports nothing. Either way, switch the script to the account's
+current id from `/api/integrations/accounts`.
 
 **A folder import runs in the background.** Pressing *Import* hands the
 plan to the server and the page follows it file by file — *N of M files*,

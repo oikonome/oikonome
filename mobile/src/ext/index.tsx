@@ -1,4 +1,5 @@
 import type { ComponentType } from "react";
+import { releasedHoldDays } from "../lib/api";
 
 // The extension point a client add-on fills (an add-on is swapped in for
 // this directory at build time, and may add screens under src/app/).
@@ -40,7 +41,8 @@ export const ext = {
   allowanceNote: (used: number | null | undefined, cap: number | null | undefined,
                   full: boolean): string =>
     `${used} of ${cap} institutions connected.`
-    + (full ? " A bank you disconnect keeps its slot for 30 days." : ""),
+    + (full ? ` A bank you disconnect keeps its slot for ${
+        releasedHoldDays()} days.` : ""),
   // links the More tab and the SMS consent copy show when the operator
   // publishes them
   legal: { privacy: null as string | null, terms: null as string | null },

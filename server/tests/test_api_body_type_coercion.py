@@ -109,6 +109,47 @@ class BodyIdTypeCoercionTests(unittest.TestCase):
                                  json={"account_id": "chk", "name": bad})
             self.assertEqual(r.status_code, 400, r.text)
 
+    def test_alert_doors_refuse_a_non_string_kind_or_message(self):
+        for path in ("/api/alerts/dismiss", "/api/alerts/restore"):
+            for bad in (True, 123, *BAD_IDS):
+                for field in ("kind", "message"):
+                    r = self.client.post(path, json={"kind": "k", "message": "m",
+                                                     field: bad})
+                    self.assertEqual(r.status_code, 400, f"{path} {field}={bad}")
+
+    def test_alert_doors_match_the_stored_message_exactly(self):
+        # the pair is a lookup key, not a name to tidy: a stored message that
+        # ends in a space is only dismissed when it is sent back as stored
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            conn.execute(
+                "INSERT INTO alerts_log (kind, severity, message, first_seen, "
+                "last_seen) VALUES ('edge', 'warn', 'padded message ', "
+                "'2026-07-01', '2026-07-01')")
+        finally:
+            conn.close()
+        r = self.client.post("/api/alerts/dismiss",
+                             json={"kind": "edge",
+                                   "message": "padded message "})
+        self.assertEqual(r.json()["dismissed"], 1, r.text)
+        r = self.client.post("/api/alerts/restore",
+                             json={"kind": "edge",
+                                   "message": "padded message "})
+        self.assertEqual(r.json()["restored"], 1, r.text)
+
+    def test_bill_offer_door_refuses_a_non_string_offer_id(self):
+        for action in ("approve", "reject"):
+            for bad in (True, 123, *BAD_IDS):
+                r = self.client.post("/api/bills/proposal",
+                                     json={"action": action, "pid": bad})
+                self.assertEqual(r.status_code, 400, f"{action} pid={bad}")
+
+    def test_bill_offer_door_answers_an_unknown_offer_id_as_a_bad_request(self):
+        for pid in ("", "not-an-offer"):
+            r = self.client.post("/api/bills/proposal",
+                                 json={"action": "reject", "pid": pid})
+            self.assertEqual(r.status_code, 400, f"pid={pid!r}: {r.text}")
+
     def test_business_doors_non_string_bodies_do_not_500(self):
         # tier-gated or not, none of these may 500 on a container value —
         # the containers must die at validation before any SQL adapter

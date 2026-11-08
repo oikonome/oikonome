@@ -87,12 +87,17 @@ class CashGraphCurrentMonthTests(unittest.TestCase):
         g = reporting.compute_cashflow(self.conn)["cash_graph"]
         fc = forecast.build(self.conn, days=forecast.HORIZON_DAYS)
         fwd = sum(v for _, v in g["points"][g["forecast_from"]:])
+        # the graph draws whole months only; its last one closes here
+        self._last_mk = g["points"][-1][0]
         return fwd, fc
 
     def _expect(self, fc, mtd_cash):
-        # sum of every forecast-month net == (final walk balance − checking
-        # now) + the current month's actual CASH flow so far
-        return fc["pace_stmt"]["series"][-1][1] - fc["checking"] + mtd_cash
+        # sum of every forecast-month net == (the walk's balance where the
+        # last drawn month closes − checking now) + the current month's
+        # actual CASH flow so far
+        closing = [b for d, b in fc["pace_stmt"]["series"]
+                   if d[:7] == self._last_mk][-1]
+        return closing - fc["checking"] + mtd_cash
 
     def test_unpaid_card_charge_counts_once(self):
         """THE CASE: $300 charged this month, still on the card. The walk

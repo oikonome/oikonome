@@ -20,7 +20,8 @@ import { discardPicked, errText, getHandedOffTxn, Receipt, SplitPart, TodayFull,
          TxnPage } from "../lib/api";
 import { patchQueries, removeFromList } from "../lib/cache";
 import { categoryForServer, CLEAR_CATEGORY, catLabel, filterCategories,
-         isCategoryReset, spendPickerGroups, CATEGORY_MAX, goneTxnIds } from "../lib/pure";
+         isCategoryReset, spendPickerGroups, CATEGORY_MAX, goneTxnIds,
+         splitDraftCheck } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { useDemo, useViewer } from "../lib/viewer";
 import { forgetParseStart, parseStalled, rankWaiting, useMatchReceipt,
@@ -691,15 +692,7 @@ export default function TxnDetail() {
           )}
         </View>
         {splitDraft !== null && (() => {
-          const total = Math.round(Math.abs(txn.amount) * 100);
-          const sum = splitDraft.reduce((a, p) => {
-            const v = Number(p.amount);
-            return a + (Number.isFinite(v) ? Math.round(v * 100) : 0);
-          }, 0);
-          const left = total - sum;
-          const ready = splitDraft.length >= 2 && left === 0
-            && splitDraft.every((p) => p.category && Math.round(Number(p.amount) * 100) > 0)
-            && new Set(splitDraft.map((p) => p.category)).size === splitDraft.length;
+          const { cents, left, ready } = splitDraftCheck(txn.amount, splitDraft);
           const sign = txn.amount < 0 ? -1 : 1;
           const set = (i: number, patch: Partial<{ category: string; amount: string }>) =>
             setSplitDraft((d) => d ? d.map((p, j) => j === i ? { ...p, ...patch } : p) : d);
@@ -727,7 +720,7 @@ export default function TxnDetail() {
                   {left !== 0 ? (
                     <Text style={{ color: C.accent, fontSize: 12 }}
                           onPress={() => set(i, { amount: (Math.max(0,
-                            Math.round((Number(p.amount) || 0) * 100) + left) / 100).toFixed(2) })}>
+                            (cents[i] ?? 0) + left) / 100).toFixed(2) })}>
                       ← {(left / 100).toFixed(2)}
                     </Text>
                   ) : null}
@@ -756,9 +749,9 @@ export default function TxnDetail() {
                 </Pressable>
                 <Pressable style={[s.btn, !ready && { opacity: 0.4 }]}
                            disabled={!ready || splitSave.isPending}
-                           onPress={() => splitSave.mutate(splitDraft.map((p) => ({
+                           onPress={() => splitSave.mutate(splitDraft.map((p, i) => ({
                              category: p.category,
-                             amount: sign * Math.round(Number(p.amount) * 100) / 100 })))}>
+                             amount: sign * (cents[i] ?? 0) / 100 })))}>
                   <Text style={s.btnText}>
                     {splitSave.isPending ? "Saving…" : "Save split"}
                   </Text>
@@ -832,13 +825,21 @@ export default function TxnDetail() {
           </View>
         )}
         <Text style={[s.mut, { marginTop: 10 }]}>Note</Text>
+        {/* the demo instance refuses note writes — disabled-in-place, as
+            the web NoteEditor does, beats a refusal after typing */}
+        {demo && (
+          <Text style={{ color: C.warn, fontSize: 12 }}>
+            Not available on the demo instance — synthetic data only.
+          </Text>
+        )}
         <View style={s.actRow}>
           <TextInput
-            style={s.noteInput}
+            style={[s.noteInput, demo && { opacity: 0.5 }]}
             placeholder="add a note…" placeholderTextColor={C.mut}
             value={noteDraft ?? txn.note ?? ""}
+            editable={!demo}
             onChangeText={setNoteDraft} multiline />
-          {noteDraft !== null && noteDraft !== (txn.note ?? "") && (
+          {!demo && noteDraft !== null && noteDraft !== (txn.note ?? "") && (
             <Pressable style={s.btn} disabled={note.isPending}
                        onPress={() => note.mutate(noteDraft.trim())}>
               <Text style={s.btnText}>Save</Text>

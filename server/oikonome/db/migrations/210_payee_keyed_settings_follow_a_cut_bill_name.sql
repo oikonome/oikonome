@@ -1,0 +1,21 @@
+-- Migration 206 cut a card number out of a detected bill's name and moved
+-- two of the settings that name a bill by its payee (the bills switched
+-- off, the occurrence caps) onto the cut name. It left the dismissed fit
+-- hints and health pills under the whole number: the bill is read under
+-- its cut name, so a dismissed hint came back, and the whole number stayed
+-- in the settings and rode every export. A rename now moves every such
+-- setting (bills.PAYEE_KEYED_CONFIG); this moves what 206 left behind.
+--
+-- The move runs in Python, as db/migrate.py's PYTHON_STEPS step for this
+-- file (bills.follow_cut_payees), in this file's transaction, with the
+-- cut a bill's name was given (sync/card_number.py). So this file changes
+-- no schema and no row; it is the record that the step ran.
+--
+-- An entry moves only where its own name names no bill, its cut names a
+-- detected bill, and nothing a person made is renamed by it; an entry
+-- naming no bill stays, as a rename leaves it. Where the cut name already
+-- has its own entry, that is the newer choice and stays. Idempotent: a
+-- cut name is "…" and four digits, which no cut changes again, and a
+-- household's settings are written only if they still read as read.
+
+SELECT 1;

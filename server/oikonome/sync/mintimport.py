@@ -14,7 +14,7 @@ dedup reuses csvimport's ±3-day window.
 
 Multi-account files: "Account Name" carries the
 Mint-side account; >1 distinct name splits per account exactly like the
-other-app importers (stable slug ids, re-import-safe, shared type
+other-app importers (one account per source, re-import-safe, shared type
 inference), with per-account counts in the result.
 """
 
@@ -26,7 +26,7 @@ from ..engine.compat import as_date
 from . import flowmap
 from .base import (FileImportIds, Transaction, check_split_accounts,
                    drop_before_history, ensure_split_account, split_former,
-                   mask_long_digits, tally_split, upsert_transactions)
+                   tally_split, upsert_transactions)
 from .csvimport import (bounded_dict_reader, date_order, parse_money_text,
                         scrub_identifiers)
 from .rowcap import capped
@@ -191,18 +191,21 @@ def import_mint(conn, account_id: str, text: str,
     total = {"imported": 0, "rows": 0, "skipped_duplicates": 0,
              "split_accounts": {}}
     check_split_accounts(by_acct)
+    run_ids: dict = {}          # one FileImportIds per target across the run
     for mint_name in sorted(by_acct):
         target = ensure_split_account(
             conn, "mint", mint_name,
             lines=[(p[0], p[1], p[2]) for p in by_acct[mint_name]])
         out = _import_into(conn, target, by_acct[mint_name],
                            batch_id=batch_id,
-                           former=split_former("mint", mint_name, target))
+                           former=split_former("mint", mint_name, target),
+                           ids=run_ids.setdefault(
+                               target, FileImportIds("mint", target)))
         for k in ("imported", "rows", "skipped_duplicates"):
             total[k] += out[k]
         # keyed by the name as the account holds it: the full number of
         # an account named by its number never reaches the response
-        tally_split(total["split_accounts"], mask_long_digits(mint_name),
+        tally_split(total["split_accounts"], mint_name,
                out["imported"])
     total["note"] = (f"file contains {len(by_acct)} accounts — split "
                      f"into one account per Mint account (the selected "
@@ -211,10 +214,14 @@ def import_mint(conn, account_id: str, text: str,
 
 
 def _import_into(conn, account_id: str, parsed: list[tuple], *,
-                 batch_id: str | None, former: tuple[str, ...] = ()) -> dict:
+                 batch_id: str | None, former: tuple[str, ...] = (),
+                 ids: "FileImportIds | None" = None) -> dict:
     deduper = Deduper(conn, account_id, "mint", [p[0] for p in parsed])
     txns: list[Transaction] = []
-    ids = FileImportIds("mint", account_id, former=former)
+    if ids is None:
+        ids = FileImportIds("mint", account_id, former=former)
+    else:
+        ids.also_former(former)
     skipped_dupes = 0
     for date, amount, name, merchant, cat_raw, _acct, raw in parsed:
         if deduper.claim(date, amount, name, merchant):

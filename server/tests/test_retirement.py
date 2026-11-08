@@ -23,6 +23,9 @@ class TestRetirement(unittest.TestCase):
         self.assertEqual(R.age_from_birthdate(bd, dt.date(2026, 7, 6)), 54)
         self.assertEqual(R.age_from_birthdate(bd, dt.date(2026, 11, 8)), 55)
         self.assertEqual(R.age_from_birthdate(bd, dt.date(2026, 11, 7)), 54)
+        # a Feb 29 birthday turns over on Mar 1 in a common year
+        self.assertEqual(R.age_from_birthdate("1960-02-29", dt.date(2027, 2, 28)), 66)
+        self.assertEqual(R.age_from_birthdate("1960-02-29", dt.date(2027, 3, 1)), 67)
 
     def test_rmd_forces_distribution(self):
         """td-only portfolio, zero spend, zero growth: RMDs must move money
@@ -245,6 +248,25 @@ class TestBuckets(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_a_childs_custodial_account_is_not_household_savings(self):
+        """A UGMA/UTMA account legally belongs to the minor: counting it as
+        the household's taxable savings would fund a retirement with money
+        the parents cannot spend."""
+        conn = make_db()
+        try:
+            for aid, name, sub, bal in (
+                    ("u1", "Custodial A", "utma", 600),
+                    ("u2", "Custodial B", "ugma", 200),
+                    ("b1", "Brokerage", "brokerage", 100)):
+                conn.execute(
+                    "INSERT INTO accounts (id,item_id,name,type,subtype,"
+                    "balance_current) VALUES (%s,'it1',%s,'investment',%s,%s)",
+                    (aid, name, sub, bal))
+            b = R.current_buckets(conn)
+            self.assertEqual(b["taxable"], 100.0)
+        finally:
+            conn.close()
+
     def test_default_spend_is_net_of_partial_reimbursements(self):
         """A $5,000 charge with $2,000 reimbursed is $3,000 the household
         actually lives on — the same net every other spend surface uses.
@@ -252,6 +274,9 @@ class TestBuckets(unittest.TestCase):
         the household never spent."""
         conn = make_db()
         try:
+            # a ledger older than the year window, so nothing is annualized
+            add_txn(conn, dt.date.today() - dt.timedelta(days=400), 10.0,
+                    "EXAMPLE GROCER", txn_id="old1")
             add_txn(conn, dt.date.today() - dt.timedelta(days=30), 5000.0,
                     "CONFERENCE HOTEL", txn_id="exp1")
             add_txn(conn, dt.date.today() - dt.timedelta(days=20), -2000.0,
@@ -264,6 +289,77 @@ class TestBuckets(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_balance_at_67_is_only_reported_when_the_curve_reaches_67(self):
+        """"By 67" is the curve's balance at 67. Someone already past 67,
+        or a plan ending before 67, has no such point: reporting the
+        horizon's balance under that label presents years of growth as a
+        figure for an age already passed. Exactly 67 is today's balance."""
+        conn = make_db()
+        try:
+            conn.execute(
+                "INSERT INTO accounts (id,item_id,name,type,subtype,"
+                "balance_current) VALUES ('b1','it1','Brokerage','investment',"
+                "'brokerage',100000)")
+            kw = dict(spend=20_000, nominal=0.07, inflation=0.03,
+                      ss_monthly=0, ss_age=67, rental_monthly=0,
+                      td_annual=0, taxable_annual=0, resume_age=99)
+            self.assertIsNone(
+                R.project(conn, age=70, end_age=95, **kw)["grow_to_67"])
+            self.assertIsNone(
+                R.project(conn, age=40, end_age=60, **kw)["grow_to_67"])
+            at67 = R.project(conn, age=67, end_age=95, **kw)
+            self.assertEqual(at67["grow_to_67"], at67["growth_path"][0][1])
+            younger = R.project(conn, age=60, end_age=95, **kw)
+            self.assertEqual(younger["grow_to_67"], younger["growth_path"][7][1])
+        finally:
+            conn.close()
+
+    def test_default_spend_annualizes_a_ledger_younger_than_a_year(self):
+        """A household that linked three months of history spends at its
+        monthly rate all year; the starting spend is that rate over a year,
+        not the three months' raw sum. A quarter of real spending makes
+        early retirement look affordable when it is not."""
+        conn = make_db()
+        try:
+            today = dt.date.today()
+            # 120 days of ledger, $1,000 every 10 days: $3,000/30 days
+            for i in range(12):
+                add_txn(conn, today - dt.timedelta(days=119 - 10 * i), 1000.0,
+                        "EXAMPLE GROCER", txn_id=f"g{i}")
+            got = R.default_spend(conn, floor=0)
+            self.assertEqual(got, int(round(12_000 * 365 / 120, -3)))
+        finally:
+            conn.close()
+
+    def test_default_spend_dates_the_ledger_by_the_rows_it_sums(self):
+        """An old transfer (or a business, loan or shadow account) the spend
+        leaves out must not make a young spending ledger read a year deep:
+        the first date comes from the same rows the sum reads."""
+        conn = make_db()
+        try:
+            today = dt.date.today()
+            add_txn(conn, today - dt.timedelta(days=700), 5.0,
+                    "EXAMPLE TRANSFER", primary="TRANSFER_OUT", txn_id="old")
+            for i in range(12):
+                add_txn(conn, today - dt.timedelta(days=119 - 10 * i), 1000.0,
+                        "EXAMPLE GROCER", txn_id=f"y{i}")
+            got = R.default_spend(conn, floor=0)
+            self.assertEqual(got, int(round(12_000 * 365 / 120, -3)))
+        finally:
+            conn.close()
+
+    def test_default_spend_falls_back_on_a_thin_ledger(self):
+        """Under about three months of ledger the rate says too little to
+        stretch over a year; the fixed starting point is used instead."""
+        conn = make_db()
+        try:
+            add_txn(conn, dt.date.today() - dt.timedelta(days=20), 40_000.0,
+                    "EXAMPLE STORE")
+            self.assertEqual(R.default_spend(conn, floor=0, fallback=123_000),
+                             123_000)
+        finally:
+            conn.close()
+
     def test_default_spend_leaves_out_excluded_accounts(self):
         """An account the household switched off on the Accounts page is
         money it tracks but does not live on; every spend report drops it,
@@ -271,6 +367,8 @@ class TestBuckets(unittest.TestCase):
         from .util import write_config
         conn = make_db()
         try:
+            add_txn(conn, dt.date.today() - dt.timedelta(days=400), 10.0,
+                    "EXAMPLE STORE", account="chk", txn_id="old1")
             add_txn(conn, dt.date.today() - dt.timedelta(days=30), 3000.0,
                     "EXAMPLE STORE", account="chk")
             add_txn(conn, dt.date.today() - dt.timedelta(days=30), 9000.0,

@@ -58,29 +58,38 @@ def token_key(public_token: str) -> str:
 
 
 def record(tenant_id, link_token: str, kind: str, item_id: str | None,
-           manage_accounts: bool, institution: str | None) -> bool:
+           manage_accounts: bool, institution: str | None,
+           days_requested: int | None = None) -> bool:
     """Put a newly started session on record. Best-effort: a session that
-    is not recorded still completes through its poll, as it always did."""
+    is not recorded still completes through its poll, as it always did.
+
+    `days_requested` is the backfill its link token asked Plaid for
+    (create_hosted_link's answer). Plaid fixes the backfill then, so every
+    door that finishes the session records that window on the new Item,
+    not the household's choice at the exchange (window_of)."""
     try:
         admin = tenancy.admin_connect()
         try:
             n = admin.execute(
                 "INSERT INTO plaid_link_sessions (link_token, tenant, kind, "
-                "item_id, manage_accounts, institution) "
-                "VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (link_token) "
+                "item_id, manage_accounts, institution, days_requested) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (link_token) "
                 # Plaid mints a fresh token per session, so a start naming
                 # one already on record is that session starting over
                 "DO UPDATE SET tenant=EXCLUDED.tenant, kind=EXCLUDED.kind, "
                 "item_id=EXCLUDED.item_id, "
                 "manage_accounts=EXCLUDED.manage_accounts, "
-                "institution=EXCLUDED.institution, created_at=now(), "
+                "institution=EXCLUDED.institution, "
+                "days_requested=EXCLUDED.days_requested, created_at=now(), "
                 "exchanged='{}'::jsonb, done_at=NULL, reply=NULL "
                 # …of the same household: a start can never move a session
                 # on record to another one, whose finisher would then
                 # exchange the first household's bank into it
                 "WHERE plaid_link_sessions.tenant = EXCLUDED.tenant",
                 (link_token, str(tenant_id), kind, item_id or None,
-                 bool(manage_accounts), institution)).rowcount
+                 bool(manage_accounts), institution,
+                 days_requested if plaid._is_days(days_requested)
+                 else None)).rowcount
         finally:
             admin.close()
         if not n:
@@ -173,7 +182,7 @@ def _row(admin, link_token: str, tenant_id) -> dict | None:
     return admin.execute(
         "SELECT link_token, tenant, kind, item_id, manage_accounts, "
         "institution, extract(epoch FROM created_at) AS at, exchanged, "
-        "done_at, reply FROM plaid_link_sessions "
+        "done_at, reply, days_requested FROM plaid_link_sessions "
         "WHERE link_token=%s AND tenant=%s",
         (link_token, str(tenant_id))).fetchone()
 
@@ -195,6 +204,7 @@ def _as_session(row: dict) -> dict:
             "refuse": reply.get("refuse") if row["done_at"] is None
             else None,
             "reply": row["reply"],
+            "days_requested": row["days_requested"],
             "exchanged": dict(row["exchanged"] or {})}
 
 
@@ -230,6 +240,8 @@ def refresh(sess: dict, link_token: str) -> None:
     if not row:
         return
     sess.setdefault("exchanged", {}).update(row["exchanged"] or {})
+    if sess.get("days_requested") is None:
+        sess["days_requested"] = row["days_requested"]
     if row["done_at"] is None and (row["reply"] or {}).get("refuse"):
         sess["refuse"] = row["reply"]["refuse"]
     if row["done_at"] is not None and not sess.get("done"):
@@ -367,6 +379,71 @@ def _hand_back(conn, client, tenant_id, public_token: str,
     return {"error": why}
 
 
+def apply_account_selection(conn, client, token, item_id: str) -> None:
+    """After a shared-accounts (account-selection) update completes, hide
+    the item's LIVE accounts that Plaid no longer returns: the user just
+    deselected them, so Plaid stops serving (and billing) them, and their
+    local rows would otherwise linger looking connected with a
+    forever-stale balance.
+
+    Live-served only — balance_current IS NOT NULL — because accounts
+    that carry no live balance, such as history imported from files, may
+    share the item, and hiding those would pull their history out of net
+    worth and cash flow.
+
+    Hide-only, never unhide: an account re-selected later stays hidden
+    until the user unhides it on the Accounts page, because this cannot
+    tell a row IT hid apart from one the user hid on purpose for display.
+    Sync already refuses hidden accounts' rows, so this also stops the
+    data at our door. Best-effort: a Plaid hiccup here leaves rows
+    visible-but-stale, which the next completed session cleans up."""
+    try:
+        returned = {a["account_id"] for a in client.post(
+            "/accounts/get", {"access_token": token})["accounts"]}
+    except Exception:                            # noqa: BLE001
+        return
+    if not returned:
+        return
+    n = conn.execute(
+        "UPDATE accounts SET user_removed_at=now(), balance_current=NULL, "
+        "balance_available=NULL "
+        "WHERE item_id=%s AND user_removed_at IS NULL "
+        "AND balance_current IS NOT NULL AND NOT (id = ANY(%s))",
+        (item_id, list(returned))).rowcount
+    if n:
+        # a hidden member of a linked group must stop serving it — the
+        # ambient shadow set follows the change within this request
+        from ..engine import links as _links
+        _links.set_shadow_scope(conn)
+
+
+def _finish_checklist_session(conn, sess: dict, client) -> None:
+    """A shared-accounts session Plaid answered with a public token: the same
+    finish the update path gives it. The session could have shared the
+    waiting accounts, so the new-accounts prompt is done, and whatever was
+    deselected stops looking connected. Plaid does not always report such a
+    session as an update, and the prompt would otherwise stay up for good
+    after the person answered it."""
+    item_id = sess["item_id"]
+    conn.execute(
+        "UPDATE items SET webhook_status = NULL, webhook_status_at = NULL "
+        "WHERE id=%s AND webhook_status='new_accounts' "
+        "AND COALESCE(status,'') != 'archived'", (item_id,))
+    apply_account_selection(conn, client or plaid.Client.for_tenant(conn),
+                            plaid.get_access_token(conn, item_id), item_id)
+
+
+def window_of(sess: dict) -> int:
+    """The backfill window a session's new Item is recorded with: the one
+    its link token asked Plaid for, kept with the session. A session with
+    none kept (started by an older build, or never put on record) gets the
+    widest window — the household's choice read now may be narrower than
+    the backfill the token asked for, and an Item recorded narrower than
+    its backfill is offered a relink, a new billed Item, it does not need."""
+    asked = sess.get("days_requested")
+    return asked if plaid._is_days(asked) else plaid.DAYS_REQUESTED
+
+
 def complete_add(conn, sess: dict, link_token: str,
                  sessions: list, refuse: str | None = None,
                  client=None, defer_sync: list | None = None) -> dict | None:
@@ -443,6 +520,7 @@ def complete_add(conn, sess: dict, link_token: str,
                                       link_session_id=lsid, outcome=outcome,
                                       on_saved=saved,
                                       first_sync=defer_sync is None,
+                                      window_asked=window_of(sess),
                                       relink_of=relink_of)
                 if defer_sync is not None:
                     defer_sync.append(iid)
@@ -487,6 +565,15 @@ def complete_add(conn, sess: dict, link_token: str,
                          {"done": True, "kind": "add_failed",
                           "institution": institution, **err})
     reply = {"done": True, "kind": "add", "institution": institution}
+    # the session was opened on an Item and its token led back to that Item:
+    # a reconnect, whichever way Plaid reported it
+    own = sess.get("item_id") and any(
+        (settled.get(token_key(r["public_token"])) or {}).get("item_id")
+        == sess["item_id"] for _, r in add_results)
+    if own:
+        reply["kind"] = "update"
+        if sess.get("manage_accounts") and refuse is None:
+            _finish_checklist_session(conn, sess, client)
     if pending:
         reply["first_sync"] = "pending"
     return mark_done(sess, link_token, reply)

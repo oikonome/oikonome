@@ -1,4 +1,5 @@
 import type { ComponentType, ReactNode } from "react";
+import { releasedHoldDays } from "../api/client";
 
 // The extension point a client add-on fills (docker/Dockerfile swaps an
 // add-on in for this directory at build time). Nothing in the product
@@ -41,7 +42,8 @@ export const ext = {
   // reports one; `full` when the add door is refusing
   allowanceNote: (used: number, cap: number, full: boolean): ReactNode => (
     <><b>{used} of {cap}</b> institutions connected.
-      {full ? " A bank you disconnect keeps its slot for 30 days." : ""}</>
+      {full ? ` A bank you disconnect keeps its slot for ${
+        releasedHoldDays()} days.` : ""}</>
   ),
   // links the footer and consent copy show when the operator publishes them
   legal: { privacy: null as string | null, terms: null as string | null },

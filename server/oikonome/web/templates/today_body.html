@@ -263,13 +263,13 @@
   </div>
   {% elif cash and cash.state == 'critical' %}
   <div style="margin-top:.6rem;border-top:1px solid var(--line);padding-top:.5rem;font-size:.85rem;color:var(--red);">
-    {% if cash.kind == 'today' %}Short <b>{{ money(cash.short) }}</b> today — checking doesn't cover cards &amp; bills before the next paycheck. Cover it from savings{% if cash.slow_to is not none %}, or slow spending to <b>{{ money(cash.slow_to) }}/day</b>{% endif %}.
+    {% if cash.kind == 'today' %}Short <b>{{ money(cash.short) }}</b> today — checking doesn't cover cards &amp; bills before the next paycheck{% if cash.next_paycheck %} ({{ cash.next_paycheck|d }}){% endif %}. Cover it from savings{% if cash.slow_to is not none %}, or slow spending to <b>{{ money(cash.slow_to) }}/day</b>{% endif %}.
     {% else %}Short <b>{{ money(cash.short) }}</b> by <b>{{ cash.by|d if cash.by else 'now' }}</b> — cover it from savings{% if cash.slow_to is not none %}, or slow spending to <b>{{ money(cash.slow_to) }}/day</b>{% endif %}.{% endif %}
   </div>
   {% elif cash %}
   <div class="sub" style="margin-top:.6rem;border-top:1px solid var(--line);padding-top:.5rem;font-size:.85rem;">
     {% if cash.kind == 'forecast' %}Cash gets tight around {{ cash.low_date|d }} (low {{ money(cash.low) }}).
-    {% else %}Cash is tight — {{ money(cash.headroom) }} left after cards &amp; bills before the next paycheck.{% endif %}
+    {% else %}Cash is tight — {{ money(cash.headroom) }} left after cards &amp; bills before the next paycheck{% if cash.next_paycheck %} ({{ cash.next_paycheck|d }}){% endif %}.{% endif %}
   </div>
   {% endif %}
   {# the WHY, over-budget only — a good day is QUIET: merchant chips,
@@ -442,8 +442,22 @@
     <div style="display:inline-block;vertical-align:top;margin:0 1.4rem .5rem 0;"><span class="sub">card debt</span>
       <div class="kpi sm">{{ money(fc.card_debt) }}</div></div>
     {% if rw and rw.checking is not none and st.bills_remaining_month is not none %}
+    {# the month-end figure counts the paychecks still due as well as the
+       bills still due — bills alone reads as if the product forgot the
+       household's pay. Without an income series the tile says why (the
+       gathered `income_due_note`): nothing set up, income budgeted rather
+       than scheduled, or switched off — the figure stays cash. #}
+    {% if st.income_due_total is not none %}
+    <div style="display:inline-block;vertical-align:top;margin:0 1.4rem .5rem 0;"><span class="sub" title="paychecks still due this month">paychecks still due</span>
+      <div class="kpi sm pos">+{{ money(st.income_due_total) }}</div>
+      {% if st.income_due_dates %}<div class="sub" style="font-size:11px;">{% for x in st.income_due_dates[:3] %}{{ x|d }}{{ ", " if not loop.last }}{% endfor %}</div>{% endif %}</div>
+    <div style="display:inline-block;vertical-align:top;margin:0 1.4rem .5rem 0;"><span class="sub" title="checking − card debt − bills still due this month + paychecks still due this month">after cards, bills &amp; paychecks</span>
+      <div class="kpi sm {{ 'pos' if rw.checking - rw.card_debt - st.bills_remaining_month + st.income_due_total >= 0 else 'neg' }}">{{ money(rw.checking - rw.card_debt - st.bills_remaining_month + st.income_due_total) }}</div></div>
+    {% else %}
     <div style="display:inline-block;vertical-align:top;margin:0 1.4rem .5rem 0;"><span class="sub" title="checking − card debt − bills still due this month">after cards &amp; bills</span>
-      <div class="kpi sm {{ 'pos' if rw.checking - rw.card_debt - st.bills_remaining_month >= 0 else 'neg' }}">{{ money(rw.checking - rw.card_debt - st.bills_remaining_month) }}</div></div>
+      <div class="kpi sm {{ 'pos' if rw.checking - rw.card_debt - st.bills_remaining_month >= 0 else 'neg' }}">{{ money(rw.checking - rw.card_debt - st.bills_remaining_month) }}</div>
+      <div class="sub" style="font-size:11px;">{{ no_paycheck_note(st) }}</div></div>
+    {% endif %}
     {% endif %}
     {% if fc_lows_converged %}
     {% set l0 = fc_lows[0] %}

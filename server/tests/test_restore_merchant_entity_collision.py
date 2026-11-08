@@ -66,7 +66,10 @@ class MerchantEntityCollisionTests(unittest.TestCase):
         # a later SELECT — is the evidence)
         report = restore.restore_zip(self.conn, data)
         self.assertEqual(report.get("merchants"), 1, report)
-        self.assertEqual(report.get("already_present"), 1, report)
+        # folded onto the live merchant: counted as merged, never as a row
+        # the destination already held under the archive's id
+        self.assertEqual(report.get("merged"), 1, report)
+        self.assertNotIn("already_present", report)
 
 if __name__ == "__main__":
     unittest.main()

@@ -78,13 +78,36 @@ export function removeFromList<T extends object, R>(
  *  one to land holds every change before it. */
 export const SETTINGS_SAVES = { id: "settings-email" };
 
+/** Where the assistant and the other AI tasks send their data is read from
+ *  ["assistant-status"], and every "nothing leaves the box" line reads that
+ *  key. Anything that can move an AI route — an AI-settings save, a
+ *  restored config, an outbound pause or its resume — refetches it, so the
+ *  line never vouches for a route that was just changed. */
+export function invalidateAiRoute(qc: QueryClient): void {
+  void qc.invalidateQueries({ queryKey: ["assistant-status"] });
+}
+
+/** An AI-settings key in a settings body (llm_backends, llm_roles, …). */
+const movesAiRoute = (body: Record<string, unknown>): boolean =>
+  Object.keys(body).some((k) => k.startsWith("llm_"));
+
 export function saveSettings(
   qc: QueryClient, body: Record<string, unknown>,
 ): Promise<Settings> {
-  return api.settingsSave(body).then((v) => {
-    qc.setQueryData<Settings>(["settings"], v);
-    return v;
-  });
+  // a read already in flight answers from before the write; cancelled
+  // before the save is sent, it cannot land after the saved copy and put
+  // old values back, and a read another change starts later still lands
+  return qc.cancelQueries({ queryKey: ["settings"] })
+    .then(() => api.settingsSave(body))
+    .then((v) => {
+      qc.setQueryData<Settings>(["settings"], v);
+      if (movesAiRoute(body)) invalidateAiRoute(qc);
+      return v;
+    }, (e) => {
+      // the cancelled read must still happen when the save does not
+      void qc.invalidateQueries({ queryKey: ["settings"] });
+      throw e;
+    });
 }
 
 /** A password, login-address or second-factor change pauses the
@@ -104,9 +127,12 @@ export function smsPauseNote(
 
 /** A credential rotation (password, login address, a first second factor)
  *  also ends every support-access grant this person made and can pause
- *  outbound mail to the household's extra recipients — both shown on the
- *  Settings screens, so both are refetched with the lists it empties. */
+ *  outbound mail to the household's extra recipients and the webhooks —
+ *  all shown on the Settings screens, so all are refetched with the lists it empties. */
 export function invalidateAfterRotation(qc: QueryClient): void {
+  // a rotation can pause the household's own AI endpoint
+  invalidateAiRoute(qc);
   qc.invalidateQueries({ queryKey: ["support-access"] });
   qc.invalidateQueries({ queryKey: ["settings"] });
+  qc.invalidateQueries({ queryKey: ["webhooks"] });
 }

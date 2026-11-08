@@ -11,6 +11,7 @@ config (forecast._checking_balance), and delivery is SMTP resolved per
 tenant.
 """
 
+import calendar
 import datetime as dt
 import logging
 import os
@@ -88,17 +89,33 @@ def _money(v: float) -> str:
     return f"-${-r:,.0f}" if r < 0 else f"${r:,.0f}"
 
 
+def _still_due_this_month(conn, cfg: dict, day: dt.date, *,
+                          income: bool = False,
+                          memo: dict | None = None) -> list[dict]:
+    """The walk's occurrences that are still this month's money — one month
+    boundary for both sides of the "after cards, bills & paychecks" tile.
+    The walk re-dates an unpaid occurrence due today (a bill also when
+    overdue) to at least tomorrow, so on the month's last day a horizon of
+    month end would lose them all and the tile would read $0 with rent
+    unpaid. Looking one day further also expands next month, so only a
+    RE-DATED occurrence may cross: a bill or a pension genuinely due on the
+    1st is next month's. The original date rides on occ["due"]; the walk
+    re-dates a copy."""
+    month_end = day.replace(day=calendar.monthrange(day.year, day.month)[1])
+    occs = budget.upcoming_bill_occurrences(
+        conn, cfg, day, max(month_end, day + dt.timedelta(days=1)),
+        income=income, memo=memo)
+    return [o for o in occs
+            if o["due"] <= month_end or o["occ"]["due"] <= day]
+
+
 def bills_remaining_month(conn, cfg: dict, day: dt.date,
                           env_states: list[dict] | None = None,
                           memo: dict | None = None) -> float:
     """Unpaid bill occurrences through month end — the Today plan card's
     "After cards & bills" tile, summed with the same occurrence helper the
-    runway and forecast reserve with. That helper re-dates unpaid
-    current-month occurrences to at least TOMORROW, so a month-end-only
-    horizon would exclude every re-dated bill on the last calendar day and
-    the tile would read $0 with rent still unpaid. The horizon is therefore
-    never before tomorrow — on EOM this can include a bill genuinely due on
-    the 1st, the acceptable direction for a still-owed figure.
+    runway and forecast reserve with, cut at month end by
+    _still_due_this_month.
 
     Envelope bills are bills too, but they have no occurrences, so summing
     occurrences alone reads low against the forecast walk. Each envelope
@@ -112,9 +129,8 @@ def bills_remaining_month(conn, cfg: dict, day: dt.date,
     pass."""
     nxt = (dt.date(day.year + 1, 1, 1) if day.month == 12
            else dt.date(day.year, day.month + 1, 1))
-    end = max(nxt - dt.timedelta(days=1), day + dt.timedelta(days=1))
-    total = sum(o["planned"] for o in budget.upcoming_bill_occurrences(
-        conn, cfg, day, end, memo=memo))
+    total = sum(o["planned"] for o in _still_due_this_month(
+        conn, cfg, day, memo=memo))
     if env_states is None:
         env_states = budget.month_status(
             conn, day, memo=memo)["buckets"]["fixed"]["envelopes"]
@@ -405,6 +421,71 @@ def gather(conn, today: dt.date, *, live: bool = True,
             if live else None)
     except Exception:
         status["bills_remaining_month"] = None
+    # The paychecks still due this month — their dates and their sum —
+    # from the ONE walk the cash forecast and the runway reserve with
+    # (budget.upcoming_bill_occurrences, income=True), each occurrence
+    # sized at the series' latest deposit like the month's expected
+    # income is. Not `income_expected` itself: that half is matched
+    # against posted AND pending deposits, while checking starts from the
+    # current balance when the bank reports no available one — so on
+    # payday a pending check would be "received" there and absent from
+    # the balance here, and the tile would read +$0 against a cash figure
+    # that never saw the money. The walk re-dates that case to tomorrow.
+    # None when the household tracks no income series: the tile then says
+    # that no paycheck is set up — the month-end figure counts bills and
+    # no income, and a reader who sees only the bills side thinks the
+    # product forgot their pay. None too when not live (a past day has no
+    # "still due").
+    # `income_due_note` says WHY there is no paycheck figure, so the tile's
+    # wording does not tell a household to set up what it already has:
+    # "off" — every income series is switched off; "budgeted" — income is a
+    # budgeted figure (a scenario or the monthly amount), not a schedule;
+    # "none" — nothing at all. The figure itself stays cash either way: a
+    # budgeted amount has no dates, so it is not a paycheck still due.
+    # None whenever the figure exists (or not live). One predicate, here;
+    # web, mobile and the email read the key and never re-derive it.
+    status["income_due_dates"] = None
+    status["income_due_total"] = None
+    status["income_due_note"] = None
+    try:
+        if live:
+            off = {(p or "").lower() for p in (cfg.get("disabled_bills") or [])}
+            scheduled = [b for b in budget._recurring_bills(
+                             conn, caps=cfg.get("occurrence_caps"),
+                             income=True, memo=memo)
+                         if (b["recurrence"] or {}).get("frequency")]
+            series = [b for b in scheduled if b["payee"].lower() not in off]
+            if not series:
+                status["income_due_note"] = (
+                    "off" if scheduled
+                    else "budgeted" if budget.active_monthly_income(cfg)
+                    else "none")
+            if series:
+                # the same month boundary the bills side uses: a month-end
+                # payday not yet posted (the commonest semi-monthly
+                # schedule) is re-dated into next month and still counts
+                occs = _still_due_this_month(
+                    conn, cfg, today, income=True, memo=memo)
+                total = 0.0
+                if occs:
+                    claims = budget._income_claims(
+                        conn, today, [o["occ"]["bill"] for o in occs], memo=memo,
+                        excluded=budget.excluded_account_ids(cfg))
+                    latest: dict = {}
+                    for o in occs:
+                        b = o["occ"]["bill"]
+                        if b["payee"] not in latest:
+                            latest[b["payee"]] = budget.latest_deposit_amount(
+                                conn, today, b, claims=claims)
+                        amt = latest[b["payee"]]
+                        total += amt if amt is not None else o["planned"]
+                status["income_due_dates"] = [o["due"].isoformat()
+                                              for o in occs]
+                status["income_due_total"] = round(total, 2)
+    except Exception:
+        status["income_due_dates"] = None
+        status["income_due_total"] = None
+        status["income_due_note"] = None
     # charges flagged "reimbursement expected" — surfaced as an alert.
     # The engine helper nets partial receipts off each charge, so the
     # total is what's still OWED, not the charges' face value.
@@ -532,6 +613,9 @@ def build(d: dict, *, summary: bool = False) -> tuple:
     slow_txt = (f", or slow spending to {_money(slow_to)}/day"
                 if slow_to is not None else "")
     cash_line = None
+    # the payday the headroom stops at, named so the notice reads as timing
+    np_ = d.get("next_paycheck")
+    np_txt = f" ({_d(np_)})" if np_ else ""
     # the two "we can't see your cash yet" nudges — the same sentences the
     # HTML card carries in place of a cash alarm
     if rw.get("balance_unreliable"):
@@ -544,7 +628,7 @@ def build(d: dict, *, summary: bool = False) -> tuple:
         if spare is not None and spare < 0:
             cash_line = (f"!! CASH: short {_money(-spare)} today — checking "
                          f"doesn't cover cards & bills before the next "
-                         f"paycheck. Cover it from savings{slow_txt}.")
+                         f"paycheck{np_txt}. Cover it from savings{slow_txt}.")
         else:
             by = _d(pc["negative_date"]) if pc.get("negative_date") else "now"
             short = first_neg if first_neg is not None else pc["min"]
@@ -556,7 +640,7 @@ def build(d: dict, *, summary: bool = False) -> tuple:
                          f"(low {_money(pc['min'])}).")
         else:
             cash_line = (f"Cash is tight — {_money(spare)} left after cards "
-                         f"& bills before the next paycheck.")
+                         f"& bills before the next paycheck{np_txt}.")
 
     # the plan chain and the heavy/light judgement read the month's bill
     # SCHEDULE, the figure the variable scale subtracted — the cash-basis
@@ -577,7 +661,8 @@ def build(d: dict, *, summary: bool = False) -> tuple:
     # the whole hero (allowances, bill cards, why chips, MTD rollups),
     # which is too much work to redo for a second surface of the same
     # send.
-    from .todayview import _moneyc, build_context, render_email
+    from .todayview import (_moneyc, build_context, no_paycheck_note,
+                            render_email)
     ctx = build_context(d, email=True)
     html = render_email(d, summary=summary, ctx=ctx)
 
@@ -701,8 +786,19 @@ def build(d: dict, *, summary: bool = False) -> tuple:
         cash_now = (f"Cash timeline: checking {_money(rw['checking'])} · "
                     f"card debt {_money(rw['card_debt'])}")
         if d.get("bills_remaining_month") is not None:
-            cash_now += (" · after cards & bills "
-                         + _money(after_cards - d["bills_remaining_month"]))
+            inc = d.get("income_due_total")
+            if inc is not None:
+                dates = d.get("income_due_dates") or []
+                when = (" (" + ", ".join(_d(x) for x in dates[:3]) + ")"
+                        if dates else "")
+                cash_now += (f" · paychecks still due +{_money(inc)}{when}"
+                             " · after cards, bills & paychecks "
+                             + _money(after_cards - d["bills_remaining_month"]
+                                      + inc))
+            else:
+                cash_now += (" · after cards & bills "
+                             + _money(after_cards - d["bills_remaining_month"])
+                             + f" ({no_paycheck_note(d)})")
         if pc:
             cash_now += (f" · low {_money(pc['min'])} {_d(pc['min_date'])}")
         plain += ["", cash_now]

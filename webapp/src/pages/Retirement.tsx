@@ -6,13 +6,31 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRef, useState } from "react";
 import { useSearchParams } from "react-router";
 import { isViewer } from "../role";
-import { api, money, type RetirementData } from "../api/client";
+import { api, errText, money, pyround, type RetirementData } from "../api/client";
 import { saveSettings } from "../api/cache";
 import AreaChart from "../components/AreaChart";
 import RetireWizard from "../components/RetireWizard";
+import { parseMoneyDraft } from "../moneymath";
+import { rebaseSsDraft, ssDraftOf } from "../ssDraft";
+import { SS_CLAIM_AGES, ssEstimatesBody } from "../ssEstimates";
 
-function Fld({ name, label, value, step = "1", w = "6rem", ph, onChange }: {
+// /api/retirement takes the dollar boxes as whole numbers and refuses
+// "250.50" or "60,000" outright, so they are parsed and rounded before
+// they ride the query — the form, the wizard and a /retirement/setup URL
+// all pass through here. Text that is not an amount rides as typed and
+// the refusal shows beside the form.
+const MONEY_KEYS = ["spend", "employer_mo", "taxable_mo"];
+const whatIfParams = (p: Record<string, string>) =>
+  Object.fromEntries(Object.entries(p).map(([k, v]) => {
+    if (!MONEY_KEYS.includes(k)) return [k, v];
+    const n = parseMoneyDraft(v);
+    return [k, n === null ? v : String(pyround(n))];
+  }));
+
+function Fld({ name, label, value, step = "1", w = "6rem", ph, text, onChange }: {
   name: string; label: string; value: number | string; step?: string; w?: string;
+  // a saved amount: a number box reads "2,400" as empty in some browsers
+  text?: boolean;
   // what an empty field means (the server's default), shown in its place
   ph?: string;
   onChange: (name: string, v: string) => void;
@@ -21,10 +39,70 @@ function Fld({ name, label, value, step = "1", w = "6rem", ph, onChange }: {
     <label style={{ display: "flex", flexDirection: "column", fontSize: 12,
                     color: "var(--mut)", gap: ".15rem" }}>
       {label}
-      <input type="number" name={name} value={value} step={step}
+      <input type={text ? "text" : "number"} name={name} value={value}
+             step={text ? undefined : step}
+             inputMode={text ? "decimal" : undefined}
              placeholder={ph}
              style={{ width: w }} onChange={(e) => onChange(name, e.target.value)} />
     </label>
+  );
+}
+
+// Unlike the what-if form above it, this one is saved: the estimates are the
+// projection's only source of Social Security income.
+function SsEstimates({ saved }: { saved: Record<string, number> | null }) {
+  const qc = useQueryClient();
+  const seeded = ssDraftOf(saved);
+  const [draft, setDraft] = useState(seeded);
+  // the schedule the untouched boxes show; a newer one moves them over
+  const [base, setBase] = useState(seeded);
+  if (JSON.stringify(base) !== JSON.stringify(seeded)) {
+    setBase(seeded);
+    setDraft(rebaseSsDraft(draft, base, seeded));
+  }
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [done, setDone] = useState(false);
+  const save = (e: React.FormEvent) => {
+    e.preventDefault();
+    setDone(false);
+    const b = ssEstimatesBody(draft, parseMoneyDraft);
+    if (!b.ok) { setErr(b.error); return; }
+    setErr(null);
+    setBusy(true);
+    saveSettings(qc, { ss_estimates: b.body })
+      .then(() => {
+        setDone(true);
+        // what went up is now what the boxes were based on: the server's
+        // copy replaces it, and anything typed since stays
+        setBase(draft);
+        qc.invalidateQueries({ queryKey: ["retirement"] });
+      })
+      .catch((x) => setErr(errText(x)))
+      .finally(() => setBusy(false));
+  };
+  return (
+    <form onSubmit={save} noValidate
+          style={{ background: "var(--hover)", borderRadius: "var(--rs)",
+                   padding: ".6rem .8rem", marginTop: ".5rem", fontSize: 13 }}>
+      <div className="sub" style={{ marginBottom: ".4rem" }}>
+        Social Security $/mo by claim age</div>
+      <div style={{ display: "flex", gap: ".7rem", flexWrap: "wrap",
+                    alignItems: "flex-end" }}>
+        {SS_CLAIM_AGES.map((age) => (
+          <Fld key={age} name={`ss_${age}`} label={`at ${age}`}
+               value={draft[age] ?? ""} w="4.5rem" text
+               onChange={(_, v) => {
+                 setDone(false);
+                 setDraft((d) => ({ ...d, [age]: v }));
+               }} />
+        ))}
+        <button className="pri" disabled={busy}>
+          {busy ? "Saving…" : "Save"}</button>
+        {done && <span className="pos">Saved</span>}
+      </div>
+      {err && <div className="note bad" style={{ marginTop: ".5rem" }}>{err}</div>}
+    </form>
   );
 }
 
@@ -48,11 +126,21 @@ export default function Retirement() {
   // the ten assumption fields open from the hero's summary line
   const [adjust, setAdjust] = useState(false);
   const q = useQuery({
-    queryKey: ["retirement", params],
-    queryFn: () => api.retirement(params),
+    queryKey: ["retirement", whatIfParams(params)],
+    queryFn: () => api.retirement(whatIfParams(params)),
     placeholderData: (prev) => prev,
   });
-  const settings = useQuery({ queryKey: ["settings"], queryFn: api.settings });
+  // A failed what-if leaves q.data empty (placeholderData only covers the
+  // pending fetch). Keep the last projection the server did send, so a
+  // refused answer is corrected in the form instead of taking the page.
+  const [lastGood, setLastGood] = useState<RetirementData>();
+  if (q.data && q.data !== lastGood) setLastGood(q.data);
+  // refetched on every visit: the Social Security editor below waits for a
+  // read made since the page opened, and a young cache would never get one
+  const settings = useQuery({ queryKey: ["settings"], queryFn: api.settings,
+                              refetchOnMount: "always" });
+  const [openedAt] = useState(() => Date.now());
+  const ssFresh = settings.dataUpdatedAt >= openedAt;
   const meQ = useQuery({ queryKey: ["me"], queryFn: api.me });
   const viewer = isViewer(meQ);
   const qc = useQueryClient();
@@ -60,21 +148,24 @@ export default function Retirement() {
   const birthRef = useRef("");
   // persist both wizard exits (done AND skipped) — the needsWizard gate
   // below reads this mark, and every exit has to write it
-  const markWizard = (v: "done" | "skipped",
-                      extra: Record<string, unknown> = {}) => {
-    saveSettings(qc, { ret_wizard_steps: { done: v }, ...extra })
-      .then(() => {
+  // A birthdate typed before Skip is saved on its own: the server refuses
+  // a whole body over one bad field, so riding with the mark would let a
+  // refused birthdate drop the mark and reopen the walkthrough every visit.
+  const [birthErr, setBirthErr] = useState<string | null>(null);
+  const markWizard = (v: "done" | "skipped", birthdate = "") => {
+    saveSettings(qc, { ret_wizard_steps: { done: v } }).catch(() => {});
+    if (birthdate)
+      saveSettings(qc, { birthdate })
         // a birthdate saved on the way out changes the model's starting age
-        if (extra.birthdate)
-          qc.invalidateQueries({ queryKey: ["retirement"] });
-      })
-      .catch(() => {});
+        .then(() => qc.invalidateQueries({ queryKey: ["retirement"] }),
+              (e) => setBirthErr(errText(e)));
   };
   const [form, setForm] = useState<Record<string, number | string> | null>(null);
 
   if (q.isPending) return <p className="mut" style={{ marginTop: "2rem" }}>loading…</p>;
-  if (q.isLoadingError) return <div className="note bad">Couldn't load: {String(q.error)}</div>;
-  const r: RetirementData = q.data;
+  const r: RetirementData | undefined = q.data ?? lastGood;
+  if (!r) return <div className="note bad">Couldn't load: {errText(q.error)}</div>;
+  const whatIfErr = q.isError && !q.data ? errText(q.error) : null;
   const inp = r.inputs;
   // First visit with no birthdate and default-looking age → offer wizard.
   // `ret_wizard_steps.done` is the persisted mark /retirement/setup writes on
@@ -127,7 +218,7 @@ export default function Retirement() {
                   // already given — a typed birthdate still lands in
                   // settings
                   const b = birthRef.current.trim();
-                  markWizard("skipped", b ? { birthdate: b } : {});
+                  markWizard("skipped", b);
                   if (forced) { search.delete("wizard"); setSearch(search, { replace: true }); }
                 }}>
           Skip — open the full model
@@ -208,9 +299,10 @@ export default function Retirement() {
           <div className="tile">
             <div className="sub">You have today</div>
             <div className="kpi sm">{money(r.buckets.total)}</div>
-            <div className="sub">→ ~{money(r.grow_to_67)} by 67 at{" "}
-              {(r.real_return * 100).toFixed(1)}%/yr real
-              {!inp.saving_yr && " (saving nothing)"}</div>
+            {r.grow_to_67 != null && (
+              <div className="sub">→ ~{money(r.grow_to_67)} by 67 at{" "}
+                {(r.real_return * 100).toFixed(1)}%/yr real
+                {!inp.saving_yr && " (saving nothing)"}</div>)}
           </div>
           <div className="tile">
             <div className="sub">Crash-proof spend at {r.stress_ref_age}</div>
@@ -228,7 +320,14 @@ export default function Retirement() {
             {inp.ret}% return · {inp.infl}% inflation
             {inp.cash != null ? ` · cash ${inp.cash}%` : ""}
             · to {inp.end} · SS at {inp.ssage}
-            {inp.has_sched ? ` (${money(inp.your_ss)}/mo)` : " (no SSA statement)"}
+            {inp.has_sched ? ` (${money(inp.your_ss)}/mo)`
+              : !viewer ? (
+                <> (<button type="button" className="linklike"
+                            style={{ background: "none", border: "none",
+                                     cursor: "pointer", padding: 0,
+                                     color: "var(--blue)", fontSize: 13 }}
+                            onClick={() => setAdjust(true)}>no SSA statement</button>)</>
+              ) : " (no SSA statement)"}
             {" "}· {inp.stockpct}% stocks ·{" "}
             {inp.saving_yr
               ? `saving ${money(inp.saving_yr)}/yr`
@@ -245,6 +344,14 @@ export default function Retirement() {
                            cursor: "pointer", fontSize: 13 }}
                   onClick={() => setWizard(true)}>re-run wizard</button>
         </div>
+        {birthErr && (
+          <div className="note bad" style={{ marginTop: ".5rem" }}>
+            Birthdate not saved: {birthErr}</div>
+        )}
+        {whatIfErr && (
+          <div className="note bad" style={{ marginTop: ".5rem" }}>
+            Couldn&apos;t recalculate: {whatIfErr}</div>
+        )}
         {adjust && (
           <form onSubmit={recalc} noValidate
                 style={{ background: "var(--hover)", borderRadius: "var(--rs)",
@@ -272,6 +379,19 @@ export default function Retirement() {
                  onChange={set} />
             <button className="pri">Recalculate</button>
           </form>
+        )}
+        {/* a cached copy may be older than another device's save, and saving
+            these boxes replaces the schedule: they wait for a read made since
+            the page opened */}
+        {adjust && !viewer && settings.data && ssFresh && (
+          <SsEstimates saved={settings.data.ss_estimates} />
+        )}
+        {adjust && !viewer && !ssFresh && (
+          <div className="sub" style={{ marginTop: ".5rem" }}>
+            {settings.isError
+              ? "Couldn't load your Social Security estimates — reload to retry."
+              : "Loading your Social Security estimates…"}
+          </div>
         )}
       </div>
 

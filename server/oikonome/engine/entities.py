@@ -131,6 +131,44 @@ def create_entity(conn, *, name: str, structure: str, state: str | None = None,
     return _row(row)
 
 
+# How long an identical create counts as the same request repeated (a
+# double tap, a second tab, a retry after a lost response) rather than a
+# deliberate second business.
+REPEAT_CREATE_WINDOW = "10 minutes"
+
+
+def create_entity_once(conn, **kw) -> dict:
+    """create_entity for a door a person can press twice. An ACTIVE business
+    with the same name (any case) and structure created within
+    REPEAT_CREATE_WINDOW is the same request arriving again, so it is
+    returned (with any field the repeat supplies applied to it) instead of
+    inserting a twin. A household may keep several
+    businesses, so anything else is a new one. Serialized per tenant, so two
+    copies sent at once cannot both miss the other."""
+    name = _name(kw.get("name"))
+    with conn.transaction():
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtext('entity-create'), hashtext("
+            "    coalesce(current_setting('app.tenant_id', true), '')))")
+        row = conn.execute(
+            """SELECT * FROM business_entity
+                WHERE status = 'active' AND lower(name) = lower(%s)
+                  AND structure = %s
+                  AND created_at > now() - %s::interval
+                ORDER BY created_at LIMIT 1""",
+            (name, kw.get("structure"), REPEAT_CREATE_WINDOW)).fetchone()
+        if row is not None:
+            # A retry after a lost answer may carry a corrected date or EIN:
+            # the latest answer is the one the person meant, so it is applied
+            # to the row just made rather than dropped without a word.
+            fields = {k: v for k, v in kw.items()
+                      if k not in ("name", "structure") and v is not None}
+            if fields:
+                return update_entity(conn, str(row["id"]), **fields) or _row(row)
+            return _row(row)
+        return create_entity(conn, **kw)
+
+
 def list_entities(conn, *, include_archived: bool = True) -> list[dict]:
     q = "SELECT * FROM business_entity"
     if not include_archived:
@@ -461,10 +499,15 @@ def live_txn_id(conn, txn_id: str) -> str | None:
         return None
     if not row["removed"]:
         return row["id"]
+    # which posted row a hold became is engine.live_txn's one rule
+    from .live_txn import successors
+    nxt = successors(conn, [txn_id]).get(txn_id)
+    if nxt is None:
+        return None
+    # under the pairing lock nothing retires it before this row lock
     nxt = conn.execute(
-        "SELECT id FROM transactions WHERE pending_transaction_id = %s "
-        "AND removed = 0 ORDER BY id LIMIT 1 FOR UPDATE",
-        (txn_id,)).fetchone()
+        "SELECT id FROM transactions WHERE id = %s AND removed = 0"
+        " FOR UPDATE", (nxt,)).fetchone()
     return nxt["id"] if nxt else None
 
 

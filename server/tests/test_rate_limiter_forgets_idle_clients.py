@@ -217,7 +217,7 @@ class SecurityBucketsAreTheLastToBeForgotten(unittest.TestCase):
         self.assertEqual(
             security._PROTECTED_NS,
             frozenset({"login-fail", "stepup-fail", "strike", "banhist",
-                       "risk-ip", "risk-acct", "risk-site"}))
+                       "risk-ip", "risk-acct", "risk-site", "otp-verify"}))
 
 
 if __name__ == "__main__":

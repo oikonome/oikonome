@@ -74,7 +74,8 @@ import re
 
 from ..engine.compat import as_date
 from . import flowmap, reimport
-from .base import (FileImportIds, Transaction, mask_long_digits,
+from .base import (FileImportIds, Transaction, mask_account_name,
+                   mask_long_digits,
                    drop_before_history, upsert_transactions)
 from .dedup import WINDOW_DAYS as DEDUP_WINDOW_DAYS  # noqa: F401 (re-export)
 from .dedup import Deduper
@@ -239,8 +240,8 @@ def _column_hints(lines: list[str]) -> list[str | None]:
 # ledger content survives untouched. The description cut from the line
 # (the row's name) gets the same cut; the rule itself lives beside the
 # upsert, which applies it to every file importer's names.
-def _mask_long_digits(line: str) -> str:
-    return mask_long_digits(line or "")
+def _mask_line(line: str) -> str:
+    return mask_account_name(line or "")
 
 
 _MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
@@ -1119,7 +1120,8 @@ def _adopt_earlier_ids(conn, account_id: str, txns: list[Transaction],
     have = reimport.stored(conn, account_id, probe)
 
     def same(r, t):
-        return r is not None and r["line"] == t.raw.get("line")
+        # the stored line may predate a form the new line is now cut for
+        return r is not None and _mask_line(r["line"]) == t.raw.get("line")
 
     def standing(cands, t):
         return next((c for c, amt in cands
@@ -1151,9 +1153,10 @@ def _adopt_earlier_ids(conn, account_id: str, txns: list[Transaction],
                 claimed.add(k)
                 primary, detailed = flowmap.flow_category(
                     t.raw.get("flow"), -t.amount)
+                # under the id the row is held by: a keyed row's own
                 out[i] = dataclasses.replace(
-                    t, id=k, amount=-t.amount, category_primary=primary,
-                    category_detailed=detailed)
+                    t, id=have[k]["held_id"], amount=-t.amount,
+                    category_primary=primary, category_detailed=detailed)
                 continue
         for c in [st[i] for st in olds] + [standing(flipped_of[i], t)]:
             if c is None or c == t.id or c in claimed or c in taken:
@@ -1243,7 +1246,7 @@ def _retire_absorbed(conn, account_id: str, txns: list[Transaction],
     absorbed = []
     for i in gone:
         r = scanned[i][0]
-        line = _mask_long_digits(r["line"])
+        line = _mask_line(r["line"])
         then = {}
         for c, _, pd in redated_of[i]:
             then.setdefault(c, pd)
@@ -1253,7 +1256,7 @@ def _retire_absorbed(conn, account_id: str, txns: list[Transaction],
         cands = list(dict.fromkeys(cands))
 
         def accept(row, line=line, then=then):
-            if row["line"] != line:
+            if _mask_line(row["line"]) != line:
                 return False
             pd = then.get(row["id"])
             if pd is None:
@@ -1330,7 +1333,7 @@ def import_pdf(conn, account_id: str, data: bytes, *,
             id=tid, account_id=account_id, date=r["date"],
             amount=r["amount"], name=name,
             category_primary=primary, category_detailed=detailed,
-            raw={"line": _mask_long_digits(r["line"]),
+            raw={"line": _mask_line(r["line"]),
                  "flow": r["flow"]}))
     txns = ids.resolve(conn, txns)
 

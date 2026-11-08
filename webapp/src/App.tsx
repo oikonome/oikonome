@@ -21,6 +21,7 @@ function applyTheme(t: Theme) {
   document.querySelector('meta[name="theme-color"]')
     ?.setAttribute("content", light ? "#f2f5f7" : "#0f141a");
 }
+import ErrorBoundary from "./components/ErrorBoundary";
 import TwoFactorGate from "./components/TwoFactorGate";
 import { LogosProvider } from "./components/MerchantAvatar";
 import { ext } from "./ext";
@@ -992,9 +993,11 @@ export default function App() {
       )}
       <RouteTitle demo={!!me.data.demo} />
       <main>
-        <AppRoutes me={me.data} homeWeb={settingsQ.data?.home_web}
-                   homeKnown={settingsQ.isSuccess || settingsQ.isError}
-                   homeOk={settingsQ.isSuccess} />
+        <ErrorBoundary resetKey={loc.pathname}>
+          <AppRoutes me={me.data} homeWeb={settingsQ.data?.home_web}
+                     homeKnown={settingsQ.isSuccess || settingsQ.isError}
+                     homeOk={settingsQ.isSuccess} />
+        </ErrorBoundary>
         <footer className="mut" style={{ textAlign: "center", fontSize: 12,
                  padding: "1.2rem 0 .8rem", opacity: .7 }}>
           {/* the version opens the release notes on GitHub — the releases
@@ -1201,7 +1204,8 @@ function AlertsBell() {
 function AssistantTab() {
   const asstAvail = useQuery({ queryKey: ["assistant-status"],
                               queryFn: assistantApi.status, retry: false });
-  if (!asstAvail.data?.available) return null;
+  // a failed status read is not "none configured": keep the tab
+  if (!(asstAvail.isError || asstAvail.data?.available)) return null;
   return (
     <NavLink to="/assistant" className={tab}><span className="nav-i">{ICON["/assistant"]}</span><span className="nav-t">Assistant</span></NavLink>
   );

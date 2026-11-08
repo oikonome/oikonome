@@ -13,20 +13,35 @@ import { Card, H, KV } from "../components/ui";
 import { useRefetchWhenShown } from "../lib/focus";
 import { useSession } from "../lib/session";
 import { VERDICT } from "../lib/verdict";
+import type { YearLensData } from "../lib/api";
 import { C, money } from "../lib/theme";
-import { catLabel, isPlanSavingsGoal, routeInt } from "../lib/pure";
+import { catLabel, householdDay, isPlanSavingsGoal, routeInt } from "../lib/pure";
+import { useMe } from "../lib/viewer";
 import { ESTIMATED_SAVINGS_CAPTION, labelSavingsRow, yearSavings }
   from "../lib/planner";
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
+// The prior year's column label: "2025" when both years are whole, and
+// "2025 (to Jun 30)" while the lens year is in progress — the server sets
+// it against that same span of the year before
+function priorYearLabel(d: YearLensData): string {
+  const [, m, day] = (d.prev_through ?? "").split("-").map(Number);
+  return m ? `${d.y - 1} (to ${MONTHS[m - 1]} ${day})` : `${d.y - 1}`;
+}
+
+/** The plan savings goal as the lens payload carries it. */
+type LensGoal = { monthly_plan: number; rate_90d: number | null } | null;
 const TODAY_KEY = ["today"];
 
 export default function YearLens() {
   const { client } = useSession();
   const router = useRouter();
-  const now = new Date();
+  // the household's day, not the device's: near midnight across zones
+  // the device would open the wrong month or year
+  const me = useMe();
+  const now = householdDay(new Date(), me.data?.timezone);
   // ?y= deep link (notifications, the month lens's year label)
   const p = useLocalSearchParams<{ y?: string }>();
   const [y, setY] = useState(
@@ -38,13 +53,21 @@ export default function YearLens() {
     // ‹ › keeps the last year on screen (dimmed) while the next loads
     placeholderData: (prev) => prev,
   });
+  // the savings goal for the money map's row: the lens payload names it
+  // (savings_goal; null = none). Only an older server's payload, which
+  // lacks the key, sends the screen to the whole Today payload for it.
+  const lensGoal = (query.data as { savings_goal?: LensGoal } | undefined)
+    ?.savings_goal;
+  const needToday = query.isSuccess && lensGoal === undefined;
   const today = useQuery({ queryKey: ["today"],
-    queryFn: () => client!.todayFull(), enabled: !!client });
+    queryFn: () => client!.todayFull(), enabled: !!client && needToday });
   // a write on a screen pushed over this one defers its ["today"]
-  // refetch to whoever shows it — this screen does, on the way back
-  useRefetchWhenShown(today, TODAY_KEY);
-  const goal = (today.data?.savings_goals ?? [])
-    .find((g) => isPlanSavingsGoal(g.name));
+  // refetch to whoever shows it — this screen does, on the way back, but
+  // only while it reads the goal from Today at all
+  useRefetchWhenShown({ isStale: today.isStale, isFetching: today.isFetching,
+    refetch: () => (needToday ? today.refetch() : undefined) }, TODAY_KEY);
+  const goal = lensGoal !== undefined ? lensGoal
+    : (today.data?.savings_goals ?? []).find((g) => isPlanSavingsGoal(g.name));
   const d = query.data;
   const atNow = y === now.getFullYear();
   const floor = d?.first_year ?? 1990;
@@ -192,7 +215,7 @@ export default function YearLens() {
           </Card>
           {d.categories.length > 0 ? (
             <Card>
-              <H>Spending by category — {y} vs {y - 1}</H>
+              <H>Spending by category — {y} vs {priorYearLabel(d)}</H>
               {d.categories.map(([name, cur, prev, key]) => (
                 <KV key={name} k={catLabel(name)}
                     // the stored key, not the display name the row
@@ -202,7 +225,7 @@ export default function YearLens() {
                       params: { cat: key, date_from: `${y}-01-01`,
                                 date_to: `${y}-12-31`, counted: "1" } } as never)
                       : undefined}
-                    v={`${money(cur, false)}  ·  ${y - 1} ${
+                    v={`${money(cur, false)}  ·  ${priorYearLabel(d)} ${
                         money(prev, false)}  ·  ${
                         cur - prev >= 0 ? "+" : "−"}${
                         money(Math.abs(cur - prev), false)}`}
@@ -210,7 +233,7 @@ export default function YearLens() {
               ))}
               {d.prev_totals.spend > 0 && (
                 <KV k="Total spend"
-                    v={`${money(d.totals.spend, false)}  ·  ${y - 1} ${
+                    v={`${money(d.totals.spend, false)}  ·  ${priorYearLabel(d)} ${
                         money(d.prev_totals.spend, false)}  ·  ${
                         d.totals.spend - d.prev_totals.spend >= 0
                           ? "+" : "−"}${money(Math.abs(

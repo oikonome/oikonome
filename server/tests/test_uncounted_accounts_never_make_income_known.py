@@ -40,8 +40,10 @@ def _seed(conn, *, how: str) -> None:
     for m in range(1, 10):
         add_txn(conn, dt.date(2026, m, 12), 900.0, "CORNER GROCER",
                 primary="FOOD_AND_DRINK")
+    # the live checking is imported from June 1: a feed opening later in
+    # June would leave June itself unknown
     for m in range(6, 10):
-        add_txn(conn, dt.date(2026, m, 10), -4000.0, "PAYROLL",
+        add_txn(conn, dt.date(2026, m, 1), -4000.0, "PAYROLL",
                 primary="INCOME", detailed="INCOME_WAGES", account="chk")
     if how == "hidden":
         conn.execute("UPDATE accounts SET user_removed_at = now() "

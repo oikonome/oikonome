@@ -8,7 +8,9 @@
 // adoptsDeviceZone, the reimbursement matcher's reimbCandidateWhy,
 // pairGapHint and reimbLeft, receiptDetailsDraft, and the whole-value
 // save rebase (rebaseFields, rebaseKeyed, rebaseNamedList, rebaseNamedSave,
-// assetListLanded) and the planner's historyBasisNote).
+// assetListLanded), the planner's historyBasisNote, and rowSpend — the
+// per-row spending share both Today totals and the ledger's day subtotals
+// sum).
 
 // The awaiting-reimbursement rows the owed-back case runs, exported so the
 // server suite can seed the same rows and check the server's own figure
@@ -39,8 +41,28 @@ export function moneyCases(impl, assert) {
           spendPickerGroups, localYmd, adoptsDeviceZone, reimbCandidateWhy,
           pairGapHint, reimbLeft, receiptDetailsDraft, rebaseFields,
           rebaseKeyed, rebaseNamedList, rebaseNamedSave, assetListLanded,
-          historyBasisNote } = impl;
+          historyBasisNote, rowSpend } = impl;
   return {
+    "a row's spending is the verdict's netted share, a transfer's is 0": () => {
+      // a $100 charge with $60 already reimbursed: the server's
+      // spend_amount (40) wins over the gross amount
+      assert.equal(rowSpend({ amount: 100, category: "FOOD_AND_DRINK",
+                              counts_as_spend: true, spend_amount: 40 }), 40);
+      // a transfer the verdict does not count: 0, whatever its size
+      assert.equal(rowSpend({ amount: 250, category: "TRANSFER_OUT",
+                              counts_as_spend: false, spend_amount: 0 }), 0);
+      // an older server without spend_amount: the flag, with the gross
+      // amount, then the category rule
+      assert.equal(rowSpend({ amount: 100, category: "FOOD_AND_DRINK",
+                              counts_as_spend: true }), 100);
+      assert.equal(rowSpend({ amount: 250, category: "TRANSFER_OUT",
+                              counts_as_spend: false }), 0);
+      assert.equal(rowSpend({ amount: 250, category: "TRANSFER_OUT" }), 0);
+      assert.equal(rowSpend({ amount: 12, category: "GENERAL_MERCHANDISE" }),
+                   12);
+      // a deposit with neither field spends nothing
+      assert.equal(rowSpend({ amount: -30, category: "INCOME" }), 0);
+    },
     "the planner says how many days a scaled suggestion stands on": () => {
       assert.equal(historyBasisNote({ history_days: 12, history_scaled: true,
                                       min_rate_days: 7 }),

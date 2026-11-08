@@ -56,10 +56,14 @@ def _col(n: int) -> str:
 
 
 def _clean(text: str) -> str:
-    # XML 1.0 forbids most control characters outright; a bank feed has
-    # been known to carry one, and a reader refuses the whole workbook
+    # Keep only what XML 1.0 allows as a character: most control
+    # characters, lone surrogates and the noncharacters U+FFFE/U+FFFF are
+    # forbidden outright. Text from outside the household (a bank feed, a
+    # seller's item title) has been known to carry one, and a reader
+    # refuses the whole workbook over a single bad cell.
     return "".join(ch for ch in text
-                   if ch in "\t\n\r" or ord(ch) >= 32)
+                   if ch in "\t\n\r" or 0x20 <= ord(ch) <= 0xD7FF
+                   or 0xE000 <= ord(ch) <= 0xFFFD or ord(ch) >= 0x10000)
 
 
 def _cell(ref: str, v) -> str:

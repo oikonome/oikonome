@@ -273,15 +273,19 @@ class SimplefinFirstPullWindowTests(unittest.TestCase):
 
     def test_a_bank_added_later_reaches_no_further_than_the_window(self):
         # a one-month window is no deeper than the routine pull that found
-        # the bank, so there is nothing more to fetch
+        # the bank, so there is nothing more to fetch — except after the
+        # 30th of a 31-day month, when "one month ago" is a day deeper than
+        # 30 days and the new bank is owed that one day
         from .test_simplefin_first_pull_depth import ORG_B
         _choose(self.conn, 1)
         self._sync(simplefin.FIRST_PULL_DAYS)
         self.bridge.orgs.append(ORG_B)
         self.bridge.requests.clear()
         self._sync(30)
+        routine = dt.date.today() - dt.timedelta(days=30)
+        cutoff = base.history_cutoff(self.conn)
         self.assertEqual(self.bridge.requests,
-                         [dt.date.today() - dt.timedelta(days=30)])
+                         [routine] + ([cutoff] if cutoff < routine else []))
 
     def test_a_window_wider_than_the_first_pull_does_not_deepen_it(self):
         from .test_simplefin_first_pull_depth import ORG_B

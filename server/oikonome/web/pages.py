@@ -83,11 +83,16 @@ def _connections(conn):
     # reconnect" state on the Accounts page. User-initiated disconnects
     # (archived, no reason) stay hidden.
     rows = conn.execute(
-        """SELECT i.id, i.aggregator, i.institution_name,
+        """SELECT i.id, i.aggregator, i.institution_name, i.archived_reason,
                   CASE WHEN COALESCE(i.status,'') = 'archived' THEN 'reaped'
                        ELSE COALESCE(NULLIF(i.status, 'ok'),
                                      i.webhook_status, 'ok') END AS status,
-                  MAX(s.ran_at) FILTER (WHERE s.error IS NULL) AS last_ok,
+                  -- newest successful pull, one descent of the per-item
+                  -- index (the log keeps years of rows, so a join over it
+                  -- grew with every sync this household ever ran)
+                  (SELECT s.ran_at FROM sync_log s
+                    WHERE s.item_id = i.id AND s.error IS NULL
+                    ORDER BY s.ran_at DESC LIMIT 1) AS last_ok,
                   -- two different clocks, and only one of them was ever
                   -- shown: last_ok is when WE last read Plaid's copy,
                   -- bank_updated_at is when the BANK last refreshed that
@@ -113,7 +118,7 @@ def _connections(conn):
                   (SELECT COUNT(*) FROM accounts a
                    WHERE a.item_id = i.id
                      AND a.user_removed_at IS NULL) AS accounts
-           FROM items i LEFT JOIN sync_log s ON s.item_id = i.id
+           FROM items i
            -- simplefin-org = the per-institution child items that actually
            -- OWN the accounts (the 'simplefin' bridge holds only the token,
            -- no accounts). Without these the SPA couldn't match an account
@@ -121,9 +126,6 @@ def _connections(conn):
            WHERE i.aggregator IN ('plaid','simplefin','simplefin-org','mx')
              AND (COALESCE(i.status,'') != 'archived'
                   OR i.archived_reason IN ('auto-reap','plaid-gone','sub-ended'))
-           GROUP BY i.id, i.aggregator, i.institution_name, i.status,
-                    i.webhook_status, i.archived_reason,
-                    i.bank_updated_at, i.bank_failed_at, i.raw
            ORDER BY i.institution_name, i.id""").fetchall()
     # What the status MEANS, decided once here rather than by each client
     # re-deriving it from a raw Plaid code. Treating every non-'ok' status
@@ -235,9 +237,13 @@ def add_account(user: dict = Depends(_user()), name: str = Form(...),
     Starting balance defaults to 0 — a NULL balance would file the brand-
     new account under 'archived/closed' and make the cash runway scream
     'out of money' on day one."""
-    import re
+    from .api import _merchant_name_or_400
+    from .bulk_import import create_manual_account
+    # the JSON door's rule: a bounded name, its full card number cut to the
+    # last four in the stored name; the id is opaque, never the name
+    name = name.strip()
+    _merchant_name_or_400("name", name)
     typ, _, sub = kind.partition("/")
-    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "account"
     import math
     from .api import _MONEY_MAX, _typed_money
     try:
@@ -249,16 +255,9 @@ def add_account(user: dict = Depends(_user()), name: str = Form(...),
         bal = 0.0
     conn = tenancy.tenant_connect(user["tenant_id"])
     try:
-        conn.execute(
-            """INSERT INTO items (id, aggregator, institution_name, access_token)
-               VALUES ('manual','manual','Manual',NULL)
-               ON CONFLICT (tenant_id, id) DO NOTHING""")
-        conn.execute(
-            """INSERT INTO accounts (id, item_id, name, type, subtype,
-                                     balance_current, updated_at)
-               VALUES (%s,'manual',%s,%s,%s,%s,now())
-               ON CONFLICT (tenant_id, id) DO NOTHING""",
-            (f"manual:{slug}", name.strip(), typ, sub or None, bal))
+        # a second account of the same name is a second account, as the
+        # JSON door makes it: the id is minted under the account lock
+        create_manual_account(conn, name, typ, sub or None, bal)
     finally:
         conn.close()
     return RedirectResponse("/accounts", status_code=303)
@@ -563,6 +562,7 @@ def export_dump(user: dict = Depends(_user()), t: str = ""):
 # mirroring test_tenant_table_coverage's doctrine.
 EXPORT_SKIP = {
     "tenant_keys",       # envelope key material — secret, never travels
+    "txn_id_keys",       # the secret file-row ids are keyed under — never travels
     "import_staging",    # import scratch
     # a folder import's frozen plan and the files it has not reached yet:
     # import scratch and job bookkeeping, never the household's data
@@ -1242,7 +1242,8 @@ def _start_plaid_session(user: dict, item_id: str = "",
     for k in dropped:
         plaid_links.forget(k, tid)
     plaid_links.record(tid, lt, kind, item_id or None,
-                       bool(item_id and manage_accounts), inst)
+                       bool(item_id and manage_accounts), inst,
+                       days_requested=created.get("days_requested"))
     return {"link_token": lt, "hosted_link_url": url,
             "kind": kind, "institution": inst}
 
@@ -1367,44 +1368,6 @@ def plaid_link_page(link_token: str, user: dict = Depends(_user())):
     return _tpl("link.html", title="Link account", link_token=link_token, centered=False,
                 url=sess["url"], kind=sess["kind"],
                 institution=sess["institution"])
-
-
-def _apply_account_selection(conn, client, token, item_id: str) -> None:
-    """After a shared-accounts (account-selection) update completes, hide
-    the item's LIVE accounts that Plaid no longer returns: the user just
-    deselected them, so Plaid stops serving (and billing) them, and their
-    local rows would otherwise linger looking connected with a
-    forever-stale balance.
-
-    Live-served only — balance_current IS NOT NULL — because legacy
-    history imports ride under the same item with hand-shaped ids and a
-    NULL balance, and hiding those would pull years of closed-account
-    history out of net worth and cash flow.
-
-    Hide-only, never unhide: an account re-selected later stays hidden
-    until the user unhides it on the Accounts page, because this cannot
-    tell a row IT hid apart from one the user hid on purpose for display.
-    Sync already refuses hidden accounts' rows, so this also stops the
-    data at our door. Best-effort: a Plaid hiccup here leaves rows
-    visible-but-stale, which the next completed session cleans up."""
-    try:
-        returned = {a["account_id"] for a in client.post(
-            "/accounts/get", {"access_token": token})["accounts"]}
-    except Exception:                            # noqa: BLE001
-        return
-    if not returned:
-        return
-    n = conn.execute(
-        "UPDATE accounts SET user_removed_at=now(), balance_current=NULL, "
-        "balance_available=NULL "
-        "WHERE item_id=%s AND user_removed_at IS NULL "
-        "AND balance_current IS NOT NULL AND NOT (id = ANY(%s))",
-        (item_id, list(returned))).rowcount
-    if n:
-        # a hidden member of a linked group must stop serving it — the
-        # ambient shadow set follows the change within this request
-        from ..engine import links as _links
-        _links.set_shadow_scope(conn)
 
 
 @router.get("/accounts/plaid/links/open")
@@ -1576,7 +1539,7 @@ def plaid_link_status(link_token: str, user: dict = Depends(_user()),
                 # webhook_status too (not just status) — otherwise the reaper,
                 # which falls back to webhook_status when status='ok', could
                 # reap this just-repaired Item before the next clean sync
-                # clears the flag (both fire at 04:00 UTC).
+                # clears the flag (both run in the nightly).
                 # ...but never an item a disconnect archived while this
                 # session was open — the same guard every other status
                 # writer carries, or a re-auth finishing late silently
@@ -1597,10 +1560,10 @@ def plaid_link_status(link_token: str, user: dict = Depends(_user()),
                 if not revived:
                     item_err = {"error_code": "archived"}
                 if sess.get("manage_accounts") and item_err is None:
-                    _apply_account_selection(conn, client,
-                                             sync_base.get_access_token(
-                                                 conn, sess["item_id"]),
-                                             sess["item_id"])
+                    plaid_links.apply_account_selection(
+                        conn, client,
+                        sync_base.get_access_token(conn, sess["item_id"]),
+                        sess["item_id"])
                 return plaid_links.mark_done(
                     sess, link_token,
                     {"done": True, "kind": "update",
@@ -1988,12 +1951,14 @@ def transactions_recategorize(user: dict = Depends(_user()),
     return RedirectResponse(dest, status_code=303)
 
 
-def _cadence_label(frequency: str | None, interval) -> str:
-    """A bill cadence in words ("monthly", "every 14 days"). One phrasing
-    for the bills API, the proposal emails, the continuity packet and the
-    activity log, so a bill never reads two ways in two places."""
+def _cadence_label(frequency: str | None, interval,
+                   by_month_day: list[int] | None = None) -> str:
+    """A bill cadence in words ("monthly", "every 14 days", "twice a month
+    (15th and last day)"). One phrasing for the bills API, the proposal
+    emails, the continuity packet and the activity log, so a bill never
+    reads two ways in two places."""
     from ..engine.activity import _cadence_words
-    return _cadence_words(frequency, interval)
+    return _cadence_words(frequency, interval, by_month_day)
 
 
 def _proposal_summary(p) -> str:
@@ -2028,13 +1993,19 @@ def bills_page(user: dict = Depends(_user()), msg: str = ""):
     return RedirectResponse("/app/bills" + (f"?msg={quote(msg)}" if msg else ""), status_code=303)
 
 
-@router.post("/bills/detect")
+@router.post("/bills/detect",
+             dependencies=[Depends(limit("bills_detect", 6, 600))])
 def bills_detect(user: dict = Depends(_user())):
+    # the whole-ledger pass: rate-limited and one at a time per household
+    # (the demo keeps its "Find bills" button; the limit and the single
+    # flight are what keep the pool)
     conn = tenancy.tenant_connect(user["tenant_id"])
     try:
-        stats = bills.run(conn)
+        stats = bills.run_single_flight(conn)
     finally:
         conn.close()
+    if stats is None:
+        raise HTTPException(409, "bill detection is already running")
     n_inc = stats.get("proposed_income", 0)
     n_add = stats["proposed_add"]
     found = (f"{n_inc} income + {n_add - n_inc} bills"
@@ -2105,6 +2076,35 @@ def _stash_csv(conn, account_id: str, amount_sign: str, filename: str,
                        meta={"account_id": account_id,
                              "amount_sign": amount_sign,
                              "header": header})
+
+
+def remember_when_landed(conn, need: dict | None, names) -> None:
+    """Note on a parked upload the names an account picked for it is to be
+    remembered under (the new-account name typed, the file's own), so the
+    finish that lands its rows remembers the pick (_remember_landed) as
+    the upload door does for a file that lands at once. A file still to
+    be mapped or placed settles nothing until it lands."""
+    token = (need or {}).get("token")
+    names = sorted({str(n or "").strip() for n in names} - {""})
+    if not isinstance(token, str) or not token or not names:
+        return
+    from ..engine.compat import jsonb
+    conn.execute("UPDATE import_staging SET meta = COALESCE(meta, "
+                 "'{}'::jsonb) || %s WHERE token = %s AND idx = 0",
+                 (jsonb({"remember_as": names}), token))
+
+
+def _remember_landed(conn, meta: dict, account_id: str | None) -> None:
+    """Remember the account picked for a parked upload, now its rows have
+    landed there, under the names its door noted (remember_when_landed).
+    A stage parked before those were noted remembers nothing."""
+    names = (meta or {}).get("remember_as")
+    if not account_id or not isinstance(names, list):
+        return
+    from .bulk_import import remember_choice
+    for typed in names:
+        if isinstance(typed, str) and typed.strip():
+            remember_choice(conn, typed, account_id)
 
 
 def _auto_map(header: list[str]) -> dict | None:
@@ -2224,14 +2224,20 @@ def restore_result(counts: dict) -> dict:
     `already_present` summed into `rows`, so re-restoring an archive that
     inserted nothing announces tens of thousands of rows; and the notes the
     config check returns (a dropped AI backend, a rerouted role) having
-    nowhere to surface, leaving the person to discover the loss later."""
+    nowhere to surface, leaving the person to discover the loss later.
+
+    Only the per-table counts are rows written. Every refusal (a row left
+    out, and why) is named beside them, never added in; a repair is part
+    of its table's written count and is told by the notes."""
+    from ..sync import restore
     notes = counts.get("_notes") or []
-    present = counts.get("already_present", 0)
-    inserted = {k: v for k, v in counts.items()
-                if k not in ("_notes", "already_present")}
+    refusals = [restore._RESULT_KEY.get(r, r) for r in restore.REFUSALS]
+    outcomes = {"_notes", *refusals,
+                *(restore._RESULT_KEY.get(r, r) for r in restore.REPAIRS)}
+    inserted = {k: v for k, v in counts.items() if k not in outcomes}
     parts = [f"{v} {k}" for k, v in inserted.items()]
-    if present:
-        parts.append(f"{present} already present")
+    parts += [f"{counts[k]} {k.replace('_', ' ')}"
+              for k in refusals if counts.get(k)]
     return {"imported": counts.get("transactions", 0),
             "rows": sum(inserted.values()),
             "warnings": list(notes) or None,
@@ -2575,20 +2581,42 @@ def _run_mapped_import_unlocked(conn, token: str, cols: dict) -> dict:
         # has no rows in that direction", not as a missing mapping
         mapping["debit"] = cols.get("debit_col") or None
         mapping["credit"] = cols.get("credit_col") or None
+    # the CSV conventions only — card/statement are PDF conventions and
+    # the drop zone refuses them for a CSV before any stash
+    sign = meta.get("amount_sign") \
+        if meta.get("amount_sign") in ("bank", "plaid", "investment") \
+        else "bank"
     bid = None
-    try:
-        bid = batches.create(conn, "csv", meta.get("account_id"),
-                             filename)
-        result = csvimport.import_csv(
-            conn, meta.get("account_id"), text, mapping,
-            # the CSV conventions only — card/statement are PDF conventions
-            # and the drop zone refuses them for a CSV before any stash
-            amount_sign=meta.get("amount_sign")
-            if meta.get("amount_sign") in ("bank", "plaid", "investment")
-            else "bank",
-            batch_id=bid)
+
+    def run(aid):
+        nonlocal bid
+        bid = batches.create(conn, "csv", aid, filename)
+        result = csvimport.import_csv(conn, aid, text, mapping,
+                                      amount_sign=sign, batch_id=bid)
         batches.finish(conn, bid, result["imported"])
-        return result
+        return result, None
+    try:
+        typed = str(meta.get("new_account_name") or "").strip()
+        if meta.get("account_id") or not typed:
+            result = run(meta.get("account_id"))[0]
+            _remember_landed(conn, meta, meta.get("account_id"))
+            return result
+        # parked under the new-account name the upload typed: the account
+        # is decided now, from the mapped rows (bulk_import.import_named),
+        # so a card an earlier account already holds lands there. One
+        # transaction, so a refusal below takes the new account back too;
+        # the ledger locks first, as the upload door takes them
+        from .bulk_import import (AccountChoiceNeeded,
+                                  hold_ledger_write_locks, import_named)
+        try:
+            with conn.transaction():
+                hold_ledger_write_locks(conn)
+                return import_named(conn, typed, sign, run)[1][0]
+        except AccountChoiceNeeded as e:
+            # the name now leads to two cards sharing a last four: only
+            # the upload can ask which, so the file goes back to it
+            return {"error": f"{e} (upload it again to choose)",
+                    "expired": True}
     except ValueError as e:                   # deliberate importer guidance
         # A mapping the file does not support: an unrecognized date, an
         # amount column of prose, more rows than the cap. import_csv parses
@@ -2629,11 +2657,13 @@ def run_ynab_import(conn, token: str, accounts, remove_earlier) -> dict:
 
 
 def _ynab_answers(conn, names: list[str], accounts, remove_earlier
-                  ) -> tuple[dict, str | None]:
+                  ) -> tuple[dict, str | dict | None]:
     """The person's answer for each YNAB account, checked: (answers,
-    refusal). An answer is an existing visible account id, "skip", or
-    {"new": "<name>"}. Every account must be answered, and something must
-    be imported."""
+    refusal). An answer is an existing visible account id, "skip",
+    {"new": "<name>"}, or {"id": "<account id>", "typed": "<name>"} — an
+    account picked from those a typed new-account name could mean, with
+    that name, so the pick is remembered under what the person typed.
+    Every account must be answered, and something must be imported."""
     if not isinstance(accounts, dict):
         return {}, "accounts must map each YNAB account to a destination"
     if remove_earlier is not None and not isinstance(remove_earlier, dict):
@@ -2652,14 +2682,29 @@ def _ynab_answers(conn, names: list[str], accounts, remove_earlier
                 and a["new"].strip():
             answers[n] = ("new", a["new"].strip()[:120])
         elif isinstance(a, str) and a:
-            answers[n] = ("id", a)
+            answers[n] = ("id", a, "")
             ids.add(a)
+        elif isinstance(a, dict) and isinstance(a.get("id"), str) \
+                and a["id"] and isinstance(a.get("typed", ""), str):
+            answers[n] = ("id", a["id"], a.get("typed", "").strip()[:120])
+            ids.add(a["id"])
         else:
             return {}, (f"choose where “{ynabimport.label(n)}” goes: an "
                         f"account, a new account, or skip")
     if all(v[0] == "skip" for v in answers.values()):
         return {}, ("every YNAB account is skipped — choose where at least "
                     "one goes")
+    # a new-account name two moved cards share is refused here, before the
+    # upload is consumed: the card keeps its token and the person picks
+    # one of the existing accounts it lists
+    from .bulk_import import _choice_message, account_choices, stored_name
+    for n, v in answers.items():
+        if v[0] == "new" and (choices := account_choices(conn, v[1])):
+            # the choices go with it, each described: the two cards can
+            # read the same, and the account picked is remembered
+            return {}, {"error": _choice_message(stored_name(v[1]),
+                                                 len(choices)),
+                        "choices": choices, "choice_for": n}
     if ids:
         # a hidden account is not a destination: upsert_transactions
         # refuses its rows, and the import would land nothing
@@ -2703,20 +2748,22 @@ def _run_ynab_import_unlocked(conn, token: str, accounts,
         return {"error": str(e)}
     answers, refusal = _ynab_answers(conn, names, accounts, remove_earlier)
     if refusal:
-        return {"error": refusal}
+        return refusal if isinstance(refusal, dict) else {"error": refusal}
     stash = staging.pop(conn, "ynab", token)       # destroy the upload
     if stash is None:                              # spent between the two
         return {"error": "upload expired — please upload the file again",
                 "expired": True}
-    from .bulk_import import _ensure_account
+    from .bulk_import import _ensure_account, remember_choice
     bid = None
     try:
         dest: dict[str, str | None] = {}
         for n, v in answers.items():
             if v[0] == "new":
                 dest[n] = _ensure_account(conn, v[1], "bank")
+            elif v[0] == "id":
+                dest[n] = v[1]
             else:
-                dest[n] = v[1] if v[0] == "id" else None
+                dest[n] = None
         places = {d for d in dest.values() if d}
         bid = batches.create(conn, "ynab",
                              next(iter(places)) if len(places) == 1
@@ -2726,6 +2773,19 @@ def _run_ynab_import_unlocked(conn, token: str, accounts,
             remove_earlier={n: (remove_earlier or {}).get(n) is True
                             for n in names})
         batches.finish(conn, bid, result["imported"])
+        # an account picked for a name two cards share is remembered once
+        # the register has landed, so the next file is not asked again:
+        # under the name the person typed, and under the YNAB account's
+        # own (the new-account name the card offers, which the next
+        # register spells). remember_choice records only a name that does
+        # lead to the pick, so the second is a no-op when it does not.
+        for n, v in answers.items():
+            if v[0] == "id":
+                for typed in {v[2], n} - {""}:
+                    remember_choice(conn, typed, v[1])
+        # and the account picked at the upload, when rows landed on it
+        if pick in places:
+            _remember_landed(conn, meta, pick)
         result["source"] = "YNAB register detected"
         return result
     except ValueError as e:                   # deliberate importer guidance
@@ -2790,8 +2850,11 @@ async def import_submit(user: dict = Depends(_user()),
     if data is not None and is_restore:
         if not permissions.may_restore(user["role"]):
             raise HTTPException(403, permissions.RESTORE_DENIED)
+        from starlette.concurrency import run_in_threadpool
+
         from ..sync import restore_job
-        started = restore_job.start(str(user["tenant_id"]), data)
+        started = await run_in_threadpool(restore_job.start,
+                                          str(user["tenant_id"]), data)
         if not started.get("error"):
             started = {"source": "restore started — it keeps running in "
                                  "the background; reload this page to see "

@@ -45,13 +45,22 @@ class UnreadableClusterTests(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("can't read which Postgres version", r.stderr)
 
-    def test_the_version_is_read_through_a_container(self):
-        want = re.search(r"image: docker.io/library/postgres:(\d+)",
+    def _want(self):
+        return re.search(r"base_image: docker.io/library/postgres:(\d+)",
                          (ROOT / "docker/compose.yaml").read_text()).group(1)
+
+    def test_the_version_is_read_through_the_installs_own_image(self):
+        want = self._want()
         r, log = self._run(STUB_RUN_OUT=want)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn(f"postgres:{want}-alpine", log)
-        self.assertIn("/d:ro", log)
+        self.assertRegex(log, r"ARGS: run .*/d:ro oikonome-postgres:acme ")
+
+    def test_without_a_built_image_the_base_reads_it(self):
+        want = self._want()
+        r, log = self._run(STUB_RUN_OUT=want, STUB_NO_IMAGE=1)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(
+            log, rf"ARGS: run .*/d:ro docker.io/library/postgres:{want}-alpine ")
 
 
 class NoSecretOnACommandLineTests(unittest.TestCase):

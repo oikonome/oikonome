@@ -99,9 +99,10 @@ def deny_shared_login(user: dict) -> None:
         raise HTTPException(403, SHARED_DENIED)
 
 
-SHARED_GRANT_DENIED = ("This is a shared demonstration login — it can't add "
-                       "people, script tokens, support access or new "
-                       "outbound destinations to this household")
+SHARED_GRANT_DENIED = ("This is a shared demonstration login — it can't "
+                       "change who is in this household or how they are "
+                       "reached, send to its members, or add script tokens, "
+                       "support access or outbound destinations")
 
 
 def deny_shared_grant(user: dict) -> None:

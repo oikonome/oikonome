@@ -2,7 +2,7 @@ import { focusManager, useIsFetching } from "@tanstack/react-query";
 import { PersistQueryClientProvider } from "@tanstack/react-query-persist-client";
 import { Stack, usePathname, useRouter } from "expo-router";
 import { StatusBar } from "expo-status-bar";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AppState, KeyboardAvoidingView, Modal, Platform, View } from "react-native";
 import * as ScreenCapture from "expo-screen-capture";
 
@@ -13,28 +13,39 @@ import { PINNED_SERVER_URL, type Me } from "../lib/api";
 import { useAppUpdateCheck } from "../lib/app-updates";
 import { markLaunchConsumed, settleLaunch } from "../lib/launch";
 import { pushSupported } from "../lib/push";
-import { pushRoute, pushSentAt } from "../lib/pure";
+import { pushRoute, pushSentAt, pushTapRoute } from "../lib/pure";
 import { persistOptions, queryClient } from "../lib/query";
 import { SessionProvider, useSession } from "../lib/session";
 import { C, isDarkTheme } from "../lib/theme";
 import Unlock from "./unlock";
 
 /** Warm the tabs someone taps next while they read Today — a first tap
- *  on Bills/Accounts then paints from cache instead of a spinner. */
+ *  on Bills/Accounts then paints from cache instead of a spinner. Once per
+ *  session: re-warming on every Today refetch (each foreground after the
+ *  stale window) would re-run the heaviest page payload for tabs nobody
+ *  opened. */
 function Prefetcher() {
   const { phase, client } = useSession();
-  // after Today has its answer: the first screen's request must not
-  // share the radio with three warm-ups nobody is looking at yet
+  // after Today has a FRESH answer from this session: the first screen's
+  // request must not share the radio with three warm-ups nobody is looking
+  // at yet. A persisted Today restored at launch does not count — its
+  // refetch is still to come — so the answer must be newer than the mount.
   const todaySettled = useIsFetching({ queryKey: ["today"] }) === 0;
+  const mountedAt = useRef(Date.now());
+  const warmedFor = useRef<unknown>(null);
+  const todayAt = queryClient.getQueryState(["today"])?.dataUpdatedAt ?? 0;
+  const todayFresh = todaySettled && todayAt >= mountedAt.current;
   useEffect(() => {
-    if (phase !== "ready" || !client || !todaySettled) return;
+    if (phase !== "ready" || !client || !todayFresh) return;
+    if (warmedFor.current === client) return;
+    warmedFor.current = client;
     queryClient.prefetchQuery({ queryKey: ["bills"],
       queryFn: () => client.bills(), staleTime: 60_000 });
     queryClient.prefetchQuery({ queryKey: ["accounts"],
       queryFn: () => client.accounts(), staleTime: 60_000 });
     queryClient.prefetchQuery({ queryKey: ["alerts"],
       queryFn: () => client.alertsHistory(), staleTime: 60_000 });
-  }, [phase, client, todaySettled]);
+  }, [phase, client, todayFresh]);
   return null;
 }
 
@@ -179,9 +190,14 @@ export default function RootLayout() {
         // a report push opens the period it reports on, dated from when it
         // was sent rather than when it was tapped
         // and on the household's clock, which the cached profile knows
-        const route = pushRoute(event, data,
-          pushSentAt(resp.notification.date),
-          queryClient.getQueryData<Me>(["me"])?.timezone);
+        // an alert tap while a two-factor recovery is pending opens the
+        // screen that cancels it; the profile is refetched too, so a
+        // recovery the cache has not seen yet shows on Alerts' banner
+        const cachedMe = queryClient.getQueryData<Me>(["me"]);
+        if (event === "alert")
+          queryClient.invalidateQueries({ queryKey: ["me"] });
+        const route = pushTapRoute(pushRoute(event, data,
+          pushSentAt(resp.notification.date), cachedMe?.timezone), cachedMe);
         if (route === "/") router.navigate("/");
         else router.push(route as never);
       };

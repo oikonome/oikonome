@@ -120,6 +120,10 @@ class BillsRemainingMonthTests(unittest.TestCase):
             # only the unpaid occurrence may be reserved
             add_bill(conn, "Rent", 1500.0, next_due=MONTH_END,
                      last_seen=MONTH_END - dt.timedelta(days=31))
+            # …and last month's rent was paid: an unpaid one still inside
+            # its match window would be owed tomorrow as well
+            add_txn(conn, MONTH_END - dt.timedelta(days=31), 1500.0, "Rent",
+                    account="chk", primary="RENT_AND_UTILITIES")
             add_bill(conn, "Gym", 50.0, next_due=TODAY,
                      last_seen=TODAY - dt.timedelta(days=30))
             add_txn(conn, TODAY, 50.0, "Gym", account="chk",

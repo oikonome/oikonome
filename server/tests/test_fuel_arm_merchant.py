@@ -84,6 +84,67 @@ class FuelArmParser(unittest.TestCase):
         self.assertIsNone(fuel_arm(None, "KROGER FUEL"))
 
 
+def _reference_fuel_arm(merchant, orig_desc, name=None):
+    """The rule as a regex built per brand: what fuel_arm must keep
+    answering, whatever it does to answer it cheaply."""
+    import re
+    brand = (merchant or "").strip()
+    if not brand or re.search(r"\b(gas|fuel)\b", brand, re.IGNORECASE):
+        return None
+    letters = re.sub(r"[^A-Za-z0-9]", "", brand)
+    if len(letters) < 3:
+        return None
+    pattern = (r"(?:^|[^A-Za-z0-9])" + r"[^A-Za-z0-9]*".join(letters)
+               + r"[^A-Za-z0-9]+(gas|fuel)(?:[^A-Za-z0-9]|$)")
+    for text in (name, orig_desc):
+        m = text and re.search(pattern, text, re.IGNORECASE)
+        if m:
+            return f"{brand} {m.group(1).capitalize()}"
+    return None
+
+
+class FuelArmCostDoesNotGrowWithDistinctMerchants(unittest.TestCase):
+    """Every upsert and every restored row asks fuel_arm about its
+    merchant. A ledger (or a crafted file) with thousands of distinct
+    merchant names must not pay a pattern build per name: a long brand's
+    pattern alone took tens of milliseconds to build."""
+
+    def test_thousands_of_long_distinct_brands_stay_cheap(self):
+        import random
+        import string
+        import time
+        rng = random.Random(7)
+        brands = ["".join(rng.choice(string.ascii_uppercase)
+                          for _ in range(600)) for _ in range(600)]
+        started = time.perf_counter()
+        for b in brands:
+            self.assertEqual(fuel_arm(b.title(), f"{b} GAS #12"),
+                             f"{b.title()} Gas")
+            self.assertIsNone(fuel_arm(b.title(), f"{b} WHSE #12"))
+        # a per-brand pattern build costs ~40 ms here: 600 of them is far
+        # past this bound, the linear read is far inside it
+        self.assertLess(time.perf_counter() - started, 5.0)
+
+    def test_the_answer_matches_the_rule_on_every_shape(self):
+        merchants = ["Northwind Club", "Kroger", "A-B-C", "Lowe's", "Vega",
+                     "A+ (Market)", "Shell", "Northwind Gas", "kbx", "AB",
+                     "Ex", "Café Rouge", "7-Eleven", "Q", ""]
+        texts = ["NORTHWIND CLUB GAS #0123", "NORTHWIND CLUB WHSE #0123",
+                 "WWW NORTHWIND CLUB COM", "KROGER FUEL CTR #2020",
+                 "A B C FUEL TX", "A-B-C #0123", "LOWES FUEL CENTER",
+                 "VEGAS BUFFET", "VEGA GAS", "xVEGA GAS", "VEGA GASOLINE",
+                 "VEGA  --  gas", "A MARKET GAS #1", "SHELL OIL AUTO FUEL",
+                 "K-B-X GAS", "KBX GAS STATION", "kbxgas", "CAFE ROUGE GAS",
+                 "CAFÉ ROUGE GAS", "7 ELEVEN FUEL", "7-ELEVEN 7-ELEVEN GAS",
+                 "NORTHWIND NORTHWIND CLUB FUEL", "", None, "GAS"]
+        for m in merchants:
+            for t in texts:
+                for n in (None, "Northwind Club Gas", "Vega Fuel"):
+                    self.assertEqual(fuel_arm(m, t, n),
+                                     _reference_fuel_arm(m, t, n),
+                                     (m, t, n))
+
+
 class FuelArmOnIngest(unittest.TestCase):
     def setUp(self):
         self.conn = make_db()

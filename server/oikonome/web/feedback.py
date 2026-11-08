@@ -242,9 +242,28 @@ def smtp_configured(conn=None) -> bool:
     return bool(os.environ.get("OIKONOME_SMTP_HOST"))
 
 
+def sender_muted(email: str | None) -> bool:
+    """Whether reports from this account are kept but not emailed.
+
+    An automated or test account can press every button, the feedback
+    form's Send included, and mail the operator reports nobody wrote. The
+    operator names such accounts in OIKONOME_FEEDBACK_SKIP: comma-separated
+    shell globs matched against the whole account address. The report is
+    still stored, so nothing a person did write is lost. Empty mutes
+    nothing."""
+    pats = [p.strip().lower()
+            for p in os.environ.get("OIKONOME_FEEDBACK_SKIP", "").split(",")
+            if p.strip()]
+    addr = (email or "").strip().lower()
+    if not pats or not addr:
+        return False
+    import fnmatch
+    return any(fnmatch.fnmatch(addr, p) for p in pats)
+
+
 def submit(conn, tenant_id: str, message: str,
            screenshot: tuple[str, bytes] | None = None,
-           kind: str = "feedback") -> dict:
+           kind: str = "feedback", sender: str | None = None) -> dict:
     """Returns {number, delivery, package?}: delivery 'emailed' when SMTP
     took it, else 'downloaded' with the zip for the person to send to
     feedback_to() themselves. Email failure falls back to the download —
@@ -256,6 +275,13 @@ def submit(conn, tenant_id: str, message: str,
                             kind=kind)
     delivery = "downloaded"
     from . import mailguard, report
+    if sender_muted(sender):
+        # Stored, not mailed; the sender sees the same "sent" answer as any
+        # emailed report, since from their side it was received.
+        conn.execute(
+            "INSERT INTO feedback_reports (number, message, delivery, kind) "
+            "VALUES (%s,%s,%s,%s)", (number, message.strip(), "skipped", kind))
+        return {"number": number, "delivery": "emailed", "package": None}
     smtp = report.resolve_smtp(conn)
     if smtp["configured"] and feedback_to():
         import html as _html

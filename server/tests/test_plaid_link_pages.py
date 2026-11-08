@@ -289,6 +289,38 @@ class PlaidLinkPagesTests(unittest.TestCase):
         self.assertEqual(s["kind"], "update")
         self.assertIsNone(self._webhook_status("it-new"))
 
+    def test_a_checklist_session_answered_with_a_token_clears_the_prompt(self):
+        """Plaid can report a shared-accounts session as an added Item with a
+        public token, the Item being the one the session was opened on. That
+        is a finished reconnect: the new-accounts prompt goes, the answer
+        says update, and it survives no second look."""
+        self._flag_new_accounts("it-tok")
+        state = {"link_token": "lt-tok", "link_done": True, "item_id": "it-tok"}
+        with _patch_client(state):
+            r = self.client.post("/accounts/plaid/link",
+                                 data={"item_id": "it-tok"},
+                                 headers={"accept": "application/json"})
+            self.assertEqual(r.status_code, 200, r.text)
+            s = self.client.get("/accounts/plaid/link/lt-tok/status").json()
+            again = self.client.get("/accounts/plaid/link/lt-tok/status").json()
+        self.assertEqual(s["kind"], "update")
+        self.assertEqual(again["kind"], "update")
+        self.assertIsNone(self._webhook_status("it-tok"))
+
+    def test_a_token_leading_to_another_item_leaves_the_prompt_alone(self):
+        """A token that created a different Item says nothing about the
+        accounts waiting on this one."""
+        self._flag_new_accounts("it-other")
+        state = {"link_token": "lt-other", "link_done": True,
+                 "item_id": "pl-other-1"}
+        with _patch_client(state):
+            self.client.post("/accounts/plaid/link",
+                             data={"item_id": "it-other"},
+                             headers={"accept": "application/json"})
+            s = self.client.get("/accounts/plaid/link/lt-other/status").json()
+        self.assertEqual(s["kind"], "add")
+        self.assertEqual(self._webhook_status("it-other"), "new_accounts")
+
     def test_a_session_without_the_checklist_leaves_new_accounts_flagged(self):
         """A completion that could not have shared anything (a session
         opened before the flag arrived, so without the checklist) must not

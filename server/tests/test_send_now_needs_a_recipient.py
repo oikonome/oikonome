@@ -91,7 +91,8 @@ class SendNowNeedsARecipientTests(unittest.TestCase):
         self.assertEqual(m.call_args.args[3], [self.owner])
 
     def test_the_button_answers_409_not_ok(self):
-        user = {"tenant_id": self.tid, "user_id": "u", "email": self.owner}
+        user = {"tenant_id": self.tid, "user_id": "u", "email": self.owner,
+                "role": "owner"}
         with mock.patch.object(api.demoguard, "deny"):
             with self.assertRaises(HTTPException) as cm:
                 api.jobs_email_api(user=user)

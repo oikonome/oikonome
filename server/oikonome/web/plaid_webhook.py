@@ -46,7 +46,7 @@ import json
 import logging
 import os
 
-from ..envnum import env_num
+from ..envnum import env_float, env_int
 import time
 
 import httpx
@@ -89,9 +89,8 @@ _TRANSPORT = None            # tests inject an httpx.MockTransport here
 #   3. a global ceiling on CONCURRENT outbound key fetches — a burst can't
 #      pile unbounded authenticated calls onto Plaid under the platform credentials.
 _NEG_CACHE: dict[str, float] = {}       # kid -> monotonic expiry
-_NEG_TTL = float(env_num("OIKONOME_PLAID_WEBHOOK_NEG_TTL", "60"))
-_FETCH_CEILING = int(env_num(
-    "OIKONOME_PLAID_WEBHOOK_FETCH_CEILING", "4"))
+_NEG_TTL = env_float("OIKONOME_PLAID_WEBHOOK_NEG_TTL", 60.0, lo=0.0)
+_FETCH_CEILING = env_int("OIKONOME_PLAID_WEBHOOK_FETCH_CEILING", 4, lo=1)
 # asyncio.Semaphore construction needs no running loop on 3.10+.
 _FETCH_SEM = asyncio.Semaphore(_FETCH_CEILING)
 

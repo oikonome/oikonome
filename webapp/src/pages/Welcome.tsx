@@ -185,6 +185,14 @@ function LiveCount({ n }: { n: number }) {
     {shown.toLocaleString()}</span>;
 }
 
+/** The history gate fails open only when the import status could never be
+ *  read. A background poll that fails keeps its last answer, which still
+ *  says history is arriving, so opening on it would seed bills and the
+ *  budget from the first month alone. (The phone's twin is
+ *  wizard-logic.ts backfillFailsOpen.) */
+const backfillFailsOpen = (q: { isError: boolean; data?: unknown }) =>
+  q.isError && q.data === undefined;
+
 /** Step-2 doorman. Income/bill detection is only as good as the history
  *  it scans, and Plaid delivers its two-year backfill ASYNCHRONOUSLY —
  *  minutes after the link, not at it. Run the finder against the first
@@ -241,7 +249,7 @@ function BackfillGate({ children }: { children: ReactNode }) {
     const t = setTimeout(() => setReveal(true), 1800);
     return () => clearTimeout(t);
   }, [finished]);
-  if (q.isError || (q.data && q.data.all_ready && (reveal || !finished)))
+  if (backfillFailsOpen(q) || (q.data && q.data.all_ready && (reveal || !finished)))
     return <>{children}</>;
   if (!q.data) return <p className="mut">Checking your import status…</p>;
   const items = q.data.items;
@@ -320,13 +328,15 @@ export function flagsOf(d: Delivery): { on: boolean; push: boolean } {
 const DELIVERY_WORDS: Record<Delivery, string> = {
   email: "Email", push: "Push", both: "Email and push", off: "Off" };
 
-/** Who the scheduled mail reaches: the owner (always), then every other
- *  address on the settings view with its own on/off. The Email & push step
- *  lists them; the closing summary counts them. */
+/** Who the scheduled mail reaches: the owner first, then every other
+ *  address on the settings view, each with its on/off. The owner can mute
+ *  themselves in Settings (or by the unsubscribe link) and the worker
+ *  honours it, so their row reads that state like any other. The Email &
+ *  push step lists them; the closing summary counts them. */
 function recipientRows(st: Settings | undefined) {
   const muted = new Set((st?.email_muted ?? []).map((m) => m.toLowerCase()));
   const rows = (st?.email_recipient_status ?? []).map((r) => ({
-    ...r, off: !r.owner && (!!r.muted || muted.has(r.email.toLowerCase())) }));
+    ...r, off: !!r.muted || muted.has(r.email.toLowerCase()) }));
   return [...rows.filter((r) => r.owner), ...rows.filter((r) => !r.owner)];
 }
 
@@ -392,7 +402,9 @@ function RecipientsBlock() {
           <div key={r.email} className="wiz-row"><div className="wiz-row-main">
             <span className="wiz-addr">{r.email}{" "}
               <small className="mut">· {role(r)}</small></span>
-            {r.owner ? <span className="pill g">on</span> : (
+            {r.owner ? (r.off
+              ? <span className="pill">off — change in Settings</span>
+              : <span className="pill g">on</span>) : (
               <button type="button" role="switch" aria-checked={!r.off}
                       aria-label={`${r.email} receives the email`}
                       className={"wiz-pill" + (r.off ? "" : " sel")}
@@ -453,22 +465,25 @@ function EmailPushStep() {
   const hourVal = hour ?? daily?.hour ?? 7;
   const summaryVal = summary ?? daily?.summary ?? false;
   const [pushNote, setPushNote] = useState<{ text: string; bad?: boolean } | null>(null);
+  // The cached schedule may be older than a change made on another device
+  // or by a save still in flight, so each tap sends only the daily fields
+  // it changed, laid over the schedule stored NOW: the other reports and
+  // every field this tap did not touch stay as stored, and the last tap on
+  // a field wins. One settings save at a time, so each read sees the one
+  // before it.
+  type Daily = { on: boolean; push: boolean; hour: number; summary: boolean };
   const save = useMutation({
-    mutationFn: (next: { on: boolean; push: boolean; hour: number;
-                         summary: boolean }) =>
-      saveSettings(qc, {
-        email_schedule: {
-          ...(s.data?.email_schedule ?? {}),
-          daily: { ...(daily ?? {}), on: next.on, push: next.push,
-                   hour: next.hour, summary: next.summary },
-        },
-      }),
+    mutationFn: async (patch: Partial<Daily>) => {
+      const live = (await api.settings()).email_schedule ?? {};
+      const was = (live as { daily?: Partial<Daily> }).daily ?? {};
+      return saveSettings(qc, { email_schedule: {
+        ...live, daily: { on: true, push: false, hour: 7, summary: false,
+                          ...was, ...patch } } });
+    },
     scope: SETTINGS_SAVES,
     onError: () => setDeliveryOv(null),     // failed write ≠ new truth
   });
-  const commit = (patch: Partial<{ on: boolean; push: boolean; hour: number;
-                                    summary: boolean }>) =>
-    save.mutate({ on, push, hour: hourVal, summary: summaryVal, ...patch });
+  const commit = (patch: Partial<Daily>) => save.mutate(patch);
   // browser push (VAPID) and phone push (the relay) are separate channels:
   // an instance with only the relay can still deliver to the mobile apps,
   // so the choice has to stay offered even though THIS browser cannot
@@ -603,7 +618,11 @@ function DoneStep({ d }: { d: Onboarding | undefined }) {
   const nBills = tracked.length - nInc;
   const daily = s.data?.email_schedule?.daily;
   const delivery = deliveryOf(daily?.on ?? true, !!daily?.push);
-  const nRecip = Math.max(1, recipientRows(s.data).filter((r) => !r.off).length);
+  // no status list (an older server, or still loading) = the owner alone,
+  // as the Email & push step shows it; a list where every address is
+  // muted mails nobody, and the summary says so
+  const recips = recipientRows(s.data);
+  const nRecip = recips.length ? recips.filter((r) => !r.off).length : 1;
   const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
   const conns = d?.connections ?? 0;
   const reach = d && d.history_months !== undefined ? d.history_months
@@ -627,7 +646,7 @@ function DoneStep({ d }: { d: Onboarding | undefined }) {
     ["Budgets", budgets],
     ["Email & push", `${DELIVERY_WORDS[delivery]}`
       + (delivery === "off" ? "" : ` at ${hourLabel(daily?.hour ?? 7)}`)
-      + ` · ${plural(nRecip, "recipient")}`],
+      + ` · ${nRecip ? plural(nRecip, "recipient") : "nobody"}`],
     // what the Today page's checklist will say — the same list it reads
     ["Today checklist", d ? checklistSummary(d) : "…"],
   ];
@@ -761,7 +780,7 @@ export default function Welcome() {
     refetchInterval: (query) =>
       query.state.data?.all_ready ? false : 4000,
   });
-  const backfillReady = backfill.isError
+  const backfillReady = backfillFailsOpen(backfill)
     || !!(backfill.data && backfill.data.all_ready);
   // The wizard connects a bank and configures the household's mail, both
   // of which are the owner's — so a member landing here (deep link, stale

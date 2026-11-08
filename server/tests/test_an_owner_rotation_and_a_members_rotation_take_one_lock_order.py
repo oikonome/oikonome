@@ -159,17 +159,18 @@ class OwnerAndMemberRotationsTakeOneOrder(unittest.TestCase):
 
     def test_a_members_authenticator_enrolment_lets_the_owners_rotation_finish(self):
         """The member is turning an authenticator on (holding their factor
-        lock and their users row) when the owner's password change reaches
-        for that factor lock to remove them. The member's door commits
-        first and the owner's rotation then removes the member: neither is
+        lock, mid-rotation) when the owner's password change reaches for
+        that factor lock to remove them. The member's door commits first
+        and the owner's rotation then removes the member: neither is
         killed."""
+        from oikonome.auth import posture
         secret = self.member.post("/api/totp/enroll",
                                   data={"password": PW}).json()["secret"]
         code = _code(secret)
         gate = Gate()
         with mock.patch.object(
-                self.appmod, "_revoke_bearer_persistence",
-                gate.before(self.appmod._revoke_bearer_persistence)):
+                posture, "_revoke_support_grants",
+                gate.before(posture._revoke_support_grants)):
             member, owner = self._race(gate, lambda: self.member.post(
                 "/api/totp/confirm",
                 data={"secret": secret, "code": code, "password": PW}))

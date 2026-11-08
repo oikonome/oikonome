@@ -9,7 +9,8 @@ import TxnTable from "../components/TxnTable";
 import { api, mmdd, money as money$, catLabel, errText, toast } from "../api/client";
 import { RANGES, RANGE_LABEL, ledgerRange } from "../components/RangePicker";
 import { SnapReceiptButton, WaitingBadge } from "../components/WaitingReceipts";
-import { canEdit } from "../role";
+import { canEdit, isOwner } from "../role";
+import { householdDay } from "../moneymath";
 const money = (v: number | null | undefined) => money$(v, true);  // cents on transaction/recurring surfaces
 
 
@@ -25,7 +26,10 @@ function linkInt(v: string | null, lo: number, hi: number, dflt: number) {
 
 
 export default function Transactions() {
-  const now = new Date();
+  // "this month" is the household's (/api/me timezone), the month the
+  // server's ledger and verdicts count in — not the device's
+  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
+  const now = householdDay(new Date(), me.data?.timezone);
   const [sp] = useSearchParams();         // /transactions?… deep links
   // honor the full query the /transactions→/app redirect forwards
   // (q, cat, y, m, date range) — not just acct
@@ -112,7 +116,7 @@ export default function Transactions() {
   // the wrong rows under the right heading.
   const spKey = sp.toString();
   useEffect(() => {
-    const n = new Date();
+    const n = householdDay(new Date(), me.data?.timezone);
     setY(linkInt(sp.get("y"), 1900, 2100, n.getFullYear()));
     setM(linkInt(sp.get("m"), 1, 12, n.getMonth() + 1));
     setQ(sp.get("q") ?? ""); setLive(sp.get("q") ?? "");
@@ -148,9 +152,15 @@ export default function Transactions() {
     if (want.length > 0 && want.length < 2) return;
     const t = setTimeout(() => {
       setLive(want); setPage(1);
-      // typing is an all-history search — leave any bucket / month scope
-      // (setters inline rather than the helper: a stable effect body)
-      if (want) { setBucket(""); setMonthScope(false); }
+      // typing is an all-history search — leave every scope leaveScope
+      // leaves, the counted flag included: a counted category is the
+      // engine's own row set, which the server answers without the query,
+      // so a search left inside one is silently ignored (setters inline
+      // rather than the helper: a stable effect body)
+      if (want) {
+        setBucket(""); setAsOf(""); setCounted(false); setMonthScope(false);
+        setYearScope(false);
+      }
     }, 250);
     return () => clearTimeout(t);
   }, [q, live]);
@@ -242,7 +252,6 @@ export default function Transactions() {
   // sat beside it is gone: the Business tab is where that number lives,
   // and here it read as a claim about the month on screen.
   const reimb = useQuery({ queryKey: ["reimb"], queryFn: api.reimbPending });
-  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   // The business link follows the Business TAB: hidden until a business
   // exists (has_business on /api/me), so a household that never runs one
   // is not pointed at a feature built for someone else.
@@ -505,8 +514,10 @@ export default function Transactions() {
           {/* the page as a file — the same filters, every page of rows,
               named after what was asked for. Fetched same-origin (the
               server refuses a cross-site start); the href stays so the
-              link still reads as a download */}
-          {query.data && (
+              link still reads as a download. The ledger as a file is the
+              owner's to take — the door refuses a member or a viewer, so
+              they are not shown a link that could only fail */}
+          {query.data && isOwner(me) && (
             <span className="sub" style={{ marginLeft: "auto", fontSize: ".85rem",
                                            whiteSpace: "nowrap" }}
                   title="download these rows, filters included">

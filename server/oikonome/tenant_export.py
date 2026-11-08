@@ -19,10 +19,13 @@ from __future__ import annotations
 import datetime as dt
 import io
 import json
+import os
 import zipfile
 
 from . import ext
 from .db import tenancy
+from .sync.archive_upgrades import MANIFEST
+from .sync.archive_upgrades import manifest as restore_manifest
 
 # Tenant-scoped tables worth exporting, with the columns to keep. `None`
 # means "every column except the excluded secret/blob set below". Ordered
@@ -114,7 +117,8 @@ def _dump_table(conn, table: str, fh) -> int:
                     # rule existed still carries what the rule removes
                     if (table in ("tenant_settings", "budget_snapshots")
                             and row.get("config")):
-                        from .sync.restore import scrub_config
+                        from .web.settings_exposure import (
+                            export_view as scrub_config)
                         cfg = row["config"]
                         if isinstance(cfg, str):
                             try:
@@ -247,6 +251,8 @@ def _control_rows(admin, table: str, tenant_id: str) -> list[dict]:
 # RLS tenant tables the portability archive leaves out, each with its
 # reason. Discovery would otherwise carry them like any other table.
 ARCHIVE_TABLE_SKIP = {
+    "txn_id_keys": "the secret file-row ids are keyed under — never travels; "
+                   "a restore mints its own",
     "webhooks": "outbound webhook destinations — a receiver URL is a "
                 "credential in its own right (whoever holds a Home "
                 "Assistant webhook id or a chat incoming-webhook URL can "
@@ -286,6 +292,7 @@ def build_archive(tenant_id: str, *, operator: str,
                   consented: bool, now: dt.datetime | None = None) -> bytes:
     """Return a ZIP (bytes) of the tenant's data as JSON. `operator` and
     `consented` are recorded in the manifest for provenance."""
+    from .sync.export import schema_version
     now = now or dt.datetime.now(dt.timezone.utc)
     admin = tenancy.admin_connect()
     try:
@@ -321,12 +328,20 @@ def build_archive(tenant_id: str, *, operator: str,
                    for t in ARCHIVE_CONTROL_TABLES}
         tables = [t for t in rls_tenant_tables(admin)
                   if t not in ARCHIVE_TABLE_SKIP]
+        schema = schema_version(admin)
     finally:
         admin.close()
     if tenant is None:
         raise ValueError("no such tenant")
 
+    # The household export's manifest first — the schema these rows are
+    # in, which a restore reads to decide what an older archive missed —
+    # then this archive's provenance. `tables` here counts the rows of each
+    # data/ member rather than listing them; a restore reads only the
+    # format and the schema.
     manifest = {
+        **json.loads(restore_manifest(
+            schema, os.environ.get("OIKONOME_VERSION") or "dev", tables)),
         "export_format": "oikonome-tenant-export/1",
         "generated_at": now.isoformat(),
         "generated_by_operator": operator,
@@ -369,7 +384,7 @@ def build_archive(tenant_id: str, *, operator: str,
                     manifest["tables"][t] = _dump_table(conn, t, fh)
                     fh.flush()
                     fh.detach()
-            z.writestr("manifest.json",
+            z.writestr(MANIFEST,
                        json.dumps(manifest, indent=1, ensure_ascii=False))
     finally:
         conn.close()

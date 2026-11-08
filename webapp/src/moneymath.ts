@@ -1,7 +1,7 @@
 // Dependency-free money logic shared by the pages that type or total
 // money. It imports nothing at runtime, so the server suite can execute
 // it under plain node next to its mobile twin.
-import type { CustomBucket } from "./api/client";
+import type { CustomBucket, Txn } from "./api/client";
 
 // A typed amount's separators, read by the server's own rules for an
 // amount cell (csvimport.parse_money_text), so a client never sends a
@@ -201,6 +201,22 @@ export function rebaseKeyed<T extends object>(
   for (const [k, v] of Object.entries(mine))
     if (!has(live, k) && (!has(base, k) || !sameValue(v, base[k]))) out[k] = v;
   return out;
+}
+
+/** An email-schedule edit laid over the schedule stored NOW. The server
+ *  replaces each cadence a body names, and the copy on screen may be
+ *  older than what another device saved since, so only the fields this
+ *  edit changed (mine against base) move. The edited cadence is always
+ *  sent. The phone's twin is mobile/src/lib/schedule.ts rebaseSched. */
+export function rebaseSchedule<S extends object>(
+  mine: S, base: S, live: object, edited?: keyof S & string,
+): S {
+  type R = Record<string, object>;
+  const out = rebaseKeyed<object>({ ...(mine as R) }, { ...(base as R) },
+                                  { ...(live as R) });
+  const m = mine as R;
+  if (edited && !out[edited] && m[edited]) out[edited] = m[edited];
+  return out as S;
 }
 
 /** Each row's identity in a list that has no ids: its name, numbered by
@@ -485,6 +501,36 @@ export function localYmd(d: Date): string {
     + String(d.getDate()).padStart(2, "0");
 }
 
+/** The calendar day it is where the household lives, as YYYY-MM-DD. The
+ *  server answers "today" and "this month" on the household's clock
+ *  (/api/me `timezone`), so a device in another zone must read the same
+ *  clock: between London's midnight and Los Angeles's, a browser in LA
+ *  would otherwise call the household's yesterday "today" and its new
+ *  month the future. Before /api/me answers, or with a zone this runtime
+ *  cannot read, the device clock stands in. */
+export function householdYmd(at: Date, zone?: string): string {
+  if (zone) {
+    try {
+      const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone: zone, year: "numeric", month: "numeric", day: "numeric",
+      }).formatToParts(at);
+      const n = (t: string) => Number(parts.find((p) => p.type === t)?.value);
+      const y = n("year"), m = n("month"), d = n("day");
+      if (Number.isInteger(y) && Number.isInteger(m) && Number.isInteger(d))
+        return `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+    } catch { /* an unknown zone name: read the device clock instead */ }
+  }
+  return `${at.getFullYear()}-${String(at.getMonth() + 1).padStart(2, "0")}-`
+    + String(at.getDate()).padStart(2, "0");
+}
+
+/** The household's day as a device-local midnight Date, for the helpers
+ *  that take a Date (getFullYear, getMonth, date arithmetic). */
+export function householdDay(at: Date, zone?: string): Date {
+  const [y, m, d] = householdYmd(at, zone).split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+
 /** The local day a timestamp fell on, as YYYY-MM-DD; the text itself when
  *  it is not a time JS can read, so a date-only value still prints. */
 export function localDayOf(ts: string): string {
@@ -588,4 +634,36 @@ export function historyBasisNote(s: {
   return n < (s.min_rate_days ?? 7)
     ? `${head} — under a week, so expect it to move; revisit after your first full month.`
     : `${head}.`;
+}
+
+// The server sends each row's share of spending (spend_amount) by the
+// verdict's own math — net of a partial reimbursement, a split row's
+// matching parts' share under the search's category filter, 0 for rows the
+// verdict does not count (excluded or hidden accounts, linked shadows
+// included). Summing that, not `amount`,
+// is what makes a day subtotal agree with the month hero; the client must
+// not re-derive spend semantics, because the display category can't see
+// overrides collapsing to transfers or loan-account rows. The fallbacks
+// exist only for a NEW client against an OLDER server: counts_as_spend
+// with the gross amount, then a category rule — without them every day
+// would total $0. Mirrored by mobile's rowSpend/daySpend in lib/pure.ts.
+// TxnTable's day subtotals and Today's recent-spending total both sum it,
+// which is what keeps the latter equal to the daily email's (the email adds
+// the verdict's netted rows).
+export const rowSpend = (t: Pick<Txn, "amount" | "category"
+                                 | "counts_as_spend" | "spend_amount">) => {
+  if (typeof t.spend_amount === "number") return t.spend_amount;
+  const counts = typeof t.counts_as_spend === "boolean"
+    ? t.counts_as_spend
+    : t.amount > 0 && !(t.category || "").includes("TRANSFER");
+  return counts ? t.amount : 0;
+};
+
+
+/** A bill scan refused because another pass is running (409): the list
+ *  is not "no proposals", it is waiting on that pass. */
+export const SCAN_RUNNING_RETRY_MS = 20_000;
+export function scanAlreadyRunning(e: unknown): boolean {
+  const m = e instanceof Error ? e.message : String(e ?? "");
+  return /^409\b/.test(m) || /already running/i.test(m);
 }

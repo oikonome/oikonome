@@ -756,6 +756,71 @@ def deduction_for_year(ded: dict, year: int, begins: dt.date | None) -> dict:
     return out
 
 
+def capitalized_deducted_through(conn, entity_id: str, through_year: int,
+                                 rows=None, lifetime=None) -> float:
+    """The organizational and start-up allowance deducted so far: each
+    year's share (deduction_for_year, the same figure the estimated-tax
+    calculation takes) summed from the year the business began through
+    `through_year`. `rows` is the entity's history up to the as-of date
+    (all of it by default); it decides which costs count. `lifetime` is
+    the entity's whole history (fetched when a caller passes `rows`
+    without it): with no start date recorded, the business begins the
+    month after its LATEST pre-opening cost, and that is a fact about the
+    whole history. Judged on rows cut at a year end, a later cost would be
+    invisible and an earlier year would claim a deduction the year's own
+    P&L and estimate never take."""
+    if rows is None:
+        rows = entity_transactions(conn, entity_id, None)
+        lifetime = rows
+    start = _entity_start(conn, entity_id)
+    scan = _lifetime_scan(conn, entity_id, rows)
+    if start is None and lifetime is not rows:
+        if lifetime is None:
+            lifetime = entity_transactions(conn, entity_id, None)
+        begins = business_begins(None, _lifetime_scan(conn, entity_id,
+                                                      lifetime))
+    else:
+        begins = business_begins(start, scan)
+    if begins is None:
+        return 0.0
+    total = 0.0
+    for kind in _CAPITALIZED:
+        ded = startup_deduction(scan[kind])
+        for y in range(begins.year, through_year + 1):
+            total += deduction_for_year(ded, y, begins)["deductible_this_year"]
+    return round(total, 2)
+
+
+def net_income_through(conn, entity_id: str, through_year: int,
+                       rows=None, lifetime=None) -> float:
+    """Cumulative net income for the capital account: net operating income
+    less the organizational and start-up costs deducted through
+    `through_year`. Operating net income alone leaves those costs out
+    entirely (they are capitalized, not operating), so a pre-opening cost
+    the owner capitalized would credit capital with the contribution while
+    the deduction it funded was never charged against it. `rows` is the
+    entity's history up to the as-of date (all of it by default),
+    `lifetime` its whole history when the caller already has it (see
+    capitalized_deducted_through)."""
+    if rows is None:
+        rows = entity_transactions(conn, entity_id, None)
+        lifetime = rows
+    elif lifetime is None:
+        lifetime = entity_transactions(conn, entity_id, None)
+    # _pnl_core, NOT pnl: pnl attaches the capital summary, which calls this.
+    # `rows` decides what is summed, but the refund index and the year the
+    # start-up deduction is taken come from the WHOLE history: cut at a
+    # year end, a later pre-opening cost would be invisible, the deduction
+    # year would land early, and a refund of a capitalized cost would count
+    # as an operating recovery that the year's own P&L nets against the
+    # start-up total instead.
+    operating = float(_pnl_core(conn, entity_id, None, rows,
+                                lifetime=lifetime)
+                      .get("net_operating") or 0)
+    return round(operating - capitalized_deducted_through(
+        conn, entity_id, through_year, rows, lifetime), 2)
+
+
 def pnl(conn, entity_id: str, year: int | None = None, txns=None) -> dict:
     """Full P&L, including the capital block."""
     # The all-history rows are read ONCE and shared: the year's §195/§248

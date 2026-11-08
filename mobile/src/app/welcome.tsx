@@ -38,14 +38,16 @@ import { accountsSummary, billsContinue, billsSummary, budgetsSummary,
          windowNarrower,
          finishBlurb, type HistoryMonths, historyMonthsOf,
          THEME_LABEL, type ThemeChoice, WIZARD_STEPS, type WizardStep,
-         wizardThemeChoice } from "../components/wizard-logic";
+         backfillFailsOpen, wizardThemeChoice }
+  from "../components/wizard-logic";
 import { HistoryChoice, useLatestWins } from "../components/wizard-history";
 import { PrimaryCheckingPick } from "../components/wizard-primary-checking";
 import { TAP, ws } from "../components/wizard-ui";
 import type { Onboarding, SettingsView } from "../lib/api";
-import { patchQuery, removeFromList, saveSettings } from "../lib/cache";
+import { patchQuery, removeFromList, SETTINGS_SAVES, saveSettings } from "../lib/cache";
 import { bankAwaitsConfirm, deliveryOf, institutionAllowance,
-         FIRST_SYNC_RUNNING } from "../lib/pure";
+         FIRST_SYNC_RUNNING, scanAlreadyRunning,
+         SCAN_RUNNING_RETRY_MS } from "../lib/pure";
 import { ext } from "../ext";
 import { useSession } from "../lib/session";
 import { C, setThemeMode, themeRestartPending } from "../lib/theme";
@@ -133,7 +135,7 @@ export default function Welcome() {
     const t = setTimeout(() => setReveal(true), 1800);
     return () => clearTimeout(t);
   }, [finished]);
-  const backfillReady = backfill.isError
+  const backfillReady = backfillFailsOpen(backfill)
     || !!(backfill.data && backfill.data.all_ready && (reveal || !finished));
   // the poll is read-only; kicking a quiet backfill is an owner-only
   // POST — once when the wizard opens and then every 30 s while the
@@ -231,6 +233,7 @@ export default function Welcome() {
 
   // the reply seeds ["settings"]; the step marks live on /api/onboarding
   const mark = useMutation({
+    scope: SETTINGS_SAVES,
     mutationFn: (m: { key: StepKey; state: "done" | "skipped" }) =>
       saveSettings(qc, client!, { wizard_steps: { [m.key]: m.state } }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["onboarding"] }),
@@ -239,6 +242,7 @@ export default function Welcome() {
   // what gates Today's redirect back in, so nothing waits on the round
   // trip — the save lands behind the navigation
   const finish = useMutation({
+    scope: SETTINGS_SAVES,
     mutationFn: () => saveSettings(qc, client!,
       { wizard_done: true, wizard_steps: { finish: "done" } }),
     onMutate: async () => {
@@ -350,6 +354,13 @@ export default function Welcome() {
       await qc.cancelQueries({ queryKey: ["bills"] });
       await qc.invalidateQueries({ queryKey: ["bills"], refetchType: "none" });
       qc.invalidateQueries({ queryKey: ["onboarding"] });
+    },
+    // another pass (the nightly, another device) holds the scan: ask again
+    // once it has had time to finish, so the step shows its proposals and
+    // never "no proposals" from before it
+    onError: (e) => {
+      if (scanAlreadyRunning(e))
+        setTimeout(() => detect.mutate(), SCAN_RUNNING_RETRY_MS);
     },
   });
   // either planner's save: Continue unlocks now (the refetch only
@@ -488,6 +499,11 @@ export default function Welcome() {
   }, [step.key]);
   // the finder runs only on the path that asked for it: "I'll enter them
   // myself" means nothing is detected behind the person's back
+  // a gate that closes again (a bank linked since) means more history is
+  // coming: the next opening detects again, over the whole ledger
+  useEffect(() => {
+    if (!backfillReady) detectRan.current = false;
+  }, [backfillReady]);
   useEffect(() => {
     if (step.key === "bills" && billsPane === "auto" && backfillReady
         && !detectRan.current && client && !viewer) {

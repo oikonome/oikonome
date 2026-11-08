@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import json
 
-from .base import STOOD_IN_KEY, mask_file_raw
+from .base import STOOD_IN_KEY, held_forms, mask_file_raw
 
 
 def _cents(x) -> int | None:
@@ -51,11 +51,12 @@ def _public(raw) -> dict | None:
 def same_line_raw(stored_raw, new_raw, name, merchant) -> bool:
     """True when a stored file row was read from the very cells `new_raw`
     holds. raw is the whole scrubbed source row, date and printed amount
-    cells included, so equal raw is the same printed line; the stored raw
-    was masked on the way in (and by the stored-row migrations), so the
-    new one is masked the same way before they are compared. A stored raw
-    of an older shape simply fails to match, which leaves it alone."""
-    a = _public(stored_raw)
+    cells included, so equal raw is the same printed line. Both sides are
+    masked before they are compared: the new one as the upsert will, and the
+    stored one too, since it may have been written before the mask learned a
+    form the new one is now cut for. A stored raw of an older shape simply
+    fails to match, which leaves it alone."""
+    a = _public(mask_file_raw(stored_raw, name, merchant))
     b = _public(mask_file_raw(new_raw, name, merchant))
     return a is not None and b is not None and a == b
 
@@ -73,15 +74,22 @@ def batch_owners(raw) -> set[str]:
 
 
 def stored(conn, account_id: str, ids) -> dict[str, dict]:
-    """The stored rows on `account_id` among `ids`, by id."""
-    ids = sorted({i for i in ids if i})
-    if not ids:
+    """The stored rows on `account_id` among `ids`, by the id asked for.
+    A row re-id'd under the household's secret since an earlier import
+    stored it answers to the id it was keyed from (base.held_forms), and
+    keeps that id under "id" so the caller's proofs read as before; the id
+    it is held under is "held_id", which land moves it from and a caller
+    that keeps the row where it is must write it under."""
+    held = held_forms(conn, ids, account_id)
+    if not held:
         return {}
-    return {r["id"]: dict(r) for r in conn.execute(
+    rows = {r["id"]: dict(r) for r in conn.execute(
         "SELECT id, date, amount, raw, removed, retired_at,"
         "       raw->>'line' AS line"
         "  FROM transactions WHERE account_id = %s AND id = ANY(%s)",
-        (account_id, ids)).fetchall()}
+        (account_id, sorted(set(held.values())))).fetchall()}
+    return {asked: {**rows[real], "id": asked, "held_id": real}
+            for asked, real in held.items() if real in rows}
 
 
 def same_file_batches(conn, account_id: str, source: str,
@@ -134,6 +142,14 @@ def land(conn, moves: list[tuple[str, str]],
     repeated until none makes progress. A move whose target never frees
     up is left undone, which is the state before this repair."""
     from .adopt import _retire_twin, _rewrite_txn_id
+    if not moves and not retires:
+        return 0
+    # the callers name a row by the id they recomputed for it; one re-id'd
+    # under the household's secret is moved from the id it is held under
+    held = held_forms(conn, [o for o, _ in moves]
+                      + [x for pair in retires for x in pair])
+    moves = [(held.get(o, o), n) for o, n in moves]
+    retires = [(held.get(k, k), held.get(x, x)) for k, x in retires]
     done = 0
     pending = list(moves)
     while pending:

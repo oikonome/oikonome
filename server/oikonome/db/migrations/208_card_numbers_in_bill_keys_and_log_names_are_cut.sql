@@ -1,0 +1,28 @@
+-- Migration 206 cut a card number out of a detected bill's name and the
+-- activity log's label and sentence, and left three places spelling it
+-- whole: a detected bill's match key (bills.merchant) and the names its
+-- identity is stored under (raw.merchant_refs, raw.merchant_names), and
+-- the log's target where it is a name (a bill's payee, a merchant's, the
+-- merchant a rule is keyed on) with the names its detail quotes (a bill's
+-- payee before and after, a merchant's or an account's name, the merchant
+-- a category act taught). The bill pass and the log now cut what they
+-- write (activity.record); this cuts what they stored.
+--
+-- The cut runs in Python, as db/migrate.py's PYTHON_STEPS step for this
+-- file (bills.cut_detected_keys, activity.cut_stored_names), in this
+-- file's transaction. The SQL cut is the same cut, but it takes seconds
+-- per megabyte on text dense with groups of four, and a migration hands
+-- no stored text to it (sync/card_number.py). So this file changes no
+-- schema and no row; it is the record that the step ran.
+--
+-- A key is matched cut on both sides (budget._phrase_in), so a bill finds
+-- the rows it found before, whether a row spells the number whole (a feed
+-- row) or cut (a file row). A bill a person made (raw.source 'manual')
+-- keeps its key as typed; an identity name stays whole where a live
+-- merchant still holds it whole (a person's name, which 204 kept). Ids are
+-- never cut: not a bill's, not the log's targets that are ids (a
+-- transaction's, an account's, a merge offer's), not the ids a detail
+-- lists. Idempotent: a cut number is "…" and four digits, which no cut
+-- changes again, and every row is written only if it still reads as read.
+
+SELECT 1;

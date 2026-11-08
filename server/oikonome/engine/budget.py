@@ -23,6 +23,7 @@ import math
 import re
 
 from .. import localtime
+from ..sync import card_number
 from .compat import MAX_AMOUNT, as_date, as_dict, jsonb
 from . import merchant_sql
 from . import categories as _cats
@@ -447,7 +448,6 @@ def snapshot_month(conn, today: dt.date, *,
         if row is None or row["updated_at"] is None \
                 or row["updated_at"] > unchanged_since:
             return False
-    from ..sync.restore import scrub_config
     conn.execute(
         """INSERT INTO budget_snapshots (year, month, config, bills)
            VALUES (%s, %s, %s, %s)
@@ -457,7 +457,7 @@ def snapshot_month(conn, today: dt.date, *,
                             THEN COALESCE(budget_snapshots.bills, EXCLUDED.bills)
                             ELSE EXCLUDED.bills END,
                captured_at = now()""",
-        (today.year, today.month, jsonb(scrub_config(cfg)),
+        (today.year, today.month, jsonb(_clean_snapshot_config(cfg)),
          jsonb(_freeze_bills(conn, today)), unchanged_since is not None))
     return True
 
@@ -483,8 +483,7 @@ def backfill_snapshots(conn, today: dt.date) -> int:
         return 0                     # no ledger, nothing to judge
     have = {(r["year"], r["month"]) for r in conn.execute(
         "SELECT year, month FROM budget_snapshots")}
-    from ..sync.restore import scrub_config
-    blob = jsonb(scrub_config(cfg))
+    blob = jsonb(_clean_snapshot_config(cfg))
     # the CURRENT schedule, same opt-in retroactivity as the config — the
     # row stays source='backfill' so the card can say the schedule (like
     # the budget) was chosen after the fact
@@ -505,6 +504,29 @@ def backfill_snapshots(conn, today: dt.date) -> int:
     return n
 
 
+def _clean_snapshot_config(cfg: dict) -> dict:
+    """A frozen month's settings held to the shape a restored live config
+    is held to — the restore's own cleaners, called, never re-spelled here.
+
+    A snapshot is a full copy of the settings at close, so it carries
+    whatever an older door let into them, and a restored ZIP lands it
+    verbatim; the lenses then hand it to month_status for that month and
+    for every Year lens and report that walks it. Applied when a month is
+    frozen AND when it is read back, so a row stored before this rule (or
+    by an archive) reads clean too. Returns a cleaned copy; the notes the
+    cleaners write for a restore have no reader here."""
+    from ..sync import restore as _restore      # late: sync imports engine
+    out = _restore.scrub_config(dict(cfg))
+    _restore.clean_excluded_accounts(out)
+    for clean in (_restore.clean_budget_amounts,
+                  _restore.clean_income_scenarios,
+                  _restore.clean_savings_goals,
+                  _restore.clean_manual_assets,
+                  _restore.clean_config_shapes):
+        clean(out)
+    return out
+
+
 def _snapshot_budgets_numeric(cfg: dict) -> bool:
     """Both variable budgets present and genuinely numeric (bool is an
     int in Python — excluded on purpose)."""
@@ -522,7 +544,9 @@ def snapshot_config(conn, year: int, month: int) -> dict | None:
         (year, month)).fetchone()
     if row is None:
         return None
-    cfg = dict(row["config"])
+    if not isinstance(row["config"], dict):
+        return None
+    cfg = _clean_snapshot_config(row["config"])
     # a snapshot always comes through load_config, so these exist and are
     # numbers; treat a malformed row as absent rather than crashing the
     # whole lens — a restored ZIP is the door junk can arrive through,
@@ -544,7 +568,15 @@ def snapshot_bill_rows(conn, year: int, month: int) -> list | None:
     sched = row["bills"] if row else None
     if not isinstance(sched, dict) or not isinstance(sched.get("rows"), list):
         return None
-    return [r for r in sched["rows"]
+    # each raw config gets the pass a live bill's gets on restore
+    # (clean_bill_raw), here as well as at restore: a row frozen before
+    # that rule reads the same as one restored after it. Every key the
+    # closed-month readers index is present on every row handed out — a
+    # hand-built row without merchant or category reads as having none.
+    from ..sync.restore import clean_bill_raw
+    return [{**r, "raw": clean_bill_raw(r["raw"]),
+             "merchant": r.get("merchant"), "category": r.get("category")}
+            for r in sched["rows"]
             if isinstance(r, dict)
             and isinstance(r.get("payee"), str)
             and isinstance(r.get("amount"), (int, float))
@@ -925,14 +957,13 @@ def _recurring_bills(conn, caps: dict | None = None,
     schedule from several engine passes over the same snapshot; the bill
     dicts are never mutated downstream, so sharing them is safe.
     `rows`: a frozen schedule (snapshot_bill_rows) replaces the live table
-    — never memoized, since one request can span months with different
-    frozen schedules and the key carries no row identity."""
-    if rows is not None:
-        return _recurring_bills_load(conn, caps, disabled, income, rows)
-    key = _memo_key("recurring_bills", caps, disabled, income)
+    — memoized by the rows' content, since one request can span months
+    with different frozen schedules (and a Year page's months mostly share
+    one)."""
+    key = _memo_key("recurring_bills", caps, disabled, income, rows)
     if memo is not None and key in memo:
         return memo[key]
-    out = _recurring_bills_load(conn, caps, disabled, income)
+    out = _recurring_bills_load(conn, caps, disabled, income, rows)
     if memo is not None:
         memo[key] = out
     return out
@@ -1001,13 +1032,11 @@ def _envelope_bills(conn, disabled: list | None = None, *,
     monthly cap would call every renewal month overspending). `monthly` is the
     pool spread over its months — what the plan reserves and the forecast
     drips — and at 1 month it IS the pool. `memo`: request-scoped cache, as on _recurring_bills. `rows`: a
-    frozen schedule replaces the live table, memo bypassed as there."""
-    if rows is not None:
-        return _envelope_bills_load(conn, disabled, rows)
-    key = _memo_key("envelope_bills", disabled)
+    frozen schedule replaces the live table, memoized by content as there."""
+    key = _memo_key("envelope_bills", disabled, rows)
     if memo is not None and key in memo:
         return memo[key]
-    out = _envelope_bills_load(conn, disabled)
+    out = _envelope_bills_load(conn, disabled, rows)
     if memo is not None:
         memo[key] = out
     return out
@@ -1076,35 +1105,73 @@ def _envelope_prior_used(conn, envelopes, today: dt.date,
         return {}
     used = {e["payee"]: 0.0 for e in annual}
     month_start = today.replace(day=1)
-    year_start = today.replace(month=1, day=1)
-    if year_start >= month_start:       # January: the pool is untouched
+    if month_start.month == 1:          # January: the pool is untouched
         return used
-    # the year-to-date match is the widest pass on the Today path, and one
-    # request runs month_status more than once (the verdict, the forecast,
-    # the bills-left tile); the answer depends only on the month, the
-    # excluded accounts and the schedules, so it is computed once per
-    # request. Copied out so a caller cannot mutate the cached dict.
-    key = _memo_key("envelope_prior_used", month_start, excluded,
-                    [(e["payee"], e["period_months"]) for e in envelopes],
-                    [(b["payee"], b["amount"]) for b in (bills or [])])
+    for on, payee, amount in _envelope_year_claims(
+            conn, envelopes, annual, month_start.year, excluded,
+            memo=memo, bills=bills):
+        if on < month_start:
+            used[payee] += amount
+    return used
+
+
+def _schedule_print(items, fields) -> tuple:
+    """What a matching pass reads of each bill or envelope, frozen for a
+    memo key: two months judged under frozen schedules that differ only
+    in a due day or a merchant must not share an answer."""
+    def one(v):
+        if isinstance(v, (set, frozenset)):
+            return tuple(sorted(map(str, v)))
+        return v
+    return tuple(tuple(one(it.get(f)) for f in fields) for it in items)
+
+
+_BILL_PRINT = ("payee", "amount", "fee_total", "anchor", "floor",
+               "recurrence", "cap", "bands", "ids", "key",
+               "merchant_tokens", "merchant_phrase", "tokens", "companions")
+_ENVELOPE_PRINT = ("payee", "period_months", "ids", "key", "match_cat",
+                   "merchant_tokens", "merchant_phrase", "off")
+
+
+def _envelope_year_claims(conn, envelopes, annual, year: int,
+                          excluded: list | None, *,
+                          memo: dict | None = None,
+                          bills: list | None = None) -> list[tuple]:
+    """(date, annual envelope payee, amount) for every row of `year` an
+    ANNUAL envelope claims — ONE pass over the year, so the prior use of
+    every month is a sum of the claims dated before it. Re-matching the
+    year to date for each month made the Year lens quadratic in the month
+    number (each month re-read and re-matched every month before it).
+
+    The pass matches the whole year's rows against the whole year's
+    occurrences (the December before and the January after as decoys), so
+    a row an occurrence claims is the bill's exactly as in the month the
+    occurrence is homed in — the same answer whichever month asks."""
+    # the answer depends only on the year, the excluded accounts and the
+    # schedules; one request (the Today page's verdict, forecast and
+    # bills-left tile, or the twelve months of a Year page) asks for it
+    # many times
+    key = _memo_key("envelope_year_claims", year, excluded,
+                    _schedule_print(envelopes, _ENVELOPE_PRINT),
+                    _schedule_print(bills or [], _BILL_PRINT))
     if memo is not None and key in memo:
-        return dict(memo[key])
-    # the claimer reads payee/name/amount/category only — the year-to-date
-    # window is the widest scan on the Today path, so it skips the display
-    # name, logo and account columns the month rows carry for rendering
-    rows = _spend_rows(conn, year_start, month_start, excluded=excluded,
-                       slim=True, memo=memo)
+        return memo[key]
+    year_start = dt.date(year, 1, 1)
+    # the claimer reads payee/name/amount/category only — the year window
+    # is the widest scan on the Today path, so it skips the display name,
+    # logo and account columns the month rows carry for rendering
+    rows = _spend_rows(conn, year_start, dt.date(year + 1, 1, 1),
+                       excluded=excluded, slim=True, memo=memo)
     claimed: set[int] = set()
     if bills:
-        # the same candidate set month_status matches over: the December
-        # before as decoys, every month of the year so far, and the
-        # current month, so a payment made late in the prior month for
-        # this month's occurrence is the bill's too
-        occs = month_occurrences(bills, year_start.year - 1, 12)
-        y, m = year_start.year, 1
-        while (y, m) <= (month_start.year, month_start.month):
-            occs += month_occurrences(bills, y, m)
-            y, m = (y, m + 1) if m < 12 else (y + 1, 1)
+        # the candidate set month_status matches over: the December before
+        # as decoys, every month of the year, and the January after, so a
+        # payment made late in one month for the next month's occurrence
+        # is the bill's too
+        occs = month_occurrences(bills, year - 1, 12)
+        for m in range(1, 13):
+            occs += month_occurrences(bills, year, m)
+        occs += month_occurrences(bills, year + 1, 1)
         claimed, _ = match_occurrences(rows, occs)
     # an envelope with a merchant identity is claimed by merchant id and
     # never reads the row's words, so the year's rows are tokenised only
@@ -1114,13 +1181,14 @@ def _envelope_prior_used(conn, envelopes, today: dt.date,
     # only hand a row to an envelope that matches it by merchant or by
     # category. A row no annual envelope could match is nobody's business
     # in this pass, whoever ends up claiming it, so it is passed over before
-    # its words are tokenised — the year to date is thousands of rows and
-    # an annual envelope wants a handful of them. An annual envelope that
+    # its words are tokenised — the year is thousands of rows and an
+    # annual envelope wants a handful of them. An annual envelope that
     # matches on text cannot be ruled out without the words, so every row
     # takes the full claim then.
     annual_text = any(e.get("ids") is None for e in annual)
     annual_ids = [e["ids"] for e in annual if e.get("ids") is not None]
     annual_cats = {e["match_cat"] for e in annual if e.get("match_cat")}
+    out: list[tuple] = []
     for i, r in enumerate(rows):
         if i in claimed:
             continue
@@ -1134,33 +1202,61 @@ def _envelope_prior_used(conn, envelopes, today: dt.date,
         toks = _tokens(txt) if by_words else set()
         e = _claim_envelope(envelopes, r, toks, txt)
         if e is not None and e["period_months"] > 1:
-            used[e["payee"]] += r["amount"]
+            out.append((as_date(r["date"]), e["payee"], r["amount"]))
     if memo is not None:
-        memo[key] = dict(used)
-    return used
+        memo[key] = out
+    return out
 
 
 def _claim_envelope(envelopes, row, toks, txt):
-    """Which envelope claims this row? Merchant matches win over category
-    matches (mirrors _claim_custom); within each tier, list order breaks
-    ties. One shared claimer so prior-used and the month's matching cannot
-    disagree about who owns a row."""
+    """Which envelope claims this row? A BUDGET envelope always beats one
+    marked `off` (taken out of the budget, carried only for its
+    informational row — display_envelopes): every budget envelope, at
+    either tier, gets first refusal, and an `off` envelope only claims a
+    row none of them wants. Without that, a disabled envelope's merchant
+    match outbids an enabled envelope's category match, and the page that
+    carries disabled envelopes disagrees with the verdict, which never sees
+    them — whatever order the caller listed them in. Within that, merchant
+    matches win over category matches (mirrors _claim_custom), and within
+    each tier list order breaks ties. One shared claimer so prior-used and
+    the month's matching cannot disagree about who owns a row."""
     mid = row_merchant_id(row)
-    for e in envelopes:
-        # an envelope with a merchant identity is _bill_matches' first
-        # branch, tested inline: this runs per row of the year to date
-        # against every envelope
-        ids = e.get("ids")
-        if ids is not None:
-            if mid is not None and mid in ids:
+    rc = None
+    for off in ((False, True) if any(e.get("off") for e in envelopes)
+                else (False,)):
+        for e in envelopes:
+            if bool(e.get("off")) is not off:
+                continue
+            # an envelope with a merchant identity is _bill_matches' first
+            # branch, tested inline: this runs per row of the year to date
+            # against every envelope
+            ids = e.get("ids")
+            if ids is not None:
+                if mid is not None and mid in ids:
+                    return e
+            elif _bill_matches(e, toks, txt, mid):
                 return e
-        elif _bill_matches(e, toks, txt, mid):
-            return e
-    rc = _cat_norm(row["category"]) if row.get("category") else ""
-    for e in envelopes:
-        if e.get("match_cat") and e["match_cat"] == rc:
-            return e
+        if rc is None:
+            rc = _cat_norm(row["category"]) if row.get("category") else ""
+        for e in envelopes:
+            if (bool(e.get("off")) is off and e.get("match_cat")
+                    and e["match_cat"] == rc):
+                return e
     return None
+
+
+def display_envelopes(conn, disabled: list | None = None, *,
+                      rows: list | None = None) -> tuple[list[dict], set]:
+    """Every envelope of the schedule, for a page that shows the disabled
+    ones too, and the payees of the ones in the budget. A disabled envelope
+    is marked `off`, so the claimer (_claim_envelope) lets it draw only on
+    rows no budget envelope wants — the budget envelopes then land on
+    exactly the claims month_status gives them."""
+    in_budget = {e["payee"] for e in _envelope_bills(conn, disabled=disabled,
+                                                     rows=rows)}
+    out = [e if e["payee"] in in_budget else {**e, "off": True}
+           for e in _envelope_bills(conn, rows=rows)]
+    return out, in_budget
 
 
 def match_envelopes(rows, envelopes, matched_idx: set[int],
@@ -1224,7 +1320,39 @@ def match_envelopes(rows, envelopes, matched_idx: set[int],
     return env_matched, states
 
 
+def monthly_rule_days(rec: dict) -> list[int]:
+    """The calendar days of a rule that falls on several days of every month
+    (the 15th and the last day: [15, -1]), or [] for any other rule. A bill
+    on such a rule costs its amount once per day listed."""
+    if str(rec.get("frequency") or "").upper() != "MONTHLY" \
+            or (rec.get("interval") or 1) != 1:
+        return []
+    days = rec.get("byMonthDay")
+    if not isinstance(days, (list, tuple)):
+        return []
+    # a restored rule can hold anything; a bool is an int to isinstance
+    days = list(dict.fromkeys(d for d in days if isinstance(d, int)
+                              and not isinstance(d, bool)))
+    return days if len(days) >= 2 else []
+
+
+def month_days_words(days: list[int]) -> str:
+    """A rule's days of the month in words: "15th and last day"."""
+    def word(d: int) -> str:
+        if d < 0:
+            return "last day" if d == -1 else f"{-d} days before month end"
+        tail = ("th" if 11 <= d % 100 <= 13
+                else {1: "st", 2: "nd", 3: "rd"}.get(d % 10, "th"))
+        return f"{d}{tail}"
+    words = [word(d) for d in sorted(days, key=lambda d: (d < 0, d))]
+    return " and ".join(words) if len(words) <= 2 else (
+        ", ".join(words[:-1]) + f" and {words[-1]}")
+
+
 def _cycle_days(rec: dict) -> int:
+    days = monthly_rule_days(rec)
+    if days:
+        return 30 // len(days)
     per = {"DAILY": 1, "WEEKLY": 7, "MONTHLY": 30, "YEARLY": 365}
     return per.get((rec.get("frequency") or "MONTHLY").upper(), 30) * (rec.get("interval") or 1)
 
@@ -1447,7 +1575,8 @@ def _occurrences_in_month(bill: dict, year: int, month: int) -> list[dt.date]:
             if d < 0:  # iCal convention: -1 = last day of month
                 d = last_day + 1 + d
             out.append(dt.date(year, month, min(max(d, 1), last_day)))
-        return out
+        # [30, -1] lands twice on the 28th of a February: one payment
+        return sorted(set(out))
 
     if freq == "YEARLY":
         months = _ints(rec.get("byMonth"), [anchor.month])
@@ -1491,9 +1620,14 @@ def custom_bucket_specs(cfg: dict) -> list[dict]:
             monthly = max(0.0, float(e.get("monthly") or 0))
         except (TypeError, ValueError):
             monthly = 0.0
-        cats = [str(c).strip() for c in (e.get("categories") or [])
+        # a rule list that is not a list (a restored or frozen config)
+        # holds no rules — iterating a number would 500 the page
+        cats_in, merch_in = e.get("categories"), e.get("merchants")
+        cats = [str(c).strip() for c in (cats_in
+                                         if isinstance(cats_in, list) else [])
                 if str(c).strip()]
-        merch = [str(m).strip() for m in (e.get("merchants") or [])
+        merch = [str(m).strip() for m in (merch_in
+                                          if isinstance(merch_in, list) else [])
                  if str(m).strip()]
         # A matcher-less bucket is a valid PLAN PLACEHOLDER, and
         # /api/settings accepts one deliberately — the Budget planner's
@@ -1568,7 +1702,7 @@ def _pending_expense_shapes(conn) -> list[dict]:
 
 def _pending_expense_monthly(conn) -> tuple[float, int]:
     """Monthly-equivalent load of pending expense proposals (wizard seed)."""
-    from .bills import _monthly
+    from .bills import offer_monthly
     total = 0.0
     n = 0
     for p in conn.execute(
@@ -1577,8 +1711,7 @@ def _pending_expense_monthly(conn) -> tuple[float, int]:
                WHERE status = 'pending' AND kind = 'add'""").fetchall():
         if (as_dict(p["evidence"]) or {}).get("income"):
             continue
-        total += _monthly(abs(float(p["amount"] or 0)),
-                          p["frequency"], p["interval"] or 1)
+        total += offer_monthly(p)
         n += 1
     return round(total, 2), n
 
@@ -1652,9 +1785,13 @@ def suggest_budgets(conn, today: dt.date) -> dict:
         mk = _month_key(r["date"])
         if mk not in months or i in owned:
             continue
+        # a carve-out's row stays in its pool too: the verdict judges food/
+        # other whole, carve-outs inside, so the pool's suggestion must be
+        # the whole pool (one left without them reads OVER once accepted)
+        totals["food" if r["is_food"] else "other"][mk] += r["amount"]
         c = _claim_custom(customs, r)
-        key = c["name"] if c else ("food" if r["is_food"] else "other")
-        totals[key][mk] += r["amount"]
+        if c:
+            totals[c["name"]][mk] += r["amount"]
 
     def _median(vals: list[float]) -> float:
         vs = sorted(vals)
@@ -1730,9 +1867,9 @@ def suggest_budgets(conn, today: dt.date) -> dict:
         inc = monthly_income(conn)
     if inc <= 0:
         from .compat import as_dict
-        from .bills import _monthly
+        from .bills import offer_monthly
         inc = round(sum(
-            _monthly(abs(p["amount"]), p["frequency"], p["interval"] or 1)
+            offer_monthly(p)
             for p in conn.execute(
                 """SELECT amount, frequency, "interval", evidence
                    FROM bill_proposals
@@ -1766,6 +1903,19 @@ def suggest_budgets(conn, today: dt.date) -> dict:
                                "category": cat.replace(" ", "_").upper(),
                                "monthly": med})
     candidates.sort(key=lambda c: -c["monthly"])
+    # the planner saves a candidate's name as a bucket name, so each must be
+    # one the settings door takes: 1-40 chars, no reserved word, unique
+    # ignoring case, at most 40 buckets beside the ones already saved. The
+    # full category stays the matcher.
+    named, seen_names = [], {c["name"].lower() for c in customs}
+    for c in candidates:
+        nm = c["name"][:40].rstrip()
+        if not nm or nm.lower() in RESERVED_BUCKET_NAMES \
+                or nm.lower() in seen_names:
+            continue
+        seen_names.add(nm.lower())
+        named.append(dict(c, name=nm))
+    candidates = named[:max(0, 40 - len(customs))]
     # monthly bill load for the savings-surplus prefill — same
     # evened_monthly_load the month plan uses. Approved bills only for
     # the occurrence engine (pending rows lack recurrence anchors); when
@@ -1932,15 +2082,52 @@ def _text_norm(text: str) -> str:
                         join_apostrophes((text or "").lower())).strip() + " "
 
 
+def _phrase_text(text: str | None) -> str:
+    """The text a phrase is read from, on either side: lowercased,
+    apostrophes joined, and every card or account number cut to its last
+    four (sync.card_number). A key and a ledger row spell the same number
+    whole or cut — a file row stores it cut, a feed row keeps the bank's
+    digits, a detected bill's key is stored cut and a typed one as typed —
+    so both are compared cut and a key matches the same rows either way."""
+    return card_number.cut(join_apostrophes((text or "").lower()))
+
+
+_DIGIT = re.compile(r"[0-9]")
+
+
+def _phrase_in(phrase: str, text: str | None) -> bool:
+    """Does `text` hold `phrase` (a _merchant_phrase), word-bounded? A
+    phrase holding digits is compared against the row's text cut
+    (_phrase_text); one without reads the row as it always has."""
+    if _DIGIT.search(phrase):
+        low = join_apostrophes((text or "").lower())
+        # the cut is slow; a row not spelling the phrase's longest word
+        # cannot hold the phrase cut either (_phrase_probe)
+        if _phrase_probe(phrase) not in low:
+            return False
+        return phrase in _text_norm(card_number.cut(low))
+    return phrase in _text_norm(text)
+
+
+def _phrase_probe(phrase: str) -> str:
+    """The word a row must spell, as it stands, to hold `phrase` read cut.
+    Every word of a cut text is spelled in the uncut text: a cut keeps a
+    number's last four digits beside what followed the number, and leaves
+    the rest as it was. So a row without the phrase's longest word cannot
+    match, and the slow cut is skipped for it (_phrase_in, and the
+    SQL forms in merchant_match_sql and merchant_claim_sql)."""
+    return max(phrase.split(), key=len)
+
+
 def _merchant_phrase(merchant: str | None) -> str | None:
     """A word-boundary-padded phrase to SUBSTRING-match, used when a merchant's
     LEADING word is a too-short-to-tokenize disambiguator ('ox mobile').
     Only a dropped FIRST word triggers phrase mode — dropped trailing junk
-    (order codes, TLDs) must NOT."""
+    (order codes, TLDs) must NOT. Read cut (_phrase_text): a number in the
+    phrase is its last four, whichever way the key spells it."""
     if not merchant:
         return None
-    words = [w for w in re.split(r"[^a-z0-9]+",
-                                 join_apostrophes(merchant.lower())) if w]
+    words = [w for w in re.split(r"[^a-z0-9]+", _phrase_text(merchant)) if w]
     if words and words[0] not in _tokens(merchant):   # leading word was dropped
         return " " + " ".join(words) + " "
     return None
@@ -1993,7 +2180,7 @@ def _text_matcher(merchant: str | None, key: str | None):
             s(text, tokens) for s in subs)
     phrase = _merchant_phrase(merchant)
     if phrase:
-        return lambda text, tokens=None, merchant_id=None: phrase in _text_norm(text)
+        return lambda text, tokens=None, merchant_id=None: _phrase_in(phrase, text)
     toks = _tokens(merchant) if merchant else ({key} if key else set())
     if not toks:
         return lambda text, tokens=None, merchant_id=None: False
@@ -2016,8 +2203,10 @@ def merchant_claim_sql(merchant: str | None,
                        key: str | None = None) -> tuple[str, list]:
     """merchant_matcher's three forms as a predicate over ONE merchant
     NAME, precomputed as `runs` (its maximal letter runs, lowercased, a
-    text[]) and `norm` (its _text_norm form): alternatives OR, phrase as
-    a substring of norm, tokens as array containment. The same decision
+    text[]), `norm` (its _text_norm form) and `cnorm` (norm with its
+    numbers cut, cut_norm_sql): alternatives OR, phrase as a substring of
+    norm (of cnorm when the phrase holds digits), tokens as array
+    containment. The same decision
     tokens_match_sql makes with a regex per token — a token is a maximal
     letter run — without the regex, so a few thousand names can be tested
     against every bill in one statement. 'FALSE' where the Python form
@@ -2032,6 +2221,13 @@ def merchant_claim_sql(merchant: str | None,
         return ("(" + " OR ".join(frags) + ")") if frags else "FALSE", params
     phrase = _merchant_phrase(merchant)
     if phrase:
+        # a phrase holding digits reads the key cut (cnorm), as
+        # _phrase_in reads a row
+        if _DIGIT.search(phrase):
+            # norm spells every word the key spells (_phrase_probe)
+            return ("CASE WHEN strpos(norm, %s) > 0"
+                    " THEN strpos(cnorm, %s) > 0 ELSE FALSE END",
+                    [_phrase_probe(phrase), phrase])
         return "strpos(norm, %s) > 0", [phrase]
     toks = _tokens(merchant) if merchant else ({key} if key else set())
     if not toks:
@@ -2322,8 +2518,8 @@ def bill_displays(conn, bills, today: dt.date | None = None,
     entity. A rename is exactly that shape: the old spelling is a key the
     bill names entirely, and the person (or Plaid) filed it under the
     merchant's new name. A processor's note in the descriptor is not:
-    "SMASH BURGER … GOOGLE PAY" is the Smashburger key, whose name says
-    nothing of Google, so a Google bill is never offered Smashburger's rows
+    "HARBORLIGHT GRILL … WALLETCO" is the Harborlight key, whose name
+    says nothing of Walletco, so a Walletco bill is never offered its rows
     however few they are. Keys grouped only by the string clean or a
     reviewed map carry no such authority, so there the bill's keys must be
     at least half the name's rows — one stray descriptor folded into a
@@ -2377,7 +2573,8 @@ def bill_displays(conn, bills, today: dt.date | None = None,
                                regexp_split_to_array(btrim(regexp_replace(
                                    raw_key, '[^a-z]+', ' ', 'g')), ' ') AS runs,
                                ' ' || btrim(regexp_replace(
-                                   raw_key, '[^a-z0-9]+', ' ', 'g')) || ' ' AS norm
+                                   raw_key, '[^a-z0-9]+', ' ', 'g')) || ' ' AS norm,
+                               {cut_norm_sql('raw_key')} AS cnorm
                           FROM k0 WHERE display IS NOT NULL) x),
             b AS (SELECT display, sum(n) AS bucket_n FROM k GROUP BY 1)
             SELECT g.i, k.display
@@ -2439,6 +2636,24 @@ MATCH_NORM_SQL = (f"' ' || btrim(regexp_replace({MATCH_TEXT_SQL}, "
                   "'[^a-z0-9]+', ' ', 'g')) || ' '")
 
 
+def cut_norm_sql(expr: str) -> str:
+    """_text_norm(_phrase_text(...)), in SQL, over `expr` already lowered
+    and apostrophe-joined: the number cut (card_number.sql_cut) only where
+    the cheap selector finds one, so a row with none never reaches the
+    cut's patterns."""
+    cut = (f"CASE WHEN ({expr}) ~ {_sql_literal(card_number.sql_selector())}"
+           f" THEN {card_number.sql_cut(f'({expr})')} ELSE ({expr}) END")
+    return f"' ' || btrim(regexp_replace({cut}, '[^a-z0-9]+', ' ', 'g')) || ' '"
+
+
+def _sql_literal(s: str) -> str:
+    return "'" + s.replace("'", "''") + "'"
+
+
+# MATCH_NORM_SQL read cut: what a phrase holding digits is compared with
+MATCH_CUT_NORM_SQL = cut_norm_sql(MATCH_TEXT_SQL)
+
+
 def tokens_match_sql(toks: set[str]) -> tuple[str, list]:
     """_tokens' subset test, in SQL: every required token present.
 
@@ -2470,6 +2685,12 @@ def merchant_match_sql(merchant: str | None,
         return ("(" + " OR ".join(frags) + ")") if frags else "FALSE", params
     phrase = _merchant_phrase(merchant)
     if phrase:
+        if _DIGIT.search(phrase):
+            # the cut only for a row spelling the phrase's longest word
+            # (_phrase_probe): CASE, so the planner cannot reorder it
+            return (f"CASE WHEN strpos({MATCH_TEXT_SQL}, %s) > 0"
+                    f" THEN strpos({MATCH_CUT_NORM_SQL}, %s) > 0"
+                    " ELSE FALSE END", [_phrase_probe(phrase), phrase])
         return f"strpos({MATCH_NORM_SQL}, %s) > 0", [phrase]
     return tokens_match_sql(_tokens(merchant) if merchant
                             else ({key} if key else set()))
@@ -2489,7 +2710,7 @@ def _bill_matches(bill: dict, txn_tokens: set, txn_text: str = "",
         return matcher(txn_text, txn_tokens)
     phrase = bill.get("merchant_phrase")
     if phrase:
-        return phrase in _text_norm(txn_text)
+        return _phrase_in(phrase, txn_text)
     mt = _match_tokens(bill)
     return bool(mt) and mt <= txn_tokens
 
@@ -2649,6 +2870,15 @@ def bill_candidates(rows) -> list[tuple[dict, list[int]]]:
 # how far outside a bill's band envelope match_occurrences' pre-filter
 # still hands a charge to the exact amount test (see there)
 _GATE_SLACK = 0.01
+
+
+def awaits_payment(occ: dict, day: dt.date) -> bool:
+    """An unpaid, unfloored occurrence that a payment dated `day` could
+    still settle: `day` lies inside the occurrence's own match window of its
+    due date — the window match_occurrences pairs a charge by. Past it, a
+    payment would not be this bill's at all, so the occurrence is not owed."""
+    return (occ["txn"] is None and not occ["floored"]
+            and abs((day - occ["due"]).days) <= occ["window"])
 
 
 def match_occurrences(rows, occurrences) -> tuple[set[int], list]:
@@ -2953,6 +3183,28 @@ _LEDGER_TABLES = ("transactions", "transaction_splits", "reimbursements",
                   "merchant_canonical", "account_links", "tenant_settings")
 
 
+_SPEND_SPAN = ("spend_rows_span",)
+
+
+def share_spend_window(memo: dict | None, since: dt.date,
+                       until: dt.date) -> None:
+    """Have every _spend_rows call this request makes inside [since, until)
+    served from ONE read of that window (see _spend_rows). For a request
+    that judges many months — the Year lens, the yearly mail — whose match
+    windows overlap: each month read on its own pulls its rows four times
+    over."""
+    if memo is not None:
+        memo[_SPEND_SPAN] = (since, until)
+
+
+def year_spend_window(year: int) -> tuple[dt.date, dt.date]:
+    """Every row month_status reads judging any month of `year`, closed or
+    live: from PREPAY_MATCH_DAYS before January through a closed
+    December's horizon (the end of February after, plus the match days)."""
+    return (dt.date(year, 1, 1) - dt.timedelta(days=PREPAY_MATCH_DAYS),
+            _month_after(year + 1, 1) + dt.timedelta(days=PREPAY_MATCH_DAYS))
+
+
 def _spend_rows(conn, since: dt.date, until: dt.date,
                 excluded: list | None = None, *, slim: bool = False,
                 memo: dict | None = None, parts: bool = True,
@@ -2999,6 +3251,25 @@ def _spend_rows(conn, since: dt.date, until: dt.date,
         if memo is not None:
             memo[key] = hit
         return hit
+    span = memo.get(_SPEND_SPAN) if memo is not None else None
+    if span is not None and span[0] <= since and until <= span[1] \
+            and (since, until) != span:
+        # a request that walks many overlapping windows (the Year lens:
+        # twelve months, each matching five weeks either side) reads the
+        # whole span once and slices it here; the filter keeps the read's
+        # order, so every pass sees the rows it would have read itself. A
+        # slim caller takes the full read's rows when one is already in
+        # hand — the columns it reads are a subset.
+        wide = None
+        if slim:
+            wide = memo.get(_memo_key("spend_rows", span[0], span[1],
+                                      excluded, False, parts, withdrawn))
+        if wide is None:
+            wide = _spend_rows(conn, span[0], span[1], excluded, slim=slim,
+                               memo=memo, parts=parts, withdrawn=withdrawn)
+        out = [r for r in wide if since <= as_date(r["date"]) < until]
+        memo[key] = out
+        return out
     from . import links
     excluded = list(excluded or []) + links.shadow_ids(conn)
     excl_sql = "AND NOT (t.account_id = ANY(%s))" if excluded else ""
@@ -3087,7 +3358,7 @@ def _spend_rows(conn, since: dt.date, until: dt.date,
               AND t.date >= %s AND t.date < %s
               {PERSONAL_ONLY_SQL}
               {excl_sql}
-            ORDER BY t.amount DESC, {split_line}""",
+            ORDER BY t.amount DESC, {split_line}, t.id""",
         params).fetchall()
     if hasattr(conn, "memo_put"):
         conn.memo_put(key, out, *_LEDGER_TABLES)
@@ -3256,10 +3527,12 @@ def upcoming_bill_occurrences(conn, cfg: dict, today: dt.date,
         go "overdue" (no lookback before month start). Payments span a match
         window before the month start, and future-month occurrences are
         matched before being reserved.
-      - LAST month's occurrences join the match as decoys only: a boundary
+      - LAST month's occurrences join the match as decoys: a boundary
         payment (June's bill paid late on Jul 1) attaches to its own
-        occurrence instead of eating a current/future one. They are never
-        emitted.
+        occurrence instead of eating a current/future one. A BILL among
+        them still unpaid while a payment could yet be its own
+        (awaits_payment) is emitted for tomorrow, so the 1st does not
+        release a late rent's reserve before it posts; income never is.
       - `floored` occurrences are never expectations
       - an overdue unpaid bill is not dropped — it lands tomorrow, the
         soonest it can realistically be paid (current month only; future
@@ -3286,15 +3559,28 @@ def upcoming_bill_occurrences(conn, cfg: dict, today: dt.date,
     # window (≤PREPAY_MATCH_DAYS, month_occurrences) — look back that far
     # before the month start so an early cross-boundary payment is visible
     since = today.replace(day=1) - dt.timedelta(days=PREPAY_MATCH_DAYS)
+    py, pm = ((today.year, today.month - 1) if today.month > 1
+              else (today.year - 1, 12))
+    if not income:
+        # last month's unpaid bills can be owed tomorrow (below), so their
+        # own early payments must be visible: a premium due on the 20th of
+        # last month may have been paid up to its window before that.
+        since = dt.date(py, pm, 1) - dt.timedelta(days=PREPAY_MATCH_DAYS)
     if income:
         rows = _inflow_rows(conn, since, today + dt.timedelta(days=1),
                             excluded=excluded_account_ids(cfg), memo=memo)
     else:
         rows = _spend_rows(conn, since, today + dt.timedelta(days=1),
                            excluded=excluded_account_ids(cfg), memo=memo)
-    py, pm = ((today.year, today.month - 1) if today.month > 1
-              else (today.year - 1, 12))
-    occs = month_occurrences(bills, py, pm)         # decoys — never emitted
+    occs: list[dict] = []
+    if not income:
+        # the month before last, as decoys only: with the wider read its
+        # late payments are in view and must pair with their own
+        # occurrence, not with last month's.
+        ppy, ppm = (py, pm - 1) if pm > 1 else (py - 1, 12)
+        occs += month_occurrences(bills, ppy, ppm)
+    n_decoy = len(occs)
+    occs += month_occurrences(bills, py, pm)   # income: decoys only
     n_prev = len(occs)
     occs += month_occurrences(bills, today.year, today.month)
     n_cur = len(occs)
@@ -3330,11 +3616,22 @@ def upcoming_bill_occurrences(conn, cfg: dict, today: dt.date,
             from . import forecast
             if not forecast._checking_start(conn, cfg)[1]:
                 pending_hit = set()
-    for i in range(n_prev, len(occs)):
+    tomorrow = today + dt.timedelta(days=1)
+    for i in range(n_decoy if not income else n_prev, len(occs)):
         occ = occs[i]
         if occ["floored"] or occ["txn"] is not None:
             continue
         due = occ["due"]
+        if i < n_prev:
+            # last month's bill still unpaid: owed tomorrow for as long as
+            # a payment could still be its own (awaits_payment). Dropped on
+            # the 1st, headroom would jump by the bill overnight with
+            # nothing in the ledger moved, and the late payment would land
+            # as a drop the forecast never expected. A bill skipped longer
+            # ago than its window is not coming and stays dropped.
+            if not awaits_payment(occ, tomorrow):
+                continue
+            due = tomorrow
         if income and due == today and i in pending_hit:
             continue
         if i < n_cur and (not income or (
@@ -4147,6 +4444,35 @@ def _month_income(conn, cfg: dict, today: dt.date, *, closed: bool,
     return round((received or 0.0) + expected, 2), received, expected
 
 
+def _month_after(year: int, month: int) -> dt.date:
+    """The 1st of the month after (year, month)."""
+    return (dt.date(year + 1, 1, 1) if month == 12
+            else dt.date(year, month + 1, 1))
+
+
+def occurrence_home(occ: dict) -> tuple[int, int]:
+    """The ONE month a matched bill occurrence belongs to: the month its
+    payment is dated in when it was paid, its due month when it was not.
+
+    That month alone plans it, expects it, counts its cash and calls it
+    overdue; every other month's view leaves it out. A rent due the 30th
+    and paid on the 2nd is the next month's; one due the 1st and paid on
+    the 29th before is the previous month's. Judging the plan by the due
+    month and the payment by the month the cash moved, in two places,
+    would plan one rent in two months and call it overdue in the month it
+    was paid for.
+    """
+    d = (as_date(occ["txn"]["date"]) if occ.get("txn") is not None
+         else occ["due"])
+    return d.year, d.month
+
+
+def occurrences_homed_in(occs: list[dict], year: int,
+                         month: int) -> list[dict]:
+    """The occurrences whose home (occurrence_home) is (year, month)."""
+    return [o for o in occs if occurrence_home(o) == (year, month)]
+
+
 def month_status(conn, today: dt.date, *, historical: bool = False,
                  cfg: dict | None = None, memo: dict | None = None,
                  bill_rows: list | None = None,
@@ -4211,12 +4537,26 @@ def month_status(conn, today: dt.date, *, historical: bool = False,
     # The wider set is for MATCHING ONLY. Spend accounting stays inside the
     # month: `rows` is the in-month slice, so last month's cash cannot land
     # in this month's actuals.
+    #
+    # A CLOSED month also looks PAST its own end, through the end of the
+    # next month: an occurrence belongs to the month its payment is dated in
+    # (occurrence_home), so the month that was due a rent posted on the 2nd
+    # must see that payment to know the rent is not its own — otherwise it
+    # plans it and calls it overdue while the next month plans it again as
+    # a late-paid decoy. The next month's own view sees no further than its
+    # end, so neither does this one. Live, there are no rows past today.
+    ny, nm = ((today.year, today.month + 1) if today.month < 12
+              else (today.year + 1, 1))
+    # ...and a long-cycle bill may be paid up to PREPAY_MATCH_DAYS past its
+    # due day, so a closed month looks that much further still: an annual
+    # bill due on the 29th and paid five weeks late is homed two months on
+    horizon = (_month_after(ny, nm) + dt.timedelta(days=PREPAY_MATCH_DAYS)
+               if closed else today + dt.timedelta(days=1))
     match_rows = _spend_rows(
         conn, month_start - dt.timedelta(days=PREPAY_MATCH_DAYS),
-        today + dt.timedelta(days=1), excluded=excluded_account_ids(cfg),
-        memo=memo)
+        horizon, excluded=excluded_account_ids(cfg), memo=memo)
     in_month = [i for i, r in enumerate(match_rows)
-                if as_date(r["date"]) >= month_start]
+                if month_start <= as_date(r["date"]) <= today]
     _pos = {src: dst for dst, src in enumerate(in_month)}
     rows = [match_rows[i] for i in in_month]
 
@@ -4230,11 +4570,16 @@ def month_status(conn, today: dt.date, *, historical: bool = False,
     # unpaid decoy (or one settled last month) is dropped right after
     # matching — it is last month's problem, never this month's expectation
     # or "overdue".
-    py, pm = ((today.year, today.month - 1) if today.month > 1
-              else (today.year - 1, 12))
-    occs = month_occurrences(bills, py, pm)
-    n_prev = len(occs)
-    occs += month_occurrences(bills, today.year, today.month)
+    # The candidates are every month the match window can reach, not only
+    # the neighbours: a payment up to PREPAY_MATCH_DAYS from its due day can
+    # home an occurrence two months off (an annual bill prepaid five weeks
+    # early), and an occurrence nobody offers is planned in no month while
+    # its payment reads as variable spend.
+    occs = []
+    reach = _months_between(month_start - dt.timedelta(days=PREPAY_MATCH_DAYS),
+                            horizon + dt.timedelta(days=PREPAY_MATCH_DAYS))
+    for (yy, mm) in reach:      # in calendar order, next month included
+        occs += month_occurrences(bills, yy, mm)
     # Next month's occurrences join the candidates, for MATCHING only. The
     # forecast attaches rent due the 1st to its autopay on the 28th before;
     # the verdict must attach the same payment to the same occurrence, or
@@ -4244,30 +4589,46 @@ def month_status(conn, today: dt.date, *, historical: bool = False,
     # fixed spend and fixed plan (the money left here; next month skips
     # it as settled-before-start). One nobody has paid yet is dropped
     # right after matching — it is neither this month's expectation nor
-    # its plan, or every month would carry two rents.
-    ny, nm = ((today.year, today.month + 1) if today.month < 12
-              else (today.year + 1, 1))
-    n_this = len(occs)
-    occs += month_occurrences(bills, ny, nm)
+    # its plan, or every month would carry two rents. (Next month is in
+    # `reach` above.)
     matched_all, occs = match_occurrences(match_rows, occs)
+    here = (today.year, today.month)
+
+    def _dated_here(r) -> bool:
+        return month_start <= as_date(r["date"]) <= today
+
+    # THIS month's own schedule — every occurrence due inside the month that
+    # is an obligation (paid, or unpaid and unfloored), wherever its cash
+    # moved. The dynamic variable scale reads this, never cash-basis
+    # fixed_month: an early autopay of next month's bill (or a late payment
+    # of last month's) moves cash between months, and letting it move the
+    # scale would shrink this month's food/other budgets — flipping a
+    # household UNDER to OVER with no change in what it spent — while the
+    # month that actually owes the bill gets nothing back.
+    scheduled_month = sum(
+        o["planned"] for o in occs
+        if (o["due"].year, o["due"].month) == here
+        and (o["txn"] is not None or not o["floored"]))
     # A companion is spending in the month it is DATED, like every other
-    # row. An occurrence whose main charge settled before this month began
-    # is skipped below (and the decoys among them dropped right here), but
-    # a fee that rode with it can post on the 1st or 2nd: matching already
-    # took that row out of the variable side, so unless it is counted here
-    # it is counted in no month at all.
+    # row. An occurrence whose home is another month (its main charge
+    # settled before this month began, or posts after it ended) is left out
+    # below, but a fee that rode with it can post inside this month:
+    # matching already took that row out of the variable side, so unless
+    # it is counted here it is counted in no month at all.
     settled_fees = sum(
         c["amount"] for o in occs
-        if o["txn"] is not None and as_date(o["txn"]["date"]) < month_start
-        for c in o.get("companions") or []
-        if as_date(c["date"]) >= month_start)
-    occs = ([o for o in occs[:n_prev] if o["txn"] is not None
-             and as_date(o["txn"]["date"]) >= month_start]
-            + occs[n_prev:n_this]
-            + [o for o in occs[n_this:] if o["txn"] is not None])
-    mark_withdrawn(conn, occs, today,
+        if o["txn"] is not None and occurrence_home(o) != here
+        for c in o.get("companions") or [] if _dated_here(c))
+    # the withdrawn reading keeps every occurrence DUE here as well, the
+    # paid ones as decoys (mark_withdrawn): a withdrawn twin of an early
+    # payment must bind to the occurrence it duplicates
+    mark_withdrawn(conn, [o for o in occs
+                          if occurrence_home(o) == here
+                          or (o["due"].year, o["due"].month) == here],
+                   today,
                    since=month_start - dt.timedelta(days=PREPAY_MATCH_DAYS),
                    cfg=cfg, memo=memo)
+    occs = occurrences_homed_in(occs, *here)
     # translate to `rows` indices; a match on a PRIOR-month payment has no
     # in-month row and simply drops out of the spend side
     matched_idx = {_pos[i] for i in matched_all if i in _pos}
@@ -4288,15 +4649,6 @@ def month_status(conn, today: dt.date, *, historical: bool = False,
     # recognized at payment, like the charge it rode with
     fixed_actual += settled_fees
     fixed_expected_td += settled_fees
-    # THIS month's own schedule — every occurrence due inside the month that
-    # is an obligation (paid, or unpaid and unfloored), wherever its cash
-    # moved. The dynamic variable scale reads this, never cash-basis
-    # fixed_month: an early autopay of next month's bill (or a late payment
-    # of last month's) moves cash between months, and letting it move the
-    # scale would shrink this month's food/other budgets — flipping a
-    # household UNDER to OVER with no change in what it spent — while the
-    # month that actually owes the bill gets nothing back.
-    scheduled_month = 0.0
     drifts: dict[str, float] = {}
     overdue_unpaid = []
     # bills pinned to the Today page/email get a per-bill month summary —
@@ -4310,16 +4662,7 @@ def month_status(conn, today: dt.date, *, historical: bool = False,
             "overdue": False, "withdrawn_on": None})
 
     for occ in occs:
-        if ((occ["due"].year, occ["due"].month) == (today.year, today.month)
-                and (occ["txn"] is not None or not occ["floored"])):
-            scheduled_month += occ["planned"]
         if occ["txn"] is not None:
-            # settled before this month began: the cash left in the month it
-            # left, and was counted there. It is neither an expectation nor
-            # an actual here — it is simply not this month's problem. What
-            # it must NOT be is "overdue".
-            if as_date(occ["txn"]["date"]) < month_start:
-                continue
             fixed_expected_td += occ["planned"]
             fixed_month += occ["planned"]
             # what was actually paid includes the companions that rode with
@@ -4336,7 +4679,7 @@ def month_status(conn, today: dt.date, *, historical: bool = False,
             # price did not change because a fee landed a day early.
             fixed_actual += occ["txn"]["amount"] + sum(
                 c.get("amount", 0.0) for c in occ.get("companions") or []
-                if as_date(c["date"]) >= month_start)
+                if _dated_here(c))
             d = paid_amount - occ["planned"]
             if abs(d) >= 1:
                 drifts[occ["bill"]["payee"]] = drifts.get(occ["bill"]["payee"], 0.0) + d

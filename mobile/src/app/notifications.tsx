@@ -14,7 +14,7 @@ import { useSession } from "../lib/session";
 import { ext } from "../ext";
 import { C, mmddyy } from "../lib/theme";
 import { EMAIL_KIND_LABEL, EMAIL_KINDS, kindOffNote, localDayOf, looksLikeMailbox,
-         NEED_BASE_URL, prefOn, recipientDuplicate, recipientEditBody, resendHeld,
+         NEED_BASE_URL, oneTimeCodeDigits, prefOn, recipientDuplicate, recipientEditBody, resendHeld,
          withPref }
   from "../lib/pure";
 import { CADENCES, cadenceOf, rebaseSched, storedSched }
@@ -51,17 +51,20 @@ export default function Notifications() {
     queryFn: () => client!.notifyStatus(),
     enabled: !!client,
   });
-  const smsOk = !!notify.data?.sms_available
+  // The shared demonstration login cannot switch a scheduled text ON (the
+  // server refuses it); one already on can still be turned off.
+  const smsLock = useSharedLock("grant");
+  const smsOk = !smsLock && !!notify.data?.sms_available
     && !!notify.data?.phone_verified;
   // any channel that can deliver: web push (VAPID), a relay for the mobile
   // app (this phone can register itself), or a phone already registered
   // The shared demonstration login cannot register this phone (the server
-  // refuses it a new outbound destination), so for it only a phone that is
-  // already registered can carry push.
+  // refuses it a new outbound destination) and cannot switch a scheduled
+  // push on; one already on can still be turned off.
   const pushLock = useSharedLock("grant");
-  const pushOk = (!pushLock && (!!notify.data?.push_available
-                                || !!notify.data?.native_push_available))
-    || (notify.data?.native_push_devices ?? 0) > 0;
+  const pushOk = !pushLock && (!!notify.data?.push_available
+                                || !!notify.data?.native_push_available
+                                || (notify.data?.native_push_devices ?? 0) > 0);
   const [sched, setSched] = useState<EmailSchedule | null>(null);
   const [openCad, setOpenCad] = useState<string | null>(null);
   // the zone the hours are kept in — household's own, else the instance's
@@ -275,10 +278,12 @@ export default function Notifications() {
                           trackColor={{ true: C.accent, false: C.hover }}
                           thumbColor={C.text} />
                 </View>
-                <SharedLock note={pushOk ? null : pushLock}>
+                {/* only an OFF switch is locked: one already on can always
+                    be turned off, as on the web */}
+                <SharedLock note={pushOk || c.push ? null : pushLock}>
                 <View style={s.row}>
                   <Text style={s.lbl}>Push to phones</Text>
-                  <Switch value={!!c.push} disabled={!pushOk}
+                  <Switch value={!!c.push} disabled={!pushOk && !c.push}
                           onValueChange={(push) => upd(cad, { push })}
                           trackColor={{ true: C.accent, false: C.hover }}
                           thumbColor={C.text} />
@@ -336,14 +341,16 @@ export default function Notifications() {
                     )}
                   </>
                 )}
+                <SharedLock note={smsOk || c.sms ? null : smsLock}>
                 <View style={s.row}>
                   <Text style={s.lbl}>SMS</Text>
-                  <Switch value={!!c.sms} disabled={!smsOk}
+                  <Switch value={!!c.sms} disabled={!smsOk && !c.sms}
                           onValueChange={(sms) => upd(cad, { sms })}
                           trackColor={{ true: C.accent, false: C.hover }}
                           thumbColor={C.text} />
                 </View>
-                {!smsOk && (
+                </SharedLock>
+                {!smsOk && !smsLock && (
                   <Text style={s.gateHint}>
                     {!notify.data?.sms_available
                       ? "SMS isn't configured on this server"
@@ -370,12 +377,6 @@ export default function Notifications() {
           {notify.data!.native_push_devices === 1 ? "" : "s"} registered
           via the mobile app
         </Text>
-      )}
-      {pushLock && pushOk && (
-        // push still reaches the household's registered phones; this one
-        // is not among them and cannot be added
-        <Text style={[s.center, { fontSize: 11, color: C.warn }]}>
-          {pushLock}</Text>
       )}
       <RecipientsCard />
       {sched && (
@@ -702,6 +703,8 @@ function EmailPrefsCard({ sending }: {
 function PhoneCard() {
   const { client } = useSession();
   const qc = useQueryClient();
+  // a test text reaches the household's phone: not the shared login's to send
+  const pushLock = useSharedLock("grant");
   const notify = useQuery({
     queryKey: ["notify-status"],
     queryFn: () => client!.notifyStatus(),
@@ -774,8 +777,9 @@ function PhoneCard() {
             <Text style={{ color: C.good, fontSize: 12 }}>verified</Text>
           </Text>
           <View style={{ flexDirection: "row", gap: 8, marginTop: 6 }}>
-            <Pressable style={[s.btn, testing && { opacity: 0.5 }]}
-                       disabled={testing}
+            <Pressable style={[s.btn, (testing || !!pushLock)
+                                         && { opacity: 0.5 }]}
+                       disabled={testing || !!pushLock}
                        onPress={() => { setTesting(true);
                          client!.notifyTest("sms")
                            .then(() => setMsg("Test sent."))
@@ -880,8 +884,9 @@ function PhoneCard() {
               <TextInput style={[s.hour, { flex: 1, textAlign: "left" }]}
                          placeholder="6-digit code"
                          placeholderTextColor={C.mut}
-                         keyboardType="number-pad" maxLength={6}
-                         value={code} onChangeText={setCode} />
+                         keyboardType="number-pad"
+                         value={code}
+                         onChangeText={(t) => setCode(oneTimeCodeDigits(t))} />
               <Pressable style={[s.btn,
                            (!code || busy !== null) && { opacity: 0.5 }]}
                          disabled={!code || busy !== null}
@@ -915,6 +920,8 @@ function SendNowCard() {
   const { client } = useSession();
   const [msg, setMsg] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // a shared demonstration login cannot mail the household's members
+  const sendLock = useSharedLock("grant");
   return (
     <Card>
       <H>Send today&apos;s email now</H>
@@ -925,7 +932,7 @@ function SendNowCard() {
       </Text>
       <Pressable style={[s.btn, { alignSelf: "flex-start", marginTop: 6 },
                    busy && { opacity: 0.5 }]}
-                 disabled={busy}
+                 disabled={busy || !!sendLock}
                  onPress={() => { setBusy(true);
                    client!.jobsEmail()
                      .then((r) =>

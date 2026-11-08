@@ -8,7 +8,10 @@ ledger, thirty named items behind it.
 
 - Upload from a transaction's detail — image (PNG/JPEG/WebP/GIF) or
   PDF, 5 MB max per file — or **snap it before the charge exists** (see
-  the next section).
+  the next section). A household's files share one storage allowance
+  (receipts, imports waiting for a second step, a folder import's files);
+  an upload that would go past it is refused with how much is used —
+  delete receipts or finish the imports in flight to make room.
 - If you've configured a **vision-capable LLM** (Settings → AI — the
   backend the "Receipts & documents" task is routed to, each backend
   can carry its own dedicated vision model), a
@@ -138,7 +141,10 @@ attach a photo or screenshot of the receipt instead.
 Extracted items are stored under their transaction and can be tagged —
 business, personal, or anything you like. The **expense report** takes
 a tag plus a month and produces rows with linked receipt images —
-a CSV/printable summary built for Schedule-C-style bookkeeping. Items
+a CSV/printable summary built for Schedule-C-style bookkeeping. The
+CSV is the household owner's to download, like every file that carries
+the ledger: a member or view-only login sees the report on the page but
+is not offered the file. Items
 are also searchable and groupable on the Receipts page. A waiting
 receipt's items are there too, as soon as it has been read — under the
 store and date read off it (*Unknown store* if none was), marked
@@ -237,10 +243,13 @@ then documents what the parts were.
   the results are there when you come back.
 - Only a couple of photos are decoded at once (a full-resolution image
   is a lot of memory), so a batch queues rather than running together.
-  Anything still waiting after a couple of minutes is marked failed and
+  Anything still waiting after about 7 minutes is marked failed and
   picked up by the next sweep, and *"server is busy reading receipts"*
   simply means try again shortly. Operators can raise
-  `OIKONOME_RECEIPT_PARSE_CONCURRENCY` / `OIKONOME_RECEIPT_PARSE_WAIT_S`.
+  `OIKONOME_RECEIPT_PARSE_CONCURRENCY` / `OIKONOME_RECEIPT_PARSE_WAIT_S`
+  (photo decoding) and `OIKONOME_RECEIPT_READ_SLOTS` /
+  `OIKONOME_RECEIPT_READ_WAIT_S` (reads waiting on the model; each slot
+  holds a database connection while the model answers).
 - A check parse only auto-categorizes when the payee is a real
   merchant; transfer-like payees are left to the normal transfer
   handling.

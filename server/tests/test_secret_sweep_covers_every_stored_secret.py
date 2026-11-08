@@ -15,6 +15,7 @@ from cryptography.fernet import Fernet
 
 from oikonome.db import crypto, migrate, tenancy
 from oikonome.engine import budget
+from oikonome.sync import base
 
 from .util import _ensure_db
 
@@ -47,6 +48,8 @@ class SecretSweepTests(unittest.TestCase):
                                   "url": "https://llm.example.test",
                                   "api_key": "plain-key",
                                   "extra_body": '{"t": "plain"}'}]})
+            # the key file-row ids are re-id'd under, minted keyless
+            self.id_key = base.txn_id_secret(conn, create=True)
         finally:
             conn.close()
         os.environ["OIKONOME_MASTER_KEY"] = Fernet.generate_key().decode()
@@ -59,9 +62,11 @@ class SecretSweepTests(unittest.TestCase):
                 "SELECT ein_enc FROM business_entity").fetchone()["ein_enc"]
             hook = conn.execute(
                 "SELECT secret FROM webhooks").fetchone()["secret"]
+            id_key = conn.execute(
+                "SELECT secret FROM txn_id_keys").fetchone()["secret"]
             cfg = budget.load_config(conn)
             backend = cfg["llm_backends"][0]
-            stored = {"ein": ein, "webhook": hook,
+            stored = {"ein": ein, "webhook": hook, "id_key": id_key,
                       "extra": cfg["llm_extra_body"],
                       "backend_key": backend["api_key"],
                       "backend_extra": backend["extra_body"]}
@@ -69,6 +74,7 @@ class SecretSweepTests(unittest.TestCase):
                 self.assertTrue(v.startswith(crypto.PREFIX), name)
             self.assertEqual(crypto.decrypt(conn, ein), "123456789")
             self.assertEqual(crypto.decrypt(conn, hook), "signing-plain")
+            self.assertEqual(base.txn_id_secret(conn), self.id_key)
             self.assertEqual(crypto.decrypt(conn, backend["api_key"]),
                              "plain-key")
             self.assertEqual(migrate.plaintext_tenant_secrets(conn), 0)
@@ -79,7 +85,7 @@ class SecretSweepTests(unittest.TestCase):
     def test_the_plaintext_count_sees_every_kind(self):
         conn = tenancy.tenant_connect(self.tid)
         try:
-            self.assertEqual(migrate.plaintext_tenant_secrets(conn), 5)
+            self.assertEqual(migrate.plaintext_tenant_secrets(conn), 6)
         finally:
             conn.close()
 

@@ -5,7 +5,9 @@ because nothing recorded which member this household is. Marking a
 member as the household makes the estimate's headline that member's
 share of the tax (their SE tax on their share of the profit, the rate on
 that share) with the business total beside it, and the capital account
-reports the household's share by ownership percentage. At most one
+reports the household member's own account: the movements naming them,
+plus their ownership share of the net income and of unattributed
+movements. At most one
 member is the household; marking another clears the first."""
 
 import unittest
@@ -78,6 +80,60 @@ class HouseholdMemberTests(unittest.TestCase):
         bs = selfemploy.balance_sheet(self.conn, self.eid)
         self.assertEqual(bs["household_share_pct"], 60.0)
         self.assertEqual(bs["household_capital"], cap["household_capital"])
+
+    def test_a_members_own_movements_land_in_their_own_capital_account(self):
+        # out of proportion to ownership: the household puts money in, the
+        # partner takes money out. Each lands in that member's account only;
+        # only the net income is split by ownership.
+        equity.record_movement(self.conn, self.eid, kind="contribution",
+                               amount=20_000.0, date="2025-01-02",
+                               member_id=self.a["id"])
+        equity.record_movement(self.conn, self.eid, kind="draw",
+                               amount=10_000.0, date="2025-06-01",
+                               member_id=self.b["id"])
+        equity.record_movement(self.conn, self.eid, kind="distribution",
+                               amount=4_000.0, date="2025-07-01",
+                               member_id=self.b["id"])
+        cap = equity.capital_summary(self.conn, self.eid)
+        ni = cap["net_income"]
+        self.assertAlmostEqual(cap["household_capital"],
+                               round(20_000.0 + ni * 0.6, 2))
+        # the whole account is unchanged by attribution
+        self.assertAlmostEqual(cap["capital_balance"],
+                               round(20_000.0 + ni - 14_000.0, 2))
+        bs = selfemploy.balance_sheet(self.conn, self.eid)
+        self.assertEqual(bs["household_capital"], cap["household_capital"])
+
+    def test_unattributed_movements_are_split_by_ownership(self):
+        equity.record_movement(self.conn, self.eid, kind="contribution",
+                               amount=5_000.0, date="2025-01-02",
+                               member_id=self.a["id"])
+        equity.record_movement(self.conn, self.eid, kind="draw",
+                               amount=2_000.0, date="2025-06-01")
+        # naming a member who is not one of this business's members is no
+        # attribution either
+        other = entities.create_entity(self.conn, name="Elsewhere LLC",
+                                       structure="multi_member_llc")
+        stranger = entities.add_member(self.conn, other["id"],
+                                       member_name="Member Z",
+                                       ownership_pct=100)
+        equity.record_movement(self.conn, self.eid, kind="contribution",
+                               amount=1_000.0, date="2025-06-02",
+                               member_id=stranger["id"])
+        cap = equity.capital_summary(self.conn, self.eid)
+        ni = cap["net_income"]
+        self.assertAlmostEqual(
+            cap["household_capital"],
+            round(5_000.0 + (1_000.0 - 2_000.0 + ni) * 0.6, 2))
+
+    def test_a_removed_members_movements_are_split_by_ownership(self):
+        equity.record_movement(self.conn, self.eid, kind="draw",
+                               amount=3_000.0, date="2025-06-01",
+                               member_id=self.b["id"])
+        entities.delete_member(self.conn, self.eid, self.b["id"])
+        cap = equity.capital_summary(self.conn, self.eid)
+        self.assertAlmostEqual(cap["household_capital"],
+                               round(cap["capital_balance"] * 0.6, 2))
 
     def test_a_household_member_without_a_share_gives_no_share(self):
         entities.update_member(self.conn, self.eid, self.a["id"],

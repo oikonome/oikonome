@@ -141,9 +141,10 @@ class DisabledEnvelopeDoesNotOutbidTheLivePool(unittest.TestCase):
 class PrepaidOccurrenceIsSettledNotOverdue(unittest.TestCase):
     """Rent due the 1st, autopaid on the 28th of the month before. The
     verdict attaches that payment to this month's occurrence (matching
-    reaches back PREPAY_MATCH_DAYS), so the Bills page must too — one
-    ledger cannot leave the same rent 'paid ✓' on Today and 'overdue' on
-    Bills.
+    reaches back PREPAY_MATCH_DAYS) and homes it in the month the cash
+    left, so the Bills page must too — one ledger cannot leave the same
+    rent 'paid ✓' on Today and 'overdue' on Bills, nor count it in two
+    months.
     """
 
     TODAY = dt.date(2026, 8, 5)
@@ -162,14 +163,21 @@ class PrepaidOccurrenceIsSettledNotOverdue(unittest.TestCase):
         self.conn.close()
 
     def _page(self):
-        return _month_bill_stats(self.conn, self.cfg, self.TODAY)["Rent"]
+        return _month_bill_stats(self.conn, self.cfg, self.TODAY).get(
+            "Rent", {"occurrences": 0, "paid": 0, "paid_amount": 0.0,
+                     "next_unpaid": None})
 
-    def test_early_payment_marks_the_occurrence_paid(self):
+    def test_early_payment_is_julys_occurrence_not_augusts(self):
+        """Paid in July, so July's: August neither owes it nor counts it."""
         page = self._page()
-        self.assertEqual(page["occurrences"], 1)
-        self.assertEqual(page["paid"], 1)
+        self.assertEqual((page["occurrences"], page["paid"]), (0, 0))
         self.assertIsNone(page["next_unpaid"],
                           "an occurrence already paid has no next-unpaid date")
+        july = _month_bill_stats(self.conn, self.cfg, dt.date(2026, 7, 31),
+                                 closed=True)["Rent"]
+        # July's own rent (never posted in this ledger) and August's, paid
+        self.assertEqual((july["occurrences"], july["paid"]), (2, 1))
+        self.assertAlmostEqual(july["paid_amount"], 2000.0, places=2)
 
     def test_verdict_does_not_call_it_overdue_either(self):
         st = budget.month_status(self.conn, self.TODAY)
@@ -289,3 +297,88 @@ class LatePaymentOfLastMonthsBillCountsOnBothPages(unittest.TestCase):
         self.assertAlmostEqual(total, st["buckets"]["fixed"]["actual"],
                                places=2)
         self.assertAlmostEqual(total, 80.0, places=2)
+
+
+class DisabledMerchantEnvelopeNeverOutbidsAnEnabledCategoryPool(unittest.TestCase):
+    """An enabled category envelope (groceries) beside a DISABLED envelope
+    tied to one grocery merchant. The verdict never sees the disabled
+    envelope, so every grocery charge at that merchant is the enabled
+    pool's. The claimer must give budget envelopes first refusal itself —
+    merchant tier or not — or the Bills page hands those charges to the
+    disabled envelope and shows the enabled pool barely touched while
+    Today shows it nearly spent. Both the month's claims and an annual
+    pool's year-to-date draw go through the same claimer.
+    """
+
+    TODAY = dt.date(2026, 7, 15)
+
+    def setUp(self):
+        self.conn = make_db()
+        write_config(self.conn,
+                     disabled_bills=["Pantrybarn", "Greenleaf Tools"])
+        add_bill(self.conn, "Pantrybarn", 300.0, bill_type="envelope",
+                 frequency=None, interval=1, merchant="PANTRYBARN")
+        add_bill(self.conn, "Groceries", 600.0, bill_type="envelope",
+                 frequency=None, interval=1, category="FOOD_AND_DRINK",
+                 match_category=True)
+        add_bill(self.conn, "Garden Fund", 1200.0, bill_type="envelope",
+                 frequency=None, interval=12, category="HOME_IMPROVEMENT",
+                 match_category=True)
+        add_bill(self.conn, "Greenleaf Tools", 100.0, bill_type="envelope",
+                 frequency=None, interval=1, merchant="GREENLEAF TOOLS")
+        add_txn(self.conn, dt.date(2026, 7, 3), 250.0, "PANTRYBARN",
+                primary="FOOD_AND_DRINK")
+        add_txn(self.conn, dt.date(2026, 7, 9), 120.0, "CORNER GROCER",
+                primary="FOOD_AND_DRINK")
+        # an earlier month's garden-tools charge draws the annual pool
+        add_txn(self.conn, dt.date(2026, 4, 12), 80.0, "GREENLEAF TOOLS",
+                primary="HOME_IMPROVEMENT")
+        self.cfg = budget.load_config(self.conn)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _verdict(self, payee):
+        st = budget.month_status(self.conn, self.TODAY)
+        return next(e for e in st["buckets"]["fixed"]["envelopes"]
+                    if e["payee"] == payee)
+
+    def test_the_enabled_pool_gets_the_merchant_charge_on_both_pages(self):
+        verdict = self._verdict("Groceries")
+        page = _month_bill_stats(self.conn, self.cfg, self.TODAY)
+        self.assertAlmostEqual(verdict["used"], 370.0, places=2)
+        self.assertAlmostEqual(page["Groceries"]["used"], verdict["used"],
+                               places=2)
+        self.assertEqual(page["Groceries"]["paid"], 2)
+        self.assertAlmostEqual(page["Pantrybarn"]["used"], 0.0, places=2)
+
+    def test_the_annual_pool_year_to_date_agrees(self):
+        verdict = self._verdict("Garden Fund")
+        page = _month_bill_stats(self.conn, self.cfg, self.TODAY)
+        self.assertAlmostEqual(verdict["period_used"], 80.0, places=2)
+        self.assertAlmostEqual(page["Garden Fund"]["period_used"],
+                               verdict["period_used"], places=2)
+
+    def test_list_order_does_not_decide_ownership(self):
+        envs = budget._envelope_bills(self.conn)
+        off = {"Pantrybarn", "Greenleaf Tools"}
+        marked = [dict(e, off=True) if e["payee"] in off else e
+                  for e in envs]
+        row = {"payee": "PANTRYBARN", "name": "PANTRYBARN",
+               "category": "FOOD AND DRINK", "merchant_id": None,
+               "amount": 250.0}
+        txt = "pantrybarn pantrybarn"
+        toks = budget._tokens(txt)
+        for order in (marked, list(reversed(marked))):
+            self.assertEqual(
+                budget._claim_envelope(order, row, toks, txt)["payee"],
+                "Groceries")
+
+    def test_the_enabled_pools_history_lists_the_merchant_charge(self):
+        """The pool's own history page counts what the claimer gives it: a
+        disabled envelope's merchant match does not take a row from it
+        there either."""
+        from oikonome.engine import bills
+        hist = bills.merchant_history(self.conn, "Groceries", window="all")
+        self.assertEqual(sorted(float(t["amount"]) for t in hist["txns"]),
+                         [120.0, 250.0])

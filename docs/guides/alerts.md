@@ -8,6 +8,12 @@ severity, and opens the Alerts page), the phone app's Alerts screen, and
 the Alerts page itself, which adds the full history and the dismiss
 controls.
 
+The Alerts page and the phone app's Alerts screen open on what needs
+attention now — the live alerts, each with its link and its ✕ — and
+nothing else. Everything else the log holds, resolved and dismissed
+alerts included, waits behind **Show history** (the button counts the
+rows it hides) and folds away again with **Hide history**.
+
 In the email the alerts go only to **owners and members** — the people
 who can act on them. A viewer's copy, and a copy sent to an address that
 has no login on the household, carries no alerts at all.
@@ -100,7 +106,7 @@ emails off for one person without touching their daily or report mail.
 A community-script collector whose **script token was revoked** after its
 last push (a password change or reset revokes every token) gets its own
 alert on the strip, in the daily email and on the Doctor page, naming the
-source and pointing at Settings → Scripts to mint a replacement — a
+source and pointing at Settings → Connections → Script tokens to mint a replacement — a
 collector in that state is not stale, it is locked out until you do.
 
 ## Acting from the email
@@ -136,12 +142,13 @@ can do it; a view-only login sees alerts but can't dismiss them.
 
 ## History
 
-The Alerts page lists the most recent 200 alerts with first-seen and
+**Show history** on the Alerts page (and on the phone app's Alerts
+screen) opens the log: the most recent 200 alerts with first-seen and
 last-seen dates (MM/DD/YY), the kind, and an **active** or
 **dismissed** pill; a condition that has since cleared shows a green
-**resolved** pill in place of its kind. The chips above the table —
-**all**, **connection**, **bills**, **cash**, **dismissed** — narrow the
-log. Each active alert also carries a link to the page that deals with
+**resolved** pill in place of its kind. The filter chips — **all**,
+**connection**, **bills**, **cash**, **dismissed** — sit inside the
+history and narrow the log; they appear only while it is open. Each active alert also carries a link to the page that deals with
 it: **fix this ›** for something broken (a dead connection, a funding
 gap), **review ›** for a queue waiting on your decision (bill proposals,
 drift, anomalies, reimbursements).

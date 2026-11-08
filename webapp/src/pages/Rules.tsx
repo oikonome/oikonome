@@ -18,6 +18,7 @@ import { useEffect, useState } from "react";
 import { api, errText, toast, type RuleRow, type RulesPage, catLabel } from "../api/client";
 import { invalidateRollups, patchList, removeFromList } from "../api/cache";
 import { canEdit } from "../role";
+import DemoLock from "../components/DemoLock";
 import { spendPickerGroups } from "../moneymath";
 
 const SOURCE_LABEL: Record<string, string> = {
@@ -33,6 +34,9 @@ export default function Rules({ embedded = false }:
                                    { embedded?: boolean } = {}) {
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const mayEdit = canEdit(me);
+  // the demo instance refuses every rule write and the rename —
+  // disabled-in-place, as Merchants does, beats a refusal after acting
+  const demo = !!me.data?.demo;
   const [filter, setFilter] = useState("");
   const [q, setQ] = useState("");   // debounced — server-side search
   useEffect(() => {
@@ -80,6 +84,11 @@ export default function Rules({ embedded = false }:
         </div>
         <div className="sub" style={{ marginTop: ".2rem" }}>Rules are learned,
           never hand-written. Correcting or disabling one makes it yours.</div>
+        {mayEdit && demo && (
+          <div className="sub" style={{ marginTop: ".4rem", color: "var(--amber)" }}>
+            Not available on the demo instance — synthetic data only.
+          </div>
+        )}
       </div>
 
       {empty ? (
@@ -94,21 +103,21 @@ export default function Rules({ embedded = false }:
         </div>
       ) : (<>
         <div className={embedded ? undefined : "card"}>
-          <RuleGroup source="user" title="Your rules" mayEdit={mayEdit} q={q}
+          <RuleGroup source="user" title="Your rules" mayEdit={mayEdit} demo={demo} q={q}
                      note="corrections you made"
                      count={counts?.user ?? 0} defaultOpen />
         </div>
         <div className={embedded ? undefined : "card"}>
           {(counts?.llm ?? 0) > 0 && (
-            <RuleGroup source="llm" title="Model-learned" mayEdit={mayEdit} q={q}
+            <RuleGroup source="llm" title="Model-learned" mayEdit={mayEdit} demo={demo} q={q}
                        note="inferred by the local model; correcting one makes it yours"
                        count={counts?.llm ?? 0} />)}
           {(counts?.model ?? 0) > 0 && (
-            <RuleGroup source="model" title="Learned" mayEdit={mayEdit} q={q}
+            <RuleGroup source="model" title="Learned" mayEdit={mayEdit} demo={demo} q={q}
                        note="the classifier trained on your own corrections; correcting one makes it yours"
                        count={counts?.model ?? 0} />)}
           {(counts?.seed ?? 0) > 0 && (
-            <RuleGroup source="seed" title="Built-in" mayEdit={mayEdit} q={q}
+            <RuleGroup source="seed" title="Built-in" mayEdit={mayEdit} demo={demo} q={q}
                        note="shipped starting points"
                        count={counts?.seed ?? 0} />)}
         </div>
@@ -120,7 +129,7 @@ export default function Rules({ embedded = false }:
           <summary style={{ cursor: "pointer", color: "var(--mut)",
                             fontSize: 13.5 }}>
             Rename a custom category…</summary>
-          <RenameCategoryCard />
+          <DemoLock on={demo}><RenameCategoryCard /></DemoLock>
         </details>
       )}
     </>
@@ -209,9 +218,10 @@ function RenameCategoryCard() {
   );
 }
 
-function RuleGroup({ source, title, mayEdit, q, count, note,
+function RuleGroup({ source, title, mayEdit, demo, q, count, note,
                     defaultOpen = false }: {
-  source: Source; title: string; mayEdit: boolean; q: string; note: string;
+  source: Source; title: string; mayEdit: boolean; demo: boolean; q: string;
+  note: string;
   count: number; defaultOpen?: boolean;
 }) {
   const qc = useQueryClient();
@@ -321,7 +331,7 @@ function RuleGroup({ source, title, mayEdit, q, count, note,
           </thead>
           <tbody>
             {d.rules.map((r) => (
-              <RuleLine key={r.merchant} r={r} mayEdit={mayEdit}
+              <RuleLine key={r.merchant} r={r} mayEdit={mayEdit} demo={demo}
                         cats={cats.data} onEdit={onEdit}
                         onToggle={() => disable.mutate(
                           { m: r.merchant, d: !r.disabled })}
@@ -352,8 +362,8 @@ function RuleGroup({ source, title, mayEdit, q, count, note,
   );
 }
 
-function RuleLine({ r, mayEdit, cats, onEdit, onToggle, onDelete, busy }: {
-  r: RuleRow; mayEdit: boolean; cats: Cats | undefined;
+function RuleLine({ r, mayEdit, demo, cats, onEdit, onToggle, onDelete, busy }: {
+  r: RuleRow; mayEdit: boolean; demo: boolean; cats: Cats | undefined;
   onEdit: (merchant: string, category: string) => void;
   onToggle: () => void; onDelete: () => void; busy: boolean;
 }) {
@@ -384,7 +394,7 @@ function RuleLine({ r, mayEdit, cats, onEdit, onToggle, onDelete, busy }: {
           {mayEdit ? (
             <select className="cat-chip" value=""
                     aria-label={`category for ${r.merchant} — change`}
-                    disabled={saving}
+                    disabled={saving || demo}
                     onChange={(e) => e.target.value && set(e.target.value)}>
               <option value="">{saving ? "saving…"
                 : catLabel(r.category_primary)}</option>
@@ -415,12 +425,12 @@ function RuleLine({ r, mayEdit, cats, onEdit, onToggle, onDelete, busy }: {
       {mayEdit && menu && (
         <tr className="tr-expand"><td colSpan={4}>
           <div className="row-actions">
-            <button disabled={busy} onClick={onToggle}
+            <button disabled={busy || demo} onClick={onToggle}
               title={r.disabled
                 ? "apply this rule again"
                 : "keep the rule but stop applying it to new transactions"}>
               {r.disabled ? "turn back on" : "turn off"}</button>
-            <button disabled={busy} onClick={onDelete}
+            <button disabled={busy || demo} onClick={onDelete}
               title="the merchant can be classified again from scratch">
               delete this rule</button>
             <span className="sub" style={{ alignSelf: "center" }}>

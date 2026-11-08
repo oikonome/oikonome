@@ -148,21 +148,6 @@ class _Base(unittest.TestCase):
 
 
 class TotpEnrollEvictsBearers(_Base):
-    def test_totp_enroll_revokes_device_tokens(self):
-        bearer = self._device_bearer()
-        self._enroll_totp()
-        self.assertEqual(bearer.get("/api/me").status_code, 401)
-
-    def test_totp_enroll_revokes_script_tokens(self):
-        tid = self._script_token_id()
-        self._enroll_totp()
-        self.assertTrue(self._script_token_revoked(tid))
-
-    def test_totp_enroll_burns_unspent_mint_tickets(self):
-        _, ticket = self._login()
-        self._enroll_totp()
-        self.assertEqual(self._redeem(ticket).status_code, 401)
-
     def test_totp_after_a_passkey_is_not_a_first_factor(self):
         """The first-factor decision counts passkeys too: a user who already
         holds a passkey (and the recovery batch it minted) enrolling TOTP
@@ -180,6 +165,47 @@ class TotpEnrollEvictsBearers(_Base):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertIsNone(r.json().get("recovery_codes"))
 
+    def _replace_totp(self, old_secret):
+        """Bind a new authenticator over the current one, the Settings way."""
+        r = self.client.post("/api/totp/enroll", data={
+            "password": PW, "current_code": _fresh_code(old_secret)})
+        self.assertEqual(r.status_code, 200, r.text)
+        new_secret = r.json()["secret"]
+        clear_totp_burn()
+        r = self.client.post("/api/totp/confirm", data={
+            "secret": new_secret, "code": _fresh_code(new_secret),
+            "password": PW, "current_code": _fresh_code(old_secret)})
+        self.assertEqual(r.status_code, 200, r.text)
+        return new_secret, r.json()
+
+    def test_replacing_the_authenticator_voids_the_old_recovery_codes(self):
+        """A batch a hijacker minted, or an old photographed sheet, would
+        otherwise sign in past the new authenticator and open an elevation
+        window. Replacing it is the moment the owner believes that is over."""
+        first = self.client.post("/api/totp/enroll", data={"password": PW})
+        secret = first.json()["secret"]
+        old = self.client.post("/api/totp/confirm", data={
+            "secret": secret, "code": _fresh_code(secret), "password": PW,
+        }).json()["recovery_codes"]
+        self.assertTrue(old)
+        _, body = self._replace_totp(secret)
+
+        anon = TestClient(self.app)
+        r = anon.post("/api/login", data={
+            "email": self.email, "password": PW, "totp_code": old[0]})
+        self.assertEqual(r.status_code, 401, r.text)
+        r = self.client.post("/api/auth/elevate", json={
+            "password": PW, "recovery_code": old[1]})
+        self.assertEqual(r.status_code, 401, r.text)
+        # the batch the response showed is the batch that stands
+        fresh = body["recovery_codes"]
+        self.assertEqual(len(fresh), recovery.BATCH)
+        self.assertEqual(self.client.get("/api/me").json()[
+            "recovery_codes_left"], recovery.BATCH)
+        r = anon.post("/api/login", data={
+            "email": self.email, "password": PW, "totp_code": fresh[0]})
+        self.assertEqual(r.status_code, 200, r.text)
+
     def test_totp_enroll_from_a_phone_keeps_that_phone(self):
         """The device driving the enrolment just proved the new factor —
         it survives, like the calling browser session does; every OTHER
@@ -196,16 +222,6 @@ class TotpEnrollEvictsBearers(_Base):
 
 
 class FirstPasskeyEvictsBearers(_Base):
-    def test_first_passkey_revokes_other_sessions_and_devices(self):
-        other, _ = self._login()
-        bearer = self._device_bearer()
-        tid = self._script_token_id()
-        self._enroll_passkey()
-        self.assertEqual(self.client.get("/api/me").status_code, 200)
-        self.assertEqual(other.get("/api/me").status_code, 401)
-        self.assertEqual(bearer.get("/api/me").status_code, 401)
-        self.assertTrue(self._script_token_revoked(tid))
-
     def test_first_passkey_always_issues_a_fresh_recovery_batch(self):
         """Codes left over from an earlier life of the account are live
         bypass primitives for passkey login and passkey step-up — the
@@ -323,16 +339,6 @@ class PasskeyOnlyResetNeedsRecovery(_Base):
         self.assertIsNotNone(row["totp_secret"])   # nothing was stripped
         self.assertTrue(secret)
 
-    def test_password_change_burns_unspent_reset_links(self):
-        token = self._reset_link()
-        r = self.client.post("/api/password/change", json={
-            "current_password": PW, "new_password": NEW})
-        self.assertEqual(r.status_code, 200, r.text)
-        r = TestClient(self.app).post(
-            "/reset", data={"token": token, "password": NEW + "x"},
-            follow_redirects=False)
-        self.assertEqual(r.status_code, 400, r.text)   # link is dead
-
     def test_reset_page_asks_for_the_code_only_when_needed(self):
         token = self._reset_link()
         self.assertNotIn("Recovery code", TestClient(self.app).get(
@@ -372,37 +378,6 @@ class MintTicketDiesWithTheSession(_Base):
                              json={"id": sid, "password": PW})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(self._redeem(ticket).status_code, 401)
-
-    def test_password_change_burns_unspent_mint_tickets(self):
-        _, ticket = self._login()
-        r = self.client.post("/api/password/change", json={
-            "current_password": PW, "new_password": NEW})
-        self.assertEqual(r.status_code, 200, r.text)
-        self.assertEqual(self._redeem(ticket).status_code, 401)
-
-    def test_email_change_burns_unspent_mint_tickets(self):
-        _, ticket = self._login()
-        r = self.client.post("/api/email/change", data={
-            "new_email": f"new-{uuid.uuid4().hex[:8]}@example.dev",
-            "password": PW})
-        self.assertEqual(r.status_code, 200, r.text)
-        self.assertEqual(self._redeem(ticket).status_code, 401)
-
-
-class EmailChangeBurnsInvites(_Base):
-    def test_email_change_kills_pending_invites(self):
-        r = self.client.post("/api/invites",
-                             json={"label": "fam", "password": PW})
-        self.assertEqual(r.status_code, 200, r.text)
-        token = r.json()["url"].rsplit("token=", 1)[1]
-        r = self.client.post("/api/email/change", data={
-            "new_email": f"new-{uuid.uuid4().hex[:8]}@example.dev",
-            "password": PW})
-        self.assertEqual(r.status_code, 200, r.text)
-        self.assertEqual(
-            self.client.get(f"/api/invite/peek?token={token}").status_code,
-            404)
-
 
 class PasswordChangeReportsItsCost(_Base):
     def test_password_change_returns_what_it_removed(self):

@@ -338,6 +338,18 @@ class ReportRouteTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertIn("Here.", r.text)
 
+    def test_pie_values_whose_total_overflows_drop_the_block_not_the_report(self):
+        # each value is finite alone; their sum is inf, which the donut's
+        # centre total cannot format
+        r = self._post({
+            "question": "Groceries?",
+            "blocks": [{"kind": "text", "text": "Here."},
+                       {"kind": "pie", "title": "x", "labels": ["a", "b"],
+                        "series": [{"name": "s",
+                                    "values": [1e308, 1e308]}]}]})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("Here.", r.text)
+
     def test_a_conversation_downloads_as_one_file(self):
         r = self._post({"turns": [
             {"question": "Groceries?", "blocks": [{"kind": "text", "text": "Here."}]},

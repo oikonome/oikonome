@@ -918,10 +918,12 @@ class NonCookiePrincipalTests(_Base):
         r = bare.post("/api/auth/elevate", headers=hdr,
                       json={"password": PW})
         self.assertEqual(r.status_code, 200, r.text)
-        self.assertEqual(bare.post(GUARDED, headers=hdr).status_code, 200)
-        # the browser that minted the phone proved nothing
+        # the browser that minted the phone proved nothing (asked before
+        # the phone uses its window: a new recovery sheet signs every
+        # other session out)
         self.assertFalse(c.get("/api/auth/elevation").json()["elevated"])
         self.assertEqual(c.post(GUARDED).status_code, 403)
+        self.assertEqual(bare.post(GUARDED, headers=hdr).status_code, 200)
 
 
 if __name__ == "__main__":

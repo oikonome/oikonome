@@ -195,5 +195,41 @@ class ResolverIsBoundedAndCachedTest(unittest.TestCase):
         self.assertEqual(len(calls), 1, "the second lookup must hit cache")
 
 
+class MalformedHostNamesAreRefused(unittest.TestCase):
+    """A hostname the resolver cannot even encode (an empty or over-long
+    label, half a surrogate pair) is a typo in a settings field. It is
+    refused like any other bad host, on hosted and self-host alike; the
+    classifiers that only ask for addresses see "could not resolve"."""
+
+    BAD = ("smtp..gmail.com", "a" * 64 + ".example", "\ud83d.example")
+
+    def setUp(self):
+        netguard._DNS_CACHE.clear()
+
+    def test_check_host_refuses_on_both_tiers(self):
+        for hosted in ("1", ""):
+            with mock.patch.dict(os.environ, {"OIKONOME_HOSTED": hosted}):
+                for host in self.BAD:
+                    with self.assertRaises(netguard.BlockedURL) as cm:
+                        netguard.check_host(host, what="the SMTP host")
+                    self.assertIn("not a valid host name", str(cm.exception))
+
+    def test_check_url_refuses_a_bad_host_and_a_url_that_cannot_be_split(self):
+        for url in ("http://ollama..lan:11434/v1", "http://[not-ipv6/v1"):
+            with self.assertRaises(netguard.BlockedURL):
+                netguard.check_url(url, what="llm_url")
+
+    def test_resolved_ips_answers_empty_not_an_exception(self):
+        for host in self.BAD:
+            self.assertEqual(netguard._resolved_ips(host), [])
+
+    def test_a_good_name_is_not_caught_by_the_shape_check(self):
+        with mock.patch.dict(os.environ, {"OIKONOME_HOSTED": ""}), \
+                mock.patch.object(netguard, "_getaddrinfo",
+                                  return_value=["192.168.1.5"]):
+            netguard.check_host("mail.lan", what="the SMTP host")
+            netguard.check_host("b\u00fccher.example", what="the SMTP host")
+
+
 if __name__ == "__main__":
     unittest.main()

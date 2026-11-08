@@ -88,6 +88,10 @@ function elevateError(e: unknown): string {
   // a code from a step already spent is not a clock problem
   if (/code_used|already (been )?used/i.test(m)) return "That code was already used — enter the next one from your app.";
   if (m.includes("one-time code")) return "That code didn't match — check your app's clock.";
+  // a code typed and refused comes back as recovery_required too: that is
+  // a code that didn't match, not a factor the account lacks
+  if (m.includes("recovery_required") && !/not valid/i.test(m))
+    return "This account confirms with its passkey or a recovery code.";
   if (m.includes("recovery")) return "That recovery code didn't match.";
   if (m.includes("too many")) return "Too many attempts — try again in a few minutes.";
   return errText(e);
@@ -113,14 +117,28 @@ function ElevateSheet({ fresh, cached, onDone, onCancel }: {
   // door a password+TOTP account whose authenticator is gone could never
   // export or close the account at all.
   const [alt, setAlt] = useState<"password" | "recovery" | null>(null);
+  // the status read failed (a deploy's 502, a busy server, a dropped
+  // connection): the sheet says so and offers Try again — `tries` re-runs
+  // the read — and Cancel, so the guarded action settles either way
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [tries, setTries] = useState(0);
 
   useEffect(() => {
     if (info) return;
     let live = true;
     api.elevation().then((e) => { if (live) setInfo(e); })
-      .catch((e) => { if (live) setErr(errText(e)); });
+      .catch((e) => { if (live) { setErr(errText(e)); setLoadFailed(true); } });
     return () => { live = false; };
-  }, [info]);
+  }, [info, tries]);
+
+  // Escape is cancel, as the cancel button is, whatever the sheet shows
+  useEffect(() => {
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !busy) onCancel();
+    };
+    window.addEventListener("keydown", onEsc);
+    return () => window.removeEventListener("keydown", onEsc);
+  }, [busy, onCancel]);
 
   const passkey = !!info?.methods.includes("passkey");
   const hasPassword = !!info?.methods.includes("password");
@@ -189,7 +207,19 @@ function ElevateSheet({ fresh, cached, onDone, onCancel }: {
         {err && <div className="note bad" style={{ marginBottom: ".7rem" }}
                      onClick={() => setErr(null)}>{err}</div>}
         {!info ? (
-          <p className="mut">checking…</p>
+          <>
+            <p className="mut">{loadFailed
+              ? "Couldn't check how this account confirms."
+              : "checking…"}</p>
+            <div style={{ display: "flex", gap: ".5rem", flexWrap: "wrap" }}>
+              {loadFailed && (
+                <button className="pri" onClick={() => {
+                  setErr(null); setLoadFailed(false); setTries((n) => n + 1);
+                }}>Try again</button>
+              )}
+              <button onClick={onCancel}>cancel</button>
+            </div>
+          </>
         ) : passkey && !alt ? (
           <>
             <p>This account signs in with a passkey — approve the prompt on
@@ -284,8 +314,12 @@ function ElevateSheet({ fresh, cached, onDone, onCancel }: {
             {info.totp && (
               <p><label>6-digit code from your authenticator<br />
                 <input inputMode="numeric" autoComplete="one-time-code"
-                       maxLength={6} style={inputStyle} value={code}
-                       onChange={(e) => setCode(e.target.value)}
+                       style={inputStyle} value={code}
+                       // no raw length cap: an authenticator copies the code
+                       // grouped ("123 456"), and a 6-character cap would cut
+                       // the paste before it is cleaned to its six digits
+                       onChange={(e) => setCode(
+                         e.target.value.replace(/\D/g, "").slice(0, 6))}
                        onKeyDown={onKey(() => pw && code.trim()
                          && submit({ password: pw, totp_code: code.trim() }))} />
               </label></p>

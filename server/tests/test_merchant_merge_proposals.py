@@ -281,6 +281,50 @@ class OffersAreDecidedByThePerson(unittest.TestCase):
         self.assertEqual(mm.decide(self.conn, o["id"], "approve").get("error"),
                          "unknown or already-decided proposal")
 
+    def _reject_toywo(self):
+        mm.run(self.conn)
+        o = next(o for o in mm.pending(self.conn) if o["from"] == "Ashbury Toywo")
+        mm.decide(self.conn, o["id"], "reject")
+
+    def _new_row(self, name, entity=None):
+        return self.conn.execute(
+            "INSERT INTO merchants (name, name_source, plaid_entity_id) "
+            "VALUES (%s,'layer1',%s) RETURNING id::text AS id",
+            (name, entity)).fetchone()["id"]
+
+    def test_a_rejection_survives_its_merchant_being_folded_into_a_twin(self):
+        """A twin fold moves a merchant onto another row: the household's
+        'these are different businesses' answer must move with it, or the
+        next night offers the same pair again under the survivor's id."""
+        from oikonome.engine import merchant_identity
+        self._reject_toywo()
+        twin = self._new_row("Ashbury Toywo", "ent_toywo")   # the survivor
+        self.assertEqual(merchant_identity.fold_twins(self.conn)["folded"], 1)
+        mm.run(self.conn)
+        rejected = {"Ashbury Toywo", "Ashbury Toyworks Market"}
+        self.assertNotIn(rejected, [{o["from"], o["into"]}
+                                    for o in mm.pending(self.conn)])
+        self.assertEqual(self.conn.execute(
+            "SELECT status FROM merchant_merge_proposals WHERE id=%s",
+            (mm._sig(twin, self.ids["Ashbury Toyworks Market"]),)
+        ).fetchone()["status"], "rejected")
+
+    def test_a_rejection_survives_its_merchant_being_recleaned_onto_a_new_row(self):
+        """A string-clean change moves every row of a merchant to a new
+        merchant and retires the old one into it; the rejection follows."""
+        from oikonome.engine import merchant_identity
+        self._reject_toywo()
+        old = self.ids["Ashbury Toywo"]
+        new = self._new_row("Ashbury Toywo")
+        with self.conn.transaction():
+            self.conn.execute("UPDATE transactions SET merchant_id=%s "
+                              "WHERE merchant_id=%s", (new, old))
+            self.conn.execute("UPDATE merchant_canonical SET merchant_id=%s "
+                              "WHERE merchant_id=%s", (new, old))
+            merchant_identity._retire_if_empty(self.conn, old, new)
+        self.assertEqual(mm.run(self.conn)["inserted"], 0)
+        self.assertNotIn("Ashbury Toywo", {o["from"] for o in mm.pending(self.conn)})
+
     def test_only_the_merchants_a_sync_minted_are_offered_on_ingest(self):
         st = mm.run(self.conn, only_ids=[self.ids["Ashbury Toywo"]], limit=10)
         self.assertEqual(st["inserted"], 1)

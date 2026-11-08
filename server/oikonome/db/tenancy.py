@@ -23,6 +23,8 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
+from ..envnum import env_float, env_int
+
 log = logging.getLogger(__name__)
 
 APP_DSN = os.environ.get(
@@ -151,8 +153,7 @@ _pools_lock = threading.Lock()
 # `or` not a get() default: compose materializes every declared key, so an
 # unset knob arrives as an EMPTY STRING, and float("") raises. Empty must
 # mean "unset" for every env knob the container declares.
-TENANT_POOL_TIMEOUT = float(os.environ.get("OIKONOME_TENANT_POOL_TIMEOUT")
-                            or "5")
+TENANT_POOL_TIMEOUT = env_float("OIKONOME_TENANT_POOL_TIMEOUT", 5.0, lo=0.1)
 
 
 def _close_pools():
@@ -174,7 +175,7 @@ def _pool(dsn: str) -> ConnectionPool:
         if p is None:
             p = ConnectionPool(
                 dsn, min_size=0,
-                max_size=int(os.environ.get("OIKONOME_POOL_MAX") or "10"),
+                max_size=env_int("OIKONOME_POOL_MAX", 10, lo=1),
                 # An idle handle still holds one of the server's connection
                 # slots, so a shorter max_idle (two minutes, against the
                 # pool's default ten) gives slots back soon after a burst;
@@ -225,8 +226,8 @@ def _pool(dsn: str) -> ConnectionPool:
 # 30 s and then 500ing.
 
 _control_pools: dict[str, ConnectionPool] = {}
-CONTROL_POOL_TIMEOUT = float(os.environ.get("OIKONOME_CONTROL_POOL_TIMEOUT")
-                             or "5")
+CONTROL_POOL_TIMEOUT = env_float("OIKONOME_CONTROL_POOL_TIMEOUT", 5.0,
+                                 lo=0.1)
 
 
 # Every control connection waits a bounded time, because the pool is four
@@ -263,8 +264,7 @@ def _control_pool(dsn: str) -> ConnectionPool:
         if p is None:
             p = ConnectionPool(
                 dsn, min_size=0,
-                max_size=int(os.environ.get("OIKONOME_CONTROL_POOL_MAX")
-                             or "4"),
+                max_size=env_int("OIKONOME_CONTROL_POOL_MAX", 4, lo=1),
                 max_idle=POOL_MAX_IDLE_S,  # see _pool
                 # set at connect, so they hold for every checkout and a
                 # RESET on the way back to the pool cannot drop them

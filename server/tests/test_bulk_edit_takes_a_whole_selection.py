@@ -93,6 +93,47 @@ class BulkEditWholeSelection(unittest.TestCase):
         self.assertEqual(self._overridden(), 0,
                          "the slices before the failure must roll back too")
 
+    def test_slices_follow_the_database_order_not_the_clients(self):
+        # Every other writer over many rows locks them by id in the
+        # database's collation. Slicing in the order the client listed the
+        # selection would let one slice lock a row that sorts after a row a
+        # later slice still wants, which crosses such a writer.
+        from oikonome.web import data
+        real = data.bulk_apply
+        seen = []
+
+        def record(conn, ids, action, category=""):
+            seen.extend(ids)
+            return real(conn, ids, action, category)
+        with mock.patch.object(data, "bulk_apply", side_effect=record):
+            r = self.client.post("/api/transactions/bulk", json={
+                "ids": list(reversed(self.ids)), "action": "category",
+                "category": "FOOD_AND_DRINK"})
+        self.assertEqual(r.status_code, 200, r.text)
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            want = [x["u"] for x in conn.execute(
+                "SELECT u FROM unnest(%s::text[]) AS u ORDER BY u",
+                (self.ids,)).fetchall()]
+        finally:
+            conn.close()
+        self.assertEqual(seen, want)
+
+    def test_a_deadlock_answers_try_again_not_a_server_error(self):
+        import psycopg
+        from oikonome.web import data
+
+        def killed(conn, ids, action, category=""):
+            raise psycopg.errors.DeadlockDetected("deadlock detected")
+        client = TestClient(self.app, raise_server_exceptions=False)
+        client.cookies = self.client.cookies
+        with mock.patch.object(data, "bulk_apply", side_effect=killed):
+            r = client.post("/api/transactions/bulk", json={
+                "ids": self.ids[:3], "action": "category",
+                "category": "FOOD_AND_DRINK"})
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertIn("try again", r.json()["detail"])
+
     def test_the_cap_is_ten_thousand(self):
         r = self.client.post("/api/transactions/bulk", json={
             "ids": [f"x{i}" for i in range(10_001)], "action": "category",

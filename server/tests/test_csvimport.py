@@ -44,6 +44,34 @@ class CsvImportTests(unittest.TestCase):
                          {dt.date(2026, 7, 10), dt.date(2026, 7, 11),
                           dt.date(2026, 7, 12)})
 
+    def test_an_income_label_on_a_deposit_is_the_canonical_income_category(self):
+        # A bank's own "Income" column value on a deposit becomes the INCOME
+        # primary every engine rule keys on (the paycheck detector, the
+        # month's income, the spend exclusions); the same label on an
+        # outflow is a correction and stays as written.
+        csv = ("Date,Description,Amount,Category\n"
+               "2026-07-15,EMPLOYER PAYROLL,3200.00,Income\n"
+               "2026-07-16,PAYROLL REVERSAL,-50.00,Income\n"
+               "2026-07-17,CORNER COFFEE,-4.10,Dining\n"
+               "2026-07-18,EMPLOYER EXPENSES,120.00,Payroll Reimbursement\n"
+               "2026-07-19,BANK INTEREST,1.25,Income:Interest\n")
+        mapping = {"date": "Date", "name": "Description", "amount": "Amount",
+                   "category": "Category"}
+        r = csvimport.import_csv(self.conn, "chk", csv, mapping)
+        self.assertEqual(r["imported"], 5)
+        got = {row["name"]: row["category_primary"] for row in self.conn.execute(
+            "SELECT name, category_primary FROM transactions "
+            "WHERE id LIKE 'csv:%' AND name IN ('EMPLOYER PAYROLL',"
+            "'PAYROLL REVERSAL','CORNER COFFEE','EMPLOYER EXPENSES',"
+            "'BANK INTEREST')").fetchall()}
+        self.assertEqual(got["EMPLOYER PAYROLL"], "INCOME")
+        self.assertEqual(got["PAYROLL REVERSAL"], "Income")
+        self.assertEqual(got["CORNER COFFEE"], "Dining")
+        # money coming back under an income word is not pay; a sub-labelled
+        # income (Quicken-style "Income:Interest") is income
+        self.assertEqual(got["EMPLOYER EXPENSES"], "Payroll Reimbursement")
+        self.assertEqual(got["BANK INTEREST"], "INCOME")
+
     def test_same_day_duplicates_survive_and_reimport_is_idempotent(self):
         csvimport.import_csv(self.conn, "chk", CSV, MAPPING)
         r2 = csvimport.import_csv(self.conn, "chk", CSV, MAPPING)

@@ -231,6 +231,10 @@ def _survivor(conn, mid):
 
 def _create(conn, name: str, source: str, *, entity=None, kind="merchant",
             logo=None, website=None):
+    # the one door a merchant is minted through: only a person's own name
+    # may hold a card number
+    if source != "manual":
+        name = merchant_dedup.cut_card_numbers(name)
     if entity is None:
         # No unique index guards a name-only merchant, and two importers
         # (a statement upload beside the hourly sync, a restore beside a
@@ -298,7 +302,8 @@ def _upsert_plaid_merchant(conn, ident: dict, cache: dict):
                 WHERE id=%s AND (logo_url IS NULL OR website IS NULL)""",
             (ident.get("logo_url"), ident.get("website"), mid))
     else:
-        name = (ident.get("name") or "").strip() or "?"
+        name = merchant_dedup.cut_card_numbers(
+            (ident.get("name") or "").strip() or "?")
         # a merchant of the same name that has no entity yet becomes THIS
         # merchant: adopt it rather than create a twin, so the history
         # unifies under Plaid's identity and gets the logo. A layer-1 row
@@ -1100,6 +1105,9 @@ def _line_merchant(conn, bank_name: str):
 
 
 def _merchant_for_name(conn, name: str, source: str, cache: dict):
+    if source != "manual":
+        # looked up as _create would mint it, or each pass mints a twin
+        name = merchant_dedup.cut_card_numbers(name)
     key = name.lower()
     if key in cache:
         return cache[key]
@@ -1788,6 +1796,9 @@ def fold_twins(conn, limit: int = 50) -> dict:
                          "merged_into=%s, updated_at=now() "
                          "WHERE id = ANY(%s) AND merged_into IS NULL",
                          (survivor, losers))
+            # a merge offer the household answered follows the merchant
+            from . import merchant_merge
+            merchant_merge.follow_merged(conn, losers, survivor)
             # A 1099 vendor mark is held by merchant id. The loser keeps
             # only a pointer and is pruned once nothing else holds it, so
             # its marks move to the survivor now, folding where the
@@ -2144,9 +2155,12 @@ def _retire_if_empty(conn, mid, survivor) -> None:
         "SELECT (SELECT count(*) FROM transactions WHERE merchant_id=%s AND removed=0) "
         "+ (SELECT count(*) FROM merchant_canonical WHERE merchant_id=%s) AS n",
         (mid, mid)).fetchone()["n"]
-    if n == 0:
-        conn.execute("UPDATE merchants SET merged_into=%s, updated_at=now() "
-                     "WHERE id=%s AND merged_into IS NULL", (survivor, mid))
+    if n == 0 and conn.execute(
+            "UPDATE merchants SET merged_into=%s, updated_at=now() "
+            "WHERE id=%s AND merged_into IS NULL", (survivor, mid)).rowcount:
+        # a merge offer the household answered follows the merchant
+        from . import merchant_merge
+        merchant_merge.follow_merged(conn, [mid], survivor)
 
 
 def stats(conn) -> dict:

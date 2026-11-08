@@ -22,7 +22,9 @@ household's control:
 
   * **ending the account** — delete it, or change the billing behind it.
   * **taking the data out** — the export ZIP, the database dump, the
-    connections bundle. A copy that has left the instance cannot be
+    connections bundle, and every download that writes the ledger to a
+    file (the transactions CSV / XLSX, the business CSVs and year-end
+    package). A copy that has left the instance cannot be
     recalled, and "can't export" is most of what people mean when they say
     someone should not be able to walk off with the finances.
   * **deciding who else is in the household** — invites, removals, roles,
@@ -91,6 +93,93 @@ SELF_WRITE_OK = ("/api/logout", "/api/password/change", "/api/totp",
                  # stopping a factor-clearing recovery on the caller's OWN
                  # account — every member has factors of their own to keep
                  "/api/recovery/cancel-pending")
+
+# The writes a household under a READ-ONLY standing (a lapsed or cancelled
+# subscription) still makes: read-only stops writes to the household's
+# money, and must never trap the people in it. Two kinds of door:
+#
+#   - the caller's OWN account (the SELF_WRITE_OK doors, spelled out): a
+#     lapsed subscription is no reason to keep a stolen session or device
+#     token live, refuse a password change, or keep mailing someone who
+#     switched notices off — the worker goes on sending through the
+#     wind-down. Elevating (/api/auth/elevate, /api/stepup/*) rides here
+#     too: the export and the erasure demand a fresh proof, and proving is
+#     a POST.
+#   - the ways OUT of the household, every one of which only takes
+#     something away: taking the archive, deleting the account, leaving,
+#     removing a member or making them view-only (the role door refuses a
+#     promotion itself while read-only — a path cannot see the body),
+#     revoking a script token, an invite or support access, unlinking a
+#     bank, deleting a webhook, muting an alert, and the owner's switches
+#     for one member's notices.
+#
+# Exact (METHOD, route path) pairs, never path families: a family admits
+# every door anyone later mounts under it, and the gate is not consulted.
+# "{name}" is one path segment. The inventory test
+# (test_read_only_household_keeps_its_exits) fails on a new door under the
+# old families that nobody has placed. An add-on's own billing namespace is
+# the add-on's to keep open (web.app.BILLING_WRITE_OK).
+READ_ONLY_EXITS: frozenset[tuple[str, str]] = frozenset({
+    # the caller's own account
+    ("POST", "/api/logout"),
+    ("POST", "/api/password/change"),
+    ("POST", "/api/totp/enroll"), ("POST", "/api/totp/confirm"),
+    ("POST", "/api/totp/recovery-regenerate"), ("POST", "/api/totp/disable"),
+    ("POST", "/api/passkeys/options"), ("POST", "/api/passkeys"),
+    ("DELETE", "/api/passkeys/{pk_id}"),
+    ("POST", "/api/sessions/revoke"),
+    ("POST", "/api/devices"), ("POST", "/api/devices/abandon"),
+    ("POST", "/api/devices/push"), ("POST", "/api/devices/revoke"),
+    ("POST", "/api/devices/widget"),
+    ("POST", "/api/me/email"), ("POST", "/api/me/push"),
+    ("POST", "/api/email/change"), ("POST", "/api/email/change/cancel"),
+    ("POST", "/api/email/change/resend"),
+    ("POST", "/api/verify-email/resend"),
+    ("POST", "/api/notify/push/subscribe"),
+    ("POST", "/api/notify/push/unsubscribe"),
+    ("POST", "/api/recovery/cancel-pending"),
+    # feedback is how a person reaches whoever runs the instance — the one
+    # conversation a lapsed household most needs to have
+    ("POST", "/api/testing/feedback"),
+    # proving it is you
+    ("POST", "/api/auth/elevate"),
+    ("POST", "/api/stepup/passkey/options"), ("POST", "/api/stepup/passkey"),
+    # ways out of the household
+    ("POST", "/api/export/token"),
+    ("POST", "/api/account/delete"),
+    ("POST", "/api/account/leave"),
+    ("DELETE", "/api/users/{user_id}"),
+    ("POST", "/api/users/{user_id}/role"),
+    ("POST", "/api/users/{user_id}/notify"),
+    ("DELETE", "/api/invites/{token_hash}"),
+    ("POST", "/api/tokens/revoke"),
+    ("POST", "/api/support-access/revoke"),
+    ("POST", "/api/connections/{item_id}/disconnect"),
+    ("POST", "/api/webhooks/{hook_id}/delete"),
+    ("POST", "/api/alerts/dismiss"), ("POST", "/alerts/dismiss"),
+})
+
+# The exits that need no read of the household — what a standing that
+# freezes reads as well (a lapsed free trial) must still leave open beside
+# its own resolution doors, so the person can still leave or erase.
+LOCKOUT_EXITS = ("/api/account/delete", "/api/account/leave")
+
+
+def _door_pattern(template: str) -> "re.Pattern":
+    import re
+    return re.compile("^" + "/".join(
+        "[^/]+" if seg.startswith("{") and seg.endswith("}")
+        else re.escape(seg) for seg in template.split("/")) + "$")
+
+
+_EXIT_PATTERNS = tuple((m, _door_pattern(t)) for m, t in READ_ONLY_EXITS)
+
+
+def read_only_exit(method: str, path: str) -> bool:
+    """Is this exact request one of READ_ONLY_EXITS?"""
+    method = method.upper()
+    return any(m == method and p.match(path) for m, p in _EXIT_PATTERNS)
+
 
 # Doors that carry a BODY but change nothing: a read that has to be a POST
 # because the question is too large or too structured for a query string.
@@ -175,6 +264,26 @@ SHARED_LOGIN_CREDENTIAL_PATTERNS = (
     re.compile(r"^/api/connections/[^/]+/(?:disconnect|reconnect)$"),
 )
 
+# Doors that act on the household's OTHER PEOPLE or reach them: who is in
+# the household and what they may do (invites, roles, removal, what each
+# member is sent), the principals and channels that outlive a login
+# (script tokens, support access, webhooks, a phone or browser for the
+# household's alerts, an imported connection bundle), and the sends that
+# land in every member's inbox or on every member's phone. The shared
+# demonstration login is an owner, so the role gate lets it through all of
+# these; the request gate refuses it the whole family
+# (demoguard.deny_shared_grant says why), so a door added under one of
+# these prefixes later is refused to it without anyone remembering to.
+# Its own switches stay open: /api/me/email and /api/me/push are not here.
+SHARED_LOGIN_PEOPLE_DOORS = (
+    "/api/invites", "/api/users", "/api/tokens", "/api/support-access",
+    "/api/webhooks", "/api/connections/import",
+    "/api/notify/phone", "/api/notify/push/subscribe",
+    "/api/settings/outbound/resume", "/settings/email",
+    # mail and notices sent to members, not to the caller
+    "/api/jobs/email", "/api/notify/test", "/api/continuity/email",
+)
+
 # Owner-only doors whose path carries an id, so a prefix cannot name them.
 OWNER_ONLY_PATTERNS = (
     # removing an account: 'hide' keeps history, but the same door
@@ -221,9 +330,9 @@ OWNER_ONLY_SETTINGS = frozenset({
     "plaid_recurring", "plaid_enrich_cap",
     "plaid_client_id", "plaid_env", "mx_client_id", "mx_env",
 })
-# NOTE: merchant_logos, feedback_enabled and merchant_strip_cities are NOT
-# here on purpose — both clients expose them to members (a display / logo /
-# feedback preference), so gating them server-side would make a member's
+# NOTE: merchant_logos and feedback_enabled are NOT here on purpose — both
+# clients expose them to members (a logo / feedback preference), so gating
+# them server-side would make a member's
 # toggle a silent 200 no-op that springs back with no error. Owner-only
 # means the CLIENT renders it owner-only; keep this set and the clients'
 # `owner &&` gating in lockstep, which the member-role test pins.
@@ -283,6 +392,12 @@ def credential_door(path: str) -> bool:
     or restart one (a connection's disconnect or reconnect)?"""
     return (path_within(path, SHARED_LOGIN_CREDENTIAL_DOORS)
             or any(p.match(path) for p in SHARED_LOGIN_CREDENTIAL_PATTERNS))
+
+
+def people_door(path: str) -> bool:
+    """Does a write here act on, or send to, the household's other people,
+    or mint a principal or channel that outlives the login?"""
+    return path_within(path, SHARED_LOGIN_PEOPLE_DOORS)
 
 
 def read_only_route(path: str) -> bool:

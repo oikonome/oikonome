@@ -1,0 +1,13 @@
+-- A bank-link session remembers the history window its link token asked
+-- Plaid to backfill.
+--
+-- Plaid fixes an Item's backfill when the link token is created, so that
+-- is the window the Item is recorded with. Read again from the household's
+-- setting at the exchange, a history choice saved while Link was open
+-- recorded the other window — and an Item recorded narrower than its
+-- backfill is offered a "relink for more history" it already has.
+--
+-- Additive and nullable: a session started by an older build has no
+-- window, and its finisher records the widest one rather than a guess
+-- that could be narrower than the backfill.
+ALTER TABLE plaid_link_sessions ADD COLUMN IF NOT EXISTS days_requested INTEGER;

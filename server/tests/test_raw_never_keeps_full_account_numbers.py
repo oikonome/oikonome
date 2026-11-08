@@ -105,10 +105,12 @@ class RawIdentifierTests(unittest.TestCase):
             "Memo": "ref 000011112222"})
         self.assertEqual(raws["ofx-1"], {"acct": "2222", "fitid": "F1"})
         # nothing the importers would have kept is touched
-        self.assertEqual(raws["agg-1"], {
-            "account_id": "acc-abcdefgh", "account_owner": None,
-            "transaction_id": "agg-1",
-            "payment_meta": {"reference_number": FULL}})
+        # (the owner name is the Plaid identifier list's to cut, which the
+        # restore and migration 214 do; this older migration leaves it)
+        self.assertEqual(
+            {k: v for k, v in raws["agg-1"].items() if k != "account_owner"},
+            {"account_id": "acc-abcdefgh", "transaction_id": "agg-1",
+             "payment_meta": {"reference_number": FULL}})
 
     def test_stored_rows_are_cut_once_and_stay_cut(self):
         conn = make_db()
@@ -134,6 +136,7 @@ class RawIdentifierTests(unittest.TestCase):
         self.addCleanup(b.close)
         restore.restore_zip(b, data)
         self.assertScrubbed(_raws(b))
+        self.assertNotIn("account_owner", _raws(b)["agg-1"])
 
     def test_the_migration_names_the_importers_identifier_columns(self):
         """The migration and the CSV importer must agree on which columns

@@ -80,10 +80,11 @@ class CadenceWithNothingToSendTests(unittest.TestCase):
         budget.save_config(self.conn, {"email_recipients": ["one@example.com"],
                                        "dynamic_variable_budget": False})
         accept_recipient_invite(self.tid, "one@example.com")
+        # a week of finished days: today is not over, so the seed never
+        # counts it, and on the 1st a fixture of today alone seeds nothing
         today = dt.date.today()
-        start = max(today.replace(day=1), today - dt.timedelta(days=6))
-        d = start
-        while d <= today:
+        d = today - dt.timedelta(days=7)
+        while d < today:
             add_txn(self.conn, d, 50.0, "TARGET")
             d += dt.timedelta(days=1)
         loaded = budget.load_config(self.conn)

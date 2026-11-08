@@ -47,6 +47,26 @@ class EquityTests(unittest.TestCase):
         self.assertEqual(cap["draws"], 200.0)
         self.assertEqual(cap["capital_balance"], 800.0)
 
+    def test_a_sole_owners_capital_is_the_whole_account(self):
+        # one member owning everything: attributed or not, every movement
+        # is theirs, so their capital is the entity's capital account
+        owner = entities.add_member(self.conn, self.ent["id"],
+                                    member_name="Sole Owner",
+                                    ownership_pct=100, is_household=True)
+        equity.record_movement(self.conn, self.ent["id"], kind="contribution",
+                               amount=3000, date=TODAY,
+                               member_id=owner["id"])
+        equity.record_movement(self.conn, self.ent["id"], kind="contribution",
+                               amount=1000, date=TODAY)
+        equity.record_movement(self.conn, self.ent["id"], kind="draw",
+                               amount=500, date=TODAY, member_id=owner["id"])
+        equity.record_movement(self.conn, self.ent["id"], kind="distribution",
+                               amount=250, date=TODAY)
+        cap = equity.capital_summary(self.conn, self.ent["id"])
+        self.assertEqual(cap["capital_balance"], 3250.0)
+        self.assertEqual(cap["household_share_pct"], 100.0)
+        self.assertEqual(cap["household_capital"], cap["capital_balance"])
+
     def test_capital_account_includes_retained_earnings(self):
         """An owner's capital account is contributions + net income − draws.
         Leave retained earnings out and a profitable entity that distributed
@@ -103,14 +123,14 @@ class EquityTests(unittest.TestCase):
         self.assertEqual(cap["net_income"], -120.00)
         self.assertEqual(cap["capital_balance"], 0.0)
 
-    def test_contribute_expense_rejects_null_amount(self):
-        # a NULL-amount transaction must raise a clean ValueError (400), not a
-        # TypeError 500 from float(None) — transactions.amount is nullable.
-        t = add_txn(self.conn, TODAY, None, "AMOUNTLESS", account="card")
-        with self.assertRaises(ValueError):
-            equity.contribute_expense(self.conn, self.ent["id"], t)
-        with self.assertRaises(ValueError):
-            equity.reimburse_expense(self.conn, self.ent["id"], t)
+    def test_a_transaction_without_an_amount_cannot_be_stored(self):
+        # the ledger refuses a row with no amount at the column (migration
+        # 205), so contribute_expense and reimburse_expense never meet one;
+        # the ValueError they keep for a bad amount is a second guard
+        import psycopg
+        with self.assertRaises(psycopg.errors.NotNullViolation):
+            with self.conn.transaction():
+                add_txn(self.conn, TODAY, None, "AMOUNTLESS", account="card")
 
     def test_reimburse_expense_is_a_settlement_not_equity(self):
         t = add_txn(self.conn, TODAY, 50.0, "OFFICE SUPPLIES", account="card")

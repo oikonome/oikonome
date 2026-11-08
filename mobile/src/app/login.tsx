@@ -168,8 +168,8 @@ export default function Login() {
         // the platform refused before any key was used — say what it said,
         // because a bare "didn't work" gives the person nothing to act on
         setErr("Passkey sign-in couldn't start (" + e.message + "). "
-               + "Use your password, or re-add this device's passkey "
-               + "under Security & household.");
+               + "Use your password, or add a passkey for this phone "
+               + "in the web app (Settings → Security), then try again.");
       } else {
         setErr("Passkey sign-in didn't work. Use your password, or try "
                + "again from a device that has your passkey.");

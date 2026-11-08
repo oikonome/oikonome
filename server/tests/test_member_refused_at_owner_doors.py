@@ -23,6 +23,15 @@ _EID = str(uuid.uuid4())
 # (method, route template as declared, concrete path, body)
 DOORS = [
     ("get", "/tokens", "/api/tokens", None),
+    # the ledger and the business books leave the household as files only
+    # by the owner's hand
+    ("get", "/transactions/export", "/api/transactions/export?fmt=csv", None),
+    ("get", "/business/export.csv", "/api/business/export.csv", None),
+    ("get", "/receipts/report", "/api/receipts/report?tag=travel&y=2026&m=1&format=csv", None),
+    ("get", "/business/entities/{entity_id}/pnl.csv",
+     f"/api/business/entities/{_EID}/pnl.csv", None),
+    ("get", "/business/entities/{entity_id}/package.zip",
+     f"/api/business/entities/{_EID}/package.zip", None),
     ("post", "/tokens", "/api/tokens", {"label": "x"}),
     ("post", "/tokens/revoke", "/api/tokens/revoke", {"id": str(uuid.uuid4())}),
     ("post", "/business/entities/{entity_id}/delete-forever",
@@ -42,6 +51,7 @@ DOORS = [
     ("post", "/notify/phone/verify", "/api/notify/phone/verify",
      {"code": "000000"}),
     ("post", "/notify/test", "/api/notify/test", {"channel": "email"}),
+    ("post", "/jobs/email", "/api/jobs/email", {}),
     ("post", "/support-access", "/api/support-access", {"hours": 1}),
     ("post", "/support-access/revoke", "/api/support-access/revoke", {}),
     # the continuity packet's fields and its emailed copy are the owner's:

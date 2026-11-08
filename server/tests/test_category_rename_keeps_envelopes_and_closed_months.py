@@ -25,6 +25,27 @@ class CategoryRenameKeepsEnvelopesAndClosedMonths(unittest.TestCase):
         return {e["payee"]: e for e in
                 st["buckets"]["fixed"]["envelopes"]}[payee]
 
+    def test_a_rename_never_gives_a_bucket_a_name_the_settings_door_refuses(self):
+        """A bucket is relabelled with its category only when the new name
+        is one the settings door would accept; otherwise its matchers move
+        and its own name stays, so the plan can still be saved."""
+        write_config(self.conn, custom_buckets=[
+            {"name": "Misc", "parent": "other", "monthly": 10,
+             "categories": ["Misc"], "merchants": []},
+            {"name": "Treats", "parent": "food", "monthly": 10,
+             "categories": ["Treats"], "merchants": []},
+            {"name": "Snacks", "parent": "food", "monthly": 10,
+             "categories": ["Snacks"], "merchants": []},
+            {"name": "Hobby", "parent": "other", "monthly": 10,
+             "categories": ["Hobby"], "merchants": []}])
+        data.rename_category(self.conn, "Misc", "Other")      # reserved
+        data.rename_category(self.conn, "Snacks", "treats")   # duplicate
+        data.rename_category(self.conn, "Hobby", "H" * 50)    # too long
+        got = {b["name"]: b["categories"] for b in
+               budget.load_config(self.conn)["custom_buckets"]}
+        self.assertEqual(got, {"Misc": ["Other"], "Treats": ["Treats"],
+                               "Snacks": ["treats"], "Hobby": ["H" * 50]})
+
     def test_category_envelope_keeps_claiming_its_rows(self):
         """An envelope that counts rows of its category must still claim
         them after the category is renamed, and show the new name."""

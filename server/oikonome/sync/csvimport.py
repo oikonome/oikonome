@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import math
 import re
 
 from ..engine.compat import as_date
@@ -156,6 +157,16 @@ def _parse_date(s: str, order: str = "mdy") -> dt.date:
 # those as 1250 and 1.23456 — a plausible, silently wrong number that then
 # flows into every total — so the two conventions are read explicitly and
 # anything else is refused.
+# longest sensible amount text: sign, 15 digits, 5 thousands separators,
+# a decimal point and two decimals, with room for an accounting bracket
+MAX_AMOUNT_TEXT = 40
+
+
+class AmountOutOfRange(ValueError):
+    """A cell that reads as a number but not as an amount: infinite, NaN,
+    or past any real account."""
+# and no single line is a quadrillion: past this a cell is a typo or an attack
+MAX_AMOUNT_VALUE = 1e15
 _THOUSANDS_COMMA = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?")
 _THOUSANDS_DOT_DECIMAL_COMMA = re.compile(r"\d{1,3}(?:\.\d{3})+,\d{1,2}")
 _DECIMAL_COMMA = re.compile(r"\d+,\d{1,2}")
@@ -167,6 +178,12 @@ def parse_money_text(s: str) -> float:
     s = s.strip().replace("$", "").replace(" ", "")
     if s.startswith("(") and s.endswith(")"):    # accounting negatives
         s = "-" + s[1:-1]
+    # the three shapes below are matched with patterns that backtrack
+    # polynomially on a long run of digits and separators; no real amount
+    # is longer than a couple of dozen characters, so a cell past that is
+    # refused before any pattern sees it
+    if len(s) > MAX_AMOUNT_TEXT:
+        raise ValueError(f"unrecognized amount: {s[:MAX_AMOUNT_TEXT]!r}…")
     sign, body = "", s
     if s[:1] in ("-", "+"):
         sign, body = ("-" if s[0] == "-" else ""), s[1:]
@@ -179,7 +196,13 @@ def parse_money_text(s: str) -> float:
             body = body.replace(",", ".")
         else:
             raise ValueError(f"unrecognized amount: {s!r}")
-    return float(sign + body)
+    value = float(sign + body)
+    # float() also reads "inf", "nan" and "1e999": none is an amount. A
+    # distinct error, so a door that reads an unparseable cell as blank
+    # (the plan importer) still refuses a number that is out of range.
+    if not math.isfinite(value) or abs(value) > MAX_AMOUNT_VALUE:
+        raise AmountOutOfRange(f"value out of range: {s[:32]!r}")
+    return value
 
 
 def _parse_amount(s: str) -> float:

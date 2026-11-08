@@ -24,6 +24,7 @@ import uuid
 # Neither `raw ? '_batches'` nor `@>` says anything about the shape, so the
 # read sites below go through the read layer's shape guard.
 from ..web.data import _as_array, detach_pairs
+from . import card_number
 
 
 def create(conn, source: str, account_id: str | None,
@@ -34,9 +35,10 @@ def create(conn, source: str, account_id: str | None,
     if filename:
         filename = filename.replace("\x00", "")
     # banks name exports after the full account number, and this record
-    # rides /export and the portability archive: keep the last four only
-    from .base import mask_long_digits
-    filename = mask_long_digits(filename)
+    # rides /export and the portability archive: keep the last four only,
+    # whatever separates the groups ("Visa_4000_…"), as an account's slug
+    # reads them
+    filename = card_number.cut_as_slug_reads(filename)
     conn.execute(
         "INSERT INTO import_batches (id, source, account_id, filename) "
         "VALUES (%s,%s,%s,%s)", (bid, source, account_id, filename))
@@ -84,8 +86,9 @@ def tag(conn, txns: list, batch_id: str) -> list:
 def recent(conn, limit: int = 10) -> list:
     """The latest batches, each with `annotations`: what a person has since
     attached to this batch's rows — receipts, notes, reimbursement
-    pairings, business tags, category overrides, hand splits (one each,
-    however many parts). A rollback hard-deletes
+    pairings, business tags, a booking to a business with its movement
+    (one each), category overrides, hand splits (one each, however many
+    parts). A rollback hard-deletes
     the rows and everything cascades with them; the confirm has to be
     able to say so, because the import did not create any of it."""
     rows = [dict(r) for r in conn.execute(
@@ -103,7 +106,7 @@ def recent(conn, limit: int = 10) -> list:
     # with the cascade (migration 067 + the receipts FK) — count them all
     counts = conn.execute(
         """WITH owned AS (
-             SELECT t.id, t.category_override,
+             SELECT t.id, t.category_override, t.entity_id,
                     COALESCE(t.raw->'_batches'->>0, t.raw->>'_batch') AS bid
                FROM transactions t
               WHERE (t.raw->>'_batch' = ANY(%s) AND NOT t.raw ? '_batches')
@@ -122,6 +125,9 @@ def recent(conn, limit: int = 10) -> list:
                     WHERE k.transaction_id = o.id)
                 + CASE WHEN EXISTS (SELECT 1 FROM transaction_splits s
                                      WHERE s.txn_id = o.id) THEN 1 ELSE 0 END
+                + CASE WHEN o.entity_id IS NOT NULL
+                         OR EXISTS (SELECT 1 FROM equity_movement q
+                                     WHERE q.txn_id = o.id) THEN 1 ELSE 0 END
                 + CASE WHEN o.category_override IS NOT NULL THEN 1 ELSE 0 END
                   AS n
              FROM owned o""", (ids, ids)).fetchall()
@@ -318,27 +324,69 @@ def _archived_business_rows(conn, ids: list[str]) -> set[str]:
         "FOR SHARE OF e", (list(ids),)).fetchall()}
 
 
+def _lock_rows_and_pairs(conn, ids: list[str]) -> list[str]:
+    """Lock, in id order, the rows `ids` and the rows paired with them (and
+    the rows paired with those), which unlinking a pair rewrites; return
+    the ids among `ids` still there.
+
+    base.lock_account_rows for a delete whose rows are named by id rather
+    than by account, for the same reason: taken after the pairing lock and
+    before anything looks at a business, so the delete keeps the order
+    entities.delete_forever keeps (the booked rows, then the business row)
+    instead of holding the business FOR SHARE while it waits on a row
+    delete-forever holds."""
+    ids = [i for i in dict.fromkeys(ids) if i]
+    if not ids:
+        return []
+    own = set(ids)
+    return [r["id"] for r in conn.execute(
+        """WITH own AS (SELECT unnest(%s::text[]) AS id),
+           hop AS (
+               SELECT reimburse_id AS id FROM reimbursements
+                WHERE expense_id IN (SELECT id FROM own)
+               UNION
+               SELECT expense_id FROM reimbursements
+                WHERE reimburse_id IN (SELECT id FROM own)),
+           hop2 AS (
+               SELECT reimburse_id AS id FROM reimbursements
+                WHERE expense_id IN (SELECT id FROM hop)
+               UNION
+               SELECT expense_id FROM reimbursements
+                WHERE reimburse_id IN (SELECT id FROM hop))
+           SELECT t.id FROM transactions t
+            WHERE t.id IN (SELECT id FROM own UNION SELECT id FROM hop
+                           UNION SELECT id FROM hop2)
+            ORDER BY t.id FOR UPDATE OF t""", (ids,)).fetchall()
+        if r["id"] in own]
+
+
 def _let_go(conn, ids: list[str]) -> None:
     """What has to happen before rows are hard-deleted: a pair on a row
     about to go is unlinked first, so its counterpart lets go of the
     transfer category the link gave it (see detach_pairs); a receipt
-    paired with one goes back to waiting instead of down with the row.
-    Callers hold the pairing lock."""
-    from .base import release_matched_receipts
+    paired with one goes back to waiting instead of down with the row; a
+    capitalized or reimbursable cost leaves the books with it. Callers hold
+    the pairing lock."""
+    from .base import release_fronted_movements, release_matched_receipts
     detach_pairs(conn, ids)
     release_matched_receipts(conn, ids)
+    release_fronted_movements(conn, ids, "an undone import")
 
 
 def annotated(conn, ids: list[str]) -> set[str]:
     """The rows among `ids` a person has put something on — the set
     recent() counts: receipts, notes, reimbursement pairings and flags,
-    business tags and classes, category overrides, hand splits."""
+    business tags and classes, a booking to a business or an owner's
+    movement naming the row, category overrides, hand splits."""
     if not ids:
         return set()
     return {r["id"] for r in conn.execute(
         """SELECT t.id FROM transactions t
             WHERE t.id = ANY(%s) AND (
                   t.category_override IS NOT NULL
+               OR t.entity_id IS NOT NULL
+               OR EXISTS (SELECT 1 FROM equity_movement q
+                           WHERE q.txn_id = t.id)
                OR EXISTS (SELECT 1 FROM receipts r WHERE r.txn_id = t.id)
                OR EXISTS (SELECT 1 FROM transaction_notes n
                            WHERE n.txn_id = t.id)
@@ -415,9 +463,9 @@ def _rollback_locked(conn, batch_id: str, force_kept: bool = False,
         # matcher cannot hang a receipt on a doomed row between the release
         # and the delete
         hold_pairing_lock(conn)
-        doomed = [r["id"] for r in conn.execute(
+        doomed = _lock_rows_and_pairs(conn, [r["id"] for r in conn.execute(
             "SELECT id FROM transactions WHERE " + doomed_sql,
-            (member, batch_id)).fetchall()]
+            (member, batch_id)).fetchall()])
         if doomed and _archived_business_rows(conn, doomed):
             raise ArchivedBusinessRows()
         kept = relied_on_by_feed(conn, doomed,

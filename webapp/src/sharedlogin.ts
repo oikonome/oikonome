@@ -8,8 +8,9 @@ import type { Me } from "./api/client";
 export const SHARED_LOGIN_NOTE = "This is a shared demonstration login — "
   + "its password, email, sign-in factors and sessions can't be changed.";
 export const SHARED_GRANT_NOTE = "This is a shared demonstration login — "
-  + "it can't add people, script tokens, support access or new outbound "
-  + "destinations to this household.";
+  + "it can't change who is in this household or how they are reached, "
+  + "send to its members, or add script tokens, support access or "
+  + "outbound destinations.";
 export const SHARED_CREDENTIAL_NOTE = "This is a shared demonstration login — "
   + "it can't connect, disconnect or reconnect a bank or exchange, save "
   + "aggregator keys or take the credential bundle, since those outlive "

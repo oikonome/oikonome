@@ -104,6 +104,28 @@ def _moneyc(v) -> str:
 _env.globals.update(moneyc=_moneyc)
 
 
+# The cash tile's line when it has no paycheck figure, keyed by the
+# gathered status' `income_due_note` (report.gather decides; nothing here
+# re-derives it). The web and mobile Today pages carry the same three
+# strings. A missing or unknown key reads as "none".
+NO_PAYCHECK_NOTE = {
+    "none": "no paycheck set up — add your income under Bills & Income "
+            "and this counts it",
+    "budgeted": "your income is budgeted, not scheduled — this counts "
+                "no paycheck",
+    "off": "your income is switched off under Bills & Income — this "
+           "counts no paycheck",
+}
+
+
+def no_paycheck_note(st: dict) -> str:
+    return NO_PAYCHECK_NOTE.get(st.get("income_due_note") or "none",
+                                NO_PAYCHECK_NOTE["none"])
+
+
+_env.globals.update(no_paycheck_note=no_paycheck_note)
+
+
 def _asset_ver() -> str:
     """Cache-bust token for /static asset URLs. The origin already sends
     no-cache on /static, but a shared CDN in front of a hosted instance can
@@ -886,7 +908,11 @@ def build_context(st: dict, *, email: bool = False) -> dict:
             or (neg_in is not None and neg_in <= 14)):
         if headroom is not None and headroom < 0:
             cash = {"state": "critical", "kind": "today",
-                    "short": -headroom, "slow_to": slow_to}
+                    "short": -headroom, "slow_to": slow_to,
+                    # the payday the figure stops at: "before the next
+                    # paycheck" with no date reads as a verdict on the
+                    # month; with one it is the timing statement it is
+                    "next_paycheck": st.get("next_paycheck")}
         else:
             cash = {"state": "critical", "kind": "date",
                     "short": -(first_neg if first_neg is not None
@@ -900,7 +926,8 @@ def build_context(st: dict, *, email: bool = False) -> dict:
                     "low": p0["min"], "low_date": p0["min_date"]}
         else:
             cash = {"state": "tight", "kind": "headroom",
-                    "headroom": headroom}
+                    "headroom": headroom,
+                    "next_paycheck": st.get("next_paycheck")}
 
     # ---- cash timeline: recent activity flows into
     # the scheduled events across a TODAY divider. Past = the paid ✓ rows

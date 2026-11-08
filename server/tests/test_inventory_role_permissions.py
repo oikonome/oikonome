@@ -33,7 +33,7 @@ from oikonome import ext
 from oikonome.web import permissions
 from oikonome.web.app import app
 
-from .util import handler_source, mutating_routes, route_key
+from .util import all_routes, handler_source, mutating_routes, route_key
 
 # Reads its own authorization instead of leaning on the path policy.
 INLINE_OWNER = re.compile(
@@ -231,6 +231,75 @@ OWNER_ONLY_OPTIONS = {
     # owner's, like the rest of the Connections section
     "POST /api/settings": "advisory_fees",
 }
+
+
+# A GET that hands the household's data over as a FILE. The write gate in
+# `current_user` goes on method, so a download never meets the role policy
+# there: each one has to read the role itself, and this is the list of the
+# ones that may answer a member and a view-only login anyway.
+DOWNLOAD_MARK = re.compile(r"_same_site_download\(|attachment;")
+# a download door is owner-gated when it checks the role itself, or when it
+# redeems a one-shot ticket only the owner's door can mint
+OWNER_DOWNLOAD = re.compile(INLINE_OWNER.pattern + r"|_redeem_export_ticket\(")
+MEMBER_DOWNLOAD_OK = {
+    # one receipt's own image: the same picture the receipt page shows,
+    # not a copy of the ledger
+    "GET /api/receipts/{rid}/image",
+    # the receipts page's per-tag month report, as CSV or JSON: line items
+    # off receipts the household photographed, not the transaction ledger
+    "GET /api/receipts/report",
+    # an entity's filing deadlines as a calendar file — dates, no money
+    "GET /api/business/entities/{entity_id}/compliance.ics",
+}
+
+
+def download_routes() -> dict:
+    """`GET path` -> handler source for every GET that serves a file."""
+    out = {}
+    for r in all_routes(app):
+        if "GET" not in r.methods:
+            continue
+        src = handler_source(r)
+        if not any(d in src for d in SESSION_DEPS):
+            continue
+        if DOWNLOAD_MARK.search(src):
+            out[f"GET {r.path}"] = src
+    return out
+
+
+class LedgerDownloadInventoryTests(unittest.TestCase):
+    """Every door that writes the household's data to a file is the
+    owner's, unless it is named in MEMBER_DOWNLOAD_OK on purpose."""
+
+    def setUp(self):
+        self.doors = download_routes()
+
+    def test_every_download_is_owner_gated_or_listed(self):
+        open_doors = sorted(k for k, src in self.doors.items()
+                            if not OWNER_DOWNLOAD.search(src)
+                            and k not in MEMBER_DOWNLOAD_OK)
+        self.assertEqual(
+            [], open_doors,
+            f"download door(s) a member or viewer can use: {open_doors}. "
+            "Taking the data out is the owner's — check the role in the "
+            "handler (_owner_only), or name the door in MEMBER_DOWNLOAD_OK "
+            "with the reason a member may carry it away.")
+
+    def test_member_download_list_has_not_gone_stale(self):
+        gone = sorted(k for k in MEMBER_DOWNLOAD_OK if k not in self.doors)
+        self.assertEqual([], gone,
+                         f"MEMBER_DOWNLOAD_OK names gone door(s): {gone}")
+
+    def test_the_ledger_downloads_are_owner_only(self):
+        for key in ("GET /api/transactions/export",
+                    "GET /api/business/export.csv",
+                    "GET /api/business/entities/{entity_id}/pnl.csv",
+                    "GET /api/business/entities/{entity_id}/package.zip",
+                    "GET /export", "GET /export/dump",
+                    "GET /export/continuity"):
+            self.assertIn(key, self.doors, f"{key} vanished")
+            self.assertTrue(OWNER_DOWNLOAD.search(self.doors[key]),
+                            f"{key} is no longer owner-only")
 
 
 class RolePermissionInventoryTests(unittest.TestCase):

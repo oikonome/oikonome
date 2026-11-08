@@ -101,8 +101,9 @@ class ShortFormRenderTests(unittest.TestCase):
         finally:
             conn.close()
         t = render.short_daily(d)
-        # a fresh tenant has budgets → days-left line must render
-        self.assertIn("days left", t)
+        # a fresh tenant has budgets → days-left line must render ("1 day
+        # left" on the month's last day)
+        self.assertRegex(t, r"\bdays? left")
 
     def test_daily_on_budget_minimal(self):
         t = render.short_daily({"verdict": "ON BUDGET", "variance": 3,
@@ -315,8 +316,9 @@ class NotifyApiTests(unittest.TestCase):
             r = self.client.post("/api/notify/phone/verify",
                                  json={"code": "000001"})
             self.assertEqual(r.status_code, 400)     # wrong code
+            # a pasted code with a space in it is the same code
             r = self.client.post("/api/notify/phone/verify",
-                                 json={"code": code})
+                                 json={"code": f"{code[:3]} {code[3:]}"})
             self.assertEqual(r.status_code, 200, r.text)
         j = self.client.get("/api/notify").json()
         self.assertTrue(j["phone_verified"])
@@ -324,6 +326,90 @@ class NotifyApiTests(unittest.TestCase):
         # clear
         r = self.client.post("/api/notify/phone", json={"number": ""})
         self.assertEqual(r.status_code, 200)
+        self.assertFalse(self.client.get("/api/notify").json()["phone_verified"])
+
+    _SMS_ENV = {"OIKONOME_TWILIO_ACCOUNT_SID": "AC1",
+                "OIKONOME_TWILIO_AUTH_TOKEN": "t",
+                "OIKONOME_TWILIO_FROM": "+12175550000"}
+
+    def _pending(self):
+        from oikonome.engine import budget
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            return budget.load_config(conn).get("notify_phone_pending")
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _new_address():
+        """Forget every per-address bucket: the next request arrives as if
+        from an address that has spent nothing."""
+        from oikonome.web import security
+        for k in [k for k in security._limiter._hits
+                  if k and k[0] == "notify-verify"]:
+            security._limiter._hits.pop(k, None)
+
+    @staticmethod
+    def _wrong(code: str) -> str:
+        return f"{(int(code) + 1) % 1_000_000:06d}"
+
+    def test_wrong_codes_burn_the_pending_phone_code(self):
+        """A six-digit code must not be guessable by spraying it: a handful
+        of wrong answers burns the pending record, and the code that was
+        right for it no longer verifies the number."""
+        sent: list = []
+        with mock.patch.dict(os.environ, self._SMS_ENV), \
+             mock.patch("oikonome.notify.sms.send",
+                        side_effect=lambda to, body: sent.append(body) or True):
+            r = self.client.post("/api/notify/phone",
+                                 json={"number": "+12175551234",
+                                       "consent": True})
+            self.assertEqual(r.status_code, 200, r.text)
+            code = sent[0].split(":")[1].strip()
+            pend = self._pending()
+            import hashlib
+            self.assertNotIn(hashlib.sha256(code.encode()).hexdigest(),
+                             str(pend), "the stored value must not be a bare "
+                                        "sha256 of the code")
+            for _ in range(6):
+                r = self.client.post("/api/notify/phone/verify",
+                                     json={"code": self._wrong(code)})
+                self.assertEqual(r.status_code, 400, r.text)
+            self.assertIsNone(self._pending(),
+                              "six wrong codes must burn the pending record")
+            r = self.client.post("/api/notify/phone/verify",
+                                 json={"code": code})
+            self.assertEqual(r.status_code, 400, r.text)
+        self.assertFalse(self.client.get("/api/notify").json()["phone_verified"])
+
+    def test_phone_code_attempt_budget_is_per_account_not_per_address(self):
+        """Rotating the source address must not buy more guesses: the
+        attempt budget is charged to the account, so after two burned codes
+        even the right third code is refused within the hour."""
+        sent: list = []
+        with mock.patch.dict(os.environ, self._SMS_ENV), \
+             mock.patch("oikonome.notify.sms.send",
+                        side_effect=lambda to, body: sent.append(body) or True):
+            for _ in range(2):
+                r = self.client.post("/api/notify/phone",
+                                     json={"number": "+12175551234",
+                                           "consent": True})
+                self.assertEqual(r.status_code, 200, r.text)
+                code = sent[-1].split(":")[1].strip()
+                for _ in range(5):
+                    self._new_address()
+                    r = self.client.post("/api/notify/phone/verify",
+                                         json={"code": self._wrong(code)})
+                    self.assertEqual(r.status_code, 400, r.text)
+            r = self.client.post("/api/notify/phone",
+                                 json={"number": "+12175551234",
+                                       "consent": True})
+            self.assertEqual(r.status_code, 200, r.text)
+            code = sent[-1].split(":")[1].strip()
+            self._new_address()
+            r = self.client.post("/api/notify/phone/verify",
+                                 json={"code": code})
+            self.assertEqual(r.status_code, 429, r.text)
         self.assertFalse(self.client.get("/api/notify").json()["phone_verified"])
 
     def test_a_paused_number_is_reported_and_removable_without_a_code(self):

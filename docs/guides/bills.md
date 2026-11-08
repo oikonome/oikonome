@@ -27,11 +27,24 @@ page's flow line, so the pages can't disagree about the same schedule.
 ## Detection and proposals
 
 Detection scans up to 48 months of history for merchants that charge on
-a steady cycle — weekly, every 2 weeks, monthly, every 2/3/6 months, or
-yearly. It wants at least 3 occurrences before proposing (2 for long
-cycles like semi-annual and annual). It runs nightly, and on demand via
-the **Find bills & income** button (which reads "scanning…" while it
-works).
+a steady cycle — weekly, every 2 weeks, twice a month, monthly, every
+2/3/6 months, or yearly. It wants at least 3 occurrences before proposing (2 for long
+cycles like semi-annual and annual). A paycheck that has changed
+through raises is proposed at its current amount: detection anchors on
+the latest deposit, and when the same payer also sends a stipend or a
+bonus, the series with the most recent on-cycle deposits wins. It runs
+nightly, and on demand via the **Find bills & income** button (which
+reads "scanning…" while it works).
+
+**Twice a month.** A series paid on two fixed days of the month, such as
+the 15th and the last day, is one bill with both days on its rule. Its
+amount is one payment, and it counts once per day. Its next date is always
+one of those days, so a date typed off them is refused: a deposit a few days
+either side still counts as that payday. To change the days, pick another
+cadence; the days come back when the ledger shows them again. A paycheck
+already set up as every 2 weeks (or monthly) that the deposits show is
+really paid on two days of the month, three months running, gets a
+cadence-change proposal to twice a month.
 
 Everything detection wants to change arrives as a **proposal** — new
 bill, cadence change, a price change on the due date, "this bill seems
@@ -118,6 +131,12 @@ whether the change came from drift, a proposal or your own edit.
 - An occurrence is recognized **at payment** — paying early is never
   "over budget"; an unpaid occurrence starts counting on its due date
   and shows in the overdue list until it posts.
+- **Each occurrence belongs to one month**: the month its payment is
+  dated in, or its due month while it is unpaid. Rent due the 30th that
+  posts on the 2nd is paid — it is planned and counted in the month the
+  money left, and is neither *missed* nor overdue in the month it was
+  due. The Bills page, the Month and Year lenses and the report card all
+  count it once.
 - **"Withdrawn by the bank feed"** means the bill *was* charged, but
   your bank's feed later took that posted charge back out of the ledger
   (banks sometimes withdraw and re-send a batch of transactions). Instead
@@ -282,11 +301,15 @@ back a month at a time: the paid / received column then shows how that
 month ended — paid ✓, **missed** (or **withdrawn**, when the bank feed
 took the charge back), **not received**, or **not due** for a bill that
 had no occurrence that month — and an envelope shows what it used. The
-reading is the Month lens's own, so the two agree. The schedule itself
-(the bills, their next dates, the health flags) is always the live one:
-a bill added since shows with nothing due in a month it did not exist
-for, and an edit made while looking at a past month changes the live
-bill. **This month** brings you back.
+reading is the Month lens's own, so the two agree: a closed month is
+read from the snapshot taken when it closed — the settings and bill
+schedule it was judged under — so a bill archived, repriced or disabled
+since still reads the way it did that month (an archived one keeps its
+row). A month with no snapshot is read under the live schedule. The
+next dates and health flags are always the live ones: a bill added since
+shows with nothing due in a month it did not exist for, and an edit made
+while looking at a past month changes the live bill. **This month**
+brings you back.
 
 ## Upcoming calendar
 

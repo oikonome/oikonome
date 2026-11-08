@@ -10,10 +10,11 @@ import { Alert, Pressable, ScrollView, StyleSheet, Switch, Text,
 import { Card, H } from "../components/ui";
 import type { Bill, BillDetail, BillsData, BillsHistoryData } from "../lib/api";
 import { patchList, patchQuery } from "../lib/cache";
+import { TWICE_A_MONTH, cadenceFields, cadencePick, withSeveralDays } from "../lib/monthdays";
 import { useSession } from "../lib/session";
 import { useViewer } from "../lib/viewer";
 import { C } from "../lib/theme";
-import { billToggleNote, cadenceChoices, catLabel, missedBillPill }
+import { billToggleNote, cadenceChoices, catLabel, missedBillPill, parseMoneyDraft }
   from "../lib/pure";
 import { errText, takeBillPrefill } from "../lib/api";
 
@@ -44,6 +45,9 @@ export default function BillEdit() {
   const [name, setName] = useState("");
   const [amount, setAmount] = useState("");
   const [cadence, setCadence] = useState("");
+  // the days the picker's several-days option stands for: a ledger-fit
+  // prefill speaks for itself, else the bill's own rule
+  const [days, setDays] = useState<number[] | null>(null);
   const [nextDue, setNextDue] = useState("");
   const [cap, setCap] = useState("");
   const [category, setCategory] = useState("");
@@ -110,7 +114,9 @@ export default function BillEdit() {
     const fit = takeBillPrefill(String(payee));
     setName(d.payee);
     setAmount(fit?.amount || String(d.amount));
-    setCadence(fit?.cadence || d.cadence);
+    const seedDays = (fit ? fit.by_month_day : d.by_month_day) ?? null;
+    setDays(seedDays);
+    setCadence(cadencePick(fit?.cadence || d.cadence, seedDays));
     seededDue.current = d.next_due ?? "";
     setNextDue(fit?.next_due || (d.next_due ?? ""));
     setCap(d.cap !== null ? String(d.cap) : "");
@@ -151,7 +157,7 @@ export default function BillEdit() {
     // occurrence edit can never strip detection's category from the row
     mutationFn: () => client!.billsSave({
       payee: name.trim() || d!.payee, orig_payee: d!.payee,
-      amount, cadence,
+      amount, ...cadenceFields(cadence, d!.by_month_day, days, nextDue),
       ...(nextDue && nextDue !== seededDue.current
         ? { next_due: nextDue } : {}),
       income: d!.income,
@@ -167,15 +173,16 @@ export default function BillEdit() {
       ...(merchantsDirty ? { merchants } : {}),
       ...(feesDirty ? { companions: fees
           .filter((f) => f.tokens.trim() && f.amount.trim())
-          .map((f) => ({ tokens: f.tokens.trim(), amount: Number(f.amount),
+          .map((f) => ({ tokens: f.tokens.trim(), amount: parseMoneyDraft(f.amount) ?? NaN,
                          window_days: Number(f.window_days || 3) })) } : {}) }),
     onSuccess: (r) => {
       // the screens behind this one show the saved values at once; the
       // refetches that follow only confirm them
       if (r.payee === d!.payee) {
         const amt = Number(amount);
+        const sent = cadenceFields(cadence, d!.by_month_day, days, nextDue).cadence;
         patchQuery<BillDetail>(qc, ["bill", payee], {
-          amount: Number.isFinite(amt) ? amt : d!.amount, cadence,
+          amount: Number.isFinite(amt) ? amt : d!.amount, cadence: sent,
           ...(nextDue && nextDue !== seededDue.current
             ? { next_due: nextDue } : {}),
           show_today: showToday, txn_category: txnCat,
@@ -186,7 +193,7 @@ export default function BillEdit() {
         qc.setQueriesData<BillsHistoryData>({ queryKey: ["payee-history", payee] },
           (old) => old && old.bill ? { ...old, bill: { ...old.bill,
             amount: Number.isFinite(amt) ? amt : old.bill.amount,
-            cadence,
+            cadence: sent,
             ...(nextDue && nextDue !== seededDue.current
               ? { due_on: nextDue } : {}) } } : old);
       }
@@ -257,7 +264,9 @@ export default function BillEdit() {
               {/* the bill's saved interval and a ledger-fit prefill may
                   sit outside the standard list — keep both pickable, so
                   trying another chip never loses the bill's own cadence */}
-              {cadenceChoices(d.cadences, [d.cadence, cadence])
+              {withSeveralDays(cadenceChoices(d.cadences, [d.cadence,
+                 cadence === TWICE_A_MONTH ? null : cadence]),
+                 days ?? d.by_month_day)
                 .map(([key, label]) => (
                 <Pressable key={key}
                            style={[s.cad, cadence === key && s.cadOn]}

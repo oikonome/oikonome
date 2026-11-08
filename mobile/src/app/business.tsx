@@ -24,12 +24,13 @@ import { ApiError, errText, Account, BizData, BizTxn, countsInTotals, Entity,
 import { patchList, patchQueries, patchQuery, removeFromList, bizKeys, personalKeys, invalidateAll } from "../lib/cache";
 import { ymd } from "../lib/dates";
 import { bizDefaultTaxYear, bizPeriodProfit, bizTaxStillDue, bizTaxYears,
+  householdDay,
   isValidYmd, catLabel, numberDraft, parseMoneyDraft, bizShownBucket,
   bizNeedsLine,
   numberFieldsPatch, bizMemberDoorMissing } from "../lib/pure";
 import { DownloadButton } from "../components/download-button";
 import { useSession } from "../lib/session";
-import { useOwner, useViewer } from "../lib/viewer";
+import { useMe, useOwner, useViewer } from "../lib/viewer";
 import { C, mmddyy, money } from "../lib/theme";
 
 const m$ = (n: number | null | undefined) =>
@@ -61,6 +62,32 @@ const EQUITY_KINDS: [string, string][] = [
 const putEntity = (qc: QueryClient, e: Entity) =>
   patchList<{ entities: Entity[] }, Entity>(
     qc, ["biz-summary"], "entities", (x) => x.id === e.id, e);
+
+// The owner's one line pointing at Doctor's Unlinked capital list — the
+// web's notice. The list is the household's own records, so it is
+// reachable on hosted too, where the rest of Doctor is not. Same query key
+// as the list, so a Remove there brings the count down here.
+function UnlinkedCapitalNotice() {
+  const { client } = useSession();
+  const owner = useOwner();
+  const router = useRouter();
+  const q = useQuery({ queryKey: ["doctor-unlinked"],
+    queryFn: () => client!.doctorUnlinked(), enabled: !!client && owner });
+  const n = q.data?.movements.length ?? 0;
+  if (!owner || !n) return null;
+  return (
+    <Text style={[s.mut, { marginHorizontal: 12, marginTop: 10 }]}>
+      {n === 1
+        ? "1 capital contribution or reimbursement lost the charge it was recorded for and still counts"
+        : `${n} capital contributions or reimbursements lost the charges they were recorded for and still count`}
+      {" — "}
+      <Text style={{ color: C.accent }} accessibilityRole="link"
+            onPress={() => router.push("/doctor" as never)}>
+        review unlinked capital
+      </Text>
+    </Text>
+  );
+}
 
 export default function Business() {
   const { client } = useSession();
@@ -112,7 +139,8 @@ export default function Business() {
       if (ctx?.prev) qc.setQueryData(["biz-summary"], ctx.prev);
       Alert.alert("Couldn't change", errText(e));
     },
-    onSettled: () => invalidateAll(qc, personalKeys),
+    // combined view also decides which accounts net worth counts
+    onSettled: () => invalidateAll(qc, [["accounts"], ...personalKeys]),
   });
   const importFlags = useMutation({
     mutationFn: () => client!.entityImportFlags(entityId!),
@@ -155,6 +183,7 @@ export default function Business() {
                                       progressBackgroundColor={C.card}
                                       onRefresh={refreshAll} />}>
       <StaleBanner query={summary} />
+      <UnlinkedCapitalNotice />
       {summary.isPending && <Text style={s.center}>Loading…</Text>}
       {summary.isError && !summary.data && (
         <Card>
@@ -451,9 +480,18 @@ function ContinueSetupPrompt({ entity, viewer }: {
   );
 }
 
+/** Today on the household's clock — the day the server dates the books,
+ *  the deadlines and the tax year by — with the phone's own clock only
+ *  until /api/me has answered. */
+function useHouseholdDay(): Date {
+  const me = useMe();
+  return householdDay(new Date(), me.data?.timezone);
+}
+
 function Overview({ entity }: { entity: Entity }) {
   const { client } = useSession();
-  const year = new Date().getFullYear();
+  const day = useHouseholdDay();
+  const year = day.getFullYear();
   // no placeholder across an entity switch: the only thing that changes
   // these keys IS the entity, and the previous one's profit, tax and
   // deadline under the new name read as its figures — "—" is honest
@@ -476,14 +514,14 @@ function Overview({ entity }: { entity: Entity }) {
     .filter((a) => a.entity_id === entity.id && countsInTotals(a));
   const cash = mine.filter((a) => kindIs(a, "depository"))
     .reduce((t, a) => t + (a.balance_current ?? 0), 0);
-  const thisMonth = ymd(new Date()).slice(0, 7);
+  const thisMonth = ymd(day).slice(0, 7);
   // the month figure sits directly under "Profit this year", so it is
   // the server's P&L arithmetic on this month's rows — net of
   // reimbursement links, capitalized §248/§195 costs out; the web's
   // bizPeriodProfit, word for word
   const monthProfit = bizPeriodProfit(txns.data?.transactions ?? [],
     entity.business_start_date, thisMonth);
-  const today = ymd(new Date());
+  const today = ymd(day);
   const next = (compliance.data?.obligations ?? [])
     .filter((o) => o.due >= today)
     .sort((a, b) => a.due.localeCompare(b.due))[0];
@@ -647,6 +685,9 @@ function ReviewQueue({ entityId, ro }: {
 function FlaggedLedger() {
   const { client } = useSession();
   const viewer = useViewer();
+  // the worksheet as a file is the owner's to take: the door refuses a
+  // member or a viewer, so neither gets the button (web: isOwner)
+  const owner = useOwner();
   const qc = useQueryClient();
   const router = useRouter();
   const [year, setYear] = useState<number | undefined>(undefined);
@@ -754,11 +795,11 @@ function FlaggedLedger() {
       {d && limit >= 1000 && d.rows.length <= rowLimit
        && d.count > d.rows.length && (
         <Text style={s.mut}>
-          Showing the newest {d.rows.length} of {d.count} — the CSV
-          lists all.
+          Showing the newest {d.rows.length} of {d.count}
+          {owner ? " — the CSV lists all." : "."}
         </Text>
       )}
-      {d && d.count > 0 && (
+      {owner && d && d.count > 0 && (
         <DownloadButton
           path={`/api/business/export.csv${year ? `?year=${year}` : ""}`}
           filename="business.csv" label="Download CSV" />
@@ -811,7 +852,10 @@ const BOOKS_PAGE = 100;
 function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
   const { client } = useSession();
   const qc = useQueryClient();
-  const now = new Date().getFullYear();
+  // the books as a file are the owner's to take (web: isOwner)
+  const owner = useOwner();
+  const day = useHouseholdDay();
+  const now = day.getFullYear();
   const [year, setYear] = useState<number | undefined>(now);
   // a year chip swaps the key; the P&L line stays up meanwhile — but
   // only the SAME entity's: another entity's figures under this name
@@ -900,7 +944,7 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
   });
   const [eqKind, setEqKind] = useState("contribution");
   const [eqAmt, setEqAmt] = useState("");
-  const [eqDate, setEqDate] = useState(ymd(new Date()));
+  const [eqDate, setEqDate] = useState(ymd(day));
   const [eqForm, setEqForm] = useState("");
   const [eqErr, setEqErr] = useState<string | null>(null);
   const record = useMutation({
@@ -1004,10 +1048,12 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
             <Text style={s.mut}>
               Estimates — confirm the tax treatment with your CPA.
             </Text>
-            <DownloadButton
-              path={`/api/business/entities/${entity.id}/pnl.csv${
-                year ? `?year=${year}` : ""}`}
-              filename="pnl.csv" label="Download P&L CSV" />
+            {owner && (
+              <DownloadButton
+                path={`/api/business/entities/${entity.id}/pnl.csv${
+                  year ? `?year=${year}` : ""}`}
+                filename="pnl.csv" label="Download P&L CSV" />
+            )}
           </>
         )}
         {expenses.length > 0 && (
@@ -1146,7 +1192,7 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
                 <B>{m$(bs.data.capital_account)}</B>
                 {bs.data.household_capital != null
                   && bs.data.household_share_pct != null
-                  ? <> · your share ({bs.data.household_share_pct}%){" "}
+                  ? <> · your capital account ({bs.data.household_share_pct}% owner){" "}
                       <B>{m$(bs.data.household_capital)}</B></>
                   : null}
               </Text>
@@ -1177,7 +1223,7 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
                 ? ` · reimbursements ${m$(cap.reimbursements)}` : ""}
               {cap.household_capital != null
                 && cap.household_share_pct != null
-                ? ` · your share (${cap.household_share_pct}%): ${
+                ? ` · your capital account (${cap.household_share_pct}% owner): ${
                     m$(cap.household_capital)}` : ""}
             </Text>
           </Text>
@@ -1299,7 +1345,10 @@ function Tax({ entity, ro, onChanged }: {
 }) {
   const { client } = useSession();
   const qc = useQueryClient();
-  const year = new Date().getFullYear();
+  // gates the year-end package download (owner-only door)
+  const owner = useOwner();
+  const day = useHouseholdDay();
+  const year = day.getFullYear();
   const est = useQuery({ queryKey: ["esttax", entity.id, year],
     queryFn: () => client!.estTax(entity.id, year), enabled: !!client });
   // the P&L reports the estimates already paid out of the business
@@ -1309,10 +1358,10 @@ function Tax({ entity, ro, onChanged }: {
     queryFn: () => client!.accounts(), enabled: !!client });
   // the filing year the package and the 1099 list read together, so last
   // year's return can be put together in March
-  const taxYears = bizTaxYears(new Date(), entity.formation_date,
+  const taxYears = bizTaxYears(day, entity.formation_date,
                                entity.business_start_date);
   const [taxYear, setTaxYear] = useState(
-    () => bizDefaultTaxYear(new Date(), taxYears));
+    () => bizDefaultTaxYear(day, taxYears));
   const vendors = useQuery({ queryKey: ["vendors", entity.id, taxYear],
     queryFn: () => client!.vendorList(entity.id, taxYear),
     enabled: !!client });
@@ -1353,15 +1402,21 @@ function Tax({ entity, ro, onChanged }: {
   // the Switch is bound to the cached list: flip it up front, put it
   // back if the server refuses; needs_1099 is derived, so still refetch
   const mark = useMutation({
-    mutationFn: ({ merchant, reportable }:
-        { merchant: string; reportable: boolean }) =>
-      client!.vendorMark(entity.id, { merchant, reportable }),
-    onMutate: async ({ merchant, reportable }) => {
+    // a toggle leaves the TIN out (the door keeps the one on file); only
+    // the TIN field sends one
+    mutationFn: ({ merchant, reportable, tin_last4 }:
+        { merchant: string; reportable: boolean;
+          tin_last4?: string | null }) =>
+      client!.vendorMark(entity.id, { merchant, reportable,
+        ...(tin_last4 === undefined ? {} : { tin_last4 }) }),
+    onMutate: async ({ merchant, reportable, tin_last4 }) => {
+      setTouched((t) => t.includes(merchant) ? t : [...t, merchant]);
       await qc.cancelQueries({ queryKey: ["vendors", entity.id] });
       const key = ["vendors", entity.id, taxYear];
       const prev = qc.getQueryData<VendorList>(key);
       patchList<VendorList, Vendor>(qc, key, "vendors",
-        (v) => v.merchant === merchant, { reportable });
+        (v) => v.merchant === merchant,
+        { reportable, ...(tin_last4 === undefined ? {} : { tin_last4 }) });
       return { prev, key };
     },
     onError: (e, _v, ctx) => {
@@ -1371,6 +1426,26 @@ function Tax({ entity, ro, onChanged }: {
     onSettled: () =>
       qc.invalidateQueries({ queryKey: ["vendors", entity.id] }),
   });
+  const [showAllVendors, setShowAllVendors] = useState(false);
+  // a row changed this visit stays on screen, so unmarking a payee under
+  // the line does not make it vanish under the thumb
+  const [touched, setTouched] = useState<string[]>([]);
+  const [tinDraft, setTinDraft] = useState<Record<string, string>>({});
+  const allVendors = vendors.data?.vendors ?? [];
+  const line1099 = vendors.data?.threshold;
+  // every payee carries the contractor switch, so every payee must be
+  // reachable: by default each one paid at or over the 1099 line, plus any
+  // already marked; the rest are one tap away
+  const shownVendors = showAllVendors || line1099 == null ? allVendors
+    : allVendors.filter((v) => v.paid >= line1099 || v.reportable
+                               || touched.includes(v.merchant));
+  const hiddenVendors = allVendors.length - shownVendors.length;
+  const saveTin = (v: Vendor) => {
+    const draft = tinDraft[v.merchant];
+    if (draft == null || draft === (v.tin_last4 ?? "")) return;
+    mark.mutate({ merchant: v.merchant, reportable: v.reportable,
+                  tin_last4: draft || null });
+  };
   const [oTitle, setOTitle] = useState("");
   const [oDue, setODue] = useState("");
   const [oRec, setORec] = useState("yearly");
@@ -1589,13 +1664,18 @@ function Tax({ entity, ro, onChanged }: {
         <Text style={s.mut}>
           P&amp;L, ledger with Schedule C lines, balance sheet, 1099
           vendor totals and the mileage log — one zip for your
-          accountant.
+          accountant{owner ? "." : ", downloaded by the owner."}
         </Text>
-        <DownloadButton
-          path={`/api/business/entities/${entity.id}/package.zip?year=${
-            taxYear}`}
-          filename={`year-end-${taxYear}.zip`}
-          label={`Download ${taxYear} package`} />
+        {/* the whole books as a file are the owner's to take: the door
+            refuses a member or a viewer, so neither gets the button. The
+            year chips stay — they also drive the 1099 list (web: isOwner) */}
+        {owner && (
+          <DownloadButton
+            path={`/api/business/entities/${entity.id}/package.zip?year=${
+              taxYear}`}
+            filename={`year-end-${taxYear}.zip`}
+            label={`Download ${taxYear} package`} />
+        )}
       </Card>
       <Card>
         <H>1099 contractors · {taxYear}</H>
@@ -1608,8 +1688,9 @@ function Tax({ entity, ro, onChanged }: {
             ? " No business payees yet — assign an account or "
               + "transactions to this entity first." : ""}
         </Text>
-        {(vendors.data?.vendors ?? []).slice(0, 12).map((v) => (
-          <View key={v.merchant} style={s.row}>
+        {shownVendors.map((v) => (
+          <View key={v.merchant} style={{ marginBottom: 2 }}>
+          <View style={s.row}>
             <Text style={{ color: C.text, fontSize: 13, flex: 1 }}
                   numberOfLines={1}>{v.merchant}</Text>
             <Text style={{ color: C.mut, fontSize: 12 }}>
@@ -1625,12 +1706,32 @@ function Tax({ entity, ro, onChanged }: {
                     trackColor={{ true: C.accent, false: C.hover }}
                     thumbColor={C.text} />
           </View>
+          {v.reportable && (
+            <TextInput style={[s.input, { width: 120, alignSelf: "flex-end" }]}
+                       accessibilityLabel={`TIN last 4 for ${v.merchant}`}
+                       placeholder="TIN last 4" placeholderTextColor={C.mut}
+                       keyboardType="number-pad"
+                       editable={!ro}
+                       value={tinDraft[v.merchant] ?? v.tin_last4 ?? ""}
+                       onChangeText={(t) => setTinDraft({ ...tinDraft,
+                         // a pasted full TIN keeps its LAST four digits
+                         [v.merchant]: t.replace(/\D/g, "").slice(-4) })}
+                       onEndEditing={() => saveTin(v)} />
+          )}
+          </View>
         ))}
-        {(vendors.data?.vendors.length ?? 0) > 12 && (
-          <Text style={s.mut}>
-            showing the top 12 of {vendors.data!.vendors.length} payees
-            by amount — the books CSV lists every vendor.
-          </Text>
+        {allVendors.length > 0 && shownVendors.length === 0 && (
+          <Text style={s.mut}>No payee is at the 1099 line yet.</Text>
+        )}
+        {(hiddenVendors > 0 || (showAllVendors && line1099 != null)) && (
+          <Pressable onPress={() => setShowAllVendors(!showAllVendors)}>
+            <Text style={{ color: C.accent, fontSize: 13, marginTop: 6 }}>
+              {hiddenVendors > 0
+                ? `${hiddenVendors} more paid under ${m$(line1099!)} · ` : ""}
+              {showAllVendors ? "Show fewer"
+                : `Show all (${allVendors.length})`}
+            </Text>
+          </Pressable>
         )}
       </Card>
       <Card>
@@ -1739,11 +1840,13 @@ function mileageRateLabel(s: { rate: number;
 }
 
 function ReceiptsTab({ entity, ro }: { entity: Entity; ro: boolean }) {
+  const owner = useOwner();
   const { client } = useSession();
   const qc = useQueryClient();
   const mileage = useQuery({ queryKey: ["mileage", entity.id],
     queryFn: () => client!.mileageList(entity.id), enabled: !!client });
-  const [mDate, setMDate] = useState(ymd(new Date()));
+  const day = useHouseholdDay();
+  const [mDate, setMDate] = useState(ymd(day));
   const [mMiles, setMMiles] = useState("");
   const [mPurpose, setMPurpose] = useState("");
   const [mErr, setMErr] = useState<string | null>(null);
@@ -1768,7 +1871,7 @@ function ReceiptsTab({ entity, ro }: { entity: Entity; ro: boolean }) {
     },
     onError: (e) => Alert.alert("Couldn't delete", errText(e)),
   });
-  const now = new Date();
+  const now = day;
   const [tagText, setTagText] = useState("business");
   // the report is keyed on the tag; a fetch per keystroke janks the
   // card and spams the server, so the key follows the input on a delay
@@ -1793,6 +1896,11 @@ function ReceiptsTab({ entity, ro }: { entity: Entity; ro: boolean }) {
       : next > 12 ? { y: y + 1, m: 1 } : { y, m: next };
   });
   const sum = mileage.data?.summary;
+  // every trip carries a delete, so every trip must be reachable: the
+  // newest few by default, the whole log one tap away
+  const [showAllTrips, setShowAllTrips] = useState(false);
+  const allTrips = mileage.data?.trips ?? [];
+  const trips = showAllTrips ? allTrips : allTrips.slice(0, 6);
   return (
     <>
       <Card>
@@ -1804,7 +1912,7 @@ function ReceiptsTab({ entity, ro }: { entity: Entity; ro: boolean }) {
             {sum.year ? ` (${sum.year})` : ""}.
           </Text>
         )}
-        {(mileage.data?.trips ?? []).slice(0, 6).map((t) => (
+        {trips.map((t) => (
           <View key={t.id} style={s.row}>
             <Text style={[s.mut, { width: 60 }]}>
               {t.date ? mmddyy(t.date) : "·"}
@@ -1827,11 +1935,17 @@ function ReceiptsTab({ entity, ro }: { entity: Entity; ro: boolean }) {
             )}
           </View>
         ))}
-        {(mileage.data?.trips.length ?? 0) > 6 && (
-          <Text style={s.mut}>
-            showing the 6 most recent of {mileage.data!.trips.length}
-            {" trips (the deduction total covers all of this year's)."}
-          </Text>
+        {allTrips.length > 6 && (
+          <Pressable onPress={() => setShowAllTrips(!showAllTrips)}>
+            <Text style={s.mut}>
+              {showAllTrips ? `all ${allTrips.length} trips`
+                : `the 6 most recent of ${allTrips.length} trips`}
+              {" (the deduction total covers all of this year's). "}
+              <Text style={{ color: C.accent }}>
+                {showAllTrips ? "Show fewer" : `Show all (${allTrips.length})`}
+              </Text>
+            </Text>
+          </Pressable>
         )}
         {!ro && (
           <View style={{ gap: 6, marginTop: 6 }}>
@@ -1920,10 +2034,14 @@ function ReceiptsTab({ entity, ro }: { entity: Entity; ro: boolean }) {
               <B>Total: ${report.data.total.toFixed(2)}</B>
               <Text style={s.mut}> across {report.data.count} items</Text>
             </Text>
+            {/* the expense file is a download of the books: the door refuses
+                a member or a viewer, so neither gets the button (web: isOwner) */}
+            {owner && (
             <DownloadButton
               path={`/api/receipts/report?tag=${encodeURIComponent(tag)
                 }&y=${rm.y}&m=${rm.m}&format=csv`}
               filename="itemized-expenses.csv" label="Download CSV" />
+            )}
           </>
         )}
       </Card>

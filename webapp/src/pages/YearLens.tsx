@@ -12,22 +12,38 @@ import { isPlanSavingsGoal } from "../moneymath";
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
+// The prior year's column label: "2025" when both years are whole, and
+// "2025 (to Jun 30)" while the lens year is in progress — the server sets
+// it against that same span of the year before
+function priorYearLabel(d: YearLensData): string {
+  const [, m, day] = (d.prev_through ?? "").split("-").map(Number);
+  return m ? `${d.y - 1} (to ${MONTHS[m - 1]} ${day})` : `${d.y - 1}`;
+}
+
+/** The plan savings goal as the lens payload carries it. */
+type LensGoal = { monthly_plan: number; rate_90d: number | null } | null;
+
 export default function YearLens({ y, onMonth }: {
   y: number; onMonth: (m: number) => void;
 }) {
   const q = useQuery({ queryKey: ["lens-year", y],
                        queryFn: () => api.lensYear(y) });
-  // the money map's Savings row — the lens payload carries no savings
-  // figure, so the standing goal comes from the Today payload (the Budget
-  // page's existing pattern; shares Today's cache key)
+  // the money map's Savings row: the lens payload names the plan goal
+  // (savings_goal; null = none). Only an older server's payload, which
+  // lacks the key, sends the page to the Today payload for it — the
+  // costliest request the server answers, for one field.
+  const lensGoal = (q.data as { savings_goal?: LensGoal } | undefined)
+    ?.savings_goal;
   const today = useQuery({ queryKey: ["today", "now"],
-                           queryFn: () => api.todayFull() });
+                           queryFn: () => api.todayFull(),
+                           enabled: q.isSuccess && lensGoal === undefined });
   if (q.isPending) return <p className="mut" style={{ marginTop: "2rem" }}>loading…</p>;
   if (q.isLoadingError) return <div className="note bad">Couldn't load: {String(q.error)}</div>;
   const d: YearLensData = q.data;
-  const goal = (today.data?.savings_goals ?? [])
-    .find((g) => isPlanSavingsGoal(g.name));
+  const goal = lensGoal !== undefined ? lensGoal
+    : (today.data?.savings_goals ?? []).find((g) => isPlanSavingsGoal(g.name));
   const t = d.totals, pt = d.prev_totals;
+  const prevLabel = priorYearLabel(d);
 
   return (
     <>
@@ -151,12 +167,12 @@ export default function YearLens({ y, onMonth }: {
 
       {/* ---- category totals vs prior year ---- */}
       <div className="card">
-        <h2>Spending by category — {d.y} vs {d.y - 1}</h2>
+        <h2>Spending by category — {d.y} vs {prevLabel}</h2>
         {d.categories.length === 0 && <p className="sub">No spending.</p>}
         {d.categories.length > 0 && (
           <table>
             <thead><tr><th>Category</th><th className="num">{d.y}</th>
-              <th className="num">{d.y - 1}</th><th className="num hide-m">Δ</th></tr></thead>
+              <th className="num">{prevLabel}</th><th className="num hide-m">Δ</th></tr></thead>
             <tbody>
               {d.categories.map(([cat, cur, prev, key]) => (
                 <tr key={cat}>

@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type CSSProperties, useEffect, useState } from "react";
 import { Link } from "react-router";
 import { api, errText } from "../api/client";
-import { saveSettings } from "../api/cache";
+import { saveSettings, SETTINGS_SAVES } from "../api/cache";
 import { historyBasisNote, isPlanSavingsGoal, mergePlannerBuckets,
          parseMoneyDraft, plannerUnallocAuto, type PlannerRow }
   from "../moneymath";
@@ -153,6 +153,10 @@ export default function BudgetPlanner({ onSaved, standalone = false,
   ];
 
   const save = useMutation({
+    // every Budget-page list save reads the server fresh, merges and
+    // writes the whole list back: one shared queue, so no two of them
+    // interleave and erase each other's rows
+    scope: SETTINGS_SAVES,
     mutationFn: async () => {
       // /api/settings replaces each list key wholesale, and the
       // planner only OWNS the other-parent rows and the "Savings" goal —
@@ -354,6 +358,7 @@ export default function BudgetPlanner({ onSaved, standalone = false,
               <span className="bp-name" style={{ display: "flex", gap: ".35rem",
                     alignItems: "center" }}>
                 <input value={r.name} placeholder="category name" size={16}
+                  maxLength={40}
                   onChange={(e) => setRow(i, { name: e.target.value })} />
                 <button type="button" title="remove"
                   style={{ fontSize: 12, padding: "0 .4rem" }}

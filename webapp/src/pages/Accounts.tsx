@@ -16,7 +16,7 @@ import ImportPage from "./Import";
 import { Fragment, useEffect, useState } from "react";
 import { ext } from "../ext";
 import { Link, useSearchParams } from "react-router";
-import { ago, api, errText, linkCardVisible, mmdd, money, type Account,
+import { ago, api, errText, linkCardVisible, removedConnectionNote, mmdd, money, type Account,
          type Connection, type HistoryMonths, type Me, type Settings }
   from "../api/client";
 import { historyRowNote, windowNarrower } from "../components/HistoryChoice";
@@ -203,7 +203,8 @@ export default function Accounts({ embedded }: { embedded?: boolean } = {}) {
     // are the link and relink paths, and a new institution spends one of
     // the plan's — the allowance under the Connect button reads /api/me.
     const keys: Moved[] = moved
-      ?? ["accounts", "settings", "connections", "today", "calendar", "me"];
+      ?? ["accounts", "settings", "connections", "today", "calendar", "me",
+          "holdings"];
     for (const k of keys) qc.invalidateQueries({ queryKey: [k] });
   };
   const done: DoneFn = (m, moved) => {
@@ -818,8 +819,8 @@ function GroupRows({ g, archived, hidden, mayEdit, owner, primary, anchor,
       {reaped && (
         <>
           {" "}<span className="pill m" style={{ color: "var(--red)" }}
-            title="the connection kept failing for 30+ days, so it was removed to stop it billing — history is kept">
-            connection removed after 30 days of failure — reconnect</span>
+            title="removed so it stops billing — its history is kept">
+            {removedConnectionNote(g.conn ?? {})} — reconnect</span>
           {owner && (
             /* the removed Item's token is gone — reconnect = a FRESH link
                (no item_id), not update mode */
@@ -976,6 +977,8 @@ function LinkSuggestions() {
     qc.invalidateQueries({ queryKey: ["account-links"] });
     qc.invalidateQueries({ queryKey: ["accounts"] });
     qc.invalidateQueries({ queryKey: ["today"] });
+    // a linked shadow's positions drop out of top holdings
+    qc.invalidateQueries({ queryKey: ["holdings"] });
   };
   // overlapping suggestions (A-B, A-C, B-C) go stale after one is
   // linked — clicking a now-invalid pair 400'd SILENTLY. Surface the error
@@ -1088,6 +1091,8 @@ function LinkControls({ a, onDone }: { a: Account; onDone: DoneFn }) {
     qc.invalidateQueries({ queryKey: ["account-links"] });
     qc.invalidateQueries({ queryKey: ["accounts"] });
     qc.invalidateQueries({ queryKey: ["today"] });
+    // a linked shadow's positions drop out of top holdings
+    qc.invalidateQueries({ queryKey: ["holdings"] });
   };
   const promote = useMutation({
     mutationFn: (gid: string) => api.accountLinkOrder(gid,
@@ -1179,8 +1184,12 @@ function EditRow({ a, owner, primary, excluded, onDone, onCancel }: {
 
   const save = useMutation({
     mutationFn: async () => {
+      // the name as the server stored it (a typed card number is cut to
+      // its last four), which is what the cache and the editor then hold
+      let stored: string | null = null;
       if (nextName !== a.name)
-        await api.accountRename(a.id, wantsRevert ? "" : trimmed);
+        stored = (await api.accountRename(a.id, wantsRevert ? "" : trimmed))
+          .name ?? null;
       // only knock when the kind or the anchor changed, and carry the
       // anchor only when its switch moved: a kind-only save must not
       // re-send a pin another device may have moved since this cache
@@ -1196,16 +1205,20 @@ function EditRow({ a, owner, primary, excluded, onDone, onCancel }: {
       if (manual && bal.trim() !== "" &&
           (parseMoneyDraft(bal) ?? NaN) !== a.balance_current)
         await api.accountBalance(a.id, bal);
+      return stored;
     },
-    onSuccess: () => {
+    onSuccess: (stored) => {
       // The row reads its name, kind and pills straight from the cache, so
       // write what was just saved into it — the editor closes on the new
-      // values instead of the old ones. Each door is a plain field write
-      // with no server-side derivation, so the prediction is the truth.
+      // values instead of the old ones. The name is the one the server
+      // answered with (it may cut what was typed); every other door is a
+      // plain field write, so its prediction is the truth.
       const newBal = (parseMoneyDraft(bal) ?? NaN);
+      const savedName = stored ?? nextName;
+      if (stored !== null) setName(stored);
       patchList<AccountsData, Account>(qc, ["accounts"], "accounts",
         (x) => x.id === a.id,
-        { name: nextName, kind, owner: ownerLbl.trim() || null,
+        { name: savedName, kind, owner: ownerLbl.trim() || null,
           ...(manual && bal.trim() !== "" && Number.isFinite(newBal)
               ? { balance_current: newBal } : {}) });
       const anchorMoved = isPrimary !== (a.id === primary);
@@ -1223,7 +1236,7 @@ function EditRow({ a, owner, primary, excluded, onDone, onCancel }: {
       // the anchor, the exclusion and the kind move the verdict (budget
       // logic keys on account type); a rename does not
       const kindMoved = kind !== a.kind;
-      onDone(`Saved ${nextName}.`,
+      onDone(`Saved ${savedName}.`,
              anchorMoved || exclMoved || kindMoved
                ? ["accounts", "today"] : ["accounts"]);
     },
@@ -1244,7 +1257,8 @@ function EditRow({ a, owner, primary, excluded, onDone, onCancel }: {
         hidden ? { user_removed_at: new Date().toISOString(),
                    balance_current: null }
                : { user_removed_at: null });
-      onDone(r.note, ["accounts", "today"]);
+      // top holdings leaves a hidden account's positions out
+      onDone(r.note, ["accounts", "today", "holdings"]);
     },
     onError: (e) => onDone(errText(e)),
   });

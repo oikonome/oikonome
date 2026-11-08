@@ -1,9 +1,12 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { focusManager, onlineManager, useMutation, useQuery, useQueryClient }
+  from "@tanstack/react-query";
 import { Fragment, useEffect, useRef, useState,
          type ReactNode } from "react";
 import { Link, NavLink, useNavigate, useParams } from "react-router";
 import { MxFlow, PlaidFlow, SimplefinFlow } from "../components/ConnectHub";
 import DemoLock from "../components/DemoLock";
+import { copyText, RecoverySheetButtons }
+  from "../components/RecoverySheetButtons";
 import { VerifyEmailCard } from "../components/VerifyEmailCard";
 import { sharedLock } from "../sharedlogin";
 import { api, errText, mmdd, MOBILE_HOMES, NextCodeNeeded, WEB_HOMES,
@@ -11,9 +14,9 @@ import { api, errText, mmdd, MOBILE_HOMES, NextCodeNeeded, WEB_HOMES,
          type MemberNotify,
          type MobileDevice, type NotifyStatus, type Session,
          type Settings as SettingsData, type TokenScope, type Webhook,
-         type WebhookDelivery, type WebhookEvent } from "../api/client";
+         type WebhookDelivery, type WebhookEvent, type WizardStep } from "../api/client";
 import { patchQuery, removeFromList, saveSettings, SETTINGS_SAVES,
-         smsPauseNote, invalidateAfterRotation }
+         smsPauseNote, invalidateAfterRotation, invalidateAiRoute }
   from "../api/cache";
 import ManageAccounts from "../components/ManageAccounts";
 import Doctor from "./Doctor";
@@ -34,7 +37,7 @@ import { useNarrow } from "../narrow";
 import { INVEST_STALE_STATUS, investChanges, investFormOf, investSeenOf,
          type BasisRow, type FeeRow, type InvestForm,
          type InvestSeen } from "../investsettings";
-import { localDayOf, rebaseKeyed } from "../moneymath";
+import { localDayOf, rebaseSchedule } from "../moneymath";
 import { browserPushBlocked, disableBrowserPush, enableBrowserPush,
          ownPushEndpoint as ownPushEndpointShared } from "../push";
 
@@ -107,6 +110,8 @@ const OLD_SEC: Record<string, string> = {
   rules: "categorize",
   // "general" is a retired id — cheap to honor, and it was a real URL
   general: "wizards",
+  // script tokens live under Connections; old alert mails link here
+  scripts: "connections", tokens: "connections",
 };
 
 // This browser's own web-push endpoint, for the posture changes that drop
@@ -198,7 +203,7 @@ const schedOf = (es: SettingsData["email_schedule"]): Sched => ({
 // fields this edit changed move, and a change saved on another device
 // meanwhile is kept.
 const rebaseSched = (mine: Sched, base: Sched, live: Sched): Sched =>
-  rebaseKeyed<object>({ ...mine }, { ...base }, { ...live }) as unknown as Sched;
+  rebaseSchedule(mine, base, live);
 
 // Settings switches whose save writes the whole stored view back. Two quick
 // taps (or two switches) could otherwise answer out of order, and the older
@@ -813,7 +818,8 @@ export default function Settings() {
       {q.data?.outbound_paused && (
         <OutboundPausedBanner p={q.data.outbound_paused}
           canResume={owner && !lockGrant} lock={owner ? lockGrant : null}
-          onResumed={() => qc.invalidateQueries({ queryKey: ["settings"] })}
+          onResumed={() => { qc.invalidateQueries({ queryKey: ["settings"] });
+                             invalidateAiRoute(qc); }}
           onError={(text) => setNotice({ text, bad: true })} />
       )}
       {demo && (
@@ -908,8 +914,8 @@ export default function Settings() {
         <div style={{ display: "flex", gap: ".5rem", flexWrap: "wrap",
                       marginTop: ".8rem", alignItems: "center" }}>
           {saveEmail.isPending && <span className="sub">saving…</span>}
-          <button disabled={sendNow.isPending}
-                  title="sends to everyone on the list above, even if the daily toggle is off; SMS/push don't fire and the scheduled send still happens"
+          <button disabled={sendNow.isPending || !!lockGrant}
+                  title={lockGrant ?? "sends to everyone on the list above, even if the daily toggle is off; SMS/push don't fire and the scheduled send still happens"}
                   onClick={() => sendNow.mutate()}>
             {sendNow.isPending ? "sending…" : "Send today's email now"}
           </button>
@@ -969,9 +975,11 @@ export default function Settings() {
       </DemoLock>
       </Show>)}
       <Show on={h.conn}>
+      {/* off when the operator opted out of the billed Plaid products */}
+      {meQ.data?.features?.enrich !== false && (
       <DemoLock on={meQ.data?.demo}>
       <EnrichCard />
-      </DemoLock>
+      </DemoLock>)}
       </Show>
       <Show on={h.invest}>
       <DemoLock on={meQ.data?.demo}>
@@ -1114,10 +1122,12 @@ export default function Settings() {
       <ConnectionsBackupCard onImported={() => {
         setNotice({ text: "Connections imported — run a sync to pull accounts." });
         // restores provider config and bank links, and nothing the ledger
-        // reads until the sync it asks for — so only those three move
+        // reads until the sync it asks for — so only those move (the
+        // restored config can carry AI routes)
         qc.invalidateQueries({ queryKey: ["settings"] });
         qc.invalidateQueries({ queryKey: ["connections"] });
         qc.invalidateQueries({ queryKey: ["accounts"] });
+        invalidateAiRoute(qc);
       }} />
       </DemoLock>
       </Show>
@@ -1276,6 +1286,7 @@ function EnrichCard() {
   const capOk = Number.isFinite(capNum) && capNum >= 0
     && !!d && capNum !== d.cap;
   const saveCap = useMutation({
+    scope: SETTINGS_SAVES,
     mutationFn: (cap: number) => saveSettings(qc, { plaid_enrich_cap: cap }),
     onSuccess: (_v, cap) => {
       // the box follows the cached status once the draft clears, so the
@@ -2031,6 +2042,9 @@ function DataExportCard({ hosted }: { hosted: boolean }) {
 function ContinuityCard() {
   const qc = useQueryClient();
   const q = useQuery({ queryKey: ["continuity"], queryFn: api.continuity });
+  // mailing the packet sends to a member: not the shared login's to do
+  const meQ = useQuery({ queryKey: ["me"], queryFn: api.me });
+  const sendLock = sharedLock(meQ.data, "grant");
   // null = untouched since the last load; the Save button reads dirtiness
   const [note, setNote] = useState<string | null>(null);
   const [who, setWho] = useState<string | null>(null);
@@ -2146,7 +2160,9 @@ function ContinuityCard() {
                 {d.members.map((m) => <option key={m} value={m} />)}
               </datalist>
             )}
-            <button disabled={busy || !to.trim() || !d.mail_configured}
+            <button disabled={busy || !to.trim() || !d.mail_configured
+                              || !!sendLock}
+              title={sendLock ?? undefined}
               onClick={() => mail.mutate()}>
               {mail.isPending ? "sending…" : "Email the packet"}
             </button>
@@ -2295,6 +2311,9 @@ function PasskeysCard() {
   const [recovery, setRecovery] = useState<string[] | null>(null);
   // a first passkey is a credential change, and can pause the text number
   const [note, setNote] = useState<string | null>(null);
+  // removing the key this session signed in with ends the session; when
+  // that removal also minted a new sheet, sign-in waits until it is saved
+  const [signedOut, setSignedOut] = useState(false);
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const available = typeof window !== "undefined" && window.isSecureContext &&
     !!window.PublicKeyCredential;
@@ -2344,14 +2363,49 @@ function PasskeysCard() {
       return api.passkeyDelete(id);
     },
     // the removed key leaves the list on the response; the refetch confirms
-    onSuccess: (r, id) => {
+    onSuccess: (reply, id) => {
+      // a reissue sweeps what the old sheet could have reached, and says
+      // so in the same fields turning 2FA off answers with
+      const r = reply as typeof reply & SheetSweep;
+      // Another factor stays, so the old recovery sheet was voided and
+      // this is the one that stands. Shown before anything else — even
+      // when the removal signed this session out, the sheet is the only
+      // place these codes ever appear.
+      const fresh = r.recovery_codes?.length ? r.recovery_codes : null;
       // The key had signed this session in, so the server ended the
       // session with it: say why before the sign-in page, instead of
       // letting the refetch meet a bare 401.
-      if ((r as { signed_out?: boolean }).signed_out) {
+      if (r.signed_out) {
+        if (fresh) {
+          // the session is gone, so the next ["me"] refetch (a tab switch
+          // to a password manager, a reconnect) would 401 and send the
+          // page to sign-in with the sheet unread. Nothing on this page
+          // can load again anyway; dismissing the sheet reloads to /login.
+          focusManager.setEventListener(() => () => undefined);
+          onlineManager.setEventListener(() => () => undefined);
+          setRecovery(fresh);
+          setSignedOut(true);
+          // worded without refetching: this session is gone, and a
+          // refetch would 401 the page to sign-in with the sheet unread
+          setNote("That passkey signed you in, so you were signed out. "
+                  + "Save your new recovery codes, then sign in again."
+                  + smsPauseNote(inertClient, r)
+                  + membersRemovedNote(inertClient, r));
+          return;
+        }
         window.alert("That passkey signed you in, so you were signed out.");
         window.location.href = "/login";
         return;
+      }
+      if (fresh) {
+        setRecovery(fresh);
+        patchQuery<Me>(qc, ["me"], { recovery_codes_left: fresh.length });
+        // the old sheet's holders are signed out with it, and what they
+        // could have planted is removed
+        setNote(((r.other_sessions_signed_out
+          ? "Your other browsers and devices were signed out." : "")
+          + smsPauseNote(qc, r) + membersRemovedNote(qc, r)).trim() || null);
+        invalidateAfterSweep(qc);
       }
       setErr(null);
       removeFromList<{ passkeys: { id: string }[] }, { id: string }>(
@@ -2396,10 +2450,9 @@ function PasskeysCard() {
                lineHeight: 1.9, userSelect: "all", marginTop: ".4rem" }}>
             {recovery.map((c) => <div key={c}>{c}</div>)}
           </div>
-          <button style={{ marginTop: ".4rem" }}
-                  onClick={() => { navigator.clipboard?.writeText(
-                    recovery.join("\n")); setRecovery(null); }}>
-            Copy & dismiss</button>
+          <RecoverySheetButtons codes={recovery} onErr={setErr}
+            onDone={() => { setRecovery(null);
+                            if (signedOut) window.location.href = "/login"; }} />
         </div>
       )}
       {q.data.passkeys.length > 0 ? (
@@ -2542,7 +2595,8 @@ function NotifyChannels({ status }: { status?: NotifyStatus }) {
           {status.phone_verified ? (<>
             <span>{status.phone} <span className="pill g">verified</span></span>
             <button onClick={() => test.mutate("sms")}
-                    disabled={test.isPending}>send test SMS</button>
+                    title={grantLock ?? undefined}
+                    disabled={test.isPending || !!grantLock}>send test SMS</button>
             <button onClick={() => clearP.mutate()}
                     disabled={clearP.isPending || !!grantLock}
                     title={grantLock ?? ""}>remove</button>
@@ -2698,7 +2752,8 @@ function NotifyChannels({ status }: { status?: NotifyStatus }) {
           {(status.push_subscribed
             || (status.native_push_devices ?? 0) > 0) && (
             <button onClick={() => test.mutate("push")}
-                    disabled={test.isPending}>send test push</button>
+                    title={grantLock ?? undefined}
+                    disabled={test.isPending || !!grantLock}>send test push</button>
           )}
         </div>
       )}
@@ -2751,6 +2806,32 @@ function membersRemovedNote(
     + `${gone.map((m) => m.email).join(", ")} — invite back the ones that `
     + "are yours.";
 }
+
+/** What a door that voids the recovery sheet (turning 2FA off, removing a
+ *  passkey while another factor stays, regenerating) also swept, in the
+ *  reply's own fields. */
+type SheetSweep = {
+  other_sessions_signed_out?: number;
+  sms_number_needs_verify?: boolean;
+  members_removed?: { email: string }[];
+};
+
+/** The full sweep (turning 2FA off, removing a passkey with a reissue)
+ *  signs out every other session, phone and script token, pauses the
+ *  caller's webhooks and ends support grants; those lists live on this
+ *  page, so they are the keys refetched (the notes refetch the roster and
+ *  the text number). A routine regenerate moves only sessions and
+ *  devices, and refetches just those. */
+function invalidateAfterSweep(qc: ReturnType<typeof useQueryClient>): void {
+  for (const k of ["sessions", "devices", "tokens", "webhooks"])
+    qc.invalidateQueries({ queryKey: [k] });
+  invalidateAfterRotation(qc);
+}
+
+/** For wording a note after this session was signed out: refetching then
+ *  would only 401. */
+const inertClient = { invalidateQueries: () => Promise.resolve() } as
+  unknown as ReturnType<typeof useQueryClient>;
 
 /** A credential rotation paused the household's own outbound settings —
  *  the relay, extra recipients, the AI endpoint — until the owner says
@@ -2869,17 +2950,21 @@ function CadenceEditor({ sched, onChange, timezone, onTimezone }: {
   // states what it does in words, and the controls open in place behind
   // "change"; every channel is still there, just not at rest.
   const notify = useQuery({ queryKey: ["notify"], queryFn: api.notifyStatus });
-  const smsOk = !!notify.data?.sms_available && !!notify.data?.phone_verified;
+  // The shared demonstration login cannot switch a scheduled text or push
+  // ON (the server refuses it); a channel already on can still be turned off.
+  const smsOk = !!notify.data?.sms_available && !!notify.data?.phone_verified
+    && !sharedLock(me.data, "grant");
   // push means browser push OR the mobile apps through the relay — a
   // household whose phones can receive it must be able to tick the box on
   // an instance that never configured VAPID keys. The shared demonstration
   // login cannot register a new device (the server refuses it a new outbound
-  // destination), so for it only a phone already registered can carry push.
+  // destination) and cannot switch a scheduled push on.
   const pushLock = sharedLock(me.data, "grant");
-  const pushOk = (!pushLock && (!!notify.data?.push_available
-                                || !!notify.data?.native_push_available))
-    || (notify.data?.native_push_devices ?? 0) > 0;
-  const smsWhy = !notify.data?.sms_available
+  const pushOk = !pushLock && (!!notify.data?.push_available
+                                || !!notify.data?.native_push_available
+                                || (notify.data?.native_push_devices ?? 0) > 0);
+  const smsWhy = pushLock ? pushLock
+    : !notify.data?.sms_available
     ? "SMS isn't configured on this instance"
     : notify.data?.phone && !notify.data.phone_verified
       ? "texts are paused until you confirm the number below"
@@ -3005,8 +3090,8 @@ function CadenceEditor({ sched, onChange, timezone, onTimezone }: {
                   )}
                   {chanBox(cad, "sms", "SMS", smsOk, smsWhy)}
                   {chanBox(cad, "push", "push", pushOk,
-                           "push needs a supported browser over HTTPS, "
-                           + "or the mobile app")}
+                           pushLock ?? ("push needs a supported browser "
+                                        + "over HTTPS, or the mobile app"))}
                 </div>
               )}
             </div>
@@ -3370,9 +3455,12 @@ function FamilyCard({ onMemberRemoved }: {
                   ? <>. We also emailed it to <b>{fresh.label}</b>.</>
                   : ":"}<br />
                 <b>{fresh.url}</b>{" "}
-                <button style={{ marginLeft: 6 }} onClick={() =>
-                  navigator.clipboard?.writeText(fresh.url ?? "")}>
-                  copy</button>
+                <button style={{ marginLeft: 6 }} onClick={async () => {
+                  // the link stays on screen; a refused copy says so
+                  if (!(await copyText(fresh.url ?? "")))
+                    setInvErr("Couldn't copy — select the link and copy "
+                              + "it by hand.");
+                }}>copy</button>
               </>) : (<>
                 Invitation emailed to <b>{fresh.label}</b>. The link works
                 once, expires in 7 days, and only that address can use
@@ -3554,6 +3642,7 @@ function SmtpCard({ data, onSaved }: {
   const [err, setErr] = useState<string | null>(null);
   const qc = useQueryClient();
   const save = useMutation({
+    scope: SETTINGS_SAVES,
     // seeds ["settings"] from the response — the password-set flag and
     // the sender line read from there
     mutationFn: () => saveSettings(qc, {
@@ -3712,6 +3801,7 @@ function LlmCard({ data, hosted = false, onSaved }: {
   const [err, setErr] = useState<string | null>(null);
   const qc = useQueryClient();
   const save = useMutation({
+    scope: SETTINGS_SAVES,
     // seeds ["settings"] from the response; the key-set flags and the
     // bundled-model line read from there
     mutationFn: () => saveSettings(qc, {
@@ -4044,6 +4134,14 @@ function LlmBackendForm({ initial, hosted, onDone, onCancel }: {
  *  step value as "forget this mark", so this is a normal save, not a new
  *  API. Retire keeps its own state and only needs ?wizard=1.
  */
+// Every step mark, cleared. Typed as a Record over the whole step union so
+// a step added to the wizard fails the build until it is listed here too —
+// a mark left behind makes the restarted wizard skip that step.
+const CLEARED_WIZARD_STEPS: Record<WizardStep, null> = {
+  appearance: null, connect: null, sync: null, import: null,
+  bills: null, budgets: null, email: null, finish: null,
+};
+
 function GuidedSetupCard() {
   const qc = useQueryClient();
   const nav = useNavigate();
@@ -4052,12 +4150,10 @@ function GuidedSetupCard() {
   const ob = useQuery({ queryKey: ["onboarding"], queryFn: api.onboarding });
   const [msg, setMsg] = useState<string | null>(null);
   const restart = useMutation({
+    scope: SETTINGS_SAVES,
     mutationFn: () => saveSettings(qc, {
       wizard_done: false,
-      wizard_steps: {
-        connect: null, sync: null, import: null,
-        bills: null, budgets: null, email: null, finish: null,
-      },
+      wizard_steps: CLEARED_WIZARD_STEPS,
     }),
     onSuccess: () => {
       // the step marks are a setting (seeded from the response) and the
@@ -4555,6 +4651,8 @@ function EmailCard({ current, pending, pendingUntil, onChanged }: {
   const qc = useQueryClient();
   const [email, setEmail] = useState("");
   const [msg, setMsg] = useState<{ text: string; bad: boolean } | null>(null);
+  // the change voided the recovery sheet; the new one is shown once
+  const [recovery, setRecovery] = useState<string[] | null>(null);
   const change = useMutation({
     // the rotation drops every browser's web push but this one's — name it
     mutationFn: async () => {
@@ -4588,11 +4686,18 @@ function EmailCard({ current, pending, pendingUntil, onChanged }: {
             : ""),
         bad: false });
       setEmail("");
+      // The rotation voided the old recovery sheet (the account has a
+      // second factor) and this is the one that stands. Its code count
+      // rides the same patch.
+      const fresh = r.recovery_codes?.length ? r.recovery_codes : null;
+      setRecovery(fresh);
       // the heading reads the address off ["me"]. A pending change moved
       // nothing — the sign-in address and its verified state stand — so
       // only the pending line is patched; a completed one moves the address
-      patchQuery<Me>(qc, ["me"], r.pending_email
-        ? { pending_email: r.pending_email } : { email: r.email });
+      patchQuery<Me>(qc, ["me"], {
+        ...(r.pending_email
+          ? { pending_email: r.pending_email } : { email: r.email }),
+        ...(fresh ? { recovery_codes_left: fresh.length } : {}) });
       // the patch covers the address; the pending expiry, the old inbox's
       // bounce state and the verify banner are the server's to recompute
       qc.invalidateQueries({ queryKey: ["me"] });
@@ -4637,6 +4742,20 @@ function EmailCard({ current, pending, pendingUntil, onChanged }: {
         </p>)}
       {msg && <div className={`note ${msg.bad ? "bad" : "good"}`}
                    onClick={() => setMsg(null)}>{msg.text}</div>}
+      {recovery && (
+        <div className="note good" style={{ display: "block" }}>
+          <b>Recovery codes</b> — save these somewhere safe. Each works once
+          to sign in if you lose your passkey or authenticator; they won't be
+          shown again. The codes you had before no longer work.
+          <div style={{ fontFamily: "monospace", fontSize: 14,
+               lineHeight: 1.9, userSelect: "all", marginTop: ".4rem" }}>
+            {recovery.map((c) => <div key={c}>{c}</div>)}
+          </div>
+          <RecoverySheetButtons codes={recovery}
+            onErr={(text) => setMsg({ text, bad: true })}
+            onDone={() => setRecovery(null)} />
+        </div>
+      )}
       <div className="field-grid" style={{ maxWidth: "26rem" }}>
         <label>New email
           <input type="email" value={email} autoComplete="email"
@@ -4659,6 +4778,8 @@ function PasswordCard() {
   const [totp, setTotp] = useState("");
   const [needTotp, setNeedTotp] = useState(false);
   const [msg, setMsg] = useState<{ text: string; bad: boolean } | null>(null);
+  // the change voided the recovery sheet; the new one is shown once
+  const [recovery, setRecovery] = useState<string[] | null>(null);
 
   const change = useMutation({
     // the rotation drops every browser's web push but this one's — name it
@@ -4670,10 +4791,7 @@ function PasswordCard() {
     onSuccess: (r) => {
       // the server reports what the rotation actually cost, so a passkey
       // or phone that stops working right after is explained, not a mystery
-      const c = r as { ok: boolean; passkeys_removed?: number;
-                       passkeys_kept?: number;
-                       tokens_revoked?: number; devices_revoked?: number;
-                       sms_number_needs_verify?: boolean };
+      const c = r;
       const cost = [
         c.passkeys_removed ? `${c.passkeys_removed} passkey(s) removed` : "",
         // the key that proved this change survives when it is the account's
@@ -4691,6 +4809,12 @@ function PasswordCard() {
                bad: false });
       setCurrent(""); setNext(""); setConfirm(""); setTotp("");
       setNeedTotp(false);
+      // The rotation voided the old recovery sheet (the account has a
+      // second factor) and this is the one that stands.
+      const fresh = r.recovery_codes?.length ? r.recovery_codes : null;
+      setRecovery(fresh);
+      if (fresh)
+        patchQuery<Me>(qc, ["me"], { recovery_codes_left: fresh.length });
       // the rotation empties these lists, and they live on this same page
       qc.invalidateQueries({ queryKey: ["sessions"] });
       qc.invalidateQueries({ queryKey: ["passkeys"] });
@@ -4748,6 +4872,20 @@ function PasswordCard() {
       {msg && (
         <div className={"note " + (msg.bad ? "bad" : "good")}
              onClick={() => setMsg(null)}>{msg.text}</div>
+      )}
+      {recovery && (
+        <div className="note good" style={{ display: "block" }}>
+          <b>Recovery codes</b> — save these somewhere safe. Each works once
+          to sign in if you lose your passkey or authenticator; they won't be
+          shown again. The codes you had before no longer work.
+          <div style={{ fontFamily: "monospace", fontSize: 14,
+               lineHeight: 1.9, userSelect: "all", marginTop: ".4rem" }}>
+            {recovery.map((c) => <div key={c}>{c}</div>)}
+          </div>
+          <RecoverySheetButtons codes={recovery}
+            onErr={(text) => setMsg({ text, bad: true })}
+            onDone={() => setRecovery(null)} />
+        </div>
       )}
       <div className="field-grid">
         <label>Current password
@@ -4825,7 +4963,7 @@ function TwoFactorCard() {
     mutationFn: () => api.totpConfirm(enroll!.secret, code.trim()),
     onSuccess: (r) => {
       setEnroll(null); setCode("");
-      // first-factor enrolment returns one-time recovery codes
+      // a first factor or a replaced authenticator returns recovery codes
       if (r.recovery_codes && r.recovery_codes.length)
         setRecovery(r.recovery_codes);
       setMsg({ text: (enabled ? "Your new authenticator is set up — the old "
@@ -4850,10 +4988,21 @@ function TwoFactorCard() {
     // elevation-gated; the live code a TOTP account owes was collected at
     // elevate time, so nothing is typed here
     mutationFn: () => api.recoveryRegenerate(),
-    onSuccess: (r) => { setRecovery(r.recovery_codes);
-                        // the unused-codes count is the batch just minted
-                        patchQuery<Me>(qc, ["me"],
-                          { recovery_codes_left: r.recovery_codes.length }); },
+    onSuccess: (reply) => {
+      const r = reply as typeof reply & SheetSweep;
+      setRecovery(r.recovery_codes);
+      // the unused-codes count is the batch just minted
+      patchQuery<Me>(qc, ["me"],
+        { recovery_codes_left: r.recovery_codes.length });
+      // the old sheet's holders are signed out with it; tokens, webhooks,
+      // invites and the text number are left alone, so only the session
+      // and device lists moved
+      setMsg(r.other_sessions_signed_out
+        ? { text: "Your other browsers and devices were signed out.",
+            bad: false } : null);
+      for (const k of ["sessions", "devices"])
+        qc.invalidateQueries({ queryKey: [k] });
+    },
     onError: fail,
   });
   const cancelRecovery = useMutation({
@@ -4871,12 +5020,21 @@ function TwoFactorCard() {
     mutationFn: () => api.totpDisable(code.trim()),
     onSuccess: (r) => {
       setCode("");
-      setMsg({ text: "Two-factor is off." + smsPauseNote(qc, r)
+      // a passkey stays, so the old recovery sheet was voided and this is
+      // the one that stands — shown like the replace flow's
+      if (r.recovery_codes && r.recovery_codes.length)
+        setRecovery(r.recovery_codes);
+      // the server signs every other session and device out with it
+      setMsg({ text: "Two-factor is off — every other session was signed "
+                     + "out." + smsPauseNote(qc, r)
                      + membersRemovedNote(qc, r), bad: false });
+      invalidateAfterSweep(qc);
       // flip the flag the card keys on now; whether a hosted account is
       // back to owing a second factor depends on its passkeys, which only
       // the server knows — hence the refetch too
-      patchQuery<Me>(qc, ["me"], { totp_enabled: false });
+      patchQuery<Me>(qc, ["me"], { totp_enabled: false,
+        ...(r.recovery_codes?.length
+          ? { recovery_codes_left: r.recovery_codes.length } : {}) });
       qc.invalidateQueries({ queryKey: ["me"] });
     },
     onError: fail,
@@ -4902,10 +5060,9 @@ function TwoFactorCard() {
                lineHeight: 1.9, userSelect: "all", marginTop: ".4rem" }}>
             {recovery.map((c) => <div key={c}>{c}</div>)}
           </div>
-          <button style={{ marginTop: ".4rem" }}
-                  onClick={() => { navigator.clipboard?.writeText(
-                    recovery.join("\n")); setRecovery(null); }}>
-            Copy & dismiss</button>
+          <RecoverySheetButtons codes={recovery}
+            onErr={(text) => setMsg({ text, bad: true })}
+            onDone={() => setRecovery(null)} />
         </div>
       )}
       {/* The recovery notice sends people here, and someone already
@@ -4914,7 +5071,7 @@ function TwoFactorCard() {
       {me.data.factor_reset_pending && (
         <p className="sub" style={{ color: "var(--amber)" }}>
           Someone asked for a recovery that removes this account's
-          two-factor methods. It lands {mmdd(me.data.factor_reset_pending)}.
+          two-factor methods. It lands {mmdd(localDayOf(me.data.factor_reset_pending))}.
           {" "}Not you?{" "}
           <button disabled={cancelRecovery.isPending}
             onClick={() => cancelRecovery.mutate()}>

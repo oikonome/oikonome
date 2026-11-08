@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
-import { ago, api, AuthError, errText, req, toast, type Connection,
-         type Settings } from "../api/client";
+import { ago, api, AuthError, errText, releasedHoldDays, req, toast,
+         type Connection, type Settings } from "../api/client";
 import { ext } from "../ext";
 import { patchQuery, removeFromList } from "../api/cache";
 import { sharedLock } from "../sharedlogin";
@@ -1046,11 +1046,12 @@ export default function ConnectHub({ onDone }: { onDone?: () => void }) {
                               `Disconnect ${c.institution_name || c.id}? `
                               + "It stops syncing (history is kept)"
                               // a released Item keeps its place under the
-                              // allowance for 30 days, so only say so where
+                              // allowance for a while, so only say so where
                               // there is an allowance to hold it
                               + (r.key === "plaid"
                                    && typeof me.data?.features?.institution_cap === "number"
-                                 ? ". It keeps its slot for 30 days." : "."))
+                                 ? `. It keeps its slot for ${releasedHoldDays()} days.`
+                                 : "."))
                               && disc.mutate(c.id)}>✕</button>
                         </span>
                       ))}

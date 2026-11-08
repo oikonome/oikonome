@@ -8,13 +8,11 @@ second factor while one is pending, the recovery must stop there: landing
 later, it would strip the credentials the owner has just put on. Its
 mailed cancel link then answers that there is nothing left to stop.
 
-The last test keeps the rule structural: every door in web/app.py that
-re-enrols a factor or pauses outbound for a rotation must go through the
-one helper that voids pending recoveries.
+The structural rule — every rotating door goes through auth/posture,
+whose levels void pending recoveries — is kept by
+test_every_posture_door_against_every_foothold.
 """
-import ast
 import datetime as dt
-import inspect
 import os
 import unittest
 import uuid
@@ -211,36 +209,6 @@ class HostedPasskeyDoors(_Base):
         r = self._register(totp_code=_code(self.secret))
         self.assertEqual(r.status_code, 200, r.text)
         self.assertRecoveryEnded(cancel)
-
-
-class EveryRotationDoorEndsPendingRecoveries(unittest.TestCase):
-    """A door that re-enrols a factor or rotates a credential marks itself
-    by pausing the household's outbound destinations, re-verifying its SMS
-    number, minting recovery codes or binding a passkey. Every such door
-    must call `_end_pending_recoveries` (directly or through
-    `_revoke_bearer_persistence`) — a new door that forgets is the bug this
-    rule exists to stop recurring."""
-
-    MARKERS = ("_unverify_sms_number", "recovery.issue", "bind()")
-    VOIDERS = ("_end_pending_recoveries(", "_revoke_bearer_persistence(")
-
-    def test_every_marked_door_voids_recoveries(self):
-        import oikonome.web.app as appmod
-        tree = ast.parse(inspect.getsource(appmod))
-        src = inspect.getsource(appmod).splitlines()
-        missing = []
-        checked = 0
-        for node in tree.body:
-            if not isinstance(node, ast.FunctionDef):
-                continue
-            body = "\n".join(src[node.lineno - 1:node.end_lineno])
-            if not any(m in body for m in self.MARKERS):
-                continue
-            checked += 1
-            if not any(v in body for v in self.VOIDERS):
-                missing.append(node.name)
-        self.assertGreaterEqual(checked, 5)
-        self.assertEqual(missing, [])
 
 
 class AReclaimMoveOutEndsThePendingRecovery(unittest.TestCase):

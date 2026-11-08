@@ -20,6 +20,7 @@ import datetime as dt
 from urllib.parse import quote
 
 from . import links
+from ..settings_sections import settings_link
 
 
 def _mmdd(s) -> str:
@@ -50,11 +51,10 @@ def sync_max_hours() -> float:
     few missed polls, never less than SYNC_MAX_HOURS. Read from the
     environment here, as the worker reads it, rather than imported from
     the worker (which the web process does not load)."""
-    from ..envnum import env_num
-    try:
-        buckets = max(1, int(env_num("OIKONOME_SYNC_BUCKETS", "12")))
-    except ValueError:
-        buckets = 12
+    # the same reader, bounds and default the worker sizes its polls with,
+    # so both processes read one value the same way ("48.0" included)
+    from ..envnum import env_int
+    buckets = env_int("OIKONOME_SYNC_BUCKETS", 12, lo=1)
     poll_hours = buckets * 5 / 60
     return max(float(SYNC_MAX_HOURS), SYNC_MISSED_POLLS * poll_hours)
 
@@ -104,11 +104,12 @@ def freshness(conn, jobs: list[tuple[str, str, int]] | None = None,
         from ..sync import heartbeat as _hb
         for source, when in _hb.revoked_tokens(conn).items():
             out.append({"kind": "collector-token-revoked", "severity": "warn",
-                        "link": "/settings/scripts",
+                        "link": settings_link("connections"),
                         "message": f"The {source} collector's script token "
                                    f"was revoked {_mmdd(when.date().isoformat())}"
                                    f" — mint a new one under Settings → "
-                                   f"Scripts and update the host."})
+                                   f"Connections → Script tokens and update "
+                                   f"the host."})
     except Exception:                                    # noqa: BLE001
         pass
     hb = {r["job"]: r["ran_at"] for r in conn.execute(
@@ -379,8 +380,15 @@ def log(conn, alerts: list[dict], today: dt.date, *, partial: bool = False,
                        -- an older view of the world is not news
                        last_seen=GREATEST(alerts_log.last_seen,
                                           EXCLUDED.last_seen),
-                       seen_at=GREATEST(alerts_log.seen_at,
-                                        EXCLUDED.seen_at),
+                       -- a writer a DAY behind asserts nothing, its
+                       -- instant included: raising seen_at would make a
+                       -- newer-day clear that read the clock a hair
+                       -- earlier look stale and leave the alert standing
+                       seen_at=CASE
+                           WHEN EXCLUDED.last_seen < alerts_log.last_seen
+                               THEN alerts_log.seen_at
+                           ELSE GREATEST(alerts_log.seen_at,
+                                         EXCLUDED.seen_at) END,
                        -- a recurrence AFTER a clearance is news (dismissal
                        -- resets); an upsert of a still-active row keeps the
                        -- user's dismissal. Deciding this inside the upsert

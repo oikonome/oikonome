@@ -93,11 +93,17 @@ export default function Assistant() {
     queryKey: ["assistant-status"],
     queryFn: () => client!.assistantStatus(),
     enabled: !!client,
+    // asked afresh on every visit: a cached or persisted "nothing leaves
+    // the box" from before a Settings → AI change must not be shown
+    staleTime: 0,
   });
+  // a status read that failed is not "no assistant": the screen stays,
+  // with its history, and says it could not check
+  const statusFailed = status.isError && !status.data;
   const history = useQuery({
     queryKey: ["assistant-history"],
     queryFn: () => client!.assistantHistory(),
-    enabled: !!client && !!status.data?.available,
+    enabled: !!client && (!!status.data?.available || statusFailed),
   });
   // a 404 is a server older than the shared log: this screen's own
   // turns are all there is, and that is not an error
@@ -311,10 +317,16 @@ export default function Assistant() {
   // read handed back; a page with no more ends it
   const cursor = noMore ? null : pagingCursor(history.data, lastOlder);
   const title = (th: Thread<Turn>) => th.turns[0]?.question ?? "";
-  const whereLine = status.data?.local === false
-    ? `read-only tools — your questions and the figures they return go to ${
-        status.data.host || "the model host this instance is configured with"}`
-    : "answered on this instance — read-only tools, nothing leaves the box";
+  // "nothing leaves the box" only on the server's word, read on this
+  // visit: loading, a cached reading or an error is not local
+  const sure = status.isFetchedAfterMount && status.isSuccess;
+  const whereLine = status.isError
+    ? `couldn't check where answers come from: ${errText(status.error)}`
+    : !sure ? "read-only tools — checking where answers come from…"
+    : status.data?.local
+      ? "answered on this instance — read-only tools, nothing leaves the box"
+      : `read-only tools — your questions and the figures they return go to ${
+          status.data?.host || "the model host this instance is configured with"}`;
 
   const pendingRows = (rows: Pending[]) => rows.map((t) => (
     <View key={t.key} style={{ gap: 6 }}>
@@ -353,7 +365,12 @@ export default function Assistant() {
           <Text style={s.sendText}>Send</Text>
         </Pressable>
       </View>
-      <Text style={{ color: C.mut, fontSize: 11, marginTop: 4 }}>{whereLine}</Text>
+      <Text style={{ color: status.isError ? C.bad : C.mut, fontSize: 11, marginTop: 4 }}>
+        {whereLine}</Text>
+      {status.isError && (
+        <Pressable onPress={() => void status.refetch()} hitSlop={8}>
+          <Text style={s.act}>try again</Text></Pressable>
+      )}
     </View>
   );
 
@@ -392,7 +409,7 @@ export default function Assistant() {
                 {th.turns[0]?.asked_by ? ` · ${th.turns[0].asked_by}` : ""}</Text>
             </Pressable>
           ))}
-          {history.isPending && status.data?.available && <LogoSpinner color={C.mut} />}
+          {history.isPending && history.fetchStatus !== "idle" && <LogoSpinner color={C.mut} />}
           {history.isError && !noLog && (
             <View style={{ alignItems: "center", gap: 6 }}>
               <Text style={{ color: C.bad, textAlign: "center" }}>

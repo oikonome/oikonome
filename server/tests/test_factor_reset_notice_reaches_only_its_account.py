@@ -88,10 +88,11 @@ class FactorResetNoticeReachesOnlyItsAccount(unittest.TestCase):
             admin.close()
 
     def _notify(self, email):
-        sent = {"web": [], "native": [], "sms": []}
+        sent = {"web": [], "native": [], "sms": [], "url": []}
 
         def web(cc, tid, title, body, url="/app/", *, user_id=None, **_kw):
             sent["web"].append((user_id, body))
+            sent["url"].append(url)
 
         def native(cc, tid, event, *a, user_id=None, **kw):
             sent["native"].append(user_id)
@@ -131,6 +132,18 @@ class FactorResetNoticeReachesOnlyItsAccount(unittest.TestCase):
         self.assertEqual([u for u, _ in sent["web"]], [None])
         self.assertNotIn("authenticator", sent["web"][0][1])
         self.assertEqual(sent["native"], [None])
+
+    def test_every_web_push_opens_the_section_that_can_cancel_it(self):
+        # the cancel control lives in Settings > Security; bare
+        # /app/settings opens the FIRST section on a wide screen, which has
+        # nothing about the recovery on it
+        self._subscribe(self.owner_id)
+        self._subscribe(self.member_id)
+        own = self._notify(self.owner)
+        fallback = self._notify(self.member)
+        urls = own["url"] + fallback["url"]
+        self.assertTrue(urls)
+        self.assertEqual(set(urls), {"/app/settings/security"})
 
     def test_the_sole_owners_notice_uses_every_channel(self):
         self._subscribe(self.owner_id)

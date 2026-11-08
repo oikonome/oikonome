@@ -148,6 +148,127 @@ class BulkEnsureAccountTypeTests(unittest.TestCase):
         self.assertEqual(self._type(aid), ("depository", "checking"))
 
 
+class ImportCreatedAccountKeepsNoFullNumberTests(unittest.TestCase):
+    """An account created at import time from a name that spells a full
+    account number gets an id and a stored name holding only its last
+    four: the id is permanent and rides every exported row, URL and log
+    line. An account an earlier release already made under the full
+    number is still reused, never duplicated beside it."""
+
+    def setUp(self):
+        self.conn = make_db()
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_new_account_id_and_name_hold_only_the_last_four(self):
+        from oikonome.web.bulk_import import _ensure_account
+        aid = _ensure_account(self.conn, "Visa 4111111111111111", "card")
+        name = self.conn.execute("SELECT name FROM accounts WHERE id=%s",
+                                 (aid,)).fetchone()["name"]
+        self.assertNotRegex(aid, r"\d")       # opaque: no digit at all
+        self.assertNotRegex(name, r"\d{8,}")
+        self.assertIn("1111", name)
+        # a re-run of the same import lands on the same account
+        self.assertEqual(
+            _ensure_account(self.conn, "Visa 4111111111111111", "card"), aid)
+
+    def test_a_grouped_card_number_keeps_only_its_last_four(self):
+        # spaced or dashed, the way a card prints it and a person types it
+        from oikonome.web.bulk_import import _ensure_account
+        # — one card, so one account however the number is grouped
+        got = set()
+        for typed in ("Visa 4111 1111 1111 1111", "Visa 4111-1111-1111-1111"):
+            aid = _ensure_account(self.conn, typed, "card")
+            name = self.conn.execute("SELECT name FROM accounts WHERE id=%s",
+                                     (aid,)).fetchone()["name"]
+            self.assertNotRegex(aid, r"\d", typed)
+            self.assertEqual(name, "Visa \u20261111", typed)
+            got.add(aid)
+        self.assertEqual(len(got), 1, got)
+
+    def test_account_made_under_a_grouped_full_number_is_reused(self):
+        from oikonome.web.bulk_import import _ensure_account
+        self._legacy("manual:visa-4111-1111-1111-1111",
+                     "Visa 4111 1111 1111 1111")
+        self.assertEqual(
+            _ensure_account(self.conn, "Visa 4111 1111 1111 1111", "card"),
+            "manual:visa-4111-1111-1111-1111")
+        self.assertEqual(self._visas(), 1)
+
+    def test_account_made_under_the_full_number_is_reused(self):
+        from oikonome.web.bulk_import import _ensure_account
+        self.conn.execute(
+            "INSERT INTO items (id, aggregator, institution_name)"
+            " VALUES ('manual','manual','Manual')"
+            " ON CONFLICT (tenant_id, id) DO NOTHING")
+        self.conn.execute(
+            "INSERT INTO accounts (id, item_id, name, type, subtype)"
+            " VALUES ('manual:visa-4111111111111111','manual',"
+            "'Visa 4111111111111111','credit','credit card')")
+        self.assertEqual(
+            _ensure_account(self.conn, "Visa 4111111111111111", "card"),
+            "manual:visa-4111111111111111")
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) AS n FROM accounts WHERE id LIKE 'manual:visa%%'"
+        ).fetchone()["n"], 1)
+
+
+    def _legacy(self, aid, name):
+        self.conn.execute(
+            "INSERT INTO items (id, aggregator, institution_name)"
+            " VALUES ('manual','manual','Manual')"
+            " ON CONFLICT (tenant_id, id) DO NOTHING")
+        self.conn.execute(
+            "INSERT INTO accounts (id, item_id, name, type, subtype)"
+            " VALUES (%s,'manual',%s,'credit','credit card')", (aid, name))
+
+    def _visas(self):
+        return self.conn.execute(
+            "SELECT count(*) AS n FROM accounts WHERE id LIKE 'manual:visa%%'"
+        ).fetchone()["n"]
+
+    def test_full_number_account_made_at_a_suffixed_id_is_reused(self):
+        # an earlier release put the account at "-2" because the base id
+        # was taken by a different account of the same slug
+        from oikonome.web.bulk_import import _ensure_account
+        self._legacy("manual:visa-4111111111111111", "VISA 4111111111111111!")
+        self._legacy("manual:visa-4111111111111111-2",
+                     "Visa 4111111111111111")
+        self.assertEqual(
+            _ensure_account(self.conn, "Visa 4111111111111111", "card"),
+            "manual:visa-4111111111111111-2")
+        self.assertEqual(self._visas(), 2)
+
+    def test_full_number_account_whose_name_was_already_cut_is_reused(self):
+        # the stored-name scrub cut the name but left the id alone
+        from oikonome.web.bulk_import import _ensure_account
+        self._legacy("manual:visa-4111111111111111", "Visa \u20261111")
+        self.assertEqual(
+            _ensure_account(self.conn, "Visa 4111111111111111", "card"),
+            "manual:visa-4111111111111111")
+        self.assertEqual(self._visas(), 1)
+
+    def test_a_legacy_name_with_an_unbroken_run_and_a_trailing_group_is_reused(self):
+        # the stored-name scrub cut only the unbroken run, so the legacy
+        # row sits under that cut, not under today's grouped cut
+        from oikonome.web.bulk_import import _ensure_account
+        self._legacy("manual:acct-12345678-9012", "Acct \u20265678 9012")
+        self.assertEqual(
+            _ensure_account(self.conn, "Acct 12345678 9012", "card"),
+            "manual:acct-12345678-9012")
+
+    def test_a_year_range_or_date_in_a_name_is_not_a_card_number(self):
+        from oikonome.sync.base import mask_account_name
+        for name in ("College 2023-2024", "Checking 12 31 2024", "Loan 2024 0115"):
+            self.assertEqual(mask_account_name(name), name)
+        self.assertEqual(mask_account_name("Visa 4111 1111 1111 1111"), "Visa \u20261111")
+        # an unbroken run is cut on its own; a short group beside it is not
+        # guessed to be part of the number (only the two card layouts are
+        # read as one number)
+        self.assertEqual(mask_account_name("Acct 12345678 9012"), "Acct \u20265678 9012")
+
+
 class HonestAggregatorStampTests(unittest.TestCase):
     """Push doors stamp their real source — coinbase/plan_csv, not 'csv' —
     without ever landing in the worker's hourly pull loop."""

@@ -345,7 +345,7 @@ def _render(request: Request, **ctx) -> HTMLResponse:
 _SINGLE_HOUSEHOLD_NOTICE = (
     "This instance is a single household — it does not take signups, so "
     "invites and instance provisioning do not apply here. "
-    "To share it, use Settings → Security & household → Invite.")
+    "To share it, use Settings → Users → Invite.")
 
 _NOTICE_CODES = {
     "rebooting": ("Reboot requested — users see a 60-second countdown, "
@@ -2115,6 +2115,12 @@ def broadcast_set(request: Request, message: str = Form(""),
     return _dashboard(request, notice=note)
 
 
+# button -> worker job. The sync button takes the every-slot variant: the
+# cron's own sync_all serves one five-minute slot of tenants per firing.
+_RUN_JOBS = {"sync_all": "sync_all_now", "nightly_all": "nightly_all",
+             "email_all": "email_all"}
+
+
 @router.post("/run-job",
              dependencies=[Depends(limit("admin_action", 30, 3600))])
 def run_job(request: Request, job: str = Form(...)):
@@ -2123,11 +2129,11 @@ def run_job(request: Request, job: str = Form(...)):
     email sweep. Enqueued to the worker, never run in-request."""
     if (bounce := _require(request)) is not None:
         return bounce
-    if job not in ("sync_all", "nightly_all", "email_all"):
+    if job not in _RUN_JOBS:
         raise HTTPException(400, "unknown job")
     admin = tenancy.admin_connect()
     try:
-        if not _enqueue(job):
+        if not _enqueue(_RUN_JOBS[job]):
             _audit(admin, "run_job_failed", target=job, ip=client_ip(request))
             return _dashboard(request,
                               notice="Couldn't reach the job queue — is "
@@ -2937,6 +2943,13 @@ def _provision_instance(admin, email: str, password_hash: str, extra: dict,
         """INSERT INTO users (tenant_id, email, password_hash, verified_at)
            VALUES (%s, %s, %s, now()) RETURNING id""",
         (tid, email, password_hash)).fetchone()["id"]
+    # opens Today on the detail face, like a signed-up or set-up household
+    admin.execute(
+        """INSERT INTO tenant_settings (tenant_id, config)
+           VALUES (%s, '{"today_view": "detail"}'::jsonb)
+           ON CONFLICT (tenant_id) DO UPDATE SET config =
+             tenant_settings.config || '{"today_view": "detail"}'::jsonb""",
+        (tid,))
     # WELCOME mechanics, not reset — a fresh user gets 7 days, and
     # the email says "your account is ready", not "someone requested a
     # password reset", which reads like phishing to someone who was

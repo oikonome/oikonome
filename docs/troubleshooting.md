@@ -10,14 +10,31 @@ overrides whatever `.env` says, so that is the variable to check.
 
 **Postgres major upgrade.** When a release moves the bundled Postgres to a
 new major version (16 → 18, say), `./oikonome.sh upgrade` migrates
-your data folder in place: it dumps everything with the old server image,
-moves `data/postgres` aside as `data/postgres.pg<old>-<stamp>`, initialises
-the new major and reloads. Nothing is deleted — remove the old folder once
-you are happy. If the container logs show *"database files are incompatible
+your data folder in place: it first builds the new major's database image
+(while the old server still runs — a failed build changes nothing), dumps
+everything with the old server, moves `data/postgres` aside as
+`data/postgres.pg<old>-<stamp>`, initialises the new major, checks the
+server that came up really is the new major, and reloads. Nothing is
+deleted — remove the old folder once you are happy. To roll back, put the
+old folder back (the upgrade prints the exact commands), check out the
+previous release and rebuild its database image (`docker compose build
+postgres` in `docker/`) before starting it, since the image now built is
+the new major. If the container logs show *"database files are incompatible
 with server"*, the migration did not run (e.g. `docker compose up` was run
 by hand instead of `./oikonome.sh upgrade`); run `./oikonome.sh upgrade` and
 it will. External/managed databases are untouched — upgrade those with your
 provider's tools.
+
+**The bundled database image.** The `postgres` service is built
+locally, from the official `postgres:<major>-alpine` image pinned by
+digest in `docker/postgres/Dockerfile`, with Alpine's `su-exec` in place
+of the `gosu` binary upstream ships (same entrypoint, same server, same
+data format — a data folder moves between this image and the official
+one either way). It is tagged `oikonome-postgres:<project>`, so a
+pull never updates it; `./oikonome.sh install` (or `docker compose build
+postgres` in `docker/`) rebuilds it. The build fails, naming the line
+to change, if the pinned digest is another major than `base_image` in
+`compose.yaml` or upstream's runtime settings moved.
 
 ### bank sync (worker) / nightly detection (worker) / daily email
 "never ran" or stale: the worker container isn't running or can't reach
@@ -99,6 +116,14 @@ the endpoint does not exist.
 Zero transactions: connect a bank or import a file — see
 [importing.md](importing.md).
 
+### unlinked capital
+A capital contribution or reimbursement recorded for a charge that was later
+deleted, from before a deleted charge took its movement along. It still
+counts on the business's capital account. The **Unlinked capital** card lists
+each one with its date, business and amount; the household owner removes the
+wrong ones with **Remove**. Nothing is removed automatically. The card shows
+on hosted instances too, at /doctor.
+
 ### merchant logos aren't showing
 Three ordinary reasons, in the order worth checking. **Show merchant
 logos** may be off (Settings → Merchants) — that hides them everywhere.
@@ -129,13 +154,24 @@ Both are deliberate limits, not failures. Reading a receipt photo and
 answering an Assistant question each hold a lot of memory and a worker
 thread, so only a couple run at once on an instance: an extra receipt
 parse waits briefly for a slot and, if none frees in time, is marked
-**failed** with a *server is busy* note — the nightly sweep only picks up
-receipts still waiting to parse, so re-parse that one yourself; an extra
+**failed** with a *server is busy* note — the nightly sweep tries that
+receipt again on its own for 7 days after it was uploaded, so there is
+no need to re-parse it by hand; only one still failed after that week
+needs a manual re-parse; an extra
 Assistant question is refused outright — waiting in line would hold the
 very thread the limit exists to spare. Wait a moment and retry. On a big machine, raise
-`OIKONOME_RECEIPT_PARSE_CONCURRENCY`, `OIKONOME_RECEIPT_PARSE_WAIT_S`
+`OIKONOME_RECEIPT_PARSE_CONCURRENCY`, `OIKONOME_RECEIPT_PARSE_WAIT_S`,
+`OIKONOME_RECEIPT_READ_SLOTS`, `OIKONOME_RECEIPT_READ_WAIT_S`
 and `OIKONOME_ASSISTANT_CONCURRENCY` in `docker/.env`; the defaults suit
 a small container.
+
+### a page says "This page did not load"
+Something on that page failed while it was drawing; the menu still
+works, and moving to another page clears the card. A tab left open
+across an upgrade asks for page code the new release no longer has, and
+reloads itself once to fetch the current one, landing back on the same
+page. If the card stays, press **Reload**; if it comes back after that,
+check the browser console and `docker compose logs app`.
 
 ### a new bank shows "first sync pending", or syncs lag behind
 When a bank link finishes, the connection is saved at once and its first
@@ -231,7 +267,8 @@ someone settled it in the app first; a category button names the category
 the charge is under now and changes nothing. A button that says email
 buttons are off means the household can't be changed right now (read-only
 billing, a suspension, or — on a hosted instance — no second factor
-enrolled yet); sign in to see what it needs. Links older than seven days,
+enrolled yet); sign in to see what it needs. Muting an alert from its email
+still works on a read-only household. Links older than seven days,
 or sent before a master-key rotation, are dead; use the next morning's.
 
 ### Prometheus marks the target down, or a sensor reads nothing
@@ -382,7 +419,9 @@ still sign in, the last key may go.
 Open a GitHub issue with the **diagnostic bundle** from /doctor attached
 (it contains check results and versions — never tokens or transactions,
 and no hostnames, bank names or collector labels, so it is safe to attach to
-a public issue; the signed-in /doctor page still shows them).
+a public issue; the signed-in /doctor page still shows them). It names no
+time zone and gives ages in whole days only — a scheduled job reads as on
+schedule or overdue — so it does not give away where the instance runs.
 Issues without the bundle get auto-asked for it.
 
 ## Signing up says "this address already has an account"

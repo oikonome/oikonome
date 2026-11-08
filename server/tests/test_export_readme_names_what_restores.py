@@ -1,7 +1,7 @@
 """The export ZIP's README says which files a restore loads back.
 
 The export writes every RLS-scoped table; the restore reads a fixed
-subset and silently ignores the rest (alerts, sync logs, staged uploads —
+subset and silently ignores the rest (sync logs, staged uploads —
 this instance's operating state, not the household's data). Unless the
 README says so, a file the person can see in the ZIP simply "does not
 restore".
@@ -45,7 +45,9 @@ class ReadmeTests(unittest.TestCase):
         readme = z.read("README.txt").decode()
         members = {n[:-4] for n in z.namelist() if n.endswith(".csv")}
         only = members - set(restore.RESTORED_MEMBERS)
-        self.assertTrue(only, "export writes nothing the restore skips?")
+        # the alert log was the last records-only file of the core export
+        # (it now restores its dismissed rows); a table discovered later
+        # and not restored must still be marked
         for t in only:
             line = next(l for l in readme.splitlines()
                         if l.strip().startswith(f"{t}.csv"))

@@ -7,7 +7,7 @@ from unittest import mock
 
 from oikonome.web import bulk_import
 
-from .bulk_job_util import submit_and_run
+from .bulk_job_util import submit, submit_and_run
 from .util import make_db, write_config
 
 BANK_CSV = (b"Date,Description,Amount\n"
@@ -138,12 +138,21 @@ class AnalyzeTests(unittest.TestCase):
         self.assertEqual(results[0]["error"],
                          "this PDF expands past the size limit")
 
-    def test_a_file_with_no_account_says_so(self):
+    def test_a_file_with_no_account_is_refused_before_the_upload_is_spent(
+            self):
+        """A row naming no account (a "choose one" row nobody chose) is
+        refused at submit, naming the file, while the stage still holds the
+        upload: the person picks an account and posts the same plan."""
         plan = bulk_import.analyze(self.conn, [("old bank.csv", BANK_CSV)])
         plan["files"][0]["account_id"] = None
         plan["files"][0]["new_account_name"] = ""
+        with self.assertRaises(ValueError) as e:
+            submit(self.conn, plan["token"], plan["files"])
+        self.assertIn("old bank.csv", str(e.exception))
+        self.assertIn("choose", str(e.exception))
+        plan["files"][0]["new_account_name"] = "Old Bank"
         results = submit_and_run(self.conn, plan["token"], plan["files"])
-        self.assertEqual(results[0]["error"], "needs an account")
+        self.assertTrue(results[0]["ok"], results)
 
     def test_skip_rows_do_not_import(self):
         plan = bulk_import.analyze(self.conn, [("a.csv", BANK_CSV)])
@@ -369,3 +378,106 @@ class SignGuessReadsTheAmountColumn(unittest.TestCase):
                b"2021-03-02,GROCERY,88.10,-20.00\n"
                b"2021-03-03,GAS,30.00,-30.00\n")
         self.assertEqual(bulk_import._csv_sign_guess(csv), ("plaid", False))
+
+
+class NumberedAccountMovedOffItsNumberTests(unittest.TestCase):
+    """A name typed with a full card number still finds the account an
+    earlier release made under that number after the account has moved
+    onto an id keeping only the last four: the move leaves a record of the
+    id it came from, with the number cut, and the folder import follows
+    it. Two cards sharing their last four leave one record pointing at
+    both, and the import then asks which one rather than guessing."""
+
+    CARD_CSV = (b"Date,Description,Amount\n"
+                b"2021-05-01,HARBOR BAKERY,-8.00\n"
+                b"2021-05-02,NORTHWIND FUEL,-31.00\n"
+                b"2021-05-03,CONTOSO STREAM,-12.00\n")
+
+    def setUp(self):
+        self.conn = make_db()
+        write_config(self.conn)
+        self.conn.execute(
+            "INSERT INTO items (id, aggregator, institution_name)"
+            " VALUES ('manual','manual','Manual')"
+            " ON CONFLICT (tenant_id, id) DO NOTHING")
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _old_account(self, number):
+        """An account as a release before masked names made it, holding
+        the file's rows under its full-number id."""
+        aid = f"manual:visa-{number}"
+        self.conn.execute(
+            "INSERT INTO accounts (id, item_id, name, type, subtype)"
+            " VALUES (%s,'manual',%s,'credit','credit card')",
+            (aid, f"Visa {number}"))
+        res = self._run(f"Visa {number}")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["account_id"], aid)
+        self.assertEqual(res["imported"], 3)
+        return aid
+
+    def _run(self, typed):
+        plan = bulk_import.analyze(self.conn, [("card.csv", self.CARD_CSV)])
+        decision = dict(plan["files"][0], account_id=None,
+                        new_account_name=typed, amount_sign="bank")
+        return submit_and_run(self.conn, plan["token"], [decision])[0]
+
+    def _counts(self):
+        return self.conn.execute(
+            "SELECT (SELECT count(*) FROM accounts) AS accounts,"
+            " (SELECT count(*) FROM transactions) AS rows").fetchone()
+
+    def test_bulk_file_naming_the_number_lands_on_the_moved_account(self):
+        from oikonome.sync import base
+        old = self._old_account("4111111111111111")
+        moved = base.rekey_numbered_accounts(self.conn)
+        self.assertIn(old, moved)
+        before = self._counts()
+        res = self._run("Visa 4111111111111111")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["account_id"], moved[old])
+        # the job counts lines written, re-writes of a row it already
+        # holds included; what must not change is the ledger
+        self.assertEqual(self._counts(), before)
+
+    def test_bulk_file_sharing_the_last_four_asks_instead_of_guessing(self):
+        from oikonome.sync import account_sources, base
+        self._old_account("4111111111111111")
+        self._old_account("5500000000001111")
+        self.assertEqual(len(base.rekey_numbered_accounts(self.conn)), 2)
+        # the record each import wrote moved with its card and still
+        # names it; with those gone, the move's record alone cannot say
+        # which card a number is
+        self.conn.execute("DELETE FROM account_sources"
+                          " WHERE left(source_hmac, 2) <> 'c:'")
+        self.assertIsNone(account_sources.lookup(
+            self.conn, account_sources.DOOR_MANUAL,
+            "Visa 4111111111111111"))
+        before = self._counts()
+        # the plan is refused before it runs, so the person picks one
+        with self.assertRaises(ValueError) as e:
+            self._run("Visa 4111111111111111")
+        self.assertIn("matches two accounts", str(e.exception))
+        self.assertIn("choose one", str(e.exception))
+        self.assertEqual(self._counts(), before)
+
+    def test_a_card_whose_source_row_moved_with_it_lands_on_its_own(self):
+        from oikonome.sync import base
+        first = self._old_account("4111111111111111")
+        self._old_account("5500000000001111")
+        moves = base.rekey_numbered_accounts(self.conn)
+        before = self._counts()
+        res = self._run("Visa 4111111111111111")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["account_id"], moves[first])
+        self.assertEqual(self._counts(), before)
+
+    def test_a_typed_number_on_an_instance_not_yet_moved_lands_as_before(self):
+        old = self._old_account("4111111111111111")
+        before = self._counts()
+        res = self._run("Visa 4111111111111111")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["account_id"], old)
+        self.assertEqual(self._counts(), before)

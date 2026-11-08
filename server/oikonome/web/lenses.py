@@ -44,7 +44,7 @@ import logging
 
 log = logging.getLogger("oikonome.lenses")
 
-from ..engine import budget, reporting
+from ..engine import budget, coverage, reporting
 from ..engine import categories as _categories
 
 # ---- shared helpers ---------------------------------------------------------
@@ -75,7 +75,12 @@ def month_state(conn, y: int, m: int, today: dt.date, *,
 
     `memo` is the lens request's engine cache (budget._memo_key): the live
     config, the bill schedules and every spend window the twelve months of
-    a year page share are read once, not once per month."""
+    a year page share are read once, not once per month — and the month's
+    state itself, which the yearly mail's detail walk asks for again
+    (callers only read it)."""
+    key = ("lens_month_state", y, m, today)
+    if memo is not None and key in memo:
+        return memo[key]
     last = calendar.monthrange(y, m)[1]
     snap = frozen = None
     if (y, m) == (today.year, today.month):
@@ -94,6 +99,8 @@ def month_state(conn, y: int, m: int, today: dt.date, *,
     st["bills_source"] = "snapshot" if frozen is not None else "live"
     st["bill_rows"] = frozen    # the schedule the month was judged under
     st["snapshot_config"] = snap   # …and the budget (None = the live one)
+    if memo is not None:
+        memo[key] = st
     return st
 
 
@@ -339,6 +346,7 @@ def year_bucket_ledger(conn, bucket: str, year: int,
     today = today or localtime.household_day(conn)
     snap_months = budget.snapshot_months(conn, year)
     memo: dict = {}
+    budget.share_spend_window(memo, *budget.year_spend_window(year))
     ids: list[str] = []
     seen: set[str] = set()
     amount = 0.0
@@ -444,39 +452,51 @@ def _year_detail(conn, year: int, today: dt.date, memo: dict,
             "months_walked": walked, "budgeted_months": budgeted}
 
 
+def _month_income_actual(conn, year: int, month: int) -> float | None:
+    """The month's bank income by the Cash Flow definitions — reporting's
+    month grain (_income_by), read for this one month only: grouping the
+    whole ledger to keep one row made every Month-lens view pay for every
+    bank row ever held."""
+    excl, ex_p = reporting.excluded_accounts_sql(conn)
+    return conn.execute(
+        f"SELECT {reporting._R2.format(f'SUM({reporting.INCOME_NET})')} amt "
+        f"FROM transactions t WHERE {reporting._INCOME_WHERE} "
+        f"AND t.date >= %s AND t.date < %s {excl}",
+        (reporting._bank_account_ids(conn), dt.date(year, month, 1),
+         budget._month_after(year, month), *ex_p)).fetchone()["amt"]
+
+
 def _first_year(conn) -> int | None:
     row = conn.execute("SELECT MIN(date) AS d FROM transactions "
                        "WHERE removed = 0").fetchone()
     return row["d"].year if row and row["d"] else None
 
 
-class _Coverage:
-    """Which months have known income. A month's income is a number only
-    once a bank account feeds the ledger: from the month of the first bank
-    row on record, in a year that has bank rows at all (the Cash Flow
-    report's year rule). Deciding it per YEAR alone would read the months
-    of a year before its checking feed starts as income $0, so each would
-    show its whole spend as a loss; those months are unknown instead.
-    Excluded, hidden and linked-backup accounts do not count, for the
-    reason _bank_coverage_years gives: their rows are invisible to the
-    income figure. The rule is reporting._income_coverage itself, not a
-    copy of it, so the lenses and the Cash Flow page cannot disagree about
-    which months are known."""
-
-    def __init__(self, conn):
-        self.years, self.start = reporting._income_coverage(conn)
-
-    def month(self, key: str) -> bool:
-        """`key` is 'YYYY-MM'."""
-        return (self.start is not None and key >= self.start
-                and key[:4] in self.years)
-
-    def whole_year(self, y: int) -> bool:
-        """Every month of `y` is covered, so a sum over the year is known."""
-        return self.month(f"{y:04d}-01")
+def _Coverage(conn):
+    """Which months have known income: the household's MeasuredWindow
+    (engine/coverage.py) — the object Cash Flow reads too, so the lenses
+    and that page cannot disagree about which months are known."""
+    return coverage.window(conn)
 
 
 # ---- week lens --------------------------------------------------------------
+
+
+def _lens_goal(conn, cfg, goal, today: dt.date) -> dict | None:
+    """The plan savings goal both lenses show, so the clients need not fetch
+    the whole Today payload for one number. Always present (None = no plan
+    goal). rate_90d is the figure savings.progress gives the same goal (None
+    for a plan-only goal): the clients' estimate when no saved figure."""
+    from ..engine import savings as _sv
+    if goal is None:
+        return None
+    rate = None
+    if not _sv.is_plan_only(goal):
+        since = today - dt.timedelta(days=90)
+        cover = _sv._pace_months(conn, cfg, goal, since, today)
+        rate = round(_sv.matched_net(conn, cfg, goal, since=since) / cover, 2)
+    return {"monthly_plan": round(float(goal.get("monthly_plan") or 0), 2),
+            "rate_90d": rate}
 
 
 def month_summary(conn, year: int, month: int,
@@ -530,9 +550,8 @@ def month_summary(conn, year: int, month: int,
     # and the reports' totals read the same rule, so the hero cannot call
     # a month unknown while its cell counts it as a loss
     key = f"{year:04d}-{month:02d}"
-    income_actual = (next((r["amt"] for r in reporting._income_by(conn, "month")
-                           if r["p"] == key), None) or 0
-                     if status != "future" and _Coverage(conn).month(key)
+    income_actual = (_month_income_actual(conn, year, month) or 0
+                     if status != "future" and _Coverage(conn).month_known(key)
                      else None)
     paid = sorted(b["fixed"].get("occ_rows") or [],
                   key=lambda r: r["date"])
@@ -631,6 +650,7 @@ def month_summary(conn, year: int, month: int,
         "plan_surplus": (_R(st["plan_surplus"])
                          if st.get("plan_surplus") is not None else None),
         "saved_month": saved_month,
+        "savings_goal": _lens_goal(conn, _cfg, _goal, today),
         # 'snapshot' when a closed month was judged against its frozen
         # budget; 'live' = today's config (current/future months, or a
         # closed month that predates snapshots — the SPA says so)
@@ -643,6 +663,31 @@ def month_summary(conn, year: int, month: int,
 
 
 # ---- year lens --------------------------------------------------------------
+
+
+def prior_year_window(year: int, today: dt.date
+                      ) -> tuple[dt.date, dt.date, dt.date | None]:
+    """The span of `year - 1` that `year` is compared with, as of the
+    household's `today`: (start, EXCLUSIVE end, through). A year still in
+    progress holds only its days up to today, so the prior year stops the
+    same number of days in — eleven months of spend set against twelve
+    reads as a drop in every category that never happened. The rule is
+    reporting._prev_window_end's for months: the same date one year back,
+    Feb 29 read as Feb 28, and on a month's last day the prior year's whole
+    month (Feb 28 against a leap February's 29 days; Dec 31 against the
+    whole year). `through` is the last day counted, or None when the prior
+    year is whole — a closed year, a future one, or Dec 31."""
+    start, whole = dt.date(year - 1, 1, 1), dt.date(year, 1, 1)
+    if year != today.year:
+        return start, whole, None
+    py = year - 1
+    pm_days = calendar.monthrange(py, today.month)[1]
+    month_end = (today + dt.timedelta(days=1)).day == 1
+    through = dt.date(py, today.month,
+                      pm_days if month_end else min(today.day, pm_days))
+    if through == dt.date(py, 12, 31):
+        return start, whole, None
+    return start, through + dt.timedelta(days=1), through
 
 
 def year_summary(conn, year: int, today: dt.date | None = None,
@@ -677,7 +722,12 @@ def year_summary(conn, year: int, today: dt.date | None = None,
     cov = _Coverage(conn)
     # one pass over the bank rows serves both the annual totals below and
     # the net cells' months
-    income_y, income_m = reporting._income_year_month(conn)
+    # this year and last (the totals' comparison); the yearly email's
+    # detail strip below reads every year, so it takes the whole history
+    income_y, income_m = (
+        reporting._income_year_month(conn) if with_detail
+        else reporting._income_year_month(conn, dt.date(year - 1, 1, 1),
+                                          dt.date(year + 1, 1, 1)))
     # the income above drops the accounts the household excluded from the
     # budget; every spend read below drops them too, or saved, the savings
     # rate and the net cells would set filtered income against unfiltered
@@ -685,6 +735,9 @@ def year_summary(conn, year: int, today: dt.date | None = None,
     excl, ex_p = reporting.excluded_accounts_sql(conn)
     spend_m: dict | None = None     # lazy — only no-snapshot months pay
     memo: dict = {}                 # one engine cache across the 12 months
+    # …and one ledger read: the months' match windows overlap five weeks
+    # either side, so each month read alone pulls the year four times over
+    budget.share_spend_window(memo, *budget.year_spend_window(year))
     for m in range(1, 13):
         if (year, m) > (today.year, today.month):
             cells.append({"m": m, "status": "future", "verdict": None,
@@ -706,7 +759,7 @@ def year_summary(conn, year: int, today: dt.date | None = None,
             key = f"{year:04d}-{m:02d}"
             spend = _R(spend_m.get(key, 0) or 0)
             inc = (_R(income_m.get(key, 0) or 0)
-                   if cov.month(key) else None)
+                   if cov.month_known(key) else None)
             cells.append({"m": m, "status": "net", "verdict": None,
                           "variance": None, "variable_actual": None,
                           "variable_budget": None,
@@ -721,7 +774,7 @@ def year_summary(conn, year: int, today: dt.date | None = None,
             # verdict on the loader's unsaved guess
             key = f"{year:04d}-{m:02d}"
             inc = (_R(income_m.get(key, 0) or 0)
-                   if cov.month(key) else None)
+                   if cov.month_known(key) else None)
             spend = _R(st["total_actual"])
             cells.append({"m": m, "status": "net", "verdict": None,
                           "variance": None, "variable_actual": None,
@@ -746,7 +799,7 @@ def year_summary(conn, year: int, today: dt.date | None = None,
         # kept or lost, not only how it was judged
         key = f"{year:04d}-{m:02d}"
         inc = (_R(income_m.get(key, 0) or 0)
-               if cov.month(key) else None)
+               if cov.month_known(key) else None)
         spend = _R(st["total_actual"])
         flow = {"income": inc, "spend": spend,
                 "net": _R(inc - spend) if inc is not None else None}
@@ -783,23 +836,39 @@ def year_summary(conn, year: int, today: dt.date | None = None,
     # by category, so a hand-split row's parts are joined and each counts
     # under its own category (the year total is unchanged: parts sum to
     # the row)
+    # the prior year counts only the span comparable with this one
+    # (prior_year_window); rows past its cut are left out of both groupings
+    prev_start, prev_end, prev_through = prior_year_window(year, today)
     two_years = conn.execute(
         f"SELECT to_char(t.date,'YYYY') yr, {reporting.PART_CAT} cat, "
         f"MIN(COALESCE({_categories.PART_CAT}, '?')) cat_key, "
         f"SUM({reporting.PART_NET_JOINED}) amt, GROUPING({reporting.PART_CAT}) gc "
         f"FROM transactions t {reporting.REIMB_PARTIAL_JOIN} {reporting.SPLIT_JOIN} "
         f"WHERE {reporting.SPEND_WHERE} "
-        f"AND t.date >= %s AND t.date < %s {excl} "
+        f"AND t.date >= %s AND t.date < %s "
+        f"AND NOT (t.date >= %s AND t.date < %s) {excl} "
         f"GROUP BY GROUPING SETS ((yr), (yr, cat))",
-        (dt.date(year - 1, 1, 1), dt.date(year + 1, 1, 1), *ex_p)).fetchall()
+        (prev_start, dt.date(year + 1, 1, 1), prev_end, dt.date(year, 1, 1),
+         *ex_p)).fetchall()
     spend_y = {r["yr"]: r["amt"] for r in two_years if r["gc"]}
+    # the prior year's income over the same cut span; whole years read the
+    # yearly grain already summed above
+    prev_income = None
+    if prev_through is not None:
+        prev_income = conn.execute(
+            f"SELECT {reporting._R2.format(f'SUM({reporting.INCOME_NET})')} amt "
+            f"FROM transactions t WHERE {reporting._INCOME_WHERE} "
+            f"AND t.date >= %s AND t.date < %s {excl}",
+            (reporting._bank_account_ids(conn), prev_start, prev_end,
+             *ex_p)).fetchone()["amt"]
 
     def totals(y: int) -> dict:
         ys = str(y)
         spend = _R(spend_y.get(ys, 0) or 0)
-        if not cov.whole_year(y):
+        if not cov.year_known(y):
             return {"income": None, "spend": spend, "saved": None, "rate": None}
-        inc = income_y.get(ys, 0) or 0
+        inc = ((prev_income if y == year - 1 and prev_through is not None
+                else income_y.get(ys, 0)) or 0)
         return {"income": _R(inc), "spend": spend, "saved": _R(inc - spend),
                 "rate": round(100 * (inc - spend) / inc, 1) if inc else None}
 
@@ -894,7 +963,7 @@ def year_summary(conn, year: int, today: dt.date | None = None,
         for yy in range(min(first, year), year + 1):
             ys = str(yy)
             spend = _R(all_years.get(ys, 0) or 0)
-            inc = (_R(income_y.get(ys, 0) or 0) if cov.whole_year(yy)
+            inc = (_R(income_y.get(ys, 0) or 0) if cov.year_known(yy)
                    else None)
             if not years and inc is None and not spend:
                 # the ledger's first row may be an income record from
@@ -919,7 +988,10 @@ def year_summary(conn, year: int, today: dt.date | None = None,
             closed=closed)
     return {"y": year, "cells": cells, "detail": detail,
             "totals": totals(year), "prev_totals": totals(year - 1),
+            "prev_through": (prev_through.isoformat()
+                             if prev_through is not None else None),
             "categories": categories, "saved_ytd": saved_ytd,
+            "savings_goal": _lens_goal(conn, _lens_cfg, goal, today),
             "buckets_annual": {k: {f: _R(v) for f, v in d.items()}
                                for k, d in annual.items()},
             "plan_surplus": (_R(plan_surplus)

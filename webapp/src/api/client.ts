@@ -275,6 +275,14 @@ export interface Continuity {
 }
 
 export interface Me {
+  /** The day counts the Accounts copy prints, from the server's own
+   *  settings: how long a failing connection lasts before it is removed
+   *  (null while the instance does not remove them) and how long a
+   *  released bank keeps its place under the allowance. Absent from an
+   *  older server; read them through `plaidReapDays()` /
+   *  `releasedHoldDays()`, which fall back to the defaults. */
+  day_counts?: { plaid_reap_days?: number | null;
+                 released_hold_days?: number | null };
   // the household's daily-email schedule + whether THIS login is muted
   daily_email?: { on: boolean; hour: number; summary: boolean;
                   muted: boolean;
@@ -305,6 +313,7 @@ export interface Me {
     institutions_used?: number;
     // false when the plan does not include Plaid's recurring cross-check
     plaid_recurring?: boolean;
+    enrich?: boolean;
     // true when no bank can be connected until an owner confirms their
     // email address — the server's own reason for an allowance of 0, so
     // a paying but unconfirmed household is never shown a closed door.
@@ -540,6 +549,11 @@ export interface TodayFull {
             balance_unreliable?: boolean; no_checking?: boolean } | null;
   // unpaid bill occurrences through month end; null on past days
   bills_remaining_month: number | null;
+  /** the paychecks still due this month: ISO dates and their sum (null = no income series) */
+  income_due_dates?: string[] | null;
+  income_due_total?: number | null;
+  /** why there is no paycheck figure (null when there is one) */
+  income_due_note?: "none" | "budgeted" | "off" | null;
   next_paycheck: string | null;
   // full ledger-row shape — Today's recent pane renders the shared
   // TxnTable, identical to the Transactions page
@@ -617,6 +631,7 @@ export interface MonthLensData {
   // the ledger's posted contribution to the standing
   // "Savings" goal within THIS month (null: no goal / future month)
   saved_month: number | null;
+  savings_goal?: { monthly_plan: number; rate_90d: number | null } | null;
   // "snapshot": a closed month judged against its frozen budget; "live":
   // today's config (current/future months, or a closed month predating
   // snapshots — the page notes the retroactive judgment)
@@ -654,6 +669,10 @@ export interface YearTotals {
 export interface YearLensData {
   y: number; cells: YearCell[];
   totals: YearTotals; prev_totals: YearTotals;
+  // the last day of the prior year the comparison counts ("YYYY-MM-DD"):
+  // a year in progress is set against the same span of the year before,
+  // so the column reads "2025 (to Jun 30)"; null when both years are whole
+  prev_through?: string | null;
   // [display label, this year, last year, stored key] — the key comes
   // last and is what the ledger filter matches; '?' is uncategorized,
   // null a row with no category filter behind it
@@ -670,6 +689,7 @@ export interface YearLensData {
   // Optional — older servers omit it, and the SPA falls back to the
   // rate_90d × elapsed extrapolation, labelled as an estimate.
   saved_ytd?: number | null;
+  savings_goal?: { monthly_plan: number; rate_90d: number | null } | null;
   first_year: number | null;
 }
 
@@ -679,6 +699,8 @@ export interface Proposal {
   id: string; kind: string; bill_type: string | null;
   payee: string; amount: number; cadence: string; summary: string;
   frequency?: string | null; interval?: number | null;
+  /** the days of an offer on several days of the month, else null */
+  by_month_day?: number[] | null;
   next_due?: string | null; llm_tag?: string | null; income?: boolean;
 }
 export interface Bill {
@@ -718,8 +740,10 @@ export interface Bill {
   // the edit-form prefill (what /api/bills/bill serves for one bill),
   // carried on every row so a page of N bills is one request, not N+1.
   // `cadence_value` is the FREQ:interval select value; `cadence` above is
-  // the human label.
-  cadence_value: string; bill_type: string; source: string;
+  // the human label. `by_month_day` holds the days of a rule on several days
+  // of the month (null otherwise), which the select value cannot say.
+  cadence_value: string; by_month_day?: number[] | null;
+  bill_type: string; source: string;
   category: string | null; merchant: string | null; cap: number | null;
   show_today: boolean; match_category: boolean; txn_category: string;
   // the merchants the bill pays, by display name — its identity: the
@@ -754,6 +778,7 @@ export interface BillsData {
 // /api/bills/bill — one bill's editable fields + payee-keyed config
 export interface BillDetail {
   payee: string; amount: number; income: boolean; cadence: string;
+  by_month_day?: number[] | null;
   next_due: string; bill_type: string; source: string;
   category: string | null; merchant: string | null; active: boolean;
   cap: number | null; disabled: boolean;
@@ -789,6 +814,8 @@ export interface MergeProposal {
 export interface LedgerFit {
   kind: string; amount: number; cadence: string; next_due: string;
   short: string; label: string; cycle_days?: number; hits?: number;
+  // the two days a twice-a-month fit landed on; `cadence` reads MONTHLY:1
+  by_month_day?: number[] | null;
 }
 // history rows are the Transactions-page shape (same renderer) plus the
 // matcher verdict and a legacy id alias
@@ -806,6 +833,7 @@ export interface BillsHistoryData {
               active_months: number; avg_monthly_active: number };
   inflow: boolean;
   bill: { amount: number; bill_type: string; source: string; cadence: string;
+          by_month_day?: number[] | null;
           due_on: string | null; income: boolean; tol: number } | null;
   health: { health: string; last_match: string | null;
             matched?: number; fit_diverges?: boolean;
@@ -1000,6 +1028,9 @@ export interface DebtSchedule {
   monthly: number;                  // every minimum + the extra
   starting: number;
   growing: boolean;                 // the minimums do not cover the interest
+  // false = the walk stopped at fifty years: total_interest is a cut-off
+  // figure, never shown as what the plan costs (absent from an older server)
+  finishes?: boolean;
   series: [string, number][];       // today, then each month's first
   debts: { id: string; order: number; paid_off: string | null;
            interest: number; paid: number; remaining: number }[];
@@ -1033,7 +1064,9 @@ export interface RetirementData {
   spend: number;
   spend_now: number;
   growth_path: [string, number][];
-  grow_to_67: number;
+  // null when the curve has no point at 67 (already past it, or the plan
+  // ends first)
+  grow_to_67: number | null;
   stress: { label: string; earliest: number | null; max_spend_at_ref: number }[];
   stress_ref_age: number;
   hist: { ok: number; n: number; pct: number; spend90: number;
@@ -1078,8 +1111,18 @@ export interface ReimbPair {
   deposit_date: string; deposit_amount: number; deposit_payee: string;
 }
 
+// An account a refusal asks the person to choose, described by what tells
+// two cards sharing their last four apart when their names read the same.
+export interface AccountChoice {
+  id: string; name: string; mask: string | null;
+  rows: number; first_date: string | null; last_date: string | null;
+  balance_cents: number | null;
+}
 export interface ImportResult {
   error?: string; imported?: number; skipped_duplicates?: number;
+  // a typed new-account name that leads to several accounts: the ones it
+  // could mean, and (on the YNAB card) the YNAB account it was typed for
+  choices?: AccountChoice[]; choice_for?: string;
   // Mapped-CSV refusals only. `token` is a fresh claim token for the same
   // upload — the mapping is correctable, submit again with it. `expired`
   // says the upload is gone for good and the file has to be re-uploaded.
@@ -1165,7 +1208,10 @@ export interface YnabAccountsNeeded {
 }
 export type MappingNeeded = ColumnMappingNeeded | YnabAccountsNeeded;
 // Where one YNAB account goes: an account id, "skip", or a new account.
-export type YnabDestination = string | { new: string };
+// an account id, "skip", a new account, or an account picked from those a
+// typed new-account name could mean, with that name (remembered under it)
+export type YnabDestination = string | { new: string }
+  | { id: string; typed: string };
 export interface ImportOutcome {
   result: ImportResult | null;
   mapping_needed: MappingNeeded | null;
@@ -1243,6 +1289,7 @@ export type SetupMode = "auto" | "manual";
  *  day of the month (1-31). */
 export interface ProposalAdjust {
   name?: string; amount?: number; cadence?: string; due_day?: number;
+  by_month_day?: number[];
 }
 // live progress of the background sync the wizard starts
 export interface SyncProgressItem {
@@ -1644,6 +1691,10 @@ export interface Connection {
   // this from `status`: an institution outage is not a broken login,
   // and offering update mode for one is what makes the warning noise.
   status_kind?: "ok" | "retrying" | "reauth" | "gone" | "attention";
+  // why a 'reaped' connection was removed: the reaper after its run of
+  // failures, Plaid no longer holding the Item, or the plan ending.
+  // Absent from an older server — the clients then name no cause.
+  archived_reason?: "auto-reap" | "plaid-gone" | "sub-ended" | null;
   // Plaid's fleet-wide login health for this BANK (HEALTHY | DEGRADED |
   // DOWN), cached by the hourly sync. Distinct from status_kind: the
   // item can be green while the bank's own OAuth is failing for
@@ -1668,12 +1719,10 @@ export interface Holding {
   acct: string; symbol: string; fund: string | null;
   qty: number | null; price: number | null; value: number;
 }
-// config manual_assets[] — property/vehicle/mortgage entries, auto-valued
-// server-side; edited on Net Worth
+// config manual_assets[] — property/vehicle/mortgage entries, valued by
+// hand on Net Worth
 export interface ManualAsset {
   name: string; value: number; kind?: string | null; as_of?: string | null;
-  auto?: string | null;
-  rate?: number | null; monthly_delta?: number | null;
 }
 // config custom_buckets[]: a named carve-out of a parent variable
 // bucket — categories + merchant overrides route spend into it for display
@@ -1812,8 +1861,6 @@ export interface Settings {
   home_mobile?: string | null;
   // Plaid's recurring streams as a bill-detection cross-check (absent = on)
   plaid_recurring?: boolean | null;
-  merchant_strip_cities?: string[];
-  merchant_cities_seen?: string[];
   // provider key presence (secrets write-only)
   plaid_client_id: string | null; plaid_env: string | null;
   plaid_secret_set: boolean;
@@ -1934,8 +1981,44 @@ export type MerchantDetail = {
 export const BULK_MAX = 10000;
 export const BULK_CHUNK = BULK_MAX;
 
+// The last /api/me answer's day counts. Kept here, beside the one fetch
+// that delivers them, so every sentence that names a number of days — the
+// allowance note in the extension slot included, which is not a hook —
+// reads the instance's value instead of writing its own.
+let dayCounts: Me["day_counts"] = undefined;
+const posInt = (v: unknown): number | null =>
+  typeof v === "number" && Number.isInteger(v) && v > 0 ? v : null;
+/** Days of failure before a connection is removed; null when the
+ *  instance does not remove them. An older server says nothing: 30, the
+ *  default. */
+export function plaidReapDays(): number | null {
+  if (!dayCounts || !("plaid_reap_days" in dayCounts)) return 30;
+  return posInt(dayCounts.plaid_reap_days);
+}
+/** Days a released bank keeps its place under the allowance. */
+export function releasedHoldDays(): number {
+  return posInt(dayCounts?.released_hold_days) ?? 30;
+}
+/** What the Accounts screens say about a connection the server removed,
+ *  by the reason it was removed. A removal whose reason the server did
+ *  not send names no cause rather than guessing one. */
+export function removedConnectionNote(
+    c: { archived_reason?: string | null }): string {
+  switch (c.archived_reason) {
+    case "plaid-gone": return "connection no longer exists at Plaid";
+    case "sub-ended": return "connection removed when the subscription ended";
+    case "auto-reap": {
+      const n = plaidReapDays();
+      return n ? `connection removed after ${n} days of failure`
+               : "connection removed after failing for weeks";
+    }
+    default: return "connection removed";
+  }
+}
+
 export const api = {
-  me: () => req<Me>("/api/me"),
+  me: () => req<Me>("/api/me").then((m) => {
+    dayCounts = m?.day_counts; return m; }),
   // pre-auth; only a single-user demo-locked instance ever returns creds
   // how a person without an account (or locked out of one) gets help
   // on this instance — public, read before any login
@@ -2104,8 +2187,10 @@ export const api = {
   accountAdd: (name: string, kind: string, balance = "") =>
     json<{ ok: boolean; account_id: string }>("/api/accounts/add",
                                               { name, kind, balance }),
+  // answers the label as stored: a typed card number keeps its last four
   accountRename: (account_id: string, name: string) =>
-    json("/api/accounts/rename", { account_id, name }),
+    json<{ ok: boolean; name?: string | null }>("/api/accounts/rename",
+                                                { account_id, name }),
   accountExclude: (account_id: string, excluded: boolean) =>
     json<{ ok: boolean; account_id: string; excluded: boolean }>(
       "/api/accounts/exclude", { account_id, excluded }),
@@ -2243,9 +2328,15 @@ export const api = {
           hint?: string | null; passkeys_removed?: number;
           passkeys_kept?: number; mail_list_entry_dropped?: boolean;
           sms_number_needs_verify?: boolean;
-          members_removed?: RemovedMember[] }>(
+          members_removed?: RemovedMember[];
+          other_sessions_signed_out?: number;
+          // the rotation voided the recovery sheet; this is the one that
+          // stands (null when the account has no second factor)
+          recovery_codes?: string[] | null }>(
       "/api/email/change",
-      form({ new_email,
+      // this client shows a reissued sheet; one that does not omits it
+      // and keeps its codes
+      form({ new_email, reissue_codes: "1",
              ...(keep_push_endpoint ? { keep_push_endpoint } : {}) })),
   // withdraw a pending sign-in address change (no step-up: it only
   // takes something away)
@@ -2287,8 +2378,16 @@ export const api = {
                    totp_code?: string, keep_push_endpoint?: string) =>
     json<{ ok: boolean; passkeys_removed?: number;
            passkeys_kept?: number; sms_number_needs_verify?: boolean;
-           members_removed?: RemovedMember[] }>(
+           members_removed?: RemovedMember[];
+           other_sessions_signed_out?: number;
+           tokens_revoked?: number; devices_revoked?: number;
+           // the rotation voided the recovery sheet; this is the one that
+           // stands (null when the account has no second factor)
+           recovery_codes?: string[] | null }>(
       "/api/password/change", { current_password, new_password,
+      // this client shows a reissued sheet; one that does not omits it
+      // and keeps its codes
+      reissue_codes: true,
       ...(totp_code ? { totp_code } : {}),
       ...(keep_push_endpoint ? { keep_push_endpoint } : {}) }),
   // receipts
@@ -2407,7 +2506,11 @@ export const api = {
                sign_certain: boolean; note: string; oversized?: boolean;
                // an export ZIP too large to read here names the door
                // that takes it
-               restore_door?: string }[] };
+               restore_door?: string;
+               // the accounts the file could mean when the server cannot
+               // say which (two cards sharing their last four)
+               // each described (AccountChoice)
+               choices?: AccountChoice[] }[] };
   },
   // submits the plan; the files import in the background (bulkJob)
   bulkRun: (token: string, files: unknown[]) =>
@@ -2577,10 +2680,16 @@ export const api = {
                       created_at: string; last_used: string | null }[] }>(
       "/api/passkeys"),
   passkeyDelete: (id: string) =>
-    req<{ ok: boolean; signed_out?: boolean }>(`/api/passkeys/${id}`, {
+    // a key removed while another factor stays voids the old recovery
+    // sheet and returns the new one (null when nothing was minted)
+    req<{ ok: boolean; signed_out?: boolean;
+          recovery_codes?: string[] | null;
+          other_sessions_signed_out?: number }>(`/api/passkeys/${id}`, {
       method: "DELETE",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({}),
+      // this client shows a reissued sheet; one that does not omit it and
+      // keeps its codes
+      body: JSON.stringify({ reissue_codes: true }),
     }),
   // inline WebAuthn re-assertion on a passkey account — verify mints a
   // 5-minute single-use ticket that /api/auth/elevate redeems (stepup.ts)
@@ -2633,6 +2742,23 @@ export const api = {
     req<{ ok: boolean }>(`/api/users/${id}`,
       { method: "DELETE", body: JSON.stringify({}),
         headers: { "content-type": "application/json" } }),
+  // a server-made file (a CSV door) handed to the browser as a download.
+  // Fetched rather than followed as a plain link so a refusal — an
+  // owner-only door answering a page left open after a role change —
+  // arrives as the server's sentence for the caller to toast, instead of
+  // navigating the tab to a bare JSON body.
+  saveFile: async (path: string, fallbackName: string) => {
+    const r = await rawFetch(path, { credentials: "same-origin" });
+    if (!r.ok) await settle<never>(r);
+    const name = /filename="?([^";]+)/.exec(r.headers.get("content-disposition") ?? "")?.[1]
+      ?? fallbackName;
+    const url = URL.createObjectURL(await r.blob());
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    a.click();
+    URL.revokeObjectURL(url);
+  },
   testing: () => req<TestingState>("/api/testing"),
   // returns the feedback number; when the package can't be emailed the
   // zip comes back and is handed to the browser as a download here
@@ -2754,9 +2880,12 @@ export const api = {
   // route's own live code (code alone let a stolen session drop 2FA)
   // The code is single-use, so this door is never resent after the sheet
   totpDisable: (code: string) =>
+    // turned off while a passkey stays, the old recovery sheet is voided
+    // and the new one returned (null when no factor remains)
     reqOneTimeCode<{ ok: boolean; sms_number_needs_verify?: boolean;
+                     recovery_codes?: string[] | null;
                      members_removed?: RemovedMember[] }>(
-      "/api/totp/disable", form({ code })),
+      "/api/totp/disable", form({ code, reissue_codes: "1" })),
   // session elevation — see the Elevation type at the top of this file
   elevation: () => req<Elevation>("/api/auth/elevation"),
   elevate: (body: { password: string; totp_code: string }
@@ -2912,7 +3041,10 @@ export const api = {
     req<{ vendors: Vendor[]; threshold?: number }>(
       `/api/business/entities/${encodeURIComponent(id)}/vendors` +
       (year ? `?year=${year}` : "")),
-  vendorMark: (id: string, body: { merchant: string; reportable: boolean }) =>
+  // the door stores the TIN it is sent and an omitted one clears it, so a
+  // caller toggling `reportable` sends the TIN already on file back
+  vendorMark: (id: string, body: { merchant: string; reportable: boolean;
+                                   tin_last4?: string | null }) =>
     json(`/api/business/entities/${encodeURIComponent(id)}/vendors`, body),
   accountAssignEntity: (accountId: string, entityId: string | null) =>
     json(`/api/accounts/${encodeURIComponent(accountId)}/entity`,
@@ -3034,7 +3166,9 @@ export const api = {
   billsBill: (payee: string) =>
     req<BillDetail>(`/api/bills/bill?payee=${encodeURIComponent(payee)}`),
   billsSave: (body: { payee: string; amount: string | number;
-                          cadence: string; next_due?: string; income?: boolean;
+                          // absent keeps the bill's stored cadence
+                          cadence?: string; by_month_day?: number[];
+                          next_due?: string; income?: boolean;
                           orig_payee?: string; cap?: string | number | null;
                           merchant?: string; show_today?: boolean;
                           match_category?: boolean;
@@ -3150,10 +3284,20 @@ export interface AssistantTurn {
 }
 /** where the next older page of the log starts */
 export interface AssistantCursor { before: string; before_id?: string | null }
+/** where one AI task's data goes, judged by the server from the endpoint
+ *  that task would call: on this server or its network, to a remote AI
+ *  service (`host` named only when the household configured it), or
+ *  nowhere. Every "stays on this instance" line reads this — absent
+ *  (loading, an older server) is never read as "stays here". */
+export interface AiDestination { where: "local" | "remote" | "off"; host: string }
+export interface AssistantStatus {
+  available: boolean; local: boolean; host: string;
+  roles?: Partial<Record<"categorize" | "assistant" | "vision", AiDestination>>;
+}
 export const assistant = {
   // local=false means answers (and the ledger figures the tools return)
   // travel to `host` — the UI must say so instead of claiming "local"
-  status: () => req<{ available: boolean; local: boolean; host: string }>("/api/assistant"),
+  status: () => req<AssistantStatus>("/api/assistant"),
   // `answer` is the prose alone; `blocks` the ordered text + chart/table
   // pieces the page draws (components/AssistantBlocks)
   // a follow-up names the conversation it continues (`threadId`); the

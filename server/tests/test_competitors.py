@@ -147,6 +147,15 @@ class CompetitorImportTests(unittest.TestCase):
              "2026-07-12,Employer,Paycheck,Checking,EMPLOYER PAYROLL,,2000.00,\n"
              "2026-07-13,Acme Bank,Interest,Savings,INTEREST PAID,,1.25,\n")
 
+    def _by_name(self, prefix):
+        """Rows per split account, by its name (the id is opaque)."""
+        return {r["name"]: r["n"] for r in self.conn.execute(
+            "SELECT a.name, COUNT(*) AS n FROM transactions t"
+            "  JOIN accounts a ON a.id = t.account_id"
+            f" WHERE t.id LIKE '{prefix}:%%'"
+            f"   AND a.id LIKE 'manual:{prefix}-%%'"
+            " GROUP BY a.name").fetchall()}
+
     def _by_account(self, prefix):
         return {r["account_id"]: r["n"] for r in self.conn.execute(
             "SELECT account_id, COUNT(*) AS n FROM transactions "
@@ -158,15 +167,9 @@ class CompetitorImportTests(unittest.TestCase):
         self.assertEqual(out["split_accounts"],
                          {"Checking": 2, "Chase Card": 1, "Savings": 1})
         self.assertIn("3 accounts", out["note"])
-        self.assertEqual(self._by_account("monarch"), {
-            "manual:monarch-checking": 2,
-            "manual:monarch-chase-card": 1,
-            "manual:monarch-savings": 1})
         # the split accounts exist, named after the vendor's account
-        names = {r["id"]: r["name"] for r in self.conn.execute(
-            "SELECT id, name FROM accounts WHERE id LIKE 'manual:monarch%'"
-        ).fetchall()}
-        self.assertEqual(names["manual:monarch-chase-card"], "Chase Card")
+        self.assertEqual(self._by_name("monarch"), {
+            "Checking": 2, "Chase Card": 1, "Savings": 1})
 
     def test_multi_account_reimport_is_idempotent(self):
         # same content-hashed ids land on the same split accounts — no
@@ -174,22 +177,25 @@ class CompetitorImportTests(unittest.TestCase):
         # contract the single-account simplifi test asserts)
         C.import_monarch(self.conn, "chk", self.MULTI)
         C.import_monarch(self.conn, "chk", self.MULTI)
-        self.assertEqual(self._by_account("monarch"), {
-            "manual:monarch-checking": 2,
-            "manual:monarch-chase-card": 1,
-            "manual:monarch-savings": 1})
+        self.assertEqual(self._by_name("monarch"), {
+            "Checking": 2, "Chase Card": 1, "Savings": 1})
         n = self.conn.execute("SELECT COUNT(*) AS n FROM accounts "
                               "WHERE id LIKE 'manual:monarch%'").fetchone()
         self.assertEqual(n["n"], 3)
 
     def test_reimport_never_clobbers_a_user_rename(self):
         C.import_monarch(self.conn, "chk", self.MULTI)
-        self.conn.execute("UPDATE accounts SET name='My Card' "
-                          "WHERE id='manual:monarch-chase-card'")
+        card = self.conn.execute(
+            "SELECT id FROM accounts WHERE name = 'Chase Card'"
+            "   AND id LIKE 'manual:monarch-%'").fetchone()["id"]
+        self.conn.execute("UPDATE accounts SET name='My Card' WHERE id=%s",
+                          (card,))
         C.import_monarch(self.conn, "chk", self.MULTI)
-        r = self.conn.execute("SELECT name FROM accounts "
-                              "WHERE id='manual:monarch-chase-card'").fetchone()
+        r = self.conn.execute("SELECT name FROM accounts WHERE id=%s",
+                              (card,)).fetchone()
         self.assertEqual(r["name"], "My Card")
+        self.assertEqual(self._by_name("monarch"), {
+            "Checking": 2, "My Card": 1, "Savings": 1})
 
     def test_single_account_file_uses_the_selected_account(self):
         out = C.import_monarch(self.conn, "chk", MONARCH)
@@ -205,8 +211,8 @@ class CompetitorImportTests(unittest.TestCase):
                 "Sapphire,9876,,\n")
         out = C.import_copilot(self.conn, "chk", text)
         self.assertEqual(out["split_accounts"], {"Checking": 1, "Sapphire": 1})
-        self.assertEqual(self._by_account("copilot"), {
-            "manual:copilot-checking": 1, "manual:copilot-sapphire": 1})
+        self.assertEqual(self._by_name("copilot"),
+                         {"Checking": 1, "Sapphire": 1})
 
     def test_copilot_type_and_excluded_flags(self):
         """Copilot's `type` = internal transfer and its `excluded` flag both

@@ -17,14 +17,21 @@ import BusinessWizard from "../components/BusinessWizard";
 import { bizDefaultTaxYear, bizPeriodProfit, bizTaxStillDue, bizTaxYears,
   countsInTotals, bizShownBucket, bizNeedsLine, numberFieldsPatch,
   numberDraft, bizMemberDoorMissing } from "../bizmath";
-import { localYmd } from "../moneymath";
+import { householdDay, localYmd } from "../moneymath";
+
+// the household's day, not the browser's: near midnight across zones the
+// browser would date a trip, a payment or a tax year on the wrong day
+function useHouseholdDay(): Date {
+  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
+  return householdDay(new Date(), me.data?.timezone);
+}
 import ReceiptPanel from "../components/ReceiptPanel";
 import { NoteEditor } from "../components/TxnTable";
 import { api, errText, kindIs, mmdd, money, toast, type Account, type BizData,
          type BizTxn, type BusinessSummary, type Entity, type EquityMovement,
          type EstimatedTax,
          type MileageTrip, type Obligation, type Vendor,
-         catLabel } from "../api/client";
+         catLabel, req } from "../api/client";
 import { patchList, patchQueries, patchQuery, removeFromList }
   from "../api/cache";
 import { canEdit, isOwner, isViewer } from "../role";
@@ -39,6 +46,9 @@ const afterAccountsMoved = (qc: ReturnType<typeof useQueryClient>,
     qc.invalidateQueries({ queryKey: [k, entityId] });
   qc.invalidateQueries({ queryKey: ["biz-summary"] });
   qc.invalidateQueries({ queryKey: ["today"] });
+  // top holdings leaves a business account's positions out of the
+  // personal view
+  qc.invalidateQueries({ queryKey: ["holdings"] });
 };
 
 // business-entity management ----------------------------------------
@@ -234,7 +244,7 @@ function bizHouseholdHint(why: EstimatedTax["household_unavailable"]): string {
 }
 
 function TaxSetAside({ entity }: { entity: Entity }) {
-  const year = new Date().getFullYear();
+  const year = useHouseholdDay().getFullYear();
   const tax = useQuery({ queryKey: ["esttax", entity.id, year],
     queryFn: () => api.estTax(entity.id, year) });
   // the P&L reports the estimates already paid out of the business
@@ -491,7 +501,7 @@ function ReviewQueue({ entity, ro }: { entity: Entity; ro?: boolean }) {
   return (
     <div className="card">
       <h4 style={{ marginTop: 0 }}>Schedule C review
-        <span className="mut" style={{ fontWeight: 400 }}> — {rows.length} to go</span>
+        <span className="mut" style={{ fontWeight: 400 }}> — {q.data?.unclassified ?? rows.length} to go</span>
       </h4>
       <p className="sub" style={{ marginTop: 0 }}>
         Nothing is filed automatically. Accept a suggestion or pick a
@@ -536,8 +546,9 @@ function ReviewQueue({ entity, ro }: { entity: Entity; ro?: boolean }) {
         })}
       </tbody></table>
       {rows.length > 25 && (
-        <p className="sub">Showing 25 of {rows.length} — the list refills as
-          you go.</p>
+        // the reply's list is capped; `unclassified` is the true backlog
+        <p className="sub">Showing 25 of {q.data?.unclassified ?? rows.length}
+          {" "}— the list refills as you go.</p>
       )}
     </div>
   );
@@ -552,7 +563,7 @@ function ReviewQueue({ entity, ro }: { entity: Entity; ro?: boolean }) {
  *  break out by month.
  */
 function OverviewSection({ entity }: { entity: Entity }) {
-  const year = new Date().getFullYear();
+  const year = useHouseholdDay().getFullYear();
   const pnl = useQuery({ queryKey: ["pnl", entity.id, year],
     queryFn: () => api.entityPnl(entity.id, year) });
   const txns = useQuery({ queryKey: ["biz-txns", entity.id, year],
@@ -568,7 +579,7 @@ function OverviewSection({ entity }: { entity: Entity }) {
   // LOCAL date, not toISOString() — that is UTC, so west of Greenwich it
   // reports the next day/month for most of the evening
   const ymd = localYmd;
-  const ym = ymd(new Date()).slice(0, 7);
+  const ym = ymd(useHouseholdDay()).slice(0, 7);
   // The month figure sits directly under the year's profit, so it is the
   // server's P&L arithmetic (books._pnl_core) on this month's rows: net of
   // reimbursement links, transfers and card payments out, capitalized
@@ -584,7 +595,7 @@ function OverviewSection({ entity }: { entity: Entity }) {
   const cash = counted.filter(a => kindIs(a, "depository"))
     .reduce((s, a) => s + (a.balance_current ?? 0), 0);
 
-  const today = ymd(new Date());        // local, per ymd() above
+  const today = ymd(useHouseholdDay());        // local, per ymd() above
   const next = (comp.data?.obligations || [])
     .filter(o => (o.due || "") >= today)
     .sort((a, b) => (a.due || "").localeCompare(b.due || ""))[0];
@@ -631,10 +642,11 @@ function EntityDetail({ entity, flaggedUnassigned, onChange, tab,
   const [editing, setEditing] = useState(false);
   // the Tax tab's filing year: the package and the 1099 list read the
   // same one, so last year's return can be put together in March
-  const taxYears = bizTaxYears(new Date(), entity.formation_date,
+  const hd = useHouseholdDay();
+  const taxYears = bizTaxYears(hd, entity.formation_date,
                                entity.business_start_date);
   const [taxYear, setTaxYear] = useState(
-    () => bizDefaultTaxYear(new Date(), taxYears));
+    () => bizDefaultTaxYear(hd, taxYears));
   // delete-forever confirm open (typed-name gate lives in the card)
   const [nuke, setNuke] = useState(false);
   const accts = useQuery({ queryKey: ["accounts"], queryFn: api.accounts });
@@ -908,12 +920,23 @@ function EntityDetail({ entity, flaggedUnassigned, onChange, tab,
           </div>
           <p className="sub">
             P&amp;L, ledger with Schedule C lines, balance sheet, 1099 vendor
-            totals and the mileage log — one zip for your accountant.
+            totals and the mileage log — one zip for your accountant
+            {isOwner(meQ) ? "." : ", downloaded by the owner."}
           </p>
-          <a className="btn pri"
-             href={`/api/business/entities/${entity.id}/package.zip` +
-                   `?year=${taxYear}`}>
-            Download {taxYear} package</a>
+          {/* the whole books as a file are the owner's to take: the door
+              refuses a member or a viewer, so the link is not drawn for
+              them. The year picker stays — it also drives the 1099 list */}
+          {isOwner(meQ) && (() => {
+            const pkg = `/api/business/entities/${entity.id}/package.zip` +
+                        `?year=${taxYear}`;
+            return (
+              <a className="btn pri" href={pkg}
+                 onClick={(e) => { e.preventDefault();
+                   api.saveFile(pkg, `year-end-${taxYear}.zip`)
+                     .catch((err) => toast(`Download failed: ${errText(err)}`)); }}>
+                Download {taxYear} package</a>
+            );
+          })()}
         </div>
         <TaxSection entity={entity} readOnly={ro} />
         <VendorSection entityId={entity.id} year={taxYear} readOnly={ro} />
@@ -938,7 +961,7 @@ function EquitySection({ entityId, readOnly }:
   const q = useQuery({ queryKey: ["equity", entityId],
     queryFn: () => api.entityEquity(entityId) });
   const [f, setF] = useState({ kind: "contribution", amount: "",
-    date: localYmd(new Date()), form: "", note: "" });
+    date: localYmd(useHouseholdDay()), form: "", note: "" });
   // a movement changes the capital account, which the balance sheet
   // beside this section also carries
   const refresh = () => {
@@ -978,7 +1001,7 @@ function EquitySection({ entityId, readOnly }:
           {cap.reimbursements > 0 &&
             <> · reimbursements {money(cap.reimbursements)}</>}
           {cap.household_capital != null && cap.household_share_pct != null &&
-            <> · your share ({cap.household_share_pct}%):{" "}
+            <> · your capital account ({cap.household_share_pct}% owner):{" "}
               <b className={cap.household_capital < 0 ? "neg" : "pos"}>
                 {money(cap.household_capital)}</b></>}
         </p>
@@ -1038,7 +1061,7 @@ const BOOKS_PAGE = 100;
 function BooksSection({ entityId, readOnly }:
   { entityId: string; readOnly: boolean }) {
   const qc = useQueryClient();
-  const now = new Date();
+  const now = useHouseholdDay();
   const [year, setYear] = useState<number | undefined>(now.getFullYear());
   // 'all years' can be a whole account history: a dropdown per row for
   // every one of them would freeze the tab, so the list renders a page at
@@ -1046,6 +1069,9 @@ function BooksSection({ entityId, readOnly }:
   const [shown, setShown] = useState(BOOKS_PAGE);
   const pnl = useQuery({ queryKey: ["pnl", entityId, year ?? "all"],
     queryFn: () => api.entityPnl(entityId, year) });
+  // the books as a file are the owner's to take: the door refuses a
+  // member or a viewer, so the link is not drawn for them
+  const meQ = useQuery({ queryKey: ["me"], queryFn: api.me });
   // the same key the Overview and the review queue use, so a decision made
   // on either tab refreshes this list too — spelled differently it never
   // would
@@ -1166,8 +1192,13 @@ function BooksSection({ entityId, readOnly }:
           <option value="">all years</option>
           {years.map(y => <option key={y} value={y}>{y}</option>)}
         </select>
-        <a className="btn" href={csv} style={{ marginLeft: "auto" }}>
-          download CSV</a>
+        {isOwner(meQ) && (
+          <a className="btn" href={csv} style={{ marginLeft: "auto" }}
+             onClick={(e) => { e.preventDefault();
+               api.saveFile(csv, "pnl.csv")
+                 .catch((err) => toast(`Download failed: ${errText(err)}`)); }}>
+            download CSV</a>
+        )}
       </div>
       {p && (
         <div className="mut" style={{ fontSize: ".9rem", margin: ".3rem 0" }}>
@@ -1384,7 +1415,7 @@ function MileageSection({ entityId, readOnly }:
   const qc = useQueryClient();
   const q = useQuery({ queryKey: ["mileage", entityId],
     queryFn: () => api.mileageList(entityId) });
-  const [f, setF] = useState({ date: localYmd(new Date()),
+  const [f, setF] = useState({ date: localYmd(useHouseholdDay()),
     miles: "", purpose: "" });
   const refresh = () => qc.invalidateQueries({ queryKey: ["mileage", entityId] });
   const [busy, run] = useBusy();
@@ -1403,6 +1434,11 @@ function MileageSection({ entityId, readOnly }:
     }).catch(toastErr).finally(() => setDeleting(null));
   };
   const s = q.data?.summary;
+  // every trip carries a delete, so every trip must be reachable: the
+  // newest few by default, the whole log one tap away
+  const [showAll, setShowAll] = useState(false);
+  const allTrips = q.data?.trips || [];
+  const trips = showAll ? allTrips : allTrips.slice(0, 6);
   return (
     <>
       <h4 style={{ marginBottom: ".3rem" }}>Mileage</h4>
@@ -1410,7 +1446,7 @@ function MileageSection({ entityId, readOnly }:
         {s.miles} mi {mileageRateLabel(s)} ={" "}
         <b className="pos">{money(s.deduction)}</b> deduction
         {s.year ? ` (${s.year})` : ""}.</p>}
-      {(q.data?.trips || []).slice(0, 6).map(t => (
+      {trips.map(t => (
         <div key={t.id} className="mut" style={{ fontSize: ".85rem",
           display: "flex", gap: ".5rem" }}>
           <span>{t.date ? mmdd(t.date) : ""}</span>
@@ -1422,10 +1458,14 @@ function MileageSection({ entityId, readOnly }:
           </button>}
         </div>
       ))}
-      {(q.data?.trips || []).length > 6 && (
+      {allTrips.length > 6 && (
         <div className="mut" style={{ fontSize: ".8rem" }}>
-          showing the 6 most recent of {(q.data?.trips || []).length} trips
-          (the deduction total covers all of this year's).</div>
+          {showAll ? `all ${allTrips.length} trips`
+            : `the 6 most recent of ${allTrips.length} trips`}{" "}
+          (the deduction total covers all of this year's).{" "}
+          <button className="ghost" onClick={() => setShowAll(!showAll)}>
+            {showAll ? "Show fewer" : `Show all (${allTrips.length})`}
+          </button></div>
       )}
       {!readOnly && (
         <div style={{ display: "flex", gap: ".4rem", flexWrap: "wrap",
@@ -1465,7 +1505,7 @@ function BalanceSheetSection({ entityId }: { entityId: string }) {
         <b className={b.net >= 0 ? "pos" : "bad"}>{money(b.net)}</b>
         {"  ·  "}Capital account {money(b.capital_account)}
         {b.household_capital != null && b.household_share_pct != null &&
-          <>{"  ·  "}your share ({b.household_share_pct}%){" "}
+          <>{"  ·  "}your capital account ({b.household_share_pct}% owner){" "}
             {money(b.household_capital)}</>}
         <span style={{ display: "block", fontSize: ".82rem" }}>
           Snapshot from business account balances — not double-entry books.</span>
@@ -1483,17 +1523,40 @@ function VendorSection({ entityId, year, readOnly }:
   // the checkbox is bound to the cached row, so it snaps back until the
   // list refetches — flip it first; the refetch settles needs_1099, and a
   // failure refetches the truth back
-  const mark = (merchant: string, reportable: boolean) => {
+  // a toggle leaves the TIN out (the door keeps the one on file, read
+  // under its own lock); only the TIN field sends one, "" clearing it
+  const mark = (v: Vendor, reportable: boolean,
+                tin_last4?: string | null) => {
+    const merchant = v.merchant;
+    setTouched((t) => t.includes(merchant) ? t : [...t, merchant]);
+    const tin = tin_last4 === undefined ? {} : { tin_last4 };
     patchList<{ vendors: Vendor[] }, Vendor>(qc, ["vendors", entityId, year],
-      "vendors", (v) => v.merchant === merchant, { reportable });
-    api.vendorMark(entityId, { merchant, reportable }).then(() =>
+      "vendors", (x) => x.merchant === merchant, { reportable, ...tin });
+    api.vendorMark(entityId, { merchant, reportable, ...tin }).then(() =>
       qc.invalidateQueries({ queryKey: ["vendors", entityId] })).catch((e) => {
       qc.invalidateQueries({ queryKey: ["vendors", entityId] });
       toastErr(e);
     });
   };
+  const [showAll, setShowAll] = useState(false);
+  // a row changed this visit stays on screen, so unmarking a payee under
+  // the line does not make it vanish under the pointer
+  const [touched, setTouched] = useState<string[]>([]);
+  const [tinDraft, setTinDraft] = useState<Record<string, string>>({});
   const all = q.data?.vendors || [];
-  const vendors = all.slice(0, 12);
+  const line = q.data?.threshold;
+  // every payee carries the contractor control, so every payee must be
+  // reachable: by default each one paid at or over the 1099 line, plus any
+  // already marked; the rest are one tap away
+  const vendors = showAll || line == null ? all
+    : all.filter((v) => v.paid >= line || v.reportable
+                        || touched.includes(v.merchant));
+  const hidden = all.length - vendors.length;
+  const saveTin = (v: Vendor) => {
+    const draft = tinDraft[v.merchant];
+    if (draft == null || draft === (v.tin_last4 ?? "")) return;
+    mark(v, v.reportable, draft || null);
+  };
   return (
     <>
       <h4 style={{ marginBottom: ".3rem" }}>1099 contractors · {year}</h4>
@@ -1518,15 +1581,34 @@ function VendorSection({ entityId, year, readOnly }:
             <td style={{ width: "1%" }}>
               <label className="mut" style={{ fontSize: ".82rem" }}>
                 <input type="checkbox" checked={v.reportable} disabled={readOnly}
-                  onChange={(e) => mark(v.merchant, e.target.checked)} />{" "}
+                  onChange={(e) => mark(v, e.target.checked)} />{" "}
                 contractor</label></td>
+            <td style={{ width: "1%" }}>
+              {v.reportable && (
+                <input aria-label={`TIN last 4 for ${v.merchant}`}
+                  placeholder="TIN last 4" inputMode="numeric"
+                  style={{ width: "6.5rem" }} disabled={readOnly}
+                  value={tinDraft[v.merchant] ?? v.tin_last4 ?? ""}
+                  onChange={(e) => setTinDraft({ ...tinDraft,
+                    // a pasted full TIN keeps its LAST four digits
+                    [v.merchant]: e.target.value.replace(/\D/g, "").slice(-4) })}
+                  onBlur={() => saveTin(v)}
+                  onKeyDown={(e) => { if (e.key === "Enter") saveTin(v); }} />
+              )}</td>
           </tr>
         ))}
       </tbody></table>
-      {all.length > 12 && (
+      {all.length > 0 && vendors.length === 0 && (
+        <div className="mut" style={{ fontSize: ".85rem" }}>
+          No payee is at the 1099 line yet.</div>
+      )}
+      {(hidden > 0 || (showAll && line != null)) && (
         <div className="mut" style={{ fontSize: ".8rem" }}>
-          showing the top 12 of {all.length} payees by amount — the books CSV
-          export lists every vendor.</div>
+          {hidden > 0 ? `${hidden} more paid under ${money(line!)} — `
+            : `all ${all.length} payees — `}
+          <button className="ghost" onClick={() => setShowAll(!showAll)}>
+            {showAll ? "Show fewer" : `Show all (${all.length})`}</button>
+        </div>
       )}
     </>
   );
@@ -1923,8 +2005,10 @@ function EntitiesSection({ tab }: { tab: BizTab }) {
           patchQuery<BusinessSummary>(qc, ["biz-summary"], { combined: v });
           api.businessCombine(v).then(() => {
             refresh();
+            // top holdings counts business accounts only in combined
+            // view (refresh() above already covers the accounts)
             for (const k of ["today", "txns", "report", "lens-month",
-                             "lens-year"])
+                             "lens-year", "holdings"])
               qc.invalidateQueries({ queryKey: [k] });
           }).catch((e) => {
             qc.invalidateQueries({ queryKey: ["biz-summary"] });
@@ -1971,7 +2055,9 @@ function EntitiesSection({ tab }: { tab: BizTab }) {
             <DeleteForeverCard
               entity={archived.find(e => e.id === nuking)!}
               onDone={() => { setNuking(null);
-                if (sel === nuking) setSel(null); refresh(); }}
+                if (sel === nuking) setSel(null); refresh();
+                // its accounts return to personal, and top holdings with them
+                qc.invalidateQueries({ queryKey: ["holdings"] }); }}
               onCancel={() => setNuking(null)} />
           )}
         </details>
@@ -1983,7 +2069,8 @@ function EntitiesSection({ tab }: { tab: BizTab }) {
 
 // tagged receipt line items → the itemized expense report
 function ExpenseReportCard() {
-  const now = new Date();
+  const meQ = useQuery({ queryKey: ["me"], queryFn: api.me });
+  const now = useHouseholdDay();
   const [tag, setTag] = useState("business");
   const [y, setY] = useState(now.getFullYear());
   const [m, setM] = useState(now.getMonth() + 1);
@@ -2007,9 +2094,13 @@ function ExpenseReportCard() {
           {Array.from({ length: 12 }, (_, i) => (
             <option key={i + 1} value={i + 1}>{i + 1}</option>))}
         </select>
+        {/* the expense file is a download of the books: the door refuses a
+            member or a viewer, so neither gets the button */}
+        {isOwner(meQ) && (
         <a className="btn"
            href={`/api/receipts/report?tag=${encodeURIComponent(tag)}&y=${y}&m=${m}&format=csv`}>
           download CSV</a>
+        )}
       </div>
       {q.data && (
         q.data.count === 0
@@ -2036,6 +2127,27 @@ function ExpenseReportCard() {
             </>
       )}
     </div>
+  );
+}
+
+// The owner's one line pointing at Doctor's Unlinked capital list: the
+// list is the household's own records, so it is reachable on hosted too,
+// where the rest of Doctor is not. Same query key as the list, so a Remove
+// there brings the count down here.
+function UnlinkedCapitalNotice({ owner }: { owner: boolean }) {
+  const q = useQuery({ queryKey: ["doctor-unlinked"],
+    queryFn: () => req<{ movements: { id: string }[] }>(
+      "/api/doctor/unlinked-movements"),
+    enabled: owner });
+  const n = q.data?.movements.length ?? 0;
+  if (!owner || !n) return null;
+  return (
+    <p className="sub" style={{ margin: "0 0 .6rem" }}>
+      {n === 1
+        ? "1 capital contribution or reimbursement lost the charge it was recorded for and still counts"
+        : `${n} capital contributions or reimbursements lost the charges they were recorded for and still count`}
+      {" — "}<Link to="/doctor">review unlinked capital</Link>
+    </p>
   );
 }
 
@@ -2100,6 +2212,7 @@ export default function Business() {
   return (
     <>
       <h1>Business</h1>
+      <UnlinkedCapitalNotice owner={isOwner(me)} />
       <BizNav tab={tab} onTab={setTab} />
       <EntitiesSection tab={tab} />
       {tab === "transactions" && <div className="card" style={{ marginTop: "1rem" }}>
@@ -2112,7 +2225,14 @@ export default function Business() {
             <option value="">all years</option>
             {d.years.map((y) => <option key={y} value={y}>{y}</option>)}
           </select>
-          <a className="btn" href={exportHref}>download CSV</a>
+          {/* owner-only door: a member or a viewer is not shown it */}
+          {isOwner(me) && (
+            <a className="btn" href={exportHref}
+               onClick={(e) => { e.preventDefault();
+                 api.saveFile(exportHref, "business.csv")
+                   .catch((err) => toast(`Download failed: ${errText(err)}`)); }}>
+              download CSV</a>
+          )}
           <Link className="btn" to="/transactions">‹ transactions</Link>
         </div>
         <div style={{ marginTop: ".6rem", fontSize: "1.15rem" }}>
@@ -2218,8 +2338,8 @@ export default function Business() {
                 show more ({d.rows.length} of {d.count})
               </button>
             : <p className="sub" style={{ marginTop: ".5rem", marginBottom: 0 }}>
-                Showing the newest {d.rows.length} of {d.count} — the CSV
-                download lists the whole worksheet.
+                Showing the newest {d.rows.length} of {d.count}
+                {isOwner(me) ? " — the CSV download lists the whole worksheet." : "."}
               </p>
         )}
       </div>}

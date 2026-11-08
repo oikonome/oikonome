@@ -94,6 +94,20 @@ class HideAndExcludeDuringRenameTests(unittest.TestCase):
             conn.close()
         self.assertIsNone(row["user_removed_at"])
 
+    def test_hiding_through_remove_mid_rename_is_a_404_not_hidden(self):
+        # the Accounts page's "Hide this account only" on web and mobile
+        # goes through the remove door, not /hidden
+        r = self._race(f"/api/accounts/{self.old}/remove", {"mode": "hide"})
+        self.assertEqual(r.status_code, 404, r.text)
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            row = conn.execute(
+                "SELECT user_removed_at FROM accounts WHERE id=%s",
+                (self.new,)).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNone(row["user_removed_at"])
+
     def test_excluding_an_account_mid_rename_is_a_404_not_excluded(self):
         r = self._race("/api/accounts/exclude",
                        {"account_id": self.old, "excluded": True})
@@ -115,6 +129,9 @@ class HideAndExcludeDuringRenameTests(unittest.TestCase):
                              json={"account_id": self.old, "excluded": True})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertTrue(r.json()["excluded"])
+        r = self.client.post(f"/api/accounts/{self.old}/remove",
+                             json={"mode": "hide"})
+        self.assertEqual(r.status_code, 200, r.text)
 
 
 if __name__ == "__main__":

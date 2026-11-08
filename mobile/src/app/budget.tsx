@@ -15,7 +15,7 @@ import MoneyMap, { planRows } from "../components/money-map";
 import StaleBanner from "../components/stale-banner";
 import { Card, H, HelpLink } from "../components/ui";
 import { errText, Account, BudgetSettings, CustomBucket } from "../lib/api";
-import { saveSettings } from "../lib/cache";
+import { saveSettings, SETTINGS_SAVES } from "../lib/cache";
 import { goalHasWords, goalNeedsAccount, isPlanSavingsGoal,
          mergeIncomeScenarios, mergePlannerBuckets,
          mergeSavingsGoals, numv, type GoalDraft, type ScenarioDraft,
@@ -77,7 +77,7 @@ export default function Budget() {
     // shown, so its own Today observer (the prefill, the goals) refetches
     // now through useRefetchWhenShown
     qc.invalidateQueries({ queryKey: ["today"], refetchType: "none" });
-    qc.invalidateQueries({ queryKey: ["lens", "month"] });
+    qc.invalidateQueries({ queryKey: ["lens"] });
     qc.invalidateQueries({ queryKey: ["budgets-suggest"] });
     qc.invalidateQueries({ queryKey: ["calendar"], refetchType: "none" });
     dirty.current[saved] = false;
@@ -276,7 +276,7 @@ function BudgetHistory({ viewer }: { viewer: boolean }) {
           // refetch that confirms it
           qc.invalidateQueries({ queryKey: ["budget-snapshots"] });
           qc.invalidateQueries({ queryKey: ["lens", "year"] });
-          qc.invalidateQueries({ queryKey: ["lens", "month"] });
+          qc.invalidateQueries({ queryKey: ["lens"] });
         } catch (e) {
           Alert.alert("Backfill failed", errText(e));
         } finally {
@@ -468,6 +468,10 @@ export function Planner({ s0, viewer, onSaved, onDirty, wizard }: {
   }, [rows, sug.isPending, sug.data, s0, wizard?.saved]);
 
   const save = useMutation({
+    // every Budget-page list save reads the server fresh, merges and
+    // writes the whole list back: one shared queue, so no two of them
+    // interleave and erase each other's rows
+    scope: SETTINGS_SAVES,
     mutationFn: async () => {
       // merge against a FRESH read — the planner owns only the
       // other-parent buckets and the "Savings" goal
@@ -623,6 +627,7 @@ export function Planner({ s0, viewer, onSaved, onDirty, wizard }: {
         <View key={r.id} style={st.rowLine}>
           <TextInput style={[st.input, { flex: 1, paddingVertical: 6 }]}
                      placeholder="category name" placeholderTextColor={C.mut}
+                     maxLength={40}
                      editable={!viewer && !r.food}
                      value={r.name}
                      onChangeText={(v) => patch(i, { name: v })} />
@@ -768,6 +773,10 @@ function IncomeScenarios({ s0, onSaved, onDirty }: {
       (x, j) => (j === i ? { ...x, ...p, touched: true } : x)));
   };
   const save = useMutation({
+    // every Budget-page list save reads the server fresh, merges and
+    // writes the whole list back: one shared queue, so no two of them
+    // interleave and erase each other's rows
+    scope: SETTINGS_SAVES,
     mutationFn: async () => {
       // The server replaces the list wholesale, and these rows were
       // seeded at mount; merge against its CURRENT list so a scenario
@@ -930,16 +939,20 @@ function SavingsGoals({ s0, onSaved, onDirty }: {
     queryFn: () => client!.accounts(), enabled: !!client });
   const today = useQuery({ queryKey: ["today"],
     queryFn: () => client!.todayFull(), enabled: !!client });
+  const goalRow = (g: NonNullable<BudgetSettings["savings_goals"]>[number]): GoalRow => ({
+    id: newRowId(), name: g.name, target: String(g.target || ""),
+    target_date: g.target_date ?? "",
+    monthly_plan: String(g.monthly_plan ?? ""),
+    account_id: g.account_id ?? "",
+    tokens: (g.tokens ?? []).join(", "),
+    start_balance: String(g.start_balance || ""),
+    mode: g.mode === "sweep" ? "sweep" : "monthly" });
   const [rows, setRows] = useState<GoalRow[]>(
-    () => (s0.savings_goals ?? []).map((g) => ({
-      id: newRowId(), name: g.name, target: String(g.target || ""),
-      target_date: g.target_date ?? "",
-      monthly_plan: String(g.monthly_plan ?? ""),
-      account_id: g.account_id ?? "",
-      tokens: (g.tokens ?? []).join(", "),
-      start_balance: String(g.start_balance || ""),
-      mode: g.mode === "sweep" ? "sweep" : "monthly" })));
+    () => (s0.savings_goals ?? []).map(goalRow));
   const [msg, setMsg] = useState<string | null>(null);
+  // the rows on screen now, for a save that lands after more typing
+  const rowsNow = useRef(rows);
+  rowsNow.current = rows;
   const patch = (i: number, p: Partial<GoalRow>) => {
     onDirty?.(true);
     setRows((rs) => rs.map((r, j) =>
@@ -954,16 +967,35 @@ function SavingsGoals({ s0, onSaved, onDirty }: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   const save = useMutation({
-    mutationFn: async () => {
+    // every Budget-page list save reads the server fresh, merges and
+    // writes the whole list back: one shared queue, so no two of them
+    // interleave and erase each other's rows
+    scope: SETTINGS_SAVES,
+    // the rows being saved ride along as the variables, so success can
+    // tell whether the person kept typing while the save was in flight
+    mutationFn: async (sent: GoalRow[]) => {
       // fresh-read merge: untouched rows defer to the server's copy;
       // rows added elsewhere are carried through (logic in pure.ts so
       // node can exercise it — it's the only lost-update guard here)
       const cur = await client!.settingsFull();
       return saveSettings(qc, client!, {
-        savings_goals: mergeSavingsGoals(rows, cur.savings_goals ?? [],
+        savings_goals: mergeSavingsGoals(sent, cur.savings_goals ?? [],
                                          baseline.current) });
     },
-    onSuccess: () => { setMsg("Savings goals saved."); onSaved(); },
+    onSuccess: (v, sent) => {
+      // the saved view is the new merge base: a goal added here and saved
+      // is no longer "added elsewhere", so removing or renaming it in a
+      // later save must not carry it back through
+      const goals = v.savings_goals ?? [];
+      baseline.current = goals.map((g) => g.name);
+      // every edit makes a new rows array: the same array means nothing
+      // was typed since the save began, and only then does the saved view
+      // replace the rows — edits typed in flight stay, still unsaved
+      const edited = rowsNow.current !== sent;
+      if (!edited) setRows(goals.map(goalRow));
+      setMsg("Savings goals saved."); if (!edited) onDirty?.(false);
+      onSaved();
+    },
     onError: (e) => setMsg(errText(e)),
   });
   return (
@@ -1084,7 +1116,7 @@ function SavingsGoals({ s0, onSaved, onDirty }: {
       <Pressable style={[st.btn, { alignSelf: "flex-start", marginTop: 8 },
                    save.isPending && { opacity: 0.5 }]}
                  disabled={save.isPending}
-                 onPress={() => save.mutate()}>
+                 onPress={() => save.mutate(rows)}>
         <Text style={st.btnText}>
           {save.isPending ? "saving…" : "Save savings goals"}
         </Text>
@@ -1148,6 +1180,10 @@ function BucketRules({ s0, onSaved, onDirty }: {
   const committedDyn = useRef(s0.dynamic_variable_budget !== false);
   const [msg, setMsg] = useState<string | null>(null);
   const save = useMutation({
+    // every Budget-page list save reads the server fresh, merges and
+    // writes the whole list back: one shared queue, so no two of them
+    // interleave and erase each other's rows
+    scope: SETTINGS_SAVES,
     mutationFn: async (dyn: boolean) => {
       const cur = await client!.settingsFull();
       const curBy = new Map((cur.custom_buckets ?? [])
@@ -1217,6 +1253,7 @@ function BucketRules({ s0, onSaved, onDirty }: {
           <View style={st.rowLine}>
             <TextInput style={[st.input, { flex: 1, paddingVertical: 6 }]}
                        placeholder="Coffee" placeholderTextColor={C.mut}
+                       maxLength={40}
                        value={r.name}
                        onChangeText={(v) => patch(i, { name: v })} />
             <TextInput style={[st.input, { width: 80, paddingVertical: 6,

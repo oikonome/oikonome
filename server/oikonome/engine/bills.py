@@ -12,6 +12,7 @@ Everything detection wants to change goes through `bill_proposals`
 and leaves an `auto` audit row.
 """
 
+import calendar
 import datetime as dt
 import hashlib
 import logging
@@ -19,6 +20,7 @@ import re
 import statistics
 
 from .. import localtime
+from ..sync import card_number
 from . import budget, merchant_dedup
 from .compat import as_date, as_dict, jsonb
 
@@ -35,6 +37,13 @@ PER_YEAR = {"DAILY": 365.2425, "WEEKLY": 365.2425 / 7, "MONTHLY": 12.0,
 CYCLES = [(7, "WEEKLY", 1), (14, "WEEKLY", 2), (30, "MONTHLY", 1),
           (61, "MONTHLY", 2), (91, "MONTHLY", 3), (182, "MONTHLY", 6),
           (365, "YEARLY", 1)]
+
+# Two fixed days of every month. Not in CYCLES: its gaps sit inside the 14-day
+# cycle's tolerance, so it is only ever a second reading of a 14-day run
+# (_twice_monthly_days), by the fit that first finds that run.
+TWICE_MONTHLY = (15, "MONTHLY", 1)
+TWICE_MONTHLY_MIN_HITS = 6    # three months: fewer cannot tell it from 14 days
+TWICE_MONTHLY_DAY_TOL = 3     # a payday moved off a weekend or a holiday
 
 LOOKBACK_MONTHS = 48          # ledger window for detection
 
@@ -84,6 +93,23 @@ def _monthly(amount: float, frequency: str | None, interval: int) -> float:
     if not frequency or frequency.upper() == "ENVELOPE":
         return amount
     return amount * PER_YEAR[frequency.upper()] / (interval or 1) / 12.0
+
+
+def offer_days(p) -> list[int] | None:
+    """The days of the month a pending offer (a bill_proposals row) pays on
+    when it pays on several: it says "monthly" alone otherwise."""
+    return budget.monthly_rule_days(
+        {"frequency": "MONTHLY", "interval": 1,
+         "byMonthDay": as_dict(p["evidence"]).get("by_month_day")}) or None
+
+
+def offer_monthly(p) -> float:
+    """What a pending offer (a bill_proposals row) comes to per month: a
+    twice-a-month offer pays its amount on each of its days."""
+    days = as_dict(p["evidence"]).get("by_month_day")
+    n = len(days) if isinstance(days, list) and days else 1
+    return n * _monthly(abs(float(p["amount"] or 0)), p["frequency"],
+                        p["interval"] or 1)
 
 
 # The longest cycle a bill may repeat on: twenty years. The bound is on the
@@ -284,11 +310,43 @@ def in_manual_grace(raw: dict, today: dt.date | None = None) -> bool:
 _in_manual_grace = in_manual_grace   # alias kept for older call sites
 
 
+# The most bills a household may keep active. Every Today load, the hourly
+# email sweep and the nightly pass expand every active bill into its
+# occurrences and match each against the month's spending, so the cost of
+# one request grows with this count (times ~30 for a daily bill). A real
+# household keeps a few dozen; the ceiling sits far above that and far
+# below the thousands that would let one household's saves exhaust the
+# memory of a process every household shares.
+MAX_ACTIVE_BILLS = 300
+
+TOO_MANY_BILLS = (f"a household can keep at most {MAX_ACTIVE_BILLS} active "
+                  "bills — archive one you no longer pay first")
+
+
+def active_bill_count(conn) -> int:
+    return conn.execute(
+        "SELECT count(*) AS n FROM bills WHERE active=1").fetchone()["n"]
+
+
+def lock_active_bills(conn) -> None:
+    """Serialize the writes that can add an active bill, per household.
+
+    The ceiling is a count read before an insert; two saves both reading
+    one below the limit would both pass. A transaction-scoped lock keyed
+    on the tenant makes the second wait for the first to commit, so it
+    counts the first one's bill. Taken before any row lock, in every path
+    that checks the ceiling, so the order is always the same."""
+    conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtext('bills-active'), hashtext("
+        "    coalesce(current_setting('app.tenant_id', true), '')))")
+
+
 def save_bill(conn, *, payee: str, amount: float, bill_type: str = "occurrence",
               frequency: str | None = None, interval: int = 1,
               next_due: str | dt.date | None = None, category: str | None = None,
               source: str = "manual", last_seen: str | dt.date | None = None,
-              by_month_day: int | None = None, income: bool = False,
+              by_month_day: int | list[int] | None = None,
+              income: bool = False,
               merchant: str | None = None,
               manual_touch: bool | None = None,
               show_today: bool | None = None,
@@ -318,6 +376,14 @@ def save_bill(conn, *, payee: str, amount: float, bill_type: str = "occurrence",
     dues and shopping under one name, and a merchant rule cannot say both.
     None keeps the current value; "" clears it; a name sets it.
 
+    `by_month_day`: a list IS the monthly rule's days, replacing whatever it
+    had, and the only thing that does. A single day, or none, on a bill due
+    on several days of the month keeps that rule: most forms show one date
+    at a time, and a save through them must not drop the other payday. A
+    bill on several days always has its due date on one of them, so a date
+    off the rule lands on the rule's next day on or after it. The doors a
+    person types into refuse such a date first (due_off_rule).
+
     `companions` are the fees that ride with this bill's payment (see
     companions_of): a list replaces the set, None keeps it, [] clears it.
     The bill's `amount` stays the main charge; cap, health, Today and the
@@ -333,15 +399,23 @@ def save_bill(conn, *, payee: str, amount: float, bill_type: str = "occurrence",
     if cadence_too_long(frequency, interval):
         raise ValueError("bill cadence is longer than twenty years")
     with conn.transaction():
+        lock_active_bills(conn)
         # Read-modify-write under the row lock: the new raw carries values
         # forward from the old one (lock_amount, anchors, companions), so two
         # concurrent saves without the lock would let the later writer revert
         # the earlier one's fields with no conflict signalled to either.
-        other = conn.execute("SELECT payee, merchant, raw, amount FROM bills "
-                             "WHERE id=%s FOR UPDATE",
+        other = conn.execute("SELECT payee, merchant, raw, amount, active "
+                             "FROM bills WHERE id=%s FOR UPDATE",
                              (_slug(payee),)).fetchone()
         if other is not None and (other["payee"] or "") != payee:
             raise ValueError(f"name collides with existing bill '{other['payee']}'")
+        # Only a save that ADDS an active bill — a new one, or bringing an
+        # archived one back — is held to the ceiling; an edit of a bill
+        # already counted never is, so a household at the limit can still
+        # fix what it has.
+        adds_active = other is None or (revive and not other["active"])
+        if adds_active and active_bill_count(conn) >= MAX_ACTIVE_BILLS:
+            raise ValueError(TOO_MANY_BILLS)
         prev_merchant = other["merchant"] if other is not None else None
         if merchant is not None:
             prev_merchant = merchant.strip().lower() or None
@@ -385,9 +459,18 @@ def save_bill(conn, *, payee: str, amount: float, bill_type: str = "occurrence",
                 # anchor is treated as absent, never a crash
                 prev_day = (bmd[0] if isinstance(bmd, list) and bmd
                             and isinstance(bmd[0], int) else None)
-                day = by_month_day or (next_due_d.day if next_due_d
-                                       else prev_day or 1)
-                recurrence["byMonthDay"] = [day]
+                day = None if isinstance(by_month_day, list) else (
+                    by_month_day or (next_due_d.day if next_due_d
+                                     else prev_day or 1))
+                recurrence["byMonthDay"] = _monthly_rule_days(
+                    by_month_day, day, interval, prev_raw.get("recurrence"))
+                on_days = budget.monthly_rule_days(recurrence)
+                monthly = (_monthly(amount, frequency, interval)
+                           * max(1, len(on_days)))
+                if on_days:
+                    start = next_due_d or today
+                    next_due_d = (_next_occurrence(recurrence, start, start)
+                                  or next_due_d)
             elif recurrence["frequency"] == "YEARLY" and next_due_d:
                 recurrence["byMonth"] = [next_due_d.month]
         raw = {"source": source, "bill_type": bill_type,
@@ -500,6 +583,47 @@ def save_bill(conn, *, payee: str, amount: float, bill_type: str = "occurrence",
         return _slug(payee)
 
 
+# The household settings that name a bill by its payee string: the
+# budget-disabled list, the per-occurrence cap, and the dismissed fit hint
+# and health pill. A rename moves every one of them; a purge drops them.
+PAYEE_KEYED_CONFIG = ("disabled_bills", "occurrence_caps",
+                      "dismissed_hints", "dismissed_health")
+
+
+def move_payee_config(cfg: dict, old: str, new: str) -> bool:
+    """Re-key every PAYEE_KEYED_CONFIG entry for `old` to `new` in place."""
+    changed = False
+    for key in PAYEE_KEYED_CONFIG:
+        val = cfg.get(key)
+        if isinstance(val, list) and old in val:
+            cfg[key] = [new if p == old else p for p in val]
+            changed = True
+        elif isinstance(val, dict) and old in val:
+            val[new] = val.pop(old)
+            changed = True
+    return changed
+
+
+def drop_payee_config(cfg: dict, payee: str) -> bool:
+    """Remove every PAYEE_KEYED_CONFIG entry for `payee`; an emptied key
+    is dropped from the document."""
+    changed = False
+    for key in PAYEE_KEYED_CONFIG:
+        val = cfg.get(key)
+        if isinstance(val, list) and payee in val:
+            val = [p for p in val if p != payee]
+        elif isinstance(val, dict) and payee in val:
+            val = {k: v for k, v in val.items() if k != payee}
+        else:
+            continue
+        changed = True
+        if val:
+            cfg[key] = val
+        else:
+            cfg.pop(key, None)
+    return changed
+
+
 def rename_bill(conn, old: str, new: str) -> int:
     """Rename in place (id is the payee slug). Matching is driven by
     `merchant` (preserved), so a rename never changes what a bill matches.
@@ -531,44 +655,37 @@ def rename_bill(conn, old: str, new: str) -> int:
                 (_slug(new), _slug(old)))
             # Proposals name their bill by PAYEE STRING — there is no
             # bill_id FK — so a rename that leaves them behind strands
-            # them: _apply_approved looks the old name up, finds nothing,
-            # and every Approve returns "bill '<old>' no longer exists"
-            # forever, with no way to act on a legitimate drift or
-            # cadence correction that happened to be pending. Only rows
-            # still awaiting a decision move; a decided proposal is
-            # history and keeps the name it was decided under.
-            conn.execute("UPDATE bill_proposals SET payee=%s "
-                         "WHERE payee=%s AND status='pending'", (new, old))
+            # them: a pending one can never be approved ("bill '<old>' no
+            # longer exists"), and a decided one stops being read back —
+            # the rejection memory and the approved-removal check look a
+            # decision up by the bill's CURRENT name, so a turned-down
+            # price change was offered again every cycle. Every offer
+            # moves, decided ones too, as the card-number migration moves
+            # them.
+            conn.execute("UPDATE bill_proposals SET payee=%s WHERE payee=%s "
+                         "AND COALESCE(kind,'') NOT IN ('attach','merchant')",
+                         (new, old))
             # kind='attach' (a fee) and kind='merchant' (a merchant to
             # join the identity) are the shapes whose `payee` is the
             # thing's OWN label: the bill they would join is named in the
             # evidence, and only that moves.
             conn.execute(
                 "UPDATE bill_proposals SET evidence = evidence || %s::jsonb "
-                "WHERE kind IN ('attach','merchant') AND status='pending' "
+                "WHERE kind IN ('attach','merchant') "
+                "AND jsonb_typeof(evidence) = 'object' "
                 "AND evidence->>'bill_payee' = %s",
                 (jsonb({"bill_payee": new}), old))
-            # The budget config keys two things by PAYEE STRING — the
-            # budget-disabled list and the per-occurrence cap — so a rename
-            # that commits before they move leaves a window in which the
-            # bill's name and the config's name disagree. Everything that
-            # reads that pair during the window reads it wrong: the nightly
-            # pass watches a paused bill (drift corrections, a standing
-            # "remove?" proposal on a bill one tap disabled), and the budget
-            # counts a bill the person excluded from it. Moving them under
-            # the rename's own transaction means no reader can ever see the
-            # halves apart. The settings lock is taken LAST, after the
-            # bill's own rows, so the order is the same on every path that
-            # holds both.
+            # The settings blob keys several things by PAYEE STRING (see
+            # PAYEE_KEYED_CONFIG), so a rename that commits before they move
+            # leaves a window in which the bill's name and the config's name
+            # disagree: the nightly pass watches a paused bill, the budget
+            # counts a bill the person excluded, a dismissed hint comes
+            # back. Moving them under the rename's own transaction means no
+            # reader can ever see the halves apart. The settings lock is
+            # taken LAST, after the bill's own rows, so the order is the
+            # same on every path that holds both.
             with budget.config_txn(conn) as cfg:
-                dis = cfg.get("disabled_bills") or []
-                if old in dis:
-                    cfg["disabled_bills"] = [new if p == old else p
-                                             for p in dis]
-                caps = cfg.get("occurrence_caps") or {}
-                if old in caps:
-                    caps[new] = caps.pop(old)
-                    cfg["occurrence_caps"] = caps
+                move_payee_config(cfg, old, new)
     return n
 
 
@@ -644,26 +761,21 @@ def apply_txn_categories(conn, *, bill_id: str | None = None,
             stale = conn.execute(
                 "SELECT transaction_id, category, bill_id FROM manual_categories "
                 "WHERE bill_id IS NOT NULL").fetchall()
+        # Every row this pass will write is locked once, in id order,
+        # before any pin is touched: a person's edit (one row, a bulk
+        # selection, a mailed tap) takes the row and then its pin, and a
+        # pass taking the pin first deadlocked against it — losing its
+        # whole stamp transaction, or the person's edit. The rows are
+        # chosen first (reverts here, stamps after the ledger scan) and
+        # locked together, so the pass's own lock order is one sorted run.
+        reverts = []
         for m in stale:
             bid = m["bill_id"] if not bill_id else bill_id
-            if keep.get(bid) == m["category"]:
-                continue
-            # re-check ownership in the write: a no-op if a person claimed
-            # the row in the meantime (their write nulls bill_id) or another
-            # bill's pass restamped it (bill_id moved) — only THIS bill's
-            # mark, as scanned, is reverted
-            n = conn.execute(
-                "DELETE FROM manual_categories WHERE transaction_id=%s "
-                "AND bill_id=%s", (m["transaction_id"], bid)).rowcount
-            if n:
-                # only the BILL's own override is taken back: an item match
-                # or a person's pin that landed on the row since stays
-                conn.execute("UPDATE transactions SET category_override=NULL, "
-                             "override_source=NULL WHERE id=%s "
-                             "AND override_source IS NOT DISTINCT FROM 'bill'",
-                             (m["transaction_id"],))
-                stats["reverted"] += 1
+            if keep.get(bid) != m["category"]:
+                reverts.append((m["transaction_id"], bid))
         if not keep:
+            _lock_rows(conn, [t for t, _ in reverts])
+            _revert_marks(conn, reverts, stats)
             return stats
         # 2. stamp the rows each kept bill matches. One ledger scan per
         #    pass, all bills tested against each row (there are tens of
@@ -714,7 +826,15 @@ def apply_txn_categories(conn, *, bill_id: str | None = None,
                 WHERE t.removed = 0{budget.PERSONAL_ONLY_SQL}{since_sql}""",
             since_args).fetchall()
         from . import categories as _cats
+        # the scan read the rows before the reverts above are written:
+        # read each reverted row as it will stand once its mark is gone
+        reverting = {t for t, _ in reverts}
+        stamps = []
         for r in rows:
+            if r["id"] in reverting:
+                r = dict(r, mark_bill=None, mark_cat=None)
+                if r["override_source"] == "bill":
+                    r.update(category_override=None, override_source=None)
             if r["user_set"]:
                 continue                       # a person's answer wins
             # nor does a bill's stamp overwrite an item match — the store's
@@ -734,6 +854,10 @@ def apply_txn_categories(conn, *, bill_id: str | None = None,
             if r["mark_bill"] == bid and r["mark_cat"] == cat \
                     and r["category_override"] == cat:
                 continue                       # already right
+            stamps.append((r["id"], cat, bid))
+        _lock_rows(conn, reverting | {t for t, _, _ in stamps})
+        _revert_marks(conn, reverts, stats)
+        for tid, cat, bid in stamps:
             # the write re-checks ownership: a row a person claimed since
             # the scan (bill_id NULL) is left exactly as they set it
             n = conn.execute(
@@ -744,7 +868,7 @@ def apply_txn_categories(conn, *, bill_id: str | None = None,
                        category=EXCLUDED.category, set_at=now(),
                        bill_id=EXCLUDED.bill_id
                    WHERE manual_categories.bill_id IS NOT NULL""",
-                (r["id"], cat, bid)).rowcount
+                (tid, cat, bid)).rowcount
             if n:
                 conn.execute(
                     """UPDATE transactions SET category_override=%s,
@@ -752,9 +876,38 @@ def apply_txn_categories(conn, *, bill_id: str | None = None,
                         WHERE id=%s AND EXISTS (SELECT 1 FROM manual_categories m
                                                 WHERE m.transaction_id=%s
                                                   AND m.bill_id=%s)""",
-                    (cat, r["id"], r["id"], bid))
+                    (cat, tid, tid, bid))
                 stats["applied"] += 1
     return stats
+
+
+def _lock_rows(conn, txn_ids) -> None:
+    """Lock the charges' rows for the rest of the transaction, in id
+    order — the order every multi-row category writer takes them in."""
+    if txn_ids:
+        conn.execute("SELECT 1 FROM transactions WHERE id = ANY(%s) "
+                     "ORDER BY id FOR UPDATE", (sorted(txn_ids),))
+
+
+def _revert_marks(conn, reverts, stats) -> None:
+    """Take back the bill marks in `reverts` ((transaction id, bill id)),
+    their rows already locked."""
+    for txn_id, bid in reverts:
+        # re-check ownership in the write: a no-op if a person claimed
+        # the row in the meantime (their write nulls bill_id) or another
+        # bill's pass restamped it (bill_id moved) — only THIS bill's
+        # mark, as scanned, is reverted
+        n = conn.execute(
+            "DELETE FROM manual_categories WHERE transaction_id=%s "
+            "AND bill_id=%s", (txn_id, bid)).rowcount
+        if n:
+            # only the BILL's own override is taken back: an item match
+            # or a person's pin that landed on the row since stays
+            conn.execute("UPDATE transactions SET category_override=NULL, "
+                         "override_source=NULL WHERE id=%s "
+                         "AND override_source IS NOT DISTINCT FROM 'bill'",
+                         (txn_id,))
+            stats["reverted"] += 1
 
 
 def archive_bill(conn, payee: str) -> int:
@@ -826,12 +979,24 @@ def restore_bill(conn, payee: str) -> int:
     """Lift the archive. The withdrawn list is read under the row lock, in
     the same transaction that strips it: read unlocked, a nightly pass
     still appending its own withdrawals would have them stripped here and
-    never released, and those offers could not be filed again."""
+    never released, and those offers could not be filed again.
+
+    Bringing an archived bill back adds an active one, so it is held to
+    the same ceiling as a save: otherwise archiving and restoring would
+    walk a household past it. Raises ValueError(TOO_MANY_BILLS).
+
+    A restored bill claims charges again, so it takes the household's
+    bill-claim lock first, as an add does, then the ceiling lock."""
     with conn.transaction():
-        b = conn.execute("SELECT raw FROM bills WHERE payee=%s FOR UPDATE",
-                         (payee,)).fetchone()
+        hold_bill_claims(conn)
+        lock_active_bills(conn)
+        b = conn.execute("SELECT raw, active FROM bills WHERE payee=%s "
+                         "FOR UPDATE", (payee,)).fetchone()
         if b is None:
             return 0
+        if (not b["active"]
+                and active_bill_count(conn) >= MAX_ACTIVE_BILLS):
+            raise ValueError(TOO_MANY_BILLS)
         n = conn.execute(
             "UPDATE bills SET active=1, synced_at=now(), "
             "raw = COALESCE(raw, '{}'::jsonb) - 'archived_by' "
@@ -851,6 +1016,11 @@ def delete_bill(conn, payee: str) -> int:
                             (payee,)).fetchall()
         for b in gone:
             _release_withdrawn(conn, b["raw"])
+        if gone:
+            # nothing names a deleted bill: its payee-keyed config goes too
+            # (settings lock last, as on the rename)
+            with budget.config_txn(conn) as cfg:
+                drop_payee_config(cfg, payee)
     return len(gone)
 
 
@@ -926,8 +1096,10 @@ def _withdraw_declined_offers(conn, declined_rows, declined, rows,
     if not pending:
         return 0
     by_payee: dict[bool, dict[str, list]] = {False: {}, True: {}}
+    # keyed on the cut spelling: an offer files its payee cut
+    # (_offer_text), a feed row's payee keeps the bank's whole number
     for r in rows:
-        by_payee[False].setdefault(r["payee"], []).append(r)
+        by_payee[False].setdefault(card_number.cut(r["payee"]), []).append(r)
     income_loaded = False
     withdrew: dict[str, list[str]] = {}
     for p in pending:
@@ -938,9 +1110,10 @@ def _withdraw_declined_offers(conn, declined_rows, declined, rows,
             continue
         if income and not income_loaded:
             for r in _income_rows(conn, today):
-                by_payee[True].setdefault(r["payee"], []).append(r)
+                by_payee[True].setdefault(card_number.cut(r["payee"]),
+                                          []).append(r)
             income_loaded = True
-        mine = by_payee[income].get(p["payee"] or "")
+        mine = by_payee[income].get(card_number.cut(p["payee"] or ""))
         owner = None
         for bill_payee, m in rules:
             if mine:
@@ -1018,6 +1191,159 @@ def _identity(conn, items, *, backed_only: bool = False) -> dict:
         refs = [r for r in refs if r["id"]]
     return {"merchant_refs": refs,
             "merchant_names": _merchant_names(r["name"] for r in refs)}
+
+
+# a detected bill whose match key or identity names may spell a number:
+# four digits anywhere, a probe the cut itself then decides on (in Python,
+# never handing stored text to the SQL cut, sync.card_number)
+_KEY_ROWS_SQL = """
+    SELECT tenant_id, id, merchant, raw FROM bills
+     WHERE raw->>'source' IS DISTINCT FROM 'manual'
+       AND (COALESCE(merchant, '') ~ '[0-9]{4}'
+            OR jsonb_typeof(raw->'merchant_refs') = 'array'
+               AND (raw->'merchant_refs')::text ~ '[0-9]{4}'
+            OR jsonb_typeof(raw->'merchant_names') = 'array'
+               AND (raw->'merchant_names')::text ~ '[0-9]{4}')"""
+
+
+def _cut_ref_name(name, live: set) -> object:
+    """A stored identity name cut, unless a live merchant of the household
+    still answers to it whole (a person's name, which migration 204 kept):
+    then the name is what finds that merchant, and it stays."""
+    if not isinstance(name, str) or name.strip().lower() in live:
+        return name
+    return card_number.cut(name)
+
+
+def follow_cut_payees(conn) -> int:
+    """Re-key every PAYEE_KEYED_CONFIG entry that names a detected bill
+    by the card number its payee was cut from onto the payee it reads now,
+    over every household `conn` sees.
+
+    A migration that renames a bill must move these as rename_bill does
+    (move_payee_config), every PAYEE_KEYED_CONFIG entry included (dismissed
+    hints and health pills too): an entry left under the old name re-shows
+    a dismissed hint and keeps the uncut card number in settings and
+    exports. An entry moves only where its
+    own name names no bill, its cut does, and that bill is a detected one
+    (a cut renames no bill a person made); an entry naming no bill either
+    way stays, as a rename would leave it. Where the cut name already has
+    its own entry that one is the newer choice and stays, and the whole
+    one goes. Each household is read and written
+    under its settings row lock. Idempotent: a cut name is "…" and
+    four digits, which no cut changes again. Returns the households
+    written."""
+    import copy
+    rows = conn.execute(
+        "SELECT tenant_id, config FROM tenant_settings"
+        " WHERE config ?| %s AND config::text ~ '[0-9]{4}'",
+        (list(PAYEE_KEYED_CONFIG),)).fetchall()
+    if not rows:
+        return 0
+    live: dict[str, dict] = {str(r["tenant_id"]): {} for r in rows}
+    for b in conn.execute(
+            "SELECT tenant_id, payee, raw->>'source' IS DISTINCT FROM"
+            " 'manual' AS detected FROM bills"
+            " WHERE tenant_id = ANY(%s::uuid[])", (sorted(live),)).fetchall():
+        live[str(b["tenant_id"])][b["payee"]] = b["detected"]
+    def follow(tid) -> bool:
+        """Move one household's entries under its settings row lock, so a
+        settings save made while the app serves waits for this one."""
+        held = live[str(tid)]
+        with conn.transaction():
+            r = conn.execute(
+                "SELECT config FROM tenant_settings WHERE tenant_id = %s"
+                " FOR UPDATE", (tid,)).fetchone()
+            if r is None:
+                return False
+            cfg = copy.deepcopy(as_dict(r["config"]))
+            names = set()
+            for key in PAYEE_KEYED_CONFIG:
+                val = cfg.get(key)
+                if isinstance(val, (list, dict)):
+                    names.update(x for x in val if isinstance(x, str))
+            changed = False
+            for old in sorted(names):
+                new = card_number.cut(old)
+                if old in held or new == old or not held.get(new):
+                    continue
+                for key in PAYEE_KEYED_CONFIG:
+                    val = cfg.get(key)
+                    if isinstance(val, list) and old in val and new in val:
+                        cfg[key] = [p for p in val if p != old]
+                    elif isinstance(val, dict) and old in val and new in val:
+                        del val[old]
+                move_payee_config(cfg, old, new)
+                changed = True
+            if not changed:
+                return False
+            conn.execute(
+                "UPDATE tenant_settings SET config = %s::jsonb,"
+                " updated_at = now() WHERE tenant_id = %s",
+                (jsonb(cfg), tid))
+            return True
+
+    n = sum(1 for r in rows if follow(r["tenant_id"]))
+    return n
+
+
+def cut_detected_keys(conn) -> int:
+    """Cut every card or account number out of what a DETECTED bill
+    matches and names its merchants by — `bills.merchant` (the match key)
+    and the names in raw.merchant_refs / raw.merchant_names — over every
+    household `conn` sees. A bill a person made (raw.source 'manual')
+    keeps its key as typed. A key matches the same rows cut or whole
+    (budget._phrase_in compares both sides cut), and a ref is followed by
+    its id, so nothing a bill pays changes. An identity name stays whole
+    where a live merchant still holds that whole name (_cut_ref_name).
+
+    Each row is written only if it still reads as it was read, so a save
+    landing between the read and the write is never overwritten; such a
+    row is left for the next run. Idempotent: a cut name is "…" and four
+    digits, which no cut changes again. Returns the bills written."""
+    # the settings that name a detected bill follow the name a cut gave it
+    follow_cut_payees(conn)
+    rows = conn.execute(_KEY_ROWS_SQL).fetchall()
+    if not rows:
+        return 0
+    tenants = sorted({str(r["tenant_id"]) for r in rows})
+    live: dict[str, set] = {t: set() for t in tenants}
+    for m in conn.execute(
+            "SELECT tenant_id, lower(btrim(name)) AS n FROM merchants"
+            " WHERE merged_into IS NULL AND name ~ '[0-9]{4}'"
+            "   AND tenant_id = ANY(%s::uuid[])", (tenants,)).fetchall():
+        live[str(m["tenant_id"])].add(m["n"])
+    n = 0
+    for r in rows:
+        raw = as_dict(r["raw"])
+        have = live[str(r["tenant_id"])]
+        merchant = card_number.cut(r["merchant"])
+        new_raw = dict(raw)
+        refs = raw.get("merchant_refs")
+        if isinstance(refs, list):
+            new_raw["merchant_refs"] = [
+                {**x, "name": _cut_ref_name(x.get("name"), have)}
+                if isinstance(x, dict) else x for x in refs]
+        names = raw.get("merchant_names")
+        if isinstance(names, list):
+            out, seen = [], set()
+            for x in names:
+                x = _cut_ref_name(x, have)
+                if isinstance(x, str):
+                    if x in seen:
+                        continue
+                    seen.add(x)
+                out.append(x)
+            new_raw["merchant_names"] = out
+        if merchant == r["merchant"] and new_raw == raw:
+            continue
+        n += conn.execute(
+            "UPDATE bills SET merchant = %s, raw = %s::jsonb, synced_at = now()"
+            " WHERE tenant_id = %s AND id = %s"
+            "   AND merchant IS NOT DISTINCT FROM %s AND raw = %s::jsonb",
+            (merchant, jsonb(new_raw), r["tenant_id"], r["id"],
+             r["merchant"], jsonb(raw))).rowcount
+    return n
 
 
 def _words(text: str | None) -> set[str]:
@@ -1577,6 +1903,28 @@ def recent_auto_changes(conn, days: int = 1) -> list[dict]:
            ORDER BY p.decided_at DESC""", (days,)).fetchall()
 
 
+# The offers whose payee is the ledger's own spelling of a series (a new
+# bill, a fee to attach), read off the rows the pass grouped. Every other
+# kind names a bill or a merchant by the name it is stored under, and the
+# offer finds it again by that exact string.
+_LEDGER_NAMED_KINDS = ("add", "attach")
+
+
+def _offer_text(kind, payee, evidence):
+    """An offer's payee and evidence as they are filed: a card or account
+    number the ledger spelled in full is cut to its last four
+    (sync.card_number) wherever the offer names the series in the ledger's
+    words, so approving it never makes a bill named by the whole number.
+    The id was already made from the uncut words, so a pass that finds
+    the same series again finds the same offer."""
+    if kind in _LEDGER_NAMED_KINDS:
+        payee = card_number.cut(payee)
+    ev = dict(evidence or {})
+    if isinstance(ev.get("description"), str):
+        ev["description"] = card_number.cut(ev["description"])
+    return payee, ev
+
+
 def _insert_proposal(conn, *, pid, kind, payee, amount, bill_type="occurrence",
                      frequency=None, interval=1, next_due=None, evidence=None,
                      status="pending") -> bool:
@@ -1584,6 +1932,7 @@ def _insert_proposal(conn, *, pid, kind, payee, amount, bill_type="occurrence",
     # twenty years; one is never filed that could not be approved
     if frequency and cadence_too_long(frequency, interval):
         return False
+    payee, evidence = _offer_text(kind, payee, evidence)
     now = dt.datetime.now(dt.timezone.utc)
     cur = conn.execute(
         """INSERT INTO bill_proposals
@@ -1598,7 +1947,8 @@ def _insert_proposal(conn, *, pid, kind, payee, amount, bill_type="occurrence",
 
 
 # Plaid stream frequency → our (frequency, interval). SEMI_MONTHLY has no
-# shape here (twice a month is not "every N months") and UNKNOWN says nothing
+# shape here (the stream names no paydays; detection reads them off the
+# ledger, _twice_monthly_days) and UNKNOWN says nothing
 _PLAID_FREQ = {"WEEKLY": ("WEEKLY", 1), "BIWEEKLY": ("WEEKLY", 2),
                "MONTHLY": ("MONTHLY", 1), "ANNUALLY": ("YEARLY", 1)}
 
@@ -1689,6 +2039,29 @@ def propose_from_plaid_streams(conn, streams: list[dict],
     return stats
 
 
+def hold_bill_claims(conn) -> None:
+    """Inside the caller's transaction: wait until no other approval in
+    the household is between its check for a bill already claiming these
+    charges (covering_bill) and the commit of the bill it creates. Two
+    approvals of different offers for one merchant ("ACME.COM" and
+    "Acme", or one renamed onto the other's charges) would each check
+    before the other's bill was visible and both create one, and the plan
+    would count the charge twice. Household-wide rather than per charge:
+    what a bill claims includes its merchant's names, which are not known
+    until the check reads them. Re-entrant within one transaction.
+
+    Keyed by the connection's household; a connection with none set (an
+    owner or admin connection) is refused, not given one key shared by
+    every such caller across all households."""
+    tid = conn.execute("SELECT current_setting('app.tenant_id', true) AS t"
+                       ).fetchone()["t"]
+    if not tid:
+        raise RuntimeError("the bill-claim lock needs a household "
+                           "connection")
+    conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                 ("oikonome:bill-claims:" + tid,))
+
+
 def apply_proposal(conn, pid: str, action: str) -> dict:
     """action = approve | reject. Approving mutates the recurring table.
 
@@ -1702,6 +2075,11 @@ def apply_proposal(conn, pid: str, action: str) -> dict:
     here rather than in each door (the app, approve-all, the form page,
     the email button), so none of them can forget to."""
     with conn.transaction():
+        if action == "approve":
+            # every door (the app, the form page, the email button) gets
+            # the claim lock here, before the row lock, as _decide_proposal
+            # takes it
+            hold_bill_claims(conn)
         p = conn.execute(
             "SELECT * FROM bill_proposals WHERE id = %s FOR UPDATE",
             (pid,)).fetchone()
@@ -1722,9 +2100,21 @@ def apply_proposal(conn, pid: str, action: str) -> dict:
                 # Nothing else in this block has written yet when
                 # _apply_approved raises.
                 return {"error": str(e)}
-    if not r.get("error"):
+    if not r.get("error") or proposal_superseded(conn, pid):
+        # a withdrawn offer (its bill was already tracked) leaves the queue
+        # as surely as an approved one
         settle_proposals_alert(conn)
     return r
+
+
+def proposal_superseded(conn, pid: str) -> bool:
+    """Was this offer withdrawn because what it offered already exists?
+    An approval that finds its bill already tracked answers an error AND
+    withdraws the offer: what the person asked for has happened, so every
+    door reports it as settled, not as a failure to retry."""
+    row = conn.execute("SELECT status FROM bill_proposals WHERE id=%s",
+                       (pid,)).fetchone()
+    return bool(row and row["status"] == "superseded")
 
 
 def settle_proposals_alert(conn) -> bool:
@@ -1761,6 +2151,97 @@ def covering_bill(conn, payee: str, *, besides: str | None = None
     return cover.get(key)
 
 
+def _offered_days(ev: dict) -> list[int] | None:
+    """The monthly days an offer asks for, as the list save_bill takes as an
+    instruction: a single day offered is the bill's whole rule, even when it
+    is one of the days the bill is on now."""
+    days = ev.get("by_month_day")
+    return [days] if isinstance(days, int) and days else (days or None)
+
+
+def _monthly_rule_days(given, day, interval, prev_rec) -> list[int]:
+    """The byMonthDay a monthly save writes (see save_bill's `by_month_day`):
+    the list it was given, else the bill's several days, else the one day."""
+    if isinstance(given, list):
+        days = [d for d in given
+                if isinstance(d, int) and not isinstance(d, bool)]
+        if days:
+            return days
+    kept = budget.monthly_rule_days(prev_rec if isinstance(prev_rec, dict)
+                                    else {})
+    if kept and interval == 1:
+        return kept
+    return [day or 1]
+
+
+def _payments_a_month(rec) -> float | None:
+    """How many payments a rule makes in an average month, or None when the
+    rule cannot be read (a restored row can hold anything)."""
+    rec = rec if isinstance(rec, dict) else {}
+    freq = str(rec.get("frequency") or "").upper()
+    try:
+        interval = int(rec.get("interval") or 1)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if freq not in PER_YEAR or interval < 1:
+        return None
+    return (_monthly(1.0, freq, interval)
+            * max(1, len(budget.monthly_rule_days(rec))))
+
+
+def _kept_amount_on_new_cadence(kept: float, p, ev: dict, old_rec) -> float:
+    """The per-payment amount a cadence offer writes when the bill's own
+    amount is kept instead of the offer's (a pin, or an offer with no
+    starting amount to check against).
+
+    The amount is stored per payment, so it can mean two things across a
+    change in how many payments a month there are: the price of a payment,
+    which stands, or the bill's share of the month, which has to be divided
+    among the new payments or the bill changes size by itself ($4,000 a month
+    on two days would be $8,000). The charges the offer read say which: the
+    reading nearer the offered amount wins, and an even call keeps the month.
+    """
+    interval = p["interval"] or 1
+    before = _payments_a_month(old_rec)
+    after = _payments_a_month(
+        {"frequency": p["frequency"], "interval": interval,
+         "byMonthDay": _monthly_rule_days(_offered_days(ev), None, interval,
+                                          old_rec)})
+    offered = abs(float(p["amount"] or 0))
+    if not before or not after or not offered:
+        return kept
+    same_month = round(kept * before / after, 2)
+    return kept if abs(offered - kept) < abs(offered - same_month) else same_month
+
+
+def due_off_rule(prev_raw: dict, frequency, interval, given,
+                 next_due) -> str | None:
+    """Why a person may not set this due date, or None when they may.
+
+    A bill on several days of the month has nowhere to store one moved
+    occurrence: its due date is always one of the rule's days, so a date
+    typed off them is refused rather than dropped or turned into a new rule.
+    A deposit a few days off its payday still matches. The date the bill
+    already holds is not a move, wherever it sits: a form echoing it back
+    has nothing to be refused for, and save_bill puts it on the rule."""
+    due = as_date(next_due) if next_due else None
+    if due is None or str(frequency or "").upper() != "MONTHLY":
+        return None
+    if due.isoformat() == prev_raw.get("dueOn"):
+        return None
+    rule = {"frequency": "MONTHLY", "interval": interval,
+            "byMonthDay": _monthly_rule_days(given, None, interval,
+                                             prev_raw.get("recurrence"))}
+    days = budget.monthly_rule_days(rule)
+    if not days or due in budget._occurrences_in_month(
+            {"recurrence": rule, "anchor": due}, due.year, due.month):
+        return None
+    return (f"This is paid on the {budget.month_days_words(days)} of each "
+            "month, so its next date has to be one of those days. A payment "
+            "a few days either side still counts. To change the days, pick "
+            "another cadence.")
+
+
 def _apply_approved(conn, p, ev) -> dict:
     note = None
     if p["kind"] == "add":
@@ -1790,7 +2271,7 @@ def _apply_approved(conn, p, ev) -> dict:
                   interval=p["interval"] or 1, next_due=p["next_due"],
                   category=ev.get("category"), source="detected",
                   last_seen=ev.get("last_seen"),
-                  by_month_day=ev.get("by_month_day"),
+                  by_month_day=_offered_days(ev),
                   income=bool(ev.get("income")), manual_touch=False,
                   # approving an offer to add the bill is the explicit ask
                   # for it, even when an archived bill of that name exists
@@ -1945,19 +2426,26 @@ def _apply_approved(conn, p, ev) -> dict:
             return {"error": f"'{p['payee']}' has changed since this offer "
                              "was made — it was withdrawn"}
         amount = p["amount"]
-        if pinned and p["kind"] == "frequency_change":
-            # the pin owns the amount: only the cadence moves. Not for a
-            # type change — there the amount changes meaning (one charge's
+        if p["kind"] == "frequency_change" and (
+                pinned or ev.get("old_amount") is None):
+            # the pin owns the amount, and the machine's figure does not move
+            # it: the bill costs what it did, on the new cadence. An offer
+            # filed before it recorded its starting amount cannot be checked
+            # against the bill, so it changes the cadence alone too. Not for
+            # a type change — there the amount changes meaning (one charge's
             # price against a month's pool), so the pinned price written
             # as the new figure would be wrong in kind: a $6 coffee pinned
             # per charge would become a $6-a-month envelope overrun every
             # month, which drift never corrects on a pinned bill. The
             # offer's own figure is written and the pin is dropped (below).
-            amount = abs(float(bill["amount"] or 0))
-        elif p["kind"] == "frequency_change" and ev.get("old_amount") is None:
-            # an offer filed before it recorded its starting amount cannot
-            # be checked against the bill, so it changes the cadence alone
-            amount = abs(float(bill["amount"] or 0)) or p["amount"]
+            kept = abs(float(bill["amount"] or 0))
+            if kept:
+                amount = _kept_amount_on_new_cadence(
+                    kept, p, ev, old.get("recurrence"))
+                if pinned and abs(amount - kept) > 0.005:
+                    note = (f"the pinned ${kept:,.2f} is now ${amount:,.2f} a "
+                            "payment, so the bill comes to the same each "
+                            "month — the pin stays")
         # never earlier than the bill's own due date: an offer without a
         # recorded starting date must not undo a roll the nightly made
         next_due = as_date(p["next_due"]) if p["next_due"] else None
@@ -1970,7 +2458,7 @@ def _apply_approved(conn, p, ev) -> dict:
                   interval=p["interval"] or 1, next_due=next_due,
                   category=bill["category"], source=old.get("source", "detected"),
                   last_seen=ev.get("last_seen") or old.get("lastDueOn"),
-                  by_month_day=ev.get("by_month_day"),
+                  by_month_day=_offered_days(ev),
                   income=(bill["amount"] or 0) > 0, manual_touch=False)
         if pinned and p["kind"] == "type_change":
             # the pin was on a per-charge price, which a pool has no longer;
@@ -2118,9 +2606,57 @@ def _run_from_end(dates: list[dt.date], cycle: int) -> list[dt.date]:
     return list(reversed(run))
 
 
+def _twice_monthly_days(run: list[dt.date]) -> list[int] | None:
+    """The two days of the month a 14-day run is really paid on (`[15, -1]`:
+    -1 is the last day), or None when it is what it looks like. A true
+    14-day series stays in phase with its own last date however long it
+    runs, and a twice-a-month one cannot: 24 payments a year against 26. So
+    a run still in phase is never re-read, and one out of phase must land
+    every hit near one payday of a single pair, one hit per payday. Only the
+    recent run is judged, so an employer that moved its paydays years ago
+    still reads."""
+    recent = run[-12:]
+    if len(recent) < TWICE_MONTHLY_MIN_HITS:
+        return None
+    tol = TWICE_MONTHLY_DAY_TOL
+    phase = [(recent[-1] - d).days % 14 for d in recent]
+    if all(min(g, 14 - g) <= tol for g in phase):
+        return None
+    months, y, m = [], recent[0].year, recent[0].month
+    y, m = (y, m - 1) if m > 1 else (y - 1, 12)
+    while y * 12 + m <= recent[-1].year * 12 + recent[-1].month + 1:
+        months.append((y, m))
+        y, m = (y, m + 1) if m < 12 else (y + 1, 1)
+    fits: dict[tuple[int, int], int] = {}
+    for first in range(1, 17):
+        for second in range(first + 12, min(first + 18, 31) + 1):
+            paydays = [dt.date(y, m, min(a, calendar.monthrange(y, m)[1]))
+                       for y, m in months for a in (first, second)]
+            miss, seen = 0, set()
+            for d in recent:
+                near = min(paydays, key=lambda p: abs((p - d).days))
+                off = abs((near - d).days)
+                if off > tol or near in seen:
+                    break
+                seen.add(near)
+                miss += off
+            else:
+                fits[(first, second)] = miss
+    if not fits:
+        return None
+    first, second = min(fits, key=fits.get)
+    # Month-end paydays moved off weekends cluster on no one day. Any late
+    # second day the last day also fits IS the last day (31 clamps to it, and
+    # -1 says so plainly).
+    if second >= 28 and (first, 31) in fits:
+        second = 31
+    return [first, -1 if second == 31 else second]
+
+
 def _fit_cycle(dates: list[dt.date]) -> tuple[tuple, list[dt.date]] | None:
     """Best (cycle_def, run) across supported cycles, longest run wins;
-    shorter cycle breaks ties.
+    shorter cycle breaks ties. A 14-day run that is really two fixed days of
+    the month comes back as TWICE_MONTHLY.
 
     Density guard: a run is only valid if the merchant's TOTAL events inside
     the run's span roughly equal the run length — otherwise the skip-close
@@ -2137,6 +2673,8 @@ def _fit_cycle(dates: list[dt.date]) -> tuple[tuple, list[dt.date]] | None:
             continue
         if best is None or len(run) > len(best[1]):
             best = (cyc, run)
+    if best and best[0][0] == 14 and _twice_monthly_days(best[1]):
+        best = (TWICE_MONTHLY, best[1])
     return best
 
 
@@ -2197,7 +2735,14 @@ def _cycle_to_proposal(cyc, run, med, events):
     days, freq, iv = cyc
     last = run[-1]
     by_month_day = None
-    if freq == "MONTHLY":
+    if cyc == TWICE_MONTHLY:
+        by_month_day = _twice_monthly_days(run)
+        # past the payday the last deposit paid, which it can land after or
+        # before; the next payday is at least thirteen days on
+        nxt = _next_occurrence(
+            {"frequency": freq, "interval": iv, "byMonthDay": by_month_day},
+            last, last + dt.timedelta(days=TWICE_MONTHLY_DAY_TOL + 1))
+    elif freq == "MONTHLY":
         by_month_day = int(statistics.median(d.day for d in run))
         nxt = (last.replace(day=1) + dt.timedelta(days=32 * iv)).replace(day=1)
         nxt = nxt.replace(day=min(by_month_day, 28))
@@ -2208,6 +2753,38 @@ def _cycle_to_proposal(cyc, run, med, events):
             "by_month_day": by_month_day, "last_seen": last.isoformat(),
             "dates": [d.isoformat() for d in run[-6:]],
             "hits": len(run)}
+
+
+DETECT_LOCK = "oikonome:bills-detect:{}"
+
+
+def run_single_flight(conn, today: dt.date | None = None, *,
+                      propose: bool = True, wait: bool = False) -> dict | None:
+    """`run`, one at a time per household.
+
+    The pass reads the whole multi-year ledger and holds its pooled
+    connection throughout, so parallel requests each doing the same pass
+    drain the pool every other household reads through. Every entry (the
+    on-demand doors and the nightly) goes through this session-level lock
+    on the household's key. With `wait=False` a second entrant gets None
+    and does no work — the doors answer 409; `wait=True` (the nightly)
+    queues behind the pass in flight and then runs its own, since that
+    pass may have started before the night's sync landed."""
+    from ..db import tenancy
+    tid = conn.execute("SELECT current_setting('app.tenant_id', true) AS t"
+                       ).fetchone()["t"]
+    if not tid:
+        raise RuntimeError("bill detection needs a household connection")
+    key = DETECT_LOCK.format(tid)
+    if wait:
+        conn.execute("SELECT pg_advisory_lock(hashtext(%s))", (key,))
+    elif not conn.execute("SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
+                          (key,)).fetchone()["ok"]:
+        return None
+    try:
+        return run(conn, today, propose=propose)
+    finally:
+        tenancy.release_lock(conn, key)
 
 
 def run(conn, today: dt.date | None = None, *, propose: bool = True) -> dict:
@@ -2262,6 +2839,7 @@ def run(conn, today: dt.date | None = None, *, propose: bool = True) -> dict:
         stats["income_rolled"] = advance_received_income(conn, today)
         _advance_due_dates(conn, today, stats)
         _maintain_bills(conn, bills, rows, today, stats)
+        _offer_income_cadence(conn, bills, today, stats)
         # Coverage is read again right before proposing: the maintenance
         # pass above can take seconds on a long fresh history, and a bill
         # the person typed in meanwhile (the setup wizard runs detection as
@@ -2810,7 +3388,9 @@ def _propose_income(conn, today, stats, declined=()):
                      -- INCOME-only, their paychecks would be undetectable. The
                      -- cadence/amount-core fit + approve gate screen the
                      -- uncategorized noise this lets in.
-                     AND COALESCE(t.category_override, t.category_primary, '')
+                     -- case-folded: rows a CSV import filed under its own
+                     -- "Income" label before the label was canonicalized
+                     AND UPPER(COALESCE(t.category_override, t.category_primary, ''))
                          IN ('INCOME', '')
                      -- A dual-source account would propose a doubled
                      -- paycheck the user could approve as real
@@ -2852,22 +3432,53 @@ def _propose_income(conn, today, stats, declined=()):
         recent_cut = today - dt.timedelta(days=180)
         recent = [e for e in events if e["date"] >= recent_cut] or events
         _, med = _amount_core(recent)
-        tol = DETECT_TOL(med)
-        core = [e for e in events if abs(e["amount"] - med) <= tol]
-        if len(core) < MIN_HITS:
+        # A raise ladder — several rungs inside those six months (a new
+        # job's starting pay, a raise, then another) — can put even the
+        # recent median on a MIDDLE rung with too few deposits at that
+        # size to make a core, and the household's current paycheck is
+        # never proposed. The latest deposit is tried first as the anchor:
+        # it is the paycheck the household lives on now. A bonus-sized
+        # latest deposit gathers no core and the median anchor still
+        # applies.
+        # Each anchor is carried through the WHOLE fit — core, cycle, run
+        # length, recency — and the anchor whose core holds the most recent
+        # on-cycle deposits wins. The latest deposit alone would hand the
+        # series to a same-descriptor stipend or a quarterly bonus paid on a
+        # payday (either gathers a core and fits a cycle of its own), and
+        # once approved the employer key is taken, so the paycheck would
+        # never be proposed again; a latest anchor whose core is an old
+        # rung from years back has no recent deposits and loses the same
+        # way. A bonus-sized one-off gathers no core and drops out.
+        latest = max(events, key=lambda e: e["date"])["amount"]
+
+        def _candidate(anchor):
+            tol = DETECT_TOL(anchor)
+            core = [e for e in events if abs(e["amount"] - anchor) <= tol]
+            if len(core) < MIN_HITS:
+                return None
+            fit = _fit_cycle([e["date"] for e in core])
+            if not fit:
+                return None
+            cyc, run_dates = fit
+            # Recency: allow ~2.5 cycles of silence so biweekly payroll
+            # holidays and mid-cycle wizard runs still propose (1.5 cycles
+            # would drop a biweekly series after one late payday). Floor
+            # 35d keeps short cycles from dying a few days past one missed
+            # payday. ledger_fit uses ×2 for the same idea on the bills side.
+            max_age = max(35, int(cyc[0] * 2.5))
+            if (len(run_dates) < MIN_HITS
+                    or (today - run_dates[-1]).days > max_age):
+                return None
+            on_cycle = set(run_dates)
+            recent_hits = sum(1 for e in core
+                              if e["date"] >= recent_cut
+                              and e["date"] in on_cycle)
+            return recent_hits, anchor, core, cyc, run_dates
+
+        cands = [c for c in (_candidate(latest), _candidate(med)) if c]
+        if not cands:
             continue
-        fit = _fit_cycle([e["date"] for e in core]) if len(core) >= 2 else None
-        if not fit:
-            continue
-        cyc, run_dates = fit
-        # Recency: allow ~2.5 cycles of silence so biweekly payroll holidays
-        # and mid-cycle wizard runs still propose (1.5 cycles would drop a
-        # biweekly series after one late payday). Floor 35d keeps short
-        # cycles from dying a few days past one missed payday. ledger_fit uses ×2 for
-        # the same idea on the bills side.
-        max_age = max(35, int(cyc[0] * 2.5))
-        if len(run_dates) < MIN_HITS or (today - run_dates[-1]).days > max_age:
-            continue
+        _hits, med, core, cyc, run_dates = max(cands, key=lambda c: c[0])
         # Prefer a clean employer label — Plaid often leaves ACH memo tails
         # (a scheduled-amount clause, a "~"-separated suffix) as the modal
         # string.
@@ -2893,6 +3504,73 @@ def _propose_income(conn, today, stats, declined=()):
                             interval=cyc[2], next_due=ev["next_due"], evidence=ev):
             stats["proposed_add"] += 1
             stats["proposed_income"] = stats.get("proposed_income", 0) + 1
+
+
+def _offer_changed_cadence(conn, b, key, payee, cycle, matched, today, stats,
+                           *, only_twice_monthly=False):
+    """Offer a new cadence when a bill's recent `matched` events fit another.
+    `only_twice_monthly` limits the offer to the move between every-14-days
+    and twice-a-month, or from one day of the month to twice-a-month."""
+    between = {14, TWICE_MONTHLY[0]}
+
+    def is_move(fitted: int) -> bool:
+        return ({fitted, cycle} == between
+                or (cycle == 30 and fitted == TWICE_MONTHLY[0]))
+    fit = _fit_cycle([e["date"] for e in matched[-6:]])
+    if fit and is_move(fit[0][0]):
+        # the two readings of one run: an offer between them rests on the
+        # longer record, and never on too few deposits to tell
+        fit = _fit_cycle([e["date"] for e in matched[-12:]])
+        if fit and len(fit[1]) < TWICE_MONTHLY_MIN_HITS:
+            fit = None
+    if not fit:
+        return
+    cyc, run_dates = fit
+    moved = is_move(cyc[0])
+    if only_twice_monthly and not moved:
+        return
+    if (len(run_dates) >= 4
+            and (moved or abs(cyc[0] - cycle) > 0.25 * cycle)
+            and (today - run_dates[-1]).days <= cyc[0] * 1.5):
+        med = statistics.median(e["amount"] for e in matched[-3:])
+        ev = _cycle_to_proposal(cyc, run_dates, med, matched)
+        ev["old_cycle_days"] = cycle
+        pid = _sig("freq", key, cyc[0], cycle)
+        if _offer_cadence(conn, b, pid=pid, kind="frequency_change",
+                          payee=payee, amount=round(med, 2),
+                          frequency=cyc[1], interval=cyc[2],
+                          next_due=ev["next_due"], evidence=ev):
+            stats["proposed_change"] += 1
+
+
+def _offer_income_cadence(conn, bills, today, stats) -> None:
+    """Income series get no drift or removal automation (_maintain_bills),
+    but a payroll stored as every 2 weeks that really pays on two days of the
+    month schedules 26 checks a year against 24, and one stored on a single
+    day schedules 12. The form cannot name days it has never seen, so the
+    right shape is offered, from the deposits the series owns. Read only when
+    such a series exists."""
+    series = []
+    for b in bills:
+        rec = as_dict(b["raw"]).get("recurrence") or {}
+        if ((b["amount"] or 0) > 0 and not b["budget_disabled"]
+                and rec.get("frequency")
+                and budget._cycle_days(rec) in (14, TWICE_MONTHLY[0], 30)):
+            series.append((b, budget._cycle_days(rec)))
+    if not series:
+        return
+    claims = budget._claim_income_rows(_income_rows(conn, today),
+                                       budget._income_claimants(conn, []))
+    for b, cycle in series:
+        amount = abs(b["amount"])
+        # the wide band bill health reads a paycheck with: raises move it
+        matched = [e for e in _events(sorted(claims.get(b["payee"]) or (),
+                                             key=lambda r: r["date"]))
+                   if 0.5 * amount <= e["amount"] <= 2 * amount]
+        if len(matched) >= TWICE_MONTHLY_MIN_HITS:
+            _offer_changed_cadence(
+                conn, b, budget._key_token(b["payee"] or ""), b["payee"],
+                cycle, matched, today, stats, only_twice_monthly=True)
 
 
 def _maintain_bills(conn, bills, rows, today, stats):
@@ -3105,22 +3783,8 @@ def _maintain_bills(conn, bills, rows, today, stats):
         # frequency change: recent matched events fit a different cycle
         # (≥4 hits — one skipped week shouldn't reshape a bill's schedule)
         if len(amt_matched) >= 4 and cycle and cycle <= 120:
-            recent = [e["date"] for e in amt_matched[-6:]]
-            fit = _fit_cycle(recent)
-            if fit:
-                cyc, run_dates = fit
-                if (len(run_dates) >= 4
-                        and abs(cyc[0] - cycle) > 0.25 * cycle
-                        and (today - run_dates[-1]).days <= cyc[0] * 1.5):
-                    med = statistics.median(e["amount"] for e in amt_matched[-3:])
-                    ev = _cycle_to_proposal(cyc, run_dates, med, amt_matched)
-                    ev["old_cycle_days"] = cycle
-                    pid = _sig("freq", key, cyc[0], cycle)
-                    if _offer_cadence(conn, b, pid=pid, kind="frequency_change",
-                                        payee=payee, amount=round(med, 2),
-                                        frequency=cyc[1], interval=cyc[2],
-                                        next_due=ev["next_due"], evidence=ev):
-                        stats["proposed_change"] += 1
+            _offer_changed_cadence(conn, b, key, payee, cycle, amt_matched,
+                                   today, stats)
 
         # type change → envelope: many variable-amount charges, stable total
         totals, counts = _monthly_totals(events, months3)
@@ -3235,12 +3899,16 @@ def ledger_fit(events: list[dict], today: dt.date) -> dict | None:
         # only offer "accept this amount" when they agree (a median of
         # 120/150/400 is not a price, it is noise)
         spread = round(max(recent) - min(recent), 2) if len(recent) > 1 else 0.0
+        days = p["by_month_day"] if cyc == TWICE_MONTHLY else None
+        how = (f"twice a month on the {budget.month_days_words(days)}" if days
+               else f"about every {cyc[0]} days")
         return {"kind": "occurrence", "amount": amt,
                 "cycle_days": cyc[0], "hits": len(run),
                 "recent_spread": spread,
-                "cadence": f"{cyc[1]}:{cyc[2]}", "next_due": p["next_due"],
+                "cadence": f"{cyc[1]}:{cyc[2]}", "by_month_day": days,
+                "next_due": p["next_due"],
                 "short": f"~${amt:,.0f}/{cyc[0]}d",
-                "label": f"~${amt:,.2f} about every {cyc[0]} days "
+                "label": f"~${amt:,.2f} {how} "
                          f"({len(run)} hits, last "
                          f"{dt.date.fromisoformat(p['last_seen']).strftime('%m/%d/%y')})"}
     months3 = _complete_months(today, 3)
@@ -3302,8 +3970,13 @@ def fit_matches_dismissal(fit: dict | None, stored: dict | None) -> bool:
         return False
     if (fit.get("cadence") or "") != (stored.get("cadence") or ""):
         return False
-    a = float(fit.get("amount") or 0)
-    b = float(stored.get("amount") or 0)
+    if fit.get("by_month_day") != stored.get("by_month_day"):
+        return False
+    try:
+        a = float(fit.get("amount") or 0)
+        b = float(stored.get("amount") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return False          # a malformed dismissal covers nothing
     return abs(a - b) <= max(DRIFT_MIN, 0.02 * max(a, b))
 
 
@@ -3721,6 +4394,10 @@ def merchant_history(conn, payee: str, today: dt.date | None = None,
     # is actually the payment for — inside its amount tolerance. Without
     # that amount gate a $600 one-off to a $200/mo payee would vanish from
     # this page while the engine still spent it out of the pool.
+    # A pool in the budget is outbid only by bills in the budget: the
+    # claimer gives budget envelopes first refusal over disabled ones, and
+    # a disabled bill owns no row the verdict counts, so neither may hide
+    # the pool's charges here.
     want_cat = None
     others = []
     if is_bill:
@@ -3728,10 +4405,15 @@ def merchant_history(conn, payee: str, today: dt.date | None = None,
         if (raw.get("bill_type") == "envelope" and raw.get("match_category")
                 and row["category"]):
             want_cat = budget._cat_norm(row["category"])
+            off = {(p or "").lower() for p in
+                   (budget.load_config(conn).get("disabled_bills") or [])
+                   if isinstance(p, str)}
             for b in conn.execute(
                     "SELECT payee, merchant, amount, raw FROM bills "
                     "WHERE active=1 AND amount<0 AND payee!=%s",
                     (payee,)).fetchall():
+                if payee.lower() not in off and (b["payee"] or "").lower() in off:
+                    continue
                 # every price the other bill has had, as its matchers
                 # read it: a charge it took at last year's price is its
                 # charge, not this pool's
@@ -4002,7 +4684,7 @@ def _cadence_offer_is_stale(bill, raw: dict, ev: dict) -> bool:
     amount or due date is not the one the offer was made from (a due date
     the bill's own schedule rolled on to excepted). A pinned
     amount is not compared — the pin owns the amount and the approval
-    leaves it alone — but its due date still is. An offer that recorded
+    keeps the bill's figure — but its due date still is. An offer that recorded
     neither (filed before it kept them) is never stale by this test.
 
     The cadence the offer was made from is compared too: a cadence the
@@ -4078,7 +4760,8 @@ def _offer_cadence(conn, bill_row, *, pid, kind, **kw) -> bool:
     approving it can tell whether the bill has moved since.
 
     A pinned amount still gets one: the pin is about the amount, the
-    offer about the cadence, and approving it keeps the pinned amount.
+    offer about the cadence, and approving it keeps the pinned figure
+    (_kept_amount_on_new_cadence).
     An offer withdrawn because the bill moved past it is offered again with
     the current figures — its id names the cadence, not the figures, so a
     plain insert would leave it withdrawn for good. A rejected one stays

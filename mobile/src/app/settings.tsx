@@ -2,12 +2,12 @@
 // support access, script tokens (self-host), sign out.
 // Deeper posture changes live on the Security & household screen.
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import * as Clipboard from "expo-clipboard";
 import Constants from "expo-constants";
 import { useRef, useState } from "react";
 import { Alert, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput,
          View } from "react-native";
 import PullRefresh from "../components/pull-refresh";
+import { SecretCopyButtons } from "../components/secret-copy";
 
 import { Card, H, HelpLink, KV, SharedLock } from "../components/ui";
 import { ext } from "../ext";
@@ -19,8 +19,8 @@ import { router, useRouter } from "expo-router";
 
 import { ApiError, Continuity, errText, Me, PickedFile, SettingsView, TokenScope, Webhook,
          WebhookEvent, EmailSchedule } from "../lib/api";
-import { patchQuery, removeFromList, saveSettings, SETTINGS_SAVES }
-  from "../lib/cache";
+import { invalidateAiRoute, patchQuery, removeFromList, saveSettings,
+         SETTINGS_SAVES } from "../lib/cache";
 import { EMAIL_KIND_LABEL, EMAIL_KINDS, kindOffNote, localDayOf, myDailyLine,
          prefOn, signOutAction }
   from "../lib/pure";
@@ -28,6 +28,7 @@ import { INVEST_STALE_STATUS, investChanges, investFormOf, investSeenOf,
          llmBackendsSeed, storedEnrichCap,
          type BasisRow, type FeeRow, type InvestForm, type InvestSeen }
   from "../lib/settings-pure";
+import { wizardRestartMarks } from "../components/wizard-logic";
 import { cadenceOf } from "../lib/schedule";
 import { registerNativePush } from "../lib/push";
 import { useSession } from "../lib/session";
@@ -145,6 +146,8 @@ function ExportDownloads({ dump }: { dump: boolean }) {
 function ContinuityCard() {
   const { client } = useSession();
   const qc = useQueryClient();
+  // mailing the packet sends to a member: not the shared login's to do
+  const sendLock = useSharedLock("grant");
   const q = useQuery({ queryKey: ["continuity"],
                        queryFn: () => client!.continuity(), enabled: !!client,
     staleTime: 5 * 60_000 });
@@ -258,9 +261,10 @@ function ContinuityCard() {
           )}
           <Pressable style={[s.btn, s.btnQuiet, { alignSelf: "flex-start",
                               marginTop: 8 },
-                             (busy || !to.trim() || !d.mail_configured)
-                               && { opacity: 0.5 }]}
-                     disabled={busy || !to.trim() || !d.mail_configured}
+                             (busy || !to.trim() || !d.mail_configured
+                              || !!sendLock) && { opacity: 0.5 }]}
+                     disabled={busy || !to.trim() || !d.mail_configured
+                               || !!sendLock}
                      onPress={askMail}>
             <Text style={s.btnText}>
               {mail.isPending ? "sending…" : "Email the packet"}</Text>
@@ -288,6 +292,8 @@ function ContinuityCard() {
 export default function Settings() {
   const { client, serverUrl, signOut } = useSession();
   const [testMsg, setTestMsg] = useState<string | null>(null);
+  // the test reaches every member's devices: not the shared login's to send
+  const pushTestLock = useSharedLock("grant");
   const testPush = useMutation({
     // a token the relay marked dead is revived by registering again, and
     // the launch-time registration runs once per sign-in: re-check it
@@ -509,8 +515,9 @@ export default function Settings() {
             phone and browser registered in the household, not this
             phone alone */}
         {owner && !me.data?.demo && (
-          <Pressable style={[s.testBtn, testPush.isPending && { opacity: 0.5 }]}
-                     disabled={testPush.isPending}
+          <Pressable style={[s.testBtn, (testPush.isPending || !!pushTestLock)
+                                        && { opacity: 0.5 }]}
+                     disabled={testPush.isPending || !!pushTestLock}
                      onPress={() => { setTestMsg(null); testPush.mutate(); }}>
             <Text style={{ color: C.text, fontWeight: "600" }}>
               Send test push to every household device
@@ -569,7 +576,8 @@ export default function Settings() {
               refuses the setting then, so the switch is not offered */}
           {me.data.features?.plaid_recurring !== false
             && <PlaidRecurringCard />}
-          {!me.data.demo && <EnrichCard />}
+          {!me.data.demo && me.data.features?.enrich !== false
+            && <EnrichCard />}
         </>)}
         {/* the web's Investment fees & basis card, under Connections like
             the web */}
@@ -716,6 +724,7 @@ function SmtpCard() {
     setSeeded(true);
   }
   const save = useMutation({
+    scope: SETTINGS_SAVES,
     mutationFn: () => saveSettings(qc, client!, {
       smtp_host: host.trim(), smtp_port: port.trim(),
       smtp_user: user.trim(), smtp_from: from.trim(),
@@ -880,6 +889,7 @@ function LlmCard({ hosted }: { hosted: boolean }) {
   const effective = (d?.llm_effective ?? {}) as
     Record<string, { model?: string; url?: string } | undefined>;
   const save = useMutation({
+    scope: SETTINGS_SAVES,
     mutationFn: () => saveSettings(qc, client!, {
       llm_backends: backends.map(
         ({ api_key_set, extra_body_set, ...rest }) => rest),
@@ -1194,6 +1204,8 @@ function ConnectionsBackupCard() {
       qc.invalidateQueries({ queryKey: ["settings"] });
       qc.invalidateQueries({ queryKey: ["connections"] });
       qc.invalidateQueries({ queryKey: ["accounts"] });
+      // the restored config can carry AI routes
+      invalidateAiRoute(qc);
     },
     onError: fail,
   });
@@ -1299,9 +1311,7 @@ function WizardsCard() {
               [{ text: "Restart",
                  onPress: () => saveSettings(qc, client!, {
                    wizard_done: false,
-                   wizard_steps: { connect: null, sync: null,
-                     import: null, bills: null, budgets: null,
-                     email: null, finish: null } })
+                   wizard_steps: wizardRestartMarks() })
                    .then(() => qc.invalidateQueries(
                      { queryKey: ["onboarding"] }))
                    .catch((e) =>
@@ -1360,6 +1370,7 @@ function EnrichCard() {
   const capOk = Number.isFinite(capNum) && capNum >= 0
     && !!d && capNum !== d.cap;
   const saveCap = useMutation({
+    scope: SETTINGS_SAVES,
     mutationFn: () => saveSettings(qc, client!, { plaid_enrich_cap: capNum }),
     onSuccess: (v) => {
       // the draft falls back to the cached cap the moment it clears, so
@@ -2133,13 +2144,8 @@ function ScriptTokensCard({ scope = "push" }: { scope?: TokenScope }) {
                          fontSize: 12 }} selectable>
             {fresh.token}
           </Text>
-          <Pressable style={[s.btn, { alignSelf: "flex-start" }]}
-                     onPress={async () => {
-                       await Clipboard.setStringAsync(fresh.token);
-                       setFresh(null);
-                     }}>
-            <Text style={s.btnText}>Copy &amp; dismiss</Text>
-          </Pressable>
+          <SecretCopyButtons text={fresh.token} what="token"
+                             onDone={() => setFresh(null)} />
         </View>
       )}
       {rows.map((t) => (
@@ -2372,13 +2378,8 @@ function WebhooksCard() {
                          fontSize: 12 }} selectable>
             {fresh.secret}
           </Text>
-          <Pressable style={[s.btn, { alignSelf: "flex-start" }]}
-                     onPress={async () => {
-                       await Clipboard.setStringAsync(fresh.secret);
-                       setFresh(null);
-                     }}>
-            <Text style={s.btnText}>Copy &amp; dismiss</Text>
-          </Pressable>
+          <SecretCopyButtons text={fresh.secret} what="secret"
+                             onDone={() => setFresh(null)} />
         </View>
       ) : null}
       {hooks.map((h) => <WebhookRow key={h.id} hook={h} />)}
@@ -2576,7 +2577,8 @@ function OutboundPausedBanner() {
     // the resume names the record it was shown, so a pause that changed
     // since this screen read it is refused rather than confirmed unseen
     mutationFn: () => client!.outboundResume(q.data?.outbound_paused?.version),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["settings"] }),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ["settings"] });
+                       invalidateAiRoute(qc); },
     onError: (e) => {
       if (e instanceof ApiError && e.status === 409) {
         qc.invalidateQueries({ queryKey: ["settings"] });

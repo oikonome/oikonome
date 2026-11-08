@@ -832,6 +832,44 @@ def _sig(a: str, b: str) -> str:
     return "mm:" + hashlib.sha1("|".join(sorted((a, b))).encode()).hexdigest()[:16]
 
 
+def follow_merged(conn, losers, survivor) -> int:
+    """Carry the decided offers about merchants that were just merged into
+    `survivor` across to the survivor's pair.
+
+    A pair is keyed by its two ids, so a merchant moved onto another row —
+    a twin fold, a re-clean retiring it — would leave the household's
+    answer behind on the old id, and the next proposal run would offer the
+    same two businesses again. The decision already on the survivor's pair
+    wins; a pending offer there takes the person's answer, as a restore
+    does. Called by every writer of merchants.merged_into, inside its
+    locked transaction."""
+    losers = [str(x) for x in losers]
+    survivor = str(survivor)
+    moved = 0
+    for r in conn.execute(
+            "SELECT from_merchant_id::text AS f, into_merchant_id::text AS i, "
+            "       evidence, status, created_at, decided_at "
+            "  FROM merchant_merge_proposals "
+            " WHERE status IN ('rejected', 'approved') "
+            "   AND (from_merchant_id = ANY(%s::uuid[]) "
+            "        OR into_merchant_id = ANY(%s::uuid[]))",
+            (losers, losers)).fetchall():
+        f = survivor if r["f"] in losers else r["f"]
+        i = survivor if r["i"] in losers else r["i"]
+        if f == i:
+            continue                     # the pair is one merchant now
+        moved += conn.execute(
+            """INSERT INTO merchant_merge_proposals (id, from_merchant_id,
+                   into_merchant_id, evidence, status, created_at, decided_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (tenant_id, id) DO UPDATE
+                  SET status = EXCLUDED.status, decided_at = EXCLUDED.decided_at
+                WHERE merchant_merge_proposals.status = 'pending'""",
+            (_sig(f, i), f, i, jsonb(r["evidence"] if isinstance(r["evidence"], dict) else {}), r["status"],
+             r["created_at"], r["decided_at"])).rowcount
+    return moved
+
+
 def run(conn, *, limit: int = 25, only_ids: list[str] | None = None) -> dict:
     """Write new proposals for the live merchants (bounded per run). A pair
     already decided keeps its decision (deterministic id, DO NOTHING).

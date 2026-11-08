@@ -34,15 +34,25 @@ KINDS = ("contribution", "draw", "distribution", "reimbursement")
 # takes exactly one of them, for exactly one entity.
 FRONTED_KINDS = ("contribution", "reimbursement")
 
+# The note a fronted booking writes on its movement. The booking door takes
+# no note of its own, so this text is what tells a movement that once
+# explained a charge from one entered by hand.
+FRONTED_NOTES = {"contribution": "capitalized personally-paid expense",
+                 "reimbursement": "reimbursement of personally-paid expense"}
+
 
 # Which movements (alias `m`) the capital figures count. A fronted movement
-# on a charge the bank feed withdrew explains a cost the books no longer
-# count (they skip removed rows), so it stops counting at the same moment,
-# not only once the nightly sweep removes it (release_withdrawn_fronted).
-COUNTS_IN_CAPITAL = f"""NOT (m.kind IN ('contribution', 'reimbursement')
+# explains a cost on the books, and the books skip every removed row: a
+# charge the bank feed withdrew, a stuck hold the person or a connector
+# retired, a file row retired onto another source's copy. While the
+# movement sits on such a row it stops counting, at the same moment the
+# cost does, whatever removed it. A row that comes back (a retirement is
+# reversible) brings its movement back; a hold that settled had its
+# movement carried onto the posted charge, which is live. Only the
+# withdrawn ones are ever deleted (release_withdrawn_fronted).
+COUNTS_IN_CAPITAL = """NOT (m.kind IN ('contribution', 'reimbursement')
     AND EXISTS (SELECT 1 FROM transactions wt
-                 WHERE wt.id = m.txn_id AND wt.removed = 1
-                   AND wt.raw ? '{_FEED_REMOVED_KEY}'))"""
+                 WHERE wt.id = m.txn_id AND wt.removed <> 0))"""
 
 
 class FrontedExpenseConflict(ValueError):
@@ -130,7 +140,8 @@ def delete_movement(conn, movement_id: str, entity_id: str) -> bool:
         (movement_id, entity_id)).rowcount > 0
 
 
-def capital_summary(conn, entity_id: str, *, lifetime=None) -> dict:
+def capital_summary(conn, entity_id: str, *, lifetime=None,
+                    today=None) -> dict:
     """Totals by kind + the capital-account balance.
 
     The balance includes RETAINED EARNINGS, because that is what an owner's
@@ -140,7 +151,9 @@ def capital_summary(conn, entity_id: str, *, lifetime=None) -> dict:
     and distributed profit is not a loss. The movements-only figure is
     still reported as `movements_balance` — it is a real sub-total, it
     just isn't the capital account. `lifetime` is the entity's all-history
-    transaction list (books.entity_transactions) when the caller has it."""
+    transaction list (books.entity_transactions) when the caller has it;
+    `today` the household's day (read from its settings when omitted),
+    which says how much of the start-up allowance has been deducted."""
     rows = conn.execute(
         f"""SELECT m.kind, COALESCE(SUM(m.amount),0) AS s
               FROM equity_movement m
@@ -152,25 +165,20 @@ def capital_summary(conn, entity_id: str, *, lifetime=None) -> dict:
     from . import books
     net_income = 0.0
     try:
-        # cumulative, all years: net operating income is what accrues to the
-        # owner. Guarded — equity must render even if the books read fails.
-        # _pnl_core, NOT pnl: pnl attaches this very summary, which would
-        # recurse forever
-        net_income = float(
-            books._pnl_core(conn, entity_id, None, lifetime)
-            .get("net_operating") or 0)
+        # cumulative, all years: net income is what accrues to the owner,
+        # and it takes the start-up allowance deducted so far as well as
+        # operating costs. Guarded — equity must render even if the books
+        # read fails.
+        if today is None:
+            from .. import localtime
+            from . import budget
+            today = localtime.now_local(budget.load_config(conn)).date()
+        net_income = books.net_income_through(conn, entity_id, today.year,
+                                              lifetime, lifetime)
     except Exception:                                     # noqa: BLE001
         log.warning("capital summary: net income unavailable", exc_info=True)
     balance = round(contrib + net_income - draws, 2)
-    # the household member's share of the capital account, by their
-    # ownership percentage, when one member is marked as the household
-    ours = conn.execute(
-        "SELECT ownership_pct FROM entity_membership "
-        "WHERE entity_id = %s AND is_household "
-        "ORDER BY created_at, id LIMIT 1",
-        (entity_id,)).fetchone()
-    pct = (float(ours["ownership_pct"])
-           if ours and ours["ownership_pct"] is not None else None)
+    household_capital, pct = _household_capital(conn, entity_id, net_income)
     return {"contributions": round(contrib, 2),
             "draws": round(by.get("draw", 0.0), 2),
             "distributions": round(by.get("distribution", 0.0), 2),
@@ -179,8 +187,46 @@ def capital_summary(conn, entity_id: str, *, lifetime=None) -> dict:
             "movements_balance": round(contrib - draws, 2),
             "capital_balance": balance,
             "household_share_pct": pct,
-            "household_capital": (round(balance * pct / 100.0, 2)
-                                  if pct is not None else None)}
+            "household_capital": household_capital}
+
+
+def _household_capital(conn, entity_id: str, net_income: float):
+    """The household member's own capital account, and their ownership %.
+
+    Each member of a multi-member business has their own capital account:
+    what THEY put in, less what THEY took out, plus their ownership share of
+    the net income. A movement naming the household member is wholly
+    theirs; one naming another member of this business is wholly that
+    member's; one naming nobody (or someone who is not a member here) is
+    split by ownership, like the net income. A business whose movements
+    name no one — and every sole owner — gets ownership % x the whole
+    account. (None, None) when no member is the household or its share is
+    not set."""
+    ours = conn.execute(
+        "SELECT id, ownership_pct FROM entity_membership "
+        "WHERE entity_id = %s AND is_household "
+        "ORDER BY created_at, id LIMIT 1",
+        (entity_id,)).fetchone()
+    if not ours or ours["ownership_pct"] is None:
+        return None, None
+    pct = float(ours["ownership_pct"])
+    rows = conn.execute(
+        f"""SELECT CASE WHEN m.member_id = %s THEN 'ours'
+                        WHEN mem.id IS NOT NULL THEN 'theirs'
+                        ELSE 'shared' END AS whose,
+                   COALESCE(SUM(CASE WHEN m.kind = 'contribution'
+                                     THEN m.amount
+                                     WHEN m.kind IN ('draw', 'distribution')
+                                     THEN -m.amount ELSE 0 END), 0) AS net
+              FROM equity_movement m
+              LEFT JOIN entity_membership mem
+                     ON mem.id = m.member_id AND mem.entity_id = m.entity_id
+             WHERE m.entity_id = %s AND {COUNTS_IN_CAPITAL}
+             GROUP BY 1""", (ours["id"], entity_id)).fetchall()
+    by = {r["whose"]: float(r["net"]) for r in rows}
+    capital = (by.get("ours", 0.0)
+               + (by.get("shared", 0.0) + net_income) * pct / 100.0)
+    return round(capital, 2), pct
 
 
 def _txn_row(conn, txn_id: str) -> tuple:
@@ -279,7 +325,7 @@ def contribute_expense(conn, entity_id: str, txn_id: str, *,
     transaction to the entity and record a matching contribution."""
     return _front_expense(
         conn, entity_id, txn_id, kind="contribution", member_id=member_id,
-        date=date, note=note or "capitalized personally-paid expense")
+        date=date, note=note or FRONTED_NOTES["contribution"])
 
 
 def reimburse_expense(conn, entity_id: str, txn_id: str, *,
@@ -288,14 +334,16 @@ def reimburse_expense(conn, entity_id: str, txn_id: str, *,
     transaction to the entity and record a reimbursement (a settlement)."""
     return _front_expense(
         conn, entity_id, txn_id, kind="reimbursement", member_id=member_id,
-        date=date, note=note or "reimbursement of personally-paid expense")
+        date=date, note=note or FRONTED_NOTES["reimbursement"])
 
 
 def release_withdrawn_fronted(conn, txn_ids: list[str], *,
                               older_than_days: int | None = None) -> int:
     """Remove the fronted movements (a capitalized cost or one marked
     reimbursable) still on charges the bank feed withdrew, once their
-    twin wait is over. Returns how many were removed.
+    twin wait is over, on a business still active (an archived one's
+    records are kept as they are; FOR SHARE orders this against an archive
+    committing at the same moment). Returns how many were removed.
 
     The books stop counting a withdrawn charge, so the cost leaves the
     entity's P&L; the movement explaining who funded it would otherwise
@@ -325,11 +373,12 @@ def release_withdrawn_fronted(conn, txn_ids: list[str], *,
             f"""SELECT m.*, e.name AS entity_name, t.name AS txn_name
                   FROM equity_movement m
                   JOIN transactions t ON t.id = m.txn_id
-                  LEFT JOIN business_entity e ON e.id = m.entity_id
+                  JOIN business_entity e ON e.id = m.entity_id
                  WHERE m.txn_id = ANY(%s) AND m.kind = ANY(%s)
                    AND t.removed = 1 AND t.pending = 0
                    AND t.raw ? '{_FEED_REMOVED_KEY}'{age}
-                   FOR UPDATE OF m""", params).fetchall()
+                   AND e.status = 'active'
+                   FOR UPDATE OF m FOR SHARE OF e""", params).fetchall()
         for r in rows:
             conn.execute("DELETE FROM equity_movement WHERE id = %s",
                          (r["id"],))
@@ -342,3 +391,61 @@ def release_withdrawn_fronted(conn, txn_ids: list[str], *,
                        f"{r['txn_name'] or 'a charge'} the bank withdrew"),
                 detail={"movement": _row(r)})
     return removed
+
+
+# A fronted booking whose charge was hard-deleted before deletes took the
+# movement with them: the foreign key's SET NULL kept it, unlinked, still
+# counted on the capital account. Nothing removes these on its own — some
+# may be right — so the owner reviews them one by one.
+_UNLINKED_FRONTED = """m.txn_id IS NULL
+    AND ((m.kind = 'contribution' AND m.note = %s)
+         OR (m.kind = 'reimbursement' AND m.note = %s))"""
+
+
+def _unlinked_params() -> tuple:
+    return (FRONTED_NOTES["contribution"], FRONTED_NOTES["reimbursement"])
+
+
+def unlinked_fronted(conn) -> list[dict]:
+    """Fronted movements whose charge no longer exists, newest first, on
+    businesses that are not archived (an archived business's records are
+    kept as they are). Each row is the movement plus its business name."""
+    rows = conn.execute(
+        f"""SELECT m.*, e.name AS entity_name
+              FROM equity_movement m
+              JOIN business_entity e ON e.id = m.entity_id
+             WHERE {_UNLINKED_FRONTED}
+               AND e.status IS DISTINCT FROM 'archived'
+             ORDER BY m.date DESC, m.created_at DESC""",
+        _unlinked_params()).fetchall()
+    return [{**_row(r), "entity_name": r["entity_name"]} for r in rows]
+
+
+def delete_unlinked_fronted(conn, movement_id: str) -> dict | None:
+    """Remove one movement listed by unlinked_fronted. A movement still
+    linked to its charge, one entered by hand, or one on an archived
+    business is not removed. Returns the removed row, or None."""
+    from .entities import _valid_uuid, require_active
+    if not _valid_uuid(movement_id):
+        return None
+    with conn.transaction():
+        r = conn.execute(
+            f"""SELECT m.*, e.name AS entity_name
+                  FROM equity_movement m
+                  JOIN business_entity e ON e.id = m.entity_id
+                 WHERE m.id = %s AND {_UNLINKED_FRONTED}""",
+            (movement_id, *_unlinked_params())).fetchone()
+        if r is None:
+            return None
+        # the business row held FOR SHARE, so an archive waits for this
+        try:
+            require_active(conn, str(r["entity_id"]))
+        except ValueError:
+            return None
+        gone = conn.execute(
+            f"""DELETE FROM equity_movement m
+                 WHERE m.id = %s AND {_UNLINKED_FRONTED}""",
+            (movement_id, *_unlinked_params())).rowcount
+        if not gone:
+            return None
+    return {**_row(r), "entity_name": r["entity_name"]}

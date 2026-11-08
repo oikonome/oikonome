@@ -10,6 +10,7 @@ import { useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useSearchParams } from "react-router";
 import { api, mmdd } from "../api/client";
+import { householdDay } from "../moneymath";
 import Today from "./Today";
 import MonthLens from "./MonthLens";
 import YearLens from "./YearLens";
@@ -28,7 +29,11 @@ const addDays = (iso: string, n: number) => {
 
 export default function Home() {
   const [sp, setSp] = useSearchParams();
-  const now = new Date();
+  // "today" is the household's day — the one the server answers on — so a
+  // browser in another zone can still reach the household's yesterday and
+  // its new month near midnight; the device clock only until /api/me lands
+  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
+  const now = householdDay(new Date(), me.data?.timezone);
   const cy = now.getFullYear(), cm = now.getMonth() + 1;
 
   const lens = (["today", "month", "year"] as const)

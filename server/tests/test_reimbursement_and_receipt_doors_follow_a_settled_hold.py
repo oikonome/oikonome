@@ -117,6 +117,111 @@ class DoorsFollowSettledHold(unittest.TestCase):
         again = api.receipt_list("hold-1", user=self.user)
         self.assertEqual([r["id"] for r in again["receipts"]], [out["id"]])
 
+    def test_pairing_a_waiting_receipt_with_the_hold_pairs_the_posted_row(self):
+        from oikonome.engine import receipts
+        rid = receipts.add(self.conn, None, _png(), "image/png")
+        self._settle()
+        out = api.receipt_match_by_hand(rid, user=self.user,
+                                        body={"txn_id": "hold-1"})
+        self.assertEqual(out["txn_id"], "post-1")
+        self.assertEqual(self.conn.execute(
+            "SELECT txn_id FROM receipts WHERE id=%s::uuid",
+            (rid,)).fetchone()["txn_id"], "post-1")
+        self.assertEqual(self.record.call_args.kwargs["target"], "post-1")
+
+    def test_linking_with_the_hold_as_anchor_pairs_the_posted_row(self):
+        add_txn(self.conn, DAY, -45.60, "VENMO FROM SAM", account="chk",
+                txn_id="dep-1")
+        self._settle()
+        out = api.reimburse_link(user=self.user, body={
+            "txn_id": "hold-1", "other_ids": ["dep-1"]})
+        self.assertEqual((out["linked"], out["errors"]), (1, []))
+        self.assertEqual(out["txn_id"], "post-1")
+        self.assertEqual(self.conn.execute(
+            "SELECT expense_id FROM reimbursements WHERE reimburse_id='dep-1'"
+        ).fetchone()["expense_id"], "post-1")
+
+    def test_linking_a_candidate_read_as_a_hold_pairs_its_posted_row(self):
+        add_txn(self.conn, DAY, -45.60, "VENMO FROM SAM", account="chk",
+                txn_id="dep-1")
+        self._settle()
+        out = api.reimburse_link(user=self.user, body={
+            "txn_id": "dep-1", "other_ids": ["hold-1"]})
+        self.assertEqual((out["linked"], out["errors"]), (1, []))
+        self.assertEqual(self.conn.execute(
+            "SELECT expense_id FROM reimbursements WHERE reimburse_id='dep-1'"
+        ).fetchone()["expense_id"], "post-1")
+
+    def test_candidates_for_the_hold_are_the_posted_rows(self):
+        add_txn(self.conn, DAY, -45.60, "VENMO FROM SAM", account="chk",
+                txn_id="dep-1")
+        self._settle()
+        out = api.reimburse_candidates("hold-1", user=self.user)
+        self.assertEqual(out["anchor"]["id"], "post-1")
+        self.assertIn("dep-1", [c["id"] for c in out["candidates"]])
+
+
+class OneRuleForWhichRowAHoldBecame(unittest.TestCase):
+    """Every door follows a settled hold by the same rule, whichever lock
+    it takes: the shared-lock edit doors (data.live_edit_ids) and the
+    row-locking business doors (entities.live_txn_id) agree on every
+    case."""
+
+    def setUp(self):
+        self.conn = make_db()
+        self.addCleanup(self.conn.close)
+        write_config(self.conn)
+        add_txn(self.conn, DAY, 38.00, "CORNER BISTRO", account="chk",
+                pending=1, txn_id="hold-1")
+        self.conn.execute("UPDATE transactions SET removed=1 "
+                          "WHERE id='hold-1'")
+
+    def _posted(self, txn_id="post-1", account="chk", raw=None, column=None):
+        add_txn(self.conn, DAY, 45.60, "CORNER BISTRO", account=account,
+                txn_id=txn_id)
+        self.conn.execute(
+            "UPDATE transactions SET raw=%s::jsonb,"
+            " pending_transaction_id=%s WHERE id=%s",
+            ('{"pending_transaction_id": "%s"}' % raw if raw else "{}",
+             column, txn_id))
+
+    def _both(self, txn_id="hold-1"):
+        from oikonome.engine import entities
+        with self.conn.transaction():
+            shared = data.live_edit_ids(self.conn, [txn_id]).get(txn_id)
+        with self.conn.transaction():
+            locked = entities.live_txn_id(self.conn, txn_id)
+        self.assertEqual(shared, locked)
+        return shared
+
+    def test_a_row_restored_with_only_the_column_is_followed(self):
+        self._posted(column="hold-1")
+        self.assertEqual(self._both(), "post-1")
+
+    def test_a_row_settled_before_the_column_is_followed_by_its_raw(self):
+        self._posted(raw="hold-1")
+        self.assertEqual(self._both(), "post-1")
+
+    def test_a_row_on_another_account_is_never_the_holds(self):
+        self._posted(account="card", raw="hold-1", column="hold-1")
+        self.assertIsNone(self._both())
+
+    def test_a_file_imports_raw_names_no_hold(self):
+        self._posted(txn_id="csv:abc", raw="hold-1")
+        self.assertIsNone(self._both())
+
+    def test_a_hold_still_live_is_its_own_row(self):
+        self.conn.execute("UPDATE transactions SET removed=0 "
+                          "WHERE id='hold-1'")
+        self._posted(column="hold-1")
+        self.assertEqual(self._both(), "hold-1")
+
+    def test_a_retired_posted_row_is_not_a_successor(self):
+        self._posted(column="hold-1")
+        self.conn.execute("UPDATE transactions SET removed=1 "
+                          "WHERE id='post-1'")
+        self.assertIsNone(self._both())
+
 
 if __name__ == "__main__":
     unittest.main()

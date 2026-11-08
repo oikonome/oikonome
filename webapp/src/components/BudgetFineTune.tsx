@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRef, useState } from "react";
 import { api, errText, money, type BudgetSuggestions, type CustomBucket,
          type Settings as SettingsData, catLabel } from "../api/client";
-import { saveSettings } from "../api/cache";
+import { saveSettings, SETTINGS_SAVES } from "../api/cache";
 import { parseMoneyDraft } from "../moneymath";
 
 // editable row form of a config custom_bucket: numbers and the
@@ -51,6 +51,10 @@ export default function BudgetFineTune({ data, onSaved, onDirtyChange }: {
   const touch = () => onDirtyChange?.(true);
 
   const save = useMutation({
+    // every Budget-page list save reads the server fresh, merges and
+    // writes the whole list back: one shared queue, so no two of them
+    // interleave and erase each other's rows
+    scope: SETTINGS_SAVES,
     // The dynamic flag arrives as the mutation variable when the checkbox
     // is what fired the save: the handler calls setDynamic and then mutate
     // in the same tick, so reading `dynamic` from this closure sent the
@@ -164,6 +168,7 @@ export default function BudgetFineTune({ data, onSaved, onDirtyChange }: {
             <div style={{ display: "flex", gap: ".6rem", flexWrap: "wrap",
                           alignItems: "center" }}>
               <input value={b.name} placeholder="Coffee" size={12}
+                     maxLength={40}
                      aria-label="bucket name"
                      onChange={(e) => setBucket(i, { name: e.target.value })} />
               <select value={b.parent} aria-label="carves out of"

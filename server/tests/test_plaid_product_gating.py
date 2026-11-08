@@ -321,5 +321,138 @@ class HostedProductsPullGateTests(EnvMixin, unittest.TestCase):
         self.assertIn("/liabilities/get", self._run())
 
 
+class EveryBilledEndpointAsksOnePredicate(EnvMixin, unittest.TestCase):
+    """Every Plaid endpoint the connector calls is either included with the
+    Transactions product or billed on its own, and every billed one asks
+    ``plaid_product_allowed`` before it is called. The operator's opt-out
+    (``OIKONOME_PLAID_PRODUCTS_EXTRA=none``) promises nothing billed beyond
+    transactions; a billed call that reads its own gate instead of the one
+    predicate keeps charging the operator after they said no."""
+
+    # endpoint -> the product name the predicate is asked about
+    BILLED = {
+        "/liabilities/get": "liabilities",
+        "/investments/holdings/get": "investments",
+        "/transactions/recurring/get": "recurring",
+        "/transactions/enrich": "enrich",
+    }
+    # included with Transactions, or not a data product at all
+    INCLUDED = {
+        "/item/public_token/exchange", "/item/get", "/item/remove",
+        "/item/webhook/update", "/accounts/get", "/transactions/sync",
+        "/link/token/create", "/link/token/get", "/institutions/get_by_id",
+    }
+
+    def _posted_endpoints(self) -> set:
+        import ast
+        tree = ast.parse(inspect.getsource(plaid))
+        out = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and \
+                    isinstance(node.func, ast.Attribute) and \
+                    node.func.attr == "post" and node.args and \
+                    isinstance(node.args[0], ast.Constant) and \
+                    isinstance(node.args[0].value, str):
+                out.add(node.args[0].value)
+        return out
+
+    def test_every_endpoint_called_is_classified(self):
+        """A new call site fails here until someone decides whether it is
+        billed — and, if it is, gates it."""
+        self.assertEqual(self._posted_endpoints(),
+                         set(self.BILLED) | self.INCLUDED)
+
+    def test_the_opt_out_refuses_every_billed_product(self):
+        os.environ["OIKONOME_PLAID_PRODUCTS_EXTRA"] = "none"
+        for product in self.BILLED.values():
+            self.assertFalse(plaid.plaid_product_allowed(None, product),
+                             product)
+
+    def test_the_self_host_default_allows_every_billed_product(self):
+        os.environ["OIKONOME_PLAID_PRODUCTS_EXTRA"] = ""
+        for product in self.BILLED.values():
+            self.assertTrue(plaid.plaid_product_allowed(None, product),
+                            product)
+
+    def test_an_unknown_product_is_a_programming_error(self):
+        with self.assertRaises(ValueError):
+            plaid.plaid_product_allowed(None, "balance")
+
+    def _hits(self, call) -> list:
+        conn = make_db()
+        try:
+            write_config(conn, plaid_client_id="cid", plaid_secret="sec",
+                         plaid_env="sandbox")
+            from oikonome.sync import base as sync_base
+            sync_base.upsert_item(conn, "it-billed", "plaid", "Demo", "tok")
+            hit: list = []
+
+            def handler(request):
+                hit.append(request.url.path)
+                return httpx.Response(200, text=json.dumps(
+                    {"outflow_streams": [], "inflow_streams": [],
+                     "enriched_transactions": []}))
+            call(conn, httpx.MockTransport(handler))
+            return hit
+        finally:
+            conn.close()
+
+    def test_the_opt_out_reaches_recurring_streams(self):
+        os.environ["OIKONOME_PLAID_PRODUCTS_EXTRA"] = "none"
+        self.assertEqual(self._hits(
+            lambda c, t: plaid.recurring_streams(c, "it-billed",
+                                                 transport=t)), [])
+
+    def test_recurring_streams_still_runs_by_default(self):
+        self.assertEqual(self._hits(
+            lambda c, t: plaid.recurring_streams(c, "it-billed",
+                                                 transport=t)),
+            ["/transactions/recurring/get"])
+
+    def test_the_opt_out_reaches_enrich(self):
+        import datetime as dt
+        from .util import add_txn
+        os.environ["OIKONOME_PLAID_PRODUCTS_EXTRA"] = "none"
+        out = {}
+
+        def call(c, t):
+            add_txn(c, dt.date.today(), 12.0, "MYSTERY SHOP", account="chk")
+            out.update(plaid.enrich_rows(c, limit=10, transport=t))
+        self.assertEqual(self._hits(call), [])
+        self.assertEqual(out["sent"], 0)
+        self.assertTrue(out["error"])
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheOptOutReachesTheClients(unittest.TestCase):
+    def test_me_turns_the_billed_controls_off_on_any_instance(self):
+        """/api/me tells the clients the recurring cross-check and Enrich
+        are off under the operator's `none`, self-host included, so their
+        controls hide instead of answering a refusal on every press."""
+        import os
+        import uuid
+        from unittest import mock
+
+        from fastapi.testclient import TestClient
+
+        from .util import _ensure_db
+        os.environ["OIKONOME_DEV"] = "1"
+        _ensure_db()
+        import oikonome.web.app as appmod
+        appmod.DEV_MODE = True
+        client = TestClient(appmod.app)
+        client.post("/api/signup", data={
+            "email": f"optout-{uuid.uuid4().hex[:8]}@example.dev",
+            "password": "correct-horse-battery-staple"})
+        with mock.patch.dict(os.environ,
+                             {"OIKONOME_PLAID_PRODUCTS_EXTRA": "none"}):
+            f = client.get("/api/me").json().get("features") or {}
+        self.assertIs(f.get("plaid_recurring"), False)
+        self.assertIs(f.get("enrich"), False)
+        with mock.patch.dict(os.environ,
+                             {"OIKONOME_PLAID_PRODUCTS_EXTRA": ""}):
+            f = client.get("/api/me").json().get("features") or {}
+        self.assertIsNot(f.get("enrich"), False)

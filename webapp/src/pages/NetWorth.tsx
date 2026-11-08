@@ -5,7 +5,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRef, useState } from "react";
 import { Link } from "react-router";
-import { saveSettings } from "../api/cache";
+import { SETTINGS_SAVES, saveSettings } from "../api/cache";
 import { nameKeys, parseMoneyDraft, rebaseNamedSave } from "../moneymath";
 import { api, errText,  money, type FeesReport, type ManualAsset, type NetWorthReport,
          type PLRow, catLabel } from "../api/client";
@@ -347,6 +347,7 @@ function ManualAssetsEditor() {
   const lastSent = useRef<ManualAsset[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const save = useMutation({
+    scope: SETTINGS_SAVES,
     // The server replaces the whole list, and this one is a copy from
     // when Edit was pressed: the nightly valuation or another device may
     // have saved since. Read the stored list now and lay only this
@@ -430,11 +431,6 @@ function ManualAssetsEditor() {
                      onChange={(e) => upd(i, { draft: e.target.value,
                                                as_of: null })} /></label>
           </div>
-          {r.auto && (
-            <div className="mut" style={{ fontSize: 12, marginTop: ".3rem" }}>
-              auto-valued ({r.auto}) — a manual value edit wins until the
-              next auto update</div>
-          )}
           <button type="button" style={{ marginTop: ".4rem" }}
                   onClick={() => setRows(rows.filter((_, j) => j !== i))}>
             Remove</button>

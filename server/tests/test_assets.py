@@ -1,7 +1,9 @@
 """manual_assets becomes writable through /api/settings — the
-Net Worth page owns the property/vehicles/mortgage editor. Auto-valuation keys ride through
-untouched; a value edit arrives with as_of cleared and is stamped today
-so the source tag shows when the human last spoke."""
+Net Worth page owns the property/vehicles/mortgage editor. An entry keeps
+only the fields something reads (name, kind, value, as_of): no step revalues
+an asset on its own, so a key claiming one would be stored unchecked and
+shown as a promise nothing keeps. A value edit arrives with as_of cleared and
+is stamped today so the source tag shows when the human last spoke."""
 
 import datetime as dt
 import unittest
@@ -51,14 +53,15 @@ class ManualAssetsApiTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertFalse(self._get())
 
-    def test_auto_valuation_keys_ride_through(self):
+    def test_an_entry_keeps_only_the_fields_something_reads(self):
         r = self.client.post("/api/settings", json={"manual_assets": [
             {"name": "Car", "kind": "vehicle", "value": 18000,
-             "auto": "depreciate", "rate": 0.12}]})
+             "auto": "depreciate", "rate": 0.12,
+             "monthly_delta": "x" * 100000, "extra": {"a": [1, 2]}}]})
         self.assertEqual(r.status_code, 200, r.text)
         got = self._get()[0]
-        self.assertEqual(got["auto"], "depreciate")
-        self.assertEqual(got["rate"], 0.12)
+        self.assertEqual(sorted(got), ["as_of", "kind", "name", "value"])
+        self.assertEqual(got["value"], 18000)
 
     def test_provided_as_of_is_kept(self):
         r = self.client.post("/api/settings", json={"manual_assets": [

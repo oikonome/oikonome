@@ -16,6 +16,7 @@ from pathlib import Path
 
 import psycopg
 
+from ..envnum import env_int
 from .tenancy import admin_connect
 
 HERE = Path(__file__).parent
@@ -236,11 +237,98 @@ def _apply_no_transaction(conn: psycopg.Connection, sql: str) -> None:
         conn.execute(stmt)
 
 
+def _cut_bill_keys_and_log_names(conn) -> None:
+    """Migration 208's step: the card numbers a detected bill's match key
+    and identity names still spell (bills.cut_detected_keys), and those in
+    the activity log's targets and the names its details quote
+    (activity.cut_stored_names), cut in Python over every household. See
+    the migration file for why. A first pass, on the deploy that brings
+    the file: a row saved between its read and its write is skipped, and
+    the log rows an old container writes while the deploy rolls are not
+    seen, so `cut_bill_keys_and_log_names` takes both on every migrate."""
+    import logging
+
+    from ..engine import activity, bills
+    keys = bills.cut_detected_keys(conn)
+    logged = activity.cut_stored_names(conn)
+    logging.getLogger("oikonome.db").info(
+        "208: cut the number from %d bill key(s), %d log row(s)",
+        keys, logged)
+
+
+def _cut_import_file_names(conn) -> None:
+    """Migration 209's step: the card numbers an import's file name still
+    spells where an underscore or a comma separates the groups, cut the
+    way batches.create now cuts a name (card_number.cut_as_slug_reads),
+    over every household. Only names holding two groups of four digits or
+    a run of eight are read; each is written only if it still reads as
+    read. See the migration file for why. The migrate tail runs it again
+    on every migrate, for names an old container stored after it read;
+    idempotent, a cut name is "…" and four digits."""
+    import logging
+
+    from ..sync import card_number
+    written = 0
+    for r in conn.execute(
+            "SELECT tenant_id, id, filename FROM import_batches"
+            " WHERE filename ~ '[0-9]{4}[^0-9A-Za-z]+[0-9]{4}|[0-9]{8}'"
+            ).fetchall():
+        cut = card_number.cut_as_slug_reads(r["filename"])
+        if cut != r["filename"]:
+            written += conn.execute(
+                "UPDATE import_batches SET filename = %s WHERE tenant_id = %s"
+                " AND id = %s AND filename = %s",
+                (cut, r["tenant_id"], r["id"], r["filename"])).rowcount
+    logging.getLogger("oikonome.db").info(
+        "209: cut the number from %d import file name(s)", written)
+
+
+def _follow_cut_payees(conn) -> None:
+    """Migration 210's step: the settings that name a detected bill by
+    its payee (bills.PAYEE_KEYED_CONFIG) moved onto the name 206's cut
+    gave the bill, where 206 left them under the whole number
+    (bills.follow_cut_payees). See the migration file for why."""
+    import logging
+
+    from ..engine import bills
+    logging.getLogger("oikonome.db").info(
+        "210: moved the bill settings of %d household(s) onto the cut name",
+        bills.follow_cut_payees(conn))
+
+
+# A migration whose stored text is changed in Python, by file name: the
+# step runs in the same transaction as the file, right after it, so the
+# file is recorded only once the step has landed, and a step that fails
+# leaves the migration pending for the next run. The step is given the
+# migrate's own connection, which sees every household (the superuser, or
+# on managed PG a member of the role that owns every table). Card numbers
+# are cut this way (sync/card_number.py): the SQL cut is slow per byte on
+# text dense with digits, and a migration never feeds stored text to it.
+# A step runs once, and the app serves while it runs, so a cut that must
+# hold for rows written later (or written past the step) is also a pass
+# every migrate runs, as `cut_bill_keys_and_log_names` is for 208. Only
+# the product's own files have steps: an add-on's file of the same name
+# is another migration.
+PYTHON_STEPS = {
+    "208_card_numbers_in_bill_keys_and_log_names_are_cut.sql":
+        _cut_bill_keys_and_log_names,
+    "209_card_numbers_in_import_file_names_are_cut.sql":
+        _cut_import_file_names,
+    "210_payee_keyed_settings_follow_a_cut_bill_name.sql":
+        _follow_cut_payees,
+}
+
+
 def _apply_dir(conn, mig_dir, done: set, applied: list) -> None:
     for f in sorted(mig_dir.glob("*.sql")) if mig_dir.exists() else []:
         if f.name in done:
             continue
         sql = f.read_text()
+        step = (PYTHON_STEPS.get(f.name)
+                if mig_dir.resolve() == (HERE / "migrations").resolve()
+                else None)
+        if step is not None and sql.lstrip().startswith(NO_TRANSACTION):
+            raise RuntimeError(f"{f.name}: a Python step needs a transaction")
         if sql.lstrip().startswith(NO_TRANSACTION):
             # recorded only once every statement landed; a failed run
             # leaves nothing recorded and is fixed by re-running
@@ -251,6 +339,8 @@ def _apply_dir(conn, mig_dir, done: set, applied: list) -> None:
         else:
             with conn.transaction():
                 conn.execute(sql)
+                if step is not None:
+                    step(conn)
                 conn.execute(
                     "INSERT INTO schema_migrations (name) VALUES (%s)",
                     (f.name,))
@@ -268,10 +358,9 @@ def _apply_dir(conn, mig_dir, done: set, applied: list) -> None:
 # reader can be held up by at one short wait. Only when every polite
 # attempt has failed does the last one wait as long as it takes — a start
 # must still finish.
-SCHEMA_LOCK_TIMEOUT_MS = int(os.environ.get(
-    "OIKONOME_MIGRATE_LOCK_TIMEOUT_MS") or 2000)
-SCHEMA_LOCK_ATTEMPTS = int(os.environ.get(
-    "OIKONOME_MIGRATE_LOCK_ATTEMPTS") or 30)
+SCHEMA_LOCK_TIMEOUT_MS = env_int("OIKONOME_MIGRATE_LOCK_TIMEOUT_MS", 2000,
+                                 lo=1)
+SCHEMA_LOCK_ATTEMPTS = env_int("OIKONOME_MIGRATE_LOCK_ATTEMPTS", 30, lo=1)
 SCHEMA_LOCK_BACKOFF_S = 1.0
 
 
@@ -635,10 +724,245 @@ def run(admin_dsn: str | None = None) -> list[str]:
         if admin_owns:
             conn.execute(ADMIN_OWNERSHIP_SQL)
         _encrypt_cp_secrets(conn)
+        key_numbered_file_rows(conn, pw)
+        cut_bill_keys_and_log_names(conn, pw)
+        # 209's cut again on every migrate: a name an old container stored
+        # while the deploy rolled, after the step read, would keep its number.
+        # A row an open import holds is left for the next migrate rather
+        # than holding up the boot.
+        try:
+            conn.execute("SET lock_timeout = '2s'")
+            _cut_import_file_names(conn)
+        except Exception:                                   # noqa: BLE001
+            import logging
+            logging.getLogger("oikonome.db").warning(
+                "could not cut card numbers from import file names",
+                exc_info=True)
+        finally:
+            conn.execute("RESET lock_timeout")
     finally:
         conn.execute("SELECT pg_advisory_unlock(%s)", (LOCK_KEY,))
         conn.close()
     return applied
+
+
+def key_numbered_file_rows(conn, app_password: str) -> int:
+    """Move, in every household that has them, each hand-made account
+    whose id spells a full account number onto one that keeps the last
+    four, re-hashing its rows under the new id, and cut the number from
+    every adoption record that names it in full (sync/base.
+    rekey_numbered_accounts); cut a number typed in groups from every
+    hand-made account's stored names (base.mask_manual_account_names);
+    then re-id the file rows whose id may still
+    hash a full account number — on a split account migration 199 moved
+    without them, or imported while the row's name still held one
+    (base.key_file_import_ids; migration 202 made the table their secret
+    lives in) — and carry any record a move left naming a row by its old
+    id (base.carry_stale_mentions). Last, after the names are cut and never
+    before (a name row taken earlier would digest a whole card number),
+    make the household's stored-name rows true (account_sources.backfill):
+    migration 207 took one over every hand-made name as it stood, before
+    the cut, and that digest of a whole card number would ride every
+    export; a row an archive or a move left naming a name its account no
+    longer stores is dropped, and a missing one written.
+
+    Python, so it cannot be a .sql migration, and it must run as the
+    household: the rows move through the same carry every other id move
+    uses, which leans on row-level security, and the secret is minted
+    under the household's own key. So each household with work — found
+    with one query over all of them on this connection — gets a
+    connection of its own as the app role, whose password this run has
+    just set. The move happens under the household's sync lock, as every
+    file import and restore writes under it: a migrate runs while the app
+    still serves, and a row moved under an import that had just looked it
+    up would be written again under its old id beside its new one, for
+    good. A household whose lock is held is tried once more after the
+    pass, then logged and left. Runs on every
+    migrate and moves nothing once done, so a household left or failed
+    here is taken again by the next one; a failure never stops the
+    migrate. A household whose masked names all hash as masked is still
+    visited (the query cannot recompute a sha1), and the visit moves
+    nothing. Returns the rows moved."""
+    import logging
+
+    from psycopg.conninfo import make_conninfo
+
+    from ..sync import account_sources, base
+    from . import tenancy
+    log = logging.getLogger("oikonome.db")
+    try:
+        rows = {str(r["tenant_id"]) for r in conn.execute(
+            "SELECT DISTINCT tenant_id FROM ("
+            + base.NUMBERED_FILE_ROWS_SQL + ") x",
+            base.NUMBERED_FILE_ROWS_ARGS).fetchall()}
+        # an account still under an id that spells a full number, or an
+        # adoption record naming one in full: the account moves and its
+        # rows are re-hashed before anything is keyed
+        rows |= {str(r["tenant_id"]) for r in conn.execute(
+            "SELECT tenant_id FROM accounts WHERE id ~ %(n)s"
+            " UNION SELECT tenant_id FROM account_adoptions"
+            "  WHERE old_account_id ~ %(n)s",
+            {"n": base.NUMBERED_MANUAL_ID_PATTERN}).fetchall()}
+        # a hand-made account whose stored names still spell a number
+        # (read as the name rows read it, base.NUMBERED_NAMES_WHERE)
+        rows |= {str(r["tenant_id"]) for r in conn.execute(
+            "SELECT DISTINCT tenant_id FROM accounts WHERE "
+            + base.NUMBERED_NAMES_WHERE,
+            {"p": base.NUMBERED_NAME_PATTERN}).fetchall()}
+        mentions = {str(r["tenant_id"]) for r in conn.execute(
+            base.STALE_MENTION_TENANTS_SQL, base.MENTION_ARGS).fetchall()}
+        # a stored-name row to drop or to write: made true in the
+        # household's own visit, under its lock like every other pass
+        # here, so a purge or restore in flight never has one recreated
+        # or dropped under it
+        name_rows = {str(r["tenant_id"]) for r in conn.execute(
+            account_sources.UNTRUE_TENANTS_SQL,
+            {"p": base.NUMBERED_NAME_PATTERN}).fetchall()}
+    except Exception:                                       # noqa: BLE001
+        log.warning("could not look for file rows to re-id", exc_info=True)
+        return 0
+    if not rows and not mentions and not name_rows:
+        return 0
+    dsn = make_conninfo(
+        conn.info.dsn, user="oikonome_app", password=app_password)
+    moved = 0
+
+    def visit(tid: str, last: bool) -> bool:
+        """One household's pass; False when its lock was held."""
+        nonlocal moved
+        try:
+            tconn = tenancy.tenant_connect(tid, dsn)
+        except Exception:                                   # noqa: BLE001
+            log.warning("re-id of file rows: no connection for household "
+                        "%s", tid, exc_info=True)
+            return True
+        try:
+            with base.tenant_sync_lock(tconn, tid) as held:
+                if not held:
+                    if last:
+                        log.warning("re-id of file rows: household %s is "
+                                    "syncing, importing or restoring; the "
+                                    "next migrate takes it", tid)
+                    return False
+                if tid in rows:
+                    # one pass: the numbered accounts move with their rows
+                    # re-hashed, full adoption records are cut the same
+                    # way (both in rekey_numbered_accounts), and only then
+                    # is what no re-hash could reach keyed
+                    base.rekey_numbered_accounts(tconn)
+                    base.mask_manual_account_names(tconn)
+                    moved += base.key_file_import_ids(tconn)
+                elif tid in mentions:
+                    base.carry_stale_mentions(tconn)
+                account_sources.backfill(tconn)
+        except Exception:                                   # noqa: BLE001
+            log.warning("re-id of file rows failed for household %s", tid,
+                        exc_info=True)
+        finally:
+            tconn.close()
+        return True
+
+    # a household whose sync or restore held the lock at its turn is
+    # usually free by the end of the pass, so it is tried once more then
+    # rather than left until the next deploy
+    busy = [tid for tid in sorted(rows | mentions | name_rows)
+            if not visit(tid, last=False)]
+    for tid in busy:
+        visit(tid, last=True)
+    return moved
+
+
+def _households_to_cut(conn) -> set[str]:
+    """The households holding a detected bill key, an identity name or a
+    log name the cut would change: the rows bills.cut_detected_keys and
+    activity.cut_stored_names read, narrowed to those spelling a number
+    (card_number.sql_selector) rather than any four digits, so a household
+    whose names are already cut ("…" and four digits) is not visited on
+    every migrate. A name a live merchant holds whole stays whole, and its
+    household is visited, for nothing, each time."""
+    from ..engine import activity, bills
+    from ..sync import card_number
+    args = {"p": card_number.sql_selector()}
+    keys = conn.execute(
+        "SELECT DISTINCT tenant_id FROM (" + bills._KEY_ROWS_SQL + ") x"
+        " WHERE COALESCE(x.merchant, '') ~ %(p)s"
+        "    OR EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN"
+        "       jsonb_typeof(x.raw->'merchant_refs') = 'array'"
+        "       THEN x.raw->'merchant_refs' END) e"
+        "        WHERE jsonb_typeof(e) = 'object' AND e->>'name' ~ %(p)s)"
+        "    OR EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN"
+        "       jsonb_typeof(x.raw->'merchant_names') = 'array'"
+        "       THEN x.raw->'merchant_names' END) e"
+        "        WHERE jsonb_typeof(e) = 'string' AND e #>> '{}' ~ %(p)s)",
+        args).fetchall()
+    # the log's probe, each "four digits" read as "a number"
+    logged = conn.execute(
+        "SELECT DISTINCT tenant_id FROM ("
+        + activity._NAMED_ROWS_SQL.replace("'[0-9]{4}'", "%(p)s") + ") x",
+        args).fetchall()
+    return {str(r["tenant_id"]) for r in [*keys, *logged]}
+
+
+def cut_bill_keys_and_log_names(conn, app_password: str) -> int:
+    """Migration 208's cut, on every migrate: in each household that still
+    holds one, the card numbers a detected bill's match key and identity
+    names spell (bills.cut_detected_keys) and those of the activity log's
+    name targets and the names its details quote
+    (activity.cut_stored_names). The migration's own step runs once, while
+    the app still serves; a row a save beat to its write, and a log row an
+    old container wrote after it read, would otherwise keep the number for
+    good and ride every export.
+
+    As key_numbered_file_rows does, and for the same reasons: each
+    household found by one probe over all of them on this connection gets
+    a connection of its own as the app role, so the cut sees that
+    household alone; the cut runs under the household's sync lock, as
+    every import and restore writes; a household whose lock is held is
+    logged and left for the next migrate, and a failure never stops the
+    migrate. Idempotent: a cut number is "…" and four digits, which no
+    cut changes again, and the probe does not select it. Returns the rows
+    written."""
+    import logging
+
+    from psycopg.conninfo import make_conninfo
+
+    from ..engine import activity, bills
+    from ..sync import base
+    from . import tenancy
+    log = logging.getLogger("oikonome.db")
+    try:
+        tenants = _households_to_cut(conn)
+    except Exception:                                       # noqa: BLE001
+        log.warning("could not look for bill keys and log names to cut",
+                    exc_info=True)
+        return 0
+    if not tenants:
+        return 0
+    dsn = make_conninfo(
+        conn.info.dsn, user="oikonome_app", password=app_password)
+    written = 0
+    for tid in sorted(tenants):
+        try:
+            tconn = tenancy.tenant_connect(tid, dsn)
+        except Exception:                                   # noqa: BLE001
+            log.warning("cut of bill keys and log names: no connection for "
+                        "household %s", tid, exc_info=True)
+            continue
+        try:
+            with base.tenant_sync_lock(tconn, tid) as held:
+                if not held:
+                    log.warning("cut of bill keys and log names: household "
+                                "%s is syncing, importing or restoring; the "
+                                "next migrate takes it", tid)
+                    continue
+                written += bills.cut_detected_keys(tconn)
+                written += activity.cut_stored_names(tconn)
+        except Exception:                                   # noqa: BLE001
+            log.warning("cut of bill keys and log names failed for "
+                        "household %s", tid, exc_info=True)
+        finally:
+            tconn.close()
+    return written
 
 
 # Every control-plane column holding a secret written by crypto.encrypt_cp —
@@ -705,6 +1029,8 @@ _SECRET_COLUMNS = (
     ("items", "id", "access_token"),
     ("business_entity", "id", "ein_enc"),
     ("webhooks", "id", "secret"),
+    # the key file-row ids on once-numbered accounts are hashed under
+    ("txn_id_keys", "tenant_id", "secret"),
 )
 
 

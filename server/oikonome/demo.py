@@ -777,13 +777,20 @@ def reset(seed_value: int | None = None, years: int = 10) -> dict:
     email/password, pre-filled on the login page); sessions are dropped by
     design — a reset IS a fresh start. Refuses on anything that isn't a
     single-tenant demo instance.
+
+    The tenant itself stays: its data is rebuilt in one transaction (see
+    _rebuild_household), so a visitor signing in while the reset runs sees
+    the old household or the new one, never a half-written one, and a
+    rebuild that fails leaves the previous one standing. Only once the new
+    household has committed are the sign-ins ended and the login restored.
     """
+    from .auth import passwords
     from .db import tenancy
     from .engine import budget
 
     # one admin connection holds the seed lock from the tenant check
-    # through delete and re-seed — the check is only meaningful if nothing
-    # else can create a tenant between it and the seed
+    # through the rebuild — the check is only meaningful if nothing else
+    # can create a tenant between it and the rebuild
     admin = tenancy.admin_connect()
     try:
         _take_seed_lock(admin)
@@ -802,10 +809,24 @@ def reset(seed_value: int | None = None, years: int = 10) -> dict:
                              "reset")
         login = cfg.get("demo_login") or {}
         email = login.get("email") or "demo@example.com"
-        password = login.get("password")   # None ⇒ seed mints a fresh one
+        # the credential is NOT part of the reproducible household: an
+        # instance that never recorded one gets a fresh one, printed and
+        # pre-filled on the login page like the seed's
+        password = login.get("password") or "".join(
+            secrets.choice(string.ascii_letters + string.digits)
+            for _ in range(14))
         if seed_value is None:
             seed_value = cfg.get("demo_seed")
+        if seed_value is None:
+            seed_value = secrets.randbelow(1_000_000)
         years = cfg.get("demo_years") or years
+        rng = random.Random(seed_value)
+        today = dt.date.today()
+        # generated and hashed before anything changes: the generator is
+        # pure, and one that fails on today's date must leave the demo
+        # standing
+        g = _generate(_Gen(rng, years, today))
+        password_hash = passwords.hash_password(password)
 
         # anything the demo tenant holds at an external service goes
         # first — otherwise the wipe orphans it (a Plaid Item, say) with no
@@ -816,13 +837,60 @@ def reset(seed_value: int | None = None, years: int = 10) -> dict:
             release_external(tid)
         except Exception:                                # noqa: BLE001
             log.warning("demo reset: external release failed", exc_info=True)
-        tenancy.delete_tenant_rows(admin, tid)
-        r = _seed_locked(admin, seed=seed_value, email=email,
-                         password=password, years=years)
+
+        # nothing the visitors carried over is a mail choice anyone made:
+        # a demo instance sends no mail, and its settings start pristine
+        _rebuild_household(admin, tid, g, rng, today, seed_value, carry=(),
+                           login=(email, password), demo_mode=True)
+        _restart_sign_ins(admin, tid, email, password_hash)
     finally:
         admin.close()
-    r["reset"] = True
-    return r
+    return {"ok": True, "seed": seed_value, "email": email,
+            "password": password, "tenant_id": tid,
+            "transactions": len(g.txns), "years": years, "reset": True}
+
+
+def _restart_sign_ins(admin, tid: str, email: str, password_hash: str) -> None:
+    """End every sign-in to the demo and put back its one login, in one
+    transaction: a visitor never meets a moment with no login to sign in to.
+
+    The login is replaced rather than edited, so everything that hangs off a
+    login — sessions, device tokens, passkeys, recovery codes, a second
+    factor, a pending reset — goes with the old row by its own cascade,
+    whatever is added later; any other login a visitor made goes too. The
+    other control-plane rows the household holds (API and widget tokens,
+    invites, consents, …) are discovered the way _household_tables finds
+    the data: every tenant_id table without row-level security, except the
+    tenant and its logins, and whatever an add-on asks a demonstration
+    household to keep."""
+    from psycopg import sql
+
+    keep = {"tenants", "users"} | set(ext.gate.demo_keep_tables())
+    control = sorted({r["table_name"] for r in admin.execute(
+        """SELECT DISTINCT c.table_name
+             FROM information_schema.columns c
+             JOIN pg_class k ON k.relname = c.table_name
+              AND k.relnamespace = 'public'::regnamespace
+            WHERE c.table_schema = 'public'
+              AND c.column_name = 'tenant_id'
+              AND k.relkind = 'r' AND NOT k.relrowsecurity"""
+    ).fetchall()} - keep)
+    with admin.transaction():
+        # the logins are locked first, the order every writer that touches
+        # a login and a per-login table takes (see delete_tenant_rows)
+        admin.execute("SELECT 1 FROM users WHERE tenant_id = %s FOR UPDATE",
+                      (tid,))
+        for t in control:
+            admin.execute(sql.SQL("DELETE FROM {} WHERE tenant_id = %s")
+                          .format(sql.Identifier(t)), (tid,))
+        # keyed `tenant`, not tenant_id, so the discovery cannot see it
+        admin.execute("DELETE FROM plaid_link_sessions WHERE tenant = %s",
+                      (tid,))
+        admin.execute("DELETE FROM users WHERE tenant_id = %s", (tid,))
+        admin.execute(
+            "INSERT INTO users (tenant_id, email, password_hash, "
+            "verified_at) VALUES (%s,%s,%s,now())",
+            (tid, email, password_hash))
 
 
 # The name the demonstration seed gives the tenant. refresh_demo_household
@@ -830,6 +898,22 @@ def reset(seed_value: int | None = None, years: int = 10) -> dict:
 # the refresh must agree on it.
 DEMO_HOUSEHOLD_NAME = "Demonstration Household"
 DEMO_HOUSEHOLD_NAMES = (DEMO_HOUSEHOLD_NAME,)
+
+
+# The settings a refresh carries across the wipe. The household's mail
+# choices are the holders', not the data's: the schedule an owner switched
+# off, the address that muted itself, the kinds a person turned off, the
+# hour they asked for, the verified texting number, and the outbound pause
+# a credential rotation armed over the recipients until the owner presses
+# Resume. tenant_settings is household data and is wiped, and a wipe hands
+# the defaults back — the daily verdict on again, to an address that asked
+# for silence or that nobody confirmed. Carried across, like the logins.
+DEMO_REFRESH_KEEPS = ("email_schedule", "email_recipients", "email_muted",
+                      "email_prefs", "email_send_hour_utc",
+                      "outbound_paused", "notify_phone",
+                      "notify_phone_pending",
+                      # the zone the schedule's local hours are read in
+                      "timezone")
 
 
 def refresh_demo_household(viewer_email: str, *, years: int = 10,
@@ -856,8 +940,6 @@ def refresh_demo_household(viewer_email: str, *, years: int = 10,
     can use.
     """
     from .db import tenancy
-    from .engine import bills, budget
-    from psycopg import sql
 
     admin = tenancy.admin_connect()
     try:
@@ -901,48 +983,21 @@ def refresh_demo_household(viewer_email: str, *, years: int = 10,
         rng = random.Random(seed)
         today = dt.date.today()
 
-        # Discovery, like delete_tenant_rows — but that function is a FULL
-        # teardown and its exclusion set is sized for one. Reusing it here
-        # wipes two things this command exists to preserve: the device
-        # tokens the native app signs in with (so a session in progress is
-        # thrown back to a login screen by a scheduled refresh) and the rows
-        # an installed add-on names in ``demo_keep_tables``, whose absence
-        # reads as a household the add-on has never seen.
-        #
-        # So only HOUSEHOLD DATA goes, and household data is exactly the
-        # tables under row-level security: that is the schema's own
-        # statement of "this row belongs to one household's books". Every
-        # tenant_id table without it is control plane — the logins, their
-        # sessions and device tokens, collector and widget tokens, push
-        # subscriptions, invites, support consents — and stays, including
-        # any added after this was written. A hand list of tables to keep
-        # silently lost each one added since. The explicit names below are
-        # the RLS tables that are nonetheless not generated data.
-        keep = {
-            "tenant_keys",                    # the tenant's encryption keys
-        } | set(ext.gate.demo_keep_tables())  # whatever an add-on must keep
-        names = {r["table_name"] for r in admin.execute(
-            """SELECT DISTINCT c.table_name
-                 FROM information_schema.columns c
-                 JOIN pg_class k ON k.relname = c.table_name
-                  AND k.relnamespace = 'public'::regnamespace
-                WHERE c.table_schema = 'public'
-                  AND c.column_name = 'tenant_id'
-                  AND k.relkind = 'r' AND k.relrowsecurity"""
-        ).fetchall()} - keep
-        ordered = sorted(names - set(tenancy.DELETE_LAST)) + \
-            [t for t in tenancy.DELETE_LAST if t in names]
+        # generated before anything is deleted: the generator is pure, and
+        # one that fails on today's date must leave the household standing
+        g = _generate(_Gen(rng, years, today))
+        _rebuild_household(admin, tid, g, rng, today, seed,
+                           carry=DEMO_REFRESH_KEEPS, login=None,
+                           demo_mode=False)
+
         with admin.transaction():
-            for t in ordered:
-                admin.execute(sql.SQL("DELETE FROM {} WHERE tenant_id = %s")
-                              .format(sql.Identifier(t)), (tid,))
             # Web-push subscriptions are control plane and stay, except
             # those of the shared demonstration login: each of those is a
             # channel to some past visitor's browser that every alert for
             # this household would still be sent down, and the refresh is
             # the point the household is handed to the next visitor. (The
-            # native app's device tokens stay: they are the sessions the
-            # keep-list above exists for, and they expire on their own.)
+            # native app's device tokens stay: they are sessions in progress
+            # that a rebuild keeps, and they expire on their own.)
             admin.execute(
                 "DELETE FROM push_subscriptions WHERE tenant_id = %s "
                 "AND user_id IN (SELECT id FROM users WHERE tenant_id = %s "
@@ -951,20 +1006,109 @@ def refresh_demo_household(viewer_email: str, *, years: int = 10,
             # them, and re-stamped here so the household starts from the
             # state the gate wants, whatever the last run left behind
             ext.gate.on_demo_household(admin, tid)
-
-        g = _generate(_Gen(rng, years, today))
-        conn = tenancy.tenant_connect(tid)
-        try:
-            _write(conn, g, rng, today)
-            _configure(conn, g, rng, today, budget, bills,
-                       login=None, rng_seed=seed, demo_mode=False)
-        finally:
-            conn.close()
     finally:
         admin.close()
     return {"ok": True, "refreshed": True, "tenant_id": tid, "seed": seed,
             "years": years, "transactions": len(g.txns),
             "through": today.isoformat()}
+
+
+def _household_tables(admin) -> tuple[set[str], list[str]]:
+    """The tables a rebuild wipes, and the order it wipes them in.
+
+    Discovery, like delete_tenant_rows — but that function is a FULL
+    teardown and its exclusion set is sized for one. Reusing it for a
+    rebuild wipes things a rebuild keeps: the tenant's encryption keys and
+    the rows an installed add-on names in ``demo_keep_tables``, whose
+    absence reads as a household the add-on has never seen.
+
+    So only HOUSEHOLD DATA goes, and household data is exactly the tables
+    under row-level security: that is the schema's own statement of "this
+    row belongs to one household's books". Every tenant_id table without it
+    is control plane — the logins, their sessions and device tokens,
+    collector and widget tokens, push subscriptions, invites, support
+    consents — and is the caller's to keep or clear, including any added
+    after this was written. The explicit names below are the RLS tables
+    that are nonetheless not generated data."""
+    from .db import tenancy
+    keep = {
+        "tenant_keys",                    # the tenant's encryption keys
+        # the once-a-day send stamps: wiped, the day's verdict (and now its
+        # text to the carried phone) would go out again after a refresh
+        "job_runs",
+    } | set(ext.gate.demo_keep_tables())  # whatever an add-on must keep
+    names = {r["table_name"] for r in admin.execute(
+        """SELECT DISTINCT c.table_name
+             FROM information_schema.columns c
+             JOIN pg_class k ON k.relname = c.table_name
+              AND k.relnamespace = 'public'::regnamespace
+            WHERE c.table_schema = 'public'
+              AND c.column_name = 'tenant_id'
+              AND k.relkind = 'r' AND k.relrowsecurity"""
+    ).fetchall()} - keep
+    ordered = sorted(names - set(tenancy.DELETE_LAST)) + \
+        [t for t in tenancy.DELETE_LAST if t in names]
+    return names, ordered
+
+
+def _rebuild_household(admin, tid: str, g: _Gen, rng: random.Random,
+                       today: dt.date, seed: int, *, carry: tuple[str, ...],
+                       login: tuple[str, str] | None,
+                       demo_mode: bool) -> None:
+    """Wipe the household's data and write the generated one in its place,
+    in ONE transaction, keeping the tenant and every control-plane row.
+
+    A visitor whose request lands mid-rebuild reads the old household until
+    the new one commits — never an empty ledger, never a half-written one —
+    and a rebuild that fails anywhere rolls back to the household as it
+    was. It runs on a TENANT connection, not `admin`: the generator and the
+    engine calls it makes read unqualified, and on an RLS-bypassing
+    connection those reads would span every household on the host. Every
+    table wiped here is under RLS, which is what scopes the app role to
+    this one household. `carry` names the settings keys that survive the
+    wipe (read under the row lock in the same transaction)."""
+    from psycopg import sql
+
+    from .db import tenancy
+    from .engine import bills, budget
+
+    names, ordered = _household_tables(admin)
+    conn = tenancy.tenant_connect(tid)
+    try:
+        with conn.transaction():
+            # read under the row lock, in the transaction that wipes and
+            # rewrites it, so a choice changed while the rebuild runs is
+            # either carried or waits; never silently undone
+            held = conn.execute(
+                "SELECT config FROM tenant_settings FOR UPDATE"
+            ).fetchone() if "tenant_settings" in names else None
+            prior = (held or {}).get("config") or {}
+            kept = {k: prior[k] for k in carry if k in prior}
+            for t in ordered:
+                conn.execute(sql.SQL("DELETE FROM {} WHERE tenant_id = %s")
+                             .format(sql.Identifier(t)), (tid,))
+            # job_runs is kept (the once-a-day send stamps), but the last
+            # export's stamp and its warnings were the previous visitor's
+            if "job_runs" not in names:
+                from .web.pages import EXPORT_LAST_JOB
+                conn.execute("DELETE FROM job_runs WHERE job = %s",
+                             (EXPORT_LAST_JOB,))
+            # the checkout stamped its derived scope (linked shadows,
+            # business accounts) from the rows just deleted; the rebuild
+            # starts from an empty household, as a fresh checkout would
+            conn.execute(
+                "SELECT set_config('app.shadow_ids', COALESCE(("
+                f"{tenancy.shadow_ids_sql()}), ''), false), "
+                f"{tenancy.ENTITY_SCOPE_SQL}")
+            if kept and "tenant_settings" in names:
+                from psycopg.types.json import Jsonb
+                conn.execute("INSERT INTO tenant_settings (config) "
+                             "VALUES (%s)", (Jsonb(kept),))
+            _write(conn, g, rng, today)
+            _configure(conn, g, rng, today, budget, bills,
+                       login=login, rng_seed=seed, demo_mode=demo_mode)
+    finally:
+        conn.close()
 
 
 def _write(conn, g: _Gen, rng: random.Random, today: dt.date) -> None:

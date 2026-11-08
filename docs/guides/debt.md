@@ -25,7 +25,7 @@ each came from:
   **issuer**. What you typed: **yours**. Neither: **unknown — 0%**, which
   understates the interest until you fill it in.
 - **Min $/mo** — the bank's minimum payment (**issuer**), what you typed
-  (**yours**), or an **estimate**: 2% of a card's balance (at least $25),
+  (**yours**), or an **estimate**: a month's interest plus 1% of a card's balance, never under 2% of it (at least $25),
   a five-year payment for another loan, a thirty-year payment for a
   mortgage. The estimate exists so the page is never empty for a bank
   that sends nothing; correct it.

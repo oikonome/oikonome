@@ -31,6 +31,13 @@ class WindowedTabsTests(unittest.TestCase):
     def tearDown(self):
         self.conn.close()
 
+    def _ledger_opened_long_ago(self):
+        # A previous window is compared only where the ledger covers all
+        # of it, so fixtures that test the comparison open the ledger
+        # before both windows, outside every range they read.
+        _txn(self.conn, self.bank, dt.date(2025, 12, 1), 9.0, "OPENING",
+             category_primary="GENERAL_SERVICES")
+
     def test_spending_window_ranks_and_compares_to_the_previous_window(self):
         # inside the 3m window (Jun–Aug)
         _txn(self.conn, self.bank, dt.date(2026, 8, 12), 240.0, "GROCER",
@@ -64,6 +71,7 @@ class WindowedTabsTests(unittest.TestCase):
         """Over a wide window a merchant renamed by its processor ("K-O-A"
         then "K O A") must rank as ONE merchant, under the bigger
         variant's name, with the previous window compared the same way."""
+        self._ledger_opened_long_ago()
         _txn(self.conn, self.bank, dt.date(2026, 8, 1), 300.0, "K-O-A",
              category_primary="FOOD_AND_DRINK")
         _txn(self.conn, self.bank, dt.date(2026, 7, 1), 200.0, "K O A",
@@ -85,6 +93,7 @@ class WindowedTabsTests(unittest.TestCase):
         it. Leaving it out of the per-category rows means the listed
         changes cannot add up to the headline, and the largest one is
         never shown. It ranks after every current row, at 0."""
+        self._ledger_opened_long_ago()
         _txn(self.conn, self.bank, dt.date(2026, 8, 12), 240.0, "GROCER",
              category_primary="FOOD_AND_DRINK")
         _txn(self.conn, self.bank, dt.date(2026, 4, 5), 100.0, "GROCER",
@@ -118,6 +127,7 @@ class WindowedTabsTests(unittest.TestCase):
         self.assertIsNone(w["merchants"][0][3])
 
     def test_income_window_splits_kinds_and_compares(self):
+        self._ledger_opened_long_ago()
         add_bill(self.conn, "ACME PAYROLL", 5000.0, frequency="MONTHLY",
                  next_due=dt.date(2026, 9, 5), income=True)
         _txn(self.conn, self.bank, dt.date(2026, 8, 5), -5000.0, "ACME PAYROLL",
@@ -144,6 +154,7 @@ class WindowedTabsTests(unittest.TestCase):
         self.assertIsNone(both["sources"][0][3])
 
     def test_a_payer_who_stopped_paying_is_listed(self):
+        self._ledger_opened_long_ago()
         _txn(self.conn, self.bank, dt.date(2026, 8, 5), -500.0, "NEW CLIENT",
              category_primary="INCOME")
         _txn(self.conn, self.bank, dt.date(2026, 4, 5), -4000.0,
@@ -162,6 +173,7 @@ class WindowedTabsTests(unittest.TestCase):
         first three days of last month. Measured against all of last month
         instead, every range reads as a collapse just after a month turns
         (the paycheck on the 15th sits in "before" but not yet in "now")."""
+        self._ledger_opened_long_ago()
         today = dt.date(2026, 9, 3)
         _txn(self.conn, self.bank, dt.date(2026, 8, 2), -100.0, "ACME PAYROLL",
              category_primary="INCOME")
@@ -190,6 +202,10 @@ class WindowedTabsTests(unittest.TestCase):
     def test_previous_window_is_whole_when_today_closes_the_month(self):
         """On the last day of a month the current month is complete, so
         the previous window is too, even when that month is longer."""
+        # the ledger opens before January, so both previous months are
+        # covered and compared rather than unknown
+        _txn(self.conn, self.bank, dt.date(2025, 12, 15), 20.0, "GROCER",
+             category_primary="FOOD_AND_DRINK")
         _txn(self.conn, self.bank, dt.date(2026, 1, 31), 50.0, "GROCER",
              category_primary="FOOD_AND_DRINK")
         w = reporting.spending_window(self.conn, dt.date(2026, 2, 28), "cur")

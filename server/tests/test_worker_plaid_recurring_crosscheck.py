@@ -99,6 +99,21 @@ class NightlyPlaidRecurringTests(unittest.TestCase):
         self.assertIn("plaid_recurring", asked)
         self.assertEqual(seen, [])
 
+    def test_the_operators_opt_out_skips_the_billed_cross_check(self):
+        """OIKONOME_PLAID_PRODUCTS_EXTRA=none promises nothing billed beyond
+        transactions, so the nightly must not spend a recurring-streams call
+        on any item even though the household's own toggle is on."""
+        import os
+        seen = []
+
+        def streams(conn, item_id):
+            seen.append(item_id)
+            return []
+        with mock.patch.dict(os.environ,
+                             {"OIKONOME_PLAID_PRODUCTS_EXTRA": "none"}):
+            self._run(streams)
+        self.assertEqual(seen, [])
+
     def test_a_failing_categorizer_does_not_end_the_tenants_night(self):
         """The categorizer run is one step of a tenant's night like the
         others: a model that is down must not skip the receipt pass, the

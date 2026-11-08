@@ -55,6 +55,63 @@ class ShortBrandNameTests(unittest.TestCase):
         self.assertEqual(canonical_merchant("ATM WITHDRAWAL"),
                          "Atm Withdrawal")
 
+    def test_a_short_trailing_number_or_letter_keeps_a_lone_word_apart(self):
+        # the brand is the generic word AND the token after it; cut to the
+        # word alone, a numbered chain fuses with every shop of that word
+        self.assertEqual(canonical_merchant("MARKET 41 #5813"), "Market 41")
+        self.assertEqual(canonical_merchant("MOTEL 9 #7716"), "Motel 9")
+        self.assertEqual(canonical_merchant("SUPER 7 #6658"), "Super 7")
+        self.assertEqual(canonical_merchant("PIZZA 37"), "Pizza 37")
+        self.assertEqual(canonical_merchant("HOOPLA Q #5813"), "Hoopla Q")
+        self.assertNotEqual(canonical_merchant("MARKET 41 #5813"),
+                            canonical_merchant("THE MARKET #12"))
+        self.assertNotEqual(canonical_merchant("HOOPLA Q #5813"),
+                            canonical_merchant("HOOPLA"))
+        # two locations of one business still fold: the store number is cut
+        self.assertEqual(canonical_merchant("MOTEL 9 #7716"),
+                         canonical_merchant("MOTEL 9 #3307"))
+        self.assertEqual(canonical_merchant("HOOPLA Q #5813"),
+                         canonical_merchant("HOOPLA Q 3307"))
+        self.assertEqual(canonical_merchant("PIZZA 37 #12"),
+                         canonical_merchant("PIZZA 37 #98"))
+        # a long number is a store or reference number, never the brand
+        self.assertEqual(canonical_merchant("ACME STORE 6658"), "Acme Store")
+        self.assertEqual(canonical_merchant("QUILLO 0042"), "Quillo")
+        # beside a bank-mechanics word the number is a reference
+        self.assertNotEqual(canonical_merchant("TRANSFER 12"), "Transfer 12")
+
+
+    def test_a_leading_letter_keeps_a_lone_word_apart(self):
+        # the brand is the letter AND the word after it; dropped as a bank
+        # prefix, two stores differing only by that letter fuse into one
+        self.assertEqual(canonical_merchant("Q DEPOT #5813"), "Q Depot")
+        self.assertEqual(canonical_merchant("V DEPOT 0042"), "V Depot")
+        self.assertNotEqual(canonical_merchant("Q DEPOT #5813"),
+                            canonical_merchant("V DEPOT 0042"))
+        self.assertNotEqual(canonical_merchant("Q ZORBIT"),
+                            canonical_merchant("V ZORBIT"))
+        self.assertNotEqual(canonical_merchant("Q DEPOT"),
+                            canonical_merchant("DEPOT"))
+        # the letter survives a processor prefix and a starred spelling
+        self.assertEqual(canonical_merchant("SQ *Q DEPOT"), "Q Depot")
+        self.assertEqual(canonical_merchant("Q*ZORBIT"), "Q Zorbit")
+        # two locations of one business still fold: the store number is cut
+        self.assertEqual(canonical_merchant("Q DEPOT #5813"),
+                         canonical_merchant("Q DEPOT 3307"))
+        # beside a name of two words the letter is still a prefix
+        self.assertEqual(canonical_merchant("N QUILLO MARKET"),
+                         "Quillo Market")
+
+    def test_a_line_with_no_name_in_it_never_names_a_merchant_the_api_refuses(self):
+        # when no word survives the clean the line itself becomes the name;
+        # a control character in it would make the merchant unopenable
+        # (the merchant endpoints refuse a name carrying one)
+        for line in ("\x01\x02 ##", "!!!\x07", "#\x1f#"):
+            got = canonical_merchant(line)
+            self.assertTrue(got)
+            self.assertFalse(any(ord(ch) < 32 or 127 <= ord(ch) <= 159
+                                 for ch in got), repr(got))
+
 
 class AccentFoldTests(unittest.TestCase):
     def test_accented_and_plain_spellings_are_one_name(self):
@@ -118,6 +175,20 @@ class StoredOldCleanMovesTests(unittest.TestCase):
         self.assertIsNotNone(self.conn.execute(
             "SELECT 1 FROM merchant_categories WHERE merchant IN "
             "('Q&X Bank', 'QR Bank') AND source = 'user'").fetchone())
+        self.assertEqual(merchant_dedup.apply(self.conn), 0)
+
+    def test_a_merchant_two_lettered_stores_shared_splits_into_the_two(self):
+        add_txn(self.conn, "2026-08-01", 180.0, "Q DEPOT #12", txn_id="qd")
+        add_txn(self.conn, "2026-08-02", 45.0, "V DEPOT 0042", txn_id="vd")
+        self._layer1("Q DEPOT #12", "Depot")
+        self._layer1("V DEPOT 0042", "Depot")
+        merchant_identity.resolve(self.conn)
+        self.assertEqual(self._merchant_of("qd"), self._merchant_of("vd"))
+
+        merchant_dedup.apply(self.conn)
+
+        self.assertEqual(self._merchant_of("qd"), "Q Depot")
+        self.assertEqual(self._merchant_of("vd"), "V Depot")
         self.assertEqual(merchant_dedup.apply(self.conn), 0)
 
     def test_an_accent_mangled_merchant_folds_into_its_plain_twin(self):

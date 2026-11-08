@@ -27,7 +27,9 @@ class ShortWindows(unittest.TestCase):
         last_month = (TODAY.replace(day=1) - dt.timedelta(days=1)).replace(day=10)
         self.last = add_txn(self.conn, last_month, 70.0, "GROCER LAST MONTH",
                             account="chk", primary="FOOD_AND_DRINK")
-        before = (last_month.replace(day=1) - dt.timedelta(days=1)).replace(day=10)
+        # on the first day of its month, so the ledger covers the whole
+        # month "1m" compares with
+        before = (last_month.replace(day=1) - dt.timedelta(days=1)).replace(day=1)
         self.before = add_txn(self.conn, before, 90.0, "GROCER BEFORE",
                               account="chk", primary="FOOD_AND_DRINK")
         add_txn(self.conn, last_month, -3000.0, "NORTHWIND PAYROLL", account="chk",

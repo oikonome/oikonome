@@ -16,13 +16,14 @@ in a fenced block, assistant_blocks validates it, and the clients draw it
 from __future__ import annotations
 
 import datetime as _dt
+import re
 import json
 import logging
 import threading
 import uuid as _uuid
 from urllib.parse import urlsplit
 
-from ..envnum import env_num
+from ..envnum import env_int
 from . import assistant_blocks as _blocks
 from . import llm_categorize as _llm
 
@@ -55,7 +56,7 @@ log = logging.getLogger(__name__)
 # than queued — a queued ask would still hold the thread it is meant to
 # spare.
 _IN_FLIGHT = threading.BoundedSemaphore(
-    int(env_num("OIKONOME_ASSISTANT_CONCURRENCY", "3")))
+    env_int("OIKONOME_ASSISTANT_CONCURRENCY", 3, lo=1))
 # Bound each LLM hop so the whole ask can't hold a web threadpool thread for
 # MAX_TOOL_HOPS x REQUEST_TIMEOUT (600s = 40 min) — a thread-exhaustion DoS.
 # 150s comfortably covers a slow bundled CPU model; worst case is
@@ -94,8 +95,24 @@ def status(conn=None) -> dict:
     the off-box consent gate for tax documents uses, so the two cannot
     disagree about one endpoint. A non-local tenant backend is named so the
     UI can say where the answers go; the operator's host never is."""
+    from . import budget
+    if conn is None:
+        return _status_of(_llm._backend(None, role="assistant"))
+    return _status_of(_llm.backend_endpoint(budget.load_config(conn),
+                                            "assistant"))
+
+
+def status_view(conn) -> dict:
+    """status() plus, per task, where its data goes — from ONE config load
+    and without decrypting any stored credential (only the URL is judged)."""
+    from . import budget
+    cfg = budget.load_config(conn)
+    return {**_status_of(_llm.backend_endpoint(cfg, "assistant")),
+            "roles": _llm.destinations_of(cfg)}
+
+
+def _status_of(be: dict) -> dict:
     from .taxdocs import _endpoint_is_local
-    be = _llm._backend(conn, role="assistant")
     url = be.get("url") or ""
     if not url:
         return {"available": False, "local": False, "host": ""}
@@ -110,7 +127,9 @@ def status(conn=None) -> dict:
 
 def _t_net_worth(conn, _args) -> dict:
     from . import reporting
-    nw = reporting.compute_networth(conn)
+    # today's figures only: the history walk is most of the cost and the
+    # tool returns none of it
+    nw = reporting.compute_networth(conn, trend=False)
     return {
         "liquid_and_investments_total": nw.get("current_total"),
         "including_property_total": nw.get("full_total"),
@@ -164,8 +183,9 @@ def _t_spend_lookup(conn, args) -> dict:
     the assistant's number is the report's number."""
     from . import reporting
     from .merchant_dedup import DISPLAY_MERCHANT, MC_JOIN
-    merchant = str(args.get("merchant") or "").strip()[:100]
-    category = str(args.get("category") or "").strip()[:100]
+    # already coerced to the declared schema (_tool_args)
+    merchant = args.get("merchant") or ""
+    category = args.get("category") or ""
     year = args.get("year")
     where = [reporting.SPEND_WHERE]
     params: list = []
@@ -176,10 +196,6 @@ def _t_spend_lookup(conn, args) -> dict:
         # per part: a split row's part category, else the row's own
         where.append(f"{reporting.PART_CAT} ILIKE %s ESCAPE '\\'")
         params.append(_like(category.replace("_", " ")))
-    try:
-        year = int(year) if year not in (None, "") else None
-    except (TypeError, ValueError):
-        year = None
     if year:
         where.append("EXTRACT(YEAR FROM t.date) = %s")
         params.append(year)
@@ -230,22 +246,96 @@ def _t_spend_lookup(conn, args) -> dict:
     }
 
 
+# the most bills one answer lists; `count` is always the whole schedule
+BILLS_LISTED = 25
+
+
+def _cadence(row) -> str:
+    """How often a bill pays, in words, from the rule the bill keeps."""
+    from .compat import as_dict
+    freq = str(row["frequency"] or "").upper()
+    if freq == "ENVELOPE":
+        return "spending cap"
+    rec = as_dict(row["raw"]).get("recurrence")
+    rec = rec if isinstance(rec, dict) else {}
+    f = str(rec.get("frequency") or "").upper()
+    unit = {"DAILY": "day", "WEEKLY": "week", "MONTHLY": "month",
+            "YEARLY": "year"}.get(f)
+    if unit is None:
+        return "one-time" if not freq else freq.lower().replace("_", " ")
+    try:
+        iv = max(1, int(rec.get("interval") or 1))
+    except (TypeError, ValueError):
+        iv = 1
+    return f"every {unit}" if iv == 1 else f"every {iv} {unit}s"
+
+
 def _t_recurring_bills(conn, _args) -> dict:
+    """The schedule's bills (money out) with what each costs — the amount
+    per charge and per month, as the Bills page stores them — beside the
+    health verdict. Income series are not bills and are left out."""
     from . import bills
+    rows = conn.execute(
+        """SELECT payee, amount, monthly_amount, frequency, due_on, raw
+             FROM bills WHERE active = 1 AND COALESCE(amount, 0) <= 0
+            ORDER BY abs(COALESCE(monthly_amount, amount, 0)) DESC, payee"""
+    ).fetchall()
     health = bills.analyze_bills(conn)
+    # the household's year, as the Bills headline reckons it — never the
+    # server's clock, which is UTC on a hosted instance
+    from .. import localtime
+    this_year = localtime.household_day(conn).year
     out = []
-    for payee, info in list(health.items())[:25]:
+    for r in rows:
+        info = health.get(r["payee"] or "")
         info = info if isinstance(info, dict) else {}
         withdrawn_on = info.get("withdrawn_on")
-        out.append({"payee": payee,
-                    "amount": info.get("amount") or info.get("expected"),
-                    "health": info.get("health"),
+        amount = abs(float(r["amount"] or 0))
+        monthly = r["monthly_amount"]
+        if not r["frequency"]:
+            # a one-time bill is its amount once, evened over its own
+            # calendar year as the Bills headline evens it — never its
+            # whole amount every month
+            due = r["due_on"]
+            monthly = (amount / 12 if due is not None
+                       and due.year == this_year else 0.0)
+        out.append({"payee": r["payee"],
+                    "amount": round(amount, 2),
+                    "monthly": round(abs(float(
+                        monthly if monthly is not None else amount)), 2),
+                    "cadence": _cadence(r),
+                    "next_due": r["due_on"].isoformat() if r["due_on"] else None,
+                    "health": info.get("health") or "unchecked",
                     # behind a "withdrawn" verdict: the day the bank feed
                     # took the missed cycle's charge back
                     "withdrawn_on": (withdrawn_on.isoformat()
                                      if withdrawn_on else None)})
-    return {"count": len(health), "bills": out}
+    # largest monthly cost first, by the evened figure (a one-time bill's
+    # stored monthly is its whole amount)
+    out.sort(key=lambda b: (-b["monthly"], b["payee"] or ""))
+    return {"count": len(rows), "truncated": len(rows) > BILLS_LISTED,
+            "bills": out[:BILLS_LISTED]}
 
+
+# What each tool's description promises, as paths into its result
+# (`a[]` = every item of list a): every one is present and non-null on a
+# household that has the data. The tool-contract test runs each tool
+# against a seeded household and checks every path, so a tool that reads
+# a field its engine function does not produce fails there, not in an
+# answer that cannot quote a figure.
+TOOL_PROMISES = {
+    "net_worth": ["liquid_and_investments_total",
+                  "including_property_total", "by_asset_class"],
+    "spending_summary": ["by_category_trailing_12_months[]",
+                         "by_year_and_category",
+                         "top_merchants_trailing_12_months[]",
+                         "total_by_year[]"],
+    "spend_lookup": ["total", "transactions", "first", "last", "by_year[]",
+                     "by_month[]", "top_merchants[]"],
+    "recurring_bills": ["count", "truncated", "bills[].payee",
+                        "bills[].amount", "bills[].monthly",
+                        "bills[].cadence", "bills[].health"],
+}
 
 _TOOLS_IMPL = {
     "net_worth": _t_net_worth,
@@ -285,13 +375,16 @@ TOOLS = [
                          "description": "part of the merchant name"},
             "category": {"type": "string",
                          "description": "part of the category name"},
-            "year": {"type": "integer", "description": "calendar year"},
+            "year": {"type": "integer", "description": "calendar year",
+                     "minimum": 1900, "maximum": 2200},
         }},
     }},
     {"type": "function", "function": {
         "name": "recurring_bills",
-        "description": "The user's recurring bills and subscriptions with their "
-                       "amounts and health (ok = matching / drifting / "
+        "description": "The user's recurring bills and subscriptions (not "
+                       "income) with the amount per charge, the monthly "
+                       "equivalent, how often each pays, the next due date "
+                       "and health (ok = matching / drifting / "
                        "stale / withdrawn = the last cycle WAS charged but "
                        "the bank feed took the charge back, on "
                        "withdrawn_on).",
@@ -354,12 +447,54 @@ _ANSWER_NOW = ("No more lookups are available. Answer the question now "
 _FINAL_RETRIES = 1
 
 
-def _run_tool(conn, name: str, args: dict) -> dict:
+_STR_ARG_MAX = 100
+_SCHEMAS = {t["function"]["name"]: t["function"]["parameters"]
+            for t in TOOLS}
+
+
+def _tool_args(name: str, args) -> dict:
+    """The model's arguments for `name`, held to that tool's declared
+    schema: undeclared keys dropped, a string trimmed and capped, an
+    integer read from a whole number or its digits and kept inside the
+    declared range. A value that cannot be read as its type is dropped,
+    as if the model had not sent it — the arguments are untrusted JSON,
+    and a tool should never meet a list where it expects a year."""
+    props = (_SCHEMAS.get(name) or {}).get("properties") or {}
+    if not isinstance(args, dict):
+        return {}
+    out = {}
+    for key, spec in props.items():
+        v = args.get(key)
+        if v is None:
+            continue
+        kind = spec.get("type")
+        if kind == "string":
+            if isinstance(v, (dict, list)):
+                continue
+            v = str(v).strip()[:_STR_ARG_MAX]
+            if v:
+                out[key] = v
+        elif kind == "integer":
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, float) and v.is_integer():
+                v = int(v)
+            elif isinstance(v, str) and re.fullmatch(r"-?[0-9]+", v.strip()):
+                v = int(v.strip())
+            if not isinstance(v, int):
+                continue
+            if not (spec.get("minimum", v) <= v <= spec.get("maximum", v)):
+                continue
+            out[key] = v
+    return out
+
+
+def _run_tool(conn, name: str, args) -> dict:
     impl = _TOOLS_IMPL.get(name)
     if impl is None:
         return {"error": f"unknown tool {name!r}"}
     try:
-        return impl(conn, args or {})
+        return impl(conn, _tool_args(name, args))
     except Exception as e:                      # a tool failure is not fatal
         return {"error": f"{type(e).__name__}: {e}"}
 
@@ -497,31 +632,39 @@ def thread_context(conn, thread_id: str) -> list[dict]:
     return [{"question": r["question"], "answer": r["answer"]} for r in rows]
 
 
-def thread_is_own(conn, thread_id: str, user_id) -> bool:
-    """Is every turn in this conversation this person's? A view-only
-    login may continue only threads it alone has asked in — the
-    household's others are not shown to it, so it must not be able to
-    read them through a follow-up either. The whole thread is checked,
-    not just its opening: the owner and a member read the viewer's
-    conversations and may continue one, and a follow-up hands the model
-    every turn in the thread, so one turn of theirs in it would reach the
-    model on the viewer's next question. A thread holding a turn whose
-    asker has left the household (asked_by_id nulled by forget_asker) is
-    not provably the viewer's either. False for a thread that does not
-    exist, so the refusal reads the same as an unknown id."""
+def own_thread_context(conn, thread_id: str, user_id) -> list[dict]:
+    """thread_context for a login that may continue only its own
+    conversations: the turns, or [] unless every turn in the thread is
+    this person's. A view-only login may continue only threads it alone
+    has asked in — the household's others are not shown to it, so it
+    must not be able to read them through a follow-up either. The whole
+    thread is checked, not just its opening: the owner and a member read
+    the viewer's conversations and may continue one, and a follow-up
+    hands the model every turn in the thread, so one turn of theirs in it
+    would reach the model on the viewer's next question. A thread holding
+    a turn whose asker has left the household (asked_by_id nulled by
+    forget_asker) is not provably the viewer's either. [] for a thread
+    that does not exist, so the refusal reads the same as an unknown id.
+    The check and the read are ONE
+    statement, so they see the same rows — as two autocommit statements,
+    a turn someone else committed between them would be handed to the
+    model on the viewer's question."""
     if user_id is None:
-        return False
+        return []
     try:
         uid = str(_uuid.UUID(str(user_id)))
     except ValueError:
-        return False
-    row = conn.execute(
-        """SELECT count(*) AS n,
+        return []
+    rows = conn.execute(
+        """SELECT question, answer,
                   bool_and(asked_by_id IS NOT NULL
-                           AND asked_by_id = %s::uuid) AS own
-             FROM assistant_turns WHERE thread_id = %s""",
-        (uid, str(_uuid.UUID(str(thread_id))))).fetchone()
-    return bool(row and row["n"] and row["own"])
+                           AND asked_by_id = %s::uuid) OVER () AS own
+             FROM assistant_turns
+            WHERE thread_id = %s ORDER BY asked_at, id""",
+        (uid, str(_uuid.UUID(str(thread_id))))).fetchall()
+    if not rows or not rows[0]["own"]:
+        return []
+    return [{"question": r["question"], "answer": r["answer"]} for r in rows]
 
 
 def record_turn(conn, user, question: str, result: dict,

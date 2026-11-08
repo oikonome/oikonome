@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type ReactNode, useEffect, useState } from "react";
 import { api, errText } from "../api/client";
-import { saveSettings } from "../api/cache";
+import { SETTINGS_SAVES, saveSettings } from "../api/cache";
 import { isPlanSavingsGoal, parseMoneyDraft } from "../moneymath";
 
 // The budgets step on the hand-entry path. The household said it would set
@@ -62,6 +62,7 @@ export default function ManualBudgets({ onSaved }: { onSaved?: () => void }) {
   const sugg = sug.data?.suggestions;
 
   const save = useMutation({
+    scope: SETTINGS_SAVES,
     mutationFn: async (): Promise<boolean> => {
       // the goals list is replaced wholesale on save: carry every other
       // goal through from the server's current copy, and keep the stored

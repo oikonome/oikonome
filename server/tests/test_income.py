@@ -5,7 +5,7 @@ import datetime as dt
 import unittest
 
 from oikonome.engine import bills, budget
-from oikonome.engine.compat import as_dict, jsonb
+from oikonome.engine.compat import as_date, as_dict, jsonb
 
 from .util import TODAY, add_txn, make_db, write_config
 
@@ -76,6 +76,110 @@ class IncomeSeedTests(unittest.TestCase):
         sug = budget.suggest_budgets(self.conn, TODAY)
         self.assertAlmostEqual(sug["suggestions"]["income_monthly"],
                                2850 * (365.2425 / 14) / 12, delta=0.5)
+
+    def test_income_filed_under_a_file_import_label_is_still_detected(self):
+        # Deposits a CSV import filed under the file's own "Income" label
+        # (before the label was canonicalized) are paycheck candidates too
+        for i in range(6):
+            add_txn(self.conn, TODAY - dt.timedelta(days=14 * i + 2), -2600,
+                    "RIVERBEND CLINIC PAYROLL", primary="Income",
+                    account="chk", txn_id=f"lbl-{i}")
+        bills.run(self.conn, TODAY)
+        income = [p for p in self.conn.execute(
+            "SELECT amount, evidence FROM bill_proposals "
+            "WHERE kind='add' AND status='pending'").fetchall()
+            if (as_dict(p["evidence"]) or {}).get("income")]
+        self.assertEqual(len(income), 1)
+        self.assertAlmostEqual(income[0]["amount"], 2600.0, delta=1.0)
+
+    def test_income_raise_ladder_proposes_the_current_paycheck(self):
+        # Three pay rungs inside six months (a new job's starting pay, a
+        # raise, then another): the recent median lands on the MIDDLE rung
+        # with two deposits at that size, so a median-anchored core never
+        # reaches three hits and the household's pay is never proposed.
+        # The latest deposit anchors first: the series is proposed at the
+        # current paycheck, biweekly, due on the next payday.
+        rungs = [1000.0] * 5 + [1500.0] * 2 + [2000.0] * 4
+        for i, amt in enumerate(reversed(rungs)):
+            add_txn(self.conn, TODAY - dt.timedelta(days=14 * i + 1), -amt,
+                    "ACME HOLDINGS PAYROLL", primary="INCOME",
+                    account="chk", txn_id=f"rung-{i}")
+        bills.run(self.conn, TODAY)
+        income = [p for p in self.conn.execute(
+            "SELECT amount, frequency, \"interval\", next_due, evidence "
+            "FROM bill_proposals WHERE kind='add' AND status='pending'"
+        ).fetchall() if (as_dict(p["evidence"]) or {}).get("income")]
+        self.assertEqual(len(income), 1, "the ladder must propose once")
+        self.assertAlmostEqual(income[0]["amount"], 2000.0, delta=1.0)
+        self.assertEqual((income[0]["frequency"], income[0]["interval"]),
+                         ("WEEKLY", 2))
+        self.assertEqual(as_date(income[0]["next_due"]),
+                         TODAY + dt.timedelta(days=13))
+
+    def test_income_latest_stipend_does_not_replace_the_paycheck(self):
+        # The same employer pays a biweekly $2,400 and a monthly $250
+        # stipend through one descriptor; detection runs the night after a
+        # stipend. The stipend gathers its own core and even fits a monthly
+        # cycle, but the paycheck has more recent on-cycle deposits: the
+        # series is proposed at the paycheck, not the stipend, and once
+        # approved the employer key is taken — so the choice has to be
+        # right the first time.
+        for i in range(13):
+            add_txn(self.conn, TODAY - dt.timedelta(days=14 * i + 3), -2400,
+                    "ACME HOLDINGS PAYROLL", primary="INCOME",
+                    account="chk", txn_id=f"pay-{i}")
+        for i in range(6):
+            add_txn(self.conn, TODAY - dt.timedelta(days=30 * i + 1), -250,
+                    "ACME HOLDINGS PAYROLL", primary="INCOME",
+                    account="chk", txn_id=f"stipend-{i}")
+        bills.run(self.conn, TODAY)
+        income = [p for p in self.conn.execute(
+            "SELECT amount, frequency, \"interval\", evidence "
+            "FROM bill_proposals WHERE kind='add' AND status='pending'"
+        ).fetchall() if (as_dict(p["evidence"]) or {}).get("income")]
+        self.assertEqual(len(income), 1)
+        self.assertAlmostEqual(income[0]["amount"], 2400.0, delta=1.0)
+        self.assertEqual((income[0]["frequency"], income[0]["interval"]),
+                         ("WEEKLY", 2))
+
+    def test_income_quarterly_bonus_on_payday_is_not_the_series(self):
+        # A quarterly bonus paid on a payday merges with that day's check
+        # into one larger event; eight of those over two years fit a
+        # 91-day cycle of their own. Detection the week after a bonus
+        # must still propose the biweekly paycheck.
+        for i in range(52):
+            d = TODAY - dt.timedelta(days=14 * i + 2)
+            amt = 3500 if i % 6 == 0 else 2000      # every sixth payday
+            add_txn(self.conn, d, -amt, "ACME HOLDINGS PAYROLL",
+                    primary="INCOME", account="chk", txn_id=f"q-{i}")
+        bills.run(self.conn, TODAY)
+        income = [p for p in self.conn.execute(
+            "SELECT amount, frequency, \"interval\", evidence "
+            "FROM bill_proposals WHERE kind='add' AND status='pending'"
+        ).fetchall() if (as_dict(p["evidence"]) or {}).get("income")]
+        self.assertEqual(len(income), 1)
+        self.assertAlmostEqual(income[0]["amount"], 2000.0, delta=1.0)
+        self.assertEqual((income[0]["frequency"], income[0]["interval"]),
+                         ("WEEKLY", 2))
+
+    def test_income_bonus_sized_latest_deposit_falls_back_to_the_median(self):
+        # The latest deposit is a bonus: no core gathers around it, so the
+        # recent median anchors as before and the regular paycheck is
+        # proposed at its own size, not the bonus's.
+        for i in range(6):
+            add_txn(self.conn, TODAY - dt.timedelta(days=14 * i + 15), -3100,
+                    "ACME HOLDINGS PAYROLL", primary="INCOME",
+                    account="chk", txn_id=f"reg-{i}")
+        add_txn(self.conn, TODAY - dt.timedelta(days=1), -12000,
+                "ACME HOLDINGS PAYROLL", primary="INCOME", account="chk",
+                txn_id="bonus-latest")
+        bills.run(self.conn, TODAY)
+        income = [p for p in self.conn.execute(
+            "SELECT amount, evidence FROM bill_proposals "
+            "WHERE kind='add' AND status='pending'").fetchall()
+            if (as_dict(p["evidence"]) or {}).get("income")]
+        self.assertEqual(len(income), 1)
+        self.assertAlmostEqual(income[0]["amount"], 3100.0, delta=1.0)
 
     def test_income_amount_core_uses_recent_paycheck(self):
         # A pay rise: an older, smaller series would drag the all-history
